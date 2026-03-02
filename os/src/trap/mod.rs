@@ -33,6 +33,9 @@ global_asm!(include_str!("trap.S"));
 /// Initialize trap handling
 pub fn init() {
     set_kernel_trap_entry();
+    unsafe {
+        sie::set_sext();
+    }
 }
 /// set trap entry for traps happen in kernel(supervisor) mode
 fn set_kernel_trap_entry() {
@@ -96,6 +99,10 @@ pub fn trap_handler() -> ! {
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::SupervisorExternal) => {
+            crate::drivers::plic::handle_supervisor_external();
+            // crate::net::poll();
         }
         _ => {
             panic!(
