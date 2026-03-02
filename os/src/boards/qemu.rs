@@ -10,7 +10,10 @@ pub const MMIO: &[(usize, usize)] = &[
     (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
 ];
 
+pub const VIRT_UART: usize = 0x1000_0000;
+
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
+pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 
 //ref:: https://github.com/andre-richter/qemu-exit
 use core::arch::asm;
