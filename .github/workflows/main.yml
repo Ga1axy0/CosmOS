@@ -1,15 +1,17 @@
 name: AutoTest
 
-on:
-  [push, pull_request]
+on: [push, pull_request]
 
 env:
-    CARGO_TERM_COLOR: always
-    rust_toolchain: nightly
+  CARGO_TERM_COLOR: always
+  rust_toolchain: nightly
 
 jobs:
   boot-test:
     runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/ga1axy0/os-ci:latest
 
     steps:
       - name: Checkout repository
@@ -17,45 +19,34 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build Docker image
+      - name: Tool versions
         run: |
-          set -eux
-          docker build -t os-ci -f ci/Dockerfile .
+          qemu-system-riscv64 --version
+          rustc --version
 
-      - name: Build and boot OS
+      - name: Boot kernel
+        shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
+          git config --global --add safe.directory "$(pwd)"
 
-          docker run --rm \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            os-ci \
-            bash -lc '
+          # make run 一般不会退出，所以 timeout；timeout 超时会返回非0，所以加 || true
+          timeout 90s bash -lc "cd os && make run" 2>&1 | tee boot.log || true
 
-              set -eux
+          echo "=== boot.log tail ==="
+          tail -n 200 boot.log
 
-              git config --global --add safe.directory /workspace
+      - name: Check boot marker
+        run: |
+          if grep -F "[kernel] Hello, world!" boot.log >/dev/null; then
+            echo "::notice::Kernel boot successful"
+            echo "## ✅ Kernel Boot Successful" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
 
-              echo "=== Tool versions ==="
-              qemu-system-riscv64 --version
-              rustc --version
-
-              echo "=== Boot kernel ==="
-
-              timeout 90s bash -lc "cd os && make run" 2>&1 | tee boot.log || true
-
-              echo "=== Boot log tail ==="
-              tail -n 200 boot.log
-
-              echo "=== Checking boot marker ==="
-              if grep -F "[kernel] Hello, world!" boot.log > /dev/null; then
-                echo "Kernel boot successful"
-                exit 0
-              fi
-
-              echo "Kernel boot FAILED"
-              exit 1
-            '
+          echo "::error::Kernel boot FAILED"
+          echo "## ❌ Kernel Boot Failed" >> $GITHUB_STEP_SUMMARY
+          exit 1
 
       - name: Upload boot log
         if: always()
@@ -63,3 +54,4 @@ jobs:
         with:
           name: boot-log
           path: boot.log
+          retention-days: 7
