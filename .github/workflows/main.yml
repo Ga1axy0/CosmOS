@@ -1,0 +1,65 @@
+name: AutoTest
+
+on:
+  [push, pull_request]
+
+env:
+    CARGO_TERM_COLOR: always
+    rust_toolchain: nightly
+
+jobs:
+  boot-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Docker image
+        run: |
+          set -eux
+          docker build -t os-ci -f ci/Dockerfile .
+
+      - name: Build and boot OS
+        run: |
+          set -eux
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            os-ci \
+            bash -lc '
+
+              set -eux
+
+              git config --global --add safe.directory /workspace
+
+              echo "=== Tool versions ==="
+              qemu-system-riscv64 --version
+              rustc --version
+
+              echo "=== Boot kernel ==="
+
+              timeout 90s bash -lc "cd os && make run" 2>&1 | tee boot.log || true
+
+              echo "=== Boot log tail ==="
+              tail -n 200 boot.log
+
+              echo "=== Checking boot marker ==="
+              if grep -F "[kernel] Hello, world!" boot.log > /dev/null; then
+                echo "Kernel boot successful"
+                exit 0
+              fi
+
+              echo "Kernel boot FAILED"
+              exit 1
+            '
+
+      - name: Upload boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: boot.log
