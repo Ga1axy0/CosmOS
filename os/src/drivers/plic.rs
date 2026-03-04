@@ -52,7 +52,7 @@ fn enable_irq(context: usize, irq: u32) {
 }
 
 fn set_priority(irq: u32, prio: u32) {
-    debug!("Set IRQ {:?} priority to {}", priority_ptr(irq), prio);
+    debug!("Set IRQ {} priority to {}", irq, prio);
     unsafe { write_volatile(priority_ptr(irq), prio) }
 }
 
