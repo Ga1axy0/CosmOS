@@ -5,6 +5,8 @@ KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
 DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
+# easyfs or fat32
+MAIN_FS := fat32
 APPS := ../user/src/bin/*
 OFFLINE :=
 
@@ -66,14 +68,14 @@ $(KERNEL_BIN): kernel
 fs-img: $(APPS)
 	@make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
 	@rm -f $(FS_IMG)
-	@cd ../fs-fuse && cargo run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/
+	@cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS)
 
 kernel:
 	@echo Platform: $(BOARD)
 ifeq ($(QEMU7_CFG),--cfg qemu7)
-	@cargo rustc $(MODE_ARG) -- --cfg qemu7
+	@cargo rustc $(MODE_ARG) --no-default-features --features $(MAIN_FS) -- --cfg qemu7
 else
-	@cargo build $(MODE_ARG)
+	@cargo build $(MODE_ARG) --no-default-features --features $(MAIN_FS)
 endif
 
 clean:

@@ -96,7 +96,7 @@ impl EasyFileSystem {
         get_block_cache(0, Arc::clone(&block_device))
             .lock()
             .read(0, |super_block: &SuperBlock| {
-                assert!(super_block.is_valid(), "Error loading EFS!");
+                assert!(super_block.is_valid(), "Error loading EFS: magic number mismatch");
                 let inode_total_blocks =
                     super_block.inode_bitmap_blocks + super_block.inode_area_blocks;
                 let efs = Self {
