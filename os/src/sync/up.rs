@@ -57,6 +57,7 @@ impl<T> UPIntrFreeCell<T> {
         }
     }
 
+    /// Get exclusive access.
     pub fn exclusive_access(&self) -> UPIntrFreeCellRefMut<'_, T> {
         UPIntrFreeCellRefMut {
             cell: self,
