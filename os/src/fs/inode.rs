@@ -7,7 +7,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
 use fs::Inode;
+#[cfg(feature = "easyfs")]
 use fs::EasyFileSystem;
+#[cfg(feature = "ext4")]
+use fs::Ext4FileSystem;
+#[cfg(feature = "fat32")]
 use fs::Fat32FileSystem;
 use lazy_static::*;
 
@@ -64,9 +68,14 @@ lazy_static! {
             let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
             Arc::new(EasyFileSystem::root_inode(&efs))
         }
-        #[cfg(not(any(feature = "fat32", feature = "easyfs")))]
+        #[cfg(feature = "ext4")]
         {
-            compile_error!("You must enable either 'fat32' or 'easyfs' feature!");
+            let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
+            Arc::new(Ext4FileSystem::root_inode(&efs))
+        }
+        #[cfg(not(any(feature = "fat32", feature = "easyfs", feature = "ext4")))]
+        {
+            compile_error!("You must enable one of: 'fat32', 'easyfs', or 'ext4' feature!");
         }
     };
 }

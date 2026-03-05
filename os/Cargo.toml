@@ -19,4 +19,5 @@ fs = { path = "../fs" }
 [features]
 fat32 = []
 easyfs = []
-default = ["fat32"]
+ext4 = []
+default = ["ext4"]

@@ -33,15 +33,15 @@ fn run() -> std::io::Result<()> {
                 .long("format")
                 .num_args(1)
                 .default_value("easyfs")
-                .value_parser(["easyfs", "fat32"])
-                .help("Filesystem format to pack: easyfs | fat32"),
+                .value_parser(["easyfs", "fat32", "ext4"])
+                .help("Filesystem format to pack: easyfs | fat32 | ext4"),
         )
         .arg(
             Arg::new("size_mib")
                 .long("size-mib")
                 .num_args(1)
                 .value_parser(clap::value_parser!(u64))
-                .help("Image size in MiB (default: easyfs=16, fat32=64)"),
+                .help("Image size in MiB (default: easyfs=16, fat32=64, ext4=64)"),
         )
         .get_matches();
 
@@ -65,6 +65,8 @@ fn run() -> std::io::Result<()> {
         // FAT32 needs a sufficiently large volume to be standards-compliant.
         // 64MiB is a safe default for FAT32 on common formatters.
         FsFormat::Fat32 => 64,
+        // ext4 also benefits from a larger default size for metadata overhead.
+        FsFormat::Ext4 => 64,
     };
     let size_mib = matches
         .get_one::<u64>("size_mib")
@@ -86,12 +88,17 @@ fn run() -> std::io::Result<()> {
     let result = match format {
         FsFormat::EasyFs => pack::easyfs::pack(&cfg, &apps),
         FsFormat::Fat32 => pack::fat32::pack(&cfg, &apps),
+        FsFormat::Ext4 => pack::ext4::pack(&cfg, &apps),
     };
 
     if let Err(e) = result {
         if format == FsFormat::Fat32 {
             eprintln!(
                 "FAT32 packing failed: {e}. If your image is too small, try a larger --size-mib (e.g. 64)."
+            );
+        } else if format == FsFormat::Ext4 {
+            eprintln!(
+                "EXT4 packing failed: {e}. Ensure `mkfs.ext4` and `debugfs` are installed (e2fsprogs)."
             );
         }
         return Err(e);
