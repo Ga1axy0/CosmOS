@@ -13,7 +13,7 @@ extern crate core;
 #[macro_use]
 extern crate bitflags;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use buddy_system_allocator::LockedHeap;
 pub use console::{flush, STDIN, STDOUT};
 pub use syscall::*;
@@ -158,8 +158,19 @@ bitflags! {
 
 const AT_FDCWD: isize = -100;
 
+fn to_cstring(s: &str) -> String {
+    if s.as_bytes().last() == Some(&0) {
+        String::from(s)
+    } else {
+        let mut t = String::from(s);
+        t.push('\0');
+        t
+    }
+}
+
 pub fn open(path: &str, flags: OpenFlags) -> isize {
-    sys_openat(AT_FDCWD as usize, path, flags.bits, OpenFlags::RDWR.bits)
+    let path = to_cstring(path);
+    sys_openat(AT_FDCWD as usize, path.as_str(), flags.bits, OpenFlags::RDWR.bits)
 }
 
 pub fn close(fd: usize) -> isize {
@@ -468,4 +479,20 @@ pub fn sigprocmask(mask: u32) -> isize {
 
 pub fn sigreturn() -> isize {
     sys_sigreturn()
+}
+
+pub fn getcwd(buffer: &mut [u8]) -> isize {
+    sys_getcwd(buffer)
+}
+
+pub fn mkdir(path: &str, mode: u32) -> isize {
+    sys_mkdirat(AT_FDCWD as usize, to_cstring(path).as_str(), mode)
+}
+
+pub fn chdir(path: &str) -> isize {
+    sys_chdir(to_cstring(path).as_str())
+}
+
+pub fn getdents64(fd: usize, buffer: &mut [u8]) -> isize {
+    sys_getdents64(fd, buffer)
 }

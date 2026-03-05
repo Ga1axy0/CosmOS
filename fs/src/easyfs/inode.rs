@@ -161,6 +161,15 @@ impl VfsNode for EasyInode {
         // release efs lock automatically by compiler
     }
 
+    /// EasyFS does not support subdirectories; always returns `None`.
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn is_dir(&self) -> bool {
+        self.read_disk_inode(|d| d.is_dir())
+    }
+
     fn clear(&self) {
         let mut fs = self.fs.lock();
         self.modify_disk_inode(|disk_inode| {

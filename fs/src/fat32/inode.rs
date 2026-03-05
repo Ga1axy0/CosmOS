@@ -597,6 +597,103 @@ impl VfsNode for FatInode {
         Some(Arc::new(inode) as Arc<dyn VfsNode>)
     }
 
+    fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        let inner = self.inner.lock();
+        if !inner.is_dir {
+            return None;
+        }
+        let dir_cluster = inner.start_cluster;
+        drop(inner);
+
+        // Reject if name already exists.
+        if self.find_by_name_in_dir(dir_cluster, name).is_some() {
+            return None;
+        }
+
+        // Allocate a fresh cluster for the new directory, zero it, and write dot entries.
+        let bpb = self.fs.bpb();
+        let new_cluster = {
+            let mut fs_inner = self.fs.inner().lock();
+            let c = fat::alloc_cluster(bpb, self.fs.device(), &mut fs_inner)?;
+            fat::set_next(bpb, self.fs.device(), c, fat::FAT32_EOC);
+            // Zero-fill every sector of the cluster.
+            let zero = [0u8; BLOCK_SZ];
+            let first = bpb.first_sector_of_cluster(c);
+            for i in 0..bpb.sectors_per_cluster {
+                self.write_sector(first + i as u32, &zero);
+            }
+            c
+        };
+
+        // Write "." and ".." entries into the new directory cluster.
+        // "."  → points to new_cluster itself
+        // ".." → points to dir_cluster (parent)
+        let mut dot_raw: [u8; 11] = [b' '; 11];
+        dot_raw[0] = b'.';
+        let dot_entry = dir::build_sfn_entry(&dot_raw, dir::ATTR_DIRECTORY, new_cluster, 0);
+        self.write_chain_at(new_cluster, 0, &dot_entry);
+
+        let mut dotdot_raw: [u8; 11] = [b' '; 11];
+        dotdot_raw[0] = b'.';
+        dotdot_raw[1] = b'.';
+        let dotdot_entry = dir::build_sfn_entry(&dotdot_raw, dir::ATTR_DIRECTORY, dir_cluster, 0);
+        self.write_chain_at(new_cluster, 32, &dotdot_entry);
+
+        // Create the entry for `name` inside the parent directory.
+        let (sfn_off, name_raw) = if let Some(sfn) = dir::sfn_from_str(name) {
+            let off = self.find_free_dirent_offset(dir_cluster);
+            self.ensure_dir_entry_slot(dir_cluster, off);
+            let raw = dir::build_sfn_entry(&sfn, dir::ATTR_DIRECTORY, new_cluster, 0);
+            self.dir_write_entry_raw(dir_cluster, off, &raw);
+            (off, sfn)
+        } else {
+            // Long name path.
+            if !dir::is_valid_lfn_name(name) {
+                return None;
+            }
+            let mut alias: Option<[u8; 11]> = None;
+            for n in 1u32..=9999u32 {
+                let cand = dir::sfn_alias_from_lfn(name, n)?;
+                if self.find_in_dir(dir_cluster, &cand).is_none() {
+                    alias = Some(cand);
+                    break;
+                }
+            }
+            let sfn = alias?;
+            let lfn_entries = dir::build_lfn_entries(name, &sfn)?;
+            let slots = lfn_entries.len() + 1;
+            let off0 = self.find_free_dirent_range(dir_cluster, slots);
+            let sfn_off2 = off0 + lfn_entries.len() * 32;
+            self.ensure_dir_entry_slot(dir_cluster, sfn_off2);
+            for (i, e) in lfn_entries.iter().enumerate() {
+                self.dir_write_entry_raw(dir_cluster, off0 + i * 32, e);
+            }
+            let raw = dir::build_sfn_entry(&sfn, dir::ATTR_DIRECTORY, new_cluster, 0);
+            self.dir_write_entry_raw(dir_cluster, sfn_off2, &raw);
+            (sfn_off2, sfn)
+        };
+
+        let inode = FatInode {
+            fs: Arc::clone(&self.fs),
+            inner: Mutex::new(FatInodeInner {
+                start_cluster: new_cluster,
+                is_dir: true,
+                size: 0,
+                pos: Some(DirentPos {
+                    dir_start_cluster: dir_cluster,
+                    entry_offset: sfn_off,
+                    name_raw,
+                    attr: dir::ATTR_DIRECTORY,
+                }),
+            }),
+        };
+        Some(Arc::new(inode) as Arc<dyn VfsNode>)
+    }
+
+    fn is_dir(&self) -> bool {
+        self.inner.lock().is_dir
+    }
+
     fn clear(&self) {
         let mut inner = self.inner.lock();
         if inner.is_dir {

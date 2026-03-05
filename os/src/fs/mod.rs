@@ -16,6 +16,16 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Returns true if this file descriptor refers to a directory.
+    fn is_dir(&self) -> bool {
+        false
+    }
+    /// Fill `buf` with `linux_dirent64` records starting from the current directory position.
+    /// Returns the number of bytes written into `buf`.
+    /// The internal position is advanced accordingly.
+    fn getdents64(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
 }
 
 /// The stat of a inode
@@ -47,6 +57,6 @@ bitflags! {
     }
 }
 
-pub use inode::{list_apps, open_file, OSInode, OpenFlags};
+pub use inode::{list_apps, open_file, open_file_at, mkdir_at, lookup_inode, canonicalize, OSInode, OpenFlags};
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::{Stdin, Stdout};
