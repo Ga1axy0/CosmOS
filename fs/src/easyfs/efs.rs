@@ -3,10 +3,10 @@
 //! Disk block manager  knows the disk location of each layout area, and the allocation and reclamation of disk blocks need to be completed through it.
 //!
 //! NOTICE: from this level, all data structures are in memory.
-use super::{
-    block_cache_sync_all, get_block_cache, Bitmap, BlockDevice, DiskInode, DiskInodeType, Inode,
-    SuperBlock,
+use crate::{
+    block_cache_sync_all, get_block_cache, BlockDevice, Inode,
 };
+use super::{Bitmap, SuperBlock, DiskInode, DiskInodeType};
 use crate::BLOCK_SZ;
 use alloc::sync::Arc;
 use spin::Mutex;
@@ -113,6 +113,7 @@ impl EasyFileSystem {
             })
     }
     /// Get the root inode
+    /*
     pub fn root_inode(efs: &Arc<Mutex<Self>>) -> Inode {
         let block_device = Arc::clone(&efs.lock().block_device);
         // acquire efs lock temporarily
@@ -120,6 +121,7 @@ impl EasyFileSystem {
         // release efs lock
         Inode::new(block_id, block_offset, Arc::clone(efs), block_device)
     }
+    */
     /// Get inode block position (the block id and offset in this block) according to the inode id
     pub fn get_disk_inode_pos(&self, inode_id: u32) -> (u32, usize) {
         let inode_size = core::mem::size_of::<DiskInode>();
