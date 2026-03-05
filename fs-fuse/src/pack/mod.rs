@@ -1,4 +1,5 @@
 pub mod easyfs;
+pub mod ext4;
 pub mod fat32;
 
 use std::path::Path;
@@ -9,6 +10,7 @@ use crate::source::AppFile;
 pub enum FsFormat {
     EasyFs,
     Fat32,
+    Ext4,
 }
 
 impl FsFormat {
@@ -16,6 +18,7 @@ impl FsFormat {
         match s.to_ascii_lowercase().as_str() {
             "easyfs" | "easy-fs" | "easy_fs" => Some(Self::EasyFs),
             "fat32" | "fat" => Some(Self::Fat32),
+            "ext4" | "ext" => Some(Self::Ext4),
             _ => None,
         }
     }
@@ -24,6 +27,7 @@ impl FsFormat {
         match self {
             Self::EasyFs => "easyfs",
             Self::Fat32 => "fat32",
+            Self::Ext4 => "ext4",
         }
     }
 }

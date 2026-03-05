@@ -5,8 +5,8 @@ KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
 DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
-# easyfs or fat32
-MAIN_FS := fat32
+# easyfs or fat32 or ext4
+MAIN_FS := ext4
 APPS := ../user/src/bin/*
 OFFLINE :=
 
@@ -66,7 +66,7 @@ $(KERNEL_BIN): kernel
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
 
 fs-img: $(APPS)
-	@make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
+	@make -C ../user binary TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
 	@rm -f $(FS_IMG)
 	@cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS)
 

@@ -23,6 +23,7 @@ pub mod block_dev;
 pub mod vfs;
 pub mod easyfs;
 pub mod fat32;
+pub mod ext4;
 
 pub const BLOCK_SZ: usize = 512;
 
@@ -30,6 +31,7 @@ pub const BLOCK_SZ: usize = 512;
 pub use block_dev::BlockDevice;
 pub use easyfs::efs::EasyFileSystem;
 pub use fat32::Fat32FileSystem;
+pub use ext4::Ext4FileSystem;
 pub use vfs::Inode;
 
 
