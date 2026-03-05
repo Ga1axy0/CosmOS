@@ -45,4 +45,12 @@ impl Condvar {
         block_current_and_run_next();
         mutex.lock();
     }
+
+    /// blocking current task, let it wait on the condition variable, without unlocking mutex
+    pub fn wait_simple(&self) {
+        let mut inner = self.inner.exclusive_access();
+        inner.wait_queue.push_back(current_task().unwrap());
+        drop(inner);
+        block_current_and_run_next();
+    }
 }

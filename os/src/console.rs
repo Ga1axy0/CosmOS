@@ -1,5 +1,5 @@
 //! SBI console driver, for text output
-use crate::sbi::console_putchar;
+use crate::{drivers::chardev::{CharDevice, UART}};
 use core::fmt::{self, Write};
 
 struct Stdout;
@@ -8,7 +8,8 @@ impl Write for Stdout {
     /// write str to console
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for c in s.chars() {
-            console_putchar(c as usize);
+            UART.write(c as u8);
+            // console_putchar(c as usize);
         }
         Ok(())
     }
