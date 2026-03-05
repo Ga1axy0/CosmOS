@@ -22,6 +22,7 @@ pub mod block_cache;
 pub mod block_dev;
 pub mod vfs;
 pub mod easyfs;
+pub mod fat32;
 
 pub const BLOCK_SZ: usize = 512;
 
