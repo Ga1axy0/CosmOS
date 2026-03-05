@@ -55,6 +55,8 @@ pub struct ProcessControlBlockInner {
     pub mutex_detector: DeadlockDetector,
     /// deadlock detector for semaphore resources
     pub semaphore_detector: DeadlockDetector,
+    /// current working directory (absolute path)
+    pub cwd: String,
 }
 
 impl ProcessControlBlockInner {
@@ -128,6 +130,7 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
+                    cwd: String::from("/"),
                 })
             },
         });
@@ -257,6 +260,7 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
+                    cwd: parent.cwd.clone(),
                 })
             },
         });

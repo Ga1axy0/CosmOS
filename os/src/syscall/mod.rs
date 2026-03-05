@@ -10,18 +10,30 @@
 //! `sys_` then the name of the syscall. You can find functions like this in
 //! submodules, and you should also implement syscalls this way.
 
-/// openat syscall
-pub const SYSCALL_OPENAT: usize = 56;
-/// close syscall
-pub const SYSCALL_CLOSE: usize = 57;
-/// read syscall
-pub const SYSCALL_READ: usize = 63;
-/// write syscall
-pub const SYSCALL_WRITE: usize = 64;
+/// getcwd syscall
+pub const SYSCALL_GETCWD: usize = 17;
+/// dup syscall
+pub const SYSCALL_DUP: usize = 24;
+/// mkdirat syscall
+pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
 pub const SYSCALL_UNLINKAT: usize = 35;
 /// linkat syscall
 pub const SYSCALL_LINKAT: usize = 37;
+/// chdir syscall
+pub const SYSCALL_CHDIR: usize = 49;
+/// openat syscall
+pub const SYSCALL_OPENAT: usize = 56;
+/// close syscall
+pub const SYSCALL_CLOSE: usize = 57;
+/// pipe syscall
+pub const SYSCALL_PIPE: usize = 59;
+/// getdents64 syscall
+pub const SYSCALL_GETDENTS64: usize = 61;
+/// read syscall
+pub const SYSCALL_READ: usize = 63;
+/// write syscall
+pub const SYSCALL_WRITE: usize = 64;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
@@ -40,28 +52,28 @@ pub const SYSCALL_SIGPROCMASK: usize = 135;
 /// sigreturn syscall
 pub const SYSCALL_SIGRETURN: usize = 139;
 */
+/// set priority syscall
+pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
-/// fork syscall
-pub const SYSCALL_FORK: usize = 220;
-/// exec syscall
-pub const SYSCALL_EXEC: usize = 221;
-/// waitpid syscall
-pub const SYSCALL_WAITPID: usize = 260;
-/// set priority syscall
-pub const SYSCALL_SET_PRIORITY: usize = 140;
 /*
 /// sbrk syscall
 pub const SYSCALL_SBRK: usize = 214;
 */
 /// munmap syscall
 pub const SYSCALL_MUNMAP: usize = 215;
+/// fork syscall
+pub const SYSCALL_FORK: usize = 220;
+/// exec syscall
+pub const SYSCALL_EXEC: usize = 221;
 /// mmap syscall
 pub const SYSCALL_MMAP: usize = 222;
+/// waitpid syscall
+pub const SYSCALL_WAITPID: usize = 260;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
 /*
@@ -70,10 +82,7 @@ pub const SYSCALL_MAIL_READ: usize = 401;
 /// mail write syscall
 pub const SYSCALL_MAIL_WRITE: usize = 402;
 */
-/// dup syscall
-pub const SYSCALL_DUP: usize = 24;
-/// pipe syscall
-pub const SYSCALL_PIPE: usize = 59;
+
 /// thread_create syscall
 pub const SYSCALL_THREAD_CREATE: usize = 460;
 /// waittid syscall
@@ -123,6 +132,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
+        SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
+        SYSCALL_MKDIRAT => sys_mkdirat(args[1] as *const u8, args[2] as u32),
+        SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_SLEEP => sys_sleep(args[0]),
         SYSCALL_YIELD => sys_yield(),

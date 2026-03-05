@@ -8,6 +8,11 @@ pub trait VfsNode: Send + Sync {
     fn ls(&self) -> Vec<String>;
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
+    /// Create a sub-directory named `name` inside this directory.
+    /// Returns the new directory inode, or None on failure.
+    fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
+    /// Returns true if this node is a directory.
+    fn is_dir(&self) -> bool;
     fn clear(&self);
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
@@ -36,6 +41,14 @@ impl Inode {
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
         self.inner.create(name).map(Self::wrap)
+    }
+
+    pub fn mkdir(&self, name: &str) -> Option<Arc<Inode>> {
+        self.inner.mkdir(name).map(Self::wrap)
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.inner.is_dir()
     }
 
     pub fn clear(&self) {
