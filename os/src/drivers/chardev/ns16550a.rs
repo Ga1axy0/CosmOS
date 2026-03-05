@@ -130,6 +130,7 @@ struct WriteEnd {
    lsr: LSRReg,
 }
 
+/// NS16550a char device.
 pub struct NS16550a<const BASE_ADDR: usize> {
    pub(crate) inner: UPIntrFreeCell<NS16550aInner>,
    #[allow(dead_code)]
@@ -178,6 +179,7 @@ impl NS16550aRaw {
 }
 
 impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
+   /// new device
    pub fn new() -> Self {
       let mut inner = NS16550aInner {
             ns16550a: NS16550aRaw::new(BASE_ADDR),

@@ -1,3 +1,5 @@
+//! Initialization and interrpt handling for plic.
+
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::drivers::chardev::{CharDevice, UART};
@@ -68,6 +70,7 @@ fn complete(context: usize, irq: u32) {
     unsafe { write_volatile(claim_complete_ptr(context), irq) }
 }
 
+/// Init plic: enable irq
 pub fn init() {
     debug!("[kernel] Initializing PLIC...");
     // allow UART0 to interrupt S-mode

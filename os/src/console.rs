@@ -1,5 +1,5 @@
 //! SBI console driver, for text output
-use crate::{drivers::chardev::{CharDevice, UART}, sbi::console_putchar};
+use crate::{drivers::chardev::{CharDevice, UART}};
 use core::fmt::{self, Write};
 
 struct Stdout;
