@@ -66,7 +66,7 @@ $(KERNEL_BIN): kernel
 fs-img: $(APPS)
 	@make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
 	@rm -f $(FS_IMG)
-	@cd ../easy-fs-fuse && cargo run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/
+	@cd ../fs-fuse && cargo run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/
 
 kernel:
 	@echo Platform: $(BOARD)
@@ -88,6 +88,8 @@ disasm-vim: kernel
 	@rm $(DISASM_TMP)
 
 run: build run-inner
+
+fast-run: kernel $(KERNEL_BIN) run-inner
 
 run-inner:
 	@$(QEMU) \
