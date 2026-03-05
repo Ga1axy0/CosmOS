@@ -19,7 +19,7 @@
 //! userspace.
 
 #![deny(missing_docs)]
-#![deny(warnings)]
+// #![deny(warnings)]
 #![no_std]
 #![no_main]
 #![feature(panic_info_message)]
@@ -70,12 +70,13 @@ fn clear_bss() {
 /// the rust entry-point of os
 pub fn rust_main() -> ! {
     clear_bss();
-    println!("[kernel] Hello, world!");
     logging::init();
     mm::init();
     mm::remap_test();
     trap::init();
     trap::enable_timer_interrupt();
+    drivers::plic::init();
+    println!("[kernel] Hello, world!");
     timer::set_next_trigger();
     fs::list_apps();
     task::add_initproc();

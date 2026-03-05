@@ -6,11 +6,16 @@ pub const CLOCK_FREQ: usize = 12500000;
 
 /// The base address of control registers in VIRT_TEST/RTC/Virtio_Block device
 pub const MMIO: &[(usize, usize)] = &[
+    (0x0C00_0000, 0x400000), // PLIC
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
-    (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
+    (0x1000_0000, 0x100),  // UART0 (NS16550a)
+    (0x1000_1000, 0x8000),  // Virtio MMIO devices, 8 slots, each slot occupies 0x1000 bytes
 ];
 
+pub const VIRT_UART: usize = 0x1000_0000;
+
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
+pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 
 //ref:: https://github.com/andre-richter/qemu-exit
 use core::arch::asm;
