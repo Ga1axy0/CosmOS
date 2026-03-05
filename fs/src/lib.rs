@@ -29,6 +29,7 @@ pub const BLOCK_SZ: usize = 512;
 
 pub use block_dev::BlockDevice;
 pub use easyfs::efs::EasyFileSystem;
+pub use fat32::Fat32FileSystem;
 pub use vfs::Inode;
 
 

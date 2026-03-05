@@ -5,7 +5,9 @@ use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
-use fs::{EasyFileSystem, Inode};
+use fs::Inode;
+use fs::EasyFileSystem;
+use fs::Fat32FileSystem;
 use lazy_static::*;
 
 /// inode in memory
@@ -51,8 +53,20 @@ impl OSInode {
 
 lazy_static! {
     pub static ref ROOT_INODE: Arc<Inode> = {
-        let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
-        Arc::new(EasyFileSystem::root_inode(&efs))
+        #[cfg(feature = "fat32")]
+        {
+            let efs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
+            Arc::new(Fat32FileSystem::root_inode(&efs))
+        }
+        #[cfg(feature = "easyfs")]
+        {
+            let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
+            Arc::new(EasyFileSystem::root_inode(&efs))
+        }
+        #[cfg(not(any(feature = "fat32", feature = "easyfs")))]
+        {
+            compile_error!("You must enable either 'fat32' or 'easyfs' feature!");
+        }
     };
 }
 
