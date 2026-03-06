@@ -1,4 +1,5 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use log::debug;
 use spin::Mutex;
 
 use crate::block_dev::BlockDevice as OsBlockDevice;
@@ -32,6 +33,8 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
 
         for block_id in start_block..end_block {
             let mut sector = [0u8; BLOCK_SZ];
+
+            debug!("Ext4BlockDeviceAdapter read: block_id={}, offset={}, len={}", block_id, offset, len);
             self.inner.read_block(block_id, &mut sector);
 
             let block_start = block_id * BLOCK_SZ;
@@ -71,11 +74,17 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
             let dst_end = seg_end - block_start;
 
             if dst_start == 0 && dst_end == BLOCK_SZ {
+                debug!("Ext4BlockDeviceAdapter full block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
                 self.inner.write_block(block_id, &data[src_start..src_end]);
             } else {
                 let mut sector = [0u8; BLOCK_SZ];
+
+                debug!("Ext4BlockDeviceAdapter partial block read: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
                 self.inner.read_block(block_id, &mut sector);
+                
                 sector[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+
+                debug!("Ext4BlockDeviceAdapter partial block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
                 self.inner.write_block(block_id, &sector);
             }
         }
