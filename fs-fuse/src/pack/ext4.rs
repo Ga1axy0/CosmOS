@@ -94,5 +94,48 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
         )?;
     }
 
+    // 打包完成后，打印镜像元数据
+    println!("\n==== ext4 镜像元数据 ====");
+    // 镜像文件大小
+    let img_metadata = std::fs::metadata(&cfg.img_path)?;
+    println!("镜像文件路径: {}", cfg.img_path.display());
+    println!(
+        "镜像文件大小: {} bytes ({:.2} MiB)",
+        img_metadata.len(),
+        img_metadata.len() as f64 / 1024.0 / 1024.0
+    );
+
+    // 使用 debugfs 查询分区空间和 block 使用情况
+    let output = Command::new(&debugfs)
+        .arg("-R")
+        .arg("stats")
+        .arg(&cfg.img_path)
+        .output()?;
+    println!(
+        "debugfs stats:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let output_df = Command::new(&debugfs)
+        .arg("-R")
+        .arg("df")
+        .arg(&cfg.img_path)
+        .output()?;
+    println!(
+        "debugfs df:\n{}",
+        String::from_utf8_lossy(&output_df.stdout)
+    );
+
+    // 查询根目录文件列表及大小
+    let output_ls = Command::new(&debugfs)
+        .arg("-R")
+        .arg("ls -l /")
+        .arg(&cfg.img_path)
+        .output()?;
+    println!(
+        "debugfs ls -l /:\n{}",
+        String::from_utf8_lossy(&output_ls.stdout)
+    );
+
     Ok(())
 }
