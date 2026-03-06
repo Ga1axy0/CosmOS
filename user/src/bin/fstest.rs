@@ -174,7 +174,7 @@ pub fn main() -> i32 {
 	let fd = fd as usize;
 	let mut buf2 = [0u8; 16];
 	let n = read(fd, &mut buf2);
-	assert_eq!(n, 3);
+	assert_eq!(n, 3, "after TRUNC, should read 3 bytes, actually read {}", n);
 	assert_eq!(&buf2[..3], b"abc");
 	assert_eq!(close(fd), 0);
 
