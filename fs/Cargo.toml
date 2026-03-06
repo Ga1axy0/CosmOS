@@ -10,6 +10,7 @@ edition = "2018"
 spin = "0.7.0"
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 ext4_rs = { path = "src/ext4_rs" }
+log = "0.4"
 
 [profile.release]
 debug = true
