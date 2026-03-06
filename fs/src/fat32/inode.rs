@@ -477,6 +477,7 @@ impl VfsNode for FatInode {
         self.iter_dir(dir_cluster)
             .into_iter()
             .map(|e| e.name_string())
+            .filter(|name| name != "." && name != "..")
             .collect()
     }
 
