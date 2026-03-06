@@ -182,6 +182,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
     } else {
         lookup_inode(&abs).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
+                debug!("open_file_at: truncating existing file at {}", abs);
                 inode.clear();
             }
             Arc::new(OSInode::new(readable, writable, inode))
@@ -272,6 +273,7 @@ impl File for OSInode {
         let mut inner = self.inner.exclusive_access();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
+            debug!("OSInode::read: offset={}, slice_len={}", inner.offset, slice.len());
             let read_size = inner.inode.read_at(inner.offset, *slice);
             if read_size == 0 {
                 break;

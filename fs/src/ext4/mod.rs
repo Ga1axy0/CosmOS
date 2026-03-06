@@ -178,7 +178,8 @@ impl VfsNode for Ext4Inode {
         }
         let ext4 = self.fs.ext4.lock();
         let mut inode_ref = ext4.get_inode_ref(self.inode_num);
-        let _ = ext4.truncate_inode(&mut inode_ref, 0);
+        // let _ = ext4.truncate_inode(&mut inode_ref, 0);
+        ext4.truncate_inode(&mut inode_ref, 0).unwrap();
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
