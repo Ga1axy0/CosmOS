@@ -6,7 +6,7 @@ use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
+use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE,VirtAddr,MapPermission};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -293,5 +293,14 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// map an anonymous area with given permission, return true if success
+    pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        self.inner.exclusive_access().memory_set.mmap_anonymous(start, end, perm)
+    }
+    /// unmap an area. return true if success
+    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        self.inner.exclusive_access().memory_set.munmap_anonymous(start, end)
     }
 }
