@@ -210,10 +210,25 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// HINT: fork + exec =/= spawn
 pub fn sys_spawn(_path: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
+
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+
+
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let parent = current_process();
+        let child = parent.fork();
+        let pid = child.pid.0 as isize;
+        let all_data = app_inode.read_all();
+        child.exec(all_data.as_slice(), Vec::new());
+        // return argc because cx.x[10] will be covered with it later
+        pid
+    } else {
     -1
+}
 }
 
 /// set priority syscall
