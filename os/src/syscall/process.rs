@@ -194,6 +194,13 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
     if _port & 0x7 == 0 {
         return -1;
     }
+
+    if _len == 0 {
+        return -1; 
+        //这里对于错误类型其实还没有文件去规范，理应该有一个专门
+        //的错误类型来区分不同的错误，但现在先简单地返回-1
+    }
+
     let Some(end) = _start.checked_add(_len) else {
         return -1;
     };
@@ -228,6 +235,13 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
         return -1;
     }
+
+    if _len == 0 {
+        return -1; 
+        //这里对于错误类型其实还没有文件去规范，理应该有一个专门的错误类
+        //型来区分不同的错误，但现在先简单地返回-1
+    }
+
     let Some(end) = _start.checked_add(_len) else {
         return -1;
     };
