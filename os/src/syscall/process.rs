@@ -1,8 +1,10 @@
 use crate::{
+    config::PAGE_SIZE_BITS,
     fs::{OpenFlags, open_file},
-    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str},
+    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str,MapPermission,VirtAddr},
     task::{
-        SignalFlags, current_process, current_task, current_user_token, exit_current_and_run_next, pid2process, suspend_current_and_run_next
+        SignalFlags, current_process, current_task, current_user_token, exit_current_and_run_next, pid2process, 
+        suspend_current_and_run_next, mmap_current_process, munmap_current_process,
     },
     timer::get_time_us,
 };
@@ -179,10 +181,47 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 /// YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    
+    if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+        return -1;
+    }
+    if _port & !0x7 != 0 {
+        return -1;
+    }
+    if _port & 0x7 == 0 {
+        return -1;
+    }
+
+    if _len == 0 {
+        return -1; 
+        //这里对于错误类型其实还没有文件去规范，理应该有一个专门
+        //的错误类型来区分不同的错误，但现在先简单地返回-1
+    }
+
+    let Some(end) = _start.checked_add(_len) else {
+        return -1;
+    };
+
+    let mut perm = MapPermission::U;
+    if _port & 0x1 != 0 {
+        perm |= MapPermission::R;
+    }
+    if _port & 0x2 != 0 {
+        perm |= MapPermission::W;
+    }
+    if _port & 0x4 != 0 {
+        perm |= MapPermission::X;
+    }
+
+    if mmap_current_process(VirtAddr::from(_start), VirtAddr::from(end), perm) {
+        0
+    } else {
+        -1
+    }
+    
 }
 
 /// munmap syscall
@@ -190,10 +229,27 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_munmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+        return -1;
+    }
+
+    if _len == 0 {
+        return -1; 
+        //这里对于错误类型其实还没有文件去规范，理应该有一个专门的错误类
+        //型来区分不同的错误，但现在先简单地返回-1
+    }
+
+    let Some(end) = _start.checked_add(_len) else {
+        return -1;
+    };
+    if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -210,10 +266,20 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// HINT: fork + exec =/= spawn
 pub fn sys_spawn(_path: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let parent = current_process();
+        let all_data = app_inode.read_all();
+        let child = parent.spawn(all_data.as_slice());
+        child.getpid() as isize
+    } else {
+        -1
+    }
 }
 
 /// set priority syscall
