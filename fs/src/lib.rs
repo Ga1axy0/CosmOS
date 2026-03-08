@@ -18,17 +18,21 @@
 
 extern crate alloc;
 
-pub mod bitmap;
 pub mod block_cache;
 pub mod block_dev;
-pub mod efs;
-pub mod layout;
 pub mod vfs;
+pub mod easyfs;
+pub mod fat32;
+pub mod ext4;
 
 pub const BLOCK_SZ: usize = 512;
-use bitmap::Bitmap;
-use block_cache::{block_cache_sync_all, get_block_cache};
+
+
 pub use block_dev::BlockDevice;
-pub use efs::EasyFileSystem;
-pub use layout::*;
+pub use easyfs::efs::EasyFileSystem;
+pub use fat32::Fat32FileSystem;
+pub use ext4::Ext4FileSystem;
 pub use vfs::Inode;
+
+
+pub use block_cache::{get_block_cache, block_cache_sync_all};

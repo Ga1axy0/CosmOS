@@ -9,9 +9,10 @@
     "rust-analyzer.check.overrideCommand": [
         "bash",
         "-c",
-        "if [ \"$(basename $(pwd))\" = \"easy-fs-fuse\" ]; then target=\"x86_64-unknown-linux-gnu\"; else target=\"riscv64gc-unknown-none-elf\"; fi; cargo clippy --target $target --workspace --message-format=json --message-format=json-diagnostic-rendered-ansi"
+        "if [ \"$(basename $(pwd))\" = \"fs-fuse\" ]; then target=\"x86_64-unknown-linux-gnu\"; else target=\"riscv64gc-unknown-none-elf\"; fi; cargo clippy --target $target --workspace --message-format=json --message-format=json-diagnostic-rendered-ansi"
     ],
     "rust-analyzer.checkOnSave.allTargets": false,
+    "rust-analyzer.checkOnSave": true,
     // "rust-analyzer.cargo.features": [
     //     "board_qemu"
     // ]
