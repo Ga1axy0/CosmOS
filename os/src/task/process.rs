@@ -6,7 +6,7 @@ use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
+use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE,VirtAddr,MapPermission};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -294,8 +294,77 @@ impl ProcessControlBlock {
         add_task(task);
         child
     }
+
+    /// Create a child process directly from elf image.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let mut parent = self.inner_exclusive_access();
+        let pid = pid_alloc();
+        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        for fd in parent.fd_table.iter() {
+            if let Some(file) = fd {
+                new_fd_table.push(Some(file.clone()));
+            } else {
+                new_fd_table.push(None);
+            }
+        }
+        let child = Arc::new(Self {
+            pid,
+            inner: unsafe {
+                UPSafeCell::new(ProcessControlBlockInner {
+                    is_zombie: false,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: new_fd_table,
+                    signals: SignalFlags::empty(),
+                    tasks: Vec::new(),
+                    task_res_allocator: RecycleAllocator::new(),
+                    mutex_list: Vec::new(),
+                    semaphore_list: Vec::new(),
+                    condvar_list: Vec::new(),
+                    deadlock_enabled: false,
+                    mutex_detector: DeadlockDetector::new(),
+                    semaphore_detector: DeadlockDetector::new(),
+                })
+            },
+        });
+        parent.children.push(Arc::clone(&child));
+        drop(parent);
+
+        let task = Arc::new(TaskControlBlock::new(Arc::clone(&child), ustack_base, true));
+        let task_inner = task.inner_exclusive_access();
+        let trap_cx = task_inner.get_trap_cx();
+        let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
+        let kstack_top = task.kstack.get_top();
+        drop(task_inner);
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            ustack_top,
+            KERNEL_SPACE.exclusive_access().token(),
+            kstack_top,
+            trap_handler as usize,
+        );
+
+        let mut child_inner = child.inner_exclusive_access();
+        child_inner.tasks.push(Some(Arc::clone(&task)));
+        drop(child_inner);
+        insert_into_pid2process(child.getpid(), Arc::clone(&child));
+        add_task(task);
+        child
+    }
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// map an anonymous area with given permission, return true if success
+    pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        self.inner.exclusive_access().memory_set.mmap_anonymous(start, end, perm)
+    }
+    /// unmap an area. return true if success
+    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        self.inner.exclusive_access().memory_set.munmap_anonymous(start, end)
     }
 }

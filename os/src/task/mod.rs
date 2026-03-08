@@ -23,6 +23,7 @@ use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::task::manager::add_stopping_task;
 use crate::timer::remove_timer;
+use crate::mm::{MapPermission, VirtAddr};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
@@ -207,4 +208,14 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_task(Arc::clone(&task));
     trace!("kernel: remove_inactive_task .. remove_timer");
     remove_timer(Arc::clone(&task));
+}
+
+/// Map an anonymous area in current process with given permission.
+pub fn mmap_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+    current_process().mmap(start, end, perm)
+}
+
+/// Unmap an anonymous area in current process.
+pub fn munmap_current_process(start: VirtAddr, end: VirtAddr) -> bool {
+    current_process().munmap(start, end)
 }
