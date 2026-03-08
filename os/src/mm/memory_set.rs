@@ -9,7 +9,6 @@ use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use riscv::addr::page;
 use core::arch::asm;
 use lazy_static::*;
 use riscv::register::satp;
@@ -309,13 +308,9 @@ impl MemorySet {
                 return false;
             }
         }
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            let page_start: VirtAddr = vpn.into();
-            let page_end: VirtAddr = (usize::from(page_start) + PAGE_SIZE).into();
-            self.push(
-                MapArea::new(page_start, page_end, MapType::Framed, permission),
-                None,
-            );
+        self.push(MapArea::new(start_va, end_va, MapType::Framed, permission), None);
+        if let Some(area) = self.areas.last_mut() {
+            area.is_anonymous = true;
         }
         unsafe {
             asm!("sfence.vma");
@@ -334,32 +329,61 @@ impl MemorySet {
             if !pte.flags().contains(PTEFlags::U) {
                 return false;
             }
-            let mut found = false;
-            for area in self.areas.iter() {
-                if area.vpn_range.get_start().0 == vpn.0
-                    && area.vpn_range.get_end().0 == vpn.0 + 1
-                    && area.map_type == MapType::Framed
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
+            if !self
+                .areas
+                .iter()
+                .any(|area| area.is_anonymous_framed_containing(vpn))
+            {
                 return false;
             }
         }
 
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            let Some(pos) = self.areas.iter().position(|area| {
-                area.vpn_range.get_start().0 == vpn.0
-                    && area.vpn_range.get_end().0 == vpn.0 + 1
-                    && area.map_type == MapType::Framed
-            }) else {
-                return false;
+        let mut new_areas: Vec<MapArea> = Vec::with_capacity(self.areas.len() + 1);
+        for mut area in self.areas.drain(..) {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let overlap_start = if area_start > start_vpn {
+                area_start
+            } else {
+                start_vpn
             };
-            let mut area = self.areas.remove(pos);
-            area.unmap_one(&mut self.page_table, vpn);
+            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+
+            if overlap_start >= overlap_end {
+                new_areas.push(area);
+                continue;
+            }
+
+            for vpn in VPNRange::new(overlap_start, overlap_end) {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+
+            if area_start < overlap_start {
+                let left_data_frames = area.data_frames.split_off(&overlap_start);
+                let left_area = MapArea {
+                    vpn_range: VPNRange::new(area_start, overlap_start),
+                    data_frames: area.data_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                    is_anonymous: area.is_anonymous,
+                };
+                area.data_frames = left_data_frames;
+                new_areas.push(left_area);
+            }
+
+            if overlap_end < area_end {
+                let right_data_frames = area.data_frames.split_off(&overlap_end);
+                let right_area = MapArea {
+                    vpn_range: VPNRange::new(overlap_end, area_end),
+                    data_frames: right_data_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                    is_anonymous: area.is_anonymous,
+                };
+                new_areas.push(right_area);
+            }
         }
+        self.areas = new_areas;
         unsafe {
             asm!("sfence.vma");
         }
@@ -374,6 +398,7 @@ pub struct MapArea {
     pub data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     pub map_type: MapType,
     pub map_perm: MapPermission,
+    pub is_anonymous: bool,
 }
 
 impl MapArea {
@@ -390,6 +415,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            is_anonymous: false,
         }
     }
     pub fn from_another(another: &Self) -> Self {
@@ -398,7 +424,14 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            is_anonymous: another.is_anonymous,
         }
+    }
+    pub fn contains_vpn(&self, vpn: VirtPageNum) -> bool {
+        self.vpn_range.get_start() <= vpn && vpn < self.vpn_range.get_end()
+    }
+    pub fn is_anonymous_framed_containing(&self, vpn: VirtPageNum) -> bool {
+        self.map_type == MapType::Framed && self.is_anonymous && self.contains_vpn(vpn)
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
