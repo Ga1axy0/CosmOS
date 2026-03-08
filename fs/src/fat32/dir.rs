@@ -2,16 +2,22 @@ use alloc::{string::String, vec::Vec};
 
 pub const DIR_ENTRY_SIZE: usize = 32;
 
-#[allow(dead_code)]
-pub const ATTR_READ_ONLY: u8 = 0x01;
-#[allow(dead_code)]
-pub const ATTR_HIDDEN: u8 = 0x02;
-#[allow(dead_code)]
-pub const ATTR_SYSTEM: u8 = 0x04;
-pub const ATTR_VOLUME_ID: u8 = 0x08;
-pub const ATTR_DIRECTORY: u8 = 0x10;
-pub const ATTR_ARCHIVE: u8 = 0x20;
+use bitflags::bitflags;
+
+bitflags! {
+    #[derive(Default)]
+    pub struct DirAttr: u8 {
+        const READ_ONLY   = 0x01;
+        const HIDDEN      = 0x02;
+        const SYSTEM      = 0x04;
+        const VOLUME_ID   = 0x08;
+        const DIRECTORY   = 0x10;
+        const ARCHIVE     = 0x20;
+    }
+}
 pub const ATTR_LFN: u8 = 0x0F;
+pub const NTRES_LOWERCASE_BASE: u8 = 0x08;
+pub const NTRES_LOWERCASE_EXT: u8 = 0x10;
 
 /// A directory entry as presented to VFS: one SFN entry, optionally with a preceding LFN name.
 #[derive(Clone, Debug)]
@@ -33,6 +39,7 @@ impl DirEntry {
 pub struct SfnDirEntry {
     pub name_raw: [u8; 11],
     pub attr: u8,
+    pub nt_reserved: u8,
     pub first_cluster: u32,
     pub file_size: u32,
     /// Byte offset within the directory file where this 32B entry resides.
@@ -46,7 +53,7 @@ impl SfnDirEntry {
     }
 
     pub fn is_dir(&self) -> bool {
-        (self.attr & ATTR_DIRECTORY) != 0
+        DirAttr::from_bits_truncate(self.attr).contains(DirAttr::DIRECTORY)
     }
 
     #[allow(dead_code)]
@@ -59,25 +66,31 @@ impl SfnDirEntry {
     }
 
     pub fn is_volume_label(&self) -> bool {
-        (self.attr & ATTR_VOLUME_ID) != 0
+        DirAttr::from_bits_truncate(self.attr).contains(DirAttr::VOLUME_ID)
     }
 
     pub fn name_string(&self) -> String {
-        sfn_to_string(&self.name_raw)
+        sfn_to_string(&self.name_raw, self.nt_reserved)
     }
 }
 
-pub fn sfn_to_string(raw: &[u8; 11]) -> String {
-    let name = raw[0..8]
+pub fn sfn_to_string(raw: &[u8; 11], nt_reserved: u8) -> String {
+    let mut name = raw[0..8]
         .iter()
         .copied()
         .take_while(|c| *c != b' ')
         .collect::<Vec<u8>>();
-    let ext = raw[8..11]
+    let mut ext = raw[8..11]
         .iter()
         .copied()
         .take_while(|c| *c != b' ')
         .collect::<Vec<u8>>();
+    if (nt_reserved & NTRES_LOWERCASE_BASE) != 0 {
+        name.make_ascii_lowercase();
+    }
+    if (nt_reserved & NTRES_LOWERCASE_EXT) != 0 {
+        ext.make_ascii_lowercase();
+    }
     if ext.is_empty() {
         String::from_utf8_lossy(&name).into_owned()
     } else {
@@ -88,14 +101,26 @@ pub fn sfn_to_string(raw: &[u8; 11]) -> String {
     }
 }
 
-/// Convert an input name to 8.3 SFN (11 bytes, uppercased, space-padded).
+#[derive(Clone, Copy, Debug)]
+pub struct SfnCreateInfo {
+    pub name_raw: [u8; 11],
+    pub nt_reserved: u8,
+}
+
+/// Convert an input name to a standard-friendly 8.3 SFN.
+///
+/// The returned SFN bytes are uppercased and space-padded. If the original
+/// user-visible case can be represented by FAT NT case bits, `nt_reserved`
+/// carries those flags. Mixed-case components (for example `Foo.txt`) return
+/// `None` so callers can fall back to an LFN entry.
 ///
 /// Supported examples:
 /// - "FOO" -> "FOO     " + "   "
-/// - "FOO.TXT" -> "FOO     " + "TXT"
+/// - "foo.txt" -> raw "FOO     " + "TXT", lowercase base/ext flags set
+/// - "foo.TXT" -> raw "FOO     " + "TXT", lowercase base flag set
 ///
 /// Returns None if the name cannot be represented as SFN.
-pub fn sfn_from_str(name: &str) -> Option<[u8; 11]> {
+pub fn sfn_from_str(name: &str) -> Option<SfnCreateInfo> {
     let name = name.trim();
     if name.is_empty() || name == "." || name == ".." {
         return None;
@@ -119,26 +144,46 @@ pub fn sfn_from_str(name: &str) -> Option<[u8; 11]> {
     }
 
     fn valid_sfn_char(c: u8) -> bool {
-        matches!(c, b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'$' | b'~' | b'!')
+        matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'$' | b'~' | b'!')
+    }
+
+    fn encode_component(dst: &mut [u8], src: &[u8]) -> Option<bool> {
+        let mut saw_lower = false;
+        let mut saw_upper = false;
+        for (i, &c) in src.iter().enumerate() {
+            if !valid_sfn_char(c) {
+                return None;
+            }
+            if c.is_ascii_lowercase() {
+                saw_lower = true;
+            }
+            if c.is_ascii_uppercase() {
+                saw_upper = true;
+            }
+            dst[i] = c.to_ascii_uppercase();
+        }
+        if saw_lower && saw_upper {
+            return None;
+        }
+        Some(saw_lower)
     }
 
     let mut raw = [b' '; 11];
-    for (i, &c) in base.iter().enumerate() {
-        let c = c.to_ascii_uppercase();
-        if !valid_sfn_char(c) {
-            return None;
-        }
-        raw[i] = c;
+    let base_is_lower = encode_component(&mut raw[0..8], base)?;
+    let ext_is_lower = encode_component(&mut raw[8..11], ext_bytes)?;
+
+    let mut nt_reserved = 0u8;
+    if base_is_lower {
+        nt_reserved |= NTRES_LOWERCASE_BASE;
     }
-    for (i, &c) in ext_bytes.iter().enumerate() {
-        let c = c.to_ascii_uppercase();
-        if !valid_sfn_char(c) {
-            return None;
-        }
-        raw[8 + i] = c;
+    if ext_is_lower {
+        nt_reserved |= NTRES_LOWERCASE_EXT;
     }
 
-    Some(raw)
+    Some(SfnCreateInfo {
+        name_raw: raw,
+        nt_reserved,
+    })
 }
 
 pub fn parse_sfn_dir_entry(raw: &[u8; DIR_ENTRY_SIZE], entry_offset: usize) -> Option<SfnDirEntry> {
@@ -149,6 +194,7 @@ pub fn parse_sfn_dir_entry(raw: &[u8; DIR_ENTRY_SIZE], entry_offset: usize) -> O
     }
 
     let attr = raw[11];
+    let nt_reserved = raw[12];
     let mut name_raw = [0u8; 11];
     name_raw.copy_from_slice(&raw[0..11]);
 
@@ -161,6 +207,7 @@ pub fn parse_sfn_dir_entry(raw: &[u8; DIR_ENTRY_SIZE], entry_offset: usize) -> O
     Some(SfnDirEntry {
         name_raw,
         attr,
+        nt_reserved,
         first_cluster,
         file_size,
         entry_offset,
@@ -497,12 +544,14 @@ pub fn name_eq(a: &str, b: &str) -> bool {
 pub fn build_sfn_entry(
     name_raw: &[u8; 11],
     attr: u8,
+    nt_reserved: u8,
     first_cluster: u32,
     file_size: u32,
 ) -> [u8; 32] {
     let mut e = [0u8; 32];
     e[0..11].copy_from_slice(name_raw);
     e[11] = attr;
+    e[12] = nt_reserved;
 
     let hi = ((first_cluster >> 16) as u16).to_le_bytes();
     let lo = ((first_cluster & 0xFFFF) as u16).to_le_bytes();
@@ -513,4 +562,30 @@ pub fn build_sfn_entry(
 
     e[28..32].copy_from_slice(&file_size.to_le_bytes());
     e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NTRES_LOWERCASE_BASE, NTRES_LOWERCASE_EXT, build_sfn_entry, parse_sfn_dir_entry,
+        sfn_from_str,
+    };
+
+    #[test]
+    fn sfn_lowercase_roundtrip_uses_nt_bits() {
+        let sfn = sfn_from_str("foo.txt").expect("foo.txt should be 8.3");
+        assert_eq!(&sfn.name_raw, b"FOO     TXT");
+        assert_eq!(sfn.nt_reserved, NTRES_LOWERCASE_BASE | NTRES_LOWERCASE_EXT);
+
+        let raw = build_sfn_entry(&sfn.name_raw, 0x20, sfn.nt_reserved, 0, 0);
+        let parsed = parse_sfn_dir_entry(&raw, 0).expect("valid dir entry");
+        assert_eq!(parsed.name_string(), "foo.txt");
+    }
+
+    #[test]
+    fn mixed_case_sfn_requires_lfn() {
+        assert!(sfn_from_str("Foo.txt").is_none());
+        assert!(sfn_from_str("foO.txt").is_none());
+        assert!(sfn_from_str("FOO.txt").is_some());
+    }
 }

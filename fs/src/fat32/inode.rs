@@ -1,7 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use spin::Mutex;
 
-use crate::BLOCK_SZ;
+use crate::{BLOCK_SZ, fat32::dir::DirAttr};
 use crate::block_cache::get_block_cache;
 use crate::vfs::VfsNode;
 
@@ -13,6 +13,7 @@ struct DirentPos {
     entry_offset: usize,
     name_raw: [u8; 11],
     attr: u8,
+    nt_reserved: u8,
 }
 
 #[derive(Debug)]
@@ -392,7 +393,13 @@ impl FatInode {
     }
 
     fn update_dirent_after_change(&self, pos: &DirentPos, first_cluster: u32, size: u32) {
-        let raw = dir::build_sfn_entry(&pos.name_raw, pos.attr, first_cluster, size);
+        let raw = dir::build_sfn_entry(
+            &pos.name_raw,
+            pos.attr,
+            pos.nt_reserved,
+            first_cluster,
+            size,
+        );
         self.dir_write_entry_raw(pos.dir_start_cluster, pos.entry_offset, &raw);
     }
 
@@ -503,6 +510,7 @@ impl VfsNode for FatInode {
                     entry_offset: e.entry_offset,
                     name_raw: e.name_raw,
                     attr: e.attr,
+                    nt_reserved: e.nt_reserved,
                 }),
             }),
         };
@@ -524,14 +532,14 @@ impl VfsNode for FatInode {
 
         // If name fits 8.3, create SFN-only entry.
         if let Some(sfn) = dir::sfn_from_str(name) {
-            if self.find_in_dir(dir_cluster, &sfn).is_some() {
+            if self.find_in_dir(dir_cluster, &sfn.name_raw).is_some() {
                 return None;
             }
             let off = self.find_free_dirent_offset(dir_cluster);
             self.ensure_dir_entry_slot(dir_cluster, off);
 
-            let attr = dir::ATTR_ARCHIVE;
-            let raw = dir::build_sfn_entry(&sfn, attr, 0, 0);
+            let attr = DirAttr::ARCHIVE;
+            let raw = dir::build_sfn_entry(&sfn.name_raw, attr.bits(), sfn.nt_reserved, 0, 0);
             self.dir_write_entry_raw(dir_cluster, off, &raw);
 
             let inode = FatInode {
@@ -543,8 +551,9 @@ impl VfsNode for FatInode {
                     pos: Some(DirentPos {
                         dir_start_cluster: dir_cluster,
                         entry_offset: off,
-                        name_raw: sfn,
-                        attr,
+                        name_raw: sfn.name_raw,
+                        attr: attr.bits(),
+                        nt_reserved: sfn.nt_reserved,
                     }),
                 }),
             };
@@ -577,8 +586,8 @@ impl VfsNode for FatInode {
         for (i, e) in lfn_entries.iter().enumerate() {
             self.dir_write_entry_raw(dir_cluster, off0 + i * 32, e);
         }
-        let attr = dir::ATTR_ARCHIVE;
-        let raw = dir::build_sfn_entry(&sfn, attr, 0, 0);
+        let attr = DirAttr::ARCHIVE;
+        let raw = dir::build_sfn_entry(&sfn, attr.bits(), 0, 0, 0);
         self.dir_write_entry_raw(dir_cluster, sfn_off, &raw);
 
         let inode = FatInode {
@@ -591,7 +600,8 @@ impl VfsNode for FatInode {
                     dir_start_cluster: dir_cluster,
                     entry_offset: sfn_off,
                     name_raw: sfn,
-                    attr,
+                    attr: attr.bits(),
+                    nt_reserved: 0,
                 }),
             }),
         };
@@ -631,22 +641,24 @@ impl VfsNode for FatInode {
         // ".." → points to dir_cluster (parent)
         let mut dot_raw: [u8; 11] = [b' '; 11];
         dot_raw[0] = b'.';
-        let dot_entry = dir::build_sfn_entry(&dot_raw, dir::ATTR_DIRECTORY, new_cluster, 0);
+        let dot_entry = dir::build_sfn_entry(&dot_raw, DirAttr::DIRECTORY.bits(), 0, new_cluster, 0);
         self.write_chain_at(new_cluster, 0, &dot_entry);
 
         let mut dotdot_raw: [u8; 11] = [b' '; 11];
         dotdot_raw[0] = b'.';
         dotdot_raw[1] = b'.';
-        let dotdot_entry = dir::build_sfn_entry(&dotdot_raw, dir::ATTR_DIRECTORY, dir_cluster, 0);
+        let dotdot_entry =
+            dir::build_sfn_entry(&dotdot_raw, DirAttr::DIRECTORY.bits(), 0, dir_cluster, 0);
         self.write_chain_at(new_cluster, 32, &dotdot_entry);
 
         // Create the entry for `name` inside the parent directory.
-        let (sfn_off, name_raw) = if let Some(sfn) = dir::sfn_from_str(name) {
+        let (sfn_off, name_raw, nt_reserved) = if let Some(sfn) = dir::sfn_from_str(name) {
             let off = self.find_free_dirent_offset(dir_cluster);
             self.ensure_dir_entry_slot(dir_cluster, off);
-            let raw = dir::build_sfn_entry(&sfn, dir::ATTR_DIRECTORY, new_cluster, 0);
+            let raw =
+                dir::build_sfn_entry(&sfn.name_raw, DirAttr::DIRECTORY.bits(), sfn.nt_reserved, new_cluster, 0);
             self.dir_write_entry_raw(dir_cluster, off, &raw);
-            (off, sfn)
+            (off, sfn.name_raw, sfn.nt_reserved)
         } else {
             // Long name path.
             if !dir::is_valid_lfn_name(name) {
@@ -669,9 +681,9 @@ impl VfsNode for FatInode {
             for (i, e) in lfn_entries.iter().enumerate() {
                 self.dir_write_entry_raw(dir_cluster, off0 + i * 32, e);
             }
-            let raw = dir::build_sfn_entry(&sfn, dir::ATTR_DIRECTORY, new_cluster, 0);
+            let raw = dir::build_sfn_entry(&sfn, DirAttr::DIRECTORY.bits(), 0, new_cluster, 0);
             self.dir_write_entry_raw(dir_cluster, sfn_off2, &raw);
-            (sfn_off2, sfn)
+            (sfn_off2, sfn, 0)
         };
 
         let inode = FatInode {
@@ -684,7 +696,8 @@ impl VfsNode for FatInode {
                     dir_start_cluster: dir_cluster,
                     entry_offset: sfn_off,
                     name_raw,
-                    attr: dir::ATTR_DIRECTORY,
+                    attr: DirAttr::DIRECTORY.bits(),
+                    nt_reserved,
                 }),
             }),
         };

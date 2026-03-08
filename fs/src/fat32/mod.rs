@@ -2,8 +2,9 @@
 //!
 //! Current scope (incremental):
 //! - No partition table support (volume starts at LBA 0)
-//! - SFN (8.3) only; LFN entries are ignored
-//! - Basic directory operations: ls/find/create in a single directory
+//! - Supports SFN (8.3) and VFAT LFN directory entries
+//! - ASCII name lookup is case-insensitive; SFN rendering respects FAT NT case bits
+//! - Basic directory operations: ls/find/create/mkdir in a directory tree
 //! - File operations: read_at/write_at/clear
 
 mod bpb;
