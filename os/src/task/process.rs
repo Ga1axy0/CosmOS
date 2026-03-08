@@ -6,7 +6,7 @@ use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE,VirtAddr,MapPermission};
+use crate::mm::{translated_refmut, MapPermission, MemorySet, VirtAddr, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -55,6 +55,8 @@ pub struct ProcessControlBlockInner {
     pub mutex_detector: DeadlockDetector,
     /// deadlock detector for semaphore resources
     pub semaphore_detector: DeadlockDetector,
+    /// current working directory (absolute path)
+    pub cwd: String,
 }
 
 impl ProcessControlBlockInner {
@@ -128,6 +130,7 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
+                    cwd: String::from("/"),
                 })
             },
         });
@@ -257,6 +260,7 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
+                    cwd: parent.cwd.clone(),
                 })
             },
         });
@@ -323,6 +327,7 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
+                    cwd: parent.cwd.clone(), // 同fork，继承自父进程
                 })
             },
         });
@@ -357,10 +362,16 @@ impl ProcessControlBlock {
 
     /// map an anonymous area with given permission, return true if success
     pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
-        self.inner.exclusive_access().memory_set.mmap_anonymous(start, end, perm)
+        self.inner
+            .exclusive_access()
+            .memory_set
+            .mmap_anonymous(start, end, perm)
     }
     /// unmap an area. return true if success
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
-        self.inner.exclusive_access().memory_set.munmap_anonymous(start, end)
+        self.inner
+            .exclusive_access()
+            .memory_set
+            .munmap_anonymous(start, end)
     }
 }

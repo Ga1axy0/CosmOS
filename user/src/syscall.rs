@@ -2,11 +2,17 @@ use crate::SignalAction;
 
 use super::{Stat, TimeVal};
 
+pub const SYSCALL_GETCWD: usize = 17;
+pub const SYSCALL_DUP: usize = 24;
+pub const SYSCALL_MKDIRAT: usize = 34;
+pub const SYSCALL_UNLINKAT: usize = 35;
+pub const SYSCALL_CHDIR: usize = 49;
 pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
+pub const SYSCALL_PIPE: usize = 59;
+pub const SYSCALL_GETDENTS64: usize = 61;
 pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
-pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_EXIT: usize = 93;
@@ -16,21 +22,19 @@ pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_SIGACTION: usize = 134;
 pub const SYSCALL_SIGPROCMASK: usize = 135;
 pub const SYSCALL_SIGRETURN: usize = 139;
+pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_FORK: usize = 220;
 pub const SYSCALL_EXEC: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
-pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_SBRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
 pub const SYSCALL_MMAP: usize = 222;
 pub const SYSCALL_SPAWN: usize = 400;
 pub const SYSCALL_MAIL_READ: usize = 401;
 pub const SYSCALL_MAIL_WRITE: usize = 402;
-pub const SYSCALL_DUP: usize = 24;
-pub const SYSCALL_PIPE: usize = 59;
 pub const SYSCALL_TRACE: usize = 410;
 pub const SYSCALL_THREAD_CREATE: usize = 460;
 pub const SYSCALL_WAITTID: usize = 462;
@@ -287,4 +291,36 @@ pub fn sys_sigreturn() -> isize {
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
     syscall(SYSCALL_KILL, [pid, signal as usize, 0])
+}
+
+pub fn sys_getcwd(buffer: &mut [u8]) -> isize {
+    syscall(
+        SYSCALL_GETCWD,
+        [buffer.as_mut_ptr() as usize, buffer.len(), 0],
+    )
+}
+
+pub fn sys_mkdirat(dirfd: usize, path: &str, mode: u32) -> isize {
+    syscall6(
+        SYSCALL_MKDIRAT,
+        [
+            dirfd,
+            path.as_ptr() as usize,
+            mode as usize,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_chdir(path: &str) -> isize {
+    syscall(SYSCALL_CHDIR, [path.as_ptr() as usize, 0, 0])
+}
+
+pub fn sys_getdents64(fd: usize, buffer: &mut [u8]) -> isize {
+    syscall(
+        SYSCALL_GETDENTS64,
+        [fd, buffer.as_mut_ptr() as usize, buffer.len()],
+    )
 }

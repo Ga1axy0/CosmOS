@@ -61,6 +61,25 @@ impl BlockCache {
     pub fn modify<T, V>(&mut self, offset: usize, f: impl FnOnce(&mut T) -> V) -> V {
         f(self.get_mut(offset))
     }
+
+    /// Read raw bytes from this cached block.
+    ///
+    /// This is preferred for parsing on-disk packed data structures (e.g. FAT32 BPB/dir entries)
+    /// because it avoids creating potentially unaligned typed references.
+    pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) {
+        assert!(offset + buf.len() <= BLOCK_SZ);
+        buf.copy_from_slice(&self.cache[offset..offset + buf.len()]);
+    }
+
+    /// Write raw bytes into this cached block.
+    ///
+    /// Marks the block as modified.
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) {
+        assert!(offset + data.len() <= BLOCK_SZ);
+        self.modified = true;
+        self.cache[offset..offset + data.len()].copy_from_slice(data);
+    }
+
     /// Sync(write) the block cache to disk.
     pub fn sync(&mut self) {
         if self.modified {
