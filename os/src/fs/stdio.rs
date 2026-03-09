@@ -1,6 +1,7 @@
 use super::File;
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::UserBuffer;
+use crate::fs::{Stat,StatMode};
 
 /// stdin file for getting chars from console
 pub struct Stdin;
@@ -26,6 +27,15 @@ impl File for Stdin {
     fn write(&self, _user_buf: UserBuffer) -> usize {
         panic!("Cannot write to stdin!");
     }
+    fn stat(&self) -> super::Stat {
+        super::Stat {
+            dev: 0,
+            ino: 0,
+            mode: super::StatMode::CHAR,
+            nlink: 1,
+            pad: [0; 7],
+        }
+    }
 }
 
 impl File for Stdout {
@@ -47,5 +57,14 @@ impl File for Stdout {
             }
         }
         n
+    }
+    fn stat(&self) -> super::Stat {
+        super::Stat {
+            dev: 0,
+            ino: 0,
+            mode: super::StatMode::CHAR,
+            nlink: 1,
+            pad: [0; 7],
+        }
     }
 }

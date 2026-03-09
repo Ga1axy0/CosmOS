@@ -2,6 +2,7 @@ use super::File;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::{Arc, Weak};
+use crate::fs::{Stat,StatMode}; 
 
 use crate::task::suspend_current_and_run_next;
 
@@ -174,6 +175,15 @@ impl File for Pipe {
                     return already_write;
                 }
             }
+        }
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: 0,
+            mode: StatMode::FIFO,
+            nlink: 1,
+            pad: [0; 7],
         }
     }
 }
