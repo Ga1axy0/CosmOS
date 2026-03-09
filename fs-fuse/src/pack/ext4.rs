@@ -1,6 +1,7 @@
 use crate::pack::PackConfig;
 use crate::source::AppFile;
 use std::env;
+use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,12 +49,6 @@ fn resolve_tool(tool: &str) -> Option<PathBuf> {
 /// - `mkfs.ext4` to format the image
 /// - `debugfs` to write files into the root directory
 pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
-    let mkfs_ext4 = resolve_tool("mkfs.ext4").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Cannot find `mkfs.ext4`. Install e2fsprogs or add it to PATH.",
-        )
-    })?;
     let debugfs = resolve_tool("debugfs").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -61,29 +56,63 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
         )
     })?;
 
-    let img = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&cfg.img_path)?;
-    img.set_len(cfg.image_size_bytes)?;
-    drop(img);
+    if let Some(base_img) = &cfg.ext4_base_img {
+        if !base_img.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Base ext4 image not found: {}", base_img.display()),
+            ));
+        }
+        if base_img != &cfg.img_path {
+            fs::copy(base_img, &cfg.img_path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to copy base image from {} to {}: {e}",
+                        base_img.display(),
+                        cfg.img_path.display()
+                    ),
+                )
+            })?;
+        }
+    } else {
+        let mkfs_ext4 = resolve_tool("mkfs.ext4").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Cannot find `mkfs.ext4`. Install e2fsprogs or add it to PATH.",
+            )
+        })?;
 
-    run_checked(
-        Command::new(mkfs_ext4)
-            .arg("-q")
-            .arg("-F")
-            .arg("-b")
-            .arg("4096")
-            .arg("-L")
-            .arg("OSDISK")
-            .arg(&cfg.img_path),
-        "mkfs.ext4",
-    )?;
+        let img = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&cfg.img_path)?;
+        img.set_len(cfg.image_size_bytes)?;
+        drop(img);
+
+        run_checked(
+            Command::new(mkfs_ext4)
+                .arg("-q")
+                .arg("-F")
+                .arg("-b")
+                .arg("4096")
+                .arg("-L")
+                .arg("OSDISK")
+                .arg(&cfg.img_path),
+            "mkfs.ext4",
+        )?;
+    }
 
     for app in apps {
         println!("Adding file: {}", app.name);
+        let _ = Command::new(&debugfs)
+            .arg("-w")
+            .arg("-R")
+            .arg(format!("rm /{}", app.name))
+            .arg(&cfg.img_path)
+            .output();
         run_checked(
             Command::new(&debugfs)
                 .arg("-w")
