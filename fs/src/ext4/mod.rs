@@ -4,7 +4,7 @@ use spin::Mutex;
 
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::vfs::{Inode, VfsNode};
-use crate::BLOCK_SZ;
+use crate::{BLOCK_SZ, ext4};
 
 use ext4_rs::{
     BlockDevice as Ext4BlockDevice, Ext4, InodeFileType,
@@ -199,5 +199,56 @@ impl VfsNode for Ext4Inode {
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
         let ext4 = self.fs.ext4.lock();
         ext4.write_at(self.inode_num, offset, buf).unwrap_or(0)
+    }
+
+    fn ino(&self) -> u64 {
+        self.inode_num as u64
+    }
+
+    fn nlink(&self) -> u32 {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref.inode.links_count() as u32
+    }
+
+    fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), ()> {
+        if !self.is_dir {
+            return Err(());
+        }
+        let (child_ino, _) = self.lookup_child_meta(_old_name).ok_or(())?;
+        let ext4 = self.fs.ext4.lock();
+        let mut parent_ref = ext4.get_inode_ref(self.inode_num);
+        let mut child_ref = ext4.get_inode_ref(child_ino);
+        ext4.link(&mut parent_ref, &mut child_ref, _new_name)
+            .map_err(|_| ())?;
+        // Persist updated link counts/dir entries.
+        ext4.write_back_inode(&mut parent_ref);
+        ext4.write_back_inode(&mut child_ref);
+        Ok(())
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), ()> {
+        if !self.is_dir {
+            return Err(());
+        }
+        let (child_ino, is_dir) = self.lookup_child_meta(name).ok_or(())?;
+        let ext4 = self.fs.ext4.lock();
+        let mut parent_ref = ext4.get_inode_ref(self.inode_num);
+        let mut child_ref = ext4.get_inode_ref(child_ino);
+        if !is_dir && child_ref.inode.links_count() > 1 {
+            // Hard-link case: remove only this directory entry and decrement nlink.
+            ext4.dir_remove_entry(&mut parent_ref, name).map_err(|_| ())?;
+            let new_links = child_ref.inode.links_count() - 1;
+            child_ref.inode.set_links_count(new_links);
+            ext4.write_back_inode(&mut parent_ref);
+            ext4.write_back_inode(&mut child_ref);
+            return Ok(());
+        }
+        if !is_dir && child_ref.inode.links_count() == 1 {
+            ext4.truncate_inode(&mut child_ref, 0).map_err(|_| ())?;
+        }
+        ext4.unlink(&mut parent_ref, &mut child_ref, name)
+            .map(|_| ())
+            .map_err(|_| ())
     }
 }

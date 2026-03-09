@@ -26,6 +26,8 @@ pub trait File: Send + Sync {
     fn getdents64(&self, _buf: &mut [u8]) -> usize {
         0
     }
+    /// get file metadata
+    fn stat(&self) -> Stat;
 }
 
 /// The stat of a inode
@@ -46,7 +48,7 @@ pub struct Stat {
 
 bitflags! {
     /// The mode of a inode
-    /// whether a directory or a file
+    /// whether a directory, regular file, char device or fifo
     pub struct StatMode: u32 {
         /// null
         const NULL  = 0;
@@ -54,9 +56,16 @@ bitflags! {
         const DIR   = 0o040000;
         /// ordinary regular file
         const FILE  = 0o100000;
+        /// character device
+        const CHAR  = 0o020000;
+        /// fifo/pipe
+        const FIFO  = 0o010000;
     }
 }
 
-pub use inode::{list_apps, open_file, open_file_at, mkdir_at, lookup_inode, canonicalize, OSInode, OpenFlags};
+pub use inode::{
+    canonicalize, linkat, list_apps, lookup_inode, mkdir_at, open_file, open_file_at, unlinkat,
+    OpenFlags, OSInode,
+};
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::{Stdin, Stdout};
