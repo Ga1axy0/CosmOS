@@ -2,6 +2,7 @@ use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
+use crate::syscall::errno::ERRNO;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -192,11 +193,23 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
 
 /// Create a directory at `path` relative to `cwd`.
 /// Returns `true` on success.
-pub fn mkdir_at(cwd: &str, path: &str) -> bool {
+pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
     if let Some((parent, name)) = resolve_parent(cwd, path) {
-        parent.mkdir(&name).is_some()
+        // 已存在同名目录或文件
+        if parent.find(&name).is_some() {
+            return Err(ERRNO::EEXIST);
+        }
+        // 父节点不是目录
+        if !parent.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        // 创建失败
+        if parent.mkdir(&name).is_none() {
+            return Err(ERRNO::EIO);
+        }
+        Ok(())
     } else {
-        false
+        Err(ERRNO::ENOENT)
     }
 }
 
@@ -259,34 +272,34 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
 ///
 /// Note: current backend link support is directory-local; we only allow linking
 /// within the same parent directory.
-pub fn linkat(cwd: &str, old_path: &str, new_path: &str) -> Result<(), ()> {
+pub fn linkat(cwd: &str, old_path: &str, new_path: &str) -> Result<(), ERRNO> {
     let old_abs = canonicalize(cwd, old_path);
     let new_abs = canonicalize(cwd, new_path);
-    let (old_parent_path, old_name) = old_abs.rsplit_once('/').ok_or(())?;
-    let (new_parent_path, new_name) = new_abs.rsplit_once('/').ok_or(())?;
+    let (old_parent_path, old_name) = old_abs.rsplit_once('/').ok_or(ERRNO::ENOENT)?;
+    let (new_parent_path, new_name) = new_abs.rsplit_once('/').ok_or(ERRNO::ENOENT)?;
     if old_name.is_empty() || new_name.is_empty() {
-        return Err(());
+        return Err(ERRNO::ENOENT);
     }
     // Keep behavior explicit: only same-parent hard-link is supported here.
     if old_parent_path != new_parent_path {
-        return Err(());
+        return Err(ERRNO::EXDEV);
     }
     let parent = lookup_inode(if old_parent_path.is_empty() {
         "/"
     } else {
         old_parent_path
     })
-    .ok_or(())?;
-    parent.link(old_name, new_name)
+    .ok_or(ERRNO::ENOENT)?;
+    parent.link(old_name, new_name).map_err(|_| ERRNO::EIO)
 }
 
 /// Remove a link at `path` relative to `cwd`.
-pub fn unlinkat(cwd: &str, path: &str) -> Result<(), ()> {
-    let (parent, name) = resolve_parent(cwd, path).ok_or(())?;
+pub fn unlinkat(cwd: &str, path: &str) -> Result<(), ERRNO> {
+    let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
     if name.is_empty() {
-        return Err(());
+        return Err(ERRNO::ENOENT);
     }
-    parent.unlink(name.as_str())
+    parent.unlink(name.as_str()).map_err(|_| ERRNO::ENOENT)
 }
 
 impl File for OSInode {

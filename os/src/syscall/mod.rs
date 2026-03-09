@@ -13,7 +13,7 @@
 /// getcwd syscall
 pub const SYSCALL_GETCWD: usize = 17;
 /// dup syscall
-pub const SYSCALL_DUP: usize = 24;
+pub const SYSCALL_DUP: usize = 23;
 /// mkdirat syscall
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
@@ -113,12 +113,37 @@ mod process;
 mod sync;
 mod thread;
 
+/// Standard error numbers and conversion traits
+pub mod errno;
+
 use fs::*;
 use process::*;
 use sync::*;
 use thread::*;
 
+
 use crate::fs::Stat;
+
+/// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
+/// converting `Err(e)` into `-(e as isize)`.  Use with the `?` operator and
+/// `OrErrno` to propagate errors cleanly:
+///
+/// ```rust
+/// syscall_body!({
+///     let path = translated_str(token, ptr).or_errno(ERRNO::EFAULT)?;
+///     Ok(0)
+/// })
+/// ```
+#[macro_export]
+macro_rules! syscall_body {
+    ($body:block) => {{
+        let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
+        match result {
+            Ok(v) => v,
+            Err(e) => -(e as isize),
+        }
+    }};
+}
 
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
