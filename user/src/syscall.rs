@@ -182,12 +182,6 @@ pub fn sys_execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
     )
 }
 
-/// TODO: 兼容接口：沿用旧的 exec(path, argv)，内部转发到 execve 并传空环境变量。
-pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
-    let envp: [*const u8; 1] = [core::ptr::null()];
-    sys_execve(path, args, &envp)
-}
-
 pub fn sys_waitpid(pid: isize, xstatus: *mut i32) -> isize {
     syscall(SYSCALL_WAITPID, [pid as usize, xstatus as usize, 0])
 }
