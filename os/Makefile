@@ -75,7 +75,11 @@ fs-img:
 		echo "Image not found: $(FS_IMG). Building user apps first."; \
 		make -C ../user clean; \
 		make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE); \
-		if [ -n "$(strip $(BASE_IMG))" ] && [ -f "$(BASE_IMG)" ]; then \
+		if [ -n "$(strip $(BASE_IMG))" ]; then \
+			if [ ! -f "$(BASE_IMG)" ]; then \
+				echo "Base image not found: $(BASE_IMG)"; \
+				exit 2; \
+			fi; \
 			if [ "$(MAIN_FS)" != "ext4" ]; then \
 				echo "BASE_IMG is only supported when MAIN_FS=ext4."; \
 				exit 2; \
@@ -83,9 +87,6 @@ fs-img:
 			echo "Injecting user apps into base ext4 image: $(BASE_IMG)"; \
 			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS) --ext4-base $(BASE_IMG); \
 		else \
-			if [ -n "$(strip $(BASE_IMG))" ]; then \
-				echo "Base image not found: $(BASE_IMG). Fallback to fresh packing."; \
-			fi; \
 			rm -f $(FS_IMG); \
 			echo "Packing fresh $(MAIN_FS) image from user apps."; \
 			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS); \
