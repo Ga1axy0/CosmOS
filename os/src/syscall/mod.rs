@@ -68,8 +68,8 @@ pub const SYSCALL_SBRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
 /// fork syscall
 pub const SYSCALL_FORK: usize = 220;
-/// exec syscall
-pub const SYSCALL_EXEC: usize = 221;
+/// execve syscall
+pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
 pub const SYSCALL_MMAP: usize = 222;
 /// waitpid syscall
@@ -120,7 +120,7 @@ use thread::*;
 
 use crate::fs::Stat;
 
-/// handle syscall exception with `syscall_id` and other arguments
+/// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
@@ -142,7 +142,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_FORK => sys_fork(),
-        SYSCALL_EXEC => sys_exec(args[0] as *const u8, args[1] as *const usize),
+        SYSCALL_EXECVE => sys_execve(
+            args[0] as *const u8,
+            args[1] as *const usize,
+            args[2] as *const usize,
+        ),
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
         SYSCALL_GETTIMEOFDAY => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),

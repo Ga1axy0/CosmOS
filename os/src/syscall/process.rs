@@ -1,17 +1,21 @@
 use crate::{
     config::PAGE_SIZE_BITS,
-    fs::{OpenFlags, open_file},
-    mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str,MapPermission,VirtAddr},
+    fs::{open_file, open_file_at, OpenFlags},
+    mm::{
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
+        VirtAddr,
+    },
     task::{
-        SignalFlags, current_process, current_task, current_user_token, exit_current_and_run_next, pid2process, 
-        suspend_current_and_run_next, mmap_current_process, munmap_current_process,
+        current_process, current_task, current_user_token, exit_current_and_run_next,
+        mmap_current_process, munmap_current_process, pid2process, suspend_current_and_run_next,
+        SignalFlags,
     },
     timer::get_time_us,
 };
 
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::slice;
-use alloc::{string::String, sync::Arc, vec::Vec};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -63,31 +67,44 @@ pub fn sys_fork() -> isize {
     trap_cx.x[10] = 0;
     new_pid as isize
 }
-/// exec syscall
-pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
+/// 解析用户态传入的 `char **`（以 NULL 结尾）为 Rust 字符串数组。
+fn parse_user_cstr_array(token: usize, mut arr: *const usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    loop {
+        let str_ptr = *translated_ref(token, arr);
+        if str_ptr == 0 {
+            break;
+        }
+        out.push(translated_str(token, str_ptr as *const u8));
+        // SAFETY: 逐个读取用户态指针数组元素，直到遇到 NULL 结束。
+        unsafe {
+            arr = arr.add(1);
+        }
+    }
+    out
+}
+
+/// sys_execve
+pub fn sys_execve(path: *const u8, args: *const usize, envp: *const usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_exec",
+        "kernel:pid[{}] sys_execve",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
     let path = translated_str(token, path);
-    let mut args_vec: Vec<String> = Vec::new();
-    loop {
-        let arg_str_ptr = *translated_ref(token, args);
-        if arg_str_ptr == 0 {
-            break;
-        }
-        args_vec.push(translated_str(token, arg_str_ptr as *const u8));
-        unsafe {
-            args = args.add(1);
-        }
-    }
-    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+    let args_vec = parse_user_cstr_array(token, args);
+
+    // 当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
+    let _envp_vec = parse_user_cstr_array(token, envp);
+
+    let process = current_process();
+    // 关键：execve 路径解析与 open/chdir 统一，支持相对路径与绝对路径。
+    let cwd = process.inner_exclusive_access().cwd.clone();
+    if let Some(app_inode) = open_file_at(cwd.as_str(), path.as_str(), OpenFlags::RDONLY) {
         let all_data = app_inode.read_all();
-        let process = current_process();
         let argc = args_vec.len();
         process.exec(all_data.as_slice(), args_vec);
-        // return argc because cx.x[10] will be covered with it later
+        // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
         argc as isize
     } else {
         -1
@@ -184,7 +201,7 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
         "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    
+
     if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
         return -1;
     }
@@ -196,7 +213,7 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
     }
 
     if _len == 0 {
-        return -1; 
+        return -1;
         //这里对于错误类型其实还没有文件去规范，理应该有一个专门
         //的错误类型来区分不同的错误，但现在先简单地返回-1
     }
@@ -221,7 +238,6 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
     } else {
         -1
     }
-    
 }
 
 /// munmap syscall
@@ -237,7 +253,7 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     }
 
     if _len == 0 {
-        return -1; 
+        return -1;
         //这里对于错误类型其实还没有文件去规范，理应该有一个专门的错误类
         //型来区分不同的错误，但现在先简单地返回-1
     }
@@ -269,7 +285,7 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    
+
     let token = current_user_token();
     let path = translated_str(token, _path);
     if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
