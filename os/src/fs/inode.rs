@@ -1,4 +1,4 @@
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -255,6 +255,40 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// Create a hard link from `old_path` to `new_path` relative to `cwd`.
+///
+/// Note: current backend link support is directory-local; we only allow linking
+/// within the same parent directory.
+pub fn linkat(cwd: &str, old_path: &str, new_path: &str) -> Result<(), ()> {
+    let old_abs = canonicalize(cwd, old_path);
+    let new_abs = canonicalize(cwd, new_path);
+    let (old_parent_path, old_name) = old_abs.rsplit_once('/').ok_or(())?;
+    let (new_parent_path, new_name) = new_abs.rsplit_once('/').ok_or(())?;
+    if old_name.is_empty() || new_name.is_empty() {
+        return Err(());
+    }
+    // Keep behavior explicit: only same-parent hard-link is supported here.
+    if old_parent_path != new_parent_path {
+        return Err(());
+    }
+    let parent = lookup_inode(if old_parent_path.is_empty() {
+        "/"
+    } else {
+        old_parent_path
+    })
+    .ok_or(())?;
+    parent.link(old_name, new_name)
+}
+
+/// Remove a link at `path` relative to `cwd`.
+pub fn unlinkat(cwd: &str, path: &str) -> Result<(), ()> {
+    let (parent, name) = resolve_parent(cwd, path).ok_or(())?;
+    if name.is_empty() {
+        return Err(());
+    }
+    parent.unlink(name.as_str())
+}
+
 impl File for OSInode {
     /// file readable?
     fn readable(&self) -> bool {
@@ -352,5 +386,21 @@ impl File for OSInode {
         }
         inner.offset = new_idx;
         written
+    }
+
+    fn stat(&self) -> Stat {
+        let inner = self.inner.exclusive_access();
+        let mode = if inner.inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+        Stat {
+            dev: 0,
+            ino: inner.inode.ino(),
+            mode,
+            nlink: inner.inode.nlink(),
+            pad: [0; 7],
+        }
     }
 }
