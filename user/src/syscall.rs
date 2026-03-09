@@ -3,7 +3,7 @@ use crate::SignalAction;
 use super::{Stat, TimeVal};
 
 pub const SYSCALL_GETCWD: usize = 17;
-pub const SYSCALL_DUP: usize = 24;
+pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_CHDIR: usize = 49;

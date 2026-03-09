@@ -1,3 +1,5 @@
+use crate::syscall::errno::{OrErrno, ERRNO};
+use crate::syscall_body;
 use crate::{
     config::PAGE_SIZE_BITS,
     fs::{open_file, open_file_at, OpenFlags},
@@ -13,7 +15,7 @@ use crate::{
     timer::get_time_us,
 };
 
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::slice;
 
@@ -77,72 +79,73 @@ pub fn sys_execve(path: *const u8, args: *const usize, envp: *const usize) -> is
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
-    let path = match try_translated_str_bounded(token, path, MAX_USER_CSTR_LEN) {
-        Some(path) => path,
-        None => return -1,
-    };
-    let args_vec = match try_translated_cstr_array(token, args, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN) {
-        Some(args_vec) => args_vec,
-        None => return -1,
-    };
+    syscall_body!({
+        let path = try_translated_str_bounded(token, path, MAX_USER_CSTR_LEN)
+            .or_errno(ERRNO::EFAULT)?;
+        let args_vec =
+            try_translated_cstr_array(token, args, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN)
+                .or_errno(ERRNO::EFAULT)?;
+        // 当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
+        let _envp_vec =
+            try_translated_cstr_array(token, envp, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN)
+                .or_errno(ERRNO::EFAULT)?;
 
-    // 当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
-    let _envp_vec = match try_translated_cstr_array(token, envp, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN) {
-        Some(envp_vec) => envp_vec,
-        None => return -1,
-    };
-
-    let process = current_process();
-    // 关键：execve 路径解析与 open/chdir 统一，支持相对路径与绝对路径。
-    let cwd = process.inner_exclusive_access().cwd.clone();
-    if let Some(app_inode) = open_file_at(cwd.as_str(), path.as_str(), OpenFlags::RDONLY) {
+        let process = current_process();
+        let cwd = process.inner_exclusive_access().cwd.clone();
+        let app_inode =
+            open_file_at(cwd.as_str(), path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
+        if app_inode.is_dir() {
+            return Err(ERRNO::EISDIR);
+        }
         let all_data = app_inode.read_all();
         let argc = args_vec.len();
-        process.exec(all_data.as_slice(), args_vec);
+        process
+            .exec(all_data.as_slice(), args_vec)
+            .or_errno(ERRNO::ENOEXEC)?;
         // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
-        argc as isize
-    } else {
-        -1
-    }
+        Ok(argc as isize)
+    })
 }
 
 /// waitpid syscall
 ///
-/// If there is not a child process whose pid is same as given, return -1.
-/// Else if there is a child process but it is still running, return -2.
+/// If there is not a child process whose pid is same as given, return -ECHILD.
+/// Else if there is a child process but it is still running, return -EAGAIN.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    //trace!("kernel: sys_waitpid");
+    trace!("kernel: sys_waitpid");
     let process = current_process();
-    // find a child process
-
     let mut inner = process.inner_exclusive_access();
-    if !inner
-        .children
-        .iter()
-        .any(|p| pid == -1 || pid as usize == p.getpid())
-    {
-        return -1;
-        // ---- release current PCB
-    }
-    let pair = inner.children.iter().enumerate().find(|(_, p)| {
-        // ++++ temporarily access child PCB exclusively
-        p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
-        // ++++ release child PCB
-    });
-    if let Some((idx, _)) = pair {
-        let child = inner.children.remove(idx);
-        // confirm that child will be deallocated after being removed from children list
-        assert_eq!(Arc::strong_count(&child), 1);
-        let found_pid = child.getpid();
-        // ++++ temporarily access child PCB exclusively
-        let exit_code = child.inner_exclusive_access().exit_code;
-        // ++++ release child PCB
-        *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
-        found_pid as isize
-    } else {
-        -2
-    }
-    // ---- release current PCB automatically
+    syscall_body!({
+        // no matching child at all
+        if !inner
+            .children
+            .iter()
+            .any(|p| pid == -1 || pid as usize == p.getpid())
+        {
+            return Err(ERRNO::ECHILD);
+        }
+        let pair = inner.children.iter().enumerate().find(|(_, p)| {
+            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
+        });
+        if let Some((idx, _)) = pair {
+            let child = inner.children.remove(idx);
+            assert_eq!(Arc::strong_count(&child), 1);
+            let found_pid = child.getpid();
+            let exit_code = child.inner_exclusive_access().exit_code;
+            // write exit code into user space; bad pointer → EFAULT
+            if !exit_code_ptr.is_null() {
+                if let Some(slot) = translated_refmut(inner.memory_set.token(), exit_code_ptr) {
+                    *slot = exit_code;
+                } else {
+                    return Err(ERRNO::EFAULT);
+                }
+            }
+            Ok(found_pid as isize)
+        } else {
+            // child exists but not yet zombie
+            Err(ERRNO::EAGAIN)
+        }
+    })
 }
 
 /// kill syscall
@@ -151,116 +154,105 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         "kernel:pid[{}] sys_kill",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    if let Some(process) = pid2process(pid) {
-        if let Some(flag) = SignalFlags::from_bits(signal) {
-            process.inner_exclusive_access().signals |= flag;
-            0
-        } else {
-            -1
-        }
-    } else {
-        -1
-    }
+    syscall_body!({
+        let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
+        let flag = SignalFlags::from_bits(signal).or_errno(ERRNO::EINVAL)?;
+        process.inner_exclusive_access().signals |= flag;
+        Ok(0)
+    })
 }
 
 /// get_time syscall
-///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!("kernel:pid[{}] sys_get_time",current_task().unwrap().process.upgrade().unwrap().getpid());
-    let time_us = get_time_us();
-    let timeval = TimeVal {
-        sec: time_us / 1_000_000,
-        usec: time_us % 1_000_000,
-    };
-    let timeval_bytes = unsafe {
-        slice::from_raw_parts(&timeval as *const TimeVal as *const u8, size_of::<TimeVal>())
-    };
-    let mut buffers = translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>());
-    let mut copied = 0usize;
-    for buffer in buffers.iter_mut() {
-        let len = buffer.len();
-        buffer.copy_from_slice(&timeval_bytes[copied..copied + len]);
-        copied += len;
-    }
-    0
+    trace!(
+        "kernel:pid[{}] sys_get_time",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let time_us = get_time_us();
+        let timeval = TimeVal {
+            sec: time_us / 1_000_000,
+            usec: time_us % 1_000_000,
+        };
+        let timeval_bytes = unsafe {
+            slice::from_raw_parts(
+                &timeval as *const TimeVal as *const u8,
+                size_of::<TimeVal>(),
+            )
+        };
+        let mut buffers =
+            translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>())
+                .or_errno(ERRNO::EFAULT)?;
+        let mut copied = 0usize;
+        for buffer in buffers.iter_mut() {
+            let len = buffer.len();
+            buffer.copy_from_slice(&timeval_bytes[copied..copied + len]);
+            copied += len;
+        }
+        Ok(0)
+    })
 }
 
 /// mmap syscall
-///
-/// YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
+    syscall_body!({
+        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+            return Err(ERRNO::EINVAL); // start not page-aligned
+        }
+        if _port & !0x7 != 0 {
+            return Err(ERRNO::EINVAL); // unknown permission bits
+        }
+        if _port & 0x7 == 0 {
+            return Err(ERRNO::EINVAL); // no access at all is meaningless
+        }
+        if _len == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
 
-    if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-        return -1;
-    }
-    if _port & !0x7 != 0 {
-        return -1;
-    }
-    if _port & 0x7 == 0 {
-        return -1;
-    }
+        let mut perm = MapPermission::U;
+        if _port & 0x1 != 0 {
+            perm |= MapPermission::R;
+        }
+        if _port & 0x2 != 0 {
+            perm |= MapPermission::W;
+        }
+        if _port & 0x4 != 0 {
+            perm |= MapPermission::X;
+        }
 
-    if _len == 0 {
-        return -1;
-        //这里对于错误类型其实还没有文件去规范，理应该有一个专门
-        //的错误类型来区分不同的错误，但现在先简单地返回-1
-    }
-
-    let Some(end) = _start.checked_add(_len) else {
-        return -1;
-    };
-
-    let mut perm = MapPermission::U;
-    if _port & 0x1 != 0 {
-        perm |= MapPermission::R;
-    }
-    if _port & 0x2 != 0 {
-        perm |= MapPermission::W;
-    }
-    if _port & 0x4 != 0 {
-        perm |= MapPermission::X;
-    }
-
-    if mmap_current_process(VirtAddr::from(_start), VirtAddr::from(end), perm) {
-        0
-    } else {
-        -1
-    }
+        if mmap_current_process(VirtAddr::from(_start), VirtAddr::from(end), perm) {
+            Ok(0)
+        } else {
+            Err(ERRNO::ENOMEM)
+        }
+    })
 }
 
 /// munmap syscall
-///
-/// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_munmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-        return -1;
-    }
-
-    if _len == 0 {
-        return -1;
-        //这里对于错误类型其实还没有文件去规范，理应该有一个专门的错误类
-        //型来区分不同的错误，但现在先简单地返回-1
-    }
-
-    let Some(end) = _start.checked_add(_len) else {
-        return -1;
-    };
-    if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
-        0
-    } else {
-        -1
-    }
+    syscall_body!({
+        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+            return Err(ERRNO::EINVAL); // start not page-aligned
+        }
+        if _len == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
+        if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
+            Ok(0)
+        } else {
+            Err(ERRNO::EINVAL) // range not fully mapped as anonymous
+        }
+    })
 }
 
 /// change data segment size
@@ -273,24 +265,20 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 // }
 
 /// spawn syscall
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
 pub fn sys_spawn(_path: *const u8) -> isize {
     trace!(
         "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-
     let token = current_user_token();
-    let path = translated_str(token, _path);
-    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+    syscall_body!({
+        let path = translated_str(token, _path).or_errno(ERRNO::EFAULT)?;
+        let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
         let parent = current_process();
         let all_data = app_inode.read_all();
-        let child = parent.spawn(all_data.as_slice());
-        child.getpid() as isize
-    } else {
-        -1
-    }
+        let child = parent.spawn(all_data.as_slice()).or_errno(ERRNO::ENOEXEC)?;
+        Ok(child.getpid() as isize)
+    })
 }
 
 /// set priority syscall

@@ -158,7 +158,7 @@ impl PageTable {
 }
 
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = start + len;
@@ -166,37 +166,41 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
-        vpn.step();
-        let mut end_va: VirtAddr = vpn.into();
-        end_va = end_va.min(VirtAddr::from(end));
-        if end_va.page_offset() == 0 {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        if let Some(ppn) = page_table.translate(vpn).map(|pte| pte.ppn()) {
+            vpn.step();
+            let mut end_va: VirtAddr = vpn.into();
+            end_va = end_va.min(VirtAddr::from(end));
+            if end_va.page_offset() == 0 {
+                v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+            } else {
+                v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+            }
+            start = end_va.into();
         } else {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+            return None;
         }
-        start = end_va.into();
     }
-    v
+    Some(v)
 }
 
 /// Create String in kernel address space from u8 Array(end with 0) in other address space
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
+pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
     let page_table = PageTable::from_token(token);
     let mut string = String::new();
     let mut va = ptr as usize;
     loop {
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_mut());
+        let pa = match page_table.translate_va(VirtAddr::from(va)) {
+            Some(pa) => pa,
+            None => return None,
+        };
+        let ch: u8 = *pa.get_mut();
         if ch == 0 {
             break;
         }
         string.push(ch as char);
         va += 1;
     }
-    string
+    Some(string)
 }
 
 /// 从用户地址空间读取一个以 `\0` 结尾的 C 字符串（带最大长度限制）。
@@ -260,22 +264,20 @@ pub fn try_translated_cstr_array(
 }
 
 /// translate a pointer `ptr` in other address space to a immutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
-pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
+pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
     let page_table = PageTable::from_token(token);
     page_table
         .translate_va(VirtAddr::from(ptr as usize))
-        .unwrap()
-        .get_ref()
+        .map(|pa| pa.get_ref())
 }
 
 /// translate a pointer `ptr` in other address space to a mutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
+pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
     page_table
         .translate_va(VirtAddr::from(va))
-        .unwrap()
-        .get_mut()
+        .map(|pa| pa.get_mut())
 }
 
 /// An abstraction over a buffer passed from user space to kernel space
