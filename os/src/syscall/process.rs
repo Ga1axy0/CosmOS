@@ -2,8 +2,8 @@ use crate::{
     config::PAGE_SIZE_BITS,
     fs::{open_file, open_file_at, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
-        VirtAddr,
+        translated_byte_buffer, translated_refmut, translated_str, try_translated_cstr_array,
+        try_translated_str_bounded, MapPermission, VirtAddr,
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
@@ -13,7 +13,7 @@ use crate::{
     timer::get_time_us,
 };
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use core::mem::size_of;
 use core::slice;
 
@@ -67,22 +67,8 @@ pub fn sys_fork() -> isize {
     trap_cx.x[10] = 0;
     new_pid as isize
 }
-/// 解析用户态传入的 `char **`（以 NULL 结尾）为 Rust 字符串数组。
-fn parse_user_cstr_array(token: usize, mut arr: *const usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    loop {
-        let str_ptr = *translated_ref(token, arr);
-        if str_ptr == 0 {
-            break;
-        }
-        out.push(translated_str(token, str_ptr as *const u8));
-        // SAFETY: 逐个读取用户态指针数组元素，直到遇到 NULL 结束。
-        unsafe {
-            arr = arr.add(1);
-        }
-    }
-    out
-}
+const MAX_USER_CSTR_ARRAY_LEN: usize = 256;
+const MAX_USER_CSTR_LEN: usize = 4096;
 
 /// sys_execve
 pub fn sys_execve(path: *const u8, args: *const usize, envp: *const usize) -> isize {
@@ -91,11 +77,20 @@ pub fn sys_execve(path: *const u8, args: *const usize, envp: *const usize) -> is
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
-    let path = translated_str(token, path);
-    let args_vec = parse_user_cstr_array(token, args);
+    let path = match try_translated_str_bounded(token, path, MAX_USER_CSTR_LEN) {
+        Some(path) => path,
+        None => return -1,
+    };
+    let args_vec = match try_translated_cstr_array(token, args, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN) {
+        Some(args_vec) => args_vec,
+        None => return -1,
+    };
 
     // 当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
-    let _envp_vec = parse_user_cstr_array(token, envp);
+    let _envp_vec = match try_translated_cstr_array(token, envp, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN) {
+        Some(envp_vec) => envp_vec,
+        None => return -1,
+    };
 
     let process = current_process();
     // 关键：execve 路径解析与 open/chdir 统一，支持相对路径与绝对路径。
