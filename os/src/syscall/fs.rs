@@ -1,4 +1,7 @@
-use crate::fs::{make_pipe, open_file, open_file_at, mkdir_at, lookup_inode, canonicalize, OpenFlags, Stat};
+use crate::fs::{
+    canonicalize, linkat, lookup_inode, make_pipe, mkdir_at, open_file_at, unlinkat,
+    OpenFlags, Stat,
+};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::sync::Arc;
@@ -129,28 +132,80 @@ pub fn sys_dup(fd: usize) -> isize {
 /// YOUR JOB: Implement fstat.
 pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_fstat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if _fd >= inner.fd_table.len() {
+        return -1;
+    }
+    if let Some(file) = &inner.fd_table[_fd] {
+        let file = file.clone();
+        // release current task TCB manually to avoid multi-borrow
+        drop(inner);
+        let stat = file.stat();
+        let stat_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &stat as *const Stat as *const u8,
+                core::mem::size_of::<Stat>(),
+            )
+        };
+        let mut buffers = translated_byte_buffer(token, _st as *const u8, core::mem::size_of::<Stat>());
+        let mut copied = 0usize;
+        for buffer in buffers.iter_mut() {
+            let len = buffer.len();
+            buffer.copy_from_slice(&stat_bytes[copied..copied + len]);
+            copied += len;
+        }
+        0
+    } else {
+        -1
+    }
+
 }
 
 /// YOUR JOB: Implement linkat.
 pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let old_path = translated_str(token, _old_name);
+    let new_path = translated_str(token, _new_name);
+    if old_path.is_empty() || new_path.is_empty() {
+        return -1;
+    }
+    if old_path.as_str() == new_path.as_str() {
+        return -1;
+    }
+    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    if let Ok(()) = linkat(cwd.as_str(), old_path.as_str(), new_path.as_str()) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement unlinkat.
 pub fn sys_unlinkat(_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let name = translated_str(token, _name);
+    if name.is_empty() {
+        return -1;
+    }
+    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    if unlinkat(cwd.as_str(), name.as_str()).is_ok() {
+        0
+    } else {
+        -1
+    }
 }
 
 
