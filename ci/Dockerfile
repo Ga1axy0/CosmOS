@@ -14,9 +14,12 @@ RUN apt-get update && \
     apt-get install -y \
     curl \
     git \
+    git-lfs \
     python3 \
     wget \
     xz-utils
+
+RUN git lfs install --system
 
 # Set working directory
 WORKDIR /root
@@ -85,6 +88,11 @@ RUN rustup default $RUST_VERSION; \
 
 # Set working directory
 WORKDIR /root
+
+# Bundle prebuilt base image into CI container and decompress during image build.
+RUN mkdir -p /opt/xxos
+COPY base.img.xz /opt/xxos/base.img.xz
+RUN xz -d -k -f /opt/xxos/base.img.xz && ls -lh /opt/xxos/base.img*
 
 # Default command
 CMD ["/bin/bash"]
