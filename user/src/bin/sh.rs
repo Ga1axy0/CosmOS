@@ -63,6 +63,11 @@ pub fn main() -> i32 {
                             continue;
                         }
 
+                        if args[0] == "exit" {
+                            println!("Exiting shell...");
+                            return 0;
+                        }
+
                         let mut argv: Vec<String> = args
                             .iter()
                             .map(|&arg| {
