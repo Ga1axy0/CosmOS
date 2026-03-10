@@ -1,3 +1,4 @@
+#[repr(i32)]
 #[allow(missing_docs)]
 pub enum ERRNO {
     EPERM = 1,         // Operation not permitted
