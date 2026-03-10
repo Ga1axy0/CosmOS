@@ -73,6 +73,7 @@ pub fn rust_main() -> ! {
     logging::init();
     mm::init();
     mm::remap_test();
+    drivers::chardev::init();
     trap::init();
     trap::enable_timer_interrupt();
     drivers::plic::init();

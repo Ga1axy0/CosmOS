@@ -31,6 +31,11 @@ lazy_static! {
    pub static ref UART: Arc<CharDeviceImpl> = Arc::new(CharDeviceImpl::new());
 }
 
+/// Explicitly initializes the global UART device during early boot.
+pub fn init() {
+   lazy_static::initialize(&UART);
+}
+
 /// Returns whether the UART has finished initialization.
 pub fn uart_ready() -> bool {
    UART_READY.load(Ordering::Acquire)
