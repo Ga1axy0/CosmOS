@@ -118,43 +118,67 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
     })
 }
 
+const WNOHANG: isize = 1;
+
 /// waitpid syscall
 ///
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel: sys_waitpid");
+pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
+    trace!("kernel: sys_wait4");
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     syscall_body!({
-        // no matching child at all
-        if !inner
-            .children
-            .iter()
-            .any(|p| pid == -1 || pid as usize == p.getpid())
-        {
-            return Err(ERRNO::ECHILD);
+        if options & !WNOHANG != 0 {
+            return Err(ERRNO::EINVAL);
         }
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
-        });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
-            assert_eq!(Arc::strong_count(&child), 1);
-            let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
-            // write exit code into user space; bad pointer → EFAULT
-            if !exit_code_ptr.is_null() {
-                if let Some(slot) = translated_refmut(inner.memory_set.token(), exit_code_ptr) {
-                    *slot = exit_code;
-                } else {
-                    return Err(ERRNO::EFAULT);
-                }
+
+        loop {
+            let mut inner = process.inner_exclusive_access();
+
+            // 1) 没有任何匹配的子进程
+            let has_target_child = inner
+                .children
+                .iter()
+                .any(|p| pid == -1 || pid as usize == p.getpid());
+            if !has_target_child {
+                return Err(ERRNO::ECHILD);
             }
-            Ok(found_pid as isize)
-        } else {
-            // child exists but not yet zombie
-            Err(ERRNO::EAGAIN)
+
+            // 2) 查找已经退出的目标子进程
+            let zombie_idx = inner.children.iter().position(|p| {
+                let p_inner = p.inner_exclusive_access();
+                p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+            });
+
+            if let Some(idx) = zombie_idx {
+                let child = inner.children.remove(idx);
+                let found_pid = child.getpid();
+                let exit_code = child.inner_exclusive_access().exit_code;
+                let token = inner.memory_set.token();
+                drop(inner);
+
+                if !exit_code_ptr.is_null() {
+                    if let Some(slot) = translated_refmut(token, exit_code_ptr) {
+                        *slot = exit_code;
+                    } else {
+                        return Err(ERRNO::EFAULT);
+                    }
+                }
+
+                return Ok(found_pid as isize);
+            }
+
+            // 3) 有目标子进程，但目前没有 zombie
+            if options & WNOHANG != 0 {
+                return Ok(0);
+            }
+
+            // 4) 阻塞等待；这里必须先释放 inner，再睡眠
+            drop(inner);
+
+            // 按你仓库 Condvar 的实际 API 替换这一行：
+            // 例如可能是 wait() / wait_no_sched() / wait_with_mutex(...)
+            process.wait_exit_condvar.wait_simple();
         }
     })
 }

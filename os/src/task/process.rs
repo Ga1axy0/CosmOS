@@ -21,6 +21,7 @@ pub struct ProcessControlBlock {
     pub pid: PidHandle,
     /// mutable
     inner: UPSafeCell<ProcessControlBlockInner>,
+    pub wait_exit_condvar: Arc<Condvar>,
 }
 
 /// Inner of Process Control Block
@@ -90,6 +91,10 @@ impl ProcessControlBlockInner {
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
     }
+
+    pub fn is_zombie(&self) -> bool {
+        self.is_zombie
+    }
 }
 
 impl ProcessControlBlock {
@@ -134,6 +139,7 @@ impl ProcessControlBlock {
                     cwd: String::from("/"),
                 })
             },
+            wait_exit_condvar: Arc::new(Condvar::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = Arc::new(TaskControlBlock::new(
@@ -265,6 +271,7 @@ impl ProcessControlBlock {
                     cwd: parent.cwd.clone(),
                 })
             },
+            wait_exit_condvar: Arc::new(Condvar::new())
         });
         // add child
         parent.children.push(Arc::clone(&child));
@@ -332,6 +339,7 @@ impl ProcessControlBlock {
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
                 })
             },
+            wait_exit_condvar: Arc::new(Condvar::new())
         });
         parent.children.push(Arc::clone(&child));
         drop(parent);

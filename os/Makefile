@@ -9,7 +9,7 @@ FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
 MAIN_FS := ext4
 # Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
 # image and injects user apps into it.
-BASE_IMG ?=
+BASE_IMG ?= ../sdcard-rv.img
 APPS := ../user/src/bin/*
 OFFLINE :=
 

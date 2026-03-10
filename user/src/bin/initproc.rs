@@ -4,19 +4,20 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{exec, fork, wait, yield_};
+use user_lib::{exec, exit, fork, wait, yield_};
 
 #[no_mangle]
 fn main() -> i32 {
-    if fork() == 0 {
+    let pid = fork();
+    if pid == 0 {
         exec("sh\0", &[core::ptr::null::<u8>()]);
     } else {
         loop {
             let mut exit_code: i32 = 0;
-            let pid = wait(&mut exit_code);
-            if pid == -11 {
-                yield_();
-                continue;
+            let wait_result = wait(&mut exit_code);
+            if wait_result == pid {
+                println!("[initproc] No more children, shutting down...");
+                exit(0);
             }
             println!(
                 "[initproc] Released a zombie process, pid={}, exit_code={}",

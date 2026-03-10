@@ -38,7 +38,7 @@ pub fn init() {
     }
 }
 /// set trap entry for traps happen in kernel(supervisor) mode
-fn set_kernel_trap_entry() {
+pub fn set_kernel_trap_entry() {
     extern "C" {
         fn __trap_from_kernel();
     }
@@ -47,7 +47,7 @@ fn set_kernel_trap_entry() {
     }
 }
 /// set trap entry for traps happen in user mode
-fn set_user_trap_entry() {
+pub fn set_user_trap_entry() {
     unsafe {
         stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
     }
@@ -150,10 +150,29 @@ pub fn trap_return() -> ! {
 
 /// handle trap from kernel
 #[no_mangle]
-pub fn trap_from_kernel() -> ! {
-    use riscv::register::sepc;
-    trace!("stval = {:#x}, sepc = {:#x}", stval::read(), sepc::read());
-    panic!("a trap {:?} from kernel!", scause::read().cause());
+pub fn trap_from_kernel() {
+    // debug!("Trap from kernel: scause = {:?}, stval = {:#x}", scause::read(), stval::read());
+    let scause = scause::read();
+    let stval = stval::read();
+    let cause: Trap = scause
+        .cause()
+        .try_into()
+        .unwrap_or_else(|_| panic!("Invalid trap {:?}, stval = {:#x}!", scause.cause(), stval));
+    match cause.try_into() {
+        Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
+            // debug!("External interrupt from kernel: scause = {:?}, stval = {:#x}", scause, stval);
+            crate::drivers::plic::handle_supervisor_external();
+            // crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
+        }
+        Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            crate::timer::set_next_trigger();
+            // crate::net::poll();
+        }
+        _ => {
+            panic!("Kernel trap: {:?}, stval = {:#x}", scause.cause(), stval);
+        }
+    }
+    // check_timer();
 }
 
 pub use context::TrapContext;
