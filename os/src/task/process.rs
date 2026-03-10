@@ -101,7 +101,8 @@ impl ProcessControlBlock {
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        // assert that initproc is always valid elf
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data).unwrap();
         // allocate a pid
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -164,12 +165,12 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) {
+    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) -> Result<(), ()> {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         // memory_set with elf program headers/trampoline/trap context/user stack
         trace!("kernel: exec .. MemorySet::from_elf");
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data)?;
         let new_token = memory_set.token();
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
@@ -192,7 +193,7 @@ impl ProcessControlBlock {
                 translated_refmut(
                     new_token,
                     (argv_base + arg * core::mem::size_of::<usize>()) as *mut usize,
-                )
+                ).unwrap()
             })
             .collect();
         *argv[args.len()] = 0;
@@ -201,10 +202,10 @@ impl ProcessControlBlock {
             *argv[i] = user_sp;
             let mut p = user_sp;
             for c in args[i].as_bytes() {
-                *translated_refmut(new_token, p as *mut u8) = *c;
+                *translated_refmut(new_token, p as *mut u8).unwrap() = *c;
                 p += 1;
             }
-            *translated_refmut(new_token, p as *mut u8) = 0;
+            *translated_refmut(new_token, p as *mut u8).unwrap() = 0;
         }
         // make the user_sp aligned to 8B for k210 platform
         user_sp -= user_sp % core::mem::size_of::<usize>();
@@ -220,6 +221,7 @@ impl ProcessControlBlock {
         trap_cx.x[10] = args.len();
         trap_cx.x[11] = argv_base;
         *task_inner.get_trap_cx() = trap_cx;
+        Ok(())
     }
 
     /// Only support processes with a single thread.
@@ -296,8 +298,8 @@ impl ProcessControlBlock {
     }
 
     /// Create a child process directly from elf image.
-    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ()> {
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data)?;
         let mut parent = self.inner_exclusive_access();
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
@@ -353,7 +355,7 @@ impl ProcessControlBlock {
         drop(child_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
-        child
+        Ok(child)
     }
     /// get pid
     pub fn getpid(&self) -> usize {

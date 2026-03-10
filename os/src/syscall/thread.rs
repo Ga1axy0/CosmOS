@@ -1,5 +1,6 @@
 use crate::{
     mm::kernel_token,
+    syscall::errno::ERRNO,
     task::{add_task, current_task, TaskControlBlock},
     trap::{trap_handler, TrapContext},
 };
@@ -76,9 +77,10 @@ pub fn sys_gettid() -> isize {
 
 /// wait for a thread to exit syscall
 ///
-/// thread does not exist, return -1
-/// thread has not exited yet, return -2
-/// otherwise, return thread's exit code
+/// - Returns `EINVAL`  if `tid` is the current thread (cannot wait for self).
+/// - Returns `ESRCH`   if the thread does not exist.
+/// - Returns `EAGAIN`  if the thread has not exited yet.
+/// - Otherwise returns the thread's exit code.
 pub fn sys_waittid(tid: usize) -> i32 {
     trace!(
         "kernel:pid[{}] tid[{}] sys_waittid",
@@ -97,24 +99,18 @@ pub fn sys_waittid(tid: usize) -> i32 {
     let mut process_inner = process.inner_exclusive_access();
     // a thread cannot wait for itself
     if task_inner.res.as_ref().unwrap().tid == tid {
-        return -1;
+        return -(ERRNO::EINVAL as i32);
     }
-    let mut exit_code: Option<i32> = None;
-    let waited_task = process_inner.tasks[tid].as_ref();
-    if let Some(waited_task) = waited_task {
-        if let Some(waited_exit_code) = waited_task.inner_exclusive_access().exit_code {
-            exit_code = Some(waited_exit_code);
-        }
-    } else {
-        // waited thread does not exist
-        return -1;
-    }
-    if let Some(exit_code) = exit_code {
+    let waited_task = process_inner.tasks.get(tid).and_then(|t| t.as_ref());
+    let exit_code = match waited_task {
+        None => return -(ERRNO::ESRCH as i32), // thread does not exist
+        Some(t) => t.inner_exclusive_access().exit_code,
+    };
+    if let Some(code) = exit_code {
         // dealloc the exited thread
         process_inner.tasks[tid] = None;
-        exit_code
+        code
     } else {
-        // waited thread has not exited
-        -2
+        -(ERRNO::EAGAIN as i32) // thread has not exited yet
     }
 }

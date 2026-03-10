@@ -2,6 +2,7 @@ use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
+use crate::syscall::errno::ERRNO;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -19,6 +20,7 @@ use lazy_static::*;
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    path: String,
     inner: UPSafeCell<OSInodeInner>,
 }
 /// inner of inode in memory
@@ -29,11 +31,12 @@ pub struct OSInodeInner {
 
 impl OSInode {
     /// create a new inode in memory
-    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>, path: String) -> Self {
         trace!("kernel: OSInode::new");
         Self {
             readable,
             writable,
+            path,
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
         }
     }
@@ -41,8 +44,7 @@ impl OSInode {
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
         let mut inner = self.inner.exclusive_access();
-        let mut buffer: Vec<u8> = Vec::with_capacity(512);
-        buffer.resize(512, 0);
+        let mut buffer: Vec<u8> = alloc::vec![0; 512];
         let mut v: Vec<u8> = Vec::new();
         loop {
             let len = inner.inode.read_at(inner.offset, &mut buffer);
@@ -55,6 +57,11 @@ impl OSInode {
         v
     }
 }
+
+/// Special dirfd value meaning “use the caller's current working directory”.
+pub const AT_FDCWD: isize = -100;
+/// `unlinkat` flag for removing an empty directory instead of a non-directory.
+pub const AT_REMOVEDIR: u32 = 0x200;
 
 lazy_static! {
     pub static ref ROOT_INODE: Arc<Inode> = {
@@ -173,11 +180,16 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
         if let Some(existing) = parent.find(&name) {
             // File already exists: truncate if asked, then return it.
             existing.clear();
-            Some(Arc::new(OSInode::new(readable, writable, existing)))
+            Some(Arc::new(OSInode::new(
+                readable,
+                writable,
+                existing,
+                abs.clone(),
+            )))
         } else {
             parent
                 .create(&name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
+                .map(|inode| Arc::new(OSInode::new(readable, writable, inode, abs.clone())))
         }
     } else {
         lookup_inode(&abs).map(|inode| {
@@ -185,18 +197,30 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
                 debug!("open_file_at: truncating existing file at {}", abs);
                 inode.clear();
             }
-            Arc::new(OSInode::new(readable, writable, inode))
+            Arc::new(OSInode::new(readable, writable, inode, abs.clone()))
         })
     }
 }
 
 /// Create a directory at `path` relative to `cwd`.
 /// Returns `true` on success.
-pub fn mkdir_at(cwd: &str, path: &str) -> bool {
+pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
     if let Some((parent, name)) = resolve_parent(cwd, path) {
-        parent.mkdir(&name).is_some()
+        // 已存在同名目录或文件
+        if parent.find(&name).is_some() {
+            return Err(ERRNO::EEXIST);
+        }
+        // 父节点不是目录
+        if !parent.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        // 创建失败
+        if parent.mkdir(&name).is_none() {
+            return Err(ERRNO::EIO);
+        }
+        Ok(())
     } else {
-        false
+        Err(ERRNO::ENOENT)
     }
 }
 
@@ -234,59 +258,73 @@ impl OpenFlags {
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     trace!("kernel: open_file: name = {}, flags = {:?}", name, flags);
     let (readable, writable) = flags.read_write();
+    let abs = canonicalize("/", name);
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
             // clear size
             inode.clear();
-            Some(Arc::new(OSInode::new(readable, writable, inode)))
+            Some(Arc::new(OSInode::new(readable, writable, inode, abs)))
         } else {
             // create file
             ROOT_INODE
                 .create(name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
+                .map(|inode| Arc::new(OSInode::new(readable, writable, inode, canonicalize("/", name))))
         }
     } else {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.clear();
             }
-            Arc::new(OSInode::new(readable, writable, inode))
+            Arc::new(OSInode::new(readable, writable, inode, abs))
         })
     }
 }
 
-/// Create a hard link from `old_path` to `new_path` relative to `cwd`.
-///
-/// Note: current backend link support is directory-local; we only allow linking
-/// within the same parent directory.
-pub fn linkat(cwd: &str, old_path: &str, new_path: &str) -> Result<(), ()> {
-    let old_abs = canonicalize(cwd, old_path);
-    let new_abs = canonicalize(cwd, new_path);
-    let (old_parent_path, old_name) = old_abs.rsplit_once('/').ok_or(())?;
-    let (new_parent_path, new_name) = new_abs.rsplit_once('/').ok_or(())?;
+/// Create a hard link from `old_path` to `new_path`.
+pub fn linkat(old_cwd: &str, old_path: &str, new_cwd: &str, new_path: &str) -> Result<(), ERRNO> {
+    let (_, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
+    let (new_parent, new_name) = resolve_parent(new_cwd, new_path).ok_or(ERRNO::ENOENT)?;
     if old_name.is_empty() || new_name.is_empty() {
-        return Err(());
+        return Err(ERRNO::ENOENT);
     }
-    // Keep behavior explicit: only same-parent hard-link is supported here.
-    if old_parent_path != new_parent_path {
-        return Err(());
+    let (old_parent, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
+    let old_inode = old_parent.find(old_name.as_str()).ok_or(ERRNO::ENOENT)?;
+    if old_inode.is_dir() {
+        return Err(ERRNO::EPERM);
     }
-    let parent = lookup_inode(if old_parent_path.is_empty() {
-        "/"
-    } else {
-        old_parent_path
-    })
-    .ok_or(())?;
-    parent.link(old_name, new_name)
+    if new_parent.find(new_name.as_str()).is_some() {
+        return Err(ERRNO::EEXIST);
+    }
+    new_parent
+        .link_inode(&old_inode, new_name.as_str())?;
+    Ok(())
 }
 
 /// Remove a link at `path` relative to `cwd`.
-pub fn unlinkat(cwd: &str, path: &str) -> Result<(), ()> {
-    let (parent, name) = resolve_parent(cwd, path).ok_or(())?;
-    if name.is_empty() {
-        return Err(());
+pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(ERRNO::EINVAL);
     }
-    parent.unlink(name.as_str())
+    let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
+    if name.is_empty() {
+        return Err(ERRNO::ENOENT);
+    }
+    let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
+    if inode.is_dir() {
+        if flags & AT_REMOVEDIR == 0 {
+            return Err(ERRNO::EISDIR);
+        }
+        if !inode.ls().is_empty() {
+            return Err(ERRNO::ENOTEMPTY);
+        }
+        parent.rmdir(name.as_str())?
+    } else {
+        if flags & AT_REMOVEDIR != 0 {
+            return Err(ERRNO::ENOTDIR);
+        }
+        parent.unlink(name.as_str())?
+    }
+    Ok(())
 }
 
 impl File for OSInode {
@@ -402,5 +440,9 @@ impl File for OSInode {
             nlink: inner.inode.nlink(),
             pad: [0; 7],
         }
+    }
+
+    fn path(&self) -> Option<String> {
+        Some(self.path.clone())
     }
 }

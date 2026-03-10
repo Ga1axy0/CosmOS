@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use user_lib::{exit, mkdir, STDOUT, write};
+use user_lib::{STDOUT, exit, mkdir, println, write};
 
 
 extern crate user_lib;
@@ -17,8 +17,14 @@ pub fn main(argc: usize, argv: &[&str]) -> i32 {
     let dir = argv[1];
     let ret = mkdir(dir, 0o755);
     if ret < 0 {
-        let msg = b"mkdir: failed to create directory\n";
-        write(STDOUT, msg);
+        println!("mkdir: failed to create '{}':", dir);
+        match ret {
+            -1 => println!("Operation not permitted"),
+            -2 => println!("No such file or directory"),
+            -5 => println!("IO error"),
+            -17 => println!("File exists"),
+            _ => println!("Unknown error {}", ret),
+        }
         exit(-1);
     }
     0

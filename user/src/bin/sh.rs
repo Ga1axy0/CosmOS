@@ -105,8 +105,6 @@ pub fn main() -> i32 {
                         }
 
                         if !argv.is_empty() {
-                            let cmd_for_diag = argv[0].clone(); // 用于诊断 exec 错误
-
                             // Convert argv into C strings for exec.
                             argv.iter_mut().for_each(|s| s.push('\0'));
                             let mut args_addr: Vec<*const u8> =
@@ -143,14 +141,13 @@ pub fn main() -> i32 {
                                     close(output_fd);
                                 }
                                 // child process
-                                if exec(argv[0].as_str(), args_addr.as_slice()) == -1 {
-                                    let probe_fd = open(cmd_for_diag.as_str(), OpenFlags::RDONLY);
-                                    // 判断错误原因是文件不存在还是 exec 失败
-                                    if probe_fd < 0 {
-                                        println!("Error when finding {}", cmd_for_diag.as_str());
-                                    } else {
-                                        close(probe_fd as usize);
-                                        println!("Error when executing {}", cmd_for_diag.as_str());
+                                let ret = exec(argv[0].as_str(), args_addr.as_slice());
+                                if ret < 0 {
+                                    match ret {
+                                        -2 => println!("sh: {}: No such file or directory", argv[0]),
+                                        -8 => println!("sh: {}: Not an executable file", argv[0]),
+                                        -21 => println!("sh: {}: Is a directory", argv[0]),
+                                        _ => println!("sh: Error when executing: {}", ret),
                                     }
                                     return -4;
                                 }

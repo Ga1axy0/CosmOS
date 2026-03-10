@@ -1,6 +1,7 @@
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
+use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
 
 const DEADLOCK_DETECTED: isize = -0xDEAD;
@@ -84,17 +85,23 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     );
     let process = current_process();
     let tid = current_tid();
+    // Retrieve (and optionally deadlock-check) while holding inner, then drop before blocking.
     let mutex = {
         let mut process_inner = process.inner_exclusive_access();
-        if mutex_id >= process_inner.mutex_list.len() || process_inner.mutex_list[mutex_id].is_none()
+        let mutex = match process_inner
+            .mutex_list
+            .get(mutex_id)
+            .and_then(|m| m.as_ref())
         {
-            return -1;
-        }
-        if process_inner.deadlock_enabled && !process_inner.mutex_detector.begin_request(tid, mutex_id)
+            Some(m) => Arc::clone(m),
+            None => return -(ERRNO::EINVAL as isize),
+        };
+        if process_inner.deadlock_enabled
+            && !process_inner.mutex_detector.begin_request(tid, mutex_id)
         {
             return DEADLOCK_DETECTED;
         }
-        Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap())
+        mutex
     };
     mutex.lock();
     let mut process_inner = process.inner_exclusive_access();
@@ -118,11 +125,14 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
     let tid = current_tid();
     let mutex = {
         let process_inner = process.inner_exclusive_access();
-        if mutex_id >= process_inner.mutex_list.len() || process_inner.mutex_list[mutex_id].is_none()
+        match process_inner
+            .mutex_list
+            .get(mutex_id)
+            .and_then(|m| m.as_ref())
         {
-            return -1;
+            Some(m) => Arc::clone(m),
+            None => return -(ERRNO::EINVAL as isize),
         }
-        Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap())
     };
     mutex.unlock();
     let mut process_inner = process.inner_exclusive_access();
@@ -179,11 +189,14 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
     let tid = current_tid();
     let sem = {
         let process_inner = process.inner_exclusive_access();
-        if sem_id >= process_inner.semaphore_list.len() || process_inner.semaphore_list[sem_id].is_none()
+        match process_inner
+            .semaphore_list
+            .get(sem_id)
+            .and_then(|s| s.as_ref())
         {
-            return -1;
+            Some(s) => Arc::clone(s),
+            None => return -(ERRNO::EINVAL as isize),
         }
-        Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap())
     };
     sem.up();
     let mut process_inner = process.inner_exclusive_access();
@@ -207,16 +220,20 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     let tid = current_tid();
     let sem = {
         let mut process_inner = process.inner_exclusive_access();
-        if sem_id >= process_inner.semaphore_list.len() || process_inner.semaphore_list[sem_id].is_none()
+        let sem = match process_inner
+            .semaphore_list
+            .get(sem_id)
+            .and_then(|s| s.as_ref())
         {
-            return -1;
-        }
+            Some(s) => Arc::clone(s),
+            None => return -(ERRNO::EINVAL as isize),
+        };
         if process_inner.deadlock_enabled
             && !process_inner.semaphore_detector.begin_request(tid, sem_id)
         {
             return DEADLOCK_DETECTED;
         }
-        Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap())
+        sem
     };
     sem.down();
     let mut process_inner = process.inner_exclusive_access();

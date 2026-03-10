@@ -83,7 +83,7 @@ pub fn main() -> i32 {
 
 	let mut tiny = [0u8; 1];
 	let ret = getcwd(&mut tiny);
-	assert_eq!(ret, 0, "getcwd should fail with too-small buffer");
+	assert_eq!(ret, -34, "getcwd should fail with too-small buffer");
 
 	// ---- mkdirat/chdir basics ----
 	// Create a unique directory at root to avoid collisions with previous runs.

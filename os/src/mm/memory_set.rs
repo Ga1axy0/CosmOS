@@ -181,19 +181,19 @@ impl MemorySet {
     }
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp_base and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, usize, usize), ()> {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
         // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| ())?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
+            let ph = elf.program_header(i).map_err(|_| ())?;
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
@@ -220,11 +220,11 @@ impl MemorySet {
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_base: usize = max_end_va.into();
         user_stack_base += PAGE_SIZE;
-        (
+        Ok((
             memory_set,
             user_stack_base,
             elf.header.pt2.entry_point() as usize,
-        )
+        ))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &Self) -> Self {
@@ -308,7 +308,10 @@ impl MemorySet {
                 return false;
             }
         }
-        self.push(MapArea::new(start_va, end_va, MapType::Framed, permission), None);
+        self.push(
+            MapArea::new(start_va, end_va, MapType::Framed, permission),
+            None,
+        );
         if let Some(area) = self.areas.last_mut() {
             area.is_anonymous = true;
         }
@@ -347,7 +350,11 @@ impl MemorySet {
             } else {
                 start_vpn
             };
-            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+            let overlap_end = if area_end < end_vpn {
+                area_end
+            } else {
+                end_vpn
+            };
 
             if overlap_start >= overlap_end {
                 new_areas.push(area);
@@ -389,8 +396,6 @@ impl MemorySet {
         }
         true
     }
-
-
 }
 
 pub struct MapArea {

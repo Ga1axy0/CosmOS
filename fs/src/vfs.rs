@@ -1,10 +1,13 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 
+use crate::errno::FS_ERRNO;
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
-pub trait VfsNode: Send + Sync {
+pub trait VfsNode: Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
     fn ls(&self) -> Vec<String>;
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
@@ -26,13 +29,23 @@ pub trait VfsNode: Send + Sync {
     }
 
     /// Create a hard link in this directory.
-    fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), ()> {
-        Err(())
+    fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EACCES)
+    }
+
+    /// Create a hard link in this directory to an already-resolved inode.
+    fn link_inode(&self, _child: &Arc<dyn VfsNode>, _new_name: &str) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EACCES)
     }
 
     /// Remove a name entry in this directory.
-    fn unlink(&self, _name: &str) -> Result<(), ()> {
-        Err(())
+    fn unlink(&self, _name: &str) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EACCES)
+    }
+
+    /// Remove an empty sub-directory in this directory.
+    fn rmdir(&self, _name: &str) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EACCES)
     }
 }
 
@@ -89,11 +102,19 @@ impl Inode {
         self.inner.nlink()
     }
 
-    pub fn link(&self, old_name: &str, new_name: &str) -> Result<(), ()> {
+    pub fn link(&self, old_name: &str, new_name: &str) -> Result<(), FS_ERRNO> {
         self.inner.link(old_name, new_name)
     }
 
-    pub fn unlink(&self, name: &str) -> Result<(), ()> {
+    pub fn link_inode(&self, child: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
+        self.inner.link_inode(&child.inner, new_name)
+    }
+
+    pub fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
         self.inner.unlink(name)
+    }
+
+    pub fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
+        self.inner.rmdir(name)
     }
 }

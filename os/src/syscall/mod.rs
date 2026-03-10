@@ -13,7 +13,7 @@
 /// getcwd syscall
 pub const SYSCALL_GETCWD: usize = 17;
 /// dup syscall
-pub const SYSCALL_DUP: usize = 24;
+pub const SYSCALL_DUP: usize = 23;
 /// mkdirat syscall
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
@@ -113,27 +113,58 @@ mod process;
 mod sync;
 mod thread;
 
+/// Standard error numbers and conversion traits
+pub mod errno;
+
 use fs::*;
 use process::*;
 use sync::*;
 use thread::*;
 
+
 use crate::fs::Stat;
 
+/// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
+/// converting `Err(e)` into `-(e as isize)`.  Use with the `?` operator and
+/// `OrErrno` to propagate errors cleanly:
+///
+/// ```rust
+/// syscall_body!({
+///     let path = translated_str(token, ptr).or_errno(ERRNO::EFAULT)?;
+///     Ok(0)
+/// })
+/// ```
+#[macro_export]
+macro_rules! syscall_body {
+    ($body:block) => {{
+        let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
+        match result {
+            Ok(v) => v,
+            Err(e) => -(e as isize),
+        }
+    }};
+}
+
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
-pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
+pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
-        SYSCALL_LINKAT => sys_linkat(args[1] as *const u8, args[3] as *const u8),
-        SYSCALL_UNLINKAT => sys_unlinkat(args[1] as *const u8),
-        SYSCALL_OPENAT => sys_open(args[1] as *const u8, args[2] as u32),
+        SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_LINKAT => sys_linkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4] as u32,
+        ),
+        SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
         SYSCALL_PIPE => sys_pipe(args[0] as *mut usize),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
-        SYSCALL_MKDIRAT => sys_mkdirat(args[1] as *const u8, args[2] as u32),
+        SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),

@@ -4,6 +4,7 @@ mod inode;
 mod pipe;
 mod stdio;
 
+use alloc::string::String;
 use crate::mm::UserBuffer;
 
 /// trait File for all file types
@@ -28,6 +29,10 @@ pub trait File: Send + Sync {
     }
     /// get file metadata
     fn stat(&self) -> Stat;
+    /// Returns the canonical path used when this file was opened, if any.
+    fn path(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The stat of a inode
@@ -64,8 +69,8 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, linkat, list_apps, lookup_inode, mkdir_at, open_file, open_file_at, unlinkat,
-    OpenFlags, OSInode,
+    canonicalize, linkat, list_apps, lookup_inode, mkdir_at, open_file, open_file_at,
+    unlinkat, AT_FDCWD, AT_REMOVEDIR, OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::{Stdin, Stdout};
