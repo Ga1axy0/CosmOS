@@ -126,14 +126,16 @@ pub fn sys_close(fd: usize) -> isize {
     );
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return -1;
-    }
-    if inner.fd_table[fd].is_none() {
-        return -1;
-    }
-    inner.fd_table[fd].take();
-    0
+    syscall_body!({
+        if fd >= inner.fd_table.len() {
+            return Err(ERRNO::EBADF);
+        }
+        if inner.fd_table[fd].is_none() {
+            return Err(ERRNO::EBADF);
+        }
+        inner.fd_table[fd].take();
+        Ok(0)
+    })
 }
 
 /// pipe syscall
@@ -166,15 +168,17 @@ pub fn sys_dup(fd: usize) -> isize {
     );
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return -(ERRNO::EBADF as isize);
-    }
-    if inner.fd_table[fd].is_none() {
-        return -(ERRNO::EBADF as isize);
-    }
-    let new_fd = inner.alloc_fd();
-    inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
-    new_fd as isize
+    syscall_body!({
+        if fd >= inner.fd_table.len() {
+            return Err(ERRNO::EBADF);
+        }
+        if inner.fd_table[fd].is_none() {
+            return Err(ERRNO::EBADF);
+        }
+        let new_fd = inner.alloc_fd();
+        inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
+        Ok(new_fd as isize)
+    })
 }
 
 /// fstat syscall
