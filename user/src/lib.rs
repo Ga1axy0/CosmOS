@@ -156,7 +156,8 @@ bitflags! {
     }
 }
 
-const AT_FDCWD: isize = -100;
+pub const AT_FDCWD: isize = -100;
+pub const AT_REMOVEDIR: usize = 0x200;
 
 fn to_cstring(s: &str) -> String {
     if s.as_bytes().last() == Some(&0) {
@@ -189,11 +190,20 @@ pub fn write(fd: usize, buf: &[u8]) -> isize {
 }
 
 pub fn link(old_path: &str, new_path: &str) -> isize {
-    sys_linkat(AT_FDCWD as usize, old_path, AT_FDCWD as usize, new_path, 0)
+    let old_path = to_cstring(old_path);
+    let new_path = to_cstring(new_path);
+    sys_linkat(
+        AT_FDCWD as usize,
+        old_path.as_str(),
+        AT_FDCWD as usize,
+        new_path.as_str(),
+        0,
+    )
 }
 
 pub fn unlink(path: &str) -> isize {
-    sys_unlinkat(AT_FDCWD as usize, path, 0)
+    let path = to_cstring(path);
+    sys_unlinkat(AT_FDCWD as usize, path.as_str(), 0)
 }
 
 pub fn fstat(fd: usize, st: &mut Stat) -> isize {

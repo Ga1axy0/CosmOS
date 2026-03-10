@@ -1,13 +1,39 @@
 use crate::fs::{
-    canonicalize, linkat, lookup_inode, make_pipe, mkdir_at, open_file_at, unlinkat, OpenFlags,
-    Stat,
+    canonicalize, linkat, lookup_inode, make_pipe, mkdir_at, open_file_at, unlinkat,
+    OpenFlags, Stat, AT_FDCWD, AT_REMOVEDIR,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall_body;
 use crate::task::{current_process, current_task, current_user_token};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
+    if path.starts_with('/') {
+        return Ok(String::from("/"));
+    }
+    let process = current_process();
+    if dirfd == AT_FDCWD {
+        return Ok(process.inner_exclusive_access().cwd.clone());
+    }
+    if dirfd < 0 {
+        return Err(ERRNO::EBADF);
+    }
+    let inner = process.inner_exclusive_access();
+    let file = inner
+        .fd_table
+        .get(dirfd as usize)
+        .and_then(|file| file.as_ref())
+        .ok_or(ERRNO::EBADF)?
+        .clone();
+    drop(inner);
+    if !file.is_dir() {
+        return Err(ERRNO::ENOTDIR);
+    }
+    file.path().ok_or(ERRNO::ENOTDIR)
+}
 
 
 /// write syscall
@@ -62,7 +88,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
 }
 
 /// open sysall
-pub fn sys_open(path: *const u8, flags: u32) -> isize {
+pub fn sys_open(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_open",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -71,10 +97,13 @@ pub fn sys_open(path: *const u8, flags: u32) -> isize {
     let token = current_user_token();
     syscall_body!({
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
-        let cwd = process.inner_exclusive_access().cwd.clone();
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
         debug!(
-            "sys_open: path = {}, flags = {}, cwd = {}",
-            path, flags, cwd
+            "sys_open: dirfd = {}, path = {}, flags = {}, cwd = {}",
+            dirfd, path, flags, cwd
         );
         let inode = open_file_at(
             cwd.as_str(),
@@ -186,13 +215,22 @@ pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
 }
 
 /// linkat syscall
-pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
+pub fn sys_linkat(
+    old_dirfd: isize,
+    old_name: *const u8,
+    new_dirfd: isize,
+    new_name: *const u8,
+    flags: u32,
+) -> isize {
     trace!(
         "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
     syscall_body!({
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
         let old_path = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
         let new_path = translated_str(token, new_name).or_errno(ERRNO::EFAULT)?;
         if old_path.is_empty() || new_path.is_empty() {
@@ -201,26 +239,30 @@ pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
         if old_path == new_path {
             return Err(ERRNO::EINVAL);
         }
-        let cwd = current_process().inner_exclusive_access().cwd.clone();
-        linkat(cwd.as_str(), &old_path, &new_path)?;
+        let old_cwd = resolve_dirfd_base(old_dirfd, old_path.as_str())?;
+        let new_cwd = resolve_dirfd_base(new_dirfd, new_path.as_str())?;
+        linkat(old_cwd.as_str(), &old_path, new_cwd.as_str(), &new_path)?;
         Ok(0)
     })
 }
 
 /// unlinkat syscall
-pub fn sys_unlinkat(name: *const u8) -> isize {
+pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
     syscall_body!({
+        if flags & !AT_REMOVEDIR != 0 {
+            return Err(ERRNO::EINVAL);
+        }
         let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
         if name.is_empty() {
             return Err(ERRNO::ENOENT);
         }
-        let cwd = current_process().inner_exclusive_access().cwd.clone();
-        unlinkat(cwd.as_str(), &name)?;
+        let cwd = resolve_dirfd_base(dirfd, name.as_str())?;
+        unlinkat(cwd.as_str(), &name, flags)?;
         Ok(0)
     })
 }
@@ -263,20 +305,22 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     })
 }
 
-/// mkdirat – create a directory at `path` relative to the current working directory.
+/// mkdirat – create a directory at `path` relative to the provided directory fd.
 ///
 /// `mode` is accepted but not enforced.
 /// Returns 0 on success, −errno on failure.
-pub fn sys_mkdirat(path: *const u8, _mode: u32) -> isize {
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_mkdirat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
-    let process = current_process();
     syscall_body!({
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
-        let cwd = process.inner_exclusive_access().cwd.clone();
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
         mkdir_at(cwd.as_str(), path.as_str())?;
         Ok(0)
     })

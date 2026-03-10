@@ -1,4 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 use spin::Mutex;
 
 use crate::{BLOCK_SZ, fat32::dir::DirAttr};
@@ -473,6 +474,10 @@ impl FatInode {
 }
 
 impl VfsNode for FatInode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn ls(&self) -> Vec<String> {
         let inner = self.inner.lock();
         if !inner.is_dir {

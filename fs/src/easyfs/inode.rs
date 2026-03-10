@@ -1,4 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
@@ -81,6 +82,10 @@ impl EasyInode {
 }
 
 impl VfsNode for EasyInode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn ls(&self) -> Vec<String> {
         let _fs = self.fs.lock();
         self.read_disk_inode(|disk_inode| {

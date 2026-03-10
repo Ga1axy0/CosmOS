@@ -1,13 +1,15 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use core::any::Any;
 use log::debug;
 use spin::Mutex;
 
 use crate::block_dev::BlockDevice as OsBlockDevice;
+use crate::errno::FS_ERRNO;
 use crate::vfs::{Inode, VfsNode};
-use crate::{BLOCK_SZ, ext4};
+use crate::BLOCK_SZ;
 
 use ext4_rs::{
-    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType,
+    BlockDevice as Ext4BlockDevice, Errno, Ext4, Ext4Error, InodeFileType
 };
 
 /// Adapts the OS block-id based device into ext4_rs offset-based IO.
@@ -34,7 +36,7 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         for block_id in start_block..end_block {
             let mut sector = [0u8; BLOCK_SZ];
 
-            debug!("Ext4BlockDeviceAdapter read: block_id={}, offset={}, len={}", block_id, offset, len);
+            // debug!("Ext4BlockDeviceAdapter read: block_id={}, offset={}, len={}", block_id, offset, len);
             self.inner.read_block(block_id, &mut sector);
 
             let block_start = block_id * BLOCK_SZ;
@@ -74,17 +76,17 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
             let dst_end = seg_end - block_start;
 
             if dst_start == 0 && dst_end == BLOCK_SZ {
-                debug!("Ext4BlockDeviceAdapter full block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
+                // debug!("Ext4BlockDeviceAdapter full block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
                 self.inner.write_block(block_id, &data[src_start..src_end]);
             } else {
                 let mut sector = [0u8; BLOCK_SZ];
 
-                debug!("Ext4BlockDeviceAdapter partial block read: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
+                // debug!("Ext4BlockDeviceAdapter partial block read: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
                 self.inner.read_block(block_id, &mut sector);
                 
                 sector[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
 
-                debug!("Ext4BlockDeviceAdapter partial block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
+                // debug!("Ext4BlockDeviceAdapter partial block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
                 self.inner.write_block(block_id, &sector);
             }
         }
@@ -137,6 +139,10 @@ impl Ext4Inode {
 }
 
 impl VfsNode for Ext4Inode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn ls(&self) -> Vec<String> {
         if !self.is_dir {
             return Vec::new();
@@ -211,44 +217,77 @@ impl VfsNode for Ext4Inode {
         inode_ref.inode.links_count() as u32
     }
 
-    fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), ()> {
+    fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
         if !self.is_dir {
-            return Err(());
+            return Err(FS_ERRNO::ENOTDIR);
         }
-        let (child_ino, _) = self.lookup_child_meta(_old_name).ok_or(())?;
+        let (child_ino, _) = self.lookup_child_meta(_old_name).ok_or(FS_ERRNO::ENOENT)?;
         let ext4 = self.fs.ext4.lock();
         let mut parent_ref = ext4.get_inode_ref(self.inode_num);
         let mut child_ref = ext4.get_inode_ref(child_ino);
-        ext4.link(&mut parent_ref, &mut child_ref, _new_name)
-            .map_err(|_| ())?;
+        ext4.link(&mut parent_ref, &mut child_ref, _new_name)?;
         // Persist updated link counts/dir entries.
         ext4.write_back_inode(&mut parent_ref);
         ext4.write_back_inode(&mut child_ref);
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<(), ()> {
+    fn link_inode(&self, child: &Arc<dyn VfsNode>, new_name: &str) -> Result<(), FS_ERRNO> {
         if !self.is_dir {
-            return Err(());
+            return Err(FS_ERRNO::ENOTDIR);
         }
-        let (child_ino, is_dir) = self.lookup_child_meta(name).ok_or(())?;
+        let child = child.as_any().downcast_ref::<Self>().ok_or(FS_ERRNO::EINVAL)?;
+        if child.is_dir {
+            return Err(FS_ERRNO::EISDIR);
+        }
+        let ext4 = self.fs.ext4.lock();
+        let mut parent_ref = ext4.get_inode_ref(self.inode_num);
+        let mut child_ref = ext4.get_inode_ref(child.inode_num);
+        ext4.link(&mut parent_ref, &mut child_ref, new_name)?;
+        ext4.write_back_inode(&mut parent_ref);
+        ext4.write_back_inode(&mut child_ref);
+        Ok(())
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
+        if !self.is_dir {
+            return Err(FS_ERRNO::ENOTDIR);
+        }
+        debug!("Ext4Inode unlink: parent_inode={}, name='{}'", self.inode_num, name);
+        let (child_ino, is_dir) = self.lookup_child_meta(name).ok_or(FS_ERRNO::ENOENT)?;
+        if is_dir {
+            return Err(FS_ERRNO::EISDIR);
+        }
         let ext4 = self.fs.ext4.lock();
         let mut parent_ref = ext4.get_inode_ref(self.inode_num);
         let mut child_ref = ext4.get_inode_ref(child_ino);
+        // Hard-link case: remove only this directory entry and decrement nlink.
         if !is_dir && child_ref.inode.links_count() > 1 {
-            // Hard-link case: remove only this directory entry and decrement nlink.
-            ext4.dir_remove_entry(&mut parent_ref, name).map_err(|_| ())?;
+            ext4.dir_remove_entry(&mut parent_ref, name)?;
             let new_links = child_ref.inode.links_count() - 1;
             child_ref.inode.set_links_count(new_links);
             ext4.write_back_inode(&mut parent_ref);
             ext4.write_back_inode(&mut child_ref);
+            log::debug!("Ext4Inode unlink: removed link '{}', new links_count={}", name, new_links);
             return Ok(());
         }
+        // Normal case: remove directory entry, decrement nlink, and truncate if this is the last link.
         if !is_dir && child_ref.inode.links_count() == 1 {
-            ext4.truncate_inode(&mut child_ref, 0).map_err(|_| ())?;
+            ext4.truncate_inode(&mut child_ref, 0)?;
+            log::debug!("Ext4Inode unlink: truncated inode {} to 0 length", child_ino);
         }
         ext4.unlink(&mut parent_ref, &mut child_ref, name)
-            .map(|_| ())
-            .map_err(|_| ())
+            .map(|_| ())?;
+        Ok(())
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
+        if !self.is_dir {
+            return Err(FS_ERRNO::ENOTDIR);
+        }
+        let ext4 = self.fs.ext4.lock();
+        debug!("Ext4Inode rmdir: parent_inode={}, name='{}'", self.inode_num, name);
+        ext4.dir_remove(self.inode_num, name).map(|_| ())?;
+        Ok(())
     }
 }
