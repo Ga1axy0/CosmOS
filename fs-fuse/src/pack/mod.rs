@@ -37,6 +37,9 @@ pub struct PackConfig {
     pub src_path: std::path::PathBuf,
     pub img_path: std::path::PathBuf,
     pub image_size_bytes: u64,
+    /// Optional base ext4 image to clone before writing user apps.
+    /// Only used when format is ext4.
+    pub ext4_base_img: Option<std::path::PathBuf>,
 }
 
 pub fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {

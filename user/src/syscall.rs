@@ -27,7 +27,7 @@ pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_FORK: usize = 220;
-pub const SYSCALL_EXEC: usize = 221;
+pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
 pub const SYSCALL_SBRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
@@ -175,10 +175,10 @@ pub fn sys_fork() -> isize {
     syscall(SYSCALL_FORK, [0, 0, 0])
 }
 
-pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
+pub fn sys_execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
     syscall(
-        SYSCALL_EXEC,
-        [path.as_ptr() as usize, args.as_ptr() as usize, 0],
+        SYSCALL_EXECVE,
+        [path.as_ptr() as usize, args.as_ptr() as usize, envp.as_ptr() as usize],
     )
 }
 
@@ -303,14 +303,7 @@ pub fn sys_getcwd(buffer: &mut [u8]) -> isize {
 pub fn sys_mkdirat(dirfd: usize, path: &str, mode: u32) -> isize {
     syscall6(
         SYSCALL_MKDIRAT,
-        [
-            dirfd,
-            path.as_ptr() as usize,
-            mode as usize,
-            0,
-            0,
-            0,
-        ],
+        [dirfd, path.as_ptr() as usize, mode as usize, 0, 0, 0],
     )
 }
 
