@@ -43,7 +43,7 @@ impl Write for ConsoleBuffer {
 
 #[allow(unused)]
 pub fn print(args: fmt::Arguments) {
-    let mut buf = CONSOLE_BUFFER.lock();
+    let mut buf: spin::MutexGuard<'_, ConsoleBuffer> = CONSOLE_BUFFER.lock();
     // buf.write_fmt(args).unwrap();
     // BUG FIX: 关闭 stdout 后，本函数不能触发 panic，否则会造成死锁
     buf.write_fmt(args);

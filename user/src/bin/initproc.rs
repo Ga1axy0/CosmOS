@@ -14,7 +14,7 @@ fn main() -> i32 {
         loop {
             let mut exit_code: i32 = 0;
             let pid = wait(&mut exit_code);
-            if pid == -1 {
+            if pid == -11 {
                 yield_();
                 continue;
             }
