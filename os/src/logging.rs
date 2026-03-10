@@ -1,5 +1,6 @@
 //! Global logger
 
+use crate::drivers::chardev::uart_ready;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 /// a simple logger
@@ -11,6 +12,9 @@ impl Log for SimpleLogger {
     }
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
+            return;
+        }
+        if !uart_ready() {
             return;
         }
         let color = match record.level() {

@@ -5,7 +5,7 @@ use bitflags::bitflags;
 
 use crate::sync::{Condvar, UPIntrFreeCell};
 
-use super::CharDevice;
+use super::{set_uart_ready, CharDevice};
 
 bitflags! {
    struct IER: u8 {
@@ -186,10 +186,12 @@ impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
             read_buffer: VecDeque::new(),
       };
       inner.ns16550a.init();
-      Self {
+      let device = Self {
             inner: unsafe { UPIntrFreeCell::new(inner) },
             condvar: Condvar::new(),
-      }
+      };
+      set_uart_ready();
+      device
    }
 }
 
