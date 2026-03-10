@@ -43,6 +43,12 @@ fn run() -> std::io::Result<()> {
                 .value_parser(clap::value_parser!(u64))
                 .help("Image size in MiB (default: easyfs=16, fat32=64, ext4=64)"),
         )
+        .arg(
+            Arg::new("ext4_base")
+                .long("ext4-base")
+                .num_args(1)
+                .help("Existing ext4 image used as base (ext4 only)"),
+        )
         .get_matches();
 
     let src_path = PathBuf::from(
@@ -59,6 +65,13 @@ fn run() -> std::io::Result<()> {
         .get_one::<String>("format")
         .expect("Missing format");
     let format = FsFormat::from_str(format_str).expect("Invalid format value");
+    let ext4_base_img = matches.get_one::<String>("ext4_base").map(PathBuf::from);
+    if ext4_base_img.is_some() && format != FsFormat::Ext4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--ext4-base can only be used with --format ext4",
+        ));
+    }
 
     let default_size_mib = match format {
         FsFormat::EasyFs => 16,
@@ -77,6 +90,7 @@ fn run() -> std::io::Result<()> {
         src_path,
         img_path,
         image_size_bytes: size_mib * 1024 * 1024,
+        ext4_base_img,
     };
 
     let case_insensitive = format == FsFormat::Fat32;

@@ -233,8 +233,14 @@ pub fn fork() -> isize {
     sys_fork()
 }
 
+/// 兼容接口：执行程序（不传环境变量），内部等价于 `execve(path, args, [NULL])`。
 pub fn exec(path: &str, args: &[*const u8]) -> isize {
-    sys_exec(path, args)
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    sys_execve(path, args, &envp)
+}
+
+pub fn execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
+    sys_execve(path, args, envp)
 }
 
 pub fn set_priority(prio: isize) -> isize {

@@ -7,6 +7,9 @@ DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
+# Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
+# image and injects user apps into it.
+BASE_IMG ?=
 APPS := ../user/src/bin/*
 OFFLINE :=
 
@@ -65,10 +68,30 @@ endif
 $(KERNEL_BIN): kernel
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
 
-fs-img: $(APPS)
-	@make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE)
-	@rm -f $(FS_IMG)
-	@cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS)
+fs-img:
+	@if [ -f "$(FS_IMG)" ]; then \
+		echo "Using existing image: $(FS_IMG) (skip user rebuild/repack)."; \
+	else \
+		echo "Image not found: $(FS_IMG). Building user apps first."; \
+		make -C ../user clean; \
+		make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE); \
+		if [ -n "$(strip $(BASE_IMG))" ]; then \
+			if [ ! -f "$(BASE_IMG)" ]; then \
+				echo "Base image not found: $(BASE_IMG)"; \
+				exit 2; \
+			fi; \
+			if [ "$(MAIN_FS)" != "ext4" ]; then \
+				echo "BASE_IMG is only supported when MAIN_FS=ext4."; \
+				exit 2; \
+			fi; \
+			echo "Injecting user apps into base ext4 image: $(BASE_IMG)"; \
+			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS) --ext4-base $(BASE_IMG); \
+		else \
+			rm -f $(FS_IMG); \
+			echo "Packing fresh $(MAIN_FS) image from user apps."; \
+			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS); \
+		fi; \
+	fi
 
 kernel:
 	@echo Platform: $(BOARD)
@@ -80,6 +103,7 @@ endif
 
 clean:
 	@cargo clean
+	@rm -f $(FS_IMG)
 
 disasm: kernel
 	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) | less
