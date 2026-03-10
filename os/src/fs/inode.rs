@@ -228,15 +228,18 @@ bitflags! {
     ///  The flags argument to the open() system call is constructed by ORing together zero or more of the following values:
     pub struct OpenFlags: u32 {
         /// readyonly
-        const RDONLY = 0;
+        /// TODO: fix the bug of bitflag.
+        const RDONLY = 0x000;
         /// writeonly
-        const WRONLY = 1 << 0;
+        const WRONLY = 0x001;
         /// read and write
-        const RDWR = 1 << 1;
+        const RDWR = 0x002;
         /// create new file
-        const CREATE = 1 << 9;
+        const CREATE = 0x40;
         /// truncate file size to 0
-        const TRUNC = 1 << 10;
+        const TRUNC = 0x200;
+        /// open directory
+        const DIRECTORY = 0x10000;
     }
 }
 
