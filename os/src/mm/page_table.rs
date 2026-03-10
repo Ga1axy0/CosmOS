@@ -203,66 +203,6 @@ pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
     Some(string)
 }
 
-/// 从用户地址空间读取一个以 `\0` 结尾的 C 字符串（带最大长度限制）。
-/// 当用户指针无效、地址溢出或在 `max_len` 内未遇到结尾 `\0` 时返回 `None`。
-pub fn try_translated_str_bounded(token: usize, ptr: *const u8, max_len: usize) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    let page_table = PageTable::from_token(token);
-    let mut string = String::new();
-    let mut va = ptr as usize;
-    for _ in 0..max_len {
-        let pa = page_table.translate_va(VirtAddr::from(va))?;
-        let ch = *pa.get_ref::<u8>();
-        if ch == 0 {
-            return Some(string);
-        }
-        string.push(ch as char);
-        va = va.checked_add(1)?;
-    }
-    None
-}
-
-/// 从用户地址空间按字节读取一个 `usize`，用于安全处理可能跨页的用户指针数组元素。
-fn try_translated_usize(token: usize, ptr: *const usize) -> Option<usize> {
-    let page_table = PageTable::from_token(token);
-    let base = ptr as usize;
-    let mut value = 0usize;
-    for i in 0..core::mem::size_of::<usize>() {
-        let va = base.checked_add(i)?;
-        let pa = page_table.translate_va(VirtAddr::from(va))?;
-        let byte = *pa.get_ref::<u8>();
-        value |= (byte as usize) << (i * 8);
-    }
-    Some(value)
-}
-
-/// 解析用户态传入的 `char **`（以 NULL 结尾）为内核字符串数组，并施加数量/长度上限。
-/// 若 `arr` 为 NULL，则按空数组处理。
-/// 当用户地址无效、超过上限仍未遇到终止符或地址运算溢出时返回 `None`。
-pub fn try_translated_cstr_array(
-    token: usize,
-    mut arr: *const usize,
-    max_count: usize,
-    max_str_len: usize,
-) -> Option<Vec<String>> {
-    if arr.is_null() {
-        return Some(Vec::new());
-    }
-    let mut out: Vec<String> = Vec::new();
-    for _ in 0..max_count {
-        let str_ptr = try_translated_usize(token, arr)?;
-        if str_ptr == 0 {
-            return Some(out);
-        }
-        let item = try_translated_str_bounded(token, str_ptr as *const u8, max_str_len)?;
-        out.push(item);
-        arr = (arr as usize).checked_add(core::mem::size_of::<usize>())? as *const usize;
-    }
-    None
-}
-
 /// translate a pointer `ptr` in other address space to a immutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
 pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
     let page_table = PageTable::from_token(token);
