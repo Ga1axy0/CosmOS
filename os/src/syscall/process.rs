@@ -2,10 +2,10 @@ use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall_body;
 use crate::{
     config::PAGE_SIZE_BITS,
-    fs::{open_file, open_file_at, OpenFlags},
+    fs::{open_file, open_file_at, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_refmut, translated_str, try_translated_cstr_array,
-        try_translated_str_bounded, MapPermission, VirtAddr,
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
+        VirtAddr,
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
@@ -69,26 +69,37 @@ pub fn sys_fork() -> isize {
     trap_cx.x[10] = 0;
     new_pid as isize
 }
-const MAX_USER_CSTR_ARRAY_LEN: usize = 256;
-const MAX_USER_CSTR_LEN: usize = 4096;
-
 /// sys_execve
-pub fn sys_execve(path: *const u8, args: *const usize, envp: *const usize) -> isize {
+pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_execve",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
     syscall_body!({
-        let path = try_translated_str_bounded(token, path, MAX_USER_CSTR_LEN)
-            .or_errno(ERRNO::EFAULT)?;
-        let args_vec =
-            try_translated_cstr_array(token, args, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN)
-                .or_errno(ERRNO::EFAULT)?;
-        // 当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
-        let _envp_vec =
-            try_translated_cstr_array(token, envp, MAX_USER_CSTR_ARRAY_LEN, MAX_USER_CSTR_LEN)
-                .or_errno(ERRNO::EFAULT)?;
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let mut args_vec: Vec<String> = Vec::new();
+        loop {
+            let arg_str_ptr = *translated_ref(token, args).or_errno(ERRNO::EFAULT)?;
+            if arg_str_ptr == 0 {
+                break;
+            }
+            args_vec.push(translated_str(token, arg_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
+            unsafe {
+                args = args.add(1);
+            }
+        }
+        // TODO：当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
+        loop {
+            let env_str_ptr = *translated_ref(token, envp).or_errno(ERRNO::EFAULT)?;
+            if env_str_ptr == 0 {
+                break;
+            }
+            translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?;
+            unsafe {
+                envp = envp.add(1);
+            }
+        }
 
         let process = current_process();
         let cwd = process.inner_exclusive_access().cwd.clone();
