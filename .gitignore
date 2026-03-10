@@ -25,4 +25,4 @@ pushall.sh
 os/vendor/
 .VSCodeCounter
 notes
-sdcard-rv.img
+base.img
