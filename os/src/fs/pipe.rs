@@ -126,6 +126,7 @@ impl File for Pipe {
         loop {
             let mut ring_buffer = self.buffer.exclusive_access();
             let loop_read = ring_buffer.available_read();
+            debug!("Pipe::read: want_to_read {}, already_read {}, loop_read {}", want_to_read, already_read, loop_read);
             if loop_read == 0 {
                 if ring_buffer.all_write_ends_closed() {
                     return already_read;
@@ -158,6 +159,7 @@ impl File for Pipe {
         loop {
             let mut ring_buffer = self.buffer.exclusive_access();
             let loop_write = ring_buffer.available_write();
+            debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
             if loop_write == 0 {
                 drop(ring_buffer);
                 suspend_current_and_run_next();
