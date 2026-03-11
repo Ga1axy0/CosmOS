@@ -39,7 +39,7 @@ pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
 pub const SYSCALL_EXIT: usize = 93;
 /// sleep syscall
-pub const SYSCALL_SLEEP: usize = 101;
+pub const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
@@ -118,6 +118,8 @@ mod thread;
 /// Standard error numbers and conversion traits
 pub mod errno;
 
+use core::time;
+
 use fs::*;
 use process::*;
 use sync::*;
@@ -170,7 +172,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
-        SYSCALL_SLEEP => sys_sleep(args[0]),
+        SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
