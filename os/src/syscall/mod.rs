@@ -27,7 +27,7 @@ pub const SYSCALL_OPENAT: usize = 56;
 /// close syscall
 pub const SYSCALL_CLOSE: usize = 57;
 /// pipe syscall
-pub const SYSCALL_PIPE: usize = 59;
+pub const SYSCALL_PIPE2: usize = 59;
 /// getdents64 syscall
 pub const SYSCALL_GETDENTS64: usize = 61;
 /// read syscall
@@ -152,7 +152,7 @@ macro_rules! syscall_body {
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
-        SYSCALL_DUP => sys_dup(args[0]),
+        SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,
@@ -161,16 +161,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
-        SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
-        SYSCALL_CLOSE => sys_close(args[0]),
-        SYSCALL_PIPE => sys_pipe(args[0] as *mut usize),
-        SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
+        SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
+        SYSCALL_CLOSE => sys_close(args[0] as u32),
+        SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
+        SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
+        SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
+        SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
-        SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
         SYSCALL_YIELD => sys_yield(),
