@@ -101,7 +101,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
-                "[kernel] Idle process exit with exit_code {} ...",
+                "[kernel] Initproc process exit with exit_code {} ...",
                 exit_code
             );
             if exit_code != 0 {
