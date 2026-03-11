@@ -316,6 +316,69 @@ pub fn sys_spawn(_path: *const u8) -> isize {
     })
 }
 
+/// uname syscall
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct UtsName {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+}
+
+impl UtsName {
+    pub fn new() -> Self {
+        // 按照 Linux 标准填充字段，可以根据实际情况修改
+        let mut uname = UtsName {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+        };
+        let sysname = b"xxOS";
+        let nodename = b"xxNode";
+        let release = b"0.1";
+        let version = b"xxOS version 0.1";
+        let machine = b"riscv64";
+        uname.sysname[..sysname.len()].copy_from_slice(sysname);
+        uname.nodename[..nodename.len()].copy_from_slice(nodename);
+        uname.release[..release.len()].copy_from_slice(release);
+        uname.version[..version.len()].copy_from_slice(version);
+        uname.machine[..machine.len()].copy_from_slice(machine);
+        uname
+    }
+}
+
+/// uname syscall
+pub fn sys_uname(utsname_ptr: *mut UtsName) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_uname",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let token = current_user_token();
+        let uname = UtsName::new();
+        let uname_bytes = unsafe {
+            slice::from_raw_parts(
+                &uname as *const UtsName as *const u8,
+                size_of::<UtsName>(),
+            )
+        };
+        let mut buffers =
+            translated_byte_buffer(token, utsname_ptr as *const u8, size_of::<UtsName>())
+                .or_errno(ERRNO::EFAULT)?;
+        let mut copied = 0usize;
+        for buffer in buffers.iter_mut() {
+            let len = buffer.len();
+            buffer.copy_from_slice(&uname_bytes[copied..copied + len]);
+            copied += len;
+        }
+        Ok(0)
+    })
+}
+
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority
@@ -326,3 +389,4 @@ pub fn sys_set_priority(_prio: isize) -> isize {
     );
     -1
 }
+
