@@ -384,6 +384,7 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
     let token = current_user_token();
     let process = current_process();
     syscall_body!({
+        let fd = fd as usize;
         let inner = process.inner_exclusive_access();
         let file = inner
             .fd_table
