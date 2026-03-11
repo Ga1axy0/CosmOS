@@ -165,7 +165,8 @@ pub fn trap_from_kernel() {
             // crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
-            crate::timer::set_next_trigger();
+            set_next_trigger();
+            check_timer();
             // crate::net::poll();
         }
         _ => {
