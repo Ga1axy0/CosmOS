@@ -3,6 +3,8 @@ use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use crate::syscall::errno::ERRNO;
+use crate::fs::devfs::BlockDevNode;
+use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -236,7 +238,7 @@ pub fn init_rootfs() {
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
         let root = Arc::new(Ext4FileSystem::root_inode(&efs));
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
-        do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
+        // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
     info!("[kernel] rootfs initialised");
@@ -314,7 +316,7 @@ fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
     }
     // Split into directory part and filename.
     let (parent_path, filename) = match abs.rfind('/') {
-        Some(idx) if idx == 0 => ("/", &abs[1..]),
+        Some(0) => ("/", &abs[1..]),
         Some(idx) => (&abs[..idx], &abs[idx + 1..]),
         None => ("/", abs.as_str()),
     };
@@ -603,4 +605,66 @@ impl File for OSInode {
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Device-filesystem helpers
+// ---------------------------------------------------------------------------
+
+/// Populate `/dev` with one [`BlockDevNode`] per discovered block device.
+///
+/// Must be called **after** both [`probe_block_devices`](crate::drivers::block::probe_block_devices)
+/// and [`init_rootfs`].  The `/dev` virtual directory is created if absent.
+pub fn init_dev() {
+
+
+    let dev_dir = ensure_virtual_dir("/dev")
+        .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
+
+    let map = BLOCK_DEVICES.exclusive_access();
+    for (dev_name, dev) in map.iter() {
+        let node = Arc::new(BlockDevNode::new(Arc::clone(dev)));
+        dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);
+        info!("[kernel] /dev/{} registered", dev_name);
+    }
+    info!("[kernel] /dev initialized");
+}
+
+/// Mount the filesystem on `dev_path` at the absolute path `abs_mnt`.
+///
+/// `dev_path` must resolve to a [`BlockDevNode`] in the VFS (e.g. `/dev/vda`).
+/// `abs_mnt` must be an already-canonicalized absolute pathname.
+/// `fs_type` is a filesystem type string: `"vfat"`, `"fat32"`, or `"ext4"`.
+pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), ERRNO> {
+    debug!(
+        "mount_device: dev_path={}, abs_mnt={}, fs_type={}",
+        dev_path,
+        abs_mnt,
+        fs_type,
+    );
+    let dev_inode = lookup_inode(dev_path).ok_or(ERRNO::ENODEV)?;
+    let vfs_node = dev_inode.vfs_node();
+    let block_dev_node = vfs_node
+        .as_any()
+        .downcast_ref::<BlockDevNode>()
+        .ok_or(ERRNO::ENOTBLK)?;
+    let block_dev = Arc::clone(&block_dev_node.device);
+
+    let fs_root: Arc<Inode> = match fs_type {
+        "vfat" | "fat32" => {
+            use fs::Fat32FileSystem;
+            debug!("mount_device: opening FAT32 filesystem on {}", dev_path);
+            let vfs = Fat32FileSystem::open(block_dev);
+            Arc::new(Fat32FileSystem::root_inode(&vfs))
+        }
+        #[cfg(feature = "ext4")]
+        "ext4" => {
+            use fs::Ext4FileSystem;
+            let vfs = Ext4FileSystem::open(block_dev);
+            Arc::new(Ext4FileSystem::root_inode(&vfs))
+        }
+        _ => return Err(ERRNO::EINVAL),
+    };
+
+    do_mount(abs_mnt, fs_root)
 }
