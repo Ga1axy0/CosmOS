@@ -4,27 +4,17 @@ use crate::{
     fs::{open_file, open_file_at, File, OpenFlags},
     mm::{
         translated_byte_buffer, translated_ref, translated_refmut, translated_str,
-        
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
         pid2process, suspend_current_and_run_next,
         SignalFlags,
     },
-    timer::get_time_us,
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::slice;
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct TimeVal {
-    pub sec: usize,
-    pub usec: usize,
-}
-
 /// exit syscall
 ///
 /// exit the current task and run the next task in task list
@@ -152,8 +142,18 @@ pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
             if let Some(idx) = zombie_idx {
                 let child = inner.children.remove(idx);
                 let found_pid = child.getpid();
-                let exit_code = child.inner_exclusive_access().exit_code;
+                let child_inner = child.inner_exclusive_access();
+                let exit_code = child_inner.exit_code;
+                inner.child_user_ticks = inner
+                    .child_user_ticks
+                    .saturating_add(child_inner.user_ticks)
+                    .saturating_add(child_inner.child_user_ticks);
+                inner.child_kernel_ticks = inner
+                    .child_kernel_ticks
+                    .saturating_add(child_inner.kernel_ticks)
+                    .saturating_add(child_inner.child_kernel_ticks);
                 let token = inner.memory_set.token();
+                drop(child_inner);
                 drop(inner);
 
                 if !exit_code_ptr.is_null() {
@@ -195,39 +195,6 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         Ok(0)
     })
 }
-
-/// get_time syscall
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    syscall_body!({
-        let time_us = get_time_us();
-        let timeval = TimeVal {
-            sec: time_us / 1_000_000,
-            usec: time_us % 1_000_000,
-        };
-        let timeval_bytes = unsafe {
-            slice::from_raw_parts(
-                &timeval as *const TimeVal as *const u8,
-                size_of::<TimeVal>(),
-            )
-        };
-        let mut buffers =
-            translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&timeval_bytes[copied..copied + len]);
-            copied += len;
-        }
-        Ok(0)
-    })
-}
-
-
 
 /// change data segment size
 // pub fn sys_sbrk(size: i32) -> isize {
@@ -328,4 +295,3 @@ pub fn sys_set_priority(_prio: isize) -> isize {
     );
     -1
 }
-

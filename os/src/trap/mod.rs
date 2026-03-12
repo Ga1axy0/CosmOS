@@ -17,10 +17,11 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
 use crate::task::{
-    check_signals_of_current, current_add_signal, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, exit_current_and_run_next, suspend_current_and_run_next, SignalFlags,
+    check_signals_of_current, current_add_signal, current_process, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    suspend_current_and_run_next, SignalFlags,
 };
-use crate::timer::{check_timer, set_next_trigger};
+use crate::timer::{check_timer, get_time_ticks, set_next_trigger};
 use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
@@ -69,6 +70,7 @@ pub fn trap_handler() -> ! {
     // trace!("into {:?}", scause.cause());
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
+            let syscall_start = get_time_ticks();
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
             cx.sepc += 4;
@@ -80,6 +82,8 @@ pub fn trap_handler() -> ! {
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
             cx.x[10] = result as usize;
+            let syscall_end = get_time_ticks();
+            current_process().add_kernel_ticks(syscall_end.saturating_sub(syscall_start));
         }
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::StorePageFault)
@@ -99,6 +103,7 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            current_process().add_user_ticks(1);
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
