@@ -58,6 +58,8 @@ pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_UNAME: usize = 160;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
+/// times
+pub const SYSCALL_TIMES: usize = 153;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
 /// gettid syscall
@@ -115,6 +117,7 @@ mod process;
 mod sync;
 mod thread;
 mod mman;
+mod times;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
@@ -126,6 +129,7 @@ use process::*;
 use sync::*;
 use thread::*;
 use mman::*;
+use times::*;
 
 
 use crate::fs::Stat;
@@ -187,6 +191,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_WAIT4 => sys_wait4(args[0] as isize, args[1] as *mut i32, args[2] as isize),
         SYSCALL_GETTIMEOFDAY => sys_get_time(args[0] as *mut TimeVal, args[1]),
+        SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),

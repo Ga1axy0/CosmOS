@@ -58,6 +58,14 @@ pub struct ProcessControlBlockInner {
     pub semaphore_detector: DeadlockDetector,
     /// current working directory (absolute path)
     pub cwd: String,
+    /// CPU time spent in user mode for this process (in clock ticks)
+    pub user_ticks: usize,
+    /// CPU time spent in kernel mode for this process (in clock ticks)
+    pub kernel_ticks: usize,
+    /// waited-for children's aggregated user ticks (in clock ticks)
+    pub child_user_ticks: usize,
+    /// waited-for children's aggregated kernel ticks (in clock ticks)
+    pub child_kernel_ticks: usize,
 }
 
 impl ProcessControlBlockInner {
@@ -137,6 +145,10 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
+                    user_ticks: 0,
+                    kernel_ticks: 0,
+                    child_user_ticks: 0,
+                    child_kernel_ticks: 0,
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new()),
@@ -269,6 +281,10 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(),
+                    user_ticks: 0,
+                    kernel_ticks: 0,
+                    child_user_ticks: 0,
+                    child_kernel_ticks: 0,
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new())
@@ -337,6 +353,10 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                    user_ticks: 0,
+                    kernel_ticks: 0,
+                    child_user_ticks: 0,
+                    child_kernel_ticks: 0,
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new())
@@ -384,4 +404,28 @@ impl ProcessControlBlock {
             .memory_set
             .munmap_anonymous(start, end)
     }
+
+    /// Charge user CPU time to this process.
+    pub fn add_user_ticks(&self, ticks: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.user_ticks = inner.user_ticks.saturating_add(ticks);
+    }
+
+    /// Charge kernel CPU time to this process.
+    pub fn add_kernel_ticks(&self, ticks: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.kernel_ticks = inner.kernel_ticks.saturating_add(ticks);
+    }
+
+    /// Snapshot process times as (utime, stime, cutime, cstime), all in ticks.
+    pub fn times_snapshot(&self) -> (usize, usize, usize, usize) {
+        let inner = self.inner.exclusive_access();
+        (
+            inner.user_ticks,
+            inner.kernel_ticks,
+            inner.child_user_ticks,
+            inner.child_kernel_ticks,
+        )
+    }
+
 }
