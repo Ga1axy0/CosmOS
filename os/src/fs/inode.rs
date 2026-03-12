@@ -358,6 +358,23 @@ impl File for OSInode {
         }
         total_read_size
     }
+    fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
+        let inner = self.inner.exclusive_access();
+        let mut file_off = offset;
+        let mut total_read_size = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            let read_size = inner.inode.read_at(file_off, *slice);
+            if read_size == 0 {
+                break;
+            }
+            file_off += read_size;
+            total_read_size += read_size;
+            if read_size < slice.len() {
+                break;
+            }
+        }
+        total_read_size
+    }
     /// write buffer data into file
     fn write(&self, buf: UserBuffer) -> usize {
         trace!("kernel: OSInode::write");
@@ -441,7 +458,21 @@ impl File for OSInode {
             ino: inner.inode.ino(),
             mode,
             nlink: inner.inode.nlink(),
-            pad: [0; 7],
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: inner.inode.size() as i64,
+            blksize: 512,
+            pad1: 0,
+            blocks: (inner.inode.size() as u64 + 511) / 512,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
         }
     }
 
