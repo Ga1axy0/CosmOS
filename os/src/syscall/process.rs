@@ -1,15 +1,14 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall_body;
 use crate::{
-    config::PAGE_SIZE_BITS,
     fs::{open_file, open_file_at, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
-        VirtAddr,
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str,
+        
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
-        mmap_current_process, munmap_current_process, pid2process, suspend_current_and_run_next,
+        pid2process, suspend_current_and_run_next,
         SignalFlags,
     },
     timer::get_time_us,

@@ -143,23 +143,24 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
 }
 
 /// munmap syscall
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_munmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+        if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
             return Err(ERRNO::EINVAL); // start not page-aligned
         }
-        if _len == 0 {
+        if len == 0 {
             return Err(ERRNO::EINVAL);
         }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EOVERFLOW)?;
-        if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
+        let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        if munmap_current_process(VirtAddr::from(start), VirtAddr::from(end)) {
             Ok(0)
         } else {
-            Err(ERRNO::EINVAL) // range not fully mapped as anonymous
+            // Unmapping an invalid/unmapped range is treated as ENOMEM.
+            Err(ERRNO::ENOMEM)
         }
     })
 }
