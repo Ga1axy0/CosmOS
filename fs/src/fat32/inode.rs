@@ -773,4 +773,8 @@ impl VfsNode for FatInode {
 
         written
     }
+
+    fn size(&self) -> usize {
+        self.inner.lock().size as usize
+    }
 }

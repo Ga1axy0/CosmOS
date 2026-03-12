@@ -185,7 +185,21 @@ impl File for Pipe {
             ino: 0,
             mode: StatMode::FIFO,
             nlink: 1,
-            pad: [0; 7],
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
         }
     }
 }
