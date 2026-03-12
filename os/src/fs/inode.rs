@@ -1,20 +1,20 @@
 use super::{File, Stat, StatMode};
-use crate::drivers::BLOCK_DEVICE;
+use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use crate::syscall::errno::ERRNO;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use fs::vfs::VfsNode;
 use fs::Inode;
-#[cfg(feature = "easyfs")]
-use fs::EasyFileSystem;
-#[cfg(feature = "ext4")]
-use fs::Ext4FileSystem;
-#[cfg(feature = "fat32")]
-use fs::Fat32FileSystem;
 use lazy_static::*;
+
+// Compile-time check: exactly one filesystem backend must be selected.
+#[cfg(not(any(feature = "ext4", feature = "easyfs", feature = "fat32")))]
+compile_error!("Enable one of the cargo features: ext4 | easyfs | fat32");
 
 /// inode in memory
 pub struct OSInode {
@@ -64,27 +64,182 @@ pub const AT_FDCWD: isize = -100;
 pub const AT_REMOVEDIR: u32 = 0x200;
 
 lazy_static! {
-    pub static ref ROOT_INODE: Arc<Inode> = {
-        #[cfg(feature = "fat32")]
-        {
-            let efs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
-            Arc::new(Fat32FileSystem::root_inode(&efs))
+    /// Tracks virtual directories created by `do_mount` for sub-path mounts.
+    ///
+    /// Maps absolute path → `Arc<VirtualDirNode>` for every virtual directory
+    /// inserted into the namespace during mount operations.  Used by
+    /// `ensure_virtual_dir` (to avoid recreating existing dirs) and
+    /// `do_umount` (to clean up the registry).
+    static ref VIRT_DIRS: UPSafeCell<BTreeMap<String, Arc<VirtualDirNode>>> =
+        // SAFETY: single-processor kernel.
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+
+    /// The kernel's global root inode, backed by the virtual rootfs.
+    ///
+    /// Call [`init_rootfs`] once after `mm::init()` to overlay a real
+    /// filesystem and make the full directory tree accessible.
+    pub static ref ROOT_INODE: Arc<Inode> =
+        Arc::new(Inode::new(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>));
+}
+
+// ---------------------------------------------------------------------------
+// Mount / unmount (kernel-internal API)
+// ---------------------------------------------------------------------------
+
+/// Split an absolute path into `(parent_path, leaf_name)`.
+///
+/// Examples:
+/// - `"/mnt/fat32"` → `("/mnt", "fat32")`
+/// - `"/mnt"` → `("/", "mnt")`
+fn split_for_mount(abs_path: &str) -> (&str, &str) {
+    match abs_path.rfind('/') {
+        Some(0) => ("/", &abs_path[1..]),
+        Some(idx) => (&abs_path[..idx], &abs_path[idx + 1..]),
+        None => ("/", abs_path),
+    }
+}
+
+/// Ensure a virtual directory exists at `abs_path`, creating intermediate
+/// virtual directories as needed.
+///
+/// If the current overlay FS already has a physical directory at any
+/// component of `abs_path`, the corresponding virtual dir will inherit that
+/// physical dir as its own overlay so that files inside it remain accessible.
+fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
+    if abs_path == "/" {
+        return Ok(Arc::clone(&VIRT_ROOT));
+    }
+
+    // Fast path: already created.
+    {
+        let map = VIRT_DIRS.exclusive_access();
+        if let Some(vdir) = map.get(abs_path) {
+            return Ok(Arc::clone(vdir));
         }
-        #[cfg(feature = "easyfs")]
-        {
-            let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
-            Arc::new(EasyFileSystem::root_inode(&efs))
-        }
-        #[cfg(feature = "ext4")]
-        {
-            let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
-            Arc::new(Ext4FileSystem::root_inode(&efs))
-        }
-        #[cfg(not(any(feature = "fat32", feature = "easyfs", feature = "ext4")))]
-        {
-            compile_error!("You must enable one of: 'fat32', 'easyfs', or 'ext4' feature!");
-        }
+    }
+
+    // Create by ensuring the parent first (recursive, bounded by path depth).
+    let (parent_path, name) = split_for_mount(abs_path);
+    let parent_vdir = ensure_virtual_dir(parent_path)?;
+
+    // If the backing FS has a directory at this name, use it as the overlay of
+    // the new virtual dir so its contents remain visible.
+    let child_overlay: Option<Arc<dyn VfsNode>> = parent_vdir.overlay_child_dir(name);
+
+    let new_vdir = VirtualDirNode::new();
+    if let Some(ov) = child_overlay {
+        new_vdir.set_overlay(ov);
+    }
+
+    // Insert into the virtual namespace.
+    parent_vdir.bind(name, Arc::clone(&new_vdir) as Arc<dyn VfsNode>);
+
+    VIRT_DIRS
+        .exclusive_access()
+        .insert(String::from(abs_path), Arc::clone(&new_vdir));
+
+    Ok(new_vdir)
+}
+
+/// Mount `fs_root` at the absolute path `path`.
+///
+/// - `path = "/"`: installs `fs_root` as the *overlay* of the virtual root
+///   directory.  All on-disk paths become visible without any other changes.
+/// - `path = "/mnt/foo"`: creates virtual intermediate directories as needed
+///   and binds the FS root as a named child, making it accessible at that
+///   path while leaving other parts of the namespace unaffected.
+///
+/// This function is intentionally synchronous and infallible for well-formed
+/// inputs so it can be used during early boot before any processes exist.
+/// Future `sys_mount` / `sys_umount2` syscalls should wrap it.
+pub fn do_mount(path: &str, fs_root: Arc<Inode>) -> Result<(), ERRNO> {
+    let abs = canonicalize("/", path);
+    let vfs_node: Arc<dyn VfsNode> = fs_root.vfs_node();
+
+    if abs == "/" {
+        // Install as the overlay of the virtual root directory.
+        VIRT_ROOT.set_overlay(vfs_node);
+        info!("[kernel] mounted fs at /");
+        return Ok(());
+    }
+
+    // For sub-paths: ensure parent virtual dir exists, then bind at leaf name.
+    let (parent_path, name) = split_for_mount(&abs);
+    let parent_vdir = ensure_virtual_dir(parent_path)?;
+    parent_vdir.bind(name, vfs_node);
+    info!("[kernel] mounted fs at {}", abs);
+    Ok(())
+}
+
+/// Unmount the filesystem mounted at `path`.
+///
+/// For a mount point that was itself a [`VirtualDirNode`] (i.e. an
+/// intermediate directory created by [`do_mount`]), it is also removed from
+/// the internal registry.  Sub-mounts must be unmounted first; this function
+/// does **not** cascade.
+pub fn do_umount(path: &str) -> Result<(), ERRNO> {
+    let abs = canonicalize("/", path);
+    if abs == "/" {
+        // Unmounting the root overlay is not supported (use pivot_root instead).
+        return Err(ERRNO::EBUSY);
+    }
+
+    let (parent_path, name) = split_for_mount(&abs);
+
+    let parent_vdir: Arc<VirtualDirNode> = if parent_path == "/" {
+        Arc::clone(&VIRT_ROOT)
+    } else {
+        VIRT_DIRS
+            .exclusive_access()
+            .get(parent_path)
+            .cloned()
+            .ok_or(ERRNO::EINVAL)?
     };
+
+    if !parent_vdir.unbind(name) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    // Clean up the registry entry (no-op if `abs` was a real-FS mount, not
+    // a VirtualDirNode we created).
+    VIRT_DIRS.exclusive_access().remove(&abs);
+
+    info!("[kernel] unmounted {}", abs);
+    Ok(())
+}
+
+/// Mount the compiled-in filesystem at `"/"` and log the result.
+///
+/// Must be called **after** `mm::init()` (heap allocator required for `Arc`
+/// and filesystem initialisation) and before any file-system operations.
+/// Invoked from `rust_main` in `main.rs`.
+pub fn init_rootfs() {
+    use crate::drivers::BLOCK_DEVICE;
+
+    #[cfg(feature = "fat32")]
+    {
+        use fs::Fat32FileSystem;
+        let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
+        let root = Arc::new(Fat32FileSystem::root_inode(&vfs));
+        do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
+    }
+    #[cfg(feature = "easyfs")]
+    {
+        use fs::EasyFileSystem;
+        let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
+        let root = Arc::new(EasyFileSystem::root_inode(&efs));
+        do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
+    }
+    #[cfg(feature = "ext4")]
+    {
+        use fs::Ext4FileSystem;
+        let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
+        let root = Arc::new(Ext4FileSystem::root_inode(&efs));
+        do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
+        do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
+    }
+
+    info!("[kernel] rootfs initialised");
 }
 
 /// List all apps in the root directory

@@ -78,6 +78,7 @@ pub fn rust_main() -> ! {
     trap::enable_timer_interrupt();
     drivers::plic::init();
     println!("[kernel] Hello, world!");
+    fs::init_rootfs();
     timer::set_next_trigger();
     //    fs::list_apps();
     task::add_initproc();
