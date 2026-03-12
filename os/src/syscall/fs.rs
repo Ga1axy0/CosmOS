@@ -1,6 +1,5 @@
 use crate::fs::{
-    canonicalize, linkat, lookup_inode, make_pipe, mkdir_at, open_file_at, unlinkat,
-    OpenFlags, Stat, AT_FDCWD, AT_REMOVEDIR,
+    AT_FDCWD, AT_REMOVEDIR, OpenFlags, Stat, canonicalize, do_mount, linkat, lookup_inode, make_pipe, mkdir_at, open_file_at, unlinkat
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
@@ -410,5 +409,35 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
             src_off += len;
         }
         Ok(bytes as isize)
+    })
+}
+
+
+pub fn sys_mount(dev_name: *const u8, dir_name: *const u8, fs_type: *const u8, flags: i32, data: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mount",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let dev_name = translated_str(token, dev_name).or_errno(ERRNO::EFAULT)?;
+        let dir_name = translated_str(token, dir_name).or_errno(ERRNO::EFAULT)?;
+        let fs_type = translated_str(token, fs_type).or_errno(ERRNO::EFAULT)?;
+        let data = translated_str(token, data).or_errno(ERRNO::EFAULT)?;
+        // Do mount
+        Ok(0)
+    })
+}
+
+pub fn sys_umount(name: *const u8, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_umount",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
+        // Do umount
+        Ok(0)
     })
 }
