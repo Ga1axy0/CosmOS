@@ -228,67 +228,7 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     })
 }
 
-/// mmap syscall
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-            return Err(ERRNO::EINVAL); // start not page-aligned
-        }
-        if _port & !0x7 != 0 {
-            return Err(ERRNO::EINVAL); // unknown permission bits
-        }
-        if _port & 0x7 == 0 {
-            return Err(ERRNO::EINVAL); // no access at all is meaningless
-        }
-        if _len == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
 
-        let mut perm = MapPermission::U;
-        if _port & 0x1 != 0 {
-            perm |= MapPermission::R;
-        }
-        if _port & 0x2 != 0 {
-            perm |= MapPermission::W;
-        }
-        if _port & 0x4 != 0 {
-            perm |= MapPermission::X;
-        }
-
-        if mmap_current_process(VirtAddr::from(_start), VirtAddr::from(end), perm) {
-            Ok(0)
-        } else {
-            Err(ERRNO::ENOMEM)
-        }
-    })
-}
-
-/// munmap syscall
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-            return Err(ERRNO::EINVAL); // start not page-aligned
-        }
-        if _len == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
-        if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
-            Ok(0)
-        } else {
-            Err(ERRNO::EINVAL) // range not fully mapped as anonymous
-        }
-    })
-}
 
 /// change data segment size
 // pub fn sys_sbrk(size: i32) -> isize {
