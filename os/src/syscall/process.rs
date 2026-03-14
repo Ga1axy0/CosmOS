@@ -40,6 +40,22 @@ pub fn sys_getpid() -> isize {
     );
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
 }
+
+/// getppid syscall
+pub fn sys_getppid() -> isize {
+    trace!(
+        "kernel: sys_getppid pid:{}",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    let parent = process.inner_exclusive_access().parent.clone();
+    if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
+        parent.getpid() as isize
+    } else {
+        0
+    }
+}
+
 /// fork child process syscall
 pub fn sys_fork() -> isize {
     trace!(
