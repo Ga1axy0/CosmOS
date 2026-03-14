@@ -226,7 +226,7 @@ pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
 
 bitflags! {
     ///  The flags argument to the open() system call is constructed by ORing together zero or more of the following values:
-    pub struct OpenFlags: u32 {
+    pub struct OpenFlags: i32 {
         /// readyonly
         /// TODO: fix the bug of bitflag.
         const RDONLY = 0x000;

@@ -101,7 +101,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
-                "[kernel] Idle process exit with exit_code {} ...",
+                "[kernel] Initproc process exit with exit_code {} ...",
                 exit_code
             );
             if exit_code != 0 {
@@ -161,6 +161,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         process_inner.fd_table.clear();
         // remove all tasks
         process_inner.tasks.clear();
+
+        let parent_weak = process_inner.parent.clone();
+        
+        if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
+            parent.wait_exit_condvar.signal();
+        }
     } else {
         let mut process_inner = process.inner_exclusive_access();
         process_inner.mutex_detector.clear_thread(tid);
