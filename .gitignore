@@ -15,7 +15,6 @@ user/.idea/*
 user/Cargo.lock
 fs/Cargo.lock
 fs/target/*
-fs-fuse/Cargo.lock
 fs-fuse/target/*
 tools/
 pushall.sh
