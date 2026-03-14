@@ -52,24 +52,37 @@ lazy_static! {
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
 pub fn run_tasks() {
     loop {
-        let mut processor = PROCESSOR.exclusive_access();
+        crate::trap::set_user_trap_entry();
+        
         if let Some(task) = fetch_task() {
+            let mut processor = PROCESSOR.exclusive_access();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
-            // access coming task TCB exclusively
+
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
-            // release coming task_inner manually
             drop(task_inner);
-            // release coming task TCB manually
+
             processor.current = Some(task);
-            // release processor manually
             drop(processor);
+
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
         } else {
-            warn!("no tasks available in run_tasks");
+            // idle: enable interrupts and wait for next interrupt (timer/UART/etc.)
+            if super::INITPROC.inner_exclusive_access().is_zombie() {
+                info!("Goodbye!");
+                crate::sbi::shutdown();
+            }
+
+            // debug!("No task to run, idle...");
+
+            crate::trap::set_kernel_trap_entry();
+            
+            unsafe { riscv::register::sstatus::set_sie() };
+            unsafe { riscv::asm::wfi() };
+            unsafe { riscv::register::sstatus::clear_sie() };
         }
     }
 }

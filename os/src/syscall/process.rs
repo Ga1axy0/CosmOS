@@ -118,43 +118,67 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
     })
 }
 
+const WNOHANG: isize = 1;
+
 /// waitpid syscall
 ///
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel: sys_waitpid");
+pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
+    trace!("kernel: sys_wait4");
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
     syscall_body!({
-        // no matching child at all
-        if !inner
-            .children
-            .iter()
-            .any(|p| pid == -1 || pid as usize == p.getpid())
-        {
-            return Err(ERRNO::ECHILD);
+        if options & !WNOHANG != 0 {
+            return Err(ERRNO::EINVAL);
         }
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
-        });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
-            assert_eq!(Arc::strong_count(&child), 1);
-            let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
-            // write exit code into user space; bad pointer → EFAULT
-            if !exit_code_ptr.is_null() {
-                if let Some(slot) = translated_refmut(inner.memory_set.token(), exit_code_ptr) {
-                    *slot = exit_code;
-                } else {
-                    return Err(ERRNO::EFAULT);
-                }
+
+        loop {
+            let mut inner = process.inner_exclusive_access();
+
+            // 1) 没有任何匹配的子进程
+            let has_target_child = inner
+                .children
+                .iter()
+                .any(|p| pid == -1 || pid as usize == p.getpid());
+            if !has_target_child {
+                return Err(ERRNO::ECHILD);
             }
-            Ok(found_pid as isize)
-        } else {
-            // child exists but not yet zombie
-            Err(ERRNO::EAGAIN)
+
+            // 2) 查找已经退出的目标子进程
+            let zombie_idx = inner.children.iter().position(|p| {
+                let p_inner = p.inner_exclusive_access();
+                p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+            });
+
+            if let Some(idx) = zombie_idx {
+                let child = inner.children.remove(idx);
+                let found_pid = child.getpid();
+                let exit_code = child.inner_exclusive_access().exit_code;
+                let token = inner.memory_set.token();
+                drop(inner);
+
+                if !exit_code_ptr.is_null() {
+                    if let Some(slot) = translated_refmut(token, exit_code_ptr) {
+                        *slot = exit_code;
+                    } else {
+                        return Err(ERRNO::EFAULT);
+                    }
+                }
+
+                return Ok(found_pid as isize);
+            }
+
+            // 3) 有目标子进程，但目前没有 zombie
+            if options & WNOHANG != 0 {
+                return Ok(0);
+            }
+
+            // 4) 阻塞等待；这里必须先释放 inner，再睡眠
+            drop(inner);
+
+            // 按你仓库 Condvar 的实际 API 替换这一行：
+            // 例如可能是 wait() / wait_no_sched() / wait_with_mutex(...)
+            process.wait_exit_condvar.wait_simple();
         }
     })
 }
@@ -292,6 +316,69 @@ pub fn sys_spawn(_path: *const u8) -> isize {
     })
 }
 
+/// uname syscall
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct UtsName {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+}
+
+impl UtsName {
+    pub fn new() -> Self {
+        // 按照 Linux 标准填充字段，可以根据实际情况修改
+        let mut uname = UtsName {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+        };
+        let sysname = b"xxOS";
+        let nodename = b"xxNode";
+        let release = b"0.1";
+        let version = b"xxOS version 0.1";
+        let machine = b"riscv64";
+        uname.sysname[..sysname.len()].copy_from_slice(sysname);
+        uname.nodename[..nodename.len()].copy_from_slice(nodename);
+        uname.release[..release.len()].copy_from_slice(release);
+        uname.version[..version.len()].copy_from_slice(version);
+        uname.machine[..machine.len()].copy_from_slice(machine);
+        uname
+    }
+}
+
+/// uname syscall
+pub fn sys_uname(utsname_ptr: *mut UtsName) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_uname",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let token = current_user_token();
+        let uname = UtsName::new();
+        let uname_bytes = unsafe {
+            slice::from_raw_parts(
+                &uname as *const UtsName as *const u8,
+                size_of::<UtsName>(),
+            )
+        };
+        let mut buffers =
+            translated_byte_buffer(token, utsname_ptr as *const u8, size_of::<UtsName>())
+                .or_errno(ERRNO::EFAULT)?;
+        let mut copied = 0usize;
+        for buffer in buffers.iter_mut() {
+            let len = buffer.len();
+            buffer.copy_from_slice(&uname_bytes[copied..copied + len]);
+            copied += len;
+        }
+        Ok(0)
+    })
+}
+
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority
@@ -302,3 +389,4 @@ pub fn sys_set_priority(_prio: isize) -> isize {
     );
     -1
 }
+

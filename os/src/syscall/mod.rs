@@ -27,7 +27,7 @@ pub const SYSCALL_OPENAT: usize = 56;
 /// close syscall
 pub const SYSCALL_CLOSE: usize = 57;
 /// pipe syscall
-pub const SYSCALL_PIPE: usize = 59;
+pub const SYSCALL_PIPE2: usize = 59;
 /// getdents64 syscall
 pub const SYSCALL_GETDENTS64: usize = 61;
 /// read syscall
@@ -39,7 +39,7 @@ pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
 pub const SYSCALL_EXIT: usize = 93;
 /// sleep syscall
-pub const SYSCALL_SLEEP: usize = 101;
+pub const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
@@ -54,6 +54,8 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 */
 /// set priority syscall
 pub const SYSCALL_SET_PRIORITY: usize = 140;
+/// uname syscall
+pub const SYSCALL_UNAME: usize = 160;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 /// getpid syscall
@@ -73,7 +75,7 @@ pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
 pub const SYSCALL_MMAP: usize = 222;
 /// waitpid syscall
-pub const SYSCALL_WAITPID: usize = 260;
+pub const SYSCALL_WAIT4: usize = 260;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
 /*
@@ -116,6 +118,8 @@ mod thread;
 /// Standard error numbers and conversion traits
 pub mod errno;
 
+use core::time;
+
 use fs::*;
 use process::*;
 use sync::*;
@@ -148,7 +152,7 @@ macro_rules! syscall_body {
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
-        SYSCALL_DUP => sys_dup(args[0]),
+        SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,
@@ -157,19 +161,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
-        SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
-        SYSCALL_CLOSE => sys_close(args[0]),
-        SYSCALL_PIPE => sys_pipe(args[0] as *mut usize),
-        SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
-        SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut Stat),
+        SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
+        SYSCALL_CLOSE => sys_close(args[0] as u32),
+        SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
+        SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
+        SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
+        SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
-        SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
-        SYSCALL_SLEEP => sys_sleep(args[0]),
+        SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
         SYSCALL_YIELD => sys_yield(),
+        SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_FORK => sys_fork(),
@@ -178,7 +183,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const usize,
             args[2] as *const usize,
         ),
-        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
+        SYSCALL_WAIT4 => sys_wait4(args[0] as isize, args[1] as *mut i32, args[2] as isize),
         SYSCALL_GETTIMEOFDAY => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),

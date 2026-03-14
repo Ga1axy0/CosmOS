@@ -1,7 +1,9 @@
+use crate::mm::translated_refmut;
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
-use crate::task::{block_current_and_run_next, current_process, current_task};
+use crate::syscall_body;
+use crate::task::{block_current_and_run_next, current_process, current_task, current_user_token};
 use crate::timer::{add_timer, get_time_ms};
-use crate::syscall::errno::ERRNO;
+use crate::syscall::errno::{ERRNO, OrErrno};
 use alloc::sync::Arc;
 
 const DEADLOCK_DETECTED: isize = -0xDEAD;
@@ -15,10 +17,19 @@ fn current_tid() -> usize {
         .unwrap()
         .tid
 }
+
+/// UtsName struct for uname syscall
+#[repr(C)]
+pub struct Timespec {
+    tv_sec: usize,
+    tv_nsec: usize,
+}
+
 /// sleep syscall
-pub fn sys_sleep(ms: usize) -> isize {
+/// Though the syscall is named `nanosleep`, it actually takes milliseconds as input for simplicity.
+pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
     trace!(
-        "kernel:pid[{}] tid[{}] sys_sleep",
+        "kernel:pid[{}] tid[{}] sys_nanosleep",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
         current_task()
             .unwrap()
@@ -28,12 +39,24 @@ pub fn sys_sleep(ms: usize) -> isize {
             .unwrap()
             .tid
     );
-    let expire_ms = get_time_ms() + ms;
-    let task = current_task().unwrap();
-    add_timer(expire_ms, task);
-    block_current_and_run_next();
-    0
+    
+    let token = current_user_token();
+    syscall_body!({
+        let timespec = translated_refmut(token, req as *mut Timespec).or_errno(ERRNO::EFAULT)?;
+        let current_time = get_time_ms();
+        let expire_ms = current_time + timespec.tv_sec * 1_000 + timespec.tv_nsec / 1_000_000;
+        debug!(
+            "nanosleep: current_time = {}, expire_time = {}",
+            current_time,
+            expire_ms,
+        );
+        let task = current_task().unwrap();
+        add_timer(expire_ms, task);
+        block_current_and_run_next();
+        Ok(0)
+    })
 }
+
 /// mutex create syscall
 pub fn sys_mutex_create(blocking: bool) -> isize {
     trace!(
