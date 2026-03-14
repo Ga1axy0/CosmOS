@@ -63,8 +63,8 @@ pub fn main() -> i32 {
                             continue;
                         }
 
-                        if args[0] == "exit" {
-                            println!("Exiting shell...");
+                        if args[0] == "quit" {
+                            println!("quiting shell...");
                             return 0;
                         }
 
