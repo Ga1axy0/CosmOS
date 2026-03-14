@@ -14,6 +14,8 @@
 pub const SYSCALL_GETCWD: usize = 17;
 /// dup syscall
 pub const SYSCALL_DUP: usize = 23;
+/// dup2 syscall
+pub const SYSCALL_DUP2: usize = 24;
 /// mkdirat syscall
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
@@ -161,6 +163,7 @@ macro_rules! syscall_body {
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0] as u32),
+        SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,
