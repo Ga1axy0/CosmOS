@@ -17,7 +17,7 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
 use crate::task::{
-    check_signals_of_current, current_add_signal, current_process, current_trap_cx,
+    check_fatal_signals_of_current, current_add_signal, current_process, current_trap_cx,
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
     suspend_current_and_run_next, ExitReason, SignalFlags,
 };
@@ -118,7 +118,7 @@ pub fn trap_handler() -> ! {
         }
     }
     // check signals
-    if let Some((signum, msg)) = check_signals_of_current() {
+    if let Some((signum, msg)) = check_fatal_signals_of_current() {
         trace!("[kernel] trap_handler: .. check signals {}", msg);
         exit_current_and_run_next(ExitReason::Signal(signum as u32));
     }

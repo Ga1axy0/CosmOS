@@ -207,8 +207,9 @@ pub fn add_initproc() {
     let _initproc = INITPROC.clone();
 }
 
-/// Check if the current task has any signal to handle
-pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
+/// Check if the current task has any fatal signal to handle
+/// 因为只检查致命信号，所以可不复位pending_signals
+pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let pending = process_inner.pending_signals & !process_inner.signal_mask;
