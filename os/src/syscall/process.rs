@@ -160,14 +160,14 @@ pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
                 let found_pid = child.getpid();
                 let child_inner = child.inner_exclusive_access();
                 let exit_code = child_inner.exit_code;
-                inner.child_user_ticks = inner
-                    .child_user_ticks
-                    .saturating_add(child_inner.user_ticks)
-                    .saturating_add(child_inner.child_user_ticks);
-                inner.child_kernel_ticks = inner
-                    .child_kernel_ticks
-                    .saturating_add(child_inner.kernel_ticks)
-                    .saturating_add(child_inner.child_kernel_ticks);
+                inner.child_user_time = inner
+                    .child_user_time
+                    .saturating_add(child_inner.user_time)
+                    .saturating_add(child_inner.child_user_time);
+                inner.child_kernel_time = inner
+                    .child_kernel_time
+                    .saturating_add(child_inner.kernel_time)
+                    .saturating_add(child_inner.child_kernel_time);
                 let token = inner.memory_set.token();
                 drop(child_inner);
                 drop(inner);

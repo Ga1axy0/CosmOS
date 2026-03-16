@@ -8,6 +8,7 @@ use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -55,6 +56,7 @@ pub fn run_tasks() {
         crate::trap::set_user_trap_entry();
         
         if let Some(task) = fetch_task() {
+            let process = task.process.upgrade().unwrap();
             let mut processor = PROCESSOR.exclusive_access();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
 
@@ -65,6 +67,7 @@ pub fn run_tasks() {
 
             processor.current = Some(task);
             drop(processor);
+            process.resume_in_kernel(get_time());
 
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);

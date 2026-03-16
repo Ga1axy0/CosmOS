@@ -3,7 +3,7 @@ use crate::syscall_body;
 use crate::{
     mm::translated_byte_buffer,
     task::{current_process, current_task, current_user_token},
-    timer::{get_time_ticks, get_time_us},
+    timer::{get_time, get_time_ticks, get_time_us, time_to_ticks},
 };
 
 use core::mem::size_of;
@@ -62,12 +62,12 @@ pub fn sys_times(buf: *mut Tms) -> isize {
     );
     syscall_body!({
         let process = current_process();
-        let (tms_utime, tms_stime, tms_cutime, tms_cstime) = process.times_snapshot();
+        let (utime, stime, cutime, cstime) = process.times_snapshot(get_time());
         let tms = Tms {
-            tms_utime,
-            tms_stime,
-            tms_cutime,
-            tms_cstime,
+            tms_utime: time_to_ticks(utime),
+            tms_stime: time_to_ticks(stime),
+            tms_cutime: time_to_ticks(cutime),
+            tms_cstime: time_to_ticks(cstime),
         };
         let tms_bytes = unsafe { slice::from_raw_parts(&tms as *const Tms as *const u8, size_of::<Tms>()) };
         let mut buffers =
