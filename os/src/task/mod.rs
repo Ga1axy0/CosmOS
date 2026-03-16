@@ -12,6 +12,7 @@
 mod context;
 mod id;
 mod manager;
+mod action;
 mod process;
 mod processor;
 mod signal;
@@ -34,11 +35,13 @@ use switch::__switch;
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{add_task, pid2process, remove_from_pid2process, remove_task, wakeup_task};
+pub use action::{SignalAction, SignalActions};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use signal::SignalFlags;
+pub use process::ExitReason;
+pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus};
 
 /// Make current task suspended and switch to the next task
@@ -75,7 +78,12 @@ pub fn block_current_and_run_next() {
 use crate::board::QEMUExit;
 
 /// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
+pub fn exit_current_and_run_next(reason: ExitReason) {
+    let exit_reason = reason.into();
+    let task_exit_code = match exit_reason {
+        ExitReason::Exit(code) => code,
+        ExitReason::Signal(signum) => -(signum as i32),
+    };
     trace!(
         "kernel: pid[{}] exit_current_and_run_next",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -87,7 +95,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let mut task_inner = task.inner_exclusive_access();
     let tid = task_inner.res.as_ref().unwrap().tid;
     // record exit code
-    task_inner.exit_code = Some(exit_code);
+    task_inner.exit_code = Some(task_exit_code);
     task_inner.res = None;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
@@ -106,9 +114,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         if pid == IDLE_PID {
             println!(
                 "[kernel] Initproc process exit with exit_code {} ...",
-                exit_code
+                task_exit_code
             );
-            if exit_code != 0 {
+            if task_exit_code != 0 {
                 //crate::sbi::shutdown(255); //255 == -1 for err hint
                 crate::board::QEMU_EXIT_HANDLE.exit_failure();
             } else {
@@ -120,8 +128,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let mut process_inner = process.inner_exclusive_access();
         // mark this process as a zombie process
         process_inner.is_zombie = true;
-        // record exit code of main process
-        process_inner.exit_code = exit_code;
+        // record process exit reason for wait4/waitpid
+        process_inner.exit_reason = exit_reason;
 
         {
             // move all child processes under init process
@@ -203,14 +211,15 @@ pub fn add_initproc() {
 pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
-    process_inner.signals.check_error()
+    let pending = process_inner.pending_signals & !process_inner.signal_mask;
+    pending.check_error()
 }
 
 /// Add signal to the current task
 pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
-    process_inner.signals |= signal;
+    process_inner.pending_signals |= signal;
 }
 
 /// the inactive(blocked) tasks are removed when the PCB is deallocated.(called by exit_current_and_run_next)
