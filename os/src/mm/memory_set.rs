@@ -42,7 +42,7 @@ pub struct MemorySet {
     /// page table
     pub page_table: PageTable,
     /// virtual memory areas
-    pub areas: Vec<Vma>,
+    pub vmas: Vec<Vma>,
 }
 
 impl MemorySet {
@@ -50,7 +50,7 @@ impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTable::new(),
-            areas: Vec::new(),
+            vmas: Vec::new(),
         }
     }
     /// Get he page table token
@@ -64,32 +64,67 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) {
-        self.push(Vma::new(start_va, end_va, MapType::Framed, permission, VmaKind::Anonymous), None);
+        let _ = self.insert_vma(
+            Vma::new(start_va, end_va, MapType::Framed, permission, VmaKind::Anonymous),
+            None,
+        );
     }
-    /// remove a area
-    pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
+    /// 根据起始虚拟页号删除一段已经登记的区域。
+    pub fn remove_vma_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
-            .areas
+            .vmas
             .iter_mut()
             .enumerate()
-            .find(|(_, area)| area.vpn_range.get_start() == start_vpn)
+            .find(|(_, area)| area.start_vpn() == start_vpn)
         {
             area.unmap(&mut self.page_table);
-            self.areas.remove(idx);
+            self.vmas.remove(idx);
             unsafe {
                 asm!("sfence.vma");
             }
         }
     }
-    /// Add a new VMA into this MemorySet.
-    /// Assuming that there are no conflicts in the virtual address
-    /// space.
-    fn push(&mut self, mut vma: Vma, data: Option<&[u8]>) {
+    /// 判断给定区间是否与当前地址空间中的任意区域重叠。
+    pub fn overlaps_vma_range(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        self.vmas.iter().any(|vma| {
+            let vma_start = vma.start_vpn();
+            let vma_end = vma.end_vpn();
+            start_vpn < vma_end && vma_start < end_vpn
+        })
+    }
+    /// 按起始虚拟页号查找一段区域。
+    pub fn find_vma(&self, start_vpn: VirtPageNum) -> Option<&Vma> {
+        self.vmas.iter().find(|vma| vma.start_vpn() == start_vpn)
+    }
+    /// 按起始虚拟页号查找一段可变区域，供扩缩容等操作复用。
+    pub fn find_vma_mut(&mut self, start_vpn: VirtPageNum) -> Option<&mut Vma> {
+        self.vmas.iter_mut().find(|vma| vma.start_vpn() == start_vpn)
+    }
+    /// 将一段区域登记到地址空间并立即建立页表映射；若与现有区域冲突则失败。
+    pub fn insert_vma(&mut self, mut vma: Vma, data: Option<&[u8]>) -> bool {
+        if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
+            return false;
+        }
         vma.map(&mut self.page_table);
         if let Some(data) = data {
             vma.copy_data(&mut self.page_table, data);
         }
-        self.areas.push(vma);
+        self.vmas.push(vma);
+        true
+    }
+    /// 在完成分裂、删除或追加后整理可合并的相邻区域。
+    /// TODO：考虑使用有序数据结构维护vmas，避免每一次都需要排序。
+    pub fn merge_adjacent_vmas(&mut self) {
+        self.vmas.sort_by_key(|vma| vma.start_vpn().0);
+        let mut idx = 0;
+        while idx + 1 < self.vmas.len() {
+            if self.vmas[idx].can_merge_with(&self.vmas[idx + 1]) {
+                let right = self.vmas.remove(idx + 1);
+                self.vmas[idx].absorb(right);
+            } else {
+                idx += 1;
+            }
+        }
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
@@ -113,7 +148,7 @@ impl MemorySet {
             sbss_with_stack as usize, ebss as usize
         );
         info!("mapping .text section");
-        memory_set.push(
+        let _ = memory_set.insert_vma(
             Vma::new(
                 (stext as usize).into(),
                 (etext as usize).into(),
@@ -124,7 +159,7 @@ impl MemorySet {
             None,
         );
         info!("mapping .rodata section");
-        memory_set.push(
+        let _ = memory_set.insert_vma(
             Vma::new(
                 (srodata as usize).into(),
                 (erodata as usize).into(),
@@ -135,7 +170,7 @@ impl MemorySet {
             None,
         );
         info!("mapping .data section");
-        memory_set.push(
+        let _ = memory_set.insert_vma(
             Vma::new(
                 (sdata as usize).into(),
                 (edata as usize).into(),
@@ -146,7 +181,7 @@ impl MemorySet {
             None,
         );
         info!("mapping .bss section");
-        memory_set.push(
+        let _ = memory_set.insert_vma(
             Vma::new(
                 (sbss_with_stack as usize).into(),
                 (ebss as usize).into(),
@@ -157,7 +192,7 @@ impl MemorySet {
             None,
         );
         info!("mapping physical memory");
-        memory_set.push(
+        let _ = memory_set.insert_vma(
             Vma::new(
                 (ekernel as usize).into(),
                 MEMORY_END.into(),
@@ -169,7 +204,7 @@ impl MemorySet {
         );
         info!("mapping memory-mapped registers");
         for pair in MMIO {
-            memory_set.push(
+            let _ = memory_set.insert_vma(
                 Vma::new(
                     (*pair).0.into(),
                     ((*pair).0 + (*pair).1).into(),
@@ -213,7 +248,7 @@ impl MemorySet {
                 }
                 let vma = Vma::new_elf(start_va, end_va, map_perm);
                 max_end_vpn = vma.end_vpn();
-                memory_set.push(
+                let _ = memory_set.insert_vma(
                     vma,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
                 );
@@ -235,9 +270,9 @@ impl MemorySet {
         // map trampoline
         memory_set.map_trampoline();
         // copy data sections/trap_context/user_stack
-        for area in user_space.areas.iter() {
+        for area in user_space.vmas.iter() {
             let new_area = area.clone_metadata();
-            memory_set.push(new_area, None);
+            let _ = memory_set.insert_vma(new_area, None);
             // copy data from another space
             for vpn in area.vpn_range {
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
@@ -264,18 +299,14 @@ impl MemorySet {
 
     ///Remove all VMAs
     pub fn recycle_data_pages(&mut self) {
-        self.areas.clear();
+        self.vmas.clear();
     }
 
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
-        if let Some(area) = self
-            .areas
-            .iter_mut()
-            .find(|area| area.vpn_range.get_start() == start.floor())
-        {
-            area.shrink_to(&mut self.page_table, new_end.ceil());
+        if let Some(idx) = self.vmas.iter().position(|vma| vma.start_vpn() == start.floor()) {
+            self.vmas[idx].shrink_to(&mut self.page_table, new_end.ceil());
             true
         } else {
             false
@@ -285,12 +316,16 @@ impl MemorySet {
     /// append the area to new_end
     #[allow(unused)]
     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
-        if let Some(area) = self
-            .areas
-            .iter_mut()
-            .find(|area| area.vpn_range.get_start() == start.floor())
-        {
-            area.append_to(&mut self.page_table, new_end.ceil());
+        let new_end_vpn = new_end.ceil();
+        let old_end_vpn = match self.find_vma(start.floor()) {
+            Some(area) => area.end_vpn(),
+            None => return false,
+        };
+        if self.overlaps_vma_range(old_end_vpn, new_end_vpn) {
+            return false;
+        }
+        if let Some(idx) = self.vmas.iter().position(|vma| vma.start_vpn() == start.floor()) {
+            self.vmas[idx].append_to(&mut self.page_table, new_end.ceil());
             true
         } else {
             false
@@ -304,14 +339,9 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) -> bool {
-        let start_vpn: VirtPageNum = start_va.floor();
-        let end_vpn: VirtPageNum = end_va.ceil();
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            if self.translate(vpn).is_some() {
-                return false;
-            }
+        if !self.insert_vma(Vma::new_anonymous(start_va, end_va, permission), None) {
+            return false;
         }
-        self.push(Vma::new_anonymous(start_va, end_va, permission), None);
         unsafe {
             asm!("sfence.vma");
         }
@@ -330,7 +360,7 @@ impl MemorySet {
                 return false;
             }
             if !self
-                .areas
+                .vmas
                 .iter()
                 .any(|area| area.is_anonymous_framed_containing(vpn))
             {
@@ -338,8 +368,8 @@ impl MemorySet {
             }
         }
 
-        let mut new_areas: Vec<Vma> = Vec::with_capacity(self.areas.len() + 1);
-        for mut area in self.areas.drain(..) {
+        let mut new_areas: Vec<Vma> = Vec::with_capacity(self.vmas.len() + 1);
+        for mut area in self.vmas.drain(..) {
             let area_start = area.start_vpn();
             let area_end = area.end_vpn();
             let overlap_start = if area_start > start_vpn {
@@ -387,7 +417,8 @@ impl MemorySet {
                 new_areas.push(right_area);
             }
         }
-        self.areas = new_areas;
+        self.vmas = new_areas;
+        self.merge_adjacent_vmas();
         unsafe {
             asm!("sfence.vma");
         }
@@ -395,22 +426,45 @@ impl MemorySet {
     }
 }
 
+/// 用于描述一段虚拟地址区间在地址空间中的语义角色。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmaKind {
+    /// 内核地址空间中的固定映射区域。
     Kernel,
+    /// 来自 ELF 装载段的用户态区域。
     Elf,
+    /// 预留给 brk/sbrk 管理的进程堆区域。
     Heap,
-    UserStack { tid: usize },
-    TrapContext { tid: usize },
+    /// 某个线程的用户栈区域。
+    UserStack {
+        /// 用户栈所属线程编号。
+        tid: usize,
+    },
+    /// 某个线程的 Trap 上下文页。
+    TrapContext {
+        /// Trap 上下文所属线程编号。
+        tid: usize,
+    },
+    /// 普通匿名映射区域。
     Anonymous,
-    File { offset: usize },
+    /// 文件映射区域。
+    File {
+        /// 文件映射在底层对象中的页对齐偏移。
+        offset: usize,
+    },
 }
 
+/// 一段带有权限、来源和页框信息的虚拟内存区域描述。
 pub struct Vma {
+    /// 覆盖的虚拟页号半开区间。
     pub vpn_range: VPNRange,
+    /// 对于 framed 映射，记录每个虚拟页对应的物理页框。
     pub data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    /// 该区域采用的映射方式。
     pub map_type: MapType,
+    /// 该区域在页表中的访问权限。
     pub map_perm: MapPermission,
+    /// 该区域在地址空间中的用途标签。
     pub kind: VmaKind,
 }
 
@@ -531,12 +585,19 @@ impl Vma {
             && self.map_perm == other.map_perm
             && self.kind == other.kind
     }
+    /// 将一段可合并的相邻区域吸收到当前区域中，并保留已有映射页信息。
+    pub fn absorb(&mut self, other: Self) {
+        debug_assert!(self.can_merge_with(&other));
+        self.vpn_range = VPNRange::new(self.start_vpn(), other.end_vpn());
+        self.data_frames.extend(other.data_frames);
+    }
     /// 判断指定虚拟页是否属于匿名帧映射区域，供当前匿名 unmap 逻辑复用。
     pub fn is_anonymous_framed_containing(&self, vpn: VirtPageNum) -> bool {
         self.map_type == MapType::Framed
             && matches!(self.kind, VmaKind::Anonymous)
             && self.contains_vpn(vpn)
     }
+    /// 为指定虚拟页建立单页映射，并在需要时分配新的物理页框。
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -552,23 +613,27 @@ impl Vma {
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
+    /// 撤销指定虚拟页的映射，并释放对应的页框记录。
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         if self.map_type == MapType::Framed {
             self.data_frames.remove(&vpn);
         }
         page_table.unmap(vpn);
     }
+    /// 为当前区域覆盖的全部虚拟页建立映射。
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
+    /// 撤销当前区域覆盖的全部虚拟页映射。
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
     }
     #[allow(unused)]
+    /// 将当前区域收缩到新的上界，并同步拆除尾部页映射。
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
             self.unmap_one(page_table, vpn)
@@ -576,6 +641,7 @@ impl Vma {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
+    /// 将当前区域向高地址扩展到新的上界，并补齐新增页映射。
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
