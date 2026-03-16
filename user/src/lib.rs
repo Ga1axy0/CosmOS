@@ -343,8 +343,26 @@ pub fn munmap(start: usize, len: usize) -> isize {
     sys_munmap(start, len)
 }
 
+pub fn brk(addr: usize) -> isize {
+    sys_brk(addr)
+}
+
 pub fn sbrk(size: i32) -> isize {
-    sys_sbrk(size)
+    let old_brk = brk(0);
+    if old_brk < 0 {
+        return -1;
+    }
+    let target = if size >= 0 {
+        (old_brk as usize).saturating_add(size as usize)
+    } else {
+        (old_brk as usize).saturating_sub(size.unsigned_abs() as usize)
+    };
+    let new_brk = brk(target);
+    if new_brk == target as isize {
+        old_brk
+    } else {
+        -1
+    }
 }
 
 pub fn spawn(path: &str) -> isize {

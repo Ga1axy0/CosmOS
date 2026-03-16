@@ -82,7 +82,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         let map_addr = if addr == 0 {
             // Linux-style mmap(NULL, ...): choose a free user VA automatically.
             let step = len_aligned.max(PAGE_SIZE);
-            let mut probe = 0x1000_0000usize;
+            let mut probe = current_process().mmap_base();
             let limit = TRAP_CONTEXT_BASE.saturating_sub(step);
             let mut chosen: Option<usize> = None;
             while probe <= limit {

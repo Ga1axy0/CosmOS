@@ -70,10 +70,8 @@ pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_GETPPID: usize = 173;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
-/*
-/// sbrk syscall
-pub const SYSCALL_SBRK: usize = 214;
-*/
+/// brk syscall
+pub const SYSCALL_BRK: usize = 214;
 /// munmap syscall
 pub const SYSCALL_MUNMAP: usize = 215;
 /// fork syscall
@@ -208,6 +206,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WAIT4 => sys_wait4(args[0] as isize, args[1] as *mut i32, args[2] as isize),
         SYSCALL_GETTIMEOFDAY => sys_get_time(args[0] as *mut TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
+        SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
