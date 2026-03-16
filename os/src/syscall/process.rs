@@ -125,11 +125,22 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
 
 const WNOHANG: isize = 1;
 
+fn encode_wait_status(exit_status: i32) -> i32 {
+    if exit_status >= 0 {
+        // Linux wait status packs normal exit codes into the high byte.
+        (exit_status & 0xff) << 8
+    } else {
+        // Placeholder for future signal-aware status encoding.
+        // Current kernel still uses negative exit codes for fatal conditions.
+        exit_status
+    }
+}
+
 /// waitpid syscall
 ///
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
+pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize {
     trace!("kernel: sys_wait4");
     let process = current_process();
     syscall_body!({
@@ -160,6 +171,7 @@ pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
                 let found_pid = child.getpid();
                 let child_inner = child.inner_exclusive_access();
                 let exit_code = child_inner.exit_code;
+                let exit_status = encode_wait_status(exit_code);
                 inner.child_user_time = inner
                     .child_user_time
                     .saturating_add(child_inner.user_time)
@@ -172,9 +184,9 @@ pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
                 drop(child_inner);
                 drop(inner);
 
-                if !exit_code_ptr.is_null() {
-                    if let Some(slot) = translated_refmut(token, exit_code_ptr) {
-                        *slot = exit_code;
+                if !exit_status_ptr.is_null() {
+                    if let Some(slot) = translated_refmut(token, exit_status_ptr) {
+                        *slot = exit_status;
                     } else {
                         return Err(ERRNO::EFAULT);
                     }
