@@ -14,7 +14,9 @@ impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
-            mask: SignalFlags::from_bits(40).unwrap(),
+            // mask: SignalFlags::from_bits(40).unwrap(),
+            // idk what 40 is, just set it to empty for now
+            mask: SignalFlags::empty(),
         }
     }
 }

@@ -3,7 +3,7 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
-use super::{add_task, SignalFlags};
+use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, VirtAddr, KERNEL_SPACE};
@@ -14,6 +14,15 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+
+/// Process termination reason preserved for wait4/waitpid encoding.
+#[derive(Debug, Clone, Copy)]
+pub enum ExitReason {
+    /// Process terminated via `exit(code)`.
+    Exit(i32),
+    /// Process terminated by a signal number.
+    Signal(u32),
+}
 
 /// Process Control Block
 pub struct ProcessControlBlock {
@@ -34,12 +43,16 @@ pub struct ProcessControlBlockInner {
     pub parent: Option<Weak<ProcessControlBlock>>,
     /// children process
     pub children: Vec<Arc<ProcessControlBlock>>,
-    /// exit code
-    pub exit_code: i32,
+    /// exit reason observed by wait4/waitpid
+    pub exit_reason: ExitReason,
     /// file descriptor table
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
-    /// signal flags
-    pub signals: SignalFlags,
+    /// pending process signals
+    pub pending_signals: SignalFlags,
+    /// blocked process signals
+    pub signal_mask: SignalFlags,
+    /// installed signal actions
+    pub signal_actions: SignalActions,
     /// tasks(also known as threads)
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     /// task resource allocator
@@ -137,7 +150,7 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: None,
                     children: Vec::new(),
-                    exit_code: 0,
+                    exit_reason: ExitReason::Exit(0),
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -146,7 +159,9 @@ impl ProcessControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
-                    signals: SignalFlags::empty(),
+                    pending_signals: SignalFlags::empty(),
+                    signal_mask: SignalFlags::empty(),
+                    signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
@@ -295,9 +310,11 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
-                    exit_code: 0,
+                    exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
-                    signals: SignalFlags::empty(),
+                    pending_signals: SignalFlags::empty(),
+                    signal_mask: parent.signal_mask,
+                    signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
@@ -369,9 +386,11 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
-                    exit_code: 0,
+                    exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
-                    signals: SignalFlags::empty(),
+                    pending_signals: SignalFlags::empty(),
+                    signal_mask: parent.signal_mask,
+                    signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
