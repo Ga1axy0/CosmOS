@@ -23,6 +23,7 @@ use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::task::manager::add_stopping_task;
 use crate::timer::remove_timer;
+use crate::timer::get_time;
 use crate::mm::{MapPermission, VirtAddr};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
@@ -42,6 +43,7 @@ pub use task::{TaskControlBlock, TaskStatus};
 
 /// Make current task suspended and switch to the next task
 pub fn suspend_current_and_run_next() {
+    current_process().pause_cpu_accounting(get_time());
     // There must be an application running.
     let task = take_current_task().unwrap();
 
@@ -61,6 +63,7 @@ pub fn suspend_current_and_run_next() {
 
 /// Make current task blocked and switch to the next task.
 pub fn block_current_and_run_next() {
+    current_process().pause_cpu_accounting(get_time());
     let task = take_current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
@@ -79,8 +82,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     );
     // take from Processor
     let task = take_current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
+    process.pause_cpu_accounting(get_time());
+    let mut task_inner = task.inner_exclusive_access();
     let tid = task_inner.res.as_ref().unwrap().tid;
     // record exit code
     task_inner.exit_code = Some(exit_code);

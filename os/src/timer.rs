@@ -38,6 +38,11 @@ pub fn get_time_ticks() -> usize {
     time::read() * TICKS_PER_SEC / CLOCK_FREQ
 }
 
+/// Convert a raw timer counter delta into clock ticks used by times(2).
+pub fn time_to_ticks(time: usize) -> usize {
+    time.saturating_mul(TICKS_PER_SEC) / CLOCK_FREQ
+}
+
 /// Set the next timer interrupt
 pub fn set_next_trigger() {
     set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
