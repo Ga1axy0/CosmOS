@@ -26,3 +26,5 @@ os/vendor/
 notes
 base.img
 sdcard-rv.img
+second-easyfs.img
+second-fat32.img

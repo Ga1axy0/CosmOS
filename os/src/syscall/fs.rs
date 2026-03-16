@@ -1,6 +1,6 @@
 use crate::fs::{
-    canonicalize, linkat, lookup_inode, make_pipe, mkdir_at, open_file_at, unlinkat,
-    OpenFlags, Stat, AT_FDCWD, AT_REMOVEDIR,
+    AT_FDCWD, AT_REMOVEDIR, OpenFlags, Stat, canonicalize, do_umount, linkat,
+    lookup_inode, make_pipe, mkdir_at, mount_device, open_file_at, unlinkat,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
@@ -410,5 +410,59 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
             src_off += len;
         }
         Ok(bytes as isize)
+    })
+}
+
+
+pub fn sys_mount(
+    dev_name: *const u8,
+    dir_name: *const u8,
+    fs_type: *const u8,
+    _flags: usize,
+    data: *const u8,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mount",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let dev_name = translated_str(token, dev_name).or_errno(ERRNO::EFAULT)?;
+        let dir_name = translated_str(token, dir_name).or_errno(ERRNO::EFAULT)?;
+        let fs_type  = translated_str(token, fs_type).or_errno(ERRNO::EFAULT)?;
+        // `data` is typically NULL (e.g. mount(…, NULL)); skip translation if so.
+        let _data: String = if data.is_null() {
+            String::new()
+        } else {
+            translated_str(token, data).or_errno(ERRNO::EFAULT)?
+        };
+
+        let cwd     = current_process().inner_exclusive_access().cwd.clone();
+        let abs_mnt = canonicalize(&cwd, &dir_name);
+        debug!(
+            "sys_mount: dev_name = {}, dir_name = {}, abs_mnt = {}, fs_type = {}, data = {}",
+            dev_name,
+            dir_name,
+            abs_mnt,
+            fs_type,
+            _data
+        );
+        mount_device(&dev_name, &abs_mnt, &fs_type)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_umount",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
+        let cwd  = current_process().inner_exclusive_access().cwd.clone();
+        let abs  = canonicalize(&cwd, &name);
+        do_umount(&abs)?;
+        Ok(0)
     })
 }
