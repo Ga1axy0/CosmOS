@@ -41,8 +41,8 @@ pub fn kernel_token() -> usize {
 pub struct MemorySet {
     /// page table
     pub page_table: PageTable,
-    /// areas
-    pub areas: Vec<MapArea>,
+    /// virtual memory areas
+    pub areas: Vec<Vma>,
 }
 
 impl MemorySet {
@@ -64,10 +64,7 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) {
-        self.push(
-            MapArea::new(start_va, end_va, MapType::Framed, permission),
-            None,
-        );
+        self.push(Vma::new(start_va, end_va, MapType::Framed, permission, VmaKind::Anonymous), None);
     }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
@@ -84,15 +81,15 @@ impl MemorySet {
             }
         }
     }
-    /// Add a new MapArea into this MemorySet.
+    /// Add a new VMA into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
-    fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
-        map_area.map(&mut self.page_table);
+    fn push(&mut self, mut vma: Vma, data: Option<&[u8]>) {
+        vma.map(&mut self.page_table);
         if let Some(data) = data {
-            map_area.copy_data(&mut self.page_table, data);
+            vma.copy_data(&mut self.page_table, data);
         }
-        self.areas.push(map_area);
+        self.areas.push(vma);
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
@@ -117,62 +114,68 @@ impl MemorySet {
         );
         info!("mapping .text section");
         memory_set.push(
-            MapArea::new(
+            Vma::new(
                 (stext as usize).into(),
                 (etext as usize).into(),
                 MapType::Identical,
                 MapPermission::R | MapPermission::X,
+                VmaKind::Kernel,
             ),
             None,
         );
         info!("mapping .rodata section");
         memory_set.push(
-            MapArea::new(
+            Vma::new(
                 (srodata as usize).into(),
                 (erodata as usize).into(),
                 MapType::Identical,
                 MapPermission::R,
+                VmaKind::Kernel,
             ),
             None,
         );
         info!("mapping .data section");
         memory_set.push(
-            MapArea::new(
+            Vma::new(
                 (sdata as usize).into(),
                 (edata as usize).into(),
                 MapType::Identical,
                 MapPermission::R | MapPermission::W,
+                VmaKind::Kernel,
             ),
             None,
         );
         info!("mapping .bss section");
         memory_set.push(
-            MapArea::new(
+            Vma::new(
                 (sbss_with_stack as usize).into(),
                 (ebss as usize).into(),
                 MapType::Identical,
                 MapPermission::R | MapPermission::W,
+                VmaKind::Kernel,
             ),
             None,
         );
         info!("mapping physical memory");
         memory_set.push(
-            MapArea::new(
+            Vma::new(
                 (ekernel as usize).into(),
                 MEMORY_END.into(),
                 MapType::Identical,
                 MapPermission::R | MapPermission::W,
+                VmaKind::Kernel,
             ),
             None,
         );
         info!("mapping memory-mapped registers");
         for pair in MMIO {
             memory_set.push(
-                MapArea::new(
+                Vma::new(
                     (*pair).0.into(),
                     ((*pair).0 + (*pair).1).into(),
                     MapType::Identical,
                     MapPermission::R | MapPermission::W,
+                    VmaKind::Kernel,
                 ),
                 None,
             );
@@ -208,10 +211,10 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_vpn = map_area.vpn_range.get_end();
+                let vma = Vma::new_elf(start_va, end_va, map_perm);
+                max_end_vpn = vma.end_vpn();
                 memory_set.push(
-                    map_area,
+                    vma,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
                 );
             }
@@ -233,7 +236,7 @@ impl MemorySet {
         memory_set.map_trampoline();
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
-            let new_area = MapArea::from_another(area);
+            let new_area = area.clone_metadata();
             memory_set.push(new_area, None);
             // copy data from another space
             for vpn in area.vpn_range {
@@ -259,7 +262,7 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
-    ///Remove all `MapArea`
+    ///Remove all VMAs
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
     }
@@ -308,13 +311,7 @@ impl MemorySet {
                 return false;
             }
         }
-        self.push(
-            MapArea::new(start_va, end_va, MapType::Framed, permission),
-            None,
-        );
-        if let Some(area) = self.areas.last_mut() {
-            area.is_anonymous = true;
-        }
+        self.push(Vma::new_anonymous(start_va, end_va, permission), None);
         unsafe {
             asm!("sfence.vma");
         }
@@ -341,10 +338,10 @@ impl MemorySet {
             }
         }
 
-        let mut new_areas: Vec<MapArea> = Vec::with_capacity(self.areas.len() + 1);
+        let mut new_areas: Vec<Vma> = Vec::with_capacity(self.areas.len() + 1);
         for mut area in self.areas.drain(..) {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
             let overlap_start = if area_start > start_vpn {
                 area_start
             } else {
@@ -367,12 +364,12 @@ impl MemorySet {
 
             if area_start < overlap_start {
                 let left_data_frames = area.data_frames.split_off(&overlap_start);
-                let left_area = MapArea {
+                let left_area = Vma {
                     vpn_range: VPNRange::new(area_start, overlap_start),
                     data_frames: area.data_frames,
                     map_type: area.map_type,
                     map_perm: area.map_perm,
-                    is_anonymous: area.is_anonymous,
+                    kind: area.kind.clone(),
                 };
                 area.data_frames = left_data_frames;
                 new_areas.push(left_area);
@@ -380,12 +377,12 @@ impl MemorySet {
 
             if overlap_end < area_end {
                 let right_data_frames = area.data_frames.split_off(&overlap_end);
-                let right_area = MapArea {
+                let right_area = Vma {
                     vpn_range: VPNRange::new(overlap_end, area_end),
                     data_frames: right_data_frames,
                     map_type: area.map_type,
                     map_perm: area.map_perm,
-                    is_anonymous: area.is_anonymous,
+                    kind: area.kind.clone(),
                 };
                 new_areas.push(right_area);
             }
@@ -398,20 +395,33 @@ impl MemorySet {
     }
 }
 
-pub struct MapArea {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VmaKind {
+    Kernel,
+    Elf,
+    Heap,
+    UserStack { tid: usize },
+    TrapContext { tid: usize },
+    Anonymous,
+    File { offset: usize },
+}
+
+pub struct Vma {
     pub vpn_range: VPNRange,
     pub data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     pub map_type: MapType,
     pub map_perm: MapPermission,
-    pub is_anonymous: bool,
+    pub kind: VmaKind,
 }
 
-impl MapArea {
+impl Vma {
+    /// 根据给定区间、映射方式、权限与语义类型构造一段新的虚拟内存区域。
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
         map_type: MapType,
         map_perm: MapPermission,
+        kind: VmaKind,
     ) -> Self {
         let start_vpn: VirtPageNum = start_va.floor();
         let end_vpn: VirtPageNum = end_va.ceil();
@@ -420,23 +430,112 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
-            is_anonymous: false,
+            kind,
         }
     }
-    pub fn from_another(another: &Self) -> Self {
+    /// 为 ELF 装载段创建一段带有用户态访问语义的区域描述。
+    pub fn new_elf(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
+        Self::new(start_va, end_va, MapType::Framed, map_perm, VmaKind::Elf)
+    }
+    /// 为后续通过 brk/sbrk 管理的数据段扩展区预留专用区域类型。
+    pub fn new_heap(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
+        Self::new(start_va, end_va, MapType::Framed, map_perm, VmaKind::Heap)
+    }
+    /// 为某个线程生成用户栈对应的区域描述，并附带线程编号。
+    pub fn new_user_stack(start_va: VirtAddr, end_va: VirtAddr, tid: usize) -> Self {
+        Self::new(
+            start_va,
+            end_va,
+            MapType::Framed,
+            MapPermission::R | MapPermission::W | MapPermission::U,
+            VmaKind::UserStack { tid },
+        )
+    }
+    /// 为某个线程生成 Trap 上下文页对应的区域描述。
+    pub fn new_trap_context(start_va: VirtAddr, end_va: VirtAddr, tid: usize) -> Self {
+        Self::new(
+            start_va,
+            end_va,
+            MapType::Framed,
+            MapPermission::R | MapPermission::W,
+            VmaKind::TrapContext { tid },
+        )
+    }
+    /// 为匿名映射场景生成一段普通用户区域。
+    pub fn new_anonymous(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
+        Self::new(
+            start_va,
+            end_va,
+            MapType::Framed,
+            map_perm,
+            VmaKind::Anonymous,
+        )
+    }
+    /// 为文件映射场景保留文件偏移等来源信息。
+    pub fn new_file(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_perm: MapPermission,
+        offset: usize,
+    ) -> Self {
+        Self::new(
+            start_va,
+            end_va,
+            MapType::Framed,
+            map_perm,
+            VmaKind::File { offset },
+        )
+    }
+    /// 复制一份仅包含区间属性的区域元数据，不携带已有物理页分配结果。
+    pub fn clone_metadata(&self) -> Self {
         Self {
-            vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
+            vpn_range: VPNRange::new(self.start_vpn(), self.end_vpn()),
             data_frames: BTreeMap::new(),
-            map_type: another.map_type,
-            map_perm: another.map_perm,
-            is_anonymous: another.is_anonymous,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+            kind: self.kind.clone(),
         }
     }
-    pub fn contains_vpn(&self, vpn: VirtPageNum) -> bool {
-        self.vpn_range.get_start() <= vpn && vpn < self.vpn_range.get_end()
+    /// 返回该区域覆盖的起始虚拟页号，便于统一做区间级操作。
+    pub fn start_vpn(&self) -> VirtPageNum {
+        self.vpn_range.get_start()
     }
+    /// 返回该区域末尾的虚拟页号上界，用于配合半开区间判断。
+    pub fn end_vpn(&self) -> VirtPageNum {
+        self.vpn_range.get_end()
+    }
+    /// 判断某个虚拟页是否落在当前区域内部。
+    pub fn contains_vpn(&self, vpn: VirtPageNum) -> bool {
+        self.start_vpn() <= vpn && vpn < self.end_vpn()
+    }
+    /// 判断当前区域是否被标记为进程堆，便于后续 brk 语义接入。
+    pub fn is_heap(&self) -> bool {
+        matches!(self.kind, VmaKind::Heap)
+    }
+    /// 判断当前区域是否表示某个线程的用户栈。
+    pub fn is_user_stack(&self) -> bool {
+        matches!(self.kind, VmaKind::UserStack { .. })
+    }
+    /// 判断当前区域是否表示某个线程的 Trap 上下文页。
+    pub fn is_trap_context(&self) -> bool {
+        matches!(self.kind, VmaKind::TrapContext { .. })
+    }
+    /// 依据权限位判断该区域是否允许用户态直接访问。
+    pub fn is_user_accessible(&self) -> bool {
+        self.map_perm.contains(MapPermission::U)
+    }
+    /// 判断两段相邻区域在元数据层面是否具备合并条件。
+    pub fn can_merge_with(&self, other: &Self) -> bool {
+        self.end_vpn() == other.start_vpn()
+            && self.map_type == other.map_type
+            && self.map_perm == other.map_perm
+            && self.kind == other.kind
+    }
+    /// 判断指定虚拟页是否属于匿名帧映射区域，供当前匿名 unmap 逻辑复用。
     pub fn is_anonymous_framed_containing(&self, vpn: VirtPageNum) -> bool {
-        self.map_type == MapType::Framed && self.is_anonymous && self.contains_vpn(vpn)
+        self.map_type == MapType::Framed
+            && matches!(self.kind, VmaKind::Anonymous)
+            && self.contains_vpn(vpn)
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
