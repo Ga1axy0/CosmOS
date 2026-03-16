@@ -45,6 +45,18 @@ impl VirtIOBlock {
             ))
         }
     }
+
+    /// Try to initialise a VirtIO block device at `base_addr`.
+    ///
+    /// Returns `None` if there is no VirtIO block device at that address
+    /// (e.g. the MMIO slot is empty or maps a different device type).
+    pub fn try_new(base_addr: usize) -> Option<Self> {
+        unsafe {
+            VirtIOBlk::<VirtioHal>::new(&mut *(base_addr as *mut VirtIOHeader))
+                .ok()
+                .map(|blk| Self(UPSafeCell::new(blk)))
+        }
+    }
 }
 
 pub struct VirtioHal;
