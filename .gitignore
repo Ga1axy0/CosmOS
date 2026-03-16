@@ -15,7 +15,6 @@ user/.idea/*
 user/Cargo.lock
 fs/Cargo.lock
 fs/target/*
-fs-fuse/Cargo.lock
 fs-fuse/target/*
 tools/
 pushall.sh
@@ -27,3 +26,5 @@ os/vendor/
 notes
 base.img
 sdcard-rv.img
+second-easyfs.img
+second-fat32.img

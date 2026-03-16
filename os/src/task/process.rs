@@ -192,29 +192,42 @@ impl ProcessControlBlock {
         // push arguments on user stack
         trace!("kernel: exec .. push arguments on user stack");
         let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
-        user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
-        let argv_base = user_sp;
-        let mut argv: Vec<_> = (0..=args.len())
-            .map(|arg| {
-                translated_refmut(
-                    new_token,
-                    (argv_base + arg * core::mem::size_of::<usize>()) as *mut usize,
-                ).unwrap()
-            })
-            .collect();
-        *argv[args.len()] = 0;
-        for i in 0..args.len() {
-            user_sp -= args[i].len() + 1;
-            *argv[i] = user_sp;
+        let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            user_sp -= arg.len() + 1;
+            arg_ptrs.push(user_sp);
             let mut p = user_sp;
-            for c in args[i].as_bytes() {
+            for c in arg.as_bytes() {
                 *translated_refmut(new_token, p as *mut u8).unwrap() = *c;
                 p += 1;
             }
             *translated_refmut(new_token, p as *mut u8).unwrap() = 0;
         }
-        // make the user_sp aligned to 8B for k210 platform
-        user_sp -= user_sp % core::mem::size_of::<usize>();
+
+        let word_size = core::mem::size_of::<usize>();
+        // Build a C-compatible initial stack frame:
+        // [argc][argv[0]..argv[n-1]][NULL][envp=NULL]
+        // while still keeping a0/a1 set for the existing Rust userland ABI.
+        let stack_entries = args.len() + 3;
+        let stack_frame_size = stack_entries * word_size;
+        user_sp = (user_sp.saturating_sub(stack_frame_size)) & !0xf;
+        let argv_base = user_sp + word_size;
+
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
+        for (i, arg_ptr) in arg_ptrs.iter().enumerate() {
+            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize).unwrap() =
+                *arg_ptr;
+        }
+        *translated_refmut(
+            new_token,
+            (argv_base + args.len() * word_size) as *mut usize,
+        )
+        .unwrap() = 0;
+        *translated_refmut(
+            new_token,
+            (argv_base + (args.len() + 1) * word_size) as *mut usize,
+        )
+        .unwrap() = 0;
         // initialize trap_cx
         trace!("kernel: exec .. initialize trap_cx");
         let mut trap_cx = TrapContext::app_init_context(

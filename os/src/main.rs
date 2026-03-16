@@ -73,11 +73,12 @@ pub fn rust_main() -> ! {
     logging::init();
     mm::init();
     mm::remap_test();
-    drivers::chardev::init();
     trap::init();
     trap::enable_timer_interrupt();
-    drivers::plic::init();
+    drivers::init();
     println!("[kernel] Hello, world!");
+    fs::init_rootfs();
+    fs::init_dev();
     timer::set_next_trigger();
     //    fs::list_apps();
     task::add_initproc();
