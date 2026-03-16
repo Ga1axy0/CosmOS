@@ -4,7 +4,7 @@ use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE};
+use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -43,6 +43,18 @@ pub struct MemorySet {
     pub page_table: PageTable,
     /// virtual memory areas
     pub vmas: Vec<Vma>,
+}
+
+/// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
+pub struct UserSpaceLayout {
+    /// 程序数据段末尾对齐后的初始 break。
+    pub start_brk: usize,
+    /// 供 `mmap(NULL, ...)` 选择地址时使用的默认基址。
+    pub mmap_base: usize,
+    /// 主线程用户栈所在区域的底部地址。
+    pub ustack_base: usize,
+    /// 主线程初始栈顶地址。
+    pub start_stack: usize,
 }
 
 impl MemorySet {
@@ -217,9 +229,8 @@ impl MemorySet {
         }
         memory_set
     }
-    /// Include sections in elf and trampoline and TrapContext and user stack,
-    /// also returns user_sp_base and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, usize, usize), ()> {
+    /// Include ELF segments and trampoline, and compute initial process VM layout.
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, usize), ()> {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -254,13 +265,17 @@ impl MemorySet {
                 );
             }
         }
-        // map user stack with U flags
         let max_end_va: VirtAddr = max_end_vpn.into();
-        let mut user_stack_base: usize = max_end_va.into();
-        user_stack_base += PAGE_SIZE;
+        let start_brk: usize = max_end_va.into();
+        let layout = UserSpaceLayout {
+            start_brk,
+            mmap_base: USER_MMAP_BASE,
+            ustack_base: USER_STACK_BASE,
+            start_stack: USER_STACK_BASE + USER_STACK_SIZE,
+        };
         Ok((
             memory_set,
-            user_stack_base,
+            layout,
             elf.header.pt2.entry_point() as usize,
         ))
     }

@@ -279,13 +279,13 @@ pub fn sys_sigreturn() -> isize {
 }
 
 /// change data segment size
-// pub fn sys_sbrk(size: i32) -> isize {
-//     trace!("kernel:pid[{}] sys_sbrk", current_task().unwrap().process.upgrade().unwrap().getpid());
-//     if let Some(old_brk) = current_task().unwrap().change_program_brk(size) {
-//         old_brk as isize
-//     } else {
-//     -1
-// }
+pub fn sys_brk(addr: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_brk",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    current_process().set_program_brk(addr) as isize
+}
 
 /// spawn syscall
 pub fn sys_spawn(_path: *const u8) -> isize {

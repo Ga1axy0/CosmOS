@@ -6,7 +6,7 @@ use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MapPermission, MemorySet, VirtAddr, KERNEL_SPACE};
+use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -39,6 +39,8 @@ pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
     /// memory set(address space)
     pub memory_set: MemorySet,
+    /// process virtual memory layout metadata
+    pub vm_layout: ProcessVmLayout,
     /// parent process
     pub parent: Option<Weak<ProcessControlBlock>>,
     /// children process
@@ -92,6 +94,31 @@ pub enum CpuAccountingState {
     Kernel,
 }
 
+/// 进程级虚拟内存边界信息，用于协调 heap、mmap 和主线程栈布局。
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessVmLayout {
+    /// 初始程序 break，不允许向下收缩到此地址以下。
+    pub start_brk: usize,
+    /// 当前程序 break。
+    pub brk: usize,
+    /// 匿名 mmap 自动选址的默认基址。
+    pub mmap_base: usize,
+    /// 主线程的初始栈顶位置。
+    pub start_stack: usize,
+}
+
+impl ProcessVmLayout {
+    /// 根据装载器返回的用户地址空间布局初始化进程级边界信息。
+    pub fn from_user_layout(layout: UserSpaceLayout) -> Self {
+        Self {
+            start_brk: layout.start_brk,
+            brk: layout.start_brk,
+            mmap_base: layout.mmap_base,
+            start_stack: layout.start_stack,
+        }
+    }
+}
+
 impl ProcessControlBlockInner {
     #[allow(unused)]
     /// get the address of app's page table
@@ -139,7 +166,9 @@ impl ProcessControlBlock {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
         // assert that initproc is always valid elf
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data).unwrap();
+        let (memory_set, user_layout, entry_point) = MemorySet::from_elf(elf_data).unwrap();
+        let ustack_base = user_layout.ustack_base;
+        let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // allocate a pid
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -148,6 +177,7 @@ impl ProcessControlBlock {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
+                    vm_layout,
                     parent: None,
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
@@ -216,11 +246,17 @@ impl ProcessControlBlock {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         // memory_set with elf program headers/trampoline/trap context/user stack
         trace!("kernel: exec .. MemorySet::from_elf");
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data)?;
+        let (memory_set, user_layout, entry_point) = MemorySet::from_elf(elf_data)?;
+        let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
+        let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        self.inner_exclusive_access().memory_set = memory_set;
+        {
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set = memory_set;
+            inner.vm_layout = vm_layout;
+        }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
@@ -290,6 +326,7 @@ impl ProcessControlBlock {
         assert_eq!(parent.thread_count(), 1);
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let vm_layout = parent.vm_layout;
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -308,6 +345,7 @@ impl ProcessControlBlock {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
+                    vm_layout,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
@@ -367,7 +405,9 @@ impl ProcessControlBlock {
 
     /// Create a child process directly from elf image.
     pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ()> {
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data)?;
+        let (memory_set, user_layout, entry_point) = MemorySet::from_elf(elf_data)?;
+        let ustack_base = user_layout.ustack_base;
+        let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         let mut parent = self.inner_exclusive_access();
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
@@ -384,6 +424,7 @@ impl ProcessControlBlock {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
+                    vm_layout,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
@@ -452,6 +493,62 @@ impl ProcessControlBlock {
             .exclusive_access()
             .memory_set
             .munmap_anonymous(start, end)
+    }
+
+    /// 返回当前进程用于 `mmap(NULL, ...)` 的默认起始基址。
+    pub fn mmap_base(&self) -> usize {
+        self.inner.exclusive_access().vm_layout.mmap_base
+    }
+
+    /// 按目标地址调整程序 break，返回调整后的当前 break。
+    pub fn set_program_brk(&self, new_brk: usize) -> usize {
+        let mut inner = self.inner.exclusive_access();
+        let old_brk = inner.vm_layout.brk;
+        // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
+        if new_brk == 0 {
+            return old_brk;
+        }
+        if new_brk < inner.vm_layout.start_brk
+            || new_brk >= inner.vm_layout.mmap_base
+            || new_brk >= inner.vm_layout.start_stack
+        {
+            return old_brk;
+        }
+        if new_brk == old_brk {
+            return old_brk;
+        }
+
+        let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
+        let new_brk_va = VirtAddr::from(new_brk);
+        let old_brk_va = VirtAddr::from(old_brk);
+        let old_end_vpn = old_brk_va.ceil();
+        let new_end_vpn = new_brk_va.ceil();
+        let heap_exists = inner.memory_set.vmas.iter().any(|vma| vma.is_heap());
+
+        if new_brk > old_brk {
+            let success = if heap_exists {
+                inner.memory_set.append_to(heap_start, new_brk_va)
+            } else {
+                inner.memory_set.insert_vma(
+                    Vma::new_heap(heap_start, new_brk_va, MapPermission::R | MapPermission::W | MapPermission::U),
+                    None,
+                )
+            };
+            if !success && old_end_vpn != new_end_vpn {
+                return old_brk;
+            }
+        } else if new_brk == inner.vm_layout.start_brk {
+            inner
+                .memory_set
+                .remove_vma_with_start_vpn(heap_start.floor());
+        } else if old_end_vpn != new_end_vpn
+            && !inner.memory_set.shrink_to(heap_start, new_brk_va)
+        {
+            return old_brk;
+        }
+
+        inner.vm_layout.brk = new_brk;
+        new_brk
     }
 
     /// Mark this process as running in kernel mode from `now`.
