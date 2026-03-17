@@ -1,10 +1,26 @@
 use super::{File, Stat, StatMode};
 use crate::drivers::chardev::{CharDevice, UART};
-use crate::mm::UserBuffer;
+use crate::mm::{translated_ref, translated_refmut, UserBuffer};
+use crate::syscall::errno::ERRNO;
+use crate::task::current_user_token;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 
+/// `ioctl(TCGETS)`：读取当前终端配置。
+const TCGETS: usize = 0x5401;
+/// `ioctl(TCSETS)`：立即更新终端配置。
+const TCSETS: usize = 0x5402;
+/// `ioctl(TCSETSW)`：等待输出完成后更新终端配置。
+const TCSETSW: usize = 0x5403;
+/// `ioctl(TCSETSF)`：等待输出完成并刷新输入后更新终端配置。
+const TCSETSF: usize = 0x5404;
+/// `ioctl(TIOCGWINSZ)`：读取窗口大小。
+const TIOCGWINSZ: usize = 0x5413;
+/// `ioctl(TIOCSWINSZ)`：设置窗口大小。
+const TIOCSWINSZ: usize = 0x5414;
+
 /// tty 终端配置的最小占位结构。
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Termios {
     /// Input mode flags.
@@ -36,6 +52,7 @@ impl Default for Termios {
 }
 
 /// tty 窗口大小的最小占位结构。
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WinSize {
     /// Terminal rows in characters.
@@ -113,9 +130,19 @@ impl TtyCore {
         self.state.exclusive_access().termios
     }
 
+    /// 更新当前 tty 配置。
+    pub fn set_termios(&self, termios: Termios) {
+        self.state.exclusive_access().termios = termios;
+    }
+
     /// 读取当前窗口大小快照。
     pub fn winsize(&self) -> WinSize {
         self.state.exclusive_access().winsize
+    }
+
+    /// 更新当前窗口大小。
+    pub fn set_winsize(&self, winsize: WinSize) {
+        self.state.exclusive_access().winsize = winsize;
     }
 }
 
@@ -197,6 +224,35 @@ impl File for TtyFile {
             }
         }
         n
+    }
+
+    fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        let token = current_user_token();
+        match req {
+            TCGETS => {
+                let slot = translated_refmut(token, arg as *mut Termios).ok_or(ERRNO::EFAULT)?;
+                *slot = self.core.termios();
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                let termios = *translated_ref(token, arg as *const Termios).ok_or(ERRNO::EFAULT)?;
+                // TODO: 目前将 TCSETS/TCSETSW/TCSETSF 统一处理，尚未区分 drain/flush 语义。
+                self.core.set_termios(termios);
+                Ok(0)
+            }
+            TIOCGWINSZ => {
+                let slot = translated_refmut(token, arg as *mut WinSize).ok_or(ERRNO::EFAULT)?;
+                *slot = self.core.winsize();
+                Ok(0)
+            }
+            TIOCSWINSZ => {
+                let winsize = *translated_ref(token, arg as *const WinSize).ok_or(ERRNO::EFAULT)?;
+                // TODO: 更新窗口大小后，后续需要补发 SIGWINCH。
+                self.core.set_winsize(winsize);
+                Ok(0)
+            }
+            _ => Err(ERRNO::ENOTTY),
+        }
     }
 
     fn stat(&self) -> Stat {
