@@ -9,6 +9,80 @@ use crate::task::{current_process, current_task, current_user_token};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::size_of;
+
+/// `writev` 使用的用户态向量缓冲区描述符。
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub(super) struct IoVec {
+    /// 用户缓冲区起始地址。
+    iov_base: usize,
+    /// 用户缓冲区长度。
+    iov_len: usize,
+}
+
+/// 校验 fd 并返回可写文件对象。
+fn get_writable_file(fd: usize) -> Result<Arc<dyn crate::fs::File>, ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return Err(ERRNO::EBADF);
+    }
+    let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.clone();
+    if !file.writable() {
+        return Err(ERRNO::EACCES);
+    }
+    drop(inner);
+    Ok(file)
+}
+
+/// 从用户态复制 `iovec` 数组，避免数组跨页时直接解引用失败。
+fn copy_user_iovecs(token: usize, iov: *const IoVec, iovcnt: i32) -> Result<Vec<IoVec>, ERRNO> {
+    if iovcnt < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    if iovcnt == 0 {
+        return Ok(Vec::new());
+    }
+    let iovcnt = iovcnt as usize;
+    let iov_bytes_len: usize = size_of::<IoVec>()
+        .checked_mul(iovcnt)
+        .ok_or(ERRNO::EINVAL)?;
+    let iov_bytes = translated_byte_buffer(token, iov as *const u8, iov_bytes_len)
+        .or_errno(ERRNO::EFAULT)?;
+    let mut iovecs = Vec::with_capacity(iovcnt);
+    let mut scratch = [0u8; size_of::<IoVec>()];
+    let mut scratch_len = 0usize;
+    // 以IoVec为单位平接。可能出现一个u8分属两个不同IoVec，所以下面按照offset一点点拼凑每一个IoVec。
+    for chunk in iov_bytes {
+        let mut chunk_offset = 0usize;
+        while chunk_offset < chunk.len() {
+            let copy_len = (size_of::<IoVec>() - scratch_len).min(chunk.len() - chunk_offset);
+            // 逐步拼出一个完整的 `IoVec`，以兼容结构体跨页的情况。
+            scratch[scratch_len..scratch_len + copy_len]
+                .copy_from_slice(&chunk[chunk_offset..chunk_offset + copy_len]);
+            scratch_len += copy_len;
+            chunk_offset += copy_len;
+            if scratch_len == size_of::<IoVec>() {
+                // 这里按 C ABI 逐项复制，避免直接依赖用户地址对齐。
+                let iovec = unsafe { core::ptr::read_unaligned(scratch.as_ptr() as *const IoVec) };
+                iovecs.push(iovec);
+                scratch_len = 0;
+                if iovecs.len() == iovcnt {
+                    break;
+                }
+            }
+        }
+        if iovecs.len() == iovcnt {
+            break;
+        }
+    }
+    if scratch_len != 0 || iovecs.len() != iovcnt {
+        // 正常情况下长度应严格对齐；若触发说明用户内存翻译结果异常。
+        return Err(ERRNO::EFAULT);
+    }
+    Ok(iovecs)
+}
 
 fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     if path.starts_with('/') {
@@ -43,22 +117,53 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
-    let process = current_process();
     syscall_body!({
         let fd = fd as usize;
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return Err(ERRNO::EBADF);
-        }
-        let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.clone();
-        if !file.writable() {
-            return Err(ERRNO::EACCES);
-        }
-        // release current task TCB manually to avoid multi-borrow
-        drop(inner);
+        let file = get_writable_file(fd)?;
         Ok(file.write(UserBuffer::new(
             translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
         )) as isize)
+    })
+}
+
+/// writev syscall：按 `iovec` 顺序将多个用户缓冲区写入同一个 fd。
+pub fn sys_writev(fd: u32, iov: *const IoVec, iovcnt: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_writev",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let fd = fd as usize;
+        let file = get_writable_file(fd)?;
+        let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
+        let mut written_total = 0usize;
+        for &iovec in &iovecs {
+            written_total = written_total
+                .checked_add(iovec.iov_len)
+                .ok_or(ERRNO::EINVAL)?;
+            if written_total > isize::MAX as usize {
+                return Err(ERRNO::EINVAL);
+            }
+        }
+        let mut completed = 0usize;
+        for &iovec in &iovecs {
+            if iovec.iov_len == 0 {
+                continue;
+            }
+            let user_buf = UserBuffer::new(
+                translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len)
+                    .or_errno(ERRNO::EFAULT)?,
+            );
+            let written = file.write(user_buf);
+            completed += written;
+            // 发生短写时立即返回，保留与 `write` 一致的部分写入语义。
+            if written < iovec.iov_len {
+                return Ok(completed as isize);
+            }
+        }
+        // TODO: 当前未限制 `iovcnt` 上限；若后续补齐 `IOV_MAX`，应在复制前返回 `EINVAL`。
+        Ok(completed as isize)
     })
 }
 
