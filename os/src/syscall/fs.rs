@@ -99,7 +99,7 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let inner = process.inner_exclusive_access();
-        let _file = inner
+        let file = inner
             .fd_table
             .get(fd)
             .and_then(|f| f.as_ref())
@@ -107,7 +107,7 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
             .clone();
         drop(inner);
         debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
-        Err(ERRNO::ENOTTY)
+        file.ioctl(req, arg)
     })
 }
 
