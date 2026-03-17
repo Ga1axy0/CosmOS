@@ -3,6 +3,7 @@
 mod inode;
 mod pipe;
 mod stdio;
+mod tty;
 pub mod rootfs;
 pub mod devfs;
 
@@ -113,7 +114,8 @@ pub use inode::{
     AT_FDCWD, AT_REMOVEDIR, OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};
-pub use stdio::{Stdin, Stdout};
+pub use stdio::new_stdio_files;
+pub use tty::{Termios, TtyCore, TtyFile, WinSize};
 
 /// Initialize the filesystem, including rootfs and devfs.
 pub fn init() {

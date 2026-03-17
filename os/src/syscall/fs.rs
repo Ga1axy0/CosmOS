@@ -89,7 +89,7 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
-/// ioctl syscall
+/// ioctl 系统调用：校验 fd 后转发到具体文件对象。
 pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_ioctl",
@@ -106,6 +106,8 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
             .ok_or(ERRNO::EBADF)?
             .clone();
         drop(inner);
+        // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。
+        // TODO: tty 实现 `TCGETS/TIOCGWINSZ` 后，这里会开始承载真实终端控制语义。
         debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
         file.ioctl(req, arg)
     })
