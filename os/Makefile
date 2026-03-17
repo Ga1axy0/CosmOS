@@ -7,6 +7,8 @@ DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
+LOG ?= INFO
+SMP ?= 1
 # Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
 # image and injects user apps into it.
 BASE_IMG ?= ../sdcard-rv.img
@@ -96,9 +98,9 @@ fs-img:
 kernel:
 	@echo Platform: $(BOARD)
 ifeq ($(QEMU7_CFG),--cfg qemu7)
-	@cargo rustc $(MODE_ARG) --no-default-features --features $(MAIN_FS) -- --cfg qemu7
+	@LOG=$(LOG) cargo rustc $(MODE_ARG) --no-default-features --features $(MAIN_FS) -- --cfg qemu7
 else
-	@cargo build $(MODE_ARG) --no-default-features --features $(MAIN_FS)
+	@LOG=$(LOG) cargo build $(MODE_ARG) --no-default-features --features $(MAIN_FS)
 endif
 
 clean:
@@ -121,6 +123,7 @@ run-inner:
 	@$(QEMU) \
 		-M 128m \
 		-machine virt \
+		-smp $(SMP) \
 		-nographic \
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
@@ -132,13 +135,13 @@ run-inner:
 
 debug: build
 	@tmux new-session -d \
-		"$(QEMU) -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
+		"$(QEMU) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
 		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: build
-	@$(QEMU) -M 128m -machine virt -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+	@$(QEMU) -M 128m -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 	        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
 		-s -S

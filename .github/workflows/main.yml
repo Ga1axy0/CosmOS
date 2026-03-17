@@ -35,7 +35,7 @@ jobs:
           fi
 
           # make run 一般不会退出，所以 timeout；timeout 超时会返回非0，所以加 || true
-          timeout 180s bash -lc "cd os && make run BASE_IMG=$BASE_IMG_PATH" 2>&1 | tee boot.log || true
+          timeout 180s bash -lc "cd os && make run BASE_IMG=$BASE_IMG_PATH SMP=4" 2>&1 | tee boot.log || true
 
           echo "=== boot.log tail ==="
           tail -n 200 boot.log

@@ -7,10 +7,13 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
+use crate::config::MAX_HARTS;
+use crate::hart::hartid;
 use crate::sync::UPSafeCell;
 use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
+use core::array;
 use lazy_static::*;
 
 /// Processor management structure
@@ -46,7 +49,23 @@ impl Processor {
 }
 
 lazy_static! {
-    pub static ref PROCESSOR: UPSafeCell<Processor> = unsafe { UPSafeCell::new(Processor::new()) };
+    pub static ref PROCESSORS: [UPSafeCell<Processor>; MAX_HARTS] =
+        array::from_fn(|_| unsafe { UPSafeCell::new(Processor::new()) });
+}
+
+/// 返回当前 hart 对应的 `Processor` 存储入口。
+///
+/// 这里会根据 `hartid()` 选择 `PROCESSORS[hartid]`，从而让“当前任务”
+/// 与“idle 调度上下文”都变成每个 hart 独立维护的状态。
+pub fn current_processor() -> &'static UPSafeCell<Processor> {
+    processor_for_hart(hartid())
+}
+
+/// 返回指定 hart 对应的 `Processor` 存储入口。
+pub fn processor_for_hart(hart_id: usize) -> &'static UPSafeCell<Processor> {
+    PROCESSORS
+        .get(hart_id)
+        .unwrap_or_else(|| panic!("hart {} exceeds MAX_HARTS {}", hart_id, MAX_HARTS))
 }
 
 ///The main part of process execution and scheduling
@@ -57,7 +76,7 @@ pub fn run_tasks() {
         
         if let Some(task) = fetch_task() {
             let process = task.process.upgrade().unwrap();
-            let mut processor = PROCESSOR.exclusive_access();
+            let mut processor = current_processor().exclusive_access();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
 
             let mut task_inner = task.inner_exclusive_access();
@@ -92,12 +111,12 @@ pub fn run_tasks() {
 
 /// Get current task through take, leaving a None in its place
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().take_current()
+    current_processor().exclusive_access().take_current()
 }
 
 /// Get a copy of the current task
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().current()
+    current_processor().exclusive_access().current()
 }
 
 /// get current process
@@ -137,7 +156,7 @@ pub fn current_kstack_top() -> usize {
 
 /// Return to idle control flow for new scheduling
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
-    let mut processor = PROCESSOR.exclusive_access();
+    let mut processor = current_processor().exclusive_access();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
     unsafe {

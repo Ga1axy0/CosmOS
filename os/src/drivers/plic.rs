@@ -3,13 +3,10 @@
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::drivers::chardev::{CharDevice, UART};
+use crate::hart::hartid;
 
 /// QEMU virt PLIC base.
 const PLIC_BASE: usize = 0x0C00_0000;
-
-/// hart0 S-mode context id on QEMU virt.
-/// (Each hart has M-context then S-context, so for hart0: M=0, S=1)
-const S_CONTEXT: usize = 1;
 
 /// QEMU virt UART0 interrupt source id.
 const UART0_IRQ: u32 = 10;
@@ -70,28 +67,45 @@ fn complete(context: usize, irq: u32) {
     unsafe { write_volatile(claim_complete_ptr(context), irq) }
 }
 
-/// Init plic: enable irq
+#[inline(always)]
+fn supervisor_context(hart_id: usize) -> usize {
+    hart_id * 2 + 1
+}
+
+/// 初始化 PLIC 的全局优先级配置。
+///
+/// 这部分只需要由 bootstrap hart 执行一次，不依赖具体 hart context。
 pub fn init() {
     debug!("[kernel] Initializing PLIC...");
-    // allow UART0 to interrupt S-mode
     set_priority(UART0_IRQ, 1);
-    debug!("[kernel] Set UART0 IRQ priority to 1");
-    enable_irq(S_CONTEXT, UART0_IRQ);
-
-    // allow VirtIO MMIO devices to interrupt S-mode
-    {
-        for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
-            set_priority(irq, 1);
-            enable_irq(S_CONTEXT, irq);
-        }
+    for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
+        set_priority(irq, 1);
     }
-    set_threshold(S_CONTEXT, 0);
-    debug!("[kernel] PLIC initialized.");
+    debug!("[kernel] PLIC global priority initialized.");
+}
+
+/// 初始化指定 hart 的 supervisor context。
+///
+/// 每个 hart 都需要各自执行一次，使能本地 context 的 IRQ 位图并设置 threshold。
+pub fn init_hart(hart_id: usize) {
+    let context = supervisor_context(hart_id);
+    enable_irq(context, UART0_IRQ);
+    for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
+        enable_irq(context, irq);
+    }
+    set_threshold(context, 0);
+    info!("hart {} plic init done", hart_id);
 }
 
 /// Called from trap handler on SupervisorExternal interrupt.
 pub fn handle_supervisor_external() {
-    let irq = claim(S_CONTEXT);
+    handle_supervisor_external_hart(hartid());
+}
+
+/// 处理指定 hart 的 supervisor external interrupt。
+pub fn handle_supervisor_external_hart(hart_id: usize) {
+    let context = supervisor_context(hart_id);
+    let irq = claim(context);
     match irq {
         UART0_IRQ => {
             UART.handle_irq();
@@ -114,6 +128,6 @@ pub fn handle_supervisor_external() {
         }
     }
     if irq != 0 {
-        complete(S_CONTEXT, irq);
+        complete(context, irq);
     }
 }
