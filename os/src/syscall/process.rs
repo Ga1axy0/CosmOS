@@ -25,6 +25,12 @@ pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(ExitReason::Exit(exit_code));
     panic!("Unreachable in sys_exit!");
 }
+
+/// 临时实现
+pub fn sys_exit_group(exit_code: i32) -> ! {
+    sys_exit(exit_code);
+}
+
 /// yield syscall
 pub fn sys_yield() -> isize {
     //trace!("kernel: sys_yield");
@@ -363,6 +369,41 @@ pub fn sys_uname(utsname_ptr: *mut UtsName) -> isize {
             buffer.copy_from_slice(&uname_bytes[copied..copied + len]);
             copied += len;
         }
+        Ok(0)
+    })
+}
+
+/// get_robust_list syscall
+pub fn sys_get_robust_list(pid: i32, head_ptr: *mut usize, len_ptr: *mut usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_get_robust_list",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = pid2process(pid as usize).or_errno(ERRNO::ESRCH)?;
+        let robust_list = &process.inner_exclusive_access().robust_list;
+        let token = current_user_token();
+        if !head_ptr.is_null() {
+            translated_refmut(token, head_ptr).map(|slot| *slot = robust_list.head).ok_or(ERRNO::EFAULT)?;
+        }
+        if !len_ptr.is_null() {
+            translated_refmut(token, len_ptr).map(|slot| *slot = robust_list.len).ok_or(ERRNO::EFAULT)?;
+        }
+        Ok(0)
+    })
+}
+
+/// set_robust_list syscall
+pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_set_robust_list",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        inner.robust_list.head = head;
+        inner.robust_list.len = len;
         Ok(0)
     })
 }

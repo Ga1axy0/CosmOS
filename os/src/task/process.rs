@@ -85,7 +85,14 @@ pub struct ProcessControlBlockInner {
     pub accounting_state: CpuAccountingState,
     /// Timestamp of the last accounting state transition.
     pub accounting_timestamp: usize,
+    /// Robust list
+    pub robust_list: RobustList,
 }
+
+    pub struct RobustList {
+        pub head: usize,
+        pub len: usize,
+    }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum CpuAccountingState {
@@ -207,6 +214,7 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    robust_list: RobustList { head: 0, len: 0 },
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new()),
@@ -271,10 +279,12 @@ impl ProcessControlBlock {
         //   [sp+(argc+1)*8]   NULL           (argv terminator)
         //   [sp+(argc+2)*8]   NULL           (envp terminator, empty env)
         //   [sp+(argc+3)*8]   AT_PAGESZ = 6  \
-        //   [sp+(argc+4)*8]   4096            | auxv
-        //   [sp+(argc+5)*8]   AT_NULL = 0     |
-        //   [sp+(argc+6)*8]   0              /
-        //   [above, 16-byte aligned]  argument strings
+        //   [sp+(argc+4)*8]   4096            |
+        //   [sp+(argc+5)*8]   AT_RANDOM = 25  | auxv
+        //   [sp+(argc+6)*8]   &random[0]      |
+        //   [sp+(argc+7)*8]   AT_NULL = 0     |
+        //   [sp+(argc+8)*8]   0              /
+        //   [above + 16 bytes random data, 16-byte aligned]  argument strings
         trace!("kernel: exec .. push arguments on user stack");
         let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
 
@@ -295,19 +305,28 @@ impl ProcessControlBlock {
         // 2. 16-byte align sp (RISC-V calling convention)
         user_sp &= !0xf_usize;
 
-        // 3. Push auxv: [AT_PAGESZ=6, 0x1000, AT_NULL=0, 0]
-        //    Iterating in this order pushes 0 first (highest addr), AT_PAGESZ last (lowest),
-        //    so the in-memory layout reads: AT_PAGESZ, PAGE_SIZE, AT_NULL, 0.
-        for &word in &[0usize, 0usize, crate::config::PAGE_SIZE, 6usize] {
+        // 3. Push 16 bytes of pseudo-random data for AT_RANDOM.
+        //    glibc's __libc_start_main reads _dl_random (set from AT_RANDOM) for stack
+        //    canary / arc4random seeding; if AT_RANDOM is absent the pointer stays null
+        //    and the very first dereference crashes.
+        user_sp -= 8;
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
+        user_sp -= 8;
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
+        let at_random_ptr = user_sp; // pointer to the 16 pseudo-random bytes above
+
+        // 4. Push auxv in reverse order so the in-memory layout (low → high) reads:
+        //    AT_PAGESZ(6), PAGE_SIZE, AT_RANDOM(25), at_random_ptr, AT_NULL(0), 0
+        for &word in &[0usize, 0, at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
             user_sp -= core::mem::size_of::<usize>();
             *translated_refmut(new_token, user_sp as *mut usize).unwrap() = word;
         }
 
-        // 4. Push envp NULL terminator (empty environment)
+        // 5. Push envp NULL terminator (empty environment)
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
 
-        // 5. Push argv NULL terminator, then argv pointers (reversed to fill low→high)
+        // 6. Push argv NULL terminator, then argv pointers (reversed to fill low→high)
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0; // argv[argc] = NULL
         for &ptr in arg_ptrs.iter().rev() {
@@ -316,7 +335,7 @@ impl ProcessControlBlock {
         }
         let argv_base = user_sp; // argv_base == sp+8 once argc is pushed below
 
-        // 6. Push argc  —  sp now points here; glibc/musl _start reads argc from *sp
+        // 7. Push argc  —  sp now points here; glibc/musl _start reads argc from *sp
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
 
@@ -386,6 +405,7 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    robust_list: RobustList { head: 0, len: 0 },
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new())
@@ -465,6 +485,7 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    robust_list: RobustList { head: 0, len: 0 },
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new())
