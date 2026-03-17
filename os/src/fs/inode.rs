@@ -56,6 +56,7 @@ impl OSInode {
             inner.offset += len;
             v.extend_from_slice(&buffer[..len]);
         }
+        debug!("OSInode::read_all: read {} bytes", v.len());
         v
     }
 }
