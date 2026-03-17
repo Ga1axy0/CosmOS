@@ -44,6 +44,14 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
 pub const SYSCALL_EXIT: usize = 93;
+/// exit group syscall
+pub const SYSCALL_EXIT_GROUP: usize = 94;
+/// set tid address syscall
+pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// set robust list syscall
+pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
+/// get robust list syscall
+pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
 /// yield syscall
@@ -199,6 +207,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
+        SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
+        SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
+        SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
@@ -241,11 +253,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
 
 /// Syscalls that are invalid or not implemented yet
 fn sys_nisyscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
     syscall_body!({
         match syscall_id {
-            SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => Ok(0),
-            _ => Err(ERRNO::ENOSYS),
+            SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => {
+                warn!(
+                    "kernel: syscall {} is not implemented yet", syscall_id
+                );
+                Ok(0)
+            },
+            _ => {
+                error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
+                Err(ERRNO::ENOSYS)
+            },
         }
     })
 }

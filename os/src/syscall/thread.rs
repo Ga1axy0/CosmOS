@@ -114,3 +114,21 @@ pub fn sys_waittid(tid: usize) -> i32 {
         -(ERRNO::EAGAIN as i32) // thread has not exited yet
     }
 }
+
+
+/// 临时实现，只返回当前线程的 tid
+pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_set_tid_address",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    current_task()
+    .unwrap()
+    .inner_exclusive_access()
+    .res
+    .as_ref()
+    .unwrap()
+    .tid
+    .try_into()
+    .unwrap()
+}
