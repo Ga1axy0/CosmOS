@@ -17,10 +17,11 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
 use crate::task::{
-    check_signals_of_current, current_add_signal, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, exit_current_and_run_next, suspend_current_and_run_next, SignalFlags,
+    check_fatal_signals_of_current, current_add_signal, current_process, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    suspend_current_and_run_next, ExitReason, SignalFlags,
 };
-use crate::timer::{check_timer, set_next_trigger};
+use crate::timer::{check_timer, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
@@ -64,6 +65,7 @@ pub fn enable_timer_interrupt() {
 #[no_mangle]
 pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
+    current_process().enter_kernel(get_time());
     let scause = scause::read();
     let stval = stval::read();
     // trace!("into {:?}", scause.cause());
@@ -116,9 +118,9 @@ pub fn trap_handler() -> ! {
         }
     }
     // check signals
-    if let Some((errno, msg)) = check_signals_of_current() {
+    if let Some((signum, msg)) = check_fatal_signals_of_current() {
         trace!("[kernel] trap_handler: .. check signals {}", msg);
-        exit_current_and_run_next(errno);
+        exit_current_and_run_next(ExitReason::Signal(signum as u32));
     }
     trap_return();
 }
@@ -136,6 +138,7 @@ pub fn trap_return() -> ! {
     }
     let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
     // trace!("[kernel] trap_return: ..before return");
+    current_process().enter_user(get_time());
     unsafe {
         asm!(
             "fence.i",

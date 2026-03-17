@@ -27,6 +27,10 @@ pub trait VfsNode: Send + Sync + Any {
     fn nlink(&self) -> u32 {
         1
     }
+    /// File size in bytes for stat-like metadata.
+    fn size(&self) -> usize {
+        0
+    }
 
     /// Create a hard link in this directory.
     fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
@@ -100,6 +104,10 @@ impl Inode {
 
     pub fn nlink(&self) -> u32 {
         self.inner.nlink()
+    }
+
+    pub fn size(&self) -> usize {
+        self.inner.size()
     }
 
     pub fn link(&self, old_name: &str, new_name: &str) -> Result<(), FS_ERRNO> {

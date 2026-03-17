@@ -1,31 +1,19 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall_body;
 use crate::{
-    config::PAGE_SIZE_BITS,
     fs::{open_file, open_file_at, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
-        VirtAddr,
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str,
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
-        mmap_current_process, munmap_current_process, pid2process, suspend_current_and_run_next,
-        SignalFlags,
+        pid2process, suspend_current_and_run_next, ExitReason, SignalAction, SignalFlags,
     },
-    timer::get_time_us,
 };
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::mem::size_of;
 use core::slice;
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct TimeVal {
-    pub sec: usize,
-    pub usec: usize,
-}
-
 /// exit syscall
 ///
 /// exit the current task and run the next task in task list
@@ -34,7 +22,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
         "kernel:pid[{}] sys_exit",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    exit_current_and_run_next(exit_code);
+    exit_current_and_run_next(ExitReason::Exit(exit_code));
     panic!("Unreachable in sys_exit!");
 }
 /// yield syscall
@@ -51,6 +39,22 @@ pub fn sys_getpid() -> isize {
     );
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
 }
+
+/// getppid syscall
+pub fn sys_getppid() -> isize {
+    trace!(
+        "kernel: sys_getppid pid:{}",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    let parent = process.inner_exclusive_access().parent.clone();
+    if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
+        parent.getpid() as isize
+    } else {
+        0
+    }
+}
+
 /// fork child process syscall
 pub fn sys_fork() -> isize {
     trace!(
@@ -124,7 +128,7 @@ const WNOHANG: isize = 1;
 ///
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
-pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
+pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize {
     trace!("kernel: sys_wait4");
     let process = current_process();
     syscall_body!({
@@ -153,13 +157,27 @@ pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
             if let Some(idx) = zombie_idx {
                 let child = inner.children.remove(idx);
                 let found_pid = child.getpid();
-                let exit_code = child.inner_exclusive_access().exit_code;
+                let child_inner = child.inner_exclusive_access();
+                // 编码为wstatus
+               let exit_status = match child_inner.exit_reason {
+                    ExitReason::Exit(code) => (code & 0xff) << 8,
+                    ExitReason::Signal(signum) => (signum & 0x7f) as i32,
+                };
+                inner.child_user_time = inner
+                    .child_user_time
+                    .saturating_add(child_inner.user_time)
+                    .saturating_add(child_inner.child_user_time);
+                inner.child_kernel_time = inner
+                    .child_kernel_time
+                    .saturating_add(child_inner.kernel_time)
+                    .saturating_add(child_inner.child_kernel_time);
                 let token = inner.memory_set.token();
+                drop(child_inner);
                 drop(inner);
 
-                if !exit_code_ptr.is_null() {
-                    if let Some(slot) = translated_refmut(token, exit_code_ptr) {
-                        *slot = exit_code;
+                if !exit_status_ptr.is_null() {
+                    if let Some(slot) = translated_refmut(token, exit_status_ptr) {
+                        *slot = exit_status;
                     } else {
                         return Err(ERRNO::EFAULT);
                     }
@@ -191,113 +209,83 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     );
     syscall_body!({
         let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
-        let flag = SignalFlags::from_bits(signal).or_errno(ERRNO::EINVAL)?;
-        process.inner_exclusive_access().signals |= flag;
+        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        process.inner_exclusive_access().pending_signals |= flag;
         Ok(0)
     })
 }
 
-/// get_time syscall
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
+/// sigaction 系统调用
+///
+/// 为当前进程的指定信号安装/读取用户态处理动作。
+/// 当前仅完成动作表的存取与基础参数校验，还没有把用户态 handler
+/// 真正接入 trap 返回路径。
+pub fn sys_sigaction(
+    signum: i32,
+    action: *const SignalAction,
+    old_action: *mut SignalAction,
+) -> isize {
     syscall_body!({
-        let time_us = get_time_us();
-        let timeval = TimeVal {
-            sec: time_us / 1_000_000,
-            usec: time_us % 1_000_000,
-        };
-        let timeval_bytes = unsafe {
-            slice::from_raw_parts(
-                &timeval as *const TimeVal as *const u8,
-                size_of::<TimeVal>(),
-            )
-        };
-        let mut buffers =
-            translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&timeval_bytes[copied..copied + len]);
-            copied += len;
+        let signum = signum as u32;
+        if signum == 0 || signum as usize > crate::task::MAX_SIG {
+            return Err(ERRNO::EINVAL);
+        }
+        if signum == 9 || signum == 19 {
+            return Err(ERRNO::EINVAL);
+        }
+        let token = current_user_token();
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let slot = &mut inner.signal_actions.table[signum as usize];
+        if !old_action.is_null() {
+            let old = translated_refmut(token, old_action).or_errno(ERRNO::EFAULT)?;
+            *old = *slot;
+        }
+        if !action.is_null() {
+            // TODO: 接入用户态 signal handler 分发后，需要在这里补充
+            // 对 handler/mask 组合语义的进一步约束校验。
+            let new_action = *translated_ref(token, action).or_errno(ERRNO::EFAULT)?;
+            *slot = new_action;
         }
         Ok(0)
     })
 }
 
-/// mmap syscall
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
+/// sigprocmask 系统调用
+///
+/// 设置当前进程的信号屏蔽字。当前实现采用“整值覆盖”语义，
+/// 尚未支持 Linux 中的 SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK 三种模式。
+pub fn sys_sigprocmask(mask: u32) -> isize {
     syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-            return Err(ERRNO::EINVAL); // start not page-aligned
-        }
-        if _port & !0x7 != 0 {
-            return Err(ERRNO::EINVAL); // unknown permission bits
-        }
-        if _port & 0x7 == 0 {
-            return Err(ERRNO::EINVAL); // no access at all is meaningless
-        }
-        if _len == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
-
-        let mut perm = MapPermission::U;
-        if _port & 0x1 != 0 {
-            perm |= MapPermission::R;
-        }
-        if _port & 0x2 != 0 {
-            perm |= MapPermission::W;
-        }
-        if _port & 0x4 != 0 {
-            perm |= MapPermission::X;
-        }
-
-        if mmap_current_process(VirtAddr::from(_start), VirtAddr::from(end), perm) {
-            Ok(0)
-        } else {
-            Err(ERRNO::ENOMEM)
-        }
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        // TODO: 若后续补齐完整 Linux 语义，这里应改为根据 how 参数
+        // 对旧 mask 做增量更新，并向用户态返回旧值。
+        inner.signal_mask = SignalFlags::from_bits(mask).or_errno(ERRNO::EINVAL)?;
+        Ok(0)
     })
 }
 
-/// munmap syscall
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
+/// sigreturn 系统调用
+///
+/// 供用户态 signal handler 返回内核并恢复被中断现场。
+/// 当前仅保留 syscall 框架，尚未实现 signal frame / trap context 恢复。
+pub fn sys_sigreturn() -> isize {
     syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-            return Err(ERRNO::EINVAL); // start not page-aligned
-        }
-        if _len == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
-        if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
-            Ok(0)
-        } else {
-            Err(ERRNO::EINVAL) // range not fully mapped as anonymous
-        }
+        // TODO: 实现用户态 signal frame 恢复，包括 trap context、
+        // 屏蔽字与正在处理信号状态的回滚。
+        Err(ERRNO::ENOSYS)?
     })
 }
 
 /// change data segment size
-// pub fn sys_sbrk(size: i32) -> isize {
-//     trace!("kernel:pid[{}] sys_sbrk", current_task().unwrap().process.upgrade().unwrap().getpid());
-//     if let Some(old_brk) = current_task().unwrap().change_program_brk(size) {
-//         old_brk as isize
-//     } else {
-//     -1
-// }
+pub fn sys_brk(addr: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_brk",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    current_process().set_program_brk(addr) as isize
+}
 
 /// spawn syscall
 pub fn sys_spawn(_path: *const u8) -> isize {
@@ -389,4 +377,3 @@ pub fn sys_set_priority(_prio: isize) -> isize {
     );
     -1
 }
-

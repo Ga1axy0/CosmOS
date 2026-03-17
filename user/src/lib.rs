@@ -124,8 +124,36 @@ pub struct Stat {
     pub mode: StatMode,
     /// number of hard links
     pub nlink: u32,
-    /// unused pad
-    pad: [u64; 7],
+    /// user ID of owner
+    pub uid: u32,
+    /// group ID of owner
+    pub gid: u32,
+    /// device ID (if special file)
+    pub rdev: u64,
+    /// padding to keep C ABI-compatible layout
+    pub pad0: usize,
+    /// total size, in bytes
+    pub size: i64,
+    /// preferred block size for I/O
+    pub blksize: u32,
+    /// padding to keep C ABI-compatible layout
+    pub pad1: i32,
+    /// number of 512-byte blocks allocated
+    pub blocks: u64,
+    /// time of last access (seconds)
+    pub atime_sec: isize,
+    /// time of last access (nanoseconds)
+    pub atime_nsec: isize,
+    /// time of last modification (seconds)
+    pub mtime_sec: isize,
+    /// time of last modification (nanoseconds)
+    pub mtime_nsec: isize,
+    /// time of last status change (seconds)
+    pub ctime_sec: isize,
+    /// time of last status change (nanoseconds)
+    pub ctime_nsec: isize,
+    /// reserved fields
+    pub unused: [u32; 2],
 }
 
 impl Stat {
@@ -135,7 +163,21 @@ impl Stat {
             ino: 0,
             mode: StatMode::NULL,
             nlink: 0,
-            pad: [0; 7],
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
         }
     }
 }
@@ -301,8 +343,26 @@ pub fn munmap(start: usize, len: usize) -> isize {
     sys_munmap(start, len)
 }
 
+pub fn brk(addr: usize) -> isize {
+    sys_brk(addr)
+}
+
 pub fn sbrk(size: i32) -> isize {
-    sys_sbrk(size)
+    let old_brk = brk(0);
+    if old_brk < 0 {
+        return -1;
+    }
+    let target = if size >= 0 {
+        (old_brk as usize).saturating_add(size as usize)
+    } else {
+        (old_brk as usize).saturating_sub(size.unsigned_abs() as usize)
+    };
+    let new_brk = brk(target);
+    if new_brk == target as isize {
+        old_brk
+    } else {
+        -1
+    }
 }
 
 pub fn spawn(path: &str) -> isize {

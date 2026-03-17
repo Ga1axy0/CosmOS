@@ -14,6 +14,10 @@ pub const MEMORY_END: usize = 0x88000000;
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12
 pub const PAGE_SIZE_BITS: usize = 0xc;
+/// default base address for anonymous mmap allocations
+pub const USER_MMAP_BASE: usize = 0x1000_0000;
+/// default base address for the main thread's user stack region
+pub const USER_STACK_BASE: usize = 0x0800_0000;
 /// the virtual addr of trapoline
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context

@@ -199,6 +199,10 @@ impl VfsNode for EasyInode {
             disk_inode.write_at(offset, buf, &self.block_device)
         })
     }
+
+    fn size(&self) -> usize {
+        self.read_disk_inode(|disk_inode| disk_inode.size as usize)
+    }
 }
 
 impl EasyFileSystem {
