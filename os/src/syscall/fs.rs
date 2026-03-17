@@ -89,6 +89,28 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
+/// ioctl syscall
+pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_ioctl",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    syscall_body!({
+        let fd = fd as usize;
+        let inner = process.inner_exclusive_access();
+        let _file = inner
+            .fd_table
+            .get(fd)
+            .and_then(|f| f.as_ref())
+            .ok_or(ERRNO::EBADF)?
+            .clone();
+        drop(inner);
+        debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
+        Err(ERRNO::ENOTTY)
+    })
+}
+
 /// open sysall
 pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize {
     trace!(
