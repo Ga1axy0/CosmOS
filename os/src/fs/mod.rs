@@ -8,6 +8,7 @@ pub mod devfs;
 
 use alloc::string::String;
 use crate::mm::UserBuffer;
+use crate::syscall::errno::ERRNO;
 
 /// trait File for all file types
 pub trait File: Send + Sync {
@@ -23,6 +24,10 @@ pub trait File: Send + Sync {
     }
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Handle an ioctl request on this file descriptor.
+    fn ioctl(&self, _req: usize, _arg: usize) -> Result<isize, ERRNO> {
+        Err(ERRNO::ENOTTY)
+    }
     /// Returns true if this file descriptor refers to a directory.
     fn is_dir(&self) -> bool {
         false
