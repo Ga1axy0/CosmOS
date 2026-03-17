@@ -3,6 +3,7 @@
 use core::cmp::Ordering;
 
 use crate::config::CLOCK_FREQ;
+use crate::hart::hartid;
 use crate::sbi::set_timer;
 use crate::sync::UPSafeCell;
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
@@ -46,6 +47,16 @@ pub fn time_to_ticks(time: usize) -> usize {
 /// Set the next timer interrupt
 pub fn set_next_trigger() {
     set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
+}
+
+/// 初始化当前 hart 的时钟中断状态。
+///
+/// 该函数需要每个 hart 各自执行一次：先开启 supervisor timer interrupt，
+/// 再设置当前 hart 的下一次 timer 触发时间。
+pub fn init_hart() {
+    crate::trap::enable_timer_interrupt();
+    set_next_trigger();
+    info!("hart {} timer init done", hartid());
 }
 
 /// condvar for timer

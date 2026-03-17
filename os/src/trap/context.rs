@@ -11,6 +11,12 @@ pub struct TrapContext {
     pub sstatus: Sstatus,
     /// Supervisor Exception Program Counter
     pub sepc: usize,
+    /// 当前任务上次返回用户态前所在的 hart id。
+    ///
+    /// 用户态可能会把 `tp` 当作 TLS 指针或普通寄存器使用，因此内核不能再假设
+    /// trap 进入时 `tp` 里仍然保存着 hart-local 信息。这里单独记录内核需要恢复
+    /// 的 hart id，供 trap 入口在切回内核上下文前重新写回 `tp`。
+    pub kernel_hartid: usize,
     /// Token of kernel address space
     pub kernel_satp: usize,
     /// Kernel stack pointer of the current application
@@ -39,6 +45,7 @@ impl TrapContext {
             x: [0; 32],
             sstatus,
             sepc: entry,  // entry point of app
+            kernel_hartid: 0,
             kernel_satp,  // addr of page table
             kernel_sp,    // kernel stack
             trap_handler, // addr of trap_handler function
