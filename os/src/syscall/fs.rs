@@ -186,6 +186,36 @@ pub fn sys_dup(fd: u32) -> isize {
     })
 }
 
+/// dup2 syscall
+pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_dup2",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    syscall_body!({
+        let oldfd = oldfd as usize;
+        let newfd = newfd as usize;
+        if oldfd >= inner.fd_table.len() {
+            return Err(ERRNO::EBADF);
+        }
+        if inner.fd_table[oldfd].is_none() {
+            return Err(ERRNO::EBADF);
+        }
+        if oldfd == newfd {
+            return Ok(newfd as isize);
+        }
+        if newfd >= inner.fd_table.len() {
+            inner.fd_table.resize(newfd + 1, None);
+        }
+        // If newfd is already open, close it first.
+        inner.fd_table[newfd].take();
+        inner.fd_table[newfd] = Some(Arc::clone(inner.fd_table[oldfd].as_ref().unwrap()));
+        Ok(newfd as isize)
+    })
+}
+
 /// fstat syscall
 pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
     trace!(

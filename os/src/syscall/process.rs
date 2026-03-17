@@ -1,31 +1,20 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall_body;
 use crate::{
-    config::PAGE_SIZE_BITS,
     fs::{open_file, open_file_at, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
-        VirtAddr,
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str,
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
-        mmap_current_process, munmap_current_process, pid2process, suspend_current_and_run_next,
+        pid2process, suspend_current_and_run_next,
         SignalFlags,
     },
-    timer::get_time_us,
 };
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::slice;
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct TimeVal {
-    pub sec: usize,
-    pub usec: usize,
-}
-
 /// exit syscall
 ///
 /// exit the current task and run the next task in task list
@@ -51,6 +40,22 @@ pub fn sys_getpid() -> isize {
     );
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
 }
+
+/// getppid syscall
+pub fn sys_getppid() -> isize {
+    trace!(
+        "kernel: sys_getppid pid:{}",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    let parent = process.inner_exclusive_access().parent.clone();
+    if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
+        parent.getpid() as isize
+    } else {
+        0
+    }
+}
+
 /// fork child process syscall
 pub fn sys_fork() -> isize {
     trace!(
@@ -153,8 +158,18 @@ pub fn sys_wait4(pid: isize, exit_code_ptr: *mut i32, options: isize) -> isize {
             if let Some(idx) = zombie_idx {
                 let child = inner.children.remove(idx);
                 let found_pid = child.getpid();
-                let exit_code = child.inner_exclusive_access().exit_code;
+                let child_inner = child.inner_exclusive_access();
+                let exit_code = child_inner.exit_code;
+                inner.child_user_time = inner
+                    .child_user_time
+                    .saturating_add(child_inner.user_time)
+                    .saturating_add(child_inner.child_user_time);
+                inner.child_kernel_time = inner
+                    .child_kernel_time
+                    .saturating_add(child_inner.kernel_time)
+                    .saturating_add(child_inner.child_kernel_time);
                 let token = inner.memory_set.token();
+                drop(child_inner);
                 drop(inner);
 
                 if !exit_code_ptr.is_null() {
@@ -194,99 +209,6 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         let flag = SignalFlags::from_bits(signal).or_errno(ERRNO::EINVAL)?;
         process.inner_exclusive_access().signals |= flag;
         Ok(0)
-    })
-}
-
-/// get_time syscall
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    syscall_body!({
-        let time_us = get_time_us();
-        let timeval = TimeVal {
-            sec: time_us / 1_000_000,
-            usec: time_us % 1_000_000,
-        };
-        let timeval_bytes = unsafe {
-            slice::from_raw_parts(
-                &timeval as *const TimeVal as *const u8,
-                size_of::<TimeVal>(),
-            )
-        };
-        let mut buffers =
-            translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&timeval_bytes[copied..copied + len]);
-            copied += len;
-        }
-        Ok(0)
-    })
-}
-
-/// mmap syscall
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-            return Err(ERRNO::EINVAL); // start not page-aligned
-        }
-        if _port & !0x7 != 0 {
-            return Err(ERRNO::EINVAL); // unknown permission bits
-        }
-        if _port & 0x7 == 0 {
-            return Err(ERRNO::EINVAL); // no access at all is meaningless
-        }
-        if _len == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
-
-        let mut perm = MapPermission::U;
-        if _port & 0x1 != 0 {
-            perm |= MapPermission::R;
-        }
-        if _port & 0x2 != 0 {
-            perm |= MapPermission::W;
-        }
-        if _port & 0x4 != 0 {
-            perm |= MapPermission::X;
-        }
-
-        if mmap_current_process(VirtAddr::from(_start), VirtAddr::from(end), perm) {
-            Ok(0)
-        } else {
-            Err(ERRNO::ENOMEM)
-        }
-    })
-}
-
-/// munmap syscall
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    syscall_body!({
-        if _start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
-            return Err(ERRNO::EINVAL); // start not page-aligned
-        }
-        if _len == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let end = _start.checked_add(_len).ok_or(ERRNO::EINVAL)?;
-        if munmap_current_process(VirtAddr::from(_start), VirtAddr::from(end)) {
-            Ok(0)
-        } else {
-            Err(ERRNO::EINVAL) // range not fully mapped as anonymous
-        }
     })
 }
 
@@ -389,4 +311,3 @@ pub fn sys_set_priority(_prio: isize) -> isize {
     );
     -1
 }
-
