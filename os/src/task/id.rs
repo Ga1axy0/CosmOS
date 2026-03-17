@@ -2,7 +2,7 @@
 
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use alloc::{
     sync::{Arc, Weak},
@@ -100,7 +100,7 @@ impl Drop for KernelStack {
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         KERNEL_SPACE
             .exclusive_access()
-            .remove_area_with_start_vpn(kernel_stack_bottom_va.into());
+            .remove_vma_with_start_vpn(kernel_stack_bottom_va.into());
         KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
     }
 }
@@ -169,18 +169,16 @@ impl TaskUserRes {
         // alloc user stack
         let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
         let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        process_inner.memory_set.insert_framed_area(
-            ustack_bottom.into(),
-            ustack_top.into(),
-            MapPermission::R | MapPermission::W | MapPermission::U,
+        let _ = process_inner.memory_set.insert_vma(
+            Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid),
+            None,
         );
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_framed_area(
-            trap_cx_bottom.into(),
-            trap_cx_top.into(),
-            MapPermission::R | MapPermission::W,
+        let _ = process_inner.memory_set.insert_vma(
+            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+            None,
         );
     }
     /// Deallocate user resource for a task
@@ -192,12 +190,12 @@ impl TaskUserRes {
         let ustack_bottom_va: VirtAddr = ustack_bottom_from_tid(self.ustack_base, self.tid).into();
         process_inner
             .memory_set
-            .remove_area_with_start_vpn(ustack_bottom_va.into());
+            .remove_vma_with_start_vpn(ustack_bottom_va.into());
         // dealloc trap_cx manually
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
         process_inner
             .memory_set
-            .remove_area_with_start_vpn(trap_cx_bottom_va.into());
+            .remove_vma_with_start_vpn(trap_cx_bottom_va.into());
     }
 
     #[allow(unused)]
