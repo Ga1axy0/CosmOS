@@ -125,7 +125,10 @@ run-inner:
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
+		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+#	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
 
 debug: build
 	@tmux new-session -d \

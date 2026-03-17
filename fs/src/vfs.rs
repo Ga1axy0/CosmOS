@@ -125,4 +125,12 @@ impl Inode {
     pub fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
         self.inner.rmdir(name)
     }
+
+    /// Returns a clone of the raw [`VfsNode`] backing this inode.
+    ///
+    /// Used by the kernel's virtual-rootfs layer to obtain the concrete node
+    /// (e.g. an ext4 root) so it can be stored as a mount-point overlay.
+    pub fn vfs_node(&self) -> Arc<dyn VfsNode> {
+        Arc::clone(&self.inner)
+    }
 }

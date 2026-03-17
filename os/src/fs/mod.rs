@@ -3,6 +3,8 @@
 mod inode;
 mod pipe;
 mod stdio;
+pub mod rootfs;
+pub mod devfs;
 
 use alloc::string::String;
 use crate::mm::UserBuffer;
@@ -101,8 +103,15 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, linkat, list_apps, lookup_inode, mkdir_at, open_file, open_file_at,
-    unlinkat, AT_FDCWD, AT_REMOVEDIR, OpenFlags, OSInode,
+    canonicalize, do_mount, do_umount, init_dev, init_rootfs, linkat, list_apps,
+    lookup_inode, mkdir_at, mount_device, open_file, open_file_at, unlinkat,
+    AT_FDCWD, AT_REMOVEDIR, OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::{Stdin, Stdout};
+
+/// Initialize the filesystem, including rootfs and devfs.
+pub fn init() {
+    init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
+    init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+}
