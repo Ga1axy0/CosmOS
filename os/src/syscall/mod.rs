@@ -68,6 +68,14 @@ pub const SYSCALL_TIMES: usize = 153;
 pub const SYSCALL_GETPID: usize = 172;
 /// getppid syscall
 pub const SYSCALL_GETPPID: usize = 173;
+/// getuid syscall
+pub const SYSCALL_GETUID: usize = 174;
+/// geteuid syscall
+pub const SYSCALL_GETEUID: usize = 175;
+/// getgid syscall
+pub const SYSCALL_GETGID: usize = 176;
+/// getegid syscall
+pub const SYSCALL_GETEGID: usize = 177;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
 /// brk syscall
@@ -136,7 +144,7 @@ use mman::*;
 use times::*;
 
 
-use crate::fs::Stat;
+use crate::{fs::Stat, syscall::errno::ERRNO};
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
 /// converting `Err(e)` into `-(e as isize)`.  Use with the `?` operator and
@@ -227,6 +235,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_SIGNAL => sys_condvar_signal(args[0]),
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
-        _ => panic!("Unsupported syscall_id: {}", syscall_id),
+        _ => sys_nisyscall(syscall_id, args),
     }
+}
+
+/// Syscalls that are invalid or not implemented yet
+fn sys_nisyscall(syscall_id: usize, args: [usize; 6]) -> isize {
+    error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
+    syscall_body!({
+        match syscall_id {
+            SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => Ok(0),
+            _ => Err(ERRNO::ENOSYS),
+        }
+    })
 }
