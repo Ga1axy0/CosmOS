@@ -265,45 +265,61 @@ impl ProcessControlBlock {
         task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        // push arguments on user stack
+        // push arguments on user stack — Linux ELF ABI layout:
+        //   [sp+0*8]          argc
+        //   [sp+1*8..argc*8]  argv[0..argc-1]
+        //   [sp+(argc+1)*8]   NULL           (argv terminator)
+        //   [sp+(argc+2)*8]   NULL           (envp terminator, empty env)
+        //   [sp+(argc+3)*8]   AT_PAGESZ = 6  \
+        //   [sp+(argc+4)*8]   4096            | auxv
+        //   [sp+(argc+5)*8]   AT_NULL = 0     |
+        //   [sp+(argc+6)*8]   0              /
+        //   [above, 16-byte aligned]  argument strings
         trace!("kernel: exec .. push arguments on user stack");
         let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
+
+        // 1. Push argument strings (from stack top downward)
         let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
-        for arg in args.iter() {
+        for arg in args.iter().rev() {
             user_sp -= arg.len() + 1;
-            arg_ptrs.push(user_sp);
             let mut p = user_sp;
             for c in arg.as_bytes() {
                 *translated_refmut(new_token, p as *mut u8).unwrap() = *c;
                 p += 1;
             }
             *translated_refmut(new_token, p as *mut u8).unwrap() = 0;
+            arg_ptrs.push(user_sp);
+        }
+        arg_ptrs.reverse(); // arg_ptrs[i] now points to args[i]
+
+        // 2. 16-byte align sp (RISC-V calling convention)
+        user_sp &= !0xf_usize;
+
+        // 3. Push auxv: [AT_PAGESZ=6, 0x1000, AT_NULL=0, 0]
+        //    Iterating in this order pushes 0 first (highest addr), AT_PAGESZ last (lowest),
+        //    so the in-memory layout reads: AT_PAGESZ, PAGE_SIZE, AT_NULL, 0.
+        for &word in &[0usize, 0usize, crate::config::PAGE_SIZE, 6usize] {
+            user_sp -= core::mem::size_of::<usize>();
+            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = word;
         }
 
-        let word_size = core::mem::size_of::<usize>();
-        // Build a C-compatible initial stack frame:
-        // [argc][argv[0]..argv[n-1]][NULL][envp=NULL]
-        // while still keeping a0/a1 set for the existing Rust userland ABI.
-        let stack_entries = args.len() + 3;
-        let stack_frame_size = stack_entries * word_size;
-        user_sp = (user_sp.saturating_sub(stack_frame_size)) & !0xf;
-        let argv_base = user_sp + word_size;
+        // 4. Push envp NULL terminator (empty environment)
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
 
+        // 5. Push argv NULL terminator, then argv pointers (reversed to fill low→high)
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0; // argv[argc] = NULL
+        for &ptr in arg_ptrs.iter().rev() {
+            user_sp -= core::mem::size_of::<usize>();
+            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = ptr;
+        }
+        let argv_base = user_sp; // argv_base == sp+8 once argc is pushed below
+
+        // 6. Push argc  —  sp now points here; glibc/musl _start reads argc from *sp
+        user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
-        for (i, arg_ptr) in arg_ptrs.iter().enumerate() {
-            *translated_refmut(new_token, (argv_base + i * word_size) as *mut usize).unwrap() =
-                *arg_ptr;
-        }
-        *translated_refmut(
-            new_token,
-            (argv_base + args.len() * word_size) as *mut usize,
-        )
-        .unwrap() = 0;
-        *translated_refmut(
-            new_token,
-            (argv_base + (args.len() + 1) * word_size) as *mut usize,
-        )
-        .unwrap() = 0;
+
         // initialize trap_cx
         trace!("kernel: exec .. initialize trap_cx");
         let mut trap_cx = TrapContext::app_init_context(
@@ -313,6 +329,8 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
+        // a0/a1 are set for compatibility with non-glibc entry points;
+        // glibc _start ignores these and reads argc/argv directly from the stack.
         trap_cx.x[10] = args.len();
         trap_cx.x[11] = argv_base;
         *task_inner.get_trap_cx() = trap_cx;
