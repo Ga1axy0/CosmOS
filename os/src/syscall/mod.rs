@@ -42,6 +42,8 @@ pub const SYSCALL_GETDENTS64: usize = 61;
 pub const SYSCALL_READ: usize = 63;
 /// write syscall
 pub const SYSCALL_WRITE: usize = 64;
+/// writev syscall
+pub const SYSCALL_WRITEV: usize = 66;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
@@ -204,6 +206,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
+        SYSCALL_WRITEV => sys_writev(args[0] as u32, args[1] as *const IoVec, args[2] as i32),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
