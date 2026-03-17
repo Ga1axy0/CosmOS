@@ -257,12 +257,26 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
+                debug!("mapping ELF segment: [{:#x}, {:#x}) with flags {:?}",
+                    &(usize::from(start_va)), &(usize::from(end_va)), map_perm);
                 let vma = Vma::new_elf(start_va, end_va, map_perm);
                 max_end_vpn = vma.end_vpn();
-                let _ = memory_set.insert_vma(
-                    vma,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
+                // start_va may not be page-aligned (p_vaddr % p_align == p_offset % p_align).
+                // copy_data writes from the start of the first mapped page, so we must pad
+                // the data with zeros equal to start_va's within-page offset so that each
+                // ELF byte lands at the correct virtual address.
+                let page_off = start_va.page_offset();
+                let raw = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
+                let padded: Vec<u8>;
+                let seg_data: &[u8] = if page_off != 0 {
+                    let mut buf = alloc::vec![0u8; page_off + raw.len()];
+                    buf[page_off..].copy_from_slice(raw);
+                    padded = buf;
+                    &padded
+                } else {
+                    raw
+                };
+                let _ = memory_set.insert_vma(vma, Some(seg_data));
             }
         }
         let max_end_va: VirtAddr = max_end_vpn.into();
