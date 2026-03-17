@@ -217,6 +217,12 @@ impl VfsNode for Ext4Inode {
         inode_ref.inode.links_count() as u32
     }
 
+    fn size(&self) -> usize {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref.inode.size() as usize
+    }
+
     fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
         if !self.is_dir {
             return Err(FS_ERRNO::ENOTDIR);

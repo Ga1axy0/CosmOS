@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use lazy_static::*;
 use riscv::register::time;
 /// The number of ticks per second
-const TICKS_PER_SEC: usize = 100;
+pub const TICKS_PER_SEC: usize = 100;
 /// The number of milliseconds per second
 const MSEC_PER_SEC: usize = 1000;
 /// The number of microseconds per second
@@ -31,6 +31,16 @@ pub fn get_time_ms() -> usize {
 /// get current time in microseconds
 pub fn get_time_us() -> usize {
     time::read() * MICRO_PER_SEC / CLOCK_FREQ
+}
+
+/// Get current time in clock ticks used by times(2).
+pub fn get_time_ticks() -> usize {
+    time::read() * TICKS_PER_SEC / CLOCK_FREQ
+}
+
+/// Convert a raw timer counter delta into clock ticks used by times(2).
+pub fn time_to_ticks(time: usize) -> usize {
+    time.saturating_mul(TICKS_PER_SEC) / CLOCK_FREQ
 }
 
 /// Set the next timer interrupt

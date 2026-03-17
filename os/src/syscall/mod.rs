@@ -14,6 +14,8 @@
 pub const SYSCALL_GETCWD: usize = 17;
 /// dup syscall
 pub const SYSCALL_DUP: usize = 23;
+/// dup2 syscall
+pub const SYSCALL_DUP2: usize = 24;
 /// mkdirat syscall
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
@@ -62,8 +64,12 @@ pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_UNAME: usize = 160;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
+/// times
+pub const SYSCALL_TIMES: usize = 153;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
+/// getppid syscall
+pub const SYSCALL_GETPPID: usize = 173;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
 /*
@@ -118,6 +124,8 @@ mod fs;
 mod process;
 mod sync;
 mod thread;
+mod mman;
+mod times;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
@@ -128,6 +136,8 @@ use fs::*;
 use process::*;
 use sync::*;
 use thread::*;
+use mman::*;
+use times::*;
 
 
 use crate::fs::Stat;
@@ -157,6 +167,7 @@ macro_rules! syscall_body {
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0] as u32),
+        SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,
@@ -188,6 +199,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
+        SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXECVE => sys_execve(
@@ -197,7 +209,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_WAIT4 => sys_wait4(args[0] as isize, args[1] as *mut i32, args[2] as isize),
         SYSCALL_GETTIMEOFDAY => sys_get_time(args[0] as *mut TimeVal, args[1]),
-        SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),
+        SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
+        SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),

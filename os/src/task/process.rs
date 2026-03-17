@@ -58,6 +58,25 @@ pub struct ProcessControlBlockInner {
     pub semaphore_detector: DeadlockDetector,
     /// current working directory (absolute path)
     pub cwd: String,
+    /// CPU time spent in user mode for this process (raw timer counter units)
+    pub user_time: usize,
+    /// CPU time spent in kernel mode for this process (raw timer counter units)
+    pub kernel_time: usize,
+    /// waited-for children's aggregated user time (raw timer counter units)
+    pub child_user_time: usize,
+    /// waited-for children's aggregated kernel time (raw timer counter units)
+    pub child_kernel_time: usize,
+    /// Current CPU accounting mode for this process on the single core.
+    pub accounting_state: CpuAccountingState,
+    /// Timestamp of the last accounting state transition.
+    pub accounting_timestamp: usize,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum CpuAccountingState {
+    Inactive,
+    User,
+    Kernel,
 }
 
 impl ProcessControlBlockInner {
@@ -137,6 +156,12 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
+                    user_time: 0,
+                    kernel_time: 0,
+                    child_user_time: 0,
+                    child_kernel_time: 0,
+                    accounting_state: CpuAccountingState::Inactive,
+                    accounting_timestamp: 0,
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new()),
@@ -282,6 +307,12 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(),
+                    user_time: 0,
+                    kernel_time: 0,
+                    child_user_time: 0,
+                    child_kernel_time: 0,
+                    accounting_state: CpuAccountingState::Inactive,
+                    accounting_timestamp: 0,
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new())
@@ -350,6 +381,12 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                    user_time: 0,
+                    kernel_time: 0,
+                    child_user_time: 0,
+                    child_kernel_time: 0,
+                    accounting_state: CpuAccountingState::Inactive,
+                    accounting_timestamp: 0,
                 })
             },
             wait_exit_condvar: Arc::new(Condvar::new())
@@ -397,4 +434,85 @@ impl ProcessControlBlock {
             .memory_set
             .munmap_anonymous(start, end)
     }
+
+    /// Mark this process as running in kernel mode from `now`.
+    pub fn resume_in_kernel(&self, now: usize) {
+        let mut inner = self.inner.exclusive_access();
+        inner.accounting_state = CpuAccountingState::Kernel;
+        inner.accounting_timestamp = now;
+    }
+
+    /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
+    pub fn enter_kernel(&self, now: usize) {
+        let mut inner = self.inner.exclusive_access();
+        match inner.accounting_state {
+            CpuAccountingState::User => {
+                inner.user_time = inner
+                    .user_time
+                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
+            }
+            CpuAccountingState::Kernel | CpuAccountingState::Inactive => {}
+        }
+        inner.accounting_state = CpuAccountingState::Kernel;
+        inner.accounting_timestamp = now;
+    }
+
+    /// Account the kernel-mode slice that ended at `now`, then switch to user mode.
+    pub fn enter_user(&self, now: usize) {
+        let mut inner = self.inner.exclusive_access();
+        match inner.accounting_state {
+            CpuAccountingState::Kernel => {
+                inner.kernel_time = inner
+                    .kernel_time
+                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
+            }
+            CpuAccountingState::User | CpuAccountingState::Inactive => {}
+        }
+        inner.accounting_state = CpuAccountingState::User;
+        inner.accounting_timestamp = now;
+    }
+
+    /// Flush the current running slice into the corresponding accumulator.
+    pub fn pause_cpu_accounting(&self, now: usize) {
+        let mut inner = self.inner.exclusive_access();
+        match inner.accounting_state {
+            CpuAccountingState::User => {
+                inner.user_time = inner
+                    .user_time
+                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
+            }
+            CpuAccountingState::Kernel => {
+                inner.kernel_time = inner
+                    .kernel_time
+                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
+            }
+            CpuAccountingState::Inactive => {}
+        }
+        inner.accounting_state = CpuAccountingState::Inactive;
+        inner.accounting_timestamp = now;
+    }
+
+    /// Snapshot process times as raw counters: (utime, stime, cutime, cstime).
+    pub fn times_snapshot(&self, now: usize) -> (usize, usize, usize, usize) {
+        let inner = self.inner.exclusive_access();
+        let active_delta = now.saturating_sub(inner.accounting_timestamp);
+        let (user_time, kernel_time) = match inner.accounting_state {
+            CpuAccountingState::User => (
+                inner.user_time.saturating_add(active_delta),
+                inner.kernel_time,
+            ),
+            CpuAccountingState::Kernel => (
+                inner.user_time,
+                inner.kernel_time.saturating_add(active_delta),
+            ),
+            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
+        };
+        (
+            user_time,
+            kernel_time,
+            inner.child_user_time,
+            inner.child_kernel_time,
+        )
+    }
+
 }
