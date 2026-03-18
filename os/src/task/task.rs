@@ -3,8 +3,8 @@
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
 use crate::trap::TrapContext;
-use crate::{mm::PhysPageNum, sync::UPSafeCell};
-use crate::sync::UPSafeCellGuard;
+use crate::{mm::PhysPageNum};
+use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use alloc::sync::{Arc, Weak};
 
 /// Task control block structure
@@ -14,13 +14,13 @@ pub struct TaskControlBlock {
     /// Kernel stack corresponding to PID
     pub kstack: KernelStack,
     /// mutable
-    inner: UPSafeCell<TaskControlBlockInner>,
+    inner: SpinNoIrqLock<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
-    pub fn inner_exclusive_access(&self) -> UPSafeCellGuard<'_, TaskControlBlockInner> {
-        self.inner.exclusive_access()
+    pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, TaskControlBlockInner> {
+        self.inner.lock()
     }
     /// Get the address of app's page table
     pub fn get_user_token(&self) -> usize {
@@ -69,7 +69,7 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             inner: unsafe {
-                UPSafeCell::new(TaskControlBlockInner {
+                SpinNoIrqLock::new(TaskControlBlockInner {
                     res: Some(res),
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),

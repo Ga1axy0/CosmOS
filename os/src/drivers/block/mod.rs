@@ -4,7 +4,7 @@ mod virtio_blk;
 
 pub use virtio_blk::VirtIOBlock;
 
-use crate::sync::UPSafeCell;
+use crate::sync::{SpinNoIrqLock};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use virtio_drivers::{DeviceType, VirtIOHeader};
@@ -16,8 +16,8 @@ lazy_static! {
     /// Registry of all discovered block devices, keyed by name (`"vda"`, `"vdb"`, …).
     ///
     /// Must be populated by [`probe_block_devices`] before any FS initialisation.
-    pub static ref BLOCK_DEVICES: UPSafeCell<BTreeMap<String, Arc<dyn BlockDevice>>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    pub static ref BLOCK_DEVICES: SpinNoIrqLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
+        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
 }
 
 /// Scan the VirtIO MMIO bus slots and register every block device found.
@@ -32,7 +32,7 @@ pub fn probe_block_devices() {
     const VIRTIO_MMIO_STRIDE: usize = 0x1000;
     const VIRTIO_MMIO_SLOTS:  usize = 8;
 
-    let mut map = BLOCK_DEVICES.exclusive_access();
+    let mut map = BLOCK_DEVICES.lock();
     let mut idx = 0usize;
     for slot in 0..VIRTIO_MMIO_SLOTS {
         let addr = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
@@ -68,7 +68,7 @@ lazy_static! {
     ///
     /// [`probe_block_devices`] must be called before this is first accessed.
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = BLOCK_DEVICES
-        .exclusive_access()
+        .lock()
         .get("vda")
         .cloned()
         .expect("[kernel] BLOCK_DEVICE: vda not found");
