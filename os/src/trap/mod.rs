@@ -18,9 +18,7 @@ use crate::config::TRAMPOLINE;
 use crate::hart::hartid;
 use crate::syscall::syscall;
 use crate::task::{
-    check_fatal_signals_of_current, current_add_signal, current_process, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
-    suspend_current_and_run_next, ExitReason, SignalFlags,
+    ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token, exit_current_and_run_next, suspend_current_and_run_next
 };
 use crate::timer::{check_timer, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -151,6 +149,11 @@ pub fn trap_handler() -> ! {
     if let Some((signum, msg)) = check_fatal_signals_of_current() {
         trace!("[kernel] trap_handler: .. check signals {}", msg);
         exit_current_and_run_next(ExitReason::Signal(signum as u32));
+    }
+    if current_process_is_zombie() {
+        trace!("[kernel] trap_handler: .. current process is zombie");
+        // 非主进程才会进入这个分支，此时退出的reason是不重要的。
+        exit_current_and_run_next(ExitReason::Exit(0));
     }
     trap_return();
 }
