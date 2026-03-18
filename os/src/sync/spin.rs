@@ -126,15 +126,10 @@ impl<T> SpinNoIrqLock<T> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // Re-enable interrupts briefly while spinning to let the
-            // lock holder (on another hart) potentially run interrupt
-            // handlers that release resources. Then disable before
-            // retrying the CAS.
-            if sie_was_enabled {
-                unsafe { sstatus::set_sie() };
-            }
+            // Keep interrupts disabled while spinning to preserve irqsave
+            // semantics and avoid deadlocks with interrupt handlers that
+            // might take the same or nested locks.
             core::hint::spin_loop();
-            unsafe { sstatus::clear_sie() };
         }
 
         SpinNoIrqLockGuard {
