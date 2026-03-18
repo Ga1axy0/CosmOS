@@ -72,9 +72,12 @@ pub fn processor_for_hart(hart_id: usize) -> &'static UPSafeCell<Processor> {
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
 pub fn run_tasks() {
     loop {
-        crate::trap::set_user_trap_entry();
-        
         if let Some(task) = fetch_task() {
+            // debug!(
+            //     "kernel: hart {} run_tasks, pid[{}]",
+            //     hartid(),
+            //     task.process.upgrade().unwrap().getpid()
+            // );
             let process = task.process.upgrade().unwrap();
             let mut processor = current_processor().exclusive_access();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();

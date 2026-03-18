@@ -1,97 +1,176 @@
-//! Implementation of [`TaskManager`]
+//! Per-hart run queues with work-stealing scheduler.
 //!
-//! It is only used to manage processes and schedule process based on ready queue.
-//! Other CPU process monitoring functions are in Processor.
+//! Each hart owns a local FIFO ready queue protected by a [`SpinNoIrqLock`].
+//! `fetch_task()` first tries the local queue; if empty it attempts to steal
+//! from other harts' queues in round-robin order.
+//!
+//! A global overflow queue is used when the caller cannot determine the hart
+//! (e.g. `wakeup_task` from an arbitrary context); local queues drain the
+//! overflow queue as part of the steal loop.
 
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
-use crate::sync::UPSafeCell;
+use crate::config::MAX_HARTS;
+use crate::hart::hartid;
+use crate::sync::{SpinNoIrqLock, UPSafeCell};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use core::array;
 use lazy_static::*;
-///A array of `TaskControlBlock` that is thread-safe
-pub struct TaskManager {
+
+/// Per-hart local run queue.
+struct LocalRunQueue {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
-    
-    /// The stopping task, leave a reference so that the kernel stack will not be recycled when switching tasks
+    /// Keep a reference to the last task that exited so its kernel stack
+    /// is not freed while we are still running on it.
     stop_task: Option<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
-impl TaskManager {
-    ///Creat an empty TaskManager
-    pub fn new() -> Self {
+impl LocalRunQueue {
+    fn new() -> Self {
         Self {
             ready_queue: VecDeque::new(),
             stop_task: None,
         }
     }
-    /// Add process back to ready queue
-    pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+    fn push(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
-    pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+    fn pop(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.ready_queue.pop_front()
     }
-    pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
-        if let Some((id, _)) = self
+    fn remove(&mut self, task: &Arc<TaskControlBlock>) {
+        if let Some((idx, _)) = self
             .ready_queue
             .iter()
             .enumerate()
-            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
+            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(task))
         {
-            self.ready_queue.remove(id);
+            self.ready_queue.remove(idx);
         }
     }
-    /// Add a task to stopping task
-    pub fn add_stop(&mut self, task: Arc<TaskControlBlock>) {
-        // NOTE: as the last stopping task has completely stopped (not
-        // using kernel stack any more, at least in the single-core
-        // case) so that we can simply replace it;
-        self.stop_task = Some(task);
+    /// Steal up to half of the tasks from this queue.
+    fn steal_batch(&mut self) -> VecDeque<Arc<TaskControlBlock>> {
+        let n = (self.ready_queue.len() + 1) / 2;
+        self.ready_queue.drain(..n).collect()
     }
-
+    fn len(&self) -> usize {
+        self.ready_queue.len()
+    }
 }
 
 lazy_static! {
-    /// TASK_MANAGER instance through lazy_static!
-    pub static ref TASK_MANAGER: UPSafeCell<TaskManager> =
-        unsafe { UPSafeCell::new(TaskManager::new()) };
+    /// Per-hart run queues, indexed by hart id.
+    static ref RUN_QUEUES: [SpinNoIrqLock<LocalRunQueue>; MAX_HARTS] =
+        array::from_fn(|_| SpinNoIrqLock::new(LocalRunQueue::new()));
+
+    /// Global overflow queue for tasks that cannot be assigned to a
+    /// specific hart at the time of enqueue.
+    static ref GLOBAL_QUEUE: SpinNoIrqLock<VecDeque<Arc<TaskControlBlock>>> =
+        SpinNoIrqLock::new(VecDeque::new());
+
     /// PID2PCB instance (map of pid to pcb)
     pub static ref PID2PCB: UPSafeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
-/// Add a task to ready queue
+/// Add a task to the current hart's local run queue.
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    //trace!("kernel: TaskManager::add_task");
-    TASK_MANAGER.exclusive_access().add(task);
+    let hart = hartid();
+    RUN_QUEUES[hart].lock().push(task);
 }
 
-/// Wake up a task
+/// Add a task to the global overflow queue.
+///
+/// Use this when the caller does not know (or should not depend on) which
+/// hart will pick up the task — e.g. `wakeup_task` from an interrupt
+/// handler that may run on any hart.
+pub fn add_task_global(task: Arc<TaskControlBlock>) {
+    GLOBAL_QUEUE.lock().push_back(task);
+}
+
+/// Wake up a task by marking it `Ready` and placing it on the global queue.
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     trace!("kernel: TaskManager::wakeup_task");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
-    add_task(task);
+    // Put on global queue so that any idle hart can pick it up quickly.
+    add_task_global(task);
 }
 
-/// Remove a task from the ready queue
+/// Remove a task from **all** queues (local + global).
+///
+/// Used when a process exits and needs to cancel tasks that may be sitting
+/// in a ready queue (e.g. timer-blocked threads).
 pub fn remove_task(task: Arc<TaskControlBlock>) {
-    //trace!("kernel: TaskManager::remove_task");
-    TASK_MANAGER.exclusive_access().remove(task);
+    // Try the global queue first.
+    GLOBAL_QUEUE.lock().retain(|t| Arc::as_ptr(t) != Arc::as_ptr(&task));
+    // Then try every local queue.
+    for rq in RUN_QUEUES.iter() {
+        rq.lock().remove(&task);
+    }
 }
 
-/// Fetch a task out of the ready queue
+/// Fetch the next task to run on the current hart.
+///
+/// Order:
+/// 1. Local queue of the current hart.
+/// 2. Global overflow queue (drain up to a batch).
+/// 3. Steal from another hart's local queue.
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    //trace!("kernel: TaskManager::fetch_task");
-    TASK_MANAGER.exclusive_access().fetch()
+    let hart = hartid();
+
+    // 1. Try local queue.
+    {
+        let mut local = RUN_QUEUES[hart].lock();
+        if let Some(task) = local.pop() {
+            return Some(task);
+        }
+    }
+
+    // 2. Try global queue — take one for ourselves, spread the rest.
+    {
+        let mut global = GLOBAL_QUEUE.lock();
+        if let Some(task) = global.pop_front() {
+            // Drain a few more into our local queue to amortise the lock.
+            let n = core::cmp::min(global.len(), MAX_HARTS);
+            let batch: VecDeque<Arc<TaskControlBlock>> = global
+                .drain(..n)
+                .collect();
+            drop(global);
+            if !batch.is_empty() {
+                let mut local = RUN_QUEUES[hart].lock();
+                for t in batch {
+                    local.push(t);
+                }
+            }
+            return Some(task);
+        }
+    }
+
+    // 3. Work stealing — try each other hart once.
+    for offset in 1..MAX_HARTS {
+        let victim = (hart + offset) % MAX_HARTS;
+        let mut victim_rq = RUN_QUEUES[victim].lock();
+        if victim_rq.len() > 0 {
+            let stolen = victim_rq.steal_batch();
+            drop(victim_rq);
+            let mut local = RUN_QUEUES[hart].lock();
+            for t in stolen {
+                local.push(t);
+            }
+            return local.pop();
+        }
+    }
+
+    None
 }
 
-/// Set a task to stop-wait status, waiting for its kernel stack out of use.
+/// Set a task to stop-wait status on the current hart, keeping its kernel
+/// stack alive until the next context switch on this hart.
 pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
-    TASK_MANAGER.exclusive_access().add_stop(task);
+    let hart = hartid();
+    RUN_QUEUES[hart].lock().stop_task = Some(task);
 }
 
 /// Get process by pid
@@ -105,7 +184,7 @@ pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
     PID2PCB.exclusive_access().insert(pid, process);
 }
 
-/// Remove item(pid, _some_pcb) from PDI2PCB map (called by exit_current_and_run_next)
+/// Remove item(pid, _some_pcb) from PID2PCB map (called by exit_current_and_run_next)
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.exclusive_access();
     if map.remove(&pid).is_none() {

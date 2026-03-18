@@ -4,8 +4,8 @@ use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
 use crate::trap::TrapContext;
 use crate::{mm::PhysPageNum, sync::UPSafeCell};
+use crate::sync::UPSafeCellGuard;
 use alloc::sync::{Arc, Weak};
-use core::cell::RefMut;
 
 /// Task control block structure
 pub struct TaskControlBlock {
@@ -19,7 +19,7 @@ pub struct TaskControlBlock {
 
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+    pub fn inner_exclusive_access(&self) -> UPSafeCellGuard<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
     /// Get the address of app's page table

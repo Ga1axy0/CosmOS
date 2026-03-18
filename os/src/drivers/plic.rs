@@ -94,7 +94,7 @@ pub fn init_hart(hart_id: usize) {
         enable_irq(context, irq);
     }
     set_threshold(context, 0);
-    info!("hart {} plic init done", hart_id);
+    debug!("hart {} plic init done", hart_id);
 }
 
 /// Called from trap handler on SupervisorExternal interrupt.
