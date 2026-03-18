@@ -1,7 +1,7 @@
 use super::{File, Stat, StatMode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
-use crate::sync::UPSafeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::fs::devfs::BlockDevNode;
 use crate::drivers::block::BLOCK_DEVICES;
@@ -23,7 +23,7 @@ pub struct OSInode {
     readable: bool,
     writable: bool,
     path: String,
-    inner: UPSafeCell<OSInodeInner>,
+    inner: SpinNoIrqLock<OSInodeInner>,
 }
 /// inner of inode in memory
 pub struct OSInodeInner {
@@ -39,13 +39,13 @@ impl OSInode {
             readable,
             writable,
             path,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
+            inner: unsafe { SpinNoIrqLock::new(OSInodeInner { offset: 0, inode }) },
         }
     }
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let mut buffer: Vec<u8> = alloc::vec![0; 512];
         let mut v: Vec<u8> = Vec::new();
         loop {
@@ -72,9 +72,9 @@ lazy_static! {
     /// inserted into the namespace during mount operations.  Used by
     /// `ensure_virtual_dir` (to avoid recreating existing dirs) and
     /// `do_umount` (to clean up the registry).
-    static ref VIRT_DIRS: UPSafeCell<BTreeMap<String, Arc<VirtualDirNode>>> =
+    static ref VIRT_DIRS: SpinNoIrqLock<BTreeMap<String, Arc<VirtualDirNode>>> =
         // SAFETY: single-processor kernel.
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
+        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
 
     /// The kernel's global root inode, backed by the virtual rootfs.
     ///
@@ -114,7 +114,7 @@ fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
 
     // Fast path: already created.
     {
-        let map = VIRT_DIRS.exclusive_access();
+        let map = VIRT_DIRS.lock();
         if let Some(vdir) = map.get(abs_path) {
             return Ok(Arc::clone(vdir));
         }
@@ -137,7 +137,7 @@ fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
     parent_vdir.bind(name, Arc::clone(&new_vdir) as Arc<dyn VfsNode>);
 
     VIRT_DIRS
-        .exclusive_access()
+        .lock()
         .insert(String::from(abs_path), Arc::clone(&new_vdir));
 
     Ok(new_vdir)
@@ -192,7 +192,7 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
         Arc::clone(&VIRT_ROOT)
     } else {
         VIRT_DIRS
-            .exclusive_access()
+            .lock()
             .get(parent_path)
             .cloned()
             .ok_or(ERRNO::EINVAL)?
@@ -204,7 +204,7 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
 
     // Clean up the registry entry (no-op if `abs` was a real-FS mount, not
     // a VirtualDirNode we created).
-    VIRT_DIRS.exclusive_access().remove(&abs);
+    VIRT_DIRS.lock().remove(&abs);
 
     info!("[kernel] unmounted {}", abs);
     Ok(())
@@ -497,12 +497,12 @@ impl File for OSInode {
         self.writable
     }
     fn is_dir(&self) -> bool {
-        self.inner.exclusive_access().inode.is_dir()
+        self.inner.lock().inode.is_dir()
     }
     /// read file data into buffer
     fn read(&self, mut buf: UserBuffer) -> usize {
         trace!("kernel: OSInode::read");
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
             debug!("OSInode::read: offset={}, slice_len={}", inner.offset, slice.len());
@@ -516,7 +516,7 @@ impl File for OSInode {
         total_read_size
     }
     fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         let mut file_off = offset;
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
@@ -535,7 +535,7 @@ impl File for OSInode {
     /// write buffer data into file
     fn write(&self, buf: UserBuffer) -> usize {
         trace!("kernel: OSInode::write");
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let mut total_write_size = 0usize;
         for slice in buf.buffers.iter() {
             let write_size = inner.inode.write_at(inner.offset, *slice);
@@ -559,7 +559,7 @@ impl File for OSInode {
     ///   +19  d_name[] null-terminated name, padded to make reclen a multiple of 8
     /// ```
     fn getdents64(&self, buf: &mut [u8]) -> usize {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         if !inner.inode.is_dir() {
             return 0;
         }
@@ -604,7 +604,7 @@ impl File for OSInode {
     }
 
     fn stat(&self) -> Stat {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         let mode = if inner.inode.is_dir() {
             StatMode::DIR
         } else {
@@ -652,7 +652,7 @@ pub fn init_dev() {
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
 
-    let map = BLOCK_DEVICES.exclusive_access();
+    let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
         let node = Arc::new(BlockDevNode::new(Arc::clone(dev)));
         dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);

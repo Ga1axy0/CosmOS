@@ -11,7 +11,7 @@
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
-use crate::sync::{SpinNoIrqLock, UPSafeCell};
+use crate::sync::{SpinNoIrqLock};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::array;
@@ -69,8 +69,8 @@ lazy_static! {
         SpinNoIrqLock::new(VecDeque::new());
 
     /// PID2PCB instance (map of pid to pcb)
-    pub static ref PID2PCB: UPSafeCell<BTreeMap<usize, Arc<ProcessControlBlock>>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    pub static ref PID2PCB: SpinNoIrqLock<BTreeMap<usize, Arc<ProcessControlBlock>>> =
+        SpinNoIrqLock::new(BTreeMap::new());
 }
 
 /// Add a task to the current hart's local run queue.
@@ -175,18 +175,18 @@ pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
 
 /// Get process by pid
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
-    let map = PID2PCB.exclusive_access();
+    let map = PID2PCB.lock();
     map.get(&pid).map(Arc::clone)
 }
 
 /// Insert item(pid, pcb) into PID2PCB map (called by do_fork AND ProcessControlBlock::new)
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
-    PID2PCB.exclusive_access().insert(pid, process);
+    PID2PCB.lock().insert(pid, process);
 }
 
 /// Remove item(pid, _some_pcb) from PID2PCB map (called by exit_current_and_run_next)
 pub fn remove_from_pid2process(pid: usize) {
-    let mut map = PID2PCB.exclusive_access();
+    let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
         panic!("cannot find pid {} in pid2task!", pid);
     }
