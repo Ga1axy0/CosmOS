@@ -219,6 +219,13 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     pending.check_error()
 }
 
+/// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
+pub fn current_process_is_zombie() -> bool {
+    let process = current_process();
+    let process_inner = process.inner_exclusive_access();
+    process_inner.is_zombie
+}
+
 /// Add signal to the current task
 pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
