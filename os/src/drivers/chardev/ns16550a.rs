@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 
 use bitflags::bitflags;
 
-use crate::sync::{Condvar, UPIntrFreeCell};
+use crate::sync::{Condvar, SpinNoIrqLock};
 
 use super::{set_uart_ready, CharDevice};
 
@@ -132,7 +132,7 @@ struct WriteEnd {
 
 /// NS16550a char device.
 pub struct NS16550a<const BASE_ADDR: usize> {
-   pub(crate) inner: UPIntrFreeCell<NS16550aInner>,
+   pub(crate) inner: SpinNoIrqLock<NS16550aInner>,
    #[allow(dead_code)]
    pub(crate) condvar: Condvar,
 }
@@ -187,7 +187,7 @@ impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
       };
       inner.ns16550a.init();
       let device = Self {
-            inner: unsafe { UPIntrFreeCell::new(inner) },
+            inner: unsafe { SpinNoIrqLock::new(inner) },
             condvar: Condvar::new(),
       };
       set_uart_ready();
@@ -210,13 +210,13 @@ impl NS16550aRaw {
 
 impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
    fn write(&self, ch: u8) {
-      let mut inner = self.inner.exclusive_access();
+      let mut inner = self.inner.lock();
       inner.ns16550a.write(ch);
    }
 
    fn read(&self) -> u8 {
       loop {
-         let mut inner = self.inner.exclusive_access();
+         let mut inner = self.inner.lock();
          if let Some(ch) = inner.read_buffer.pop_front() {
             return ch;
          }
@@ -231,7 +231,7 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
    }
 
    fn handle_irq(&self) {
-      let mut inner = self.inner.exclusive_access();
+      let mut inner = self.inner.lock();
       let mut pushed = false;
       while let Some(ch) = inner.ns16550a.try_read() {
          inner.read_buffer.push_back(ch);
