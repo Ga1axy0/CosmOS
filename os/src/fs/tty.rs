@@ -3,7 +3,7 @@ use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::{translated_ref, translated_refmut, UserBuffer};
 use crate::syscall::errno::ERRNO;
 use crate::task::current_user_token;
-use crate::sync::UPSafeCell;
+use crate::sync::SpinNoIrqLock;
 use alloc::sync::Arc;
 
 /// `ioctl(TCGETS)`：读取当前终端配置。
@@ -86,7 +86,7 @@ struct TtyState {
 /// 共享 tty 核心，统一管理一个控制台终端的底层设备与状态。
 pub struct TtyCore {
     driver: Arc<dyn CharDevice>,
-    state: UPSafeCell<TtyState>,
+    state: SpinNoIrqLock<TtyState>,
 }
 
 unsafe impl Send for TtyCore {}
@@ -99,7 +99,7 @@ impl TtyCore {
             driver,
             state: unsafe {
                 // TODO: 后续接入真正的 termios 初始化策略，而不是固定默认值。
-                UPSafeCell::new(TtyState {
+                SpinNoIrqLock::new(TtyState {
                     termios: Termios::default(),
                     winsize: WinSize::default(),
                 })
@@ -127,22 +127,22 @@ impl TtyCore {
 
     /// 读取当前 tty 配置快照。
     pub fn termios(&self) -> Termios {
-        self.state.exclusive_access().termios
+        self.state.lock().termios
     }
 
     /// 更新当前 tty 配置。
     pub fn set_termios(&self, termios: Termios) {
-        self.state.exclusive_access().termios = termios;
+        self.state.lock().termios = termios;
     }
 
     /// 读取当前窗口大小快照。
     pub fn winsize(&self) -> WinSize {
-        self.state.exclusive_access().winsize
+        self.state.lock().winsize
     }
 
     /// 更新当前窗口大小。
     pub fn set_winsize(&self, winsize: WinSize) {
-        self.state.exclusive_access().winsize = winsize;
+        self.state.lock().winsize = winsize;
     }
 }
 
