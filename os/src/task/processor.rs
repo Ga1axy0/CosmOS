@@ -50,7 +50,7 @@ impl Processor {
 
 lazy_static! {
     pub static ref PROCESSORS: [SpinNoIrqLock<Processor>; MAX_HARTS] =
-        array::from_fn(|_| unsafe { SpinNoIrqLock::new(Processor::new()) });
+        array::from_fn(|_| SpinNoIrqLock::new(Processor::new()));
 }
 
 /// 返回当前 hart 对应的 `Processor` 存储入口。
