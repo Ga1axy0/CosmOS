@@ -5,13 +5,12 @@ use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
-use crate::fs::{File, Stdin, Stdout};
+use crate::fs::{new_stdio_files, File};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
@@ -188,14 +187,7 @@ impl ProcessControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
-                    fd_table: vec![
-                        // 0 -> stdin
-                        Some(Arc::new(Stdin)),
-                        // 1 -> stdout
-                        Some(Arc::new(Stdout)),
-                        // 2 -> stderr
-                        Some(Arc::new(Stdout)),
-                    ],
+                    fd_table: new_stdio_files(),
                     pending_signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
                     signal_actions: SignalActions::default(),
