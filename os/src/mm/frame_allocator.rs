@@ -1,7 +1,7 @@
 //! Physical page frame allocator
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{config::MEMORY_END, sync::SpinLock};
+use crate::{config::MEMORY_END, sync::{SpinNoIrqLock}};
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 use lazy_static::*;
@@ -87,8 +87,8 @@ impl FrameAllocator for StackFrameAllocator {
 type FrameAllocatorImpl = StackFrameAllocator;
 
 lazy_static! {
-    pub static ref FRAME_ALLOCATOR: SpinLock<FrameAllocatorImpl> =
-        unsafe { SpinLock::new(FrameAllocatorImpl::new()) };
+    pub static ref FRAME_ALLOCATOR: SpinNoIrqLock<FrameAllocatorImpl> =
+        unsafe { SpinNoIrqLock::new(FrameAllocatorImpl::new()) };
 }
 
 pub fn init_frame_allocator() {
