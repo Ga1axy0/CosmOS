@@ -84,6 +84,8 @@ impl TaskControlBlock {
 #[derive(Copy, Clone, PartialEq)]
 /// The execution status of the current process
 pub enum TaskStatus {
+    /// 已在本地 hart 上切出，等待转入真正可运行队列
+    PreReady,
     /// ready to run
     Ready,
     /// running

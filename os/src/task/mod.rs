@@ -34,7 +34,10 @@ use switch::__switch;
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub use manager::{add_task, add_task_global, pid2process, remove_from_pid2process, remove_task, wakeup_task};
+pub use manager::{
+    add_task, add_task_global, add_task_pre_ready, pid2process, promote_pre_ready_tasks,
+    remove_from_pid2process, remove_task, wakeup_task,
+};
 pub use action::{SignalAction, SignalActions};
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
@@ -53,13 +56,13 @@ pub fn suspend_current_and_run_next() {
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
+    // 当前任务先进入预就绪状态，等本 hart 切回 idle 后再正式发布。
+    task_inner.task_status = TaskStatus::PreReady;
     drop(task_inner);
     // ---- release current TCB
 
-    // push back to ready queue.
-    add_task(task);
+    // 延迟发布到真正的就绪队列，避免其他 hart 在本 hart 尚未切走时抢到该任务。
+    add_task_pre_ready(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }
