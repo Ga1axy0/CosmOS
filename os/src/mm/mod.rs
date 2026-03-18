@@ -29,3 +29,11 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     KERNEL_SPACE.exclusive_access().activate();
 }
+
+/// 在当前 hart 上激活内核地址空间（写入 satp + sfence.vma）。
+///
+/// 此函数供 secondary harts 在 bootstrap 完成后调用，因为 `satp` 是
+/// per-hart 寄存器，`mm::init()` 只激活了 bootstrap hart 的 satp。
+pub fn activate_kernel_space() {
+    KERNEL_SPACE.exclusive_access().activate();
+}

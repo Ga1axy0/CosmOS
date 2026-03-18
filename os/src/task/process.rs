@@ -8,11 +8,11 @@ use super::{pid_alloc, PidHandle};
 use crate::fs::{new_stdio_files, File};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
+use crate::sync::UPSafeCellGuard;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::RefMut;
 
 /// Process termination reason preserved for wait4/waitpid encoding.
 #[derive(Debug, Clone, Copy)]
@@ -164,7 +164,7 @@ impl ProcessControlBlockInner {
 
 impl ProcessControlBlock {
     /// inner_exclusive_access
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, ProcessControlBlockInner> {
+    pub fn inner_exclusive_access(&self) -> UPSafeCellGuard<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
     /// new process from elf file

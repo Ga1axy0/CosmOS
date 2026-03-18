@@ -2,104 +2,165 @@
 //!
 //! UPSafeCell is used to wrap a static data structure which can access safely.
 //!
-//! NOTICE: We should only use it in environment with uniprocessor（single cpu core）, and the kernel can not support task preempting in kernel mode （or trap in kernel mode）.
+//! NOTICE: UPSafeCell now uses SpinNoIrqLock internally so it is
+//! safe on multi-core as well.
 
-use core::cell::{RefCell, RefMut, UnsafeCell};
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use riscv::register::sstatus;
 
-/// Wrap a static data structure inside it so that we are
-/// able to access it without any `unsafe`.
+/// Wrap a static data structure inside a spinlock with interrupt masking.
 ///
-/// We should only use it in uniprocessor.
-///
-/// In order to get mutable reference of inner data, call
-/// `exclusive_access`.
+/// `exclusive_access()` returns a guard that holds the lock and disables
+/// supervisor interrupts.  This replaces the old `RefCell`-based
+/// implementation and is safe on SMP.
 pub struct UPSafeCell<T> {
-    /// inner data
-    inner: RefCell<T>,
+    locked: AtomicBool,
+    inner: UnsafeCell<T>,
 }
 
-unsafe impl<T> Sync for UPSafeCell<T> {}
+unsafe impl<T: Send> Send for UPSafeCell<T> {}
+unsafe impl<T: Send> Sync for UPSafeCell<T> {}
 
 impl<T> UPSafeCell<T> {
-    /// User is responsible to guarantee that inner struct is only used in
-    /// uniprocessor.
+    /// Create a new `UPSafeCell`.
+    ///
+    /// # Safety
+    /// In the new SMP-aware implementation this is actually safe, but we keep
+    /// the `unsafe` signature for source compatibility with existing callers.
     pub unsafe fn new(value: T) -> Self {
         Self {
-            inner: RefCell::new(value),
+            locked: AtomicBool::new(false),
+            inner: UnsafeCell::new(value),
         }
     }
-    /// Panic if the data has been borrowed.
-    pub fn exclusive_access(&self) -> RefMut<'_, T> {
-        self.inner.borrow_mut()
+
+    /// Obtain exclusive (mutable) access to the inner data.
+    ///
+    /// Disables supervisor interrupts and spins until the lock is acquired.
+    pub fn exclusive_access(&self) -> UPSafeCellGuard<'_, T> {
+        let sie_was_enabled = sstatus::read().sie();
+        unsafe { sstatus::clear_sie() };
+
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            if sie_was_enabled {
+                unsafe { sstatus::set_sie() };
+            }
+            core::hint::spin_loop();
+            unsafe { sstatus::clear_sie() };
+        }
+
+        UPSafeCellGuard {
+            cell: self,
+            sie_was_enabled,
+        }
+    }
+}
+
+/// RAII guard for [`UPSafeCell`].
+pub struct UPSafeCellGuard<'a, T> {
+    cell: &'a UPSafeCell<T>,
+    sie_was_enabled: bool,
+}
+
+impl<T> Deref for UPSafeCellGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.cell.inner.get() }
+    }
+}
+
+impl<T> DerefMut for UPSafeCellGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.cell.inner.get() }
+    }
+}
+
+impl<T> Drop for UPSafeCellGuard<'_, T> {
+    fn drop(&mut self) {
+        self.cell.locked.store(false, Ordering::Release);
+        if self.sie_was_enabled {
+            unsafe { sstatus::set_sie() };
+        }
     }
 }
 
 
-/// A uniprocessor cell that provides exclusive access by temporarily disabling
-/// supervisor interrupts.
+/// A multicore-safe cell that provides exclusive access by disabling
+/// supervisor interrupts and spinning.
 ///
-/// This is useful for sharing data between normal context and interrupt/trap
-/// handlers without introducing a blocking lock.
+/// Previously single-core only; now uses an atomic spinlock internally
+/// so it is safe under SMP.
 #[derive(Debug)]
 pub struct UPIntrFreeCell<T> {
+    locked: AtomicBool,
     inner: UnsafeCell<T>,
 }
 
 impl<T> UPIntrFreeCell<T> {
     /// # Safety
-    /// The caller must ensure the contained value is only accessed via
-    /// `exclusive_access`.
+    /// Kept `unsafe` for source compatibility.
     pub unsafe fn new(value: T) -> Self {
         Self {
+            locked: AtomicBool::new(false),
             inner: UnsafeCell::new(value),
         }
     }
 
-    /// Get exclusive access.
+    /// Get exclusive access with interrupts disabled + spinlock.
     pub fn exclusive_access(&self) -> UPIntrFreeCellRefMut<'_, T> {
+        let sie_was_enabled = sstatus::read().sie();
+        unsafe { sstatus::clear_sie() };
+
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            if sie_was_enabled {
+                unsafe { sstatus::set_sie() };
+            }
+            core::hint::spin_loop();
+            unsafe { sstatus::clear_sie() };
+        }
+
         UPIntrFreeCellRefMut {
             cell: self,
-            _guard: IntrGuard::new(),
+            sie_was_enabled,
         }
     }
 }
 
-unsafe impl<T> Sync for UPIntrFreeCell<T> {}
+unsafe impl<T: Send> Send for UPIntrFreeCell<T> {}
+unsafe impl<T: Send> Sync for UPIntrFreeCell<T> {}
 
 pub struct UPIntrFreeCellRefMut<'a, T> {
     cell: &'a UPIntrFreeCell<T>,
-    _guard: IntrGuard,
+    sie_was_enabled: bool,
 }
 
-impl<'a, T> core::ops::Deref for UPIntrFreeCellRefMut<'a, T> {
+impl<T> Deref for UPIntrFreeCellRefMut<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.cell.inner.get() }
     }
 }
 
-impl<'a, T> core::ops::DerefMut for UPIntrFreeCellRefMut<'a, T> {
+impl<T> DerefMut for UPIntrFreeCellRefMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.cell.inner.get() }
     }
 }
 
-struct IntrGuard {
-    sie_was_enabled: bool,
-}
-
-impl IntrGuard {
-    fn new() -> Self {
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
-        Self { sie_was_enabled }
-    }
-}
-
-impl Drop for IntrGuard {
+impl<T> Drop for UPIntrFreeCellRefMut<'_, T> {
     fn drop(&mut self) {
+        self.cell.locked.store(false, Ordering::Release);
         if self.sie_was_enabled {
             unsafe { sstatus::set_sie() };
         }

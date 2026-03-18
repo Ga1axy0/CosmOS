@@ -74,8 +74,8 @@ pub struct VirtualDirNode {
     inner: UPSafeCell<VirtDirInner>,
 }
 
-// SAFETY: single-processor kernel.  Kernel code is never preempted while in
-// kernel mode, so `RefCell` (inside `UPSafeCell`) never sees concurrent access.
+// SAFETY: UPSafeCell now uses an atomic spinlock internally, so concurrent
+// access from multiple harts is properly serialised.
 unsafe impl Send for VirtualDirNode {}
 unsafe impl Sync for VirtualDirNode {}
 

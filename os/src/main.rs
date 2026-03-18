@@ -86,7 +86,7 @@ fn init_local_hart(hart_id: usize) {
     trap::init_hart();
     timer::init_hart();
     drivers::plic::init_hart(hart_id);
-    info!("hart {} local init done", hart_id);
+    debug!("hart {} local init done", hart_id);
 }
 
 /// 记录当前环境下各 hart 的 HSM 状态，并尝试拉起处于 stopped 状态的 hart。
@@ -178,35 +178,8 @@ fn wait_for_bootstrap() {
     }
 }
 
-/// secondary hart 的主入口。
-///
-/// 当前阶段 secondary hart 在完成本地初始化后只进入 idle 循环，
-/// 暂不进入调度器；真正进入调度路径要等第 4 步把 `Processor`
-/// 改成 per-hart 存储之后再做。
-fn secondary_hart_main(hart_id: usize) -> ! {
-    wait_for_bootstrap();
-    info!("hart {} boot", hart_id);
-    init_local_hart(hart_id);
-    trap::disable_timer_interrupt();
-    trap::disable_external_interrupt();
-    info!("hart {} entered idle", hart_id);
-    loop {
-        trap::set_kernel_trap_entry();
-        unsafe { riscv::asm::wfi() };
-    }
-}
-
-#[no_mangle]
-/// 内核的 Rust 入口。
-///
-/// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
-/// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
-pub fn rust_main(hart_id: usize) -> ! {
-    let _hart_id = hart::init_with_hartid(hart_id);
-    if !try_claim_bootstrap_hart(hart_id) {
-        secondary_hart_main(hart_id);
-    }
-
+/// bootstrap hart 的主入口
+fn first_hart_main(hart_id: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
     logging::init();
@@ -225,4 +198,32 @@ pub fn rust_main(hart_id: usize) -> ! {
     info!("hart {} entered scheduler", hart_id);
     task::run_tasks();
     panic!("Unreachable in rust_main!");
+}
+
+/// secondary hart 的主入口。
+///
+/// 在 bootstrap hart 完成全局初始化后，secondary hart 完成本地初始化
+/// 并加入全局调度器，参与任务执行。
+fn secondary_hart_main(hart_id: usize) -> ! {
+    wait_for_bootstrap();
+    mm::activate_kernel_space();    // 激活内核页表：但 satp 是 per-hart 寄存器
+    info!("hart {} boot", hart_id);
+    init_local_hart(hart_id);
+    debug!("hart {} entered scheduler", hart_id);
+    task::run_tasks();
+    panic!("Unreachable in secondary_hart_main!");
+}
+
+#[no_mangle]
+/// 内核的 Rust 入口。
+///
+/// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
+/// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
+pub fn rust_main(hart_id: usize) -> ! {
+    let _hart_id = hart::init_with_hartid(hart_id);
+    if !try_claim_bootstrap_hart(hart_id) {
+        secondary_hart_main(hart_id);
+    } else {
+        first_hart_main(hart_id);
+    }
 }
