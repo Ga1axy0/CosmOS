@@ -3,8 +3,9 @@
 use core::cmp::Ordering;
 
 use crate::config::CLOCK_FREQ;
+use crate::hart::hartid;
 use crate::sbi::set_timer;
-use crate::sync::UPSafeCell;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
@@ -48,6 +49,16 @@ pub fn set_next_trigger() {
     set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
 }
 
+/// 初始化当前 hart 的时钟中断状态。
+///
+/// 该函数需要每个 hart 各自执行一次：先开启 supervisor timer interrupt，
+/// 再设置当前 hart 的下一次 timer 触发时间。
+pub fn init_hart() {
+    crate::trap::enable_timer_interrupt();
+    set_next_trigger();
+    info!("hart {} timer init done", hartid());
+}
+
 /// condvar for timer
 pub struct TimerCondVar {
     /// The time when the timer expires, in milliseconds
@@ -78,8 +89,8 @@ impl Ord for TimerCondVar {
 
 lazy_static! {
     /// TIMERS: global instance: set of timer condvars
-    static ref TIMERS: UPSafeCell<BinaryHeap<TimerCondVar>> =
-        unsafe { UPSafeCell::new(BinaryHeap::<TimerCondVar>::new()) };
+    static ref TIMERS: SpinNoIrqLock<BinaryHeap<TimerCondVar>> =
+        unsafe { SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new()) };
 }
 
 /// Add a timer
@@ -88,7 +99,7 @@ pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
         "kernel:pid[{}] add_timer",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let mut timers = TIMERS.exclusive_access();
+    let mut timers = TIMERS.lock();
     timers.push(TimerCondVar { expire_ms, task });
 }
 
@@ -96,7 +107,7 @@ pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
     //trace!("kernel:pid[{}] remove_timer", current_task().unwrap().process.upgrade().unwrap().getpid());
     trace!("kernel: remove_timer");
-    let mut timers = TIMERS.exclusive_access();
+    let mut timers = TIMERS.lock();
     let mut temp = BinaryHeap::<TimerCondVar>::new();
     for condvar in timers.drain() {
         if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
@@ -112,7 +123,7 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 pub fn check_timer() {
     // trace!("kernel: check_timer");
     let current_ms = get_time_ms();
-    let mut timers = TIMERS.exclusive_access();
+    let mut timers = TIMERS.lock();
     while let Some(timer) = timers.peek() {
         if timer.expire_ms <= current_ms {
             wakeup_task(Arc::clone(&timer.task));

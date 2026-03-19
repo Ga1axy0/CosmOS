@@ -7,12 +7,11 @@ use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{new_stdio_files, File};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
-use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, UPSafeCell};
+use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::RefMut;
 
 /// Process termination reason preserved for wait4/waitpid encoding.
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +27,7 @@ pub struct ProcessControlBlock {
     /// immutable
     pub pid: PidHandle,
     /// mutable
-    inner: UPSafeCell<ProcessControlBlockInner>,
+    inner: SpinNoIrqLock<ProcessControlBlockInner>,
     pub wait_exit_condvar: Arc<Condvar>,
 }
 
@@ -164,8 +163,8 @@ impl ProcessControlBlockInner {
 
 impl ProcessControlBlock {
     /// inner_exclusive_access
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, ProcessControlBlockInner> {
-        self.inner.exclusive_access()
+    pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, ProcessControlBlockInner> {
+        self.inner.lock()
     }
     /// new process from elf file
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -180,7 +179,7 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new(ProcessControlBlockInner {
+                SpinNoIrqLock::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
@@ -226,7 +225,7 @@ impl ProcessControlBlock {
         *trap_cx = TrapContext::app_init_context(
             entry_point,
             ustack_top,
-            KERNEL_SPACE.exclusive_access().token(),
+            KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
         );
@@ -336,7 +335,7 @@ impl ProcessControlBlock {
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
-            KERNEL_SPACE.exclusive_access().token(),
+            KERNEL_SPACE.lock().token(),
             task.kstack.get_top(),
             trap_handler as usize,
         );
@@ -371,7 +370,7 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             inner: unsafe {
-                UPSafeCell::new(ProcessControlBlockInner {
+                SpinNoIrqLock::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
@@ -451,7 +450,7 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             inner: unsafe {
-                UPSafeCell::new(ProcessControlBlockInner {
+                SpinNoIrqLock::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
@@ -494,12 +493,12 @@ impl ProcessControlBlock {
         *trap_cx = TrapContext::app_init_context(
             entry_point,
             ustack_top,
-            KERNEL_SPACE.exclusive_access().token(),
+            KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
         );
 
-        let mut child_inner = child.inner_exclusive_access();
+        let mut child_inner = child.inner.lock();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
@@ -514,26 +513,26 @@ impl ProcessControlBlock {
     /// map an anonymous area with given permission, return true if success
     pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
         self.inner
-            .exclusive_access()
+            .lock()
             .memory_set
             .mmap_anonymous(start, end, perm)
     }
     /// unmap an area. return true if success
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
         self.inner
-            .exclusive_access()
+            .lock()
             .memory_set
             .munmap_anonymous(start, end)
     }
 
     /// 返回当前进程用于 `mmap(NULL, ...)` 的默认起始基址。
     pub fn mmap_base(&self) -> usize {
-        self.inner.exclusive_access().vm_layout.mmap_base
+        self.inner.lock().vm_layout.mmap_base
     }
 
     /// 按目标地址调整程序 break，返回调整后的当前 break。
     pub fn set_program_brk(&self, new_brk: usize) -> usize {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         let old_brk = inner.vm_layout.brk;
         // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
         if new_brk == 0 {
@@ -584,14 +583,14 @@ impl ProcessControlBlock {
 
     /// Mark this process as running in kernel mode from `now`.
     pub fn resume_in_kernel(&self, now: usize) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         inner.accounting_state = CpuAccountingState::Kernel;
         inner.accounting_timestamp = now;
     }
 
     /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
     pub fn enter_kernel(&self, now: usize) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         match inner.accounting_state {
             CpuAccountingState::User => {
                 inner.user_time = inner
@@ -606,7 +605,7 @@ impl ProcessControlBlock {
 
     /// Account the kernel-mode slice that ended at `now`, then switch to user mode.
     pub fn enter_user(&self, now: usize) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         match inner.accounting_state {
             CpuAccountingState::Kernel => {
                 inner.kernel_time = inner
@@ -621,7 +620,7 @@ impl ProcessControlBlock {
 
     /// Flush the current running slice into the corresponding accumulator.
     pub fn pause_cpu_accounting(&self, now: usize) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner = self.inner.lock();
         match inner.accounting_state {
             CpuAccountingState::User => {
                 inner.user_time = inner
@@ -641,7 +640,7 @@ impl ProcessControlBlock {
 
     /// Snapshot process times as raw counters: (utime, stime, cutime, cstime).
     pub fn times_snapshot(&self, now: usize) -> (usize, usize, usize, usize) {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         let active_delta = now.saturating_sub(inner.accounting_timestamp);
         let (user_time, kernel_time) = match inner.accounting_state {
             CpuAccountingState::User => (

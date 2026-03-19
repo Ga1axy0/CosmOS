@@ -1,6 +1,12 @@
-//! SBI console driver, for text output
+//! Kernel console output helpers.
 use crate::{drivers::chardev::{CharDevice, UART}};
 use core::fmt::{self, Write};
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering};
+use riscv::register::sstatus;
+
+/// 串行化所有 hart 的控制台输出，避免多个 hart 同时逐字符写 UART 时互相穿插。
+static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
 
 struct Stdout;
 
@@ -14,8 +20,43 @@ impl Write for Stdout {
         Ok(())
     }
 }
+
+/// 控制台输出期间的临界区守卫。
+///
+/// 它同时负责两件事：
+/// 1. 通过全局自旋锁让多核输出按 `write_fmt` 为单位串行化；
+/// 2. 临时关闭当前 hart 的 supervisor interrupt，避免同一 hart 在输出过程中
+///    被中断后递归打印，造成自锁或进一步的字符交错。
+struct ConsoleGuard {
+    sie_was_enabled: bool,
+}
+
+impl ConsoleGuard {
+    /// 获取控制台输出锁。
+    fn lock() -> Self {
+        let sie_was_enabled = sstatus::read().sie();
+        unsafe { sstatus::clear_sie() };
+        while CONSOLE_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+        Self { sie_was_enabled }
+    }
+}
+
+impl Drop for ConsoleGuard {
+    fn drop(&mut self) {
+        CONSOLE_LOCK.store(false, Ordering::Release);
+        if self.sie_was_enabled {
+            unsafe { sstatus::set_sie() };
+        }
+    }
+}
 /// print to the host console using the format string and arguments.
 pub fn print(args: fmt::Arguments) {
+    let _guard = ConsoleGuard::lock();
     Stdout.write_fmt(args).unwrap();
 }
 

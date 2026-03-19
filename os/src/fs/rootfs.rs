@@ -38,7 +38,7 @@ use fs::errno::FS_ERRNO;
 use fs::vfs::VfsNode;
 use lazy_static::*;
 
-use crate::sync::UPSafeCell;
+use crate::sync::{SpinNoIrqLock};
 
 // ---------------------------------------------------------------------------
 // Inode-number allocator for virtual nodes
@@ -71,11 +71,11 @@ struct VirtDirInner {
 /// `overlay`, or (for write operations) delegate directly to `overlay`.
 pub struct VirtualDirNode {
     ino: u64,
-    inner: UPSafeCell<VirtDirInner>,
+    inner: SpinNoIrqLock<VirtDirInner>,
 }
 
-// SAFETY: single-processor kernel.  Kernel code is never preempted while in
-// kernel mode, so `RefCell` (inside `UPSafeCell`) never sees concurrent access.
+// SAFETY: SpinNoIrqLock now uses an atomic spinlock internally, so concurrent
+// access from multiple harts is properly serialised.
 unsafe impl Send for VirtualDirNode {}
 unsafe impl Sync for VirtualDirNode {}
 
@@ -84,7 +84,7 @@ impl VirtualDirNode {
     pub fn new() -> Arc<Self> {
         // SAFETY: single-processor guarantee documented above.
         let inner = unsafe {
-            UPSafeCell::new(VirtDirInner {
+            SpinNoIrqLock::new(VirtDirInner {
                 overlay: None,
                 mounts: BTreeMap::new(),
             })
@@ -100,7 +100,7 @@ impl VirtualDirNode {
     /// Typically called once at boot to set an ext4/fat32 root as the overlay
     /// of [`VIRT_ROOT`], making the whole on-disk tree visible at `/`.
     pub fn set_overlay(&self, node: Arc<dyn VfsNode>) {
-        self.inner.exclusive_access().overlay = Some(node);
+        self.inner.lock().overlay = Some(node);
     }
 
     /// Bind `name` → `node` as an explicit child of this directory.
@@ -109,7 +109,7 @@ impl VirtualDirNode {
     /// previous binding.
     pub fn bind(&self, name: &str, node: Arc<dyn VfsNode>) {
         self.inner
-            .exclusive_access()
+            .lock()
             .mounts
             .insert(String::from(name), node);
     }
@@ -118,7 +118,7 @@ impl VirtualDirNode {
     ///
     /// Returns `true` if the binding existed and was removed.
     pub fn unbind(&self, name: &str) -> bool {
-        self.inner.exclusive_access().mounts.remove(name).is_some()
+        self.inner.lock().mounts.remove(name).is_some()
     }
 
     /// If the overlay contains a *directory* child named `name`, return it.
@@ -126,7 +126,7 @@ impl VirtualDirNode {
     /// Used by `ensure_virtual_dir` to pre-populate the overlay of a newly
     /// created virtual sub-directory so that its contents remain reachable.
     pub(crate) fn overlay_child_dir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        let inner = self.inner.exclusive_access();
+        let inner = self.inner.lock();
         inner
             .overlay
             .as_ref()
@@ -163,7 +163,7 @@ impl VfsNode for VirtualDirNode {
     fn ls(&self) -> Vec<String> {
         // Phase 1: collect names from overlay (drop borrow before phase 2).
         let overlay_names: Vec<String> = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             match inner.overlay.as_ref() {
                 Some(ov) => ov.ls(),
                 None => Vec::new(),
@@ -172,7 +172,7 @@ impl VfsNode for VirtualDirNode {
 
         // Phase 2: add explicit mount names that the overlay doesn't list.
         let mount_keys: Vec<String> = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.mounts.keys().cloned().collect()
         };
 
@@ -192,14 +192,14 @@ impl VfsNode for VirtualDirNode {
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         // Step 1: explicit mounts take priority.
         {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             if let Some(node) = inner.mounts.get(name) {
                 return Some(Arc::clone(node));
             }
         }
         // Step 2: fall through to overlay.
         let overlay = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.clone()
         };
         overlay?.find(name)
@@ -212,7 +212,7 @@ impl VfsNode for VirtualDirNode {
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         // File creation is entirely delegated to the overlay.
         let overlay = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.clone()
         };
         overlay?.create(name)
@@ -221,7 +221,7 @@ impl VfsNode for VirtualDirNode {
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         // Prefer the overlay so the directory ends up on-disk.
         let from_overlay: Option<Arc<dyn VfsNode>> = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.as_ref().and_then(|ov| ov.mkdir(name))
         };
         if let Some(new_node) = from_overlay {
@@ -253,7 +253,7 @@ impl VfsNode for VirtualDirNode {
 
     fn link(&self, old_name: &str, new_name: &str) -> Result<(), FS_ERRNO> {
         let overlay = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.clone()
         };
         overlay.ok_or(FS_ERRNO::EPERM)?.link(old_name, new_name)
@@ -261,7 +261,7 @@ impl VfsNode for VirtualDirNode {
 
     fn link_inode(&self, child: &Arc<dyn VfsNode>, new_name: &str) -> Result<(), FS_ERRNO> {
         let overlay = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.clone()
         };
         overlay.ok_or(FS_ERRNO::EPERM)?.link_inode(child, new_name)
@@ -270,13 +270,13 @@ impl VfsNode for VirtualDirNode {
     fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
         // Refuse to unlink a live virtual mount point.
         {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             if inner.mounts.contains_key(name) {
                 return Err(FS_ERRNO::EBUSY);
             }
         }
         let overlay = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.clone()
         };
         overlay.ok_or(FS_ERRNO::EPERM)?.unlink(name)
@@ -285,13 +285,13 @@ impl VfsNode for VirtualDirNode {
     fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
         // Refuse to remove a live virtual mount point directory.
         {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             if inner.mounts.contains_key(name) {
                 return Err(FS_ERRNO::EBUSY);
             }
         }
         let overlay = {
-            let inner = self.inner.exclusive_access();
+            let inner = self.inner.lock();
             inner.overlay.clone()
         };
         overlay.ok_or(FS_ERRNO::EPERM)?.rmdir(name)

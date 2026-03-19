@@ -3,7 +3,7 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE};
-use crate::sync::UPSafeCell;
+use crate::sync::{SpinNoIrqLock};
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -47,11 +47,9 @@ impl RecycleAllocator {
 
 lazy_static! {
     /// Glocal allocator for pid
-    static ref PID_ALLOCATOR: UPSafeCell<RecycleAllocator> =
-        unsafe { UPSafeCell::new(RecycleAllocator::new()) };
+    static ref PID_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
     /// Global allocator for kernel stack
-    static ref KSTACK_ALLOCATOR: UPSafeCell<RecycleAllocator> =
-        unsafe { UPSafeCell::new(RecycleAllocator::new()) };
+    static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
 }
 
 /// The idle task's pid is 0
@@ -62,13 +60,13 @@ pub struct PidHandle(pub usize);
 
 /// Allocate a pid for a process
 pub fn pid_alloc() -> PidHandle {
-    PidHandle(PID_ALLOCATOR.exclusive_access().alloc())
+    PidHandle(PID_ALLOCATOR.lock().alloc())
 }
 
 impl Drop for PidHandle {
     fn drop(&mut self) {
         // trace!("drop pid {}", self.0);
-        PID_ALLOCATOR.exclusive_access().dealloc(self.0);
+        PID_ALLOCATOR.lock().dealloc(self.0);
     }
 }
 
@@ -84,9 +82,9 @@ pub struct KernelStack(pub usize);
 
 /// Allocate a kernel stack for a task
 pub fn kstack_alloc() -> KernelStack {
-    let kstack_id = KSTACK_ALLOCATOR.exclusive_access().alloc();
+    let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    KERNEL_SPACE.exclusive_access().insert_framed_area(
+    KERNEL_SPACE.lock().insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
@@ -99,9 +97,9 @@ impl Drop for KernelStack {
         let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         KERNEL_SPACE
-            .exclusive_access()
+            .lock()
             .remove_vma_with_start_vpn(kernel_stack_bottom_va.into());
-        KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
+        KSTACK_ALLOCATOR.lock().dealloc(self.0);
     }
 }
 
