@@ -109,7 +109,7 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     let process = current_process();
     let tid = current_tid();
     // Retrieve (and optionally deadlock-check) while holding inner, then drop before blocking.
-    let mutex = {
+    let mutex: Arc<dyn Mutex> = {
         let mut process_inner = process.inner_exclusive_access();
         let mutex = match process_inner
             .mutex_list
@@ -146,7 +146,7 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
     );
     let process = current_process();
     let tid = current_tid();
-    let mutex = {
+    let mutex: Arc<dyn Mutex> = {
         let process_inner = process.inner_exclusive_access();
         match process_inner
             .mutex_list
@@ -210,7 +210,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
     );
     let process = current_process();
     let tid = current_tid();
-    let sem = {
+    let sem: Arc<Semaphore> = {
         let process_inner = process.inner_exclusive_access();
         match process_inner
             .semaphore_list
@@ -241,7 +241,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     );
     let process = current_process();
     let tid = current_tid();
-    let sem = {
+    let sem: Arc<Semaphore> = {
         let mut process_inner = process.inner_exclusive_access();
         let sem = match process_inner
             .semaphore_list

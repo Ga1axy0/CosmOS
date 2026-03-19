@@ -15,11 +15,10 @@
 mod context;
 
 use crate::config::TRAMPOLINE;
+use crate::hart::hartid;
 use crate::syscall::syscall;
 use crate::task::{
-    check_fatal_signals_of_current, current_add_signal, current_process, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
-    suspend_current_and_run_next, ExitReason, SignalFlags,
+    ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token, exit_current_and_run_next, suspend_current_and_run_next
 };
 use crate::timer::{check_timer, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -31,12 +30,21 @@ use riscv::register::{
 
 global_asm!(include_str!("trap.S"));
 
-/// Initialize trap handling
+/// 初始化当前 hart 的 trap 相关状态。
+///
+/// 该函数需要每个 hart 各自执行一次，用于安装本 hart 的内核 trap 入口，
+/// 并开启 supervisor external interrupt。
 pub fn init() {
+    init_hart()
+}
+
+/// 初始化当前 hart 的 trap 相关状态。
+pub fn init_hart() {
     set_kernel_trap_entry();
     unsafe {
         sie::set_sext();
     }
+    info!("hart {} trap init done", hartid());
 }
 /// set trap entry for traps happen in kernel(supervisor) mode
 pub fn set_kernel_trap_entry() {
@@ -54,10 +62,29 @@ pub fn set_user_trap_entry() {
     }
 }
 
-/// enable timer interrupt in supervisor mode
+/// 为当前 hart 开启 supervisor timer interrupt。
 pub fn enable_timer_interrupt() {
     unsafe {
         sie::set_stimer();
+    }
+}
+
+/// 为当前 hart 关闭 supervisor timer interrupt。
+///
+/// 这用于 secondary hart 进入“纯 idle 占位”状态的场景，避免它在尚未完成
+/// 全局共享状态并发化之前，进入会访问共享 `UPSafeCell` 的 timer 路径。
+pub fn disable_timer_interrupt() {
+    unsafe {
+        sie::clear_stimer();
+    }
+}
+
+/// 为当前 hart 关闭 supervisor external interrupt。
+///
+/// 这用于 secondary hart 暂时只作为已上线但不参与设备中断处理的 idle hart。
+pub fn disable_external_interrupt() {
+    unsafe {
+        sie::clear_sext();
     }
 }
 
@@ -101,6 +128,7 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
@@ -122,6 +150,11 @@ pub fn trap_handler() -> ! {
         trace!("[kernel] trap_handler: .. check signals {}", msg);
         exit_current_and_run_next(ExitReason::Signal(signum as u32));
     }
+    if current_process_is_zombie() {
+        trace!("[kernel] trap_handler: .. current process is zombie");
+        // 非主进程才会进入这个分支，此时退出的reason是不重要的。
+        exit_current_and_run_next(ExitReason::Exit(0));
+    }
     trap_return();
 }
 
@@ -131,6 +164,7 @@ pub fn trap_return() -> ! {
     //disable_supervisor_interrupt();
     set_user_trap_entry();
     let trap_cx_user_va = current_trap_cx_user_va();
+    current_trap_cx().kernel_hartid = hartid();
     let user_satp = current_user_token();
     extern "C" {
         fn __alltraps();
@@ -145,7 +179,7 @@ pub fn trap_return() -> ! {
             "jr {restore_va}",         // jump to new addr of __restore asm function
             restore_va = in(reg) restore_va,
             in("a0") trap_cx_user_va,      // a0 = virt addr of Trap Context
-            in("a1") user_satp,        // a1 = phy addr of usr page table
+            in("a1") user_satp,        // a1 = user satp token
             options(noreturn)
         );
     }
@@ -168,6 +202,7 @@ pub fn trap_from_kernel() {
             // crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
             // crate::net::poll();
