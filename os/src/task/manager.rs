@@ -117,6 +117,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     trace!("kernel: TaskManager::wakeup_task");
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Ready;
+    task_inner.wait_reason = None;
     drop(task_inner);
     // Put on global queue so that any idle hart can pick it up quickly.
     add_task_global(task);

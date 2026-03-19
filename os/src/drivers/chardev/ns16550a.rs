@@ -3,7 +3,8 @@ use core::marker::PhantomData;
 
 use bitflags::bitflags;
 
-use crate::sync::{Condvar, SpinNoIrqLock};
+use crate::sync::SpinNoIrqLock;
+use crate::task::{WaitQueue, WaitReason};
 
 use super::{set_uart_ready, CharDevice};
 
@@ -134,7 +135,7 @@ struct WriteEnd {
 pub struct NS16550a<const BASE_ADDR: usize> {
    pub(crate) inner: SpinNoIrqLock<NS16550aInner>,
    #[allow(dead_code)]
-   pub(crate) condvar: Condvar,
+   pub(crate) rx_wait_queue: WaitQueue,
 }
 
 pub(crate) struct NS16550aInner {
@@ -188,7 +189,7 @@ impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
       inner.ns16550a.init();
       let device = Self {
             inner: unsafe { SpinNoIrqLock::new(inner) },
-            condvar: Condvar::new(),
+         rx_wait_queue: WaitQueue::new(),
       };
       set_uart_ready();
       device
@@ -226,7 +227,7 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
          drop(inner);
 
          // No data: block current task until UART IRQ pushes data and signals.
-         self.condvar.wait_simple();
+         self.rx_wait_queue.wait_with_reason(WaitReason::UartRx);
       }
    }
 
@@ -239,9 +240,7 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
       }
       drop(inner);
       if pushed {
-         // NOTE: 当前 Condvar::signal 不要求持有互斥锁。
-         // 这里主要用于“把睡眠任务唤醒”这一语义。
-         self.condvar.signal();
+         self.rx_wait_queue.wake_one();
       }
    }
 }

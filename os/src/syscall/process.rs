@@ -8,6 +8,7 @@ use crate::{
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
         pid2process, suspend_current_and_run_next, ExitReason, SignalAction, SignalFlags,
+        WaitReason,
     },
 };
 
@@ -200,9 +201,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             // 4) 阻塞等待；这里必须先释放 inner，再睡眠
             drop(inner);
 
-            // 按你仓库 Condvar 的实际 API 替换这一行：
-            // 例如可能是 wait() / wait_no_sched() / wait_with_mutex(...)
-            process.wait_exit_condvar.wait_simple();
+            process.wait_exit_queue.wait_with_reason(WaitReason::ProcessWaitExit);
         }
     })
 }
