@@ -128,7 +128,7 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            trace!("hart {} timer tick", hartid());
+            // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
@@ -202,7 +202,7 @@ pub fn trap_from_kernel() {
             // crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
-            trace!("hart {} timer tick", hartid());
+            // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
             // crate::net::poll();
