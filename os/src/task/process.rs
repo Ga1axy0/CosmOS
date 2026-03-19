@@ -5,6 +5,7 @@ use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
+use super::WaitQueue;
 use crate::fs::{new_stdio_files, File};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
@@ -28,7 +29,7 @@ pub struct ProcessControlBlock {
     pub pid: PidHandle,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
-    pub wait_exit_condvar: Arc<Condvar>,
+    pub wait_exit_queue: Arc<WaitQueue>,
 }
 
 /// Inner of Process Control Block
@@ -208,7 +209,7 @@ impl ProcessControlBlock {
                     robust_list: RobustList { head: 0, len: 0 },
                 })
             },
-            wait_exit_condvar: Arc::new(Condvar::new()),
+            wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = Arc::new(TaskControlBlock::new(
@@ -399,7 +400,7 @@ impl ProcessControlBlock {
                     robust_list: RobustList { head: 0, len: 0 },
                 })
             },
-            wait_exit_condvar: Arc::new(Condvar::new())
+            wait_exit_queue: Arc::new(WaitQueue::new())
         });
         // add child
         parent.children.push(Arc::clone(&child));
@@ -479,7 +480,7 @@ impl ProcessControlBlock {
                     robust_list: RobustList { head: 0, len: 0 },
                 })
             },
-            wait_exit_condvar: Arc::new(Condvar::new())
+            wait_exit_queue: Arc::new(WaitQueue::new())
         });
         parent.children.push(Arc::clone(&child));
         drop(parent);

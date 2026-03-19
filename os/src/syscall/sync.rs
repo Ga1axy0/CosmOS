@@ -1,7 +1,9 @@
 use crate::mm::translated_refmut;
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::syscall_body;
-use crate::task::{block_current_and_run_next, current_process, current_task, current_user_token};
+use crate::task::{
+    WaitReason, block_current_and_run_next, current_process, current_task, current_user_token
+};
 use crate::timer::{add_timer, get_time_ms};
 use crate::syscall::errno::{ERRNO, OrErrno};
 use alloc::sync::Arc;
@@ -42,6 +44,7 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
     
     let token = current_user_token();
     syscall_body!({
+        let _ = rem;
         let timespec = translated_refmut(token, req as *mut Timespec).or_errno(ERRNO::EFAULT)?;
         let current_time = get_time_ms();
         let expire_ms = current_time + timespec.tv_sec * 1_000 + timespec.tv_nsec / 1_000_000;
@@ -52,7 +55,7 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
         );
         let task = current_task().unwrap();
         add_timer(expire_ms, task);
-        block_current_and_run_next();
+        block_current_and_run_next(WaitReason::Nanosleep);
         Ok(0)
     })
 }

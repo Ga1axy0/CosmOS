@@ -1,7 +1,7 @@
 //! Semaphore
 
 use crate::sync::SpinNoIrqLock;
-use crate::task::{block_current_and_run_next, current_task, wakeup_task, TaskControlBlock};
+use crate::task::{TaskControlBlock, WaitReason, block_current_and_run_next, current_task, wakeup_task};
 use alloc::{collections::VecDeque, sync::Arc};
 
 /// semaphore structure
@@ -47,7 +47,7 @@ impl Semaphore {
         if inner.count < 0 {
             inner.wait_queue.push_back(current_task().unwrap());
             drop(inner);
-            block_current_and_run_next();
+            block_current_and_run_next(WaitReason::Semaphore);
         }
     }
 }

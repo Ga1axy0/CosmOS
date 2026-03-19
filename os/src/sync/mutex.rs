@@ -1,7 +1,7 @@
 //! Mutex (spin-like and blocking(sleep))
 
 use super::SpinNoIrqLock;
-use crate::task::TaskControlBlock;
+use crate::task::{TaskControlBlock, WaitReason};
 use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
 use crate::task::{current_task, wakeup_task};
 use alloc::{collections::VecDeque, sync::Arc};
@@ -83,7 +83,7 @@ impl Mutex for MutexBlocking {
         if mutex_inner.locked {
             mutex_inner.wait_queue.push_back(current_task().unwrap());
             drop(mutex_inner);
-            block_current_and_run_next();
+            block_current_and_run_next(WaitReason::Mutex);
         } else {
             mutex_inner.locked = true;
         }
