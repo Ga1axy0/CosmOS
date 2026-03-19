@@ -1,6 +1,7 @@
 .*/*
 .merge_chain_state
 !.github/*
+!.devcontainer/*
 !.vscode/settings.json
 .idea/*
 os/target/*
