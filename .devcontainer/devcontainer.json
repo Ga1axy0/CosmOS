@@ -1,0 +1,6 @@
+{
+  "name": "cosmOS CI Dev",
+  "image": "ghcr.io/ga1axy0/os-ci:latest",
+  "runArgs": ["--privileged"],  // 如果需要 QEMU 或内核相关特权
+  "postCreateCommand": "rustup default nightly"
+}
