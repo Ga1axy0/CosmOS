@@ -18,6 +18,10 @@ lazy_static! {
     /// Must be populated by [`probe_block_devices`] before any FS initialisation.
     pub static ref BLOCK_DEVICES: SpinNoIrqLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
         unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+
+        /// VirtIO MMIO IRQ to block device mapping.
+        pub static ref BLOCK_DEVICES_BY_IRQ: SpinNoIrqLock<BTreeMap<u32, Arc<VirtIOBlock>>> =
+        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
 }
 
 /// Scan the VirtIO MMIO bus slots and register every block device found.
@@ -31,8 +35,10 @@ pub fn probe_block_devices() {
     const VIRTIO_MMIO_BASE:   usize = 0x1000_1000;
     const VIRTIO_MMIO_STRIDE: usize = 0x1000;
     const VIRTIO_MMIO_SLOTS:  usize = 8;
+    const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
 
     let mut map = BLOCK_DEVICES.lock();
+    let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut idx = 0usize;
     for slot in 0..VIRTIO_MMIO_SLOTS {
         let addr = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
@@ -47,6 +53,7 @@ pub fn probe_block_devices() {
         }
 
         if let Some(dev) = VirtIOBlock::try_new(addr) {
+            let dev = Arc::new(dev);
             // let name = alloc::format!("vd{}", (b'a' + idx as u8) as char);
             let name = if idx > 0 {
                 alloc::format!("vda{}", (idx + 1))
@@ -54,12 +61,20 @@ pub fn probe_block_devices() {
                 "vda".into()
             };
             debug!("[kernel] block device {} idx {} at {:#x}", name, idx, addr);
-            map.insert(name, Arc::new(dev));
+            map.insert(name, dev.clone());
+            irq_map.insert(VIRTIO_MMIO_IRQ_BASE + slot as u32, dev);
             idx += 1;
         }
     }
     if idx == 0 {
         panic!("[kernel] no VirtIO block devices found");
+    }
+}
+
+/// Handle one virtio-mmio IRQ for block devices.
+pub fn handle_irq(irq: u32) {
+    if let Some(dev) = BLOCK_DEVICES_BY_IRQ.lock().get(&irq).cloned() {
+        dev.handle_irq();
     }
 }
 

@@ -44,7 +44,7 @@ pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use wait_queue::WaitQueue;
+pub use wait_queue::{WaitQueue, WaitQueueKeyed};
 pub use process::ExitReason;
 pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus, WaitReason};

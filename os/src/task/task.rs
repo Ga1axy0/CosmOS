@@ -105,6 +105,8 @@ pub enum WaitReason {
     PipeWritable,
     /// Waiting for nanosleep timer expiration.
     Nanosleep,
+    /// Waiting for block device I/O completion.
+    BlockDeviceIo,
 }
 
 #[derive(Copy, Clone, PartialEq)]
