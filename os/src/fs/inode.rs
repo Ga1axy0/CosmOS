@@ -46,7 +46,7 @@ impl OSInode {
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
         let mut inner = self.inner.lock();
-        let mut buffer: Vec<u8> = alloc::vec![0; 512];
+        let mut buffer: Vec<u8> = alloc::vec![0; 8192];
         let mut v: Vec<u8> = Vec::new();
         loop {
             let len = inner.inode.read_at(inner.offset, &mut buffer);
@@ -54,6 +54,7 @@ impl OSInode {
                 break;
             }
             inner.offset += len;
+            trace!("OSInode::read_all: read {} bytes, offset now {}", len, inner.offset);
             v.extend_from_slice(&buffer[..len]);
         }
         v
