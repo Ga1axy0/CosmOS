@@ -119,12 +119,14 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
     let mut task_inner = task.inner_exclusive_access();
     let should_enqueue = match task_inner.task_status {
         TaskStatus::Blocked => {
+            // debug!("b");
             task_inner.task_status = TaskStatus::Ready;
             task_inner.wait_reason = None;
             task_inner.wake_pending = false;
             true
         }
         TaskStatus::PreBlocked => {
+            // debug!("p");
             // Wakeup wins race before blocker switches out.
             task_inner.wake_pending = true;
             false
