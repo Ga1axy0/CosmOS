@@ -126,8 +126,12 @@ pub fn check_timer() {
     let mut timers = TIMERS.lock();
     while let Some(timer) = timers.peek() {
         if timer.expire_ms <= current_ms {
-            wakeup_task(Arc::clone(&timer.task));
-            timers.pop();
+            // hart A 将任务入堆但还没标为 Blocked (即目前是 Running)，此时 timer 已经过期，被 hart B 检查。 
+            // 此时唤醒不成功，但仍然要保留 timer。
+            // 这种情形应该较少，且最多损失一个时间片，是可以接受的。
+            if wakeup_task(Arc::clone(&timer.task)) {
+                timers.pop();
+            }
         } else {
             break;
         }
