@@ -120,6 +120,21 @@ where
 
     /// Enqueue current task with a selected key and block with a specific reason.
     pub fn wait_selected_with_reason(&self, key: T, reason: WaitReason) {
+        self.wait_selected_with_reason_or_skip(key, reason, || false);
+    }
+
+    /// Enqueue current task with a selected key and block, unless `should_skip`
+    /// reports the awaited condition is already satisfied after enqueue.
+    ///
+    /// This closes the common lost-wakeup window:
+    ///
+    /// 1) waiter checks condition (not ready)
+    /// 2) waker signals before waiter is fully asleep
+    /// 3) waiter sleeps forever
+    pub fn wait_selected_with_reason_or_skip<F>(&self, key: T, reason: WaitReason, should_skip: F)
+    where
+        F: FnOnce() -> bool,
+    {
         let task = current_task().unwrap();
         {
             let mut task_inner = task.inner_exclusive_access();
@@ -131,6 +146,22 @@ where
         let replaced = self.waiters.lock().insert(key, task);
         debug_assert!(replaced.is_none(), "duplicate wait key");
         self.queue.lock().push_back(key);
+
+        // Re-check condition after enqueueing ourselves. If already ready,
+        // cancel the sleep transition and keep running on this hart.
+        if should_skip() {
+            self.waiters.lock().remove(&key);
+            if let Some(task) = current_task() {
+                let mut task_inner = task.inner_exclusive_access();
+                if matches!(task_inner.task_status, TaskStatus::PreBlocked) {
+                    task_inner.task_status = TaskStatus::Running;
+                    task_inner.wait_reason = None;
+                    task_inner.wake_pending = false;
+                }
+            }
+            return;
+        }
+
         block_current_preblocked_and_run_next();
     }
 

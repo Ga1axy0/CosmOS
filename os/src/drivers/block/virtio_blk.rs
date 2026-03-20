@@ -96,7 +96,9 @@ impl VirtIOBlock {
             }
             if current_task().is_some() {
                 self.wait_queue
-                    .wait_selected_with_reason(token, WaitReason::BlockDeviceIo);
+                    .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
+                        self.take_completed_token(token)
+                    });
                 return;
             }
 
@@ -125,6 +127,7 @@ impl VirtIOBlock {
             }
             completed.push_back(token);
         }
+        debug!("Length of completed queue: {}", completed.len());
     }
 
     /// Called from external interrupt path for this block device.
