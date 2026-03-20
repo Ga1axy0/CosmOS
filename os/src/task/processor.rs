@@ -46,6 +46,10 @@ impl Processor {
     pub fn current(&self) -> Option<Arc<TaskControlBlock>> {
         self.current.as_ref().map(Arc::clone)
     }
+
+    pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
+        self.current = Some(task);
+    }
 }
 
 lazy_static! {
@@ -87,6 +91,7 @@ pub fn run_tasks() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
+            task_inner.wake_pending = false;
             drop(task_inner);
 
             processor.current = Some(task);
@@ -122,6 +127,14 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 /// Get a copy of the current task
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     current_processor().lock().current()
+}
+
+/// Restore the current running task without context switching.
+///
+/// Used by PreBlocked fast path when a wakeup wins the race before the
+/// blocker has switched out on this hart.
+pub fn restore_current_task(task: Arc<TaskControlBlock>) {
+    current_processor().lock().set_current(task);
 }
 
 /// get current process

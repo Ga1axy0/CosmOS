@@ -41,6 +41,8 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// Why this task is blocked (if blocked by a sleep queue/event).
     pub wait_reason: Option<WaitReason>,
+    /// Wakeup arrived before task fully transitioned from running to blocked.
+    pub wake_pending: bool,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
 }
@@ -77,6 +79,7 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     wait_reason: None,
+                    wake_pending: false,
                     exit_code: None,
                 })
             },
@@ -114,6 +117,8 @@ pub enum WaitReason {
 pub enum TaskStatus {
     /// 已在本地 hart 上切出，等待转入真正可运行队列
     PreReady,
+    /// 已加入等待队列，等待当前 hart 完成真正切出后进入 Blocked
+    PreBlocked,
     /// ready to run
     Ready,
     /// running
