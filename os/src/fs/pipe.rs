@@ -146,6 +146,7 @@ impl File for Pipe {
                     }
                     already_read += 1;
                     if already_read == want_to_read {
+                        ring_buffer.write_wait_queue.wake_one();
                         return want_to_read;
                     }
                 } else {
