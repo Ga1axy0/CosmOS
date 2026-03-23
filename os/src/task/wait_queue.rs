@@ -144,7 +144,7 @@ where
             task_inner.wake_pending = false;
         }
         let replaced = self.waiters.lock().insert(key, task);
-        debug_assert!(replaced.is_none(), "duplicate wait key");
+        assert!(replaced.is_none(), "duplicate wait key");
         self.queue.lock().push_back(key);
 
         // Re-check condition after enqueueing ourselves. If already ready,
