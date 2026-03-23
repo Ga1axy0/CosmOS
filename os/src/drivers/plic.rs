@@ -110,16 +110,11 @@ pub fn handle_supervisor_external_hart(hart_id: usize) {
         UART0_IRQ => {
             UART.handle_irq();
         }
-        /*  Not supported yet.
-
         irq if (VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT))
             .contains(&irq) =>
         {
-            // Dispatch to virtio devices (net, blk, etc.).
-            crate::drivers::net::handle_irq(irq);
-            crate::net::notify_irq();
+            crate::drivers::block::handle_irq(irq);
         }
-        */
         0 => {
             // spurious
         }

@@ -1,18 +1,17 @@
 //! Semaphore
 
 use crate::sync::SpinNoIrqLock;
-use crate::task::{block_current_and_run_next, current_task, wakeup_task, TaskControlBlock};
-use alloc::{collections::VecDeque, sync::Arc};
+use crate::task::{WaitQueue, WaitReason};
 
 /// semaphore structure
 pub struct Semaphore {
     /// semaphore inner
     pub inner: SpinNoIrqLock<SemaphoreInner>,
+    wait_queue: WaitQueue,
 }
 
 pub struct SemaphoreInner {
     pub count: isize,
-    pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl Semaphore {
@@ -22,8 +21,8 @@ impl Semaphore {
         Self {
             inner: SpinNoIrqLock::new(SemaphoreInner {
                 count: res_count as isize,
-                wait_queue: VecDeque::new(),
             }),
+            wait_queue: WaitQueue::new(),
         }
     }
 
@@ -32,22 +31,22 @@ impl Semaphore {
         trace!("kernel: Semaphore::up");
         let mut inner = self.inner.lock();
         inner.count += 1;
-        if inner.count <= 0 {
-            if let Some(task) = inner.wait_queue.pop_front() {
-                wakeup_task(task);
-            }
-        }
+        drop(inner);
+        self.wait_queue.wake_one();
     }
 
     /// down operation of semaphore
     pub fn down(&self) {
         trace!("kernel: Semaphore::down");
-        let mut inner = self.inner.lock();
-        inner.count -= 1;
-        if inner.count < 0 {
-            inner.wait_queue.push_back(current_task().unwrap());
+        loop {
+            let mut inner = self.inner.lock();
+            if inner.count > 0 {
+                inner.count -= 1;
+                return;
+            }
             drop(inner);
-            block_current_and_run_next();
+            self.wait_queue
+                .wait_with_reason_or_skip(WaitReason::Semaphore, || self.inner.lock().count > 0);
         }
     }
 }
