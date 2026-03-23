@@ -222,6 +222,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_GETUID => sys_getuid(),
+        SYSCALL_GETEUID => sys_geteuid(),
+        SYSCALL_GETGID => sys_getgid(),
+        SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXECVE => sys_execve(
@@ -259,18 +263,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
 
 /// Syscalls that are invalid or not implemented yet
 fn sys_nisyscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    syscall_body!({
-        match syscall_id {
-            SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => {
-                warn!(
-                    "kernel: syscall {} is not implemented yet", syscall_id
-                );
-                Ok(0)
-            },
-            _ => {
-                error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
-                Err(ERRNO::ENOSYS)
-            },
-        }
+    syscall_body!({  
+        error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
+        Err(ERRNO::ENOSYS)
     })
 }

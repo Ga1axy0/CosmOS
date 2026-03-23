@@ -62,6 +62,34 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+/// getuid syscall
+pub fn sys_getuid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getuid pid:{}", process.getpid());
+    process.getuid() as isize
+}
+
+/// geteuid syscall
+pub fn sys_geteuid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_geteuid pid:{}", process.getpid());
+    process.geteuid() as isize
+}
+
+/// getgid syscall
+pub fn sys_getgid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getgid pid:{}", process.getpid());
+    process.getgid() as isize
+}
+
+/// getegid syscall
+pub fn sys_getegid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getegid pid:{}", process.getpid());
+    process.getegid() as isize
+}
+
 /// fork child process syscall
 pub fn sys_fork() -> isize {
     trace!(
