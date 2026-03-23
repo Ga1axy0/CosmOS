@@ -113,13 +113,32 @@ pub fn add_task_global(task: Arc<TaskControlBlock>) {
 }
 
 /// Wake up a task by marking it `Ready` and placing it on the global queue.
-pub fn wakeup_task(task: Arc<TaskControlBlock>) {
+/// Returns `true` if the task was successfully woken up, otherwise `false`.
+pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
     trace!("kernel: TaskManager::wakeup_task");
     let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Ready;
+    let should_enqueue = match task_inner.task_status {
+        TaskStatus::Blocked => {
+            // debug!("b");
+            task_inner.task_status = TaskStatus::Ready;
+            task_inner.wait_reason = None;
+            task_inner.wake_pending = false;
+            true
+        }
+        TaskStatus::PreBlocked => {
+            // debug!("p");
+            // Wakeup wins race before blocker switches out.
+            task_inner.wake_pending = true;
+            false
+        }
+        TaskStatus::Ready | TaskStatus::Running | TaskStatus::PreReady => false,
+    };
     drop(task_inner);
-    // Put on global queue so that any idle hart can pick it up quickly.
-    add_task_global(task);
+    if should_enqueue {
+        // Put on global queue so that any idle hart can pick it up quickly.
+        add_task_global(task);
+    }
+    should_enqueue
 }
 
 /// Remove a task from **all** queues (local + global).

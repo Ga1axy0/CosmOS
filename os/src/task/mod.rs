@@ -17,6 +17,7 @@ mod process;
 mod processor;
 mod signal;
 mod switch;
+mod wait_queue;
 #[allow(clippy::module_inception)]
 mod task;
 
@@ -41,11 +42,13 @@ pub use manager::{
 pub use action::{SignalAction, SignalActions};
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
+    current_trap_cx_user_va, current_user_token, restore_current_task, run_tasks, schedule,
+    take_current_task,
 };
+pub use wait_queue::{WaitQueue, WaitQueueKeyed};
 pub use process::ExitReason;
 pub use signal::{SignalFlags, MAX_SIG};
-pub use task::{TaskControlBlock, TaskStatus};
+pub use task::{TaskControlBlock, TaskStatus, WaitReason};
 
 /// Make current task suspended and switch to the next task
 pub fn suspend_current_and_run_next() {
@@ -68,13 +71,44 @@ pub fn suspend_current_and_run_next() {
 }
 
 /// Make current task blocked and switch to the next task.
-pub fn block_current_and_run_next() {
-    current_process().pause_cpu_accounting(get_time());
+pub fn block_current_and_run_next(reason: WaitReason) {
     let task = take_current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     task_inner.task_status = TaskStatus::Blocked;
+    task_inner.wait_reason = Some(reason);
+    task_inner.wake_pending = false;
     drop(task_inner);
+    process.pause_cpu_accounting(get_time());
+    schedule(task_cx_ptr);
+}
+
+/// Complete transition from `PreBlocked` to `Blocked` and switch out current task.
+///
+/// If a wakeup arrives before the context switch happens, the task remains
+/// running on current hart and this function returns without scheduling away.
+pub fn block_current_preblocked_and_run_next() {
+    let task = take_current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let task_cx_ptr: *mut TaskContext;
+    {
+        let mut task_inner = task.inner_exclusive_access();
+        task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+        debug_assert!(matches!(task_inner.task_status, TaskStatus::PreBlocked));
+        
+        if task_inner.wake_pending {
+            task_inner.task_status = TaskStatus::Running;
+            task_inner.wait_reason = None;
+            task_inner.wake_pending = false;
+            drop(task_inner);
+            restore_current_task(task);
+            return;
+        }
+        
+        task_inner.task_status = TaskStatus::Blocked;
+    }
+    process.pause_cpu_accounting(get_time());
     schedule(task_cx_ptr);
 }
 
@@ -82,7 +116,7 @@ use crate::board::QEMUExit;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(reason: ExitReason) {
-    let exit_reason = reason.into();
+    let exit_reason = reason;
     let task_exit_code = match exit_reason {
         ExitReason::Exit(code) => code,
         ExitReason::Signal(signum) => -(signum as i32),
@@ -180,7 +214,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let parent_weak = process_inner.parent.clone();
         
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
-            parent.wait_exit_condvar.signal();
+            parent.wait_exit_queue.wake_one();
         }
     } else {
         let mut process_inner = process.inner_exclusive_access();

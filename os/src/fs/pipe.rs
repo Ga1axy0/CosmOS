@@ -3,8 +3,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use alloc::sync::{Arc, Weak};
 use crate::fs::{Stat,StatMode}; 
-
-use crate::task::suspend_current_and_run_next;
+use crate::task::{WaitQueue, WaitReason};
 
 /// IPC pipe
 pub struct Pipe {
@@ -47,6 +46,8 @@ pub struct PipeRingBuffer {
     tail: usize,
     status: RingBufferStatus,
     write_end: Option<Weak<Pipe>>,
+    read_wait_queue: Arc<WaitQueue>,
+    write_wait_queue: Arc<WaitQueue>,
 }
 
 impl PipeRingBuffer {
@@ -57,6 +58,8 @@ impl PipeRingBuffer {
             tail: 0,
             status: RingBufferStatus::Empty,
             write_end: None,
+            read_wait_queue: Arc::new(WaitQueue::new()),
+            write_wait_queue: Arc::new(WaitQueue::new()),
         }
     }
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
@@ -131,8 +134,12 @@ impl File for Pipe {
                 if ring_buffer.all_write_ends_closed() {
                     return already_read;
                 }
+                let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
                 drop(ring_buffer);
-                suspend_current_and_run_next();
+                read_wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
+                    let ring_buffer = self.buffer.lock();
+                    ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
+                });
                 continue;
             }
             for _ in 0..loop_read {
@@ -142,12 +149,15 @@ impl File for Pipe {
                     }
                     already_read += 1;
                     if already_read == want_to_read {
+                        ring_buffer.write_wait_queue.wake_one();
                         return want_to_read;
                     }
                 } else {
+                    ring_buffer.write_wait_queue.wake_one();
                     return already_read;
                 }
             }
+            ring_buffer.write_wait_queue.wake_one();
         }
     }
     fn write(&self, buf: UserBuffer) -> usize {
@@ -161,8 +171,11 @@ impl File for Pipe {
             let loop_write = ring_buffer.available_write();
             debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
             if loop_write == 0 {
+                let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);
-                suspend_current_and_run_next();
+                write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
+                    self.buffer.lock().available_write() > 0
+                });
                 continue;
             }
             // write at most loop_write bytes
@@ -171,12 +184,15 @@ impl File for Pipe {
                     ring_buffer.write_byte(unsafe { *byte_ref });
                     already_write += 1;
                     if already_write == want_to_write {
+                        ring_buffer.read_wait_queue.wake_one();
                         return want_to_write;
                     }
                 } else {
+                    ring_buffer.read_wait_queue.wake_one();
                     return already_write;
                 }
             }
+            ring_buffer.read_wait_queue.wake_one();
         }
     }
     fn stat(&self) -> Stat {
