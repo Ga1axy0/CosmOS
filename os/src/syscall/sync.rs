@@ -1,6 +1,7 @@
 use crate::mm::translated_refmut;
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::syscall_body;
+use crate::syscall::times::Timespec;
 use crate::task::{
     WaitReason, block_current_and_run_next, current_process, current_task, current_user_token
 };
@@ -18,13 +19,6 @@ fn current_tid() -> usize {
         .as_ref()
         .unwrap()
         .tid
-}
-
-/// UtsName struct for uname syscall
-#[repr(C)]
-pub struct Timespec {
-    tv_sec: usize,
-    tv_nsec: usize,
 }
 
 /// sleep syscall
