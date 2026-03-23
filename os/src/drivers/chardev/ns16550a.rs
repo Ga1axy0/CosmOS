@@ -227,7 +227,18 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
          drop(inner);
 
          // No data: block current task until UART IRQ pushes data and signals.
-         self.rx_wait_queue.wait_with_reason(WaitReason::UartRx);
+         self.rx_wait_queue
+            .wait_with_reason_or_skip(WaitReason::UartRx, || {
+               let mut inner = self.inner.lock();
+               if !inner.read_buffer.is_empty() {
+                  return true;
+               }
+               if let Some(ch) = inner.ns16550a.try_read() {
+                  inner.read_buffer.push_back(ch);
+                  return true;
+               }
+               false
+            });
       }
    }
 
