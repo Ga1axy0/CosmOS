@@ -140,7 +140,7 @@ pub fn init() {
     drop(rtc);
     RTC_READY.store(true, Ordering::Release);
     info!(
-        "rtc init done, realtime = {}.{} s",
+        "rtc init done, realtime = {}.{:09} s",
         time_ns / 1_000_000_000,
         time_ns % 1_000_000_000
     );

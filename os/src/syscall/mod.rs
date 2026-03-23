@@ -58,6 +58,8 @@ pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
+/// clock_gettime syscall
+pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// yield syscall
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
@@ -218,6 +220,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
+        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
