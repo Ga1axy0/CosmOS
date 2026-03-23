@@ -136,7 +136,10 @@ impl File for Pipe {
                 }
                 let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
                 drop(ring_buffer);
-                read_wait_queue.wait_with_reason(WaitReason::PipeReadable);
+                read_wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
+                    let ring_buffer = self.buffer.lock();
+                    ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
+                });
                 continue;
             }
             for _ in 0..loop_read {
@@ -170,7 +173,9 @@ impl File for Pipe {
             if loop_write == 0 {
                 let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);
-                write_wait_queue.wait_with_reason(WaitReason::PipeWritable);
+                write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
+                    self.buffer.lock().available_write() > 0
+                });
                 continue;
             }
             // write at most loop_write bytes

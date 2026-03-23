@@ -201,7 +201,20 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             // 4) 阻塞等待；这里必须先释放 inner，再睡眠
             drop(inner);
 
-            process.wait_exit_queue.wait_with_reason(WaitReason::ProcessWaitExit);
+            process
+                .wait_exit_queue
+                .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
+                    let inner = process.inner_exclusive_access();
+                    let has_target_child = inner
+                        .children
+                        .iter()
+                        .any(|p| pid == -1 || pid as usize == p.getpid());
+                    let has_target_zombie = inner.children.iter().any(|p| {
+                        let p_inner = p.inner_exclusive_access();
+                        p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+                    });
+                    !has_target_child || has_target_zombie
+                });
         }
     })
 }

@@ -38,6 +38,15 @@ impl WaitQueue {
 
     /// Enqueue current task and block with a specific reason.
     pub fn wait_with_reason(&self, reason: WaitReason) {
+        self.wait_with_reason_or_skip(reason, || false);
+    }
+
+    /// Enqueue current task and block, unless `should_skip` reports
+    /// the awaited condition is already satisfied after enqueue.
+    pub fn wait_with_reason_or_skip<F>(&self, reason: WaitReason, should_skip: F)
+    where
+        F: FnOnce() -> bool,
+    {
         let task = current_task().unwrap();
         let mut queue = self.queue.lock();
         {
@@ -47,8 +56,26 @@ impl WaitQueue {
             task_inner.wait_reason = Some(reason);
             task_inner.wake_pending = false;
         }
-        queue.push_back(task);
+        queue.push_back(task.clone());
         drop(queue);
+
+        // Re-check condition after enqueueing ourselves. If already ready,
+        // cancel the sleep transition and keep running on this hart.
+        if should_skip() {
+            self.queue
+                .lock()
+                .retain(|queued| Arc::as_ptr(queued) != Arc::as_ptr(&task));
+            if let Some(task) = current_task() {
+                let mut task_inner = task.inner_exclusive_access();
+                if matches!(task_inner.task_status, TaskStatus::PreBlocked) {
+                    task_inner.task_status = TaskStatus::Running;
+                    task_inner.wait_reason = None;
+                    task_inner.wake_pending = false;
+                }
+            }
+            return;
+        }
+
         block_current_preblocked_and_run_next();
     }
 

@@ -1,10 +1,9 @@
 //! Mutex (spin-like and blocking(sleep))
 
 use super::SpinNoIrqLock;
-use crate::task::{TaskControlBlock, WaitReason};
-use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
-use crate::task::{current_task, wakeup_task};
-use alloc::{collections::VecDeque, sync::Arc};
+use crate::task::WaitQueue;
+use crate::task::WaitReason;
+use crate::task::suspend_current_and_run_next;
 
 /// Mutex trait
 pub trait Mutex: Sync + Send {
@@ -55,11 +54,11 @@ impl Mutex for MutexSpin {
 /// Blocking Mutex struct
 pub struct MutexBlocking {
     inner: SpinNoIrqLock<MutexBlockingInner>,
+    wait_queue: WaitQueue,
 }
 
 pub struct MutexBlockingInner {
     locked: bool,
-    wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl MutexBlocking {
@@ -69,8 +68,8 @@ impl MutexBlocking {
         Self {
             inner: SpinNoIrqLock::new(MutexBlockingInner {
                 locked: false,
-                wait_queue: VecDeque::new(),
             }),
+            wait_queue: WaitQueue::new(),
         }
     }
 }
@@ -79,13 +78,15 @@ impl Mutex for MutexBlocking {
     /// lock the blocking mutex
     fn lock(&self) {
         trace!("kernel: MutexBlocking::lock");
-        let mut mutex_inner = self.inner.lock();
-        if mutex_inner.locked {
-            mutex_inner.wait_queue.push_back(current_task().unwrap());
+        loop {
+            let mut mutex_inner = self.inner.lock();
+            if !mutex_inner.locked {
+                mutex_inner.locked = true;
+                return;
+            }
             drop(mutex_inner);
-            block_current_and_run_next(WaitReason::Mutex);
-        } else {
-            mutex_inner.locked = true;
+            self.wait_queue
+                .wait_with_reason_or_skip(WaitReason::Mutex, || !self.inner.lock().locked);
         }
     }
 
@@ -94,10 +95,8 @@ impl Mutex for MutexBlocking {
         trace!("kernel: MutexBlocking::unlock");
         let mut mutex_inner = self.inner.lock();
         assert!(mutex_inner.locked);
-        if let Some(waking_task) = mutex_inner.wait_queue.pop_front() {
-            wakeup_task(waking_task);
-        } else {
-            mutex_inner.locked = false;
-        }
+        mutex_inner.locked = false;
+        drop(mutex_inner);
+        self.wait_queue.wake_one();
     }
 }
