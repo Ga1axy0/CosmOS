@@ -136,8 +136,14 @@ static RTC_READY: AtomicBool = AtomicBool::new(false);
 pub fn init() {
     let rtc = RTC.lock();
     rtc.init();
+    let time_ns = rtc.read_time_ns();
     drop(rtc);
     RTC_READY.store(true, Ordering::Release);
+    info!(
+        "rtc init done, realtime = {}.{} s",
+        time_ns / 1_000_000_000,
+        time_ns % 1_000_000_000
+    );
 }
 
 /// 返回 RTC 是否已完成初始化。
