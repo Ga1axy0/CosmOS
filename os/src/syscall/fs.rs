@@ -4,6 +4,7 @@ use crate::fs::{
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
+use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::string::String;
@@ -351,7 +352,6 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
         "kernel:pid[{}] sys_fstat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     let process = current_process();
     syscall_body!({
         let fd = fd as usize;
@@ -364,21 +364,7 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
             .clone();
         drop(inner);
         let stat = file.stat();
-        let stat_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &stat as *const Stat as *const u8,
-                core::mem::size_of::<Stat>(),
-            )
-        };
-        let mut buffers =
-            translated_byte_buffer(token, st as *const u8, core::mem::size_of::<Stat>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&stat_bytes[copied..copied + len]);
-            copied += len;
-        }
+        write_pod_to_user(st, &stat)?;
         Ok(0)
     })
 }
@@ -448,7 +434,6 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
         if size == 0 || buf.is_null() {
             return Err(ERRNO::EINVAL);
         }
-        let token = current_user_token();
         let cwd = current_process().inner_exclusive_access().cwd.clone();
         let cwd_bytes = cwd.as_bytes();
         if size < cwd_bytes.len() + 1 {
@@ -461,15 +446,8 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
             .copied()
             .chain(core::iter::once(0u8))
             .collect();
-        let mut off = 0usize;
-        for slice in translated_byte_buffer(token, buf as *const u8, total)
-            .or_errno(ERRNO::EFAULT)?
-            .iter_mut()
-        {
-            let len = slice.len();
-            slice.copy_from_slice(&src[off..off + len]);
-            off += len;
-        }
+        debug_assert_eq!(src.len(), total);
+        write_bytes_to_user(buf, &src)?;
         Ok(buf as isize)
     })
 }
@@ -540,7 +518,6 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         "kernel:pid[{}] sys_getdents64",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     let process = current_process();
     syscall_body!({
         let fd = fd as usize;
@@ -559,15 +536,8 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         if bytes == 0 {
             return Ok(0);
         }
-        // … then copy to user space page by page.
-        let mut user_bufs = translated_byte_buffer(token, buf as *const u8, bytes)
-            .or_errno(ERRNO::EFAULT)?;
-        let mut src_off = 0usize;
-        for slice in user_bufs.iter_mut() {
-            let len = slice.len();
-            slice.copy_from_slice(&tmp[src_off..src_off + len]);
-            src_off += len;
-        }
+        // … then copy to user space.
+        write_bytes_to_user(buf, &tmp[..bytes])?;
         Ok(bytes as isize)
     })
 }

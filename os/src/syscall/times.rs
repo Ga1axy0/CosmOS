@@ -1,13 +1,10 @@
-use crate::syscall::errno::{OrErrno, ERRNO};
+use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
+use crate::syscall::write_pod_to_user;
 use crate::{
-    mm::translated_byte_buffer,
-    task::{current_process, current_task, current_user_token},
+    task::{current_process, current_task},
     timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
 };
-
-use core::mem::size_of;
-use core::slice;
 
 /// Linux 兼容的 `clockid_t` 类型。
 pub type ClockId = i32;
@@ -46,23 +43,6 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
         tv_sec: (time_ns / 1_000_000_000) as usize,
         tv_nsec: (time_ns % 1_000_000_000) as usize,
     }
-}
-
-/// 将一个 POD 结构写回到用户地址空间。
-fn write_pod_to_user<T>(ptr: *mut T, value: &T) -> Result<(), ERRNO> {
-    let value_bytes = unsafe {
-        slice::from_raw_parts(value as *const T as *const u8, size_of::<T>())
-    };
-    let mut buffers =
-        translated_byte_buffer(current_user_token(), ptr as *const u8, size_of::<T>())
-            .or_errno(ERRNO::EFAULT)?;
-    let mut copied = 0usize;
-    for buffer in buffers.iter_mut() {
-        let len = buffer.len();
-        buffer.copy_from_slice(&value_bytes[copied..copied + len]);
-        copied += len;
-    }
-    Ok(())
 }
 
 /// get_time syscall
