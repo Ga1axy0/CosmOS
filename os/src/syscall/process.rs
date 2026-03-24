@@ -1,5 +1,5 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::write_pod_to_user;
+use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
     fs::{open_file, open_file_at, File, OpenFlags},
@@ -331,6 +331,8 @@ pub struct UtsName {
     pub version: [u8; 65],
     pub machine: [u8; 65],
 }
+
+impl Pod for UtsName {}
 
 impl UtsName {
     pub fn new() -> Self {

@@ -1,6 +1,6 @@
 use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
-use crate::syscall::write_pod_to_user;
+use crate::syscall::{write_pod_to_user, Pod};
 use crate::{
     task::{current_process, current_task},
     timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
@@ -21,6 +21,8 @@ pub struct TimeVal {
     pub usec: usize,
 }
 
+impl Pod for TimeVal {}
+
 /// Linux 风格的 `timespec` 结构。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +31,8 @@ pub struct Timespec {
     pub tv_nsec: usize,
 }
 
+impl Pod for Timespec {}
+
 #[repr(C)]
 pub struct Tms {
     pub tms_utime: usize,
@@ -36,6 +40,8 @@ pub struct Tms {
     pub tms_cutime: usize,
     pub tms_cstime: usize,
 }
+
+impl Pod for Tms {}
 
 /// 将纳秒时间戳拆分为 `timespec`。
 fn timespec_from_ns(time_ns: u64) -> Timespec {
