@@ -1,7 +1,7 @@
 use crate::fs::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, OpenFlags, Stat,
-    canonicalize, do_umount, inode_stat, linkat, lookup_inode, make_pipe, mkdir_at,
-    mount_device, open_file_at, unlinkat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, File, OpenFlags,
+    Stat, canonicalize, do_umount, inode_stat, linkat, lookup_inode, make_pipe,
+    mkdir_at, mount_device, open_file_at, unlinkat,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
@@ -109,6 +109,33 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
         return Err(ERRNO::ENOTDIR);
     }
     file.path().ok_or(ERRNO::ENOTDIR)
+}
+
+/// 规范化 `openat` 标志位：忽略当前内核可安全跳过的附加位。
+fn normalize_open_flags(flags: i32) -> Result<OpenFlags, ERRNO> {
+    const O_NOCTTY: i32 = 0x100;
+    const O_NONBLOCK: i32 = 0x800;
+    const O_LARGEFILE: i32 = 0x8000;
+    const O_CLOEXEC: i32 = 0x80000;
+    let ignorable_flags = O_LARGEFILE | O_CLOEXEC;
+    let unsupported_flags = O_NOCTTY | O_NONBLOCK;
+    if flags & unsupported_flags != 0 {
+        // TODO: 后续若补齐 tty 控制终端与非阻塞文件状态位语义，应在 fd 层实现真实行为。
+        warn!(
+            "sys_open: unsupported open flags {:#x}",
+            flags & unsupported_flags
+        );
+        return Err(ERRNO::EINVAL);
+    }
+    let normalized_flags = flags & !ignorable_flags;
+    if normalized_flags != flags {
+        // TODO: 后续若补齐 close-on-exec 语义，应在 fd 层记录 FD_CLOEXEC 状态。
+        warn!(
+            "sys_open: ignore ignorable open flags {:#x}",
+            flags & ignorable_flags
+        );
+    }
+    OpenFlags::from_bits(normalized_flags).ok_or(ERRNO::EINVAL)
 }
 
 
@@ -238,12 +265,16 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             "sys_open: dirfd = {}, path = {}, flags = {}, cwd = {}",
             dirfd, path, flags, cwd
         );
+        let open_flags = normalize_open_flags(flags)?;
         let inode = open_file_at(
             cwd.as_str(),
             path.as_str(),
-            OpenFlags::from_bits(flags).or_errno(ERRNO::EINVAL)?,
+            open_flags,
         )
         .or_errno(ERRNO::ENOENT)?;
+        if open_flags.contains(OpenFlags::DIRECTORY) && !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
         let mut inner = process.inner_exclusive_access();
         let fd = inner.alloc_fd();
         inner.fd_table[fd] = Some(inode);
