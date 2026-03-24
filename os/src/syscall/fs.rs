@@ -7,7 +7,7 @@ use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserB
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
-use crate::task::{current_process, current_task, current_user_token, FdEntry};
+use crate::task::{current_process, current_task, current_user_token, FdEntry, FdFlags};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -111,33 +111,32 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     file.path().ok_or(ERRNO::ENOTDIR)
 }
 
-/// 规范化 `openat` 标志位：忽略当前内核可安全跳过的附加位。
-fn normalize_open_flags(flags: i32) -> Result<OpenFlags, ERRNO> {
+/// 过滤并校验 `openat` 的路径打开语义位。
+fn filter_open_flags(flags: i32) -> Result<OpenFlags, ERRNO> {
     const O_NOCTTY: i32 = 0x100;
     const O_NONBLOCK: i32 = 0x800;
     const O_LARGEFILE: i32 = 0x8000;
-    const O_CLOEXEC: i32 = 0x80000;
-    let ignorable_flags = O_LARGEFILE | O_CLOEXEC;
-    let unsupported_flags = O_NOCTTY | O_NONBLOCK;
-    if flags & unsupported_flags != 0 {
-        // TODO: 后续若补齐 tty 控制终端与非阻塞文件状态位语义，应在 fd 层实现真实行为。
+    let ignored_flags = flags & O_LARGEFILE;
+    let unsupported_flags = flags & (O_NOCTTY | O_NONBLOCK);
+    let effective_flags = flags & !ignored_flags;
+
+    if unsupported_flags != 0 {
+        // TODO: 后续若补齐 tty 控制终端与非阻塞文件状态位语义，应在 fd 层或具体文件对象层实现真实行为。
         warn!(
             "sys_open: unsupported open flags {:#x}",
-            flags & unsupported_flags
+            unsupported_flags
         );
         return Err(ERRNO::EINVAL);
     }
-    let normalized_flags = flags & !ignorable_flags;
-    if normalized_flags != flags {
-        // TODO: 后续若补齐 close-on-exec 语义，应在 fd 层记录 FD_CLOEXEC 状态。
+    if ignored_flags != 0 {
+        // TODO: 后续若补齐大文件兼容细节，可在这里补充更精细的位语义校验。
         warn!(
             "sys_open: ignore ignorable open flags {:#x}",
-            flags & ignorable_flags
+            ignored_flags
         );
     }
-    OpenFlags::from_bits(normalized_flags).ok_or(ERRNO::EINVAL)
+    OpenFlags::from_bits(effective_flags).ok_or(ERRNO::EINVAL)
 }
-
 
 /// write syscall
 pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
@@ -256,6 +255,8 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
     let process = current_process();
     let token = current_user_token();
     syscall_body!({
+        // TODO: 目前只有O_CLOEXEC位会落入FD层处理。
+        const O_CLOEXEC: i32 = 0x80000;
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
@@ -265,7 +266,12 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             "sys_open: dirfd = {}, path = {}, flags = {}, cwd = {}",
             dirfd, path, flags, cwd
         );
-        let open_flags = normalize_open_flags(flags)?;
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FdFlags::CLOEXEC
+        } else {
+            FdFlags::empty()
+        };
+        let open_flags = filter_open_flags(flags & !O_CLOEXEC)?;
         let inode = open_file_at(
             cwd.as_str(),
             path.as_str(),
@@ -277,8 +283,9 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
         }
         let mut inner = process.inner_exclusive_access();
         let fd = inner.alloc_fd();
-        // TODO: 后续补齐 `O_CLOEXEC` 后，应在此根据 open flags 初始化 fd 标志位。
-        inner.fd_table[fd] = Some(FdEntry::new(inode));
+        let mut entry = FdEntry::new(inode);
+        entry.flags = fd_flags;
+        inner.fd_table[fd] = Some(entry);
         Ok(fd as isize)
     })
 }
