@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use log::debug;
 use spin::Mutex;
@@ -17,6 +17,10 @@ struct Ext4BlockDeviceAdapter {
     inner: Arc<dyn OsBlockDevice>,
 }
 
+/// 4KiB 对齐的扇区缓冲区，避免 virtio 直接访问跨物理页的 512-byte 缓冲。
+#[repr(align(4096))]
+struct AlignedSector([u8; BLOCK_SZ]);
+
 const EXT4_ROOT_INODE: u32 = 2;
 
 impl Ext4BlockDeviceAdapter {
@@ -34,10 +38,10 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         let end_block = (offset + len + BLOCK_SZ - 1) / BLOCK_SZ;
 
         for block_id in start_block..end_block {
-            let mut sector = [0u8; BLOCK_SZ];
+            let mut sector = Box::new(AlignedSector([0u8; BLOCK_SZ]));
 
             // debug!("Ext4BlockDeviceAdapter read: block_id={}, offset={}, len={}", block_id, offset, len);
-            self.inner.read_block(block_id, &mut sector);
+            self.inner.read_block(block_id, &mut sector.0);
 
             let block_start = block_id * BLOCK_SZ;
             let src_start = offset.saturating_sub(block_start);
@@ -48,7 +52,7 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
 
             let dst_start = block_start + src_start - offset;
             let copy_len = src_end - src_start;
-            out[dst_start..dst_start + copy_len].copy_from_slice(&sector[src_start..src_end]);
+            out[dst_start..dst_start + copy_len].copy_from_slice(&sector.0[src_start..src_end]);
         }
 
         out
@@ -76,18 +80,20 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
             let dst_end = seg_end - block_start;
 
             if dst_start == 0 && dst_end == BLOCK_SZ {
-                // debug!("Ext4BlockDeviceAdapter full block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
-                self.inner.write_block(block_id, &data[src_start..src_end]);
+                // 这里使用固定大小的跳板缓冲区，避免直接把可能跨物理页的 heap slice 交给 virtio 块设备。
+                let mut sector = Box::new(AlignedSector([0u8; BLOCK_SZ]));
+                sector.0.copy_from_slice(&data[src_start..src_end]);
+                self.inner.write_block(block_id, &sector.0);
             } else {
-                let mut sector = [0u8; BLOCK_SZ];
+                let mut sector = Box::new(AlignedSector([0u8; BLOCK_SZ]));
 
                 // debug!("Ext4BlockDeviceAdapter partial block read: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
-                self.inner.read_block(block_id, &mut sector);
+                self.inner.read_block(block_id, &mut sector.0);
                 
-                sector[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+                sector.0[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
 
                 // debug!("Ext4BlockDeviceAdapter partial block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
-                self.inner.write_block(block_id, &sector);
+                self.inner.write_block(block_id, &sector.0);
             }
         }
     }

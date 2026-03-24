@@ -188,6 +188,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     mm::init();
     mm::remap_test();
     drivers::init();
+    timer::init_realtime_offset_from_rtc();
     probe_and_start_other_harts(hart_id);
     init_local_hart(hart_id);
     fs::init_rootfs();

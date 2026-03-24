@@ -13,6 +13,8 @@ pub const MMIO: &[(usize, usize)] = &[
 ];
 
 pub const VIRT_UART: usize = 0x1000_0000;
+/// QEMU virt 机型上的 Goldfish RTC MMIO 基址。
+pub const VIRT_RTC: usize = 0x0010_1000;
 
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
