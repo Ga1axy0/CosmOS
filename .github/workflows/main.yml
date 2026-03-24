@@ -42,6 +42,12 @@ jobs:
 
       - name: Check boot marker
         run: |
+          if grep -F "[kernel] Panicked" boot.log >/dev/null; then
+            echo "::error::Kernel panicked during boot"
+            echo "## ❌ Kernel Panic Detected" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
           if grep -F "[kernel] Hello, world!" boot.log >/dev/null; then
             echo "::notice::Kernel boot successful"
             echo "## ✅ Kernel Boot Successful" >> $GITHUB_STEP_SUMMARY
