@@ -13,6 +13,7 @@ pub const SYSCALL_PIPE: usize = 59;
 pub const SYSCALL_GETDENTS64: usize = 61;
 pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
+pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_EXIT: usize = 93;
@@ -134,6 +135,14 @@ pub fn sys_unlinkat(dirfd: usize, path: &str, flags: usize) -> isize {
 
 pub fn sys_fstat(fd: usize, st: &mut Stat) -> isize {
     syscall(SYSCALL_FSTAT, [fd, st as *const _ as usize, 0])
+}
+
+/// `newfstatat` 用户态封装：按目录 fd 与路径查询文件状态。
+pub fn sys_newfstatat(dirfd: usize, path: &str, st: &mut Stat, flags: i32) -> isize {
+    syscall6(
+        SYSCALL_NEWFSTATAT,
+        [dirfd, path.as_ptr() as usize, st as *const _ as usize, flags as usize, 0, 0],
+    )
 }
 
 pub fn sys_mail_read(buffer: &mut [u8]) -> isize {

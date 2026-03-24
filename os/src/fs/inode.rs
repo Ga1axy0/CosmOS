@@ -65,6 +65,10 @@ impl OSInode {
 pub const AT_FDCWD: isize = -100;
 /// `unlinkat` flag for removing an empty directory instead of a non-directory.
 pub const AT_REMOVEDIR: u32 = 0x200;
+/// `newfstatat` 标志：返回符号链接自身状态而非目标状态。
+pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+/// `newfstatat` 标志：允许空路径并直接作用于 `dirfd`。
+pub const AT_EMPTY_PATH: u32 = 0x1000;
 
 lazy_static! {
     /// Tracks virtual directories created by `do_mount` for sub-path mounts.
@@ -606,36 +610,41 @@ impl File for OSInode {
 
     fn stat(&self) -> Stat {
         let inner = self.inner.lock();
-        let mode = if inner.inode.is_dir() {
-            StatMode::DIR
-        } else {
-            StatMode::FILE
-        };
-        Stat {
-            dev: 0,
-            ino: inner.inode.ino(),
-            mode,
-            nlink: inner.inode.nlink(),
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            pad0: 0,
-            size: inner.inode.size() as i64,
-            blksize: 512,
-            pad1: 0,
-            blocks: (inner.inode.size() as u64 + 511) / 512,
-            atime_sec: 0,
-            atime_nsec: 0,
-            mtime_sec: 0,
-            mtime_nsec: 0,
-            ctime_sec: 0,
-            ctime_nsec: 0,
-            unused: [0; 2],
-        }
+        inode_stat(&inner.inode)
     }
 
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
+    }
+}
+
+/// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。
+pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
+    let mode = if inode.is_dir() {
+        StatMode::DIR
+    } else {
+        StatMode::FILE
+    };
+    Stat {
+        dev: 0,
+        ino: inode.ino(),
+        mode,
+        nlink: inode.nlink(),
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        pad0: 0,
+        size: inode.size() as i64,
+        blksize: 512,
+        pad1: 0,
+        blocks: (inode.size() as u64 + 511) / 512,
+        atime_sec: 0,
+        atime_nsec: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+        unused: [0; 2],
     }
 }
 
