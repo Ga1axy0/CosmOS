@@ -58,6 +58,8 @@ pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
+/// syslog syscall
+pub const SYSCALL_SYSLOG: usize = 116;
 /// yield syscall
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
@@ -156,7 +158,8 @@ use mman::*;
 use times::*;
 
 
-use crate::{fs::Stat, syscall::errno::ERRNO};
+use crate::{fs::Stat, syscall::{self, errno::ERRNO}};
+use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
 /// converting `Err(e)` into `-(e as isize)`.  Use with the `?` operator and
@@ -218,6 +221,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
+        SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
