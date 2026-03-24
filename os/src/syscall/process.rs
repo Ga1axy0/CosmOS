@@ -1,9 +1,10 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
+use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
     fs::{open_file, open_file_at, File, OpenFlags},
     mm::{
-        translated_byte_buffer, translated_ref, translated_refmut, translated_str,
+        translated_ref, translated_refmut, translated_str,
     },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next,
@@ -13,8 +14,6 @@ use crate::{
 };
 
 use alloc::{string::String, vec::Vec};
-use core::mem::size_of;
-use core::slice;
 /// exit syscall
 ///
 /// exit the current task and run the next task in task list
@@ -333,6 +332,8 @@ pub struct UtsName {
     pub machine: [u8; 65],
 }
 
+impl Pod for UtsName {}
+
 impl UtsName {
     pub fn new() -> Self {
         // 按照 Linux 标准填充字段，可以根据实际情况修改
@@ -364,23 +365,8 @@ pub fn sys_uname(utsname_ptr: *mut UtsName) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let token = current_user_token();
         let uname = UtsName::new();
-        let uname_bytes = unsafe {
-            slice::from_raw_parts(
-                &uname as *const UtsName as *const u8,
-                size_of::<UtsName>(),
-            )
-        };
-        let mut buffers =
-            translated_byte_buffer(token, utsname_ptr as *const u8, size_of::<UtsName>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&uname_bytes[copied..copied + len]);
-            copied += len;
-        }
+        write_pod_to_user(utsname_ptr, &uname)?;
         Ok(0)
     })
 }
