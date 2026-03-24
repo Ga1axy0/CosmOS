@@ -58,6 +58,8 @@ pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
+/// clock_gettime syscall
+pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// syslog syscall
 pub const SYSCALL_SYSLOG: usize = 116;
 /// yield syscall
@@ -144,6 +146,7 @@ mod sync;
 mod thread;
 mod mman;
 mod times;
+mod utils;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
@@ -156,6 +159,7 @@ use sync::*;
 use thread::*;
 use mman::*;
 use times::*;
+pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
 
 
 use crate::{fs::Stat, syscall::{self, errno::ERRNO}};
@@ -221,6 +225,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
+        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),

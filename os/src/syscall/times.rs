@@ -1,13 +1,18 @@
-use crate::syscall::errno::{OrErrno, ERRNO};
+use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
+use crate::syscall::{write_pod_to_user, Pod};
 use crate::{
-    mm::translated_byte_buffer,
-    task::{current_process, current_task, current_user_token},
-    timer::{get_time, get_time_ticks, get_time_us, time_to_ticks},
+    task::{current_process, current_task},
+    timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
 };
 
-use core::mem::size_of;
-use core::slice;
+/// Linux 兼容的 `clockid_t` 类型。
+pub type ClockId = i32;
+
+/// Linux 兼容的实时时钟 ID。
+pub const CLOCK_REALTIME: ClockId = 0;
+/// Linux 兼容的单调时钟 ID。
+pub const CLOCK_MONOTONIC: ClockId = 1;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -16,12 +21,34 @@ pub struct TimeVal {
     pub usec: usize,
 }
 
+impl Pod for TimeVal {}
+
+/// Linux 风格的 `timespec` 结构。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Timespec {
+    pub tv_sec: usize,
+    pub tv_nsec: usize,
+}
+
+impl Pod for Timespec {}
+
 #[repr(C)]
 pub struct Tms {
     pub tms_utime: usize,
     pub tms_stime: usize,
     pub tms_cutime: usize,
     pub tms_cstime: usize,
+}
+
+impl Pod for Tms {}
+
+/// 将纳秒时间戳拆分为 `timespec`。
+fn timespec_from_ns(time_ns: u64) -> Timespec {
+    Timespec {
+        tv_sec: (time_ns / 1_000_000_000) as usize,
+        tv_nsec: (time_ns % 1_000_000_000) as usize,
+    }
 }
 
 /// get_time syscall
@@ -36,21 +63,27 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
             sec: time_us / 1_000_000,
             usec: time_us % 1_000_000,
         };
-        let timeval_bytes = unsafe {
-            slice::from_raw_parts(
-                &timeval as *const TimeVal as *const u8,
-                size_of::<TimeVal>(),
-            )
+        write_pod_to_user(_ts, &timeval)?;
+        Ok(0)
+    })
+}
+
+/// `clock_gettime(2)` 系统调用。
+pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_clock_gettime clockid={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid
+    );
+    syscall_body!({
+        let timespec = match clockid {
+            CLOCK_REALTIME => timespec_from_ns(get_realtime_ns()),
+            CLOCK_MONOTONIC => timespec_from_ns(get_time_ns()),
+            // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
+            // CLOCK_REALTIME_COARSE 等其它 clock id。
+            _ => return Err(ERRNO::EINVAL),
         };
-        let mut buffers =
-            translated_byte_buffer(current_user_token(), _ts as *const u8, size_of::<TimeVal>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&timeval_bytes[copied..copied + len]);
-            copied += len;
-        }
+        write_pod_to_user(tp, &timespec)?;
         Ok(0)
     })
 }
@@ -69,16 +102,7 @@ pub fn sys_times(buf: *mut Tms) -> isize {
             tms_cutime: time_to_ticks(cutime),
             tms_cstime: time_to_ticks(cstime),
         };
-        let tms_bytes = unsafe { slice::from_raw_parts(&tms as *const Tms as *const u8, size_of::<Tms>()) };
-        let mut buffers =
-            translated_byte_buffer(current_user_token(), buf as *const u8, size_of::<Tms>())
-                .or_errno(ERRNO::EFAULT)?;
-        let mut copied = 0usize;
-        for buffer in buffers.iter_mut() {
-            let len = buffer.len();
-            buffer.copy_from_slice(&tms_bytes[copied..copied + len]);
-            copied += len;
-        }
+        write_pod_to_user(buf, &tms)?;
         Ok(get_time_ticks() as isize)
     })
 }

@@ -81,7 +81,8 @@ bitflags! {
         const WRONLY = 0x001;
         const RDWR = 0x002;
         const CREATE = 0x40;
-        const TRUNC = 0x10000;
+        const TRUNC = 0x200;
+        const DIRECTORY = 0x10000;
     }
 }
 
