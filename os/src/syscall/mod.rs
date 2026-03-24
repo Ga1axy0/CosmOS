@@ -60,6 +60,8 @@ pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 pub const SYSCALL_NANOSLEEP: usize = 101;
 /// clock_gettime syscall
 pub const SYSCALL_CLOCK_GETTIME: usize = 113;
+/// syslog syscall
+pub const SYSCALL_SYSLOG: usize = 116;
 /// yield syscall
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
@@ -160,7 +162,8 @@ use times::*;
 pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
 
 
-use crate::{fs::Stat, syscall::errno::ERRNO};
+use crate::{fs::Stat, syscall::{self, errno::ERRNO}};
+use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
 /// converting `Err(e)` into `-(e as isize)`.  Use with the `?` operator and
@@ -223,10 +226,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
+        SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_GETUID => sys_getuid(),
+        SYSCALL_GETEUID => sys_geteuid(),
+        SYSCALL_GETGID => sys_getgid(),
+        SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXECVE => sys_execve(
@@ -264,18 +272,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
 
 /// Syscalls that are invalid or not implemented yet
 fn sys_nisyscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    syscall_body!({
-        match syscall_id {
-            SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => {
-                warn!(
-                    "kernel: syscall {} is not implemented yet", syscall_id
-                );
-                Ok(0)
-            },
-            _ => {
-                error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
-                Err(ERRNO::ENOSYS)
-            },
-        }
+    syscall_body!({  
+        error!("unknown syscall: id = {}, args = {:?}", syscall_id, args);
+        Err(ERRNO::ENOSYS)
     })
 }

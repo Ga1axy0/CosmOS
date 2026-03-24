@@ -32,6 +32,25 @@ pub struct ProcessControlBlock {
     pub wait_exit_queue: Arc<WaitQueue>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Credentials {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+}
+
+impl Credentials {
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+        }
+    }
+}
+
 /// Inner of Process Control Block
 pub struct ProcessControlBlockInner {
     /// is zombie?
@@ -72,6 +91,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_detector: DeadlockDetector,
     /// current working directory (absolute path)
     pub cwd: String,
+    /// process credentials
+    pub cred: Credentials,
     /// CPU time spent in user mode for this process (raw timer counter units)
     pub user_time: usize,
     /// CPU time spent in kernel mode for this process (raw timer counter units)
@@ -200,6 +221,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
+                    cred: Credentials::root(),
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -356,6 +378,7 @@ impl ProcessControlBlock {
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
         let vm_layout = parent.vm_layout;
+        let cred = parent.cred;
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -391,6 +414,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(),
+                    cred,
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -439,6 +463,7 @@ impl ProcessControlBlock {
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         let mut parent = self.inner_exclusive_access();
+        let cred = parent.cred;
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent.fd_table.iter() {
@@ -471,6 +496,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                    cred,
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -509,6 +535,22 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    pub fn getuid(&self) -> u32 {
+        self.inner.lock().cred.uid
+    }
+
+    pub fn geteuid(&self) -> u32 {
+        self.inner.lock().cred.euid
+    }
+
+    pub fn getgid(&self) -> u32 {
+        self.inner.lock().cred.gid
+    }
+
+    pub fn getegid(&self) -> u32 {
+        self.inner.lock().cred.egid
     }
 
     /// map an anonymous area with given permission, return true if success
