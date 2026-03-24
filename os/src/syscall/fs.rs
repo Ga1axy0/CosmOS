@@ -7,7 +7,7 @@ use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserB
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
-use crate::task::{current_process, current_task, current_user_token};
+use crate::task::{current_process, current_task, current_user_token, FdEntry};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -30,7 +30,7 @@ fn get_writable_file(fd: usize) -> Result<Arc<dyn crate::fs::File>, ERRNO> {
     if fd >= inner.fd_table.len() {
         return Err(ERRNO::EBADF);
     }
-    let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.clone();
+    let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.file.clone();
     if !file.writable() {
         return Err(ERRNO::EACCES);
     }
@@ -101,9 +101,9 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     let file = inner
         .fd_table
         .get(dirfd as usize)
-        .and_then(|file| file.as_ref())
-        .ok_or(ERRNO::EBADF)?
-        .clone();
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| entry.file.clone())
+        .ok_or(ERRNO::EBADF)?;
     drop(inner);
     if !file.is_dir() {
         return Err(ERRNO::ENOTDIR);
@@ -210,7 +210,7 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
         if fd >= inner.fd_table.len() {
             return Err(ERRNO::EBADF);
         }
-        let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.clone();
+        let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.file.clone();
         if !file.readable() {
             return Err(ERRNO::EACCES);
         }
@@ -236,9 +236,9 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
         let file = inner
             .fd_table
             .get(fd)
-            .and_then(|f| f.as_ref())
-            .ok_or(ERRNO::EBADF)?
-            .clone();
+            .and_then(|entry| entry.as_ref())
+            .map(|entry| entry.file.clone())
+            .ok_or(ERRNO::EBADF)?;
         drop(inner);
         // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。
         // TODO: tty 实现 `TCGETS/TIOCGWINSZ` 后，这里会开始承载真实终端控制语义。
@@ -277,7 +277,8 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
         }
         let mut inner = process.inner_exclusive_access();
         let fd = inner.alloc_fd();
-        inner.fd_table[fd] = Some(inode);
+        // TODO: 后续补齐 `O_CLOEXEC` 后，应在此根据 open flags 初始化 fd 标志位。
+        inner.fd_table[fd] = Some(FdEntry::new(inode));
         Ok(fd as isize)
     })
 }
@@ -315,9 +316,9 @@ pub fn sys_pipe2(pipefd: *mut i32, _flags: i32) -> isize {
         let mut inner = process.inner_exclusive_access();
         let (pipe_read, pipe_write) = make_pipe();
         let read_fd = inner.alloc_fd();
-        inner.fd_table[read_fd] = Some(pipe_read);
+        inner.fd_table[read_fd] = Some(FdEntry::new(pipe_read));
         let write_fd = inner.alloc_fd();
-        inner.fd_table[write_fd] = Some(pipe_write);
+        inner.fd_table[write_fd] = Some(FdEntry::new(pipe_write));
         drop(inner);
         *translated_refmut(token, pipefd).or_errno(ERRNO::EFAULT)? = read_fd as i32;
         *translated_refmut(token, unsafe { pipefd.add(1) }).or_errno(ERRNO::EFAULT)? = write_fd as i32;
@@ -343,7 +344,7 @@ pub fn sys_dup(fd: u32) -> isize {
             return Err(ERRNO::EBADF);
         }
         let new_fd = inner.alloc_fd();
-        inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
+        inner.fd_table[new_fd] = Some(inner.fd_table[fd].as_ref().unwrap().clone());
         Ok(new_fd as isize)
     })
 }
@@ -373,7 +374,7 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
         }
         // If newfd is already open, close it first.
         inner.fd_table[newfd].take();
-        inner.fd_table[newfd] = Some(Arc::clone(inner.fd_table[oldfd].as_ref().unwrap()));
+        inner.fd_table[newfd] = Some(inner.fd_table[oldfd].as_ref().unwrap().clone());
         Ok(newfd as isize)
     })
 }
@@ -391,9 +392,9 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
         let file = inner
             .fd_table
             .get(fd)
-            .and_then(|f| f.as_ref())
-            .ok_or(ERRNO::EBADF)?
-            .clone();
+            .and_then(|entry| entry.as_ref())
+            .map(|entry| entry.file.clone())
+            .ok_or(ERRNO::EBADF)?;
         drop(inner);
         let stat = file.stat();
         write_pod_to_user(st, &stat)?;
@@ -440,9 +441,9 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
             let file = inner
                 .fd_table
                 .get(dirfd as usize)
-                .and_then(|file| file.as_ref())
-                .ok_or(ERRNO::EBADF)?
-                .clone();
+                .and_then(|entry| entry.as_ref())
+                .map(|entry| entry.file.clone())
+                .ok_or(ERRNO::EBADF)?;
             drop(inner);
             let stat = file.stat();
             write_pod_to_user(st, &stat)?;
@@ -613,9 +614,9 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         let file = inner
             .fd_table
             .get(fd)
-            .and_then(|f| f.as_ref())
-            .ok_or(ERRNO::EBADF)?
-            .clone();
+            .and_then(|entry| entry.as_ref())
+            .map(|entry| entry.file.clone())
+            .ok_or(ERRNO::EBADF)?;
         drop(inner);
         // Fill a kernel-side temporary buffer …
         let mut tmp: Vec<u8> = Vec::new();

@@ -46,7 +46,7 @@ pub use processor::{
     take_current_task,
 };
 pub use wait_queue::{WaitQueue, WaitQueueKeyed};
-pub use process::ExitReason;
+pub use process::{ExitReason, FdEntry, FdFlags};
 pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{TaskControlBlock, TaskStatus, WaitReason};
 
