@@ -43,7 +43,7 @@ pub mod drivers;
 pub mod fs;
 pub mod hart;
 pub mod lang_items;
-pub mod logging;
+pub mod klog;
 pub mod mm;
 pub mod sbi;
 pub mod sync;
@@ -182,11 +182,11 @@ fn wait_for_bootstrap() {
 fn first_hart_main(hart_id: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
-    logging::init();
-    info!("hart {} boot", hart_id);
-    info!("hart {} elected as bootstrap hart", hart_id);
     mm::init();
     mm::remap_test();
+    klog::init();
+    info!("hart {} boot", hart_id);
+    info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
     timer::init_realtime_offset_from_rtc();
     probe_and_start_other_harts(hart_id);
