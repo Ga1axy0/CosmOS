@@ -10,6 +10,7 @@ pub mod devfs;
 use alloc::string::String;
 use crate::mm::UserBuffer;
 use crate::syscall::errno::ERRNO;
+use crate::syscall::Pod;
 
 /// trait File for all file types
 pub trait File: Send + Sync {
@@ -90,6 +91,8 @@ pub struct Stat {
     /// reserved fields
     pub unused: [u32; 2],
 }
+
+impl Pod for Stat {}
 
 bitflags! {
     /// The mode of a inode
