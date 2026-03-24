@@ -306,6 +306,8 @@ impl ProcessControlBlock {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
             inner.vm_layout = vm_layout;
+            // 按 Linux 语义，`exec` 成功后应关闭所有带 `FD_CLOEXEC` 的 fd。
+            Self::close_cloexec_fds(&mut inner);
         }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
@@ -396,6 +398,19 @@ impl ProcessControlBlock {
         trap_cx.x[11] = argv_base;
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
+    }
+
+    /// 关闭当前进程中所有带 `FD_CLOEXEC` 的 fd 表项。
+    fn close_cloexec_fds(inner: &mut ProcessControlBlockInner) {
+        for entry in inner.fd_table.iter_mut() {
+            let should_close = entry
+                .as_ref()
+                .map(|entry| entry.flags.contains(FdFlags::CLOEXEC))
+                .unwrap_or(false);
+            if should_close {
+                *entry = None;
+            }
+        }
     }
 
     /// Only support processes with a single thread.
