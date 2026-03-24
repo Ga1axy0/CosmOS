@@ -14,6 +14,34 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+bitflags! {
+    /// fd 表项级别的标志位。
+    pub struct FdFlags: u32 {
+        /// `exec` 成功后自动关闭该 fd。
+        const CLOEXEC = 0x1;
+    }
+}
+
+/// fd 表中的单个表项，区分 fd 自身标志与底层文件对象。
+#[derive(Clone)]
+pub struct FdEntry {
+    /// 当前 fd 引用的底层文件对象。
+    pub file: Arc<dyn File + Send + Sync>,
+    /// 当前 fd 的局部标志位。
+    pub flags: FdFlags,
+}
+
+impl FdEntry {
+    /// 基于文件对象创建默认 fd 表项。
+    pub fn new(file: Arc<dyn File + Send + Sync>) -> Self {
+        Self {
+            file,
+            // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
+            flags: FdFlags::empty(),
+        }
+    }
+}
+
 /// Process termination reason preserved for wait4/waitpid encoding.
 #[derive(Debug, Clone, Copy)]
 pub enum ExitReason {
@@ -66,7 +94,7 @@ pub struct ProcessControlBlockInner {
     /// exit reason observed by wait4/waitpid
     pub exit_reason: ExitReason,
     /// file descriptor table
-    pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub fd_table: Vec<Option<FdEntry>>,
     /// pending process signals
     pub pending_signals: SignalFlags,
     /// blocked process signals
@@ -382,10 +410,10 @@ impl ProcessControlBlock {
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
+            if let Some(entry) = fd {
+                new_fd_table.push(Some(entry.clone()));
             } else {
                 new_fd_table.push(None);
             }
@@ -465,10 +493,10 @@ impl ProcessControlBlock {
         let mut parent = self.inner_exclusive_access();
         let cred = parent.cred;
         let pid = pid_alloc();
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
+            if let Some(entry) = fd {
+                new_fd_table.push(Some(entry.clone()));
             } else {
                 new_fd_table.push(None);
             }
