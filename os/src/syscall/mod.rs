@@ -16,6 +16,8 @@ pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_DUP: usize = 23;
 /// dup2 syscall
 pub const SYSCALL_DUP2: usize = 24;
+/// fcntl syscall
+pub const SYSCALL_FCNTL: usize = 25;
 /// ioctl syscall
 pub const SYSCALL_IOCTL: usize = 29;
 /// mkdirat syscall
@@ -193,6 +195,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
+        SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_LINKAT => sys_linkat(

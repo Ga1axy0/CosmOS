@@ -4,6 +4,7 @@ use super::{Stat, TimeVal};
 
 pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_DUP: usize = 23;
+pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_CHDIR: usize = 49;
@@ -217,6 +218,10 @@ pub fn sys_spawn(path: &str) -> isize {
 
 pub fn sys_dup(fd: usize) -> isize {
     syscall(SYSCALL_DUP, [fd, 0, 0])
+}
+
+pub fn sys_fcntl(fd: usize, cmd: i32, arg: i32) -> isize {
+    syscall(SYSCALL_FCNTL, [fd, cmd as usize, arg as usize])
 }
 
 pub fn sys_pipe(pipe: &mut [usize]) -> isize {

@@ -111,6 +111,26 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     file.path().ok_or(ERRNO::ENOTDIR)
 }
 
+const F_DUPFD: i32 = 0;
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const F_DUPFD_CLOEXEC: i32 = 1030;
+
+/// `fcntl(F_GETFD/F_SETFD)` 可见的 fd 标志位。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+enum FcntlFdFlag {
+    /// `exec` 成功后自动关闭该 fd。
+    Cloexec = 0x1,
+}
+
+impl FcntlFdFlag {
+    /// 汇总所有当前已识别的 fd 标志位掩码。
+    const ALL_BITS: i32 = Self::Cloexec as i32;
+}
+
 /// 过滤并校验 `openat` 的路径打开语义位。
 fn filter_open_flags(flags: i32) -> Result<OpenFlags, ERRNO> {
     const O_NOCTTY: i32 = 0x100;
@@ -136,6 +156,74 @@ fn filter_open_flags(flags: i32) -> Result<OpenFlags, ERRNO> {
         );
     }
     OpenFlags::from_bits(effective_flags).ok_or(ERRNO::EINVAL)
+}
+
+/// `fcntl` 系统调用：当前最小实现仅支持 `F_GETFD/F_SETFD`。
+pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fcntl",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    syscall_body!({
+        let fd = fd as usize;
+        let mut inner = process.inner_exclusive_access();
+        let entry = inner
+            .fd_table
+            .get_mut(fd)
+            .and_then(|entry| entry.as_mut())
+            .ok_or(ERRNO::EBADF)?;
+        match cmd {
+            F_GETFD => {
+                let mut flags = 0i32;
+                if entry.flags.contains(FdFlags::CLOEXEC) {
+                    flags |= FcntlFdFlag::Cloexec as i32;
+                }
+                Ok(flags as isize)
+            }
+            F_SETFD => {
+                let arg = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
+                if arg & !FcntlFdFlag::ALL_BITS != 0 {
+                    // TODO: 后续若补齐额外 fd 标志位，应在这里扩展掩码并同步到 `FdFlags`。
+                    warn!(
+                        "sys_fcntl: unsupported F_SETFD flags {:#x}",
+                        arg & !FcntlFdFlag::ALL_BITS
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if arg & (FcntlFdFlag::Cloexec as i32) != 0 {
+                    entry.flags |= FdFlags::CLOEXEC;
+                } else {
+                    entry.flags.remove(FdFlags::CLOEXEC);
+                }
+                Ok(0)
+            }
+            F_DUPFD => {
+                // TODO: 后续实现 `F_DUPFD`，返回大于等于 `arg` 的最小空闲 fd。
+                warn!("sys_fcntl: F_DUPFD is not implemented yet, arg = {}", arg);
+                Err(ERRNO::EINVAL)
+            }
+            F_GETFL => {
+                // TODO: 后续在文件对象层补齐 file status flags 后，实现 `F_GETFL`。
+                warn!("sys_fcntl: F_GETFL is not implemented yet");
+                Err(ERRNO::EINVAL)
+            }
+            F_SETFL => {
+                // TODO: 后续在文件对象层补齐 `O_APPEND/O_NONBLOCK` 等状态位后，实现 `F_SETFL`。
+                warn!("sys_fcntl: F_SETFL is not implemented yet, arg = {}", arg);
+                Err(ERRNO::EINVAL)
+            }
+            F_DUPFD_CLOEXEC => {
+                // TODO: 后续实现 `F_DUPFD_CLOEXEC`，复制 fd 并为新 fd 设置 `FD_CLOEXEC`。
+                warn!(
+                    "sys_fcntl: F_DUPFD_CLOEXEC is not implemented yet, arg = {}",
+                    arg
+                );
+                Err(ERRNO::EINVAL)
+            }
+            _ => Err(ERRNO::EINVAL),
+        }
+    })
 }
 
 /// write syscall
