@@ -203,6 +203,13 @@ pub const AT_FDCWD: isize = -100;
 pub const AT_REMOVEDIR: usize = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 pub const AT_EMPTY_PATH: usize = 0x1000;
+pub const F_DUPFD: i32 = 0;
+pub const F_GETFD: i32 = 1;
+pub const F_SETFD: i32 = 2;
+pub const F_GETFL: i32 = 3;
+pub const F_SETFL: i32 = 4;
+pub const F_DUPFD_CLOEXEC: i32 = 1030;
+pub const FD_CLOEXEC: i32 = 0x1;
 
 fn to_cstring(s: &str) -> String {
     if s.as_bytes().last() == Some(&0) {
@@ -224,6 +231,10 @@ pub fn close(fd: usize) -> isize {
         console::flush();
     }
     sys_close(fd)
+}
+
+pub fn fcntl(fd: usize, cmd: i32, arg: i32) -> isize {
+    sys_fcntl(fd, cmd, arg)
 }
 
 pub fn read(fd: usize, buf: &mut [u8]) -> isize {
