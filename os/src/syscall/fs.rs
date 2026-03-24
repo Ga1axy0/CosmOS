@@ -1,6 +1,7 @@
 use crate::fs::{
-    AT_FDCWD, AT_REMOVEDIR, OpenFlags, Stat, canonicalize, do_umount, linkat,
-    lookup_inode, make_pipe, mkdir_at, mount_device, open_file_at, unlinkat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, OpenFlags, Stat,
+    canonicalize, do_umount, inode_stat, linkat, lookup_inode, make_pipe, mkdir_at,
+    mount_device, open_file_at, unlinkat,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
@@ -364,6 +365,62 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
             .clone();
         drop(inner);
         let stat = file.stat();
+        write_pod_to_user(st, &stat)?;
+        Ok(0)
+    })
+}
+
+/// `newfstatat` 系统调用：按目录 fd 与路径查询文件元数据。
+pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_newfstatat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let flags = flags as u32;
+        let supported_flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+        if flags & !supported_flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            // TODO: 当前 VFS 尚未实现 symlink，暂时按普通路径 stat 处理。
+            warn!(
+                "sys_newfstatat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to stat target path"
+            );
+        }
+        if path.is_empty() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(ERRNO::ENOENT);
+            }
+            if dirfd == AT_FDCWD {
+                let cwd = current_process().inner_exclusive_access().cwd.clone();
+                let inode = lookup_inode(cwd.as_str()).ok_or(ERRNO::ENOENT)?;
+                let stat = inode_stat(&inode);
+                write_pod_to_user(st, &stat)?;
+                return Ok(0);
+            }
+            if dirfd < 0 {
+                return Err(ERRNO::EBADF);
+            }
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            let file = inner
+                .fd_table
+                .get(dirfd as usize)
+                .and_then(|file| file.as_ref())
+                .ok_or(ERRNO::EBADF)?
+                .clone();
+            drop(inner);
+            let stat = file.stat();
+            write_pod_to_user(st, &stat)?;
+            return Ok(0);
+        }
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+        let stat = inode_stat(&inode);
         write_pod_to_user(st, &stat)?;
         Ok(0)
     })

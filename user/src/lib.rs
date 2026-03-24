@@ -201,6 +201,8 @@ bitflags! {
 
 pub const AT_FDCWD: isize = -100;
 pub const AT_REMOVEDIR: usize = 0x200;
+pub const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+pub const AT_EMPTY_PATH: usize = 0x1000;
 
 fn to_cstring(s: &str) -> String {
     if s.as_bytes().last() == Some(&0) {
@@ -251,6 +253,12 @@ pub fn unlink(path: &str) -> isize {
 
 pub fn fstat(fd: usize, st: &mut Stat) -> isize {
     sys_fstat(fd, st)
+}
+
+/// 按目录 fd 与路径查询文件状态。
+pub fn fstatat(dirfd: isize, path: &str, st: &mut Stat, flags: i32) -> isize {
+    let path = to_cstring(path);
+    sys_newfstatat(dirfd as usize, path.as_str(), st, flags)
 }
 
 pub fn mail_read(buf: &mut [u8]) -> isize {
