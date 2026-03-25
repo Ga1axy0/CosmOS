@@ -195,6 +195,26 @@ impl File for Pipe {
             ring_buffer.read_wait_queue.wake_one();
         }
     }
+    fn poll(&self, events: u16) -> u16 {
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+        const POLLHUP: u16 = 0x010;
+
+        let mut ready = 0u16;
+        let ring_buffer = self.buffer.lock();
+        if self.readable && (events & POLLIN) != 0 {
+            if ring_buffer.available_read() > 0 {
+                ready |= POLLIN;
+            }
+            if ring_buffer.all_write_ends_closed() {
+                ready |= POLLHUP;
+            }
+        }
+        if self.writable && (events & POLLOUT) != 0 && ring_buffer.available_write() > 0 {
+            ready |= POLLOUT;
+        }
+        ready
+    }
     fn stat(&self) -> Stat {
         Stat {
             dev: 0,

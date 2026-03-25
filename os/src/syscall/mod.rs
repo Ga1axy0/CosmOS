@@ -46,6 +46,8 @@ pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
+/// ppoll_time32 syscall
+pub const SYSCALL_PPOLL_TIME32: usize = 73;
 /// newfstatat syscall
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 /// utimensat syscall
@@ -232,6 +234,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as *const Timespec,
             args[3] as i32,
+        ),
+        SYSCALL_PPOLL_TIME32 => sys_ppoll_time32(
+            args[0] as *mut PollFd,
+            args[1] as u32,
+            args[2] as *const OldTimespec32,
+            args[3] as *const u8,
+            args[4],
         ),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
