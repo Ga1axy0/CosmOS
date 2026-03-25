@@ -15,6 +15,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use crate::timer::{add_timer, get_time_ms};
+use crate::task::{block_current_and_run_next, SignalFlags, WaitReason};
 
 /// `writev` 使用的用户态向量缓冲区描述符。
 #[derive(Clone, Copy, Debug)]
@@ -24,6 +26,162 @@ pub(super) struct IoVec {
     iov_base: usize,
     /// 用户缓冲区长度。
     iov_len: usize,
+}
+
+/// `ppoll(2)` 使用的用户态文件描述符数组元素。
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct PollFd {
+    /// 被监视的文件描述符。
+    fd: i32,
+    /// 期望事件掩码（POLLIN/POLLOUT/...）。
+    events: i16,
+    /// 已经完成的事件（由内核回填）
+    revents: i16,
+}
+
+/// Linux 旧 ABI 中 `ppoll_time32` 使用的 32 位 `timespec`。
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct OldTimespec32 {
+    tv_sec: i32,    // seconds
+    tv_nsec: i32,   // nanoseconds
+}
+
+const POLLIN: u16 = 0x001;  // readable
+const POLLOUT: u16 = 0x004; // writable
+const POLLERR: u16 = 0x008; // error
+const POLLHUP: u16 = 0x010; // hung up
+const POLLNVAL: u16 = 0x020;    // invalid fd
+
+/// 从用户态复制 `pollfd` 数组，兼容跨页布局。
+fn copy_user_pollfds(token: usize, ufds: *mut PollFd, nfds: usize) -> Result<Vec<PollFd>, ERRNO> {
+    if nfds == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes_len = size_of::<PollFd>()
+        .checked_mul(nfds)
+        .ok_or(ERRNO::EINVAL)?;
+    let bytes = translated_byte_buffer(token, ufds as *const u8, bytes_len)
+        .or_errno(ERRNO::EFAULT)?;
+
+    let mut pollfds = Vec::with_capacity(nfds);
+    let mut scratch = [0u8; size_of::<PollFd>()];
+    let mut scratch_len = 0usize;
+    for chunk in bytes {
+        let mut off = 0usize;
+        while off < chunk.len() {
+            let copy_len = (size_of::<PollFd>() - scratch_len).min(chunk.len() - off);
+            scratch[scratch_len..scratch_len + copy_len]
+                .copy_from_slice(&chunk[off..off + copy_len]);
+            scratch_len += copy_len;
+            off += copy_len;
+            if scratch_len == size_of::<PollFd>() {
+                let pfd = unsafe { core::ptr::read_unaligned(scratch.as_ptr() as *const PollFd) };
+                pollfds.push(pfd);
+                scratch_len = 0;
+                if pollfds.len() == nfds {
+                    break;
+                }
+            }
+        }
+        if pollfds.len() == nfds {
+            break;
+        }
+    }
+    if scratch_len != 0 || pollfds.len() != nfds {
+        return Err(ERRNO::EFAULT);
+    }
+    Ok(pollfds)
+}
+
+/// 将内核中的 `pollfd` 数组（主要是 `revents`）回写到用户态。
+fn write_back_pollfds(token: usize, ufds: *mut PollFd, pollfds: &[PollFd]) -> Result<(), ERRNO> {
+    if pollfds.is_empty() {
+        return Ok(());
+    }
+    let bytes_len = size_of::<PollFd>()
+        .checked_mul(pollfds.len())
+        .ok_or(ERRNO::EINVAL)?;
+    let dst = translated_byte_buffer(token, ufds as *const u8, bytes_len)
+        .or_errno(ERRNO::EFAULT)?;
+
+    let src = unsafe {
+        core::slice::from_raw_parts(pollfds.as_ptr() as *const u8, bytes_len)
+    };
+    let mut copied = 0usize;
+    for chunk in dst {
+        let n = chunk.len();
+        chunk.copy_from_slice(&src[copied..copied + n]);
+        copied += n;
+    }
+    if copied != bytes_len {
+        return Err(ERRNO::EFAULT);
+    }
+    Ok(())
+}
+
+/// 扫描 fd 集，更新每个 `pollfd.revents` 并返回已就绪计数。
+fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let mut ready_cnt = 0usize;
+
+    for pfd in pollfds.iter_mut() {
+        pfd.revents = 0;
+        if pfd.fd < 0 {
+            continue;
+        }
+        let fd = pfd.fd as usize;
+        let Some(file) = inner.fd_table.get(fd).and_then(|f| f.as_ref()) else {
+            pfd.revents = POLLNVAL as i16;
+            ready_cnt += 1;
+            continue;
+        };
+
+        let mut revents = file.poll(pfd.events as u16);
+        if !file.readable() && (pfd.events as u16 & POLLIN) != 0 {
+            revents |= POLLERR;
+        }
+        if !file.writable() && (pfd.events as u16 & POLLOUT) != 0 {
+            revents |= POLLERR;
+        }
+        // pipe 实现可能设置 POLLHUP；普通文件默认走 POLLIN/POLLOUT。
+        if (revents & POLLHUP) != 0 {
+            pfd.revents = (pfd.revents as u16 | POLLHUP) as i16;
+        }
+        pfd.revents |= revents as i16;
+        if pfd.revents != 0 {
+            ready_cnt += 1;
+        }
+    }
+
+    ready_cnt
+}
+
+fn has_unmasked_pending_signal() -> bool {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    !(inner.pending_signals & !inner.signal_mask).is_empty()
+}
+
+fn parse_timeout_ms(token: usize, tmo_p: *const OldTimespec32) -> Result<Option<usize>, ERRNO> {
+    if tmo_p.is_null() {
+        return Ok(None);
+    }
+    let tmo = translated_refmut(token, tmo_p as *mut OldTimespec32).or_errno(ERRNO::EFAULT)?;
+    if tmo.tv_sec < 0 || tmo.tv_nsec < 0 || tmo.tv_nsec >= 1_000_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let sec_ms = (tmo.tv_sec as u64)
+        .checked_mul(1_000)
+        .ok_or(ERRNO::EINVAL)?;
+    let nsec = tmo.tv_nsec as u64;
+    let nsec_ms = nsec / 1_000_000;
+    let timeout_ms = sec_ms
+        .checked_add(nsec_ms)
+        .ok_or(ERRNO::EINVAL)?;
+    Ok(Some(timeout_ms as usize))
 }
 
 /// 打开路径后需要挂入 `FileDescription` 的打开参数。
@@ -979,5 +1137,80 @@ pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
         let abs  = canonicalize(&cwd, &name);
         do_umount(&abs)?;
         Ok(0)
+    })
+}
+
+/// `ppoll_time32(2)`：在 fd 集上等待事件，支持 32 位 timespec 与临时信号掩码。
+/// sigmask 目前转为*mut u32，因为当前的信号实现中掩码就是一个 u32 位域；未来若扩展为更复杂结构体再调整类型。
+pub fn sys_ppoll_time32(
+    ufds: *mut PollFd,
+    nfds: u32,  // length of ufds
+    tmo_p: *const OldTimespec32,    // timeout, NULL for infinite
+    sigmask: *const u8,
+    sigsetsize: usize,  // length of sigmasks
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_ppoll_time32",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let mut pollfds = copy_user_pollfds(token, ufds, nfds as usize)?;
+        let timeout_ms = parse_timeout_ms(token, tmo_p)?;
+        let start_ms = get_time_ms();
+        let deadline = timeout_ms.and_then(|ms| start_ms.checked_add(ms));
+
+        let process = current_process();
+        let old_mask = if !sigmask.is_null() {
+            if sigsetsize < size_of::<u32>() {
+                warn!("sys_ppoll_time32: sigsetsize {} too small for u32 mask", sigsetsize);
+                return Err(ERRNO::EINVAL);
+            }
+            let new_mask_bits = *translated_refmut(token, sigmask as *mut u32).or_errno(ERRNO::EFAULT)?;
+            let new_mask = SignalFlags::from_bits(new_mask_bits).or_errno(ERRNO::EINVAL)?;
+            let mut inner = process.inner_exclusive_access();
+            let old = inner.signal_mask;
+            inner.signal_mask = new_mask;
+            Some(old)
+        } else {
+            None
+        };
+
+        let ret = (|| -> Result<isize, ERRNO> {
+            loop {
+                let ready = scan_pollfds(&mut pollfds);
+                write_back_pollfds(token, ufds, &pollfds)?;
+                if ready > 0 {
+                    return Ok(ready as isize);
+                }
+
+                if has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
+
+                let now_ms = get_time_ms();
+                if let Some(dl) = deadline {
+                    if now_ms >= dl {
+                        return Ok(0);
+                    }
+                }
+
+                let sleep_ms = if let Some(dl) = deadline {
+                    let remain = dl.saturating_sub(now_ms);
+                    remain.clamp(1, 10)
+                } else {
+                    10
+                };
+
+                let task = current_task().unwrap();
+                add_timer(now_ms.saturating_add(sleep_ms), task);
+                block_current_and_run_next(WaitReason::Nanosleep);
+            }
+        })();
+
+        if let Some(old) = old_mask {
+            process.inner_exclusive_access().signal_mask = old;
+        }
+        ret
     })
 }

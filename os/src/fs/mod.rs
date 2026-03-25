@@ -249,6 +249,23 @@ pub trait File: Send + Sync {
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
     }
+    /// Query readiness for a subset of poll events.
+    ///
+    /// Input `events` is a bitmask compatible with Linux `poll(2)` bits
+    /// (`POLLIN=0x001`, `POLLOUT=0x004`, ...). The return value should contain
+    /// the subset that is currently ready.
+    fn poll(&self, events: u16) -> u16 {
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+        let mut ready = 0u16;
+        if (events & POLLIN) != 0 && self.readable() {
+            ready |= POLLIN;
+        }
+        if (events & POLLOUT) != 0 && self.writable() {
+            ready |= POLLOUT;
+        }
+        ready
+    }
     /// Handle an ioctl request on this file descriptor.
     fn ioctl(&self, _req: usize, _arg: usize) -> Result<isize, ERRNO> {
         Err(ERRNO::ENOTTY)
