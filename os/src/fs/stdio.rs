@@ -1,4 +1,4 @@
-use super::{TtyCore, TtyFile};
+use super::{AccessMode, FileDescription, FileStatusFlags, TtyCore, TtyFile};
 use crate::task::FdEntry;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -9,18 +9,25 @@ pub fn new_stdio_files() -> Vec<Option<FdEntry>> {
     let core = Arc::new(TtyCore::new_console());
     vec![
         // fd 0: 可读，不可写。
-        Some(FdEntry::new(Arc::new(TtyFile::new(
-            Arc::clone(&core),
-            true,
-            false,
+        Some(FdEntry::new(Arc::new(FileDescription::new(
+            Arc::new(TtyFile::new(Arc::clone(&core), true, false)),
+            AccessMode::ReadOnly,
+            FileStatusFlags::empty(),
+            0,
         )))),
         // fd 1: 不可读，可写。
-        Some(FdEntry::new(Arc::new(TtyFile::new(
-            Arc::clone(&core),
-            false,
-            true,
+        Some(FdEntry::new(Arc::new(FileDescription::new(
+            Arc::new(TtyFile::new(Arc::clone(&core), false, true)),
+            AccessMode::WriteOnly,
+            FileStatusFlags::empty(),
+            0,
         )))),
         // fd 2: 不可读，可写。
-        Some(FdEntry::new(Arc::new(TtyFile::new(core, false, true)))),
+        Some(FdEntry::new(Arc::new(FileDescription::new(
+            Arc::new(TtyFile::new(core, false, true)),
+            AccessMode::WriteOnly,
+            FileStatusFlags::empty(),
+            0,
+        )))),
     ]
 }

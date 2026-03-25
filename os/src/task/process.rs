@@ -6,7 +6,7 @@ use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
-use crate::fs::{new_stdio_files, File};
+use crate::fs::{new_stdio_files, FileDescription};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::{trap_handler, TrapContext};
@@ -25,17 +25,17 @@ bitflags! {
 /// fd 表中的单个表项，区分 fd 自身标志与底层文件对象。
 #[derive(Clone)]
 pub struct FdEntry {
-    /// 当前 fd 引用的底层文件对象。
-    pub file: Arc<dyn File + Send + Sync>,
+    /// 当前 fd 引用的打开文件描述。
+    pub desc: Arc<FileDescription>,
     /// 当前 fd 的局部标志位。
     pub flags: FdFlags,
 }
 
 impl FdEntry {
     /// 基于文件对象创建默认 fd 表项。
-    pub fn new(file: Arc<dyn File + Send + Sync>) -> Self {
+    pub fn new(desc: Arc<FileDescription>) -> Self {
         Self {
-            file,
+            desc,
             // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
             flags: FdFlags::empty(),
         }
