@@ -8,9 +8,195 @@ pub mod rootfs;
 pub mod devfs;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use crate::mm::UserBuffer;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
+
+bitflags! {
+    /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
+    pub struct FileStatusFlags: i32 {
+        /// 追加写入。
+        const APPEND = 0x400;
+        /// 非阻塞 I/O。
+        const NONBLOCK = 0x800;
+    }
+}
+
+/// 文件访问模式，对应 `O_RDONLY/O_WRONLY/O_RDWR`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessMode {
+    /// 只读打开。
+    ReadOnly,
+    /// 只写打开。
+    WriteOnly,
+    /// 读写打开。
+    ReadWrite,
+}
+
+impl AccessMode {
+    /// 从 `open` 低两位访问模式中解析访问权限。
+    pub fn from_open_bits(bits: i32) -> Result<Self, ERRNO> {
+        match bits & 0x3 {
+            0 => Ok(Self::ReadOnly),
+            1 => Ok(Self::WriteOnly),
+            2 => Ok(Self::ReadWrite),
+            _ => Err(ERRNO::EINVAL),
+        }
+    }
+
+    /// 返回该访问模式是否允许读。
+    pub fn readable(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    /// 返回该访问模式是否允许写。
+    pub fn writable(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+
+    /// 转回 `F_GETFL` 需要返回的访问模式位。
+    pub fn bits(self) -> i32 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::WriteOnly => 1,
+            Self::ReadWrite => 2,
+        }
+    }
+}
+
+/// 打开文件描述内部状态，对应 Linux 的 open file description 可变部分。
+struct FileDescriptionInner {
+    /// 当前文件偏移。
+    offset: usize,
+    /// 当前文件状态位。
+    status_flags: FileStatusFlags,
+}
+
+/// 打开文件描述，对应 Linux 的 open file description。
+pub struct FileDescription {
+    /// 底层具体文件对象。
+    file: Arc<dyn File + Send + Sync>,
+    /// 打开时确定的访问模式。
+    access_mode: AccessMode,
+    /// `F_GETFL` 需要保留返回、但 `F_SETFL` 不可修改的状态位。
+    status_fixed_bits: i32,
+    /// 共享的偏移与状态位。
+    inner: SpinNoIrqLock<FileDescriptionInner>,
+}
+
+impl FileDescription {
+    /// 基于底层文件对象创建一个打开文件描述。
+    pub fn new(
+        file: Arc<dyn File + Send + Sync>,
+        access_mode: AccessMode,
+        status_flags: FileStatusFlags,
+        status_fixed_bits: i32,
+    ) -> Self {
+        Self {
+            file,
+            access_mode,
+            status_fixed_bits,
+            inner: SpinNoIrqLock::new(FileDescriptionInner {
+                    offset: 0,
+                    status_flags,
+                }),
+        }
+    }
+
+    /// 返回底层文件对象是否允许当前描述执行读操作。
+    pub fn readable(&self) -> bool {
+        self.access_mode.readable() && self.file.readable()
+    }
+
+    /// 返回底层文件对象是否允许当前描述执行写操作。
+    pub fn writable(&self) -> bool {
+        self.access_mode.writable() && self.file.writable()
+    }
+
+    /// 顺序读取并推进共享文件偏移。
+    pub fn read(&self, buf: UserBuffer) -> usize {
+        if self.file.is_seekable() {
+            let mut inner = self.inner.lock();
+            let read_size = self.file.read_at(inner.offset, buf);
+            inner.offset += read_size;
+            return read_size;
+        }
+        // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
+        self.file.read_at(0, buf)
+    }
+
+    /// 顺序写入并推进共享文件偏移。
+    pub fn write(&self, buf: UserBuffer) -> usize {
+        if self.file.is_seekable() {
+            let mut inner = self.inner.lock();
+            if inner.status_flags.contains(FileStatusFlags::APPEND) {
+                // TODO: 当前仅保证同一 FileDescription 内的追加写顺序；跨描述竞争仍需 inode 级串行化。
+                inner.offset = self.file.stat().size.max(0) as usize;
+            }
+            let write_size = self.file.write_at(inner.offset, buf);
+            inner.offset += write_size;
+            return write_size;
+        }
+        // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
+        self.file.write_at(0, buf)
+    }
+
+    /// 从固定偏移读取，不影响共享文件偏移。
+    pub fn read_at(&self, offset: usize, buf: UserBuffer) -> usize {
+        self.file.read_at(offset, buf)
+    }
+
+    /// 向固定偏移写入，不影响共享文件偏移。
+    pub fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
+        self.file.write_at(offset, buf)
+    }
+
+    /// 获取当前 `F_GETFL` 可见状态值。
+    pub fn status_bits(&self) -> i32 {
+        let inner = self.inner.lock();
+        self.access_mode.bits() | self.status_fixed_bits | inner.status_flags.bits()
+    }
+
+    /// 覆盖当前可变文件状态位。
+    pub fn set_status_flags(&self, status_flags: FileStatusFlags) {
+        self.inner.lock().status_flags = status_flags;
+    }
+
+    /// 返回当前文件状态位快照。
+    pub fn status_flags(&self) -> FileStatusFlags {
+        self.inner.lock().status_flags
+    }
+
+    /// 转发 `ioctl` 到底层文件对象。
+    pub fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        self.file.ioctl(req, arg)
+    }
+
+    /// 转发 `stat` 到底层文件对象。
+    pub fn stat(&self) -> Stat {
+        self.file.stat()
+    }
+
+    /// 返回底层文件对象是否为目录。
+    pub fn is_dir(&self) -> bool {
+        self.file.is_dir()
+    }
+
+    /// 返回打开路径。
+    pub fn path(&self) -> Option<String> {
+        self.file.path()
+    }
+
+    /// 读取目录项并推进共享目录位置。
+    pub fn getdents64(&self, buf: &mut [u8]) -> usize {
+        let mut inner = self.inner.lock();
+        let read_size = self.file.getdents64(inner.offset, buf);
+        inner.offset += read_size;
+        read_size
+    }
+}
 
 /// trait File for all file types
 pub trait File: Send + Sync {
@@ -18,14 +204,14 @@ pub trait File: Send + Sync {
     fn readable(&self) -> bool;
     /// the file writable?
     fn writable(&self) -> bool;
-    /// read from the file to buf, return the number of bytes read
-    fn read(&self, buf: UserBuffer) -> usize;
-    /// read from a fixed file offset without changing the current fd offset
+    /// 从固定偏移读取数据。
     fn read_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
     }
-    /// write to the file from buf, return the number of bytes written
-    fn write(&self, buf: UserBuffer) -> usize;
+    /// 向固定偏移写入数据。
+    fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
+        0
+    }
     /// Handle an ioctl request on this file descriptor.
     fn ioctl(&self, _req: usize, _arg: usize) -> Result<isize, ERRNO> {
         Err(ERRNO::ENOTTY)
@@ -34,11 +220,13 @@ pub trait File: Send + Sync {
     fn is_dir(&self) -> bool {
         false
     }
-    /// Fill `buf` with `linux_dirent64` records starting from the current directory position.
-    /// Returns the number of bytes written into `buf`.
-    /// The internal position is advanced accordingly.
-    fn getdents64(&self, _buf: &mut [u8]) -> usize {
+    /// Fill `buf` with `linux_dirent64` records starting from the given directory position.
+    fn getdents64(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+    /// 返回该对象是否支持共享文件偏移。
+    fn is_seekable(&self) -> bool {
+        false
     }
     /// get file metadata
     fn stat(&self) -> Stat;

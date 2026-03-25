@@ -114,7 +114,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                         .fd_table
                         .get(fd)
                         .and_then(|entry| entry.as_ref())
-                        .map(|entry| entry.file.clone())
+                        .map(|entry| entry.desc.clone())
                         .ok_or(ERRNO::EBADF)?
                 };
                 if file.is_dir() {
