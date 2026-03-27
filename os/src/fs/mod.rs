@@ -233,6 +233,11 @@ impl FileDescription {
         }
         read_size
     }
+
+    /// 返回该描述对应的可轮询事件源身份。
+    pub fn poll_source_id(&self) -> usize {
+        self.file.poll_source_id()
+    }
 }
 
 /// trait File for all file types
@@ -265,6 +270,10 @@ pub trait File: Send + Sync {
             ready |= POLLOUT;
         }
         ready
+    }
+    /// 返回该对象的 poll 事件源标识。
+    fn poll_source_id(&self) -> usize {
+        self as *const Self as *const () as usize
     }
     /// Handle an ioctl request on this file descriptor.
     fn ioctl(&self, _req: usize, _arg: usize) -> Result<isize, ERRNO> {

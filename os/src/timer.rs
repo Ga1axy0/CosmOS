@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use crate::config::CLOCK_FREQ;
 use crate::drivers::rtc;
 use crate::hart::hartid;
+use crate::poll::{self, PollTimerTag};
 use crate::sbi::set_timer;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
@@ -109,6 +110,8 @@ pub struct TimerCondVar {
     pub expire_ms: usize,
     /// The task to be woken up when the timer expires
     pub task: Arc<TaskControlBlock>,
+    /// Optional poll timeout identity used to validate stale timer entries.
+    pub(crate) poll_tag: Option<PollTimerTag>,
 }
 
 impl PartialEq for TimerCondVar {
@@ -139,12 +142,25 @@ lazy_static! {
 
 /// Add a timer
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
+    add_timer_with_poll_tag(expire_ms, task, None);
+}
+
+/// Add a timer with an optional poll timeout identity.
+pub(crate) fn add_timer_with_poll_tag(
+    expire_ms: usize,
+    task: Arc<TaskControlBlock>,
+    poll_tag: Option<PollTimerTag>,
+) {
     trace!(
         "kernel:pid[{}] add_timer",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let mut timers = TIMERS.lock();
-    timers.push(TimerCondVar { expire_ms, task });
+    timers.push(TimerCondVar {
+        expire_ms,
+        task,
+        poll_tag,
+    });
 }
 
 /// Remove a timer
@@ -170,6 +186,12 @@ pub fn check_timer() {
     let mut timers = TIMERS.lock();
     while let Some(timer) = timers.peek() {
         if timer.expire_ms <= current_ms {
+            if let Some(tag) = timer.poll_tag {
+                if poll::handle_poll_timeout(tag, &timer.task) {
+                    timers.pop();
+                }
+                continue;
+            }
             // hart A 将任务入堆但还没标为 Blocked (即目前是 Running)，此时 timer 已经过期，被 hart B 检查。 
             // 此时唤醒不成功，但仍然要保留 timer。
             // 这种情形应该较少，且最多损失一个时间片，是可以接受的。

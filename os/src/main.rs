@@ -45,6 +45,7 @@ pub mod hart;
 pub mod lang_items;
 pub mod klog;
 pub mod mm;
+mod poll;
 pub mod sbi;
 pub mod sync;
 pub mod syscall;

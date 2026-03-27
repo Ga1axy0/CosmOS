@@ -20,6 +20,10 @@ pub trait CharDevice: Sync + Send {
    fn write(&self, ch: u8);
    /// Read a ch to device.
    fn read(&self) -> u8;
+   /// Whether the device currently has readable input buffered.
+   fn has_data(&self) -> bool {
+      false
+   }
    /// Calls when interrupt comes.
    fn handle_irq(&self) {
       // default: no IRQ support
