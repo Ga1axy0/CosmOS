@@ -9,14 +9,15 @@ use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
 use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
+use crate::poll::{self, PollWakeState};
 use crate::task::{current_process, current_task, current_user_token, FdEntry, FdFlags};
 use crate::timer::get_realtime_ns;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use crate::timer::{add_timer, get_time_ms};
-use crate::task::{block_current_and_run_next, SignalFlags, WaitReason};
+use crate::timer::{add_timer_with_poll_tag, get_time_ms};
+use crate::task::SignalFlags;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
 #[derive(Clone, Copy, Debug)]
@@ -1159,6 +1160,7 @@ pub fn sys_ppoll_time32(
         let timeout_ms = parse_timeout_ms(token, tmo_p)?;
         let start_ms = get_time_ms();
         let deadline = timeout_ms.and_then(|ms| start_ms.checked_add(ms));
+        let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
 
         let process = current_process();
         let old_mask = if !sigmask.is_null() {
@@ -1195,16 +1197,35 @@ pub fn sys_ppoll_time32(
                     }
                 }
 
-                let sleep_ms = if let Some(dl) = deadline {
-                    let remain = dl.saturating_sub(now_ms);
-                    remain.clamp(1, 10)
-                } else {
-                    10
+                let task = current_task().unwrap();
+                let interests = {
+                    let inner = process.inner_exclusive_access();
+                    let mut rows = Vec::new();
+                    for pfd in pollfds.iter() {
+                        if pfd.fd < 0 {
+                            continue;
+                        }
+                        let fd = pfd.fd as usize;
+                        if let Some(entry) = inner.fd_table.get(fd).and_then(|slot| slot.as_ref()) {
+                            rows.push((fd, entry.desc.poll_source_id(), pfd.events as u16));
+                        }
+                    }
+                    rows
                 };
 
-                let task = current_task().unwrap();
-                add_timer(now_ms.saturating_add(sleep_ms), task);
-                block_current_and_run_next(WaitReason::Nanosleep);
+                let handle = poll::register_poll_wait(pid, &task, &interests)?;
+                if let Some(dl) = deadline {
+                    debug!("sys_ppoll_time32: wait with timeout, now = {}, deadline = {}", now_ms, dl);
+                    add_timer_with_poll_tag(dl, Arc::clone(&task), Some(handle.timer_tag()));
+                }
+                poll::wait_poll_key(handle);
+
+                let wake_state = poll::poll_wait_state(handle);
+                poll::cleanup_poll_wait(handle);
+
+                if matches!(wake_state, PollWakeState::TimedOut) {
+                    return Ok(0);
+                }
             }
         })();
 
