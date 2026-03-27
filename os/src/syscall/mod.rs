@@ -16,6 +16,8 @@ pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_DUP: usize = 23;
 /// dup2 syscall
 pub const SYSCALL_DUP2: usize = 24;
+/// fcntl syscall
+pub const SYSCALL_FCNTL: usize = 25;
 /// ioctl syscall
 pub const SYSCALL_IOCTL: usize = 29;
 /// mkdirat syscall
@@ -44,6 +46,8 @@ pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
+/// newfstatat syscall
+pub const SYSCALL_NEWFSTATAT: usize = 79;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
@@ -191,6 +195,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
+        SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_LINKAT => sys_linkat(
@@ -214,6 +219,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0] as u32, args[1] as *const IoVec, args[2] as i32),
+        SYSCALL_NEWFSTATAT => sys_newfstatat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut Stat,
+            args[3] as i32,
+        ),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),

@@ -1,12 +1,14 @@
 use crate::fs::{
-    AT_FDCWD, AT_REMOVEDIR, OpenFlags, Stat, canonicalize, do_umount, linkat,
-    lookup_inode, make_pipe, mkdir_at, mount_device, open_file_at, unlinkat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
+    FileDescription, FileStatusFlags, OpenFlags, Stat, canonicalize, do_umount,
+    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device,
+    open_file_at, unlinkat,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
-use crate::task::{current_process, current_task, current_user_token};
+use crate::task::{current_process, current_task, current_user_token, FdEntry, FdFlags};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,19 +24,46 @@ pub(super) struct IoVec {
     iov_len: usize,
 }
 
-/// 校验 fd 并返回可写文件对象。
-fn get_writable_file(fd: usize) -> Result<Arc<dyn crate::fs::File>, ERRNO> {
+/// 打开路径后需要挂入 `FileDescription` 的打开参数。
+struct OpenFileState {
+    /// 打开时确定的访问模式。
+    access_mode: AccessMode,
+    /// 当前可变文件状态位。
+    status_flags: FileStatusFlags,
+    /// `F_GETFL` 需要保留返回的固定状态位。
+    status_fixed_bits: i32,
+    /// 传给底层 inode 打开的标志位。
+    open_flags: OpenFlags,
+}
+
+/// 校验 fd 并返回打开文件描述。
+fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let process = current_process();
     let inner = process.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
         return Err(ERRNO::EBADF);
     }
-    let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.clone();
-    if !file.writable() {
+    let desc = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc.clone();
+    drop(inner);
+    Ok(desc)
+}
+
+/// 校验 fd 并返回可写打开文件描述。
+fn get_writable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
+    let desc = get_file_description(fd)?;
+    if !desc.writable() {
         return Err(ERRNO::EACCES);
     }
-    drop(inner);
-    Ok(file)
+    Ok(desc)
+}
+
+/// 校验 fd 并返回可读打开文件描述。
+fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
+    let desc = get_file_description(fd)?;
+    if !desc.readable() {
+        return Err(ERRNO::EACCES);
+    }
+    Ok(desc)
 }
 
 /// 从用户态复制 `iovec` 数组，避免数组跨页时直接解引用失败。
@@ -97,19 +126,186 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
         return Err(ERRNO::EBADF);
     }
     let inner = process.inner_exclusive_access();
-    let file = inner
+    let desc = inner
         .fd_table
         .get(dirfd as usize)
-        .and_then(|file| file.as_ref())
-        .ok_or(ERRNO::EBADF)?
-        .clone();
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| entry.desc.clone())
+        .ok_or(ERRNO::EBADF)?;
     drop(inner);
-    if !file.is_dir() {
+    if !desc.is_dir() {
         return Err(ERRNO::ENOTDIR);
     }
-    file.path().ok_or(ERRNO::ENOTDIR)
+    desc.path().ok_or(ERRNO::ENOTDIR)
 }
 
+const F_DUPFD: i32 = 0;
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const F_DUPFD_CLOEXEC: i32 = 1030;
+
+/// `fcntl(F_GETFD/F_SETFD)` 可见的 fd 标志位。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+enum FcntlFdFlag {
+    /// `exec` 成功后自动关闭该 fd。
+    Cloexec = 0x1,
+}
+
+impl FcntlFdFlag {
+    /// 汇总所有当前已识别的 fd 标志位掩码。
+    const ALL_BITS: i32 = Self::Cloexec as i32;
+}
+
+/// 过滤并校验 `openat` 的路径打开语义位。
+fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
+    const O_APPEND: i32 = FileStatusFlags::APPEND.bits();
+    const O_NOCTTY: i32 = 0x100;
+    const O_NONBLOCK: i32 = FileStatusFlags::NONBLOCK.bits();
+    const O_LARGEFILE: i32 = 0x8000;
+    const O_DIRECTORY: i32 = OpenFlags::DIRECTORY.bits();
+
+    let access_mode = AccessMode::from_open_bits(flags)?;
+    let ignored_flags = flags & O_LARGEFILE;
+    let unsupported_flags = flags & O_NOCTTY;
+    let status_flags = FileStatusFlags::from_bits_truncate(flags & (O_APPEND | O_NONBLOCK));
+    let effective_flags = flags & !(ignored_flags | O_APPEND | O_NONBLOCK);
+
+    if unsupported_flags != 0 {
+        // TODO: 后续若补齐 tty 控制终端语义，应在进程/会话层实现真实行为。
+        warn!(
+            "sys_open: unsupported open flags {:#x}",
+            unsupported_flags
+        );
+        return Err(ERRNO::EINVAL);
+    }
+    if ignored_flags != 0 {
+        // TODO: 后续若补齐大文件兼容细节，可在这里补充更精细的位语义校验。
+        warn!(
+            "sys_open: ignore ignorable open flags {:#x}",
+            ignored_flags
+        );
+    }
+    let open_flags = OpenFlags::from_bits(effective_flags).ok_or(ERRNO::EINVAL)?;
+    Ok(OpenFileState {
+        access_mode,
+        status_flags,
+        status_fixed_bits: effective_flags & O_DIRECTORY,
+        open_flags,
+    })
+}
+
+/// 解析 `F_SETFL` 可修改的文件状态位。
+fn parse_setfl_status(arg: usize) -> Result<FileStatusFlags, ERRNO> {
+    let arg = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
+    let mutable_mask = FileStatusFlags::APPEND.bits() | FileStatusFlags::NONBLOCK.bits();
+    let ignored_mask =
+        0x3 | OpenFlags::CREATE.bits() | OpenFlags::TRUNC.bits() | OpenFlags::DIRECTORY.bits() | 0x100 | 0x8000;
+    if arg & !(mutable_mask | ignored_mask) != 0 {
+        // TODO: 后续若补齐 `O_ASYNC/O_DIRECT/O_NOATIME` 等位，应在这里扩展掩码。
+        warn!(
+            "sys_fcntl: unsupported F_SETFL flags {:#x}",
+            arg & !(mutable_mask | ignored_mask)
+        );
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(FileStatusFlags::from_bits_truncate(arg))
+}
+
+/// 在 `fd_table` 中分配大于等于 `min_fd` 的最小空闲 fd。
+fn alloc_fd_from(fd_table: &mut Vec<Option<FdEntry>>, min_fd: usize) -> usize {
+    if let Some(fd) = (min_fd..fd_table.len()).find(|fd| fd_table[*fd].is_none()) {
+        return fd;
+    }
+    if min_fd > fd_table.len() {
+        fd_table.resize(min_fd, None);
+    }
+    fd_table.push(None);
+    fd_table.len() - 1
+}
+
+/// `fcntl` 系统调用：处理 fd 标志、文件状态位与描述复制。
+pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fcntl",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    syscall_body!({
+        let fd = fd as usize;
+        let mut inner = process.inner_exclusive_access();
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return Err(ERRNO::EBADF);
+        }
+        match cmd {
+            F_GETFD => {
+                let mut flags = 0i32;
+                let entry = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?;
+                if entry.flags.contains(FdFlags::CLOEXEC) {
+                    flags |= FcntlFdFlag::Cloexec as i32;
+                }
+                Ok(flags as isize)
+            }
+            F_SETFD => {
+                let entry = inner.fd_table[fd].as_mut().ok_or(ERRNO::EBADF)?;
+                let arg = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
+                if arg & !FcntlFdFlag::ALL_BITS != 0 {
+                    // TODO: 后续若补齐额外 fd 标志位，应在这里扩展掩码并同步到 `FdFlags`。
+                    warn!(
+                        "sys_fcntl: unsupported F_SETFD flags {:#x}",
+                        arg & !FcntlFdFlag::ALL_BITS
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if arg & (FcntlFdFlag::Cloexec as i32) != 0 {
+                    entry.flags |= FdFlags::CLOEXEC;
+                } else {
+                    entry.flags.remove(FdFlags::CLOEXEC);
+                }
+                Ok(0)
+            }
+            F_DUPFD => {
+                let min_fd = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
+                if min_fd < 0 {
+                    return Err(ERRNO::EINVAL);
+                }
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                let new_fd = alloc_fd_from(&mut inner.fd_table, min_fd as usize);
+                inner.fd_table[new_fd] = Some(FdEntry {
+                    desc,
+                    flags: FdFlags::empty(),
+                });
+                Ok(new_fd as isize)
+            }
+            F_GETFL => {
+                let entry = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?;
+                Ok(entry.desc.status_bits() as isize)
+            }
+            F_SETFL => {
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                let status_flags = parse_setfl_status(arg)?;
+                desc.set_status_flags(status_flags);
+                Ok(0)
+            }
+            F_DUPFD_CLOEXEC => {
+                let min_fd = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
+                if min_fd < 0 {
+                    return Err(ERRNO::EINVAL);
+                }
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                let new_fd = alloc_fd_from(&mut inner.fd_table, min_fd as usize);
+                inner.fd_table[new_fd] = Some(FdEntry {
+                    desc,
+                    flags: FdFlags::CLOEXEC,
+                });
+                Ok(new_fd as isize)
+            }
+            _ => Err(ERRNO::EINVAL),
+        }
+    })
+}
 
 /// write syscall
 pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
@@ -120,8 +316,8 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
-        let file = get_writable_file(fd)?;
-        Ok(file.write(UserBuffer::new(
+        let desc = get_writable_file(fd)?;
+        Ok(desc.write(UserBuffer::new(
             translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
         )) as isize)
     })
@@ -136,7 +332,7 @@ pub fn sys_writev(fd: u32, iov: *const IoVec, iovcnt: i32) -> isize {
     let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
-        let file = get_writable_file(fd)?;
+        let desc = get_writable_file(fd)?;
         let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
         let mut written_total = 0usize;
         for &iovec in &iovecs {
@@ -156,7 +352,7 @@ pub fn sys_writev(fd: u32, iov: *const IoVec, iovcnt: i32) -> isize {
                 translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len)
                     .or_errno(ERRNO::EFAULT)?,
             );
-            let written = file.write(user_buf);
+            let written = desc.write(user_buf);
             completed += written;
             // 发生短写时立即返回，保留与 `write` 一致的部分写入语义。
             if written < iovec.iov_len {
@@ -174,22 +370,12 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
         "kernel:pid[{}] sys_read",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let process = current_process();
     let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
-        let inner = process.inner_exclusive_access();
-        if fd >= inner.fd_table.len() {
-            return Err(ERRNO::EBADF);
-        }
-        let file = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.clone();
-        if !file.readable() {
-            return Err(ERRNO::EACCES);
-        }
-        // release current task TCB manually to avoid multi-borrow
-        drop(inner);
-        trace!("kernel: sys_read .. file.read");
-        Ok(file.read(UserBuffer::new(
+        let desc = get_readable_file(fd)?;
+        trace!("kernel: sys_read .. desc.read");
+        Ok(desc.read(UserBuffer::new(
             translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
         )) as isize)
     })
@@ -201,21 +387,13 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
         "kernel:pid[{}] sys_ioctl",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let process = current_process();
     syscall_body!({
         let fd = fd as usize;
-        let inner = process.inner_exclusive_access();
-        let file = inner
-            .fd_table
-            .get(fd)
-            .and_then(|f| f.as_ref())
-            .ok_or(ERRNO::EBADF)?
-            .clone();
-        drop(inner);
+        let desc = get_file_description(fd)?;
         // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。
         // TODO: tty 实现 `TCGETS/TIOCGWINSZ` 后，这里会开始承载真实终端控制语义。
         debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
-        file.ioctl(req, arg)
+        desc.ioctl(req, arg)
     })
 }
 
@@ -228,6 +406,8 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
     let process = current_process();
     let token = current_user_token();
     syscall_body!({
+        // TODO: 目前只有O_CLOEXEC位会落入FD层处理。
+        const O_CLOEXEC: i32 = 0x80000;
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
@@ -237,15 +417,32 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             "sys_open: dirfd = {}, path = {}, flags = {}, cwd = {}",
             dirfd, path, flags, cwd
         );
+        let fd_flags = if flags & O_CLOEXEC != 0 {
+            FdFlags::CLOEXEC
+        } else {
+            FdFlags::empty()
+        };
+        let open_state = filter_open_flags(flags & !O_CLOEXEC)?;
         let inode = open_file_at(
             cwd.as_str(),
             path.as_str(),
-            OpenFlags::from_bits(flags).or_errno(ERRNO::EINVAL)?,
+            open_state.open_flags,
         )
         .or_errno(ERRNO::ENOENT)?;
+        if open_state.open_flags.contains(OpenFlags::DIRECTORY) && !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
         let mut inner = process.inner_exclusive_access();
         let fd = inner.alloc_fd();
-        inner.fd_table[fd] = Some(inode);
+        let desc = Arc::new(FileDescription::new(
+            inode,
+            open_state.access_mode,
+            open_state.status_flags,
+            open_state.status_fixed_bits,
+        ));
+        let mut entry = FdEntry::new(desc);
+        entry.flags = fd_flags;
+        inner.fd_table[fd] = Some(entry);
         Ok(fd as isize)
     })
 }
@@ -283,9 +480,19 @@ pub fn sys_pipe2(pipefd: *mut i32, _flags: i32) -> isize {
         let mut inner = process.inner_exclusive_access();
         let (pipe_read, pipe_write) = make_pipe();
         let read_fd = inner.alloc_fd();
-        inner.fd_table[read_fd] = Some(pipe_read);
+        inner.fd_table[read_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
+            pipe_read,
+            AccessMode::ReadOnly,
+            FileStatusFlags::empty(),
+            0,
+        ))));
         let write_fd = inner.alloc_fd();
-        inner.fd_table[write_fd] = Some(pipe_write);
+        inner.fd_table[write_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
+            pipe_write,
+            AccessMode::WriteOnly,
+            FileStatusFlags::empty(),
+            0,
+        ))));
         drop(inner);
         *translated_refmut(token, pipefd).or_errno(ERRNO::EFAULT)? = read_fd as i32;
         *translated_refmut(token, unsafe { pipefd.add(1) }).or_errno(ERRNO::EFAULT)? = write_fd as i32;
@@ -311,7 +518,11 @@ pub fn sys_dup(fd: u32) -> isize {
             return Err(ERRNO::EBADF);
         }
         let new_fd = inner.alloc_fd();
-        inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
+        let desc = Arc::clone(&inner.fd_table[fd].as_ref().unwrap().desc);
+        inner.fd_table[new_fd] = Some(FdEntry {
+            desc,
+            flags: FdFlags::empty(),
+        });
         Ok(new_fd as isize)
     })
 }
@@ -341,7 +552,11 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
         }
         // If newfd is already open, close it first.
         inner.fd_table[newfd].take();
-        inner.fd_table[newfd] = Some(Arc::clone(inner.fd_table[oldfd].as_ref().unwrap()));
+        let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
+        inner.fd_table[newfd] = Some(FdEntry {
+            desc,
+            flags: FdFlags::empty(),
+        });
         Ok(newfd as isize)
     })
 }
@@ -352,18 +567,66 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
         "kernel:pid[{}] sys_fstat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let process = current_process();
     syscall_body!({
         let fd = fd as usize;
-        let inner = process.inner_exclusive_access();
-        let file = inner
-            .fd_table
-            .get(fd)
-            .and_then(|f| f.as_ref())
-            .ok_or(ERRNO::EBADF)?
-            .clone();
-        drop(inner);
-        let stat = file.stat();
+        let desc = get_file_description(fd)?;
+        let stat = desc.stat();
+        write_pod_to_user(st, &stat)?;
+        Ok(0)
+    })
+}
+
+/// `newfstatat` 系统调用：按目录 fd 与路径查询文件元数据。
+pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_newfstatat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let flags = flags as u32;
+        let supported_flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+        if flags & !supported_flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            // TODO: 当前 VFS 尚未实现 symlink，暂时按普通路径 stat 处理。
+            warn!(
+                "sys_newfstatat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to stat target path"
+            );
+        }
+        if path.is_empty() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(ERRNO::ENOENT);
+            }
+            if dirfd == AT_FDCWD {
+                let cwd = current_process().inner_exclusive_access().cwd.clone();
+                let inode = lookup_inode(cwd.as_str()).ok_or(ERRNO::ENOENT)?;
+                let stat = inode_stat(&inode);
+                write_pod_to_user(st, &stat)?;
+                return Ok(0);
+            }
+            if dirfd < 0 {
+                return Err(ERRNO::EBADF);
+            }
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            let desc = inner
+                .fd_table
+                .get(dirfd as usize)
+                .and_then(|entry| entry.as_ref())
+                .map(|entry| entry.desc.clone())
+                .ok_or(ERRNO::EBADF)?;
+            drop(inner);
+            let stat = desc.stat();
+            write_pod_to_user(st, &stat)?;
+            return Ok(0);
+        }
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+        let stat = inode_stat(&inode);
         write_pod_to_user(st, &stat)?;
         Ok(0)
     })
@@ -518,21 +781,13 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         "kernel:pid[{}] sys_getdents64",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let process = current_process();
     syscall_body!({
         let fd = fd as usize;
-        let inner = process.inner_exclusive_access();
-        let file = inner
-            .fd_table
-            .get(fd)
-            .and_then(|f| f.as_ref())
-            .ok_or(ERRNO::EBADF)?
-            .clone();
-        drop(inner);
+        let desc = get_file_description(fd)?;
         // Fill a kernel-side temporary buffer …
         let mut tmp: Vec<u8> = Vec::new();
         tmp.resize(count, 0u8);
-        let bytes = file.getdents64(&mut tmp);
+        let bytes = desc.getdents64(&mut tmp);
         if bytes == 0 {
             return Ok(0);
         }
