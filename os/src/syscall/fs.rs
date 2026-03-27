@@ -1174,7 +1174,13 @@ pub fn sys_ppoll_time32(
         let mut pollfds = copy_user_pollfds(token, ufds, nfds as usize)?;
         let timeout_ms = parse_timeout_ms(token, tmo_p)?;
         let start_ms = get_time_ms();
-        let deadline = timeout_ms.and_then(|ms| start_ms.checked_add(ms));
+        let deadline = match timeout_ms {
+            None => None,
+            Some(ms) => match start_ms.checked_add(ms) {
+                Some(d) => Some(d),
+                None => return Err(ERRNO::EINVAL),
+            },
+        };
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
 
         let process = current_process();
