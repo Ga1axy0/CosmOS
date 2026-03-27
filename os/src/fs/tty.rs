@@ -203,7 +203,7 @@ impl File for TtyFile {
         self.writable
     }
 
-    fn read(&self, mut user_buf: UserBuffer) -> usize {
+    fn read_at(&self, _offset: usize, mut user_buf: UserBuffer) -> usize {
         // 当前 tty 仍沿用旧控制台模型，一次只读取一个字节。
         // TODO: 支持按行缓冲、非阻塞和更通用的多字节读取。
         assert_eq!(user_buf.len(), 1);
@@ -214,7 +214,7 @@ impl File for TtyFile {
         1
     }
 
-    fn write(&self, buf: UserBuffer) -> usize {
+    fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         let mut n = 0usize;
         for slice in buf.buffers.iter() {
             for &ch in slice.iter() {

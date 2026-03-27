@@ -120,7 +120,7 @@ impl File for Pipe {
     fn writable(&self) -> bool {
         self.writable
     }
-    fn read(&self, buf: UserBuffer) -> usize {
+    fn read_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         trace!("kernel: Pipe::read");
         assert!(self.readable());
         let want_to_read = buf.len();
@@ -160,7 +160,7 @@ impl File for Pipe {
             ring_buffer.write_wait_queue.wake_one();
         }
     }
-    fn write(&self, buf: UserBuffer) -> usize {
+    fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         trace!("kernel: Pipe::write");
         assert!(self.writable());
         let want_to_write = buf.len();

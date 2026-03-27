@@ -20,41 +20,29 @@ compile_error!("Enable one of the cargo features: ext4 | easyfs | fat32");
 
 /// inode in memory
 pub struct OSInode {
-    readable: bool,
-    writable: bool,
     path: String,
-    inner: SpinNoIrqLock<OSInodeInner>,
-}
-/// inner of inode in memory
-pub struct OSInodeInner {
-    offset: usize,
     inode: Arc<Inode>,
 }
 
 impl OSInode {
     /// create a new inode in memory
-    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>, path: String) -> Self {
+    pub fn new(inode: Arc<Inode>, path: String) -> Self {
         trace!("kernel: OSInode::new");
-        Self {
-            readable,
-            writable,
-            path,
-            inner: unsafe { SpinNoIrqLock::new(OSInodeInner { offset: 0, inode }) },
-        }
+        Self { path, inode }
     }
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
-        let mut inner = self.inner.lock();
         let mut buffer: Vec<u8> = alloc::vec![0; 8192];
         let mut v: Vec<u8> = Vec::new();
+        let mut offset = 0usize;
         loop {
-            let len = inner.inode.read_at(inner.offset, &mut buffer);
+            let len = self.inode.read_at(offset, &mut buffer);
             if len == 0 {
                 break;
             }
-            inner.offset += len;
-            trace!("OSInode::read_all: read {} bytes, offset now {}", len, inner.offset);
+            offset += len;
+            trace!("OSInode::read_all: read {} bytes, offset now {}", len, offset);
             v.extend_from_slice(&buffer[..len]);
         }
         v
@@ -65,6 +53,10 @@ impl OSInode {
 pub const AT_FDCWD: isize = -100;
 /// `unlinkat` flag for removing an empty directory instead of a non-directory.
 pub const AT_REMOVEDIR: u32 = 0x200;
+/// `newfstatat` 标志：返回符号链接自身状态而非目标状态。
+pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+/// `newfstatat` 标志：允许空路径并直接作用于 `dirfd`。
+pub const AT_EMPTY_PATH: u32 = 0x1000;
 
 lazy_static! {
     /// Tracks virtual directories created by `do_mount` for sub-path mounts.
@@ -330,7 +322,6 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
     trace!("kernel: open_file_at: cwd={}, path={}, flags={:?}", cwd, path, flags);
     let abs = canonicalize(cwd, path);
     debug!("open_file_at: path = {} -> abs path = {}", path, abs);
-    let (readable, writable) = flags.read_write();
 
     if flags.contains(OpenFlags::CREATE) {
         // Navigate to the parent directory and create the file there.
@@ -338,16 +329,11 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
         if let Some(existing) = parent.find(&name) {
             // File already exists: truncate if asked, then return it.
             existing.clear();
-            Some(Arc::new(OSInode::new(
-                readable,
-                writable,
-                existing,
-                abs.clone(),
-            )))
+            Some(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
             parent
                 .create(&name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode, abs.clone())))
+                .map(|inode| Arc::new(OSInode::new(inode, abs.clone())))
         }
     } else {
         lookup_inode(&abs).map(|inode| {
@@ -355,7 +341,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
                 debug!("open_file_at: truncating existing file at {}", abs);
                 inode.clear();
             }
-            Arc::new(OSInode::new(readable, writable, inode, abs.clone()))
+            Arc::new(OSInode::new(inode, abs.clone()))
         })
     }
 }
@@ -418,25 +404,24 @@ impl OpenFlags {
 /// Open a file
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     trace!("kernel: open_file: name = {}, flags = {:?}", name, flags);
-    let (readable, writable) = flags.read_write();
     let abs = canonicalize("/", name);
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
             // clear size
             inode.clear();
-            Some(Arc::new(OSInode::new(readable, writable, inode, abs)))
+            Some(Arc::new(OSInode::new(inode, abs)))
         } else {
             // create file
             ROOT_INODE
                 .create(name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode, canonicalize("/", name))))
+                .map(|inode| Arc::new(OSInode::new(inode, canonicalize("/", name))))
         }
     } else {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.clear();
             }
-            Arc::new(OSInode::new(readable, writable, inode, abs))
+            Arc::new(OSInode::new(inode, abs))
         })
     }
 }
@@ -491,37 +476,22 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
 impl File for OSInode {
     /// file readable?
     fn readable(&self) -> bool {
-        self.readable
+        // 目录项遍历走 `getdents64`，普通 `read` 仅对常规文件开放。
+        !self.inode.is_dir()
     }
     /// file writable?
     fn writable(&self) -> bool {
-        self.writable
+        // 目录修改应走 `mkdir/unlink/link` 等路径操作，而不是普通 `write`。
+        !self.inode.is_dir()
     }
     fn is_dir(&self) -> bool {
-        self.inner.lock().inode.is_dir()
-    }
-    /// read file data into buffer
-    fn read(&self, mut buf: UserBuffer) -> usize {
-        trace!("kernel: OSInode::read");
-        let mut inner = self.inner.lock();
-        let mut total_read_size = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            debug!("OSInode::read: offset={}, slice_len={}", inner.offset, slice.len());
-            let read_size = inner.inode.read_at(inner.offset, *slice);
-            if read_size == 0 {
-                break;
-            }
-            inner.offset += read_size;
-            total_read_size += read_size;
-        }
-        total_read_size
+        self.inode.is_dir()
     }
     fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
-        let inner = self.inner.lock();
         let mut file_off = offset;
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let read_size = inner.inode.read_at(file_off, *slice);
+            let read_size = self.inode.read_at(file_off, *slice);
             if read_size == 0 {
                 break;
             }
@@ -533,23 +503,21 @@ impl File for OSInode {
         }
         total_read_size
     }
-    /// write buffer data into file
-    fn write(&self, buf: UserBuffer) -> usize {
-        trace!("kernel: OSInode::write");
-        let mut inner = self.inner.lock();
+    fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let mut total_write_size = 0usize;
+        let mut file_off = offset;
         for slice in buf.buffers.iter() {
-            let write_size = inner.inode.write_at(inner.offset, *slice);
+            let write_size = self.inode.write_at(file_off, *slice);
             assert_eq!(write_size, slice.len());
-            inner.offset += write_size;
+            file_off += write_size;
             total_write_size += write_size;
         }
         total_write_size
     }
     /// Fill `buf` with `linux_dirent64` records from the directory.
     ///
-    /// `inner.offset` is used as an **entry index** (not a byte offset) so that
-    /// successive calls pick up where the previous call left off.
+    /// `offset` is used as an **entry index** (not a byte offset) so that
+    /// callers can place the shared directory position in `FileDescription`.
     ///
     /// Each record layout (`linux_dirent64`):
     /// ```text
@@ -559,16 +527,14 @@ impl File for OSInode {
     ///   +18  d_type   u8   (DT_DIR=4, DT_REG=8, DT_UNKNOWN=0)
     ///   +19  d_name[] null-terminated name, padded to make reclen a multiple of 8
     /// ```
-    fn getdents64(&self, buf: &mut [u8]) -> usize {
-        let mut inner = self.inner.lock();
-        if !inner.inode.is_dir() {
+    fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if !self.inode.is_dir() {
             return 0;
         }
-        let inode = Arc::clone(&inner.inode);
+        let inode = Arc::clone(&self.inode);
         let entries = inode.ls();
-        let start_idx = inner.offset; // entry index, not byte offset
+        let start_idx = offset; // entry index, not byte offset
         let mut written = 0usize;
-        let mut new_idx = start_idx;
 
         for (i, name) in entries.iter().enumerate().skip(start_idx) {
             let name_bytes = name.as_bytes();
@@ -598,44 +564,50 @@ impl File for OSInode {
                 *b = 0;
             }
             written += reclen;
-            new_idx = i + 1;
         }
-        inner.offset = new_idx;
         written
     }
 
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
     fn stat(&self) -> Stat {
-        let inner = self.inner.lock();
-        let mode = if inner.inode.is_dir() {
-            StatMode::DIR
-        } else {
-            StatMode::FILE
-        };
-        Stat {
-            dev: 0,
-            ino: inner.inode.ino(),
-            mode,
-            nlink: inner.inode.nlink(),
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            pad0: 0,
-            size: inner.inode.size() as i64,
-            blksize: 512,
-            pad1: 0,
-            blocks: (inner.inode.size() as u64 + 511) / 512,
-            atime_sec: 0,
-            atime_nsec: 0,
-            mtime_sec: 0,
-            mtime_nsec: 0,
-            ctime_sec: 0,
-            ctime_nsec: 0,
-            unused: [0; 2],
-        }
+        inode_stat(&self.inode)
     }
 
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
+    }
+}
+
+/// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。
+pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
+    let mode = if inode.is_dir() {
+        StatMode::DIR
+    } else {
+        StatMode::FILE
+    };
+    Stat {
+        dev: 0,
+        ino: inode.ino(),
+        mode,
+        nlink: inode.nlink(),
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        pad0: 0,
+        size: inode.size() as i64,
+        blksize: 512,
+        pad1: 0,
+        blocks: (inode.size() as u64 + 511) / 512,
+        atime_sec: 0,
+        atime_nsec: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+        unused: [0; 2],
     }
 }
 

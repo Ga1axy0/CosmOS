@@ -6,13 +6,41 @@ use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
-use crate::fs::{new_stdio_files, File};
+use crate::fs::{new_stdio_files, FileDescription};
 use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+
+bitflags! {
+    /// fd 表项级别的标志位。
+    pub struct FdFlags: u32 {
+        /// `exec` 成功后自动关闭该 fd。
+        const CLOEXEC = 0x1;
+    }
+}
+
+/// fd 表中的单个表项，区分 fd 自身标志与底层文件对象。
+#[derive(Clone)]
+pub struct FdEntry {
+    /// 当前 fd 引用的打开文件描述。
+    pub desc: Arc<FileDescription>,
+    /// 当前 fd 的局部标志位。
+    pub flags: FdFlags,
+}
+
+impl FdEntry {
+    /// 基于文件对象创建默认 fd 表项。
+    pub fn new(desc: Arc<FileDescription>) -> Self {
+        Self {
+            desc,
+            // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
+            flags: FdFlags::empty(),
+        }
+    }
+}
 
 /// Process termination reason preserved for wait4/waitpid encoding.
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +94,7 @@ pub struct ProcessControlBlockInner {
     /// exit reason observed by wait4/waitpid
     pub exit_reason: ExitReason,
     /// file descriptor table
-    pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub fd_table: Vec<Option<FdEntry>>,
     /// pending process signals
     pub pending_signals: SignalFlags,
     /// blocked process signals
@@ -278,6 +306,8 @@ impl ProcessControlBlock {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
             inner.vm_layout = vm_layout;
+            // 按 Linux 语义，`exec` 成功后应关闭所有带 `FD_CLOEXEC` 的 fd。
+            Self::close_cloexec_fds(&mut inner);
         }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
@@ -370,6 +400,19 @@ impl ProcessControlBlock {
         Ok(())
     }
 
+    /// 关闭当前进程中所有带 `FD_CLOEXEC` 的 fd 表项。
+    fn close_cloexec_fds(inner: &mut ProcessControlBlockInner) {
+        for entry in inner.fd_table.iter_mut() {
+            let should_close = entry
+                .as_ref()
+                .map(|entry| entry.flags.contains(FdFlags::CLOEXEC))
+                .unwrap_or(false);
+            if should_close {
+                *entry = None;
+            }
+        }
+    }
+
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         trace!("kernel: fork");
@@ -382,10 +425,10 @@ impl ProcessControlBlock {
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
+            if let Some(entry) = fd {
+                new_fd_table.push(Some(entry.clone()));
             } else {
                 new_fd_table.push(None);
             }
@@ -465,10 +508,10 @@ impl ProcessControlBlock {
         let mut parent = self.inner_exclusive_access();
         let cred = parent.cred;
         let pid = pid_alloc();
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
+        let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
+            if let Some(entry) = fd {
+                new_fd_table.push(Some(entry.clone()));
             } else {
                 new_fd_table.push(None);
             }
