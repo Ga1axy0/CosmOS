@@ -59,11 +59,17 @@ const POLLHUP: u16 = 0x010; // hung up
 const POLLNVAL: u16 = 0x020;    // invalid fd
 /// 事件注册表耗尽时，回退轮询的休眠步长（毫秒）。
 const PPOLL_FALLBACK_POLL_MS: usize = 10;
+/// 单次 `ppoll`/`poll` 调用允许的最大 fd 数量上限，用于防止恶意的大规模分配。
+const MAX_POLL_NFDS: usize = 4096;
 
 /// 从用户态复制 `pollfd` 数组，兼容跨页布局。
 fn copy_user_pollfds(token: usize, ufds: *mut PollFd, nfds: usize) -> Result<Vec<PollFd>, ERRNO> {
     if nfds == 0 {
         return Ok(Vec::new());
+    }
+    // 防止用户态传入过大的 nfds 造成巨量内存分配或 panic。
+    if nfds > MAX_POLL_NFDS {
+        return Err(ERRNO::EINVAL);
     }
     let bytes_len = size_of::<PollFd>()
         .checked_mul(nfds)
@@ -71,7 +77,11 @@ fn copy_user_pollfds(token: usize, ufds: *mut PollFd, nfds: usize) -> Result<Vec
     let bytes = translated_byte_buffer(token, ufds as *const u8, bytes_len)
         .or_errno(ERRNO::EFAULT)?;
 
-    let mut pollfds = Vec::with_capacity(nfds);
+    let mut pollfds: Vec<PollFd> = Vec::new();
+    // 使用可失败分配，避免在内存不足时 panic。
+    pollfds
+        .try_reserve_exact(nfds)
+        .map_err(|_| ERRNO::ENOMEM)?;
     let mut scratch = [0u8; size_of::<PollFd>()];
     let mut scratch_len = 0usize;
     for chunk in bytes {
