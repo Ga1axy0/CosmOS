@@ -10,13 +10,16 @@ use crate::syscall::times::Timespec;
 use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
-use crate::task::{current_process, current_task, current_user_token, FdEntry, FdFlags};
+use crate::task::{
+    block_current_and_run_next, current_process, current_task, current_user_token, FdEntry,
+    FdFlags, WaitReason,
+};
 use crate::timer::get_realtime_ns;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use crate::timer::{add_timer_with_poll_tag, get_time_ms};
+use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
 use crate::task::SignalFlags;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
@@ -54,6 +57,8 @@ const POLLOUT: u16 = 0x004; // writable
 const POLLERR: u16 = 0x008; // error
 const POLLHUP: u16 = 0x010; // hung up
 const POLLNVAL: u16 = 0x020;    // invalid fd
+/// 事件注册表耗尽时，回退轮询的休眠步长（毫秒）。
+const PPOLL_FALLBACK_POLL_MS: usize = 10;
 
 /// 从用户态复制 `pollfd` 数组，兼容跨页布局。
 fn copy_user_pollfds(token: usize, ufds: *mut PollFd, nfds: usize) -> Result<Vec<PollFd>, ERRNO> {
@@ -1213,7 +1218,24 @@ pub fn sys_ppoll_time32(
                     rows
                 };
 
-                let handle = poll::register_poll_wait(pid, &task, &interests)?;
+                let handle = match poll::register_poll_wait(pid, &task, &interests) {
+                    Ok(handle) => handle,
+                    Err(ERRNO::ENOSPC) => {
+                        // 回退路径：全局 poll 键/行耗尽时，短周期睡眠后重新扫描 fd 集，
+                        // 避免直接失败，同时不引入忙等。
+                        let sleep_until = if let Some(dl) = deadline {
+                            let remain = dl.saturating_sub(now_ms);
+                            let step = PPOLL_FALLBACK_POLL_MS.min(remain);
+                            now_ms.saturating_add(step)
+                        } else {
+                            now_ms.saturating_add(PPOLL_FALLBACK_POLL_MS)
+                        };
+                        add_timer(sleep_until, Arc::clone(&task));
+                        block_current_and_run_next(WaitReason::Poll);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if let Some(dl) = deadline {
                     debug!("sys_ppoll_time32: wait with timeout, now = {}, deadline = {}", now_ms, dl);
                     add_timer_with_poll_tag(dl, Arc::clone(&task), Some(handle.timer_tag()));
