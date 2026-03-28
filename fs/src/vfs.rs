@@ -93,6 +93,11 @@ pub trait VfsNode: Send + Sync + Any {
     ) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
+
+    /// Update `atime`/`mtime`/`ctime` to the same timestamp.
+    fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
+        self.set_times(Some(now), Some(now), Some(now))
+    }
 }
 
 pub struct Inode {
@@ -187,6 +192,11 @@ impl Inode {
         ctime: Option<InodeTime>,
     ) -> Result<(), FS_ERRNO> {
         self.inner.set_times(atime, mtime, ctime)
+    }
+
+    /// Update `atime`/`mtime`/`ctime` to the same timestamp.
+    pub fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
+        self.inner.set_times_now(now)
     }
 
     /// Returns a clone of the raw [`VfsNode`] backing this inode.
