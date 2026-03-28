@@ -890,7 +890,11 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
             // );
         }
 
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = if path.is_null() && (flags & AT_EMPTY_PATH as i32 != 0) { 
+            String::new()
+        } else {
+            translated_str(token, path).or_errno(ERRNO::EFAULT)?
+        };
         debug!("sys_utimensat: dirfd = {}, path = {}, flags = {}", dirfd, path, flags);
         let inode = resolve_utimensat_inode(dirfd, path.as_str(), flags)?;
 
@@ -919,7 +923,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
             return Ok(0);
         }
 
-        inode.set_times(atime, mtime, Some(now)).map_err(ERRNO::from)?;
+        inode.set_times(atime, mtime, Some(now))?;
         Ok(0)
     })
 }
