@@ -1,14 +1,16 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
-    FileDescription, FileStatusFlags, OpenFlags, Stat, canonicalize, do_umount,
+    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, canonicalize, do_umount,
     inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device,
     open_file_at, unlinkat,
 };
-use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
+use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
 use crate::syscall::errno::{OrErrno, ERRNO};
+use crate::syscall::times::Timespec;
 use crate::syscall::{write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
 use crate::task::{current_process, current_task, current_user_token, FdEntry, FdFlags};
+use crate::timer::get_realtime_ns;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -114,6 +116,68 @@ fn copy_user_iovecs(token: usize, iov: *const IoVec, iovcnt: i32) -> Result<Vec<
     Ok(iovecs)
 }
 
+/// 从用户态复制 `utimensat` 需要的两个 `timespec`，允许结构体跨页。
+fn copy_user_timespec_pair(token: usize, times: *const Timespec) -> Result<[Timespec; 2], ERRNO> {
+    let raw_len = 2 * size_of::<Timespec>();
+    let raw_chunks = translated_byte_buffer(token, times as *const u8, raw_len)
+        .or_errno(ERRNO::EFAULT)?;
+    let mut raw = [0u8; 2 * size_of::<Timespec>()];
+    let mut copied = 0usize;
+    for chunk in raw_chunks {
+        if copied >= raw.len() {
+            break;
+        }
+        let take = (raw.len() - copied).min(chunk.len());
+        raw[copied..copied + take].copy_from_slice(&chunk[..take]);
+        copied += take;
+    }
+    if copied != raw.len() {
+        return Err(ERRNO::EFAULT);
+    }
+    let atime = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const Timespec) };
+    let mtime = unsafe {
+        core::ptr::read_unaligned(raw[size_of::<Timespec>()..].as_ptr() as *const Timespec)
+    };
+    Ok([atime, mtime])
+}
+
+/// 解析 `utimensat` 的单个时间参数。
+fn parse_utime_arg(ts: Timespec) -> Result<UtimeArg, ERRNO> {
+    match ts.tv_nsec {
+        UTIME_NOW => Ok(UtimeArg::Now),
+        UTIME_OMIT => Ok(UtimeArg::Omit),
+        nsec if nsec < 1_000_000_000 => Ok(UtimeArg::Set(InodeTime::new(ts.tv_sec as u64, nsec as u32))),
+        _ => Err(ERRNO::EINVAL),
+    }
+}
+
+/// 根据 `dirfd + path + flags` 解析 `utimensat` 目标 inode。
+fn resolve_utimensat_inode(
+    dirfd: isize,
+    path: &str,
+    flags: i32,
+) -> Result<Arc<fs::Inode>, ERRNO> {
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH as i32 == 0 {
+            return Err(ERRNO::ENOENT);
+        }
+        if dirfd == AT_FDCWD {
+            let cwd = current_process().inner_exclusive_access().cwd.clone();
+            return lookup_inode(cwd.as_str()).ok_or(ERRNO::ENOENT);
+        }
+        if dirfd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        let desc = get_file_description(dirfd as usize)?;
+        let target_path = desc.path().ok_or(ERRNO::EBADF)?;
+        return lookup_inode(target_path.as_str()).ok_or(ERRNO::ENOENT);
+    }
+
+    let cwd = resolve_dirfd_base(dirfd, path)?;
+    let abs_path = canonicalize(cwd.as_str(), path);
+    lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)
+}
+
 fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     if path.starts_with('/') {
         return Ok(String::from("/"));
@@ -145,6 +209,16 @@ const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+
+const UTIME_NOW: usize = 0x3fff_ffff;
+const UTIME_OMIT: usize = 0x3fff_fffe;
+
+#[derive(Clone, Copy)]
+enum UtimeArg {
+    Now,
+    Omit,
+    Set(InodeTime),
+}
 
 /// `fcntl(F_GETFD/F_SETFD)` 可见的 fd 标志位。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -794,6 +868,58 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         // … then copy to user space.
         write_bytes_to_user(buf, &tmp[..bytes])?;
         Ok(bytes as isize)
+    })
+}
+
+pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_utimensat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+
+    let token = current_user_token();
+    syscall_body!({
+        let supported_flags = (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as i32;
+        if flags & !supported_flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if flags & AT_SYMLINK_NOFOLLOW as i32 != 0 {
+            // TODO: 当前 VFS 尚未实现 symlink，先按普通路径处理。
+            warn!(
+                "sys_utimensat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to normal path"
+            );
+        }
+
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let inode = resolve_utimensat_inode(dirfd, path.as_str(), flags)?;
+
+        let now_ns = get_realtime_ns();
+        let now = InodeTime::new(now_ns / 1_000_000_000, (now_ns % 1_000_000_000) as u32);
+
+        let (atime_req, mtime_req) = if times.is_null() {
+            (UtimeArg::Now, UtimeArg::Now)
+        } else {
+            let pair = copy_user_timespec_pair(token, times)?;
+            (parse_utime_arg(pair[0])?, parse_utime_arg(pair[1])?)
+        };
+
+        let atime = match atime_req {
+            UtimeArg::Now => Some(now),
+            UtimeArg::Omit => None,
+            UtimeArg::Set(ts) => Some(ts),
+        };
+        let mtime = match mtime_req {
+            UtimeArg::Now => Some(now),
+            UtimeArg::Omit => None,
+            UtimeArg::Set(ts) => Some(ts),
+        };
+
+        if atime.is_none() && mtime.is_none() {
+            return Ok(0);
+        }
+
+        inode.set_times(atime, mtime, Some(now)).map_err(ERRNO::from)?;
+        Ok(0)
     })
 }
 

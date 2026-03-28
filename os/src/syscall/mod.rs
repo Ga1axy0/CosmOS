@@ -48,6 +48,8 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_WRITEV: usize = 66;
 /// newfstatat syscall
 pub const SYSCALL_NEWFSTATAT: usize = 79;
+/// utimensat syscall
+pub const SYSCALL_UTIMENSAT: usize = 88;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// exit syscall
@@ -223,6 +225,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as isize,
             args[1] as *const u8,
             args[2] as *mut Stat,
+            args[3] as i32,
+        ),
+        SYSCALL_UTIMENSAT => sys_utimensat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const Timespec,
             args[3] as i32,
         ),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),

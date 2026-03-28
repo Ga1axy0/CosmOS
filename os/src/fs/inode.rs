@@ -588,6 +588,9 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
     } else {
         StatMode::FILE
     };
+    let atime = inode.atime();
+    let mtime = inode.mtime();
+    let ctime = inode.ctime();
     Stat {
         dev: 0,
         ino: inode.ino(),
@@ -601,12 +604,12 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         blksize: 512,
         pad1: 0,
         blocks: (inode.size() as u64 + 511) / 512,
-        atime_sec: 0,
-        atime_nsec: 0,
-        mtime_sec: 0,
-        mtime_nsec: 0,
-        ctime_sec: 0,
-        ctime_nsec: 0,
+        atime_sec: atime.map(|t| t.sec as isize).unwrap_or(0),
+        atime_nsec: atime.map(|t| t.nsec as isize).unwrap_or(0),
+        mtime_sec: mtime.map(|t| t.sec as isize).unwrap_or(0),
+        mtime_nsec: mtime.map(|t| t.nsec as isize).unwrap_or(0),
+        ctime_sec: ctime.map(|t| t.sec as isize).unwrap_or(0),
+        ctime_nsec: ctime.map(|t| t.nsec as isize).unwrap_or(0),
         unused: [0; 2],
     }
 }
