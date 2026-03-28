@@ -116,23 +116,14 @@ fn write_back_pollfds(token: usize, ufds: *mut PollFd, pollfds: &[PollFd]) -> Re
     if pollfds.is_empty() {
         return Ok(());
     }
-    let bytes_len = size_of::<PollFd>()
-        .checked_mul(pollfds.len())
-        .ok_or(ERRNO::EINVAL)?;
-    let dst = translated_byte_buffer(token, ufds as *const u8, bytes_len)
-        .or_errno(ERRNO::EFAULT)?;
 
-    let src = unsafe {
-        core::slice::from_raw_parts(pollfds.as_ptr() as *const u8, bytes_len)
-    };
-    let mut copied = 0usize;
-    for chunk in dst {
-        let n = chunk.len();
-        chunk.copy_from_slice(&src[copied..copied + n]);
-        copied += n;
-    }
-    if copied != bytes_len {
-        return Err(ERRNO::EFAULT);
+    // 仅回写 `revents` 字段，保持用户态传入的 `fd` / `events` 不变，
+    // 以符合 poll/ppoll 语义并避免覆盖并发更新。
+    for (i, pfd) in pollfds.iter().enumerate() {
+        let user_pfd_ptr = unsafe { ufds.add(i) };
+        // 如果任意一个元素的用户态地址翻译失败，则返回 EFAULT。
+        let user_pfd = translated_refmut(token, user_pfd_ptr).or_errno(ERRNO::EFAULT)?;
+        user_pfd.revents = pfd.revents;
     }
     Ok(())
 }
