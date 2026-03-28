@@ -67,6 +67,7 @@ struct PollKeySlot {
     generation: u8,
     state: PollKeyState,
     task_ptr: usize,
+    owner_pid: usize,
     rows_mask: u128,
 }
 
@@ -76,6 +77,7 @@ impl Default for PollKeySlot {
             generation: 0,
             state: PollKeyState::Free,
             task_ptr: 0,
+            owner_pid: 0,
             rows_mask: 0,
         }
     }
@@ -99,7 +101,7 @@ impl PollRegistry {
         }
     }
 
-    fn alloc_key(&mut self, task_ptr: usize) -> Result<PollWaitHandle, ERRNO> {
+    fn alloc_key(&mut self, task_ptr: usize, owner_pid: usize) -> Result<PollWaitHandle, ERRNO> {
         for off in 0..MAX_POLL_KEYS {
             let idx = (self.next_key + off) % MAX_POLL_KEYS;
             if !matches!(self.key_slots[idx].state, PollKeyState::Free) {
@@ -109,6 +111,7 @@ impl PollRegistry {
             slot.generation = slot.generation.wrapping_add(1);
             slot.state = PollKeyState::Active;
             slot.task_ptr = task_ptr;
+            slot.owner_pid = owner_pid;
             slot.rows_mask = 0;
             self.next_key = (idx + 1) % MAX_POLL_KEYS;
             return Ok(PollWaitHandle {
@@ -191,6 +194,7 @@ impl PollRegistry {
         let slot = &mut self.key_slots[key_idx];
         slot.state = PollKeyState::Free;
         slot.task_ptr = 0;
+        slot.owner_pid = 0;
     }
 }
 
@@ -266,7 +270,7 @@ pub(crate) fn register_poll_wait(
 ) -> Result<PollWaitHandle, ERRNO> {
     let task_ptr = Arc::as_ptr(task) as usize;
     let mut registry = POLL_REGISTRY.lock();
-    let handle = registry.alloc_key(task_ptr)?;
+    let handle = registry.alloc_key(task_ptr, pid)?;
     let key_idx = handle.key_idx as usize;
     let key_bit = key_bit(key_idx);
 
@@ -373,6 +377,37 @@ pub(crate) fn notify_poll_source(source_id: usize, ready_mask: u16) {
     for key in wait_keys {
         POLL_WAIT_QUEUE.wake_selected(key);
     }
+}
+
+/// Notify pending signal delivery for a process and wake all active poll waiters of that pid.
+pub(crate) fn notify_poll_signal_pid(pid: usize) {
+    debug!("notify_poll_signal_pid: pid={}", pid);
+    let mut wait_keys = Vec::new();
+    {
+        let mut registry = POLL_REGISTRY.lock();
+        for key_idx in 0..MAX_POLL_KEYS {
+            let slot = &mut registry.key_slots[key_idx];
+            if slot.owner_pid != pid || !matches!(slot.state, PollKeyState::Active) {
+                continue;
+            }
+            slot.state = PollKeyState::Ready;
+            wait_keys.push(encode_wait_key(key_idx as u8, slot.generation));
+        }
+    }
+
+    for key in wait_keys {
+        POLL_WAIT_QUEUE.wake_selected(key);
+    }
+}
+
+/// Check whether a task currently has an in-flight keyed poll wait entry.
+pub(crate) fn task_has_inflight_keyed_poll_wait(task: &Arc<TaskControlBlock>) -> bool {
+    let task_ptr = Arc::as_ptr(task) as usize;
+    let registry = POLL_REGISTRY.lock();
+    registry
+        .key_slots
+        .iter()
+        .any(|slot| slot.task_ptr == task_ptr && !matches!(slot.state, PollKeyState::Free))
 }
 
 /// Timer callback for poll timeout entries.
