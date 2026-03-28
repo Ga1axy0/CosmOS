@@ -13,6 +13,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
+pub use fs::vfs::InodeTime;
 
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
