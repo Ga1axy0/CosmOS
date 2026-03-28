@@ -666,9 +666,9 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         }
         if flags & AT_SYMLINK_NOFOLLOW != 0 {
             // TODO: 当前 VFS 尚未实现 symlink，暂时按普通路径 stat 处理。
-            warn!(
-                "sys_newfstatat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to stat target path"
-            );
+            // warn!(
+            //     "sys_newfstatat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to stat target path"
+            // );
         }
         if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
@@ -844,8 +844,8 @@ pub fn sys_chdir(path: *const u8) -> isize {
 ///
 /// Each `linux_dirent64` record:
 /// ```text
-///   +0   d_ino    u64  (entry index used as synthetic inode number)
-///   +8   d_off    i64  (entry index of the *next* record)
+///   +0   d_ino    u64  (stable inode number, non-zero for valid entries)
+///   +8   d_off    i64  (directory position of the *next* record)
 ///   +16  d_reclen u16  (total record length, multiple of 8)
 ///   +18  d_type   u8   (DT_DIR = 4, DT_REG = 8, DT_UNKNOWN = 0)
 ///   +19  d_name[] null-terminated name, zero-padded to meet alignment
@@ -885,12 +885,13 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         }
         if flags & AT_SYMLINK_NOFOLLOW as i32 != 0 {
             // TODO: 当前 VFS 尚未实现 symlink，先按普通路径处理。
-            warn!(
-                "sys_utimensat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to normal path"
-            );
+            // warn!(
+            //     "sys_utimensat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to normal path"
+            // );
         }
 
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        debug!("sys_utimensat: dirfd = {}, path = {}, flags = {}", dirfd, path, flags);
         let inode = resolve_utimensat_inode(dirfd, path.as_str(), flags)?;
 
         let now_ns = get_realtime_ns();
