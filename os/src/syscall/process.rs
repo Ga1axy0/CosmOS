@@ -7,7 +7,7 @@ use crate::{
         translated_ref, translated_refmut, translated_str,
     },
     task::{
-        current_process, current_task, current_user_token, exit_current_and_run_next,
+        add_signal_to_process, current_process, current_task, current_user_token, exit_current_and_run_next,
         pid2process, suspend_current_and_run_next, ExitReason, SignalAction, SignalFlags,
         WaitReason,
     },
@@ -255,7 +255,7 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     syscall_body!({
         let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
         let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
-        process.inner_exclusive_access().pending_signals |= flag;
+        add_signal_to_process(&process, flag);
         Ok(0)
     })
 }

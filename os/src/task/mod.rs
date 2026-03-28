@@ -23,6 +23,7 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
+use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::task::manager::add_stopping_task;
 use crate::timer::remove_timer;
 use crate::timer::get_time;
@@ -260,11 +261,53 @@ pub fn current_process_is_zombie() -> bool {
     process_inner.is_zombie
 }
 
+/// Add signal to target process.
+///
+/// When the delivered signal introduces a **newly pending and unmasked** bit,
+/// proactively wake poll waiters of this process so `ppoll` can return `EINTR`.
+pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalFlags) {
+    let (pid, should_notify_poll) = {
+        let mut process_inner = process.inner_exclusive_access();
+        let newly_pending = signal & !process_inner.pending_signals;
+        process_inner.pending_signals |= signal;
+        let newly_unmasked = newly_pending & !process_inner.signal_mask;
+        (process.getpid(), !newly_unmasked.is_empty())
+    };
+
+    if should_notify_poll {
+        crate::poll::notify_poll_signal_pid(pid);
+
+        // `ppoll` 在注册表耗尽时会走 ENOSPC 回退路径，直接以 `WaitReason::Poll`
+        // 阻塞并依赖短时 timer 唤醒重扫；该路径不在 keyed poll registry 中，
+        // 需要在信号投递时主动唤醒，确保尽快返回 EINTR。
+        let tasks: Vec<Arc<TaskControlBlock>> = {
+            let process_inner = process.inner_exclusive_access();
+            process_inner
+                .tasks
+                .iter()
+                .filter_map(|slot| slot.as_ref().map(Arc::clone))
+                .collect()
+        };
+        for task in tasks {
+            if task_has_inflight_keyed_poll_wait(&task) {
+                continue;
+            }
+            let should_wake = {
+                let task_inner = task.inner_exclusive_access();
+                matches!(task_inner.wait_reason, Some(WaitReason::Poll))
+                    && matches!(task_inner.task_status, TaskStatus::Blocked | TaskStatus::PreBlocked)
+            };
+            if should_wake {
+                wakeup_task(task);
+            }
+        }
+    }
+}
+
 /// Add signal to the current task
 pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    process_inner.pending_signals |= signal;
+    add_signal_to_process(&process, signal);
 }
 
 /// the inactive(blocked) tasks are removed when the PCB is deallocated.(called by exit_current_and_run_next)
