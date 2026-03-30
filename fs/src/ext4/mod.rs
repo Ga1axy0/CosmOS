@@ -157,6 +157,50 @@ impl Ext4Inode {
             .find(|de| de.get_name() == name)
             .map(|de| (de.inode, de.get_de_type() == 2))
     }
+
+    fn rename_child_to(&self, old_name: &str, new_parent: &Self, new_name: &str) -> Result<(), FS_ERRNO> {
+        if !self.is_dir || !new_parent.is_dir {
+            return Err(FS_ERRNO::ENOTDIR);
+        }
+        if !Arc::ptr_eq(&self.fs, &new_parent.fs) {
+            return Err(FS_ERRNO::EXDEV);
+        }
+
+        let ext4 = self.fs.ext4.lock();
+        let old_entry = ext4
+            .ext4_dir_get_entries(self.inode_num)
+            .into_iter()
+            .find(|de| de.get_name() == old_name)
+            .ok_or(FS_ERRNO::ENOENT)?;
+        let child_ino = old_entry.inode;
+        let child_ref = ext4.get_inode_ref(child_ino);
+        let child_is_dir = child_ref.inode.is_dir();
+
+        if let Some(target_entry) = ext4
+            .ext4_dir_get_entries(new_parent.inode_num)
+            .into_iter()
+            .find(|de| de.get_name() == new_name)
+        {
+            let target_ino = target_entry.inode;
+            let target_ref = ext4.get_inode_ref(target_ino);
+            let target_is_dir = target_ref.inode.is_dir();
+            if child_ino == target_ino {
+                return Ok(());
+            }
+            if child_is_dir && !target_is_dir {
+                return Err(FS_ERRNO::ENOTDIR);
+            }
+            if !child_is_dir && target_is_dir {
+                return Err(FS_ERRNO::EISDIR);
+            }
+            if target_is_dir && ext4.dir_has_entry(target_ino) {
+                return Err(FS_ERRNO::ENOTEMPTY);
+            }
+        }
+
+        ext4.rename_entry(self.inode_num, old_name, new_parent.inode_num, new_name)?;
+        Ok(())
+    }
 }
 
 impl VfsNode for Ext4Inode {
@@ -363,5 +407,15 @@ impl VfsNode for Ext4Inode {
 
         ext4.write_back_inode(&mut inode_ref);
         Ok(())
+    }
+
+    fn rename_child(
+        &self,
+        old_name: &str,
+        new_parent: &Arc<dyn VfsNode>,
+        new_name: &str,
+    ) -> Result<(), FS_ERRNO> {
+        let new_parent = new_parent.as_any().downcast_ref::<Self>().ok_or(FS_ERRNO::EXDEV)?;
+        self.rename_child_to(old_name, new_parent, new_name)
     }
 }

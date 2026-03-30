@@ -68,7 +68,6 @@ pub trait VfsNode: Send + Sync + Any {
     fn rmdir(&self, _name: &str) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EACCES)
     }
-
     /// Last access timestamp.
     fn atime(&self) -> Option<InodeTime> {
         None
@@ -97,6 +96,16 @@ pub trait VfsNode: Send + Sync + Any {
     /// Update `atime`/`mtime`/`ctime` to the same timestamp.
     fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
         self.set_times(Some(now), Some(now), Some(now))
+    }
+
+    /// Rename or move a child entry from this directory to `new_parent/new_name`.
+    fn rename_child(
+        &self,
+        _old_name: &str,
+        _new_parent: &Arc<dyn VfsNode>,
+        _new_name: &str,
+    ) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
     }
 }
 
@@ -197,6 +206,10 @@ impl Inode {
     /// Update `atime`/`mtime`/`ctime` to the same timestamp.
     pub fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
         self.inner.set_times_now(now)
+    }
+
+    pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
+        self.inner.rename_child(old_name, &new_parent.inner, new_name)
     }
 
     /// Returns a clone of the raw [`VfsNode`] backing this inode.
