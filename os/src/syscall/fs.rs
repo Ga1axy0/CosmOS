@@ -146,11 +146,11 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
             continue;
         };
 
-        let mut revents = file.poll(pfd.events as u16);
-        if !file.readable() && (pfd.events as u16 & POLLIN) != 0 {
+        let mut revents = file.desc.poll(pfd.events as u16);
+        if !file.desc.readable() && (pfd.events as u16 & POLLIN) != 0 {
             revents |= POLLERR;
         }
-        if !file.writable() && (pfd.events as u16 & POLLOUT) != 0 {
+        if !file.desc.writable() && (pfd.events as u16 & POLLOUT) != 0 {
             revents |= POLLERR;
         }
         // pipe 实现可能设置 POLLHUP；普通文件默认走 POLLIN/POLLOUT。
