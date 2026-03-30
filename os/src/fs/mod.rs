@@ -233,6 +233,16 @@ impl FileDescription {
         }
         read_size
     }
+
+    /// 查询底层文件对象当前已就绪的 `poll` 事件。
+    pub fn poll(&self, events: u16) -> u16 {
+        self.file.poll(events)
+    }
+
+    /// 返回该描述对应的可轮询事件源身份。
+    pub fn poll_source_id(&self) -> usize {
+        self.file.poll_source_id()
+    }
 }
 
 /// trait File for all file types
@@ -248,6 +258,27 @@ pub trait File: Send + Sync {
     /// 向固定偏移写入数据。
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
+    }
+    /// Query readiness for a subset of poll events.
+    ///
+    /// Input `events` is a bitmask compatible with Linux `poll(2)` bits
+    /// (`POLLIN=0x001`, `POLLOUT=0x004`, ...). The return value should contain
+    /// the subset that is currently ready.
+    fn poll(&self, events: u16) -> u16 {
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+        let mut ready = 0u16;
+        if (events & POLLIN) != 0 && self.readable() {
+            ready |= POLLIN;
+        }
+        if (events & POLLOUT) != 0 && self.writable() {
+            ready |= POLLOUT;
+        }
+        ready
+    }
+    /// 返回该对象的 poll 事件源标识。
+    fn poll_source_id(&self) -> usize {
+        self as *const Self as *const () as usize
     }
     /// Handle an ioctl request on this file descriptor.
     fn ioctl(&self, _req: usize, _arg: usize) -> Result<isize, ERRNO> {

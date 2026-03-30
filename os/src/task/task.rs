@@ -110,6 +110,8 @@ pub enum WaitReason {
     Nanosleep,
     /// Waiting for block device I/O completion.
     BlockDeviceIo,
+    /// Waiting for poll/ppoll readiness notification.
+    Poll,
 }
 
 #[derive(Copy, Clone, PartialEq)]
