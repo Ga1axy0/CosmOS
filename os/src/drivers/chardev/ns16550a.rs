@@ -3,6 +3,7 @@ use core::marker::PhantomData;
 
 use bitflags::bitflags;
 
+use crate::poll::{notify_poll_source, POLLIN};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
 
@@ -177,6 +178,10 @@ impl NS16550aRaw {
          None
       }
    }
+
+   fn has_data(&self) -> bool {
+      self.read_end().lsr.read().contains(LSR::DATA_READY)
+   }
 }
 
 impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
@@ -242,6 +247,11 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
       }
    }
 
+   fn has_data(&self) -> bool {
+      let inner = self.inner.lock();
+      !inner.read_buffer.is_empty() || inner.ns16550a.has_data()
+   }
+
    fn handle_irq(&self) {
       let mut inner = self.inner.lock();
       let mut pushed = false;
@@ -252,6 +262,7 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
       drop(inner);
       if pushed {
          self.rx_wait_queue.wake_one();
+         notify_poll_source(self as *const Self as usize, POLLIN);
       }
    }
 }

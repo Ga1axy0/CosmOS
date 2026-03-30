@@ -125,6 +125,11 @@ impl TtyCore {
         self.driver.write(ch);
     }
 
+    /// 返回该 tty 共享底层设备的 poll 事件源标识。
+    pub fn poll_source_id(&self) -> usize {
+        Arc::as_ptr(&self.driver) as *const () as usize
+    }
+
     /// 读取当前 tty 配置快照。
     pub fn termios(&self) -> Termios {
         self.state.lock().termios
@@ -224,6 +229,24 @@ impl File for TtyFile {
             }
         }
         n
+    }
+
+    fn poll(&self, events: u16) -> u16 {
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+
+        let mut ready = 0u16;
+        if self.readable && (events & POLLIN) != 0 && self.core.driver.has_data() {
+            ready |= POLLIN;
+        }
+        if self.writable && (events & POLLOUT) != 0 {
+            ready |= POLLOUT;
+        }
+        ready
+    }
+
+    fn poll_source_id(&self) -> usize {
+        self.core.poll_source_id()
     }
 
     fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
