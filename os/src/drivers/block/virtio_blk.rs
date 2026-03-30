@@ -127,7 +127,7 @@ impl VirtIOBlock {
             }
             completed.push_back(token);
         }
-        debug!("Length of completed queue: {}", completed.len());
+        // debug!("Length of completed queue: {}", completed.len());
     }
 
     /// Called from external interrupt path for this block device.

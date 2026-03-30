@@ -2,6 +2,23 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use crate::errno::FS_ERRNO;
+
+/// Linux-style inode timestamp snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InodeTime {
+    /// Seconds since Unix epoch.
+    pub sec: u64,
+    /// Nanoseconds within the second.
+    pub nsec: u32,
+}
+
+impl InodeTime {
+    /// Build an inode timestamp from second + nanosecond parts.
+    pub const fn new(sec: u64, nsec: u32) -> Self {
+        Self { sec, nsec }
+    }
+}
+
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
@@ -50,6 +67,36 @@ pub trait VfsNode: Send + Sync + Any {
     /// Remove an empty sub-directory in this directory.
     fn rmdir(&self, _name: &str) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EACCES)
+    }
+
+    /// Last access timestamp.
+    fn atime(&self) -> Option<InodeTime> {
+        None
+    }
+
+    /// Last modification timestamp.
+    fn mtime(&self) -> Option<InodeTime> {
+        None
+    }
+
+    /// Last metadata-change timestamp.
+    fn ctime(&self) -> Option<InodeTime> {
+        None
+    }
+
+    /// Update inode timestamps.
+    fn set_times(
+        &self,
+        _atime: Option<InodeTime>,
+        _mtime: Option<InodeTime>,
+        _ctime: Option<InodeTime>,
+    ) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
+    /// Update `atime`/`mtime`/`ctime` to the same timestamp.
+    fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
+        self.set_times(Some(now), Some(now), Some(now))
     }
 }
 
@@ -124,6 +171,32 @@ impl Inode {
 
     pub fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
         self.inner.rmdir(name)
+    }
+
+    pub fn atime(&self) -> Option<InodeTime> {
+        self.inner.atime()
+    }
+
+    pub fn mtime(&self) -> Option<InodeTime> {
+        self.inner.mtime()
+    }
+
+    pub fn ctime(&self) -> Option<InodeTime> {
+        self.inner.ctime()
+    }
+
+    pub fn set_times(
+        &self,
+        atime: Option<InodeTime>,
+        mtime: Option<InodeTime>,
+        ctime: Option<InodeTime>,
+    ) -> Result<(), FS_ERRNO> {
+        self.inner.set_times(atime, mtime, ctime)
+    }
+
+    /// Update `atime`/`mtime`/`ctime` to the same timestamp.
+    pub fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
+        self.inner.set_times_now(now)
     }
 
     /// Returns a clone of the raw [`VfsNode`] backing this inode.
