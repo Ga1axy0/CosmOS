@@ -87,6 +87,8 @@ struct TtyState {
 pub struct TtyCore {
     driver: Arc<dyn CharDevice>,
     state: SpinNoIrqLock<TtyState>,
+    /// 串行化整次 tty 写调用，避免多进程输出在字符级互相穿插。
+    tx_lock: SpinNoIrqLock<()>,
 }
 
 unsafe impl Send for TtyCore {}
@@ -104,6 +106,7 @@ impl TtyCore {
                     winsize: WinSize::default(),
                 })
             },
+            tx_lock: SpinNoIrqLock::new(()),
         }
     }
 
@@ -220,6 +223,8 @@ impl File for TtyFile {
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        // 以单次 `write` 为粒度串行化终端输出，尽量贴近 Linux tty 的整块写语义。
+        let _tx_guard = self.core.tx_lock.lock();
         let mut n = 0usize;
         for slice in buf.buffers.iter() {
             for &ch in slice.iter() {
