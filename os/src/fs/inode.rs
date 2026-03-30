@@ -478,6 +478,61 @@ pub fn linkat(old_cwd: &str, old_path: &str, new_cwd: &str, new_path: &str) -> R
     Ok(())
 }
 
+/// Rename a path from `old_path` to `new_path`.
+///
+/// Linux `renameat(2)` requires the target replacement to be atomic, so the
+/// operation is always delegated to the backend's native `rename_child`
+/// primitive instead of being emulated with `link + unlink`.
+pub fn rename_at(
+    old_cwd: &str,
+    old_path: &str,
+    new_cwd: &str,
+    new_path: &str,
+) -> Result<(), ERRNO> {
+    let old_abs = canonicalize(old_cwd, old_path);
+    let new_abs = canonicalize(new_cwd, new_path);
+    if old_abs == new_abs {
+        return Ok(());
+    }
+
+    let (old_parent, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
+    let (new_parent, new_name) = resolve_parent(new_cwd, new_path).ok_or(ERRNO::ENOENT)?;
+    if old_name.is_empty() || new_name.is_empty() {
+        return Err(ERRNO::ENOENT);
+    }
+    if !old_parent.is_dir() || !new_parent.is_dir() {
+        return Err(ERRNO::ENOTDIR);
+    }
+
+    let old_inode = old_parent.find(old_name.as_str()).ok_or(ERRNO::ENOENT)?;
+    if old_inode.is_dir() {
+        let mut old_abs_prefix = old_abs.clone();
+        if !old_abs_prefix.ends_with('/') {
+            old_abs_prefix.push('/');
+        }
+        if new_abs.starts_with(old_abs_prefix.as_str()) {
+            return Err(ERRNO::EINVAL);
+        }
+    }
+    if let Some(new_inode) = new_parent.find(new_name.as_str()) {
+        if old_inode.ino() == new_inode.ino() {
+            return Ok(());
+        }
+        if old_inode.is_dir() && !new_inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        if !old_inode.is_dir() && new_inode.is_dir() {
+            return Err(ERRNO::EISDIR);
+        }
+        if new_inode.is_dir() && !new_inode.ls().is_empty() {
+            return Err(ERRNO::ENOTEMPTY);
+        }
+    }
+
+    old_parent.rename_child(old_name.as_str(), &new_parent, new_name.as_str())?;
+    Ok(())
+}
+
 /// Remove a link at `path` relative to `cwd`.
 pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
     if flags & !AT_REMOVEDIR != 0 {

@@ -370,7 +370,7 @@ bitflags! {
 pub use inode::{
     canonicalize, do_mount, do_umount, init_dev, init_rootfs, inode_stat, linkat,
     list_apps, lookup_inode, mkdir_at, mount_device, open_file, open_file_at,
-    unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
+    rename_at, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};
