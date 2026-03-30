@@ -234,6 +234,11 @@ impl FileDescription {
         read_size
     }
 
+    /// 查询底层文件对象当前已就绪的 `poll` 事件。
+    pub fn poll(&self, events: u16) -> u16 {
+        self.file.poll(events)
+    }
+
     /// 返回该描述对应的可轮询事件源身份。
     pub fn poll_source_id(&self) -> usize {
         self.file.poll_source_id()
