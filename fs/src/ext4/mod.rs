@@ -5,11 +5,11 @@ use spin::Mutex;
 
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::errno::FS_ERRNO;
-use crate::vfs::{Inode, VfsNode};
+use crate::vfs::{Inode, InodeTime, VfsNode};
 use crate::BLOCK_SZ;
 
 use ext4_rs::{
-    BlockDevice as Ext4BlockDevice, Errno, Ext4, Ext4Error, InodeFileType
+    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType
 };
 
 /// Adapts the OS block-id based device into ext4_rs offset-based IO.
@@ -22,6 +22,21 @@ struct Ext4BlockDeviceAdapter {
 struct AlignedSector([u8; BLOCK_SZ]);
 
 const EXT4_ROOT_INODE: u32 = 2;
+
+#[inline]
+fn decode_ext4_time(sec_lo: u32, extra: u32) -> InodeTime {
+    let sec_hi = (extra & 0x3) as u64;
+    let nsec = extra >> 2;
+    InodeTime::new((sec_lo as u64) | (sec_hi << 32), nsec)
+}
+
+#[inline]
+fn encode_ext4_time(ts: InodeTime) -> (u32, u32) {
+    let sec_lo = ts.sec as u32;
+    let sec_hi = ((ts.sec >> 32) as u32) & 0x3;
+    let nsec = ts.nsec & 0x3fff_ffff;
+    (sec_lo, (nsec << 2) | sec_hi)
+}
 
 impl Ext4BlockDeviceAdapter {
     fn new(inner: Arc<dyn OsBlockDevice>) -> Self {
@@ -300,6 +315,53 @@ impl VfsNode for Ext4Inode {
         let ext4 = self.fs.ext4.lock();
         debug!("Ext4Inode rmdir: parent_inode={}, name='{}'", self.inode_num, name);
         ext4.dir_remove(self.inode_num, name).map(|_| ())?;
+        Ok(())
+    }
+
+    fn atime(&self) -> Option<InodeTime> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(decode_ext4_time(inode_ref.inode.atime(), inode_ref.inode.i_atime_extra()))
+    }
+
+    fn mtime(&self) -> Option<InodeTime> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(decode_ext4_time(inode_ref.inode.mtime(), inode_ref.inode.i_mtime_extra()))
+    }
+
+    fn ctime(&self) -> Option<InodeTime> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(decode_ext4_time(inode_ref.inode.ctime(), inode_ref.inode.i_ctime_extra()))
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<InodeTime>,
+        mtime: Option<InodeTime>,
+        ctime: Option<InodeTime>,
+    ) -> Result<(), FS_ERRNO> {
+        let ext4 = self.fs.ext4.lock();
+        let mut inode_ref = ext4.get_inode_ref(self.inode_num);
+
+        if let Some(ts) = atime {
+            let (sec_lo, extra) = encode_ext4_time(ts);
+            inode_ref.inode.set_atime(sec_lo);
+            inode_ref.inode.set_i_atime_extra(extra);
+        }
+        if let Some(ts) = mtime {
+            let (sec_lo, extra) = encode_ext4_time(ts);
+            inode_ref.inode.set_mtime(sec_lo);
+            inode_ref.inode.set_i_mtime_extra(extra);
+        }
+        if let Some(ts) = ctime {
+            let (sec_lo, extra) = encode_ext4_time(ts);
+            inode_ref.inode.set_ctime(sec_lo);
+            inode_ref.inode.set_i_ctime_extra(extra);
+        }
+
+        ext4.write_back_inode(&mut inode_ref);
         Ok(())
     }
 }

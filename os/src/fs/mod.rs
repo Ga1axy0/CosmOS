@@ -13,6 +13,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
+pub use fs::vfs::InodeTime;
 
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
@@ -193,7 +194,43 @@ impl FileDescription {
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
         let read_size = self.file.getdents64(inner.offset, buf);
-        inner.offset += read_size;
+        if read_size == 0 {
+            return 0;
+        }
+
+        // 目录位置语义由底层 `linux_dirent64.d_off` 决定。
+        // 当前内核目录实现将其编码为“下一个 entry index”。
+        let mut cursor = 0usize;
+        let mut next_off = inner.offset;
+        let mut parsed_ok = false;
+        while cursor + 19 <= read_size {
+            let reclen = u16::from_le_bytes([buf[cursor + 16], buf[cursor + 17]]) as usize;
+            if reclen == 0 || cursor + reclen > read_size {
+                break;
+            }
+            let d_off = i64::from_le_bytes([
+                buf[cursor + 8],
+                buf[cursor + 9],
+                buf[cursor + 10],
+                buf[cursor + 11],
+                buf[cursor + 12],
+                buf[cursor + 13],
+                buf[cursor + 14],
+                buf[cursor + 15],
+            ]);
+            if d_off >= 0 {
+                next_off = d_off as usize;
+                parsed_ok = true;
+            }
+            cursor += reclen;
+        }
+
+        if parsed_ok {
+            inner.offset = next_off;
+        } else {
+            // 回退：若底层未按 linux_dirent64 填充，则保持旧行为（字节偏移）。
+            inner.offset += read_size;
+        }
         read_size
     }
 }

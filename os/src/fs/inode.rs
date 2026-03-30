@@ -3,6 +3,7 @@ use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
+use crate::timer::get_realtime_ns;
 use crate::fs::devfs::BlockDevNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
@@ -57,6 +58,12 @@ pub const AT_REMOVEDIR: u32 = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 /// `newfstatat` 标志：允许空路径并直接作用于 `dirfd`。
 pub const AT_EMPTY_PATH: u32 = 0x1000;
+
+#[inline]
+fn inode_now() -> fs::vfs::InodeTime {
+    let now_ns = get_realtime_ns();
+    fs::vfs::InodeTime::new(now_ns / 1_000_000_000, (now_ns % 1_000_000_000) as u32)
+}
 
 lazy_static! {
     /// Tracks virtual directories created by `do_mount` for sub-path mounts.
@@ -331,9 +338,10 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
             existing.clear();
             Some(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
-            parent
-                .create(&name)
-                .map(|inode| Arc::new(OSInode::new(inode, abs.clone())))
+            parent.create(&name).map(|inode| {
+                let _ = inode.set_times_now(inode_now());
+                Arc::new(OSInode::new(inode, abs.clone()))
+            })
         }
     } else {
         lookup_inode(&abs).map(|inode| {
@@ -359,7 +367,9 @@ pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
             return Err(ERRNO::ENOTDIR);
         }
         // 创建失败
-        if parent.mkdir(&name).is_none() {
+        if let Some(inode) =  parent.mkdir(&name) {
+            let _ = inode.set_times_now(inode_now());
+        } else {
             return Err(ERRNO::EIO);
         }
         Ok(())
@@ -412,9 +422,10 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             Some(Arc::new(OSInode::new(inode, abs)))
         } else {
             // create file
-            ROOT_INODE
-                .create(name)
-                .map(|inode| Arc::new(OSInode::new(inode, canonicalize("/", name))))
+            ROOT_INODE.create(name).map(|inode| {
+                let _ = inode.set_times_now(inode_now());
+                Arc::new(OSInode::new(inode, canonicalize("/", name)))
+            })
         }
     } else {
         ROOT_INODE.find(name).map(|inode| {
@@ -588,6 +599,9 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
     } else {
         StatMode::FILE
     };
+    let atime = inode.atime();
+    let mtime = inode.mtime();
+    let ctime = inode.ctime();
     Stat {
         dev: 0,
         ino: inode.ino(),
@@ -601,12 +615,12 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         blksize: 512,
         pad1: 0,
         blocks: (inode.size() as u64 + 511) / 512,
-        atime_sec: 0,
-        atime_nsec: 0,
-        mtime_sec: 0,
-        mtime_nsec: 0,
-        ctime_sec: 0,
-        ctime_nsec: 0,
+        atime_sec: atime.map(|t| t.sec as isize).unwrap_or(0),
+        atime_nsec: atime.map(|t| t.nsec as isize).unwrap_or(0),
+        mtime_sec: mtime.map(|t| t.sec as isize).unwrap_or(0),
+        mtime_nsec: mtime.map(|t| t.nsec as isize).unwrap_or(0),
+        ctime_sec: ctime.map(|t| t.sec as isize).unwrap_or(0),
+        ctime_nsec: ctime.map(|t| t.nsec as isize).unwrap_or(0),
         unused: [0; 2],
     }
 }

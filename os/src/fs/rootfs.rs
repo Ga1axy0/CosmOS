@@ -35,7 +35,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
-use fs::vfs::VfsNode;
+use fs::vfs::{InodeTime, VfsNode};
 use lazy_static::*;
 
 use crate::sync::{SpinNoIrqLock};
@@ -295,6 +295,45 @@ impl VfsNode for VirtualDirNode {
             inner.overlay.clone()
         };
         overlay.ok_or(FS_ERRNO::EPERM)?.rmdir(name)
+    }
+
+    fn atime(&self) -> Option<InodeTime> {
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        overlay.and_then(|ov| ov.atime())
+    }
+
+    fn mtime(&self) -> Option<InodeTime> {
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        overlay.and_then(|ov| ov.mtime())
+    }
+
+    fn ctime(&self) -> Option<InodeTime> {
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        overlay.and_then(|ov| ov.ctime())
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<InodeTime>,
+        mtime: Option<InodeTime>,
+        ctime: Option<InodeTime>,
+    ) -> Result<(), FS_ERRNO> {
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        overlay
+            .ok_or(FS_ERRNO::EPERM)?
+            .set_times(atime, mtime, ctime)
     }
 }
 
