@@ -11,7 +11,7 @@
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
-use crate::sync::{SpinNoIrqLock};
+use crate::sync::SpinNoIrqLock;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::array;
@@ -21,6 +21,8 @@ use lazy_static::*;
 struct LocalRunQueue {
     /// 当前 hart 私有的预就绪队列；其中任务尚未对其他 hart 可见
     pre_ready_queue: VecDeque<Arc<TaskControlBlock>>,
+    /// 当前 hart 私有的预阻塞队列；任务尚未完成切出，不可被其他 hart 直接唤醒入队
+    pre_blocked_queue: VecDeque<Arc<TaskControlBlock>>,
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
     /// Keep a reference to the last task that exited so its kernel stack
     /// is not freed while we are still running on it.
@@ -31,12 +33,16 @@ impl LocalRunQueue {
     fn new() -> Self {
         Self {
             pre_ready_queue: VecDeque::new(),
+            pre_blocked_queue: VecDeque::new(),
             ready_queue: VecDeque::new(),
             stop_task: None,
         }
     }
     fn push_pre_ready(&mut self, task: Arc<TaskControlBlock>) {
         self.pre_ready_queue.push_back(task);
+    }
+    fn push_pre_blocked(&mut self, task: Arc<TaskControlBlock>) {
+        self.pre_blocked_queue.push_back(task);
     }
     fn push(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
@@ -53,6 +59,26 @@ impl LocalRunQueue {
             .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(task))
         {
             self.ready_queue.remove(idx);
+        }
+    }
+    fn remove_pre_ready(&mut self, task: &Arc<TaskControlBlock>) {
+        if let Some((idx, _)) = self
+            .pre_ready_queue
+            .iter()
+            .enumerate()
+            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(task))
+        {
+            self.pre_ready_queue.remove(idx);
+        }
+    }
+    fn remove_pre_blocked(&mut self, task: &Arc<TaskControlBlock>) {
+        if let Some((idx, _)) = self
+            .pre_blocked_queue
+            .iter()
+            .enumerate()
+            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(task))
+        {
+            self.pre_blocked_queue.remove(idx);
         }
     }
     /// Steal up to half of the tasks from this queue.
@@ -72,6 +98,31 @@ impl LocalRunQueue {
                 task_inner.task_status = TaskStatus::Ready;
             }
             self.ready_queue.push_back(task);
+        }
+    }
+    /// 将本 hart 上已安全切出的预阻塞任务完成状态发布。
+    ///
+    /// - 若切出前已收到唤醒（`wake_pending=true`），直接转为 Ready 并入本地就绪队列；
+    /// - 否则转为 Blocked，等待后续 wakeup 入队。
+    fn promote_pre_blocked(&mut self) {
+        while let Some(task) = self.pre_blocked_queue.pop_front() {
+            let should_ready = {
+                let mut task_inner = task.inner_exclusive_access();
+                if !matches!(task_inner.task_status, TaskStatus::PreBlocked) {
+                    false
+                } else if task_inner.wake_pending {
+                    task_inner.task_status = TaskStatus::Ready;
+                    task_inner.wait_reason = None;
+                    task_inner.wake_pending = false;
+                    true
+                } else {
+                    task_inner.task_status = TaskStatus::Blocked;
+                    false
+                }
+            };
+            if should_ready {
+                self.ready_queue.push_back(task);
+            }
         }
     }
 }
@@ -101,6 +152,12 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 pub fn add_task_pre_ready(task: Arc<TaskControlBlock>) {
     let hart = hartid();
     RUN_QUEUES[hart].lock().push_pre_ready(task);
+}
+
+/// 向当前 hart 的预阻塞队列添加任务。
+pub fn add_task_pre_blocked(task: Arc<TaskControlBlock>) {
+    let hart = hartid();
+    RUN_QUEUES[hart].lock().push_pre_blocked(task);
 }
 
 /// Add a task to the global overflow queue.
@@ -148,9 +205,12 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
 pub fn remove_task(task: Arc<TaskControlBlock>) {
     // Try the global queue first.
     GLOBAL_QUEUE.lock().retain(|t| Arc::as_ptr(t) != Arc::as_ptr(&task));
-    // 然后尝试从每个 hart 的真正就绪队列中删除。
+    // 然后尝试从每个 hart 的本地队列中删除（ready/pre_ready/pre_blocked）。
     for rq in RUN_QUEUES.iter() {
-        rq.lock().remove_ready(&task);
+        let mut local = rq.lock();
+        local.remove_ready(&task);
+        local.remove_pre_ready(&task);
+        local.remove_pre_blocked(&task);
     }
 }
 
@@ -158,6 +218,12 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
 pub fn promote_pre_ready_tasks() {
     let hart = hartid();
     RUN_QUEUES[hart].lock().promote_pre_ready();
+}
+
+/// 将当前 hart 延迟发布的预阻塞任务完成状态转换。
+pub fn promote_pre_blocked_tasks() {
+    let hart = hartid();
+    RUN_QUEUES[hart].lock().promote_pre_blocked();
 }
 
 /// Fetch the next task to run on the current hart.
