@@ -9,13 +9,17 @@
 //! Be careful when you see [`__switch`]. Control flow around this function
 //! might not be what you expect.
 
+#[path ="../sched/context.rs"]
 mod context;
 mod id;
+#[path = "../sched/manager.rs"]
 mod manager;
 mod action;
 mod process;
+#[path ="../sched/processor.rs"]
 mod processor;
 mod signal;
+#[path ="../sched/switch.rs"]
 mod switch;
 mod wait_queue;
 #[allow(clippy::module_inception)]
