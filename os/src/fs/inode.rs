@@ -48,6 +48,23 @@ impl OSInode {
         }
         v
     }
+
+    /// 读取文件首行，返回 `(首行字节, 是否在限制内完整读到首行)`。
+    pub fn read_first_line_limited(&self, max_len: usize) -> (Vec<u8>, bool) {
+        trace!("kernel: OSInode::read_first_line_limited, max_len={}", max_len);
+        let mut buf = alloc::vec![0; max_len];
+        let read_len = self.inode.read_at(0, &mut buf);
+        buf.truncate(read_len);
+
+        if let Some(line_end) = buf.iter().position(|&ch| ch == b'\n') {
+            buf.truncate(line_end + 1);
+            return (buf, true);
+        }
+
+        // 未读满上限说明已经到达 EOF，此时首行虽然没有换行符，也视为完整。
+        let is_complete = read_len < max_len;
+        (buf, is_complete)
+    }
 }
 
 /// Special dirfd value meaning “use the caller's current working directory”.
@@ -334,8 +351,10 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
         // Navigate to the parent directory and create the file there.
         let (parent, name) = resolve_parent(cwd, path)?;
         if let Some(existing) = parent.find(&name) {
-            // File already exists: truncate if asked, then return it.
-            existing.clear();
+            // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
+            if flags.contains(OpenFlags::TRUNC) {
+                existing.clear();
+            }
             Some(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
             parent.create(&name).map(|inode| {
@@ -417,8 +436,10 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let abs = canonicalize("/", name);
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
-            // clear size
-            inode.clear();
+            // 与 `openat(O_CREAT)` 保持一致：只有显式 `O_TRUNC` 才清空已有文件。
+            if flags.contains(OpenFlags::TRUNC) {
+                inode.clear();
+            }
             Some(Arc::new(OSInode::new(inode, abs)))
         } else {
             // create file

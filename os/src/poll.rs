@@ -274,7 +274,7 @@ pub(crate) fn register_poll_wait(
     let key_idx = handle.key_idx as usize;
     let key_bit = key_bit(key_idx);
 
-    debug!("register_poll_wait: pid={}, handle={:?}, interests={:?}", pid, handle, interests);
+    // debug!("register_poll_wait: pid={}, handle={:?}, interests={:?}", pid, handle, interests);
 
     for &(fd, source_id, events) in interests {
         let row = match registry.find_or_alloc_kernel_fd(pid, fd, source_id) {
@@ -337,7 +337,7 @@ pub(crate) fn wait_poll_key(handle: PollWaitHandle) {
 
 /// Notify readiness for a source id and wake interested wait keys.
 pub(crate) fn notify_poll_source(source_id: usize, ready_mask: u16) {
-    debug!("notify_poll_source: source_id={}, ready_mask={:#x}", source_id, ready_mask);
+    // debug!("notify_poll_source: source_id={}, ready_mask={:#x}", source_id, ready_mask);
     let mut wait_keys = Vec::new();
     {
         let mut registry = POLL_REGISTRY.lock();
