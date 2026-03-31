@@ -33,6 +33,8 @@ struct ShebangInfo {
 
 /// 允许脚本解释器递归重写的最大层数，避免循环依赖。
 const EXEC_INTERPRETER_MAX_DEPTH: usize = 4;
+/// `execve` 探测文件类型时预读的前缀长度。
+const EXEC_PROBE_SIZE: usize = 256;
 /// ELF 文件头魔数。
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 
@@ -93,12 +95,22 @@ fn resolve_exec_image(
         return Err(ERRNO::EISDIR);
     }
 
-    let file_data = inode.read_all();
-    if is_elf_image(&file_data) {
-        return Ok(ResolvedExecImage { elf_data: file_data, argv });
+    // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
+    let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    if is_elf_image(&first_line) {
+        let file_data = inode.read_all();
+        return Ok(ResolvedExecImage {
+            elf_data: file_data,
+            argv,
+        });
     }
 
-    if let Some(shebang) = parse_shebang_line(&file_data)? {
+    // 首行超过限制时直接拒绝，避免 shebang 解析继续处理不完整输入。
+    if !first_line_complete {
+        return Err(ERRNO::ENOEXEC);
+    }
+
+    if let Some(shebang) = parse_shebang_line(&first_line)? {
         // shebang 语义要求解释器路径必须是绝对路径。
         if !shebang.interpreter.starts_with('/') {
             return Err(ERRNO::ENOEXEC);

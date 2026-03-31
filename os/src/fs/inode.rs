@@ -48,6 +48,23 @@ impl OSInode {
         }
         v
     }
+
+    /// 读取文件首行，返回 `(首行字节, 是否在限制内完整读到首行)`。
+    pub fn read_first_line_limited(&self, max_len: usize) -> (Vec<u8>, bool) {
+        trace!("kernel: OSInode::read_first_line_limited, max_len={}", max_len);
+        let mut buf = alloc::vec![0; max_len];
+        let read_len = self.inode.read_at(0, &mut buf);
+        buf.truncate(read_len);
+
+        if let Some(line_end) = buf.iter().position(|&ch| ch == b'\n') {
+            buf.truncate(line_end + 1);
+            return (buf, true);
+        }
+
+        // 未读满上限说明已经到达 EOF，此时首行虽然没有换行符，也视为完整。
+        let is_complete = read_len < max_len;
+        (buf, is_complete)
+    }
 }
 
 /// Special dirfd value meaning “use the caller's current working directory”.
