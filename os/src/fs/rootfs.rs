@@ -133,6 +133,14 @@ impl VirtualDirNode {
             .and_then(|ov| ov.find(name))
             .filter(|n| n.is_dir())
     }
+
+    fn has_mount(&self, name: &str) -> bool {
+        self.inner.lock().mounts.contains_key(name)
+    }
+
+    fn overlay_node(&self) -> Option<Arc<dyn VfsNode>> {
+        self.inner.lock().overlay.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +342,29 @@ impl VfsNode for VirtualDirNode {
         overlay
             .ok_or(FS_ERRNO::EPERM)?
             .set_times(atime, mtime, ctime)
+    }
+
+    fn rename_child(
+        &self,
+        old_name: &str,
+        new_parent: &Arc<dyn VfsNode>,
+        new_name: &str,
+    ) -> Result<(), FS_ERRNO> {
+        if self.has_mount(old_name) {
+            return Err(FS_ERRNO::EBUSY);
+        }
+
+        let overlay = self.overlay_node().ok_or(FS_ERRNO::EPERM)?;
+
+        if let Some(new_parent_vdir) = new_parent.as_any().downcast_ref::<Self>() {
+            if new_parent_vdir.has_mount(new_name) {
+                return Err(FS_ERRNO::EBUSY);
+            }
+            let new_overlay = new_parent_vdir.overlay_node().ok_or(FS_ERRNO::EPERM)?;
+            overlay.rename_child(old_name, &new_overlay, new_name)
+        } else {
+            overlay.rename_child(old_name, new_parent, new_name)
+        }
     }
 }
 

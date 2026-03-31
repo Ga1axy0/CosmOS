@@ -2,6 +2,7 @@ use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, canonicalize, do_umount,
     inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device,
+    rename_at,
     open_file_at, unlinkat,
 };
 use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
@@ -1264,3 +1265,33 @@ pub fn sys_ppoll_time32(
         ret
     })
 }
+
+pub fn sys_renameat2(
+    old_dirfd: isize,
+    old_name: *const u8,
+    new_dirfd: isize,
+    new_name: *const u8,
+    flags: u32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_renameat2(flags={})",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        flags
+    );
+    if flags != 0 {
+        return -(ERRNO::EINVAL as isize);
+    }
+    let token = current_user_token();
+    syscall_body!({
+        let old_name = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
+        let new_name = translated_str(token, new_name).or_errno(ERRNO::EFAULT)?;
+        if old_name.is_empty() || new_name.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let old_cwd = resolve_dirfd_base(old_dirfd, old_name.as_str())?;
+        let new_cwd = resolve_dirfd_base(new_dirfd, new_name.as_str())?;
+        rename_at(old_cwd.as_str(), &old_name, new_cwd.as_str(), &new_name)?;
+        Ok(0)
+    })
+}
+
