@@ -1274,8 +1274,9 @@ pub fn sys_renameat2(
     flags: u32,
 ) -> isize {
     trace!(
-        "kernel:pid[{}] sys_renameat",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_renameat2(flags={})",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        flags
     );
     if flags != 0 {
         return -(ERRNO::EINVAL as isize);
