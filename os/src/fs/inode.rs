@@ -351,8 +351,10 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
         // Navigate to the parent directory and create the file there.
         let (parent, name) = resolve_parent(cwd, path)?;
         if let Some(existing) = parent.find(&name) {
-            // File already exists: truncate if asked, then return it.
-            existing.clear();
+            // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
+            if flags.contains(OpenFlags::TRUNC) {
+                existing.clear();
+            }
             Some(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
             parent.create(&name).map(|inode| {
@@ -434,8 +436,10 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let abs = canonicalize("/", name);
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
-            // clear size
-            inode.clear();
+            // 与 `openat(O_CREAT)` 保持一致：只有显式 `O_TRUNC` 才清空已有文件。
+            if flags.contains(OpenFlags::TRUNC) {
+                inode.clear();
+            }
             Some(Arc::new(OSInode::new(inode, abs)))
         } else {
             // create file

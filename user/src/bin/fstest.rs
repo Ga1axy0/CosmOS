@@ -178,7 +178,7 @@ pub fn main() -> i32 {
 	assert_eq!(&buf2[..3], b"abc");
 	assert_eq!(close(fd), 0);
 
-	// ---- CREATE existing clears (current implementation clears unconditionally) ----
+	// ---- CREATE existing should not truncate ----
 	let fd = open("F1", OpenFlags::CREATE | OpenFlags::WRONLY);
 	assert!(fd >= 0);
 	let fd = fd as usize;
@@ -192,8 +192,8 @@ pub fn main() -> i32 {
 	assert!(fd >= 0);
 	let fd = fd as usize;
 	let n = read(fd, &mut buf2);
-	// should be empty because CREATE on existing clears in kernel open_file_at
-	assert_eq!(n, 0, "CREATE on existing should clear file in current FS impl");
+	assert_eq!(n, 2, "CREATE on existing should preserve existing file content");
+	assert_eq!(&buf2[..2], b"zz");
 	assert_eq!(close(fd), 0);
 
 	// ---- open error + close invalid ----
@@ -284,4 +284,3 @@ pub fn main() -> i32 {
 	println!("[fstest] PASS");
 	0
 }
-
