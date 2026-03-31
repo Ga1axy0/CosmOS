@@ -369,6 +369,52 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     })
 }
 
+/// tkill syscall
+///
+/// 当前实现按“进程内 tid 索引”最小语义处理，仅支持向当前进程中的线程投递信号。
+pub fn sys_tkill(tid: usize, signal: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_tkill",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let target_exists = {
+            let inner = process.inner_exclusive_access();
+            tid < inner.tasks.len() && inner.tasks[tid].is_some()
+        };
+        if !target_exists {
+            return Err(ERRNO::ESRCH);
+        }
+        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        add_signal_to_process(&process, flag);
+        Ok(0)
+    })
+}
+
+/// tgkill syscall
+///
+/// 当前实现按“进程号 + 进程内 tid 索引”最小语义处理。
+pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_tgkill",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = pid2process(tgid).or_errno(ERRNO::ESRCH)?;
+        let target_exists = {
+            let inner = process.inner_exclusive_access();
+            tid < inner.tasks.len() && inner.tasks[tid].is_some()
+        };
+        if !target_exists {
+            return Err(ERRNO::ESRCH);
+        }
+        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        add_signal_to_process(&process, flag);
+        Ok(0)
+    })
+}
+
 /// sigaction 系统调用
 ///
 /// 为当前进程的指定信号安装/读取用户态处理动作。
@@ -467,6 +513,7 @@ pub struct UtsName {
     pub release: [u8; 65],
     pub version: [u8; 65],
     pub machine: [u8; 65],
+    pub domainname: [u8; 65],
 }
 
 impl Pod for UtsName {}
@@ -480,17 +527,22 @@ impl UtsName {
             release: [0; 65],
             version: [0; 65],
             machine: [0; 65],
+            domainname: [0; 65],
         };
-        let sysname = b"xxOS";
-        let nodename = b"xxNode";
-        let release = b"0.1";
-        let version = b"xxOS version 0.1";
+        // glibc 启动阶段会解析 release 进行最低内核版本判断，
+        // 这里返回 Linux 风格且足够新的版本串，避免误报 "kernel too old"。
+        let sysname = b"Linux";
+        let nodename = b"localhost";
+        let release = b"6.6.0";
+        let version = b"#1 SMP PREEMPT cosmOS";
         let machine = b"riscv64";
+        let domainname = b"localdomain";
         uname.sysname[..sysname.len()].copy_from_slice(sysname);
         uname.nodename[..nodename.len()].copy_from_slice(nodename);
         uname.release[..release.len()].copy_from_slice(release);
         uname.version[..version.len()].copy_from_slice(version);
         uname.machine[..machine.len()].copy_from_slice(machine);
+        uname.domainname[..domainname.len()].copy_from_slice(domainname);
         uname
     }
 }

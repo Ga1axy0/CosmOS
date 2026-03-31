@@ -125,6 +125,11 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
+            error!(
+                "[kernel] trap_handler: Illegal instruction in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                stval,
+                current_trap_cx().sepc,
+            );
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {

@@ -74,6 +74,10 @@ pub const SYSCALL_SYSLOG: usize = 116;
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
 pub const SYSCALL_KILL: usize = 129;
+/// tkill syscall
+pub const SYSCALL_TKILL: usize = 130;
+/// tgkill syscall
+pub const SYSCALL_TGKILL: usize = 131;
 /// sigaction syscall
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -303,6 +307,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_SIGNAL => sys_condvar_signal(args[0]),
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
+        SYSCALL_TKILL => sys_tkill(args[0], args[1] as u32),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as u32),
         _ => sys_nisyscall(syscall_id, args),
     }
 }
