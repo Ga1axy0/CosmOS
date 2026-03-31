@@ -37,7 +37,8 @@ use switch::__switch;
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{
-    add_task, add_task_global, add_task_pre_ready, pid2process, promote_pre_ready_tasks,
+    add_task, add_task_global, add_task_pre_blocked, add_task_pre_ready, pid2process,
+    promote_pre_blocked_tasks, promote_pre_ready_tasks,
     remove_from_pid2process, remove_task, wakeup_task,
 };
 pub use action::{SignalAction, SignalActions};
@@ -106,10 +107,16 @@ pub fn block_current_preblocked_and_run_next() {
             restore_current_task(task);
             return;
         }
-        
-        task_inner.task_status = TaskStatus::Blocked;
+
+        // 注意：这里不要提前发布为 Blocked。
+        // 否则在真正 __switch 之前，其他 hart 可能看到 Blocked 并把该任务唤醒入队，
+        // 导致同一任务在两个 hart 上并发执行（共享同一内核栈）。
+        task_inner.task_status = TaskStatus::PreBlocked;
     }
     process.pause_cpu_accounting(get_time());
+
+    // 延迟发布到 pre_blocked 队列，等本 hart 切回 idle 后再转成 Blocked/Ready。
+    add_task_pre_blocked(task);
     schedule(task_cx_ptr);
 }
 

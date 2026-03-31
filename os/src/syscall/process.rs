@@ -2,7 +2,7 @@ use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
-    fs::{open_file, open_file_at, File, OpenFlags},
+    fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     mm::{
         translated_ref, translated_refmut, translated_str,
     },
@@ -14,6 +14,121 @@ use crate::{
 };
 
 use alloc::{string::String, vec::Vec};
+
+/// `execve` 在解析脚本后得到的最终执行目标。
+struct ResolvedExecImage {
+    /// 最终需要交给 ELF 装载器处理的字节内容。
+    elf_data: Vec<u8>,
+    /// 按 shebang 规则重写后的参数列表。
+    argv: Vec<String>,
+}
+
+/// shebang 首行解析结果。
+struct ShebangInfo {
+    /// 解释器的绝对路径。
+    interpreter: String,
+    /// shebang 中附带的单个可选参数。
+    optional_arg: Option<String>,
+}
+
+/// 允许脚本解释器递归重写的最大层数，避免循环依赖。
+const EXEC_INTERPRETER_MAX_DEPTH: usize = 4;
+/// `execve` 探测文件类型时预读的前缀长度。
+const EXEC_PROBE_SIZE: usize = 256;
+/// ELF 文件头魔数。
+const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+/// 判断当前文件是否为 ELF 映像。
+fn is_elf_image(file_data: &[u8]) -> bool {
+    file_data.starts_with(ELF_MAGIC)
+}
+
+/// 解析脚本首行 shebang，提取解释器路径和附加参数。
+fn parse_shebang_line(file_data: &[u8]) -> Result<Option<ShebangInfo>, ERRNO> {
+    if !file_data.starts_with(b"#!") {
+        return Ok(None);
+    }
+
+    let line_end = file_data
+        .iter()
+        .position(|&ch| ch == b'\n')
+        .unwrap_or(file_data.len());
+    let line = core::str::from_utf8(&file_data[2..line_end]).or_errno(ERRNO::ENOEXEC)?;
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let line = line.trim_matches(|ch| ch == ' ' || ch == '\t');
+    if line.is_empty() {
+        return Err(ERRNO::ENOEXEC);
+    }
+
+    let mut parts = line.splitn(2, |ch: char| ch == ' ' || ch == '\t');
+    let interpreter = parts.next().unwrap();
+    if interpreter.is_empty() {
+        return Err(ERRNO::ENOEXEC);
+    }
+    // TODO: 当前仅支持 shebang 中的单个附加参数，不处理引号和转义。
+    let optional_arg = parts
+        .next()
+        .map(|rest| rest.trim_matches(|ch| ch == ' ' || ch == '\t'))
+        .filter(|rest| !rest.is_empty())
+        .map(String::from);
+
+    Ok(Some(ShebangInfo {
+        interpreter: String::from(interpreter),
+        optional_arg,
+    }))
+}
+
+/// 解析 `execve` 目标，必要时按 shebang 规则递归展开到最终 ELF。
+fn resolve_exec_image(
+    cwd: &str,
+    path: &str,
+    argv: Vec<String>,
+    depth: usize,
+) -> Result<ResolvedExecImage, ERRNO> {
+    if depth >= EXEC_INTERPRETER_MAX_DEPTH {
+        return Err(ERRNO::ELOOP);
+    }
+
+    let abs_path = canonicalize(cwd, path);
+    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
+    if inode.is_dir() {
+        return Err(ERRNO::EISDIR);
+    }
+
+    // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
+    let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    if is_elf_image(&first_line) {
+        let file_data = inode.read_all();
+        return Ok(ResolvedExecImage {
+            elf_data: file_data,
+            argv,
+        });
+    }
+
+    // 首行超过限制时直接拒绝，避免 shebang 解析继续处理不完整输入。
+    if !first_line_complete {
+        return Err(ERRNO::ENOEXEC);
+    }
+
+    if let Some(shebang) = parse_shebang_line(&first_line)? {
+        // shebang 语义要求解释器路径必须是绝对路径。
+        if !shebang.interpreter.starts_with('/') {
+            return Err(ERRNO::ENOEXEC);
+        }
+
+        // 按 Linux 语义重写 argv：解释器、可选参数、脚本绝对路径、原 argv[1..]。
+        let mut next_argv = Vec::with_capacity(argv.len() + 2);
+        next_argv.push(shebang.interpreter.clone());
+        if let Some(optional_arg) = shebang.optional_arg {
+            next_argv.push(optional_arg);
+        }
+        next_argv.push(abs_path);
+        next_argv.extend(argv.into_iter().skip(1));
+        return resolve_exec_image(cwd, shebang.interpreter.as_str(), next_argv, depth + 1);
+    }
+
+    Err(ERRNO::ENOEXEC)
+}
 /// exit syscall
 ///
 /// exit the current task and run the next task in task list
@@ -141,16 +256,10 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
 
         let process = current_process();
         let cwd = process.inner_exclusive_access().cwd.clone();
-        let app_inode =
-            open_file_at(cwd.as_str(), path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
-        if app_inode.is_dir() {
-            return Err(ERRNO::EISDIR);
-        }
-        let all_data = app_inode.read_all();
-        let argc = args_vec.len();
-        process
-            .exec(all_data.as_slice(), args_vec)
-            .or_errno(ERRNO::ENOEXEC)?;
+        let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
+        let ResolvedExecImage { elf_data, argv } = resolved;
+        let argc = argv.len();
+        process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
         // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
         Ok(argc as isize)
     })

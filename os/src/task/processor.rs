@@ -5,7 +5,7 @@
 //! and the replacement and transfer of control flow of different applications are executed.
 
 use super::__switch;
-use super::{fetch_task, promote_pre_ready_tasks, TaskStatus};
+use super::{fetch_task, promote_pre_blocked_tasks, promote_pre_ready_tasks, TaskStatus};
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
@@ -77,6 +77,7 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
 pub fn run_tasks() {
     loop {
         promote_pre_ready_tasks();
+        promote_pre_blocked_tasks();
         if let Some(task) = fetch_task() {
             // debug!(
             //     "kernel: hart {} run_tasks, pid[{}]",
