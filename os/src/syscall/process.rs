@@ -451,17 +451,48 @@ pub fn sys_sigaction(
     })
 }
 
-/// sigprocmask 系统调用
+/// sigprocmask / rt_sigprocmask 系统调用
 ///
-/// 设置当前进程的信号屏蔽字。当前实现采用“整值覆盖”语义，
-/// 尚未支持 Linux 中的 SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK 三种模式。
-pub fn sys_sigprocmask(mask: u32) -> isize {
+/// Linux 语义：
+///   how == SIG_BLOCK   (0) -> mask |= set
+///   how == SIG_UNBLOCK (1) -> mask &= ~set
+///   how == SIG_SETMASK (2) -> mask = set
+/// 参数含义遵循 rt_sigprocmask: (int how, const sigset_t *set, sigset_t *oset, size_t sigsetsize)
+pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sigprocmask",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
     syscall_body!({
+        // We represent sigset as a u32 bitmask in this kernel; require user-provided
+        // buffer to be large enough to hold at least a u32.
+        if sigsetsize < core::mem::size_of::<u32>() {
+            return Err(ERRNO::EINVAL);
+        }
+
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        // TODO: 若后续补齐完整 Linux 语义，这里应改为根据 how 参数
-        // 对旧 mask 做增量更新，并向用户态返回旧值。
-        inner.signal_mask = SignalFlags::from_bits(mask).or_errno(ERRNO::EINVAL)?;
+
+        // If user requested old mask, write it out first.
+        if !oset.is_null() {
+            let old_bits = inner.signal_mask.bits();
+            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
+            *slot = old_bits;
+        }
+
+        // If user provided a new mask, apply according to `how`.
+        if !set.is_null() {
+            let new_bits = *translated_ref(token, set).or_errno(ERRNO::EFAULT)?;
+            let new_mask = SignalFlags::from_bits(new_bits).or_errno(ERRNO::EINVAL)?;
+            match how {
+                0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
+                1 => inner.signal_mask.remove(new_mask), // SIG_UNBLOCK
+                2 => inner.signal_mask = new_mask,       // SIG_SETMASK
+                _ => return Err(ERRNO::EINVAL),
+            }
+        }
+
         Ok(0)
     })
 }
