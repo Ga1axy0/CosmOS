@@ -611,6 +611,14 @@ impl ProcessControlBlock {
             .munmap_anonymous(start, end)
     }
 
+    /// change permissions of a mapped range. return true if success
+    pub fn mprotect(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        self.inner
+            .lock()
+            .memory_set
+            .mprotect_range(start, end, perm)
+    }
+
     /// 返回当前进程用于 `mmap(NULL, ...)` 的默认起始基址。
     pub fn mmap_base(&self) -> usize {
         self.inner.lock().vm_layout.mmap_base

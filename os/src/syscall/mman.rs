@@ -8,7 +8,7 @@ use crate::{
     },
     task::{
         current_process, current_task, current_user_token,
-        mmap_current_process, munmap_current_process,
+        mmap_current_process, munmap_current_process, mprotect_current_process,
     },
 };
 
@@ -160,6 +160,47 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
             Ok(0)
         } else {
             // Unmapping an invalid/unmapped range is treated as ENOMEM.
+            Err(ERRNO::ENOMEM)
+        }
+    })
+}
+
+/// mprotect syscall
+pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mprotect",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+            return Err(ERRNO::EINVAL); // start not page-aligned
+        }
+        if len == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        // PROT_* currently supports only R/W/X bits.
+        if prot & !(MMapProt::PROT_READ.bits() | MMapProt::PROT_WRITE.bits() | MMapProt::PROT_EXEC.bits()) != 0 {
+            return Err(ERRNO::EINVAL); // unknown permission bits
+        }
+        if prot & 0x7 == 0 {
+            return Err(ERRNO::EINVAL); // no access at all is meaningless (treat PROT_NONE as EINVAL)
+        }
+
+        let mut perm = MapPermission::U;
+        if prot & MMapProt::PROT_READ.bits() != 0 {
+            perm |= MapPermission::R;
+        }
+        if prot & MMapProt::PROT_WRITE.bits() != 0 {
+            perm |= MapPermission::W;
+        }
+        if prot & MMapProt::PROT_EXEC.bits() != 0 {
+            perm |= MapPermission::X;
+        }
+
+        if mprotect_current_process(VirtAddr::from(start), VirtAddr::from(end), perm) {
+            Ok(0)
+        } else {
             Err(ERRNO::ENOMEM)
         }
     })
