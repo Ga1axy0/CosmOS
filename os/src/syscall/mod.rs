@@ -122,6 +122,8 @@ pub const SYSCALL_MPROTECT: usize = 226;
 pub const SYSCALL_WAIT4: usize = 260;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
+/// getrandom syscall
+pub const SYSCALL_GETRANDOM: usize = 278;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
 /*
@@ -160,6 +162,7 @@ mod fs;
 mod process;
 mod sync;
 mod thread;
+mod random;
 mod mman;
 mod times;
 mod utils;
@@ -167,18 +170,17 @@ mod utils;
 /// Standard error numbers and conversion traits
 pub mod errno;
 
-use core::time;
-
 use fs::*;
 use process::*;
 use sync::*;
 use thread::*;
+use crate::syscall::random::*;
 use mman::*;
 use times::*;
 pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
 
 
-use crate::{fs::Stat, syscall::{self, errno::ERRNO}};
+use crate::{fs::Stat, syscall::errno::ERRNO};
 use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
@@ -251,6 +253,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
+        SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
