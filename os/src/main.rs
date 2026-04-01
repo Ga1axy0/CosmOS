@@ -224,6 +224,9 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
 pub fn rust_main(hart_id: usize) -> ! {
     let _hart_id = hart::init_with_hartid(hart_id);
+    unsafe { 
+        riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial); 
+    }
     if !try_claim_bootstrap_hart(hart_id) {
         secondary_hart_main(hart_id);
     } else {

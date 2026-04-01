@@ -23,6 +23,10 @@ pub struct TrapContext {
     pub kernel_sp: usize,
     /// Virtual address of trap handler entry point in kernel
     pub trap_handler: usize,
+    /// Floating-point registers f0-f31
+    pub f: [u64; 32],
+    /// Floating-point control and status register
+    pub fcsr: usize,
 }
 
 impl TrapContext {
@@ -41,6 +45,7 @@ impl TrapContext {
         let mut sstatus = sstatus::read();
         // set CPU privilege to User after trapping back
         sstatus.set_spp(SPP::User);
+        unsafe { riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial) };
         let mut cx = Self {
             x: [0; 32],
             sstatus,
@@ -49,6 +54,8 @@ impl TrapContext {
             kernel_satp,  // addr of page table
             kernel_sp,    // kernel stack
             trap_handler, // addr of trap_handler function
+            f: [0; 32],
+            fcsr: 0,
         };
         cx.set_sp(sp); // app's user stack pointer
         cx // return initial Trap Context of app
