@@ -453,6 +453,106 @@ impl MemorySet {
         }
         true
     }
+
+    /// Change permissions of a range in the address space.
+    /// Returns true on success. The operation is performed in two phases:
+    /// 1) verify the whole range is mapped and user-accessible;
+    /// 2) perform VMA splits (if necessary) and update PTE flags.
+    pub fn mprotect_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        debug!("mprotect_range: [{:#x}, {:#x}) with permission {:?}", start_va.0, end_va.0, permission);
+
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        // Validation: every page must be mapped, user-accessible and belong to some user VMA.
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            let Some(pte) = self.page_table.translate(vpn) else {
+                return false;
+            };
+            if !pte.flags().contains(PTEFlags::U) {
+                return false;
+            }
+            if !self
+                .vmas
+                .iter()
+                .any(|area| area.is_user_accessible() && area.contains_vpn(vpn))
+            {
+                return false;
+            }
+        }
+
+        // Modification: split VMAs as needed and update page table flags.
+        let mut new_areas: Vec<Vma> = Vec::with_capacity(self.vmas.len() + 1);
+        for mut area in self.vmas.drain(..) {
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
+            let overlap_start = if area_start > start_vpn { area_start } else { start_vpn };
+            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+
+            if overlap_start >= overlap_end {
+                new_areas.push(area);
+                continue;
+            }
+
+            // left part
+            if area_start < overlap_start {
+                let left_data_frames = area.data_frames.split_off(&overlap_start);
+                let left_area = Vma {
+                    vpn_range: VPNRange::new(area_start, overlap_start),
+                    data_frames: area.data_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                    kind: area.kind.clone(),
+                };
+                area.data_frames = left_data_frames;
+                new_areas.push(left_area);
+            }
+
+            // right part exists -> split and handle middle separately
+            if overlap_end < area_end {
+                let right_data_frames = area.data_frames.split_off(&overlap_end);
+                let right_area = Vma {
+                    vpn_range: VPNRange::new(overlap_end, area_end),
+                    data_frames: right_data_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                    kind: area.kind.clone(),
+                };
+
+                // update middle pages' PTE flags
+                let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
+                for vpn in VPNRange::new(overlap_start, overlap_end) {
+                    self.page_table.update_flags(vpn, pte_flags);
+                }
+
+                area.vpn_range = VPNRange::new(overlap_start, overlap_end);
+                area.map_perm = permission;
+                new_areas.push(area);
+                new_areas.push(right_area);
+            } else {
+                // no right split, area becomes the middle area
+                let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
+                for vpn in VPNRange::new(overlap_start, overlap_end) {
+                    self.page_table.update_flags(vpn, pte_flags);
+                }
+                area.vpn_range = VPNRange::new(overlap_start, overlap_end);
+                area.map_perm = permission;
+                new_areas.push(area);
+            }
+        }
+
+        self.vmas = new_areas;
+        self.merge_adjacent_vmas();
+        unsafe {
+            asm!("sfence.vma");
+        }
+        true
+    }
 }
 
 /// 用于描述一段虚拟地址区间在地址空间中的语义角色。

@@ -116,6 +116,8 @@ pub const SYSCALL_FORK: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
 pub const SYSCALL_MMAP: usize = 222;
+/// mprotect syscall
+pub const SYSCALL_MPROTECT: usize = 226;
 /// waitpid syscall
 pub const SYSCALL_WAIT4: usize = 260;
 /// renameat2 syscall
@@ -281,6 +283,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
         SYSCALL_RENAMEAT2 => sys_renameat2(
