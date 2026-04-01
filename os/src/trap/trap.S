@@ -1,3 +1,12 @@
+.option arch, +f,+d
+.altmacro
+.macro SAVE_FP n
+    fsd f\n, (38+\n)*8(sp)
+.endm
+.macro LOAD_FP n
+    fld f\n, (38+\n)*8(a0)
+.endm
+
 .altmacro
 .macro SAVE_GP n
     sd x\n, \n*8(sp)
@@ -29,6 +38,16 @@ __alltraps:
     csrr t1, sepc
     sd t0, 32*8(sp)
     sd t1, 33*8(sp)
+
+    # save fpu registers
+    .set n, 0
+    .rept 32
+        SAVE_FP %n
+        .set n, n + 1
+    .endr
+    frcsr t0
+    sd t0, 70*8(sp)
+
     # read user stack from sscratch and save it in TrapContext
     csrr t2, sscratch
     sd t2, 2*8(sp)
@@ -59,6 +78,16 @@ __restore:
     ld t1, 33*8(sp)
     csrw sstatus, t0
     csrw sepc, t1
+
+    # restore fpu registers
+    ld t0, 70*8(a0)
+    fscsr t0
+    .set n, 0
+    .rept 32
+        LOAD_FP %n
+        .set n, n + 1
+    .endr
+
     # restore general purpose registers except x0/sp
     ld x1, 1*8(sp)
     ld x3, 3*8(sp)
