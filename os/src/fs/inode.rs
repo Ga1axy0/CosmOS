@@ -667,6 +667,10 @@ impl File for OSInode {
         true
     }
 
+    fn as_inode(&self) -> Option<Arc<Inode>> {
+        Some(Arc::clone(&self.inode))
+    }
+
     fn stat(&self) -> Stat {
         let vfs_node = self.inode.vfs_node();
         if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
@@ -678,15 +682,18 @@ impl File for OSInode {
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
     }
+
+    fn chmod(&self, mode: u32) -> Result<(), fs::errno::FS_ERRNO> {
+        self.inode.set_mode(mode)?;
+        Ok(())
+    }
 }
 
 /// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。
 pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
-    let mode = if inode.is_dir() {
-        StatMode::DIR
-    } else {
-        StatMode::FILE
-    };
+    let mode = StatMode::from_bits_truncate(inode.mode().unwrap_or(
+        if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() }
+    ));
     let atime = inode.atime();
     let mtime = inode.mtime();
     let ctime = inode.ctime();

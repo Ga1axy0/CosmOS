@@ -288,6 +288,28 @@ impl VfsNode for Ext4Inode {
         inode_ref.inode.size() as usize
     }
 
+    fn mode(&self) -> Option<u32> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(inode_ref.inode.mode() as u32)
+    }
+
+    fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
+        let ext4 = self.fs.ext4.lock();
+        let mut inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref.inode.set_mode(mode as u16);
+        ext4.write_back_inode(&mut inode_ref);
+        Ok(())
+    }
+
+    fn check_access(&self, uid: u32, gid: u32, mode: u32) -> bool {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref
+            .inode
+            .check_access(uid as u16, gid as u16, mode as u16, 0)
+    }
+
     fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
         if !self.is_dir {
             return Err(FS_ERRNO::ENOTDIR);

@@ -9,11 +9,13 @@ pub mod devfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use fs::errno::FS_ERRNO;
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 pub use fs::vfs::InodeTime;
+use fs::Inode;
 
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
@@ -190,6 +192,12 @@ impl FileDescription {
         self.file.path()
     }
 
+    /// If this `FileDescription` refers to a real filesystem inode, return it.
+    /// This forwards to the underlying `File` object's `as_inode` method.
+    pub fn as_inode(&self) -> Option<Arc<Inode>> {
+        self.file.as_inode()
+    }
+
     /// 读取目录项并推进共享目录位置。
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
@@ -302,6 +310,15 @@ pub trait File: Send + Sync {
     fn path(&self) -> Option<String> {
         None
     }
+    /// If this `File` is a wrapper around a real filesystem inode, return it.
+    /// Default implementation returns `None` for non-inode file types.
+    fn as_inode(&self) -> Option<Arc<Inode>> {
+        None
+    }
+    /// Change the file mode bits, if supported by this file type.
+    fn chmod(&self, _mode: u32) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
 }
 
 /// The stat of a inode
@@ -352,18 +369,52 @@ impl Pod for Stat {}
 
 bitflags! {
     /// The mode of a inode
-    /// whether a directory, regular file, char device or fifo
+    /// Linux-style `st_mode` bits: file type + special bits + rwx permissions.
     pub struct StatMode: u32 {
-        /// null
-        const NULL  = 0;
-        /// directory
-        const DIR   = 0o040000;
-        /// ordinary regular file
-        const FILE  = 0o100000;
-        /// character device
-        const CHAR  = 0o020000;
+        /// file-type mask (`S_IFMT`)
+        const TYPE_MASK = 0o170000;
+        /// special + rwx permission mask (`S_ISUID|S_ISGID|S_ISVTX|0777`)
+        const PERM_MASK = 0o007777;
         /// fifo/pipe
         const FIFO  = 0o010000;
+        /// character device
+        const CHAR  = 0o020000;
+        /// directory
+        const DIR   = 0o040000;
+        /// block device
+        const BLOCK = 0o060000;
+        /// ordinary regular file
+        const FILE  = 0o100000;
+        /// symbolic link
+        const LINK  = 0o120000;
+        /// socket
+        const SOCK  = 0o140000;
+
+        /// set-user-ID bit
+        const SUID  = 0o004000;
+        /// set-group-ID bit
+        const SGID  = 0o002000;
+        /// sticky bit
+        const STICKY = 0o001000;
+
+        /// owner permissions
+        const OWNER_R = 0o000400;
+        /// owner write permission
+        const OWNER_W = 0o000200;
+        /// owner execute permission
+        const OWNER_X = 0o000100;
+        /// group permissions
+        const GROUP_R = 0o000040;
+        /// group write permission
+        const GROUP_W = 0o000020;
+        /// group execute permission
+        const GROUP_X = 0o000010;
+        /// other permissions
+        const OTHER_R = 0o000004;
+        /// other write permission
+        const OTHER_W = 0o000002;
+        /// other execute permission
+        const OTHER_X = 0o000001;
     }
 }
 
