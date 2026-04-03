@@ -30,8 +30,14 @@ pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT: usize = 39;
 /// mount syscall
 pub const SYSCALL_MOUNT: usize = 40;
+/// faccessat syscall
+pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 pub const SYSCALL_CHDIR: usize = 49;
+/// fchmod syscall
+pub const SYSCALL_FCHMOD: usize = 52;
+/// fchmodat syscall
+pub const SYSCALL_FCHMODAT: usize = 53;
 /// openat syscall
 pub const SYSCALL_OPENAT: usize = 56;
 /// close syscall
@@ -231,6 +237,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4] as *const u8,
         ),
+        SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
+        SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
+        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as i32),
         SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
