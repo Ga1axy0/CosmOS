@@ -4,7 +4,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::BlockDevNode;
+use crate::fs::devfs::{BlockDevNode, RtcDevNode};
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -601,6 +601,14 @@ impl File for OSInode {
         }
         total_write_size
     }
+
+    fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        let vfs_node = self.inode.vfs_node();
+        if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
+            return rtc.ioctl(req, arg);
+        }
+        Err(ERRNO::ENOTTY)
+    }
     /// Fill `buf` with `linux_dirent64` records from the directory.
     ///
     /// `offset` is used as an **entry index** (not a byte offset) so that
@@ -660,6 +668,10 @@ impl File for OSInode {
     }
 
     fn stat(&self) -> Stat {
+        let vfs_node = self.inode.vfs_node();
+        if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
+            return rtc.stat();
+        }
         inode_stat(&self.inode)
     }
 
@@ -721,6 +733,16 @@ pub fn init_dev() {
         dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);
         info!("[kernel] /dev/{} registered", dev_name);
     }
+
+    // Register RTC aliases for Linux userland compatibility (e.g. BusyBox hwclock).
+    let misc_dir = ensure_virtual_dir("/dev/misc")
+        .unwrap_or_else(|_| panic!("[kernel] failed to create /dev/misc"));
+    let rtc_node: Arc<dyn VfsNode> = Arc::new(RtcDevNode::new());
+    dev_dir.bind("rtc", Arc::clone(&rtc_node));
+    dev_dir.bind("rtc0", Arc::clone(&rtc_node));
+    misc_dir.bind("rtc", rtc_node);
+    info!("[kernel] /dev/rtc, /dev/rtc0 and /dev/misc/rtc registered");
+
     info!("[kernel] /dev initialized");
 }
 
