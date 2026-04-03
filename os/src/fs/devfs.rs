@@ -22,7 +22,7 @@ use crate::syscall::errno::ERRNO;
 use crate::task::current_user_token;
 
 const RTC_RD_TIME: usize = 0xFFFF_FFFF_8024_7009;
-const RTC_SET_TIME: usize = 0xFFFF_FFFF_4024_700A;
+const RTC_SET_TIME: usize = 0x4024_700A;
 
 /// Linux `struct rtc_time` ABI.
 #[repr(C)]
