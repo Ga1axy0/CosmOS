@@ -590,8 +590,37 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
+/// readv syscall：按 `iovec` 顺序将多个用户缓冲区从同一个 fd 读出。
+pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_readv",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let fd = fd as usize;
+        let desc = get_readable_file(fd)?;
+        let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
+        let mut read_total = 0usize;
+        for &iovec in &iovecs {
+            if iovec.iov_len == 0 {
+                continue;
+            }
+            let user_buf = UserBuffer::new(
+                translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len).or_errno(ERRNO::EFAULT)?,
+            );
+            let read = desc.read(user_buf);
+            read_total = read_total.checked_add(read).ok_or(ERRNO::EINVAL)?;
+            if read < iovec.iov_len {
+                break;
+            }
+        }
+        Ok(read_total as isize)
+    })
+}
+
 /// writev syscall：按 `iovec` 顺序将多个用户缓冲区写入同一个 fd。
-pub fn sys_writev(fd: u32, iov: *const IoVec, iovcnt: i32) -> isize {
+pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
     trace!(
         "kernel:pid[{}] sys_writev",
         current_task().unwrap().process.upgrade().unwrap().getpid()
