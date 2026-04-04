@@ -7,9 +7,16 @@ use crate::{
     block_cache_sync_all, get_block_cache, BlockDevice, Inode,
 };
 use super::{Bitmap, SuperBlock, DiskInode, DiskInodeType};
+use crate::lock::{BlockingMutex, LockHookTable, LockWaitHook, LockWakeHook};
 use crate::BLOCK_SZ;
 use alloc::sync::Arc;
-use spin::Mutex;
+
+static EASYFS_LOCK_HOOKS: LockHookTable = LockHookTable::new();
+
+/// Configure EasyFS lock contention/wakeup hooks.
+pub fn set_easyfs_lock_hooks(wait: Option<LockWaitHook>, wake: Option<LockWakeHook>) {
+    EASYFS_LOCK_HOOKS.set_hooks(wait, wake);
+}
 
 /// EasyFileSystem struct
 pub struct EasyFileSystem {
@@ -33,7 +40,7 @@ impl EasyFileSystem {
         block_device: Arc<dyn BlockDevice>,
         total_blocks: u32,
         inode_bitmap_blocks: u32,
-    ) -> Arc<Mutex<Self>> {
+    ) -> Arc<BlockingMutex<Self>> {
         // calculate block size of areas & create bitmaps
         let inode_bitmap = Bitmap::new(1, inode_bitmap_blocks as usize);
         let inode_num = inode_bitmap.maximum();
@@ -88,10 +95,10 @@ impl EasyFileSystem {
                 disk_inode.initialize(DiskInodeType::Directory);
             });
         block_cache_sync_all();
-        Arc::new(Mutex::new(efs))
+        Arc::new(BlockingMutex::new_with_hooks(efs, &EASYFS_LOCK_HOOKS))
     }
     /// Open an existing EasyFileSystem
-    pub fn open(block_device: Arc<dyn BlockDevice>) -> Arc<Mutex<Self>> {
+    pub fn open(block_device: Arc<dyn BlockDevice>) -> Arc<BlockingMutex<Self>> {
         // read SuperBlock
         get_block_cache(0, Arc::clone(&block_device))
             .lock()
@@ -109,7 +116,7 @@ impl EasyFileSystem {
                     inode_area_start_block: 1 + super_block.inode_bitmap_blocks,
                     data_area_start_block: 1 + inode_total_blocks + super_block.data_bitmap_blocks,
                 };
-                Arc::new(Mutex::new(efs))
+                Arc::new(BlockingMutex::new_with_hooks(efs, &EASYFS_LOCK_HOOKS))
             })
     }
     /// Get the root inode

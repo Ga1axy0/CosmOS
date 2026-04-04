@@ -1,16 +1,18 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use log::debug;
-use spin::Mutex;
 
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::errno::FS_ERRNO;
+use crate::lock::{BlockingMutex, LockHookTable, LockWaitHook, LockWakeHook};
 use crate::vfs::{Inode, InodeTime, VfsNode};
 use crate::BLOCK_SZ;
 
 use ext4_rs::{
-    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType
+    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType,
 };
+
+static EXT4_LOCK_HOOKS: LockHookTable = LockHookTable::new();
 
 /// Adapts the OS block-id based device into ext4_rs offset-based IO.
 struct Ext4BlockDeviceAdapter {
@@ -115,7 +117,12 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
 }
 
 pub struct Ext4FileSystem {
-    ext4: Mutex<Ext4>,
+    ext4: BlockingMutex<Ext4>,
+}
+
+/// Configure Ext4 lock contention/wakeup hooks.
+pub fn set_ext4_lock_hooks(wait: Option<LockWaitHook>, wake: Option<LockWakeHook>) {
+    EXT4_LOCK_HOOKS.set_hooks(wait, wake);
 }
 
 impl Ext4FileSystem {
@@ -123,7 +130,7 @@ impl Ext4FileSystem {
         let ext4_dev: Arc<dyn Ext4BlockDevice> = Arc::new(Ext4BlockDeviceAdapter::new(block_device));
         let ext4 = Ext4::open(ext4_dev);
         Arc::new(Self {
-            ext4: Mutex::new(ext4),
+            ext4: BlockingMutex::new_with_hooks(ext4, &EXT4_LOCK_HOOKS),
         })
     }
 
