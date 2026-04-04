@@ -470,18 +470,62 @@ impl MemorySet {
         let end_vpn = end_va.ceil();
 
         // Validation: every page must be mapped, user-accessible and belong to some user VMA.
+        //
+        // To avoid O(pages × vmas) behavior, first collect and merge all user-accessible
+        // VMA subranges that overlap [start_vpn, end_vpn), then validate pages against
+        // this compact list in a single linear pass.
+        let mut user_ranges: Vec<(VirtPageNum, VirtPageNum)> = Vec::new();
+        for area in &self.vmas {
+            if !area.is_user_accessible() {
+                continue;
+            }
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
+            if area_end <= start_vpn || area_start >= end_vpn {
+                // No overlap with requested range.
+                continue;
+            }
+            let overlap_start = if area_start > start_vpn { area_start } else { start_vpn };
+            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            if let Some((last_start, last_end)) = user_ranges.last_mut() {
+                // Merge adjacent overlaps to keep the list compact.
+                if *last_end == overlap_start {
+                    *last_end = overlap_end;
+                    continue;
+                }
+            }
+            user_ranges.push((overlap_start, overlap_end));
+        }
+
+        // Now walk pages once, checking mapping, user PTE flag and that each page lies
+        // within some user-accessible VMA range.
+        let mut range_idx = 0usize;
+        let mut current_range = user_ranges.get(range_idx).cloned();
         for vpn in VPNRange::new(start_vpn, end_vpn) {
+            // Ensure there is a current range that may cover this vpn.
+            while let Some((_, range_end)) = current_range {
+                if vpn < range_end {
+                    break;
+                }
+                range_idx += 1;
+                current_range = user_ranges.get(range_idx).cloned();
+            }
+            let Some((range_start, range_end)) = current_range else {
+                // No more user-accessible ranges but still pages left to validate.
+                return false;
+            };
+            if vpn < range_start || vpn >= range_end {
+                // Hole in user-accessible coverage.
+                return false;
+            }
+            // Page must be mapped and user-accessible in the page table.
             let Some(pte) = self.page_table.translate(vpn) else {
                 return false;
             };
             if !pte.flags().contains(PTEFlags::U) {
-                return false;
-            }
-            if !self
-                .vmas
-                .iter()
-                .any(|area| area.is_user_accessible() && area.contains_vpn(vpn))
-            {
                 return false;
             }
         }
