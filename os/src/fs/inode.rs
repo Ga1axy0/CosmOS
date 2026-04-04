@@ -3,6 +3,7 @@ use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
+use crate::task::{WaitQueue, WaitReason};
 use crate::timer::get_realtime_ns;
 use crate::fs::devfs::{BlockDevNode, RtcDevNode};
 use crate::drivers::block::BLOCK_DEVICES;
@@ -11,6 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use fs::vfs::VfsNode;
 use fs::Inode;
 use lazy_static::*;
@@ -82,7 +84,96 @@ fn inode_now() -> fs::vfs::InodeTime {
     fs::vfs::InodeTime::new(now_ns / 1_000_000_000, (now_ns % 1_000_000_000) as u32)
 }
 
+struct LockWaitEntry {
+    queue: WaitQueue,
+    wake_seq: AtomicUsize,
+}
+
+impl LockWaitEntry {
+    fn new() -> Self {
+        Self {
+            queue: WaitQueue::new(),
+            wake_seq: AtomicUsize::new(0),
+        }
+    }
+}
+
+fn fs_lock_wait(
+    waiters: &SpinNoIrqLock<BTreeMap<usize, Arc<LockWaitEntry>>>,
+    lock_id: usize,
+    fs_name: &str,
+) {
+    if crate::task::current_task().is_none() {
+        trace!("{} lock contention outside task context, lock_id={:#x}", fs_name, lock_id);
+        core::hint::spin_loop();
+        return;
+    }
+
+    let entry = {
+        let mut map = waiters.lock();
+        map.entry(lock_id)
+            .or_insert_with(|| Arc::new(LockWaitEntry::new()))
+            .clone()
+    };
+    let wake_seq_before = entry.wake_seq.load(Ordering::Acquire);
+    let entry_for_skip = Arc::clone(&entry);
+    trace!("{} lock wait enqueue, lock_id={:#x}", fs_name, lock_id);
+    entry.queue.wait_with_reason_or_skip(WaitReason::Mutex, move || {
+        entry_for_skip.wake_seq.load(Ordering::Acquire) != wake_seq_before
+            || !fs::lock::is_lock_held(lock_id)
+    });
+}
+
+fn fs_lock_wake(
+    waiters: &SpinNoIrqLock<BTreeMap<usize, Arc<LockWaitEntry>>>,
+    lock_id: usize,
+    fs_name: &str,
+) {
+    let entry = { waiters.lock().get(&lock_id).cloned() };
+    if let Some(entry) = entry {
+        trace!("{} lock wake_one, lock_id={:#x}", fs_name, lock_id);
+        entry.wake_seq.fetch_add(1, Ordering::AcqRel);
+        entry.queue.wake_one();
+    }
+}
+
+fn easyfs_lock_wait(lock_id: usize) {
+    fs_lock_wait(&EASYFS_LOCK_WAITERS, lock_id, "easyfs");
+}
+
+fn easyfs_lock_wake(lock_id: usize) {
+    fs_lock_wake(&EASYFS_LOCK_WAITERS, lock_id, "easyfs");
+}
+
+fn fat32_lock_wait(lock_id: usize) {
+    fs_lock_wait(&FAT32_LOCK_WAITERS, lock_id, "fat32");
+}
+
+fn fat32_lock_wake(lock_id: usize) {
+    fs_lock_wake(&FAT32_LOCK_WAITERS, lock_id, "fat32");
+}
+
+fn ext4_lock_wait(lock_id: usize) {
+    fs_lock_wait(&EXT4_LOCK_WAITERS, lock_id, "ext4");
+}
+
+fn ext4_lock_wake(lock_id: usize) {
+    fs_lock_wake(&EXT4_LOCK_WAITERS, lock_id, "ext4");
+}
+
 lazy_static! {
+    /// EasyFS lock waiters: lock_id -> wait queue.
+    static ref EASYFS_LOCK_WAITERS: SpinNoIrqLock<BTreeMap<usize, Arc<LockWaitEntry>>> =
+        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+
+    /// FAT32 lock waiters: lock_id -> wait queue.
+    static ref FAT32_LOCK_WAITERS: SpinNoIrqLock<BTreeMap<usize, Arc<LockWaitEntry>>> =
+        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+
+    /// Ext4 lock waiters: lock_id -> wait queue.
+    static ref EXT4_LOCK_WAITERS: SpinNoIrqLock<BTreeMap<usize, Arc<LockWaitEntry>>> =
+        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+
     /// Tracks virtual directories created by `do_mount` for sub-path mounts.
     ///
     /// Maps absolute path → `Arc<VirtualDirNode>` for every virtual directory
@@ -238,6 +329,7 @@ pub fn init_rootfs() {
     #[cfg(feature = "fat32")]
     {
         use fs::Fat32FileSystem;
+        fs::fat32::set_fat32_lock_hooks(Some(fat32_lock_wait), Some(fat32_lock_wake));
         let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
         let root = Arc::new(Fat32FileSystem::root_inode(&vfs));
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
@@ -245,6 +337,7 @@ pub fn init_rootfs() {
     #[cfg(feature = "easyfs")]
     {
         use fs::EasyFileSystem;
+        fs::easyfs::set_easyfs_lock_hooks(Some(easyfs_lock_wait), Some(easyfs_lock_wake));
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         let root = Arc::new(EasyFileSystem::root_inode(&efs));
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
@@ -252,6 +345,7 @@ pub fn init_rootfs() {
     #[cfg(feature = "ext4")]
     {
         use fs::Ext4FileSystem;
+        fs::ext4::set_ext4_lock_hooks(Some(ext4_lock_wait), Some(ext4_lock_wake));
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
         let root = Arc::new(Ext4FileSystem::root_inode(&efs));
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
@@ -776,6 +870,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
     let fs_root: Arc<Inode> = match fs_type {
         "vfat" | "fat32" => {
             use fs::Fat32FileSystem;
+            fs::fat32::set_fat32_lock_hooks(Some(fat32_lock_wait), Some(fat32_lock_wake));
             debug!("mount_device: opening FAT32 filesystem on {}", dev_path);
             let vfs = Fat32FileSystem::open(block_dev);
             Arc::new(Fat32FileSystem::root_inode(&vfs))
@@ -783,6 +878,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
         #[cfg(feature = "ext4")]
         "ext4" => {
             use fs::Ext4FileSystem;
+            fs::ext4::set_ext4_lock_hooks(Some(ext4_lock_wait), Some(ext4_lock_wake));
             let vfs = Ext4FileSystem::open(block_dev);
             Arc::new(Ext4FileSystem::root_inode(&vfs))
         }

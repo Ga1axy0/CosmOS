@@ -13,18 +13,25 @@ mod fat;
 mod inode;
 
 use alloc::sync::Arc;
-use spin::Mutex;
 
 use crate::block_dev::BlockDevice;
+use crate::lock::{BlockingMutex, LockHookTable, LockWaitHook, LockWakeHook};
 use crate::vfs::{Inode, VfsNode};
 
 pub use bpb::Fat32Bpb;
+
+static FAT32_LOCK_HOOKS: LockHookTable = LockHookTable::new();
+
+/// Configure FAT32 lock contention/wakeup hooks.
+pub fn set_fat32_lock_hooks(wait: Option<LockWaitHook>, wake: Option<LockWakeHook>) {
+    FAT32_LOCK_HOOKS.set_hooks(wait, wake);
+}
 
 /// FAT32 filesystem instance (volume assumed to start at LBA 0).
 pub struct Fat32FileSystem {
     block_device: Arc<dyn BlockDevice>,
     bpb: Fat32Bpb,
-    inner: Mutex<fat::Fat32Inner>,
+    inner: BlockingMutex<fat::Fat32Inner>,
 }
 
 impl Fat32FileSystem {
@@ -35,7 +42,7 @@ impl Fat32FileSystem {
         Arc::new(Self {
             block_device,
             bpb,
-            inner: Mutex::new(inner),
+            inner: BlockingMutex::new_with_hooks(inner, &FAT32_LOCK_HOOKS),
         })
     }
 
@@ -47,7 +54,7 @@ impl Fat32FileSystem {
         &self.block_device
     }
 
-    pub(crate) fn inner(&self) -> &Mutex<fat::Fat32Inner> {
+    pub(crate) fn inner(&self) -> &BlockingMutex<fat::Fat32Inner> {
         &self.inner
     }
 

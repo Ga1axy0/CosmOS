@@ -1,6 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
-use spin::{Mutex, MutexGuard};
+use crate::lock::{BlockingMutex, BlockingMutexGuard};
 
 use crate::{
     BlockDevice, EasyFileSystem,
@@ -13,7 +13,7 @@ use crate::{
 pub struct EasyInode {
     pub block_id: usize,
     pub block_offset: usize,
-    fs: Arc<Mutex<EasyFileSystem>>,
+    fs: Arc<BlockingMutex<EasyFileSystem>>,
     block_device: Arc<dyn BlockDevice>,
 }
 
@@ -22,7 +22,7 @@ impl EasyInode {
     pub fn new(
         block_id: u32,
         block_offset: usize,
-        fs: Arc<Mutex<EasyFileSystem>>,
+        fs: Arc<BlockingMutex<EasyFileSystem>>,
         block_device: Arc<dyn BlockDevice>,
     ) -> Self {
         Self {
@@ -67,7 +67,7 @@ impl EasyInode {
         &self,
         new_size: u32,
         disk_inode: &mut DiskInode,
-        fs: &mut MutexGuard<EasyFileSystem>,
+        fs: &mut BlockingMutexGuard<EasyFileSystem>,
     ) {
         if new_size < disk_inode.size {
             return;
@@ -206,7 +206,7 @@ impl VfsNode for EasyInode {
 }
 
 impl EasyFileSystem {
-    pub fn root_inode(efs: &Arc<Mutex<Self>>) -> Inode {
+    pub fn root_inode(efs: &Arc<BlockingMutex<Self>>) -> Inode {
         let block_device = Arc::clone(&efs.lock().block_device);
         // acquire efs lock temporarily
         let (block_id, block_offset) = efs.lock().get_disk_inode_pos(0);
