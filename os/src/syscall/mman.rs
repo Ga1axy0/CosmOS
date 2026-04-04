@@ -176,27 +176,37 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
             return Err(ERRNO::EINVAL); // start not page-aligned
         }
         if len == 0 {
-            return Err(ERRNO::EINVAL);
+            return Ok(0); // POSIX/Linux: zero-length mprotect is a successful no-op
         }
         let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
         // PROT_* currently supports only R/W/X bits.
         if prot & !(MMapProt::PROT_READ.bits() | MMapProt::PROT_WRITE.bits() | MMapProt::PROT_EXEC.bits()) != 0 {
             return Err(ERRNO::EINVAL); // unknown permission bits
         }
-        if prot & 0x7 == 0 {
-            return Err(ERRNO::EINVAL); // no access at all is meaningless (treat PROT_NONE as EINVAL)
-        }
 
-        let mut perm = MapPermission::U;
-        if prot & MMapProt::PROT_READ.bits() != 0 {
-            perm |= MapPermission::R;
-        }
-        if prot & MMapProt::PROT_WRITE.bits() != 0 {
-            perm |= MapPermission::W;
-        }
-        if prot & MMapProt::PROT_EXEC.bits() != 0 {
-            perm |= MapPermission::X;
-        }
+        // Translate user PROT_* flags into internal MapPermission.
+        // If no R/W/X bits are set (e.g., PROT_NONE), treat it as a valid
+        // "no access" mapping by using an empty MapPermission, matching
+        // Linux semantics used for guard pages.
+        let mut perm = if prot & (MMapProt::PROT_READ.bits()
+            | MMapProt::PROT_WRITE.bits()
+            | MMapProt::PROT_EXEC.bits())
+            == 0
+        {
+            MapPermission::empty()
+        } else {
+            let mut p = MapPermission::U;
+            if prot & MMapProt::PROT_READ.bits() != 0 {
+                p |= MapPermission::R;
+            }
+            if prot & MMapProt::PROT_WRITE.bits() != 0 {
+                p |= MapPermission::W;
+            }
+            if prot & MMapProt::PROT_EXEC.bits() != 0 {
+                p |= MapPermission::X;
+            }
+            p
+        };
 
         if mprotect_current_process(VirtAddr::from(start), VirtAddr::from(end), perm) {
             Ok(0)
