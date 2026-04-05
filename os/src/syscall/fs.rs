@@ -677,6 +677,25 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
+pub fn sys_llseek(fd: u32, offset_high: usize, offset_low: usize, result: *mut u64, whence: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_llseek",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let fd = fd as usize;
+        let desc = get_file_description(fd)?;
+        // Combine high/low into a 64-bit pattern and interpret as signed offset.
+        let offset_u = ((offset_high as u64) << 32) | (offset_low as u64);
+        let offset_i = offset_u as i64;
+        let new_pos = desc.seek(offset_i, whence as u8)?;
+        // write back as unsigned 64-bit position
+        *translated_refmut(token, result).or_errno(ERRNO::EFAULT)? = new_pos;
+        Ok(0)
+    })
+}
+
 /// ioctl 系统调用：校验 fd 后转发到具体文件对象。
 pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     trace!(
