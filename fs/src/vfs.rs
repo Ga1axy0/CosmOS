@@ -149,11 +149,25 @@ impl Inode {
     }
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.create(name).map(Self::wrap)
+        self.inner.create(name).map(|i| {
+            if let Some(cur_mode) = i.mode() {
+                let perms_mask: u32 = 0x0fff; // lower 12 bits
+                let new_mode = (cur_mode & !perms_mask) | (0o644u32 & perms_mask);
+                let _ = i.set_mode(new_mode);
+            }
+            Self::wrap(i)
+        })
     }
 
     pub fn mkdir(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.mkdir(name).map(Self::wrap)
+        self.inner.mkdir(name).map(|i|{
+            if let Some(cur_mode) = i.mode() {
+                let perms_mask: u32 = 0x0fff; // lower 12 bits
+                let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
+                let _ = i.set_mode(new_mode);
+            }
+            Self::wrap(i)
+        })
     }
 
     pub fn is_dir(&self) -> bool {
