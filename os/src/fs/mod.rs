@@ -251,6 +251,25 @@ impl FileDescription {
     pub fn poll_source_id(&self) -> usize {
         self.file.poll_source_id()
     }
+
+    /// `offset` 使用有符号 64 位，以兼容 SEEK_END 处的负位移。
+    pub fn seek(&self, offset: i64, whence: u8) -> Result<u64, ERRNO> {
+        if !self.file.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        let mut inner = self.inner.lock();
+        let new_offset = match whence {
+            0 => offset,                      // SEEK_SET
+            1 => inner.offset as i64 + offset,        // SEEK_CUR
+            2 => self.file.stat().size + offset, // SEEK_END
+            _ => return Err(ERRNO::EINVAL),
+        };
+        if new_offset < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        inner.offset = new_offset as usize;
+        Ok(new_offset as u64)
+    }
 }
 
 /// trait File for all file types
