@@ -742,8 +742,7 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             cwd.as_str(),
             path.as_str(),
             open_state.open_flags,
-        )
-        .or_errno(ERRNO::ENOENT)?;
+        )?;
         if open_state.open_flags.contains(OpenFlags::DIRECTORY) && !inode.is_dir() {
             return Err(ERRNO::ENOTDIR);
         }
