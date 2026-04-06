@@ -172,7 +172,7 @@ pub fn add_task_global(task: Arc<TaskControlBlock>) {
 /// Wake up a task by marking it `Ready` and placing it on the global queue.
 /// Returns `true` if the task was successfully woken up, otherwise `false`.
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
-    trace!("kernel: TaskManager::wakeup_task");
+    // trace!("kernel: TaskManager::wakeup_task");
     let mut task_inner = task.inner_exclusive_access();
     let should_enqueue = match task_inner.task_status {
         TaskStatus::Blocked => {

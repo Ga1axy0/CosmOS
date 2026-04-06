@@ -436,25 +436,29 @@ fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
 }
 
 /// Open (or optionally create) a file/directory at `path` relative to `cwd`.
-pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSInode>, ERRNO> {
     trace!("kernel: open_file_at: cwd={}, path={}, flags={:?}", cwd, path, flags);
     let abs = canonicalize(cwd, path);
     debug!("open_file_at: path = {} -> abs path = {}", path, abs);
 
     if flags.contains(OpenFlags::CREATE) {
         // Navigate to the parent directory and create the file there.
-        let (parent, name) = resolve_parent(cwd, path)?;
+        let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
         if let Some(existing) = parent.find(&name) {
             // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
+            debug!("EXCL flag valid: {}", flags.contains(OpenFlags::EXCL));
+            if flags.contains(OpenFlags::EXCL) {
+                return Err(ERRNO::EEXIST);
+            }
             if flags.contains(OpenFlags::TRUNC) {
                 existing.clear();
             }
-            Some(Arc::new(OSInode::new(existing, abs.clone())))
+            Ok(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
             parent.create(&name).map(|inode| {
                 let _ = inode.set_times_now(inode_now());
                 Arc::new(OSInode::new(inode, abs.clone()))
-            })
+            }).ok_or(ERRNO::EIO)
         }
     } else {
         lookup_inode(&abs).map(|inode| {
@@ -463,7 +467,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
                 inode.clear();
             }
             Arc::new(OSInode::new(inode, abs.clone()))
-        })
+        }).ok_or(ERRNO::ENOENT)
     }
 }
 
@@ -503,6 +507,8 @@ bitflags! {
         const RDWR = 0x002;
         /// create new file
         const CREATE = 0x40;
+        /// fail if file exists
+        const EXCL = 0x80;
         /// truncate file size to 0
         const TRUNC = 0x200;
         /// open directory
