@@ -1,7 +1,7 @@
 /// Keyed wait queue supporting wakeup by selected key.
 use super::{
-    block_current_preblocked_and_run_next, current_task, wakeup_task, TaskControlBlock,
-    TaskStatus, WaitReason,
+    block_current_and_run_next, current_task, wakeup_task, TaskControlBlock, TaskStatus,
+    WaitReason,
 };
 use crate::sync::SpinNoIrqLock;
 use alloc::{
@@ -52,9 +52,8 @@ impl WaitQueue {
         {
             let mut task_inner = task.inner_exclusive_access();
             debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
-            task_inner.task_status = TaskStatus::PreBlocked;
+            task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
-            task_inner.wake_pending = false;
         }
         queue.push_back(task.clone());
         drop(queue);
@@ -67,16 +66,15 @@ impl WaitQueue {
                 .retain(|queued| Arc::as_ptr(queued) != Arc::as_ptr(&task));
             if let Some(task) = current_task() {
                 let mut task_inner = task.inner_exclusive_access();
-                if matches!(task_inner.task_status, TaskStatus::PreBlocked) {
+                if matches!(task_inner.task_status, TaskStatus::Interruptible) {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
-                    task_inner.wake_pending = false;
                 }
             }
             return;
         }
 
-        block_current_preblocked_and_run_next();
+        block_current_and_run_next(reason);
     }
 
     /// Wake one waiter (FIFO order).
@@ -130,9 +128,8 @@ where
         {
             let mut task_inner = task.inner_exclusive_access();
             debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
-            task_inner.task_status = TaskStatus::PreBlocked;
+            task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
-            task_inner.wake_pending = false;
         }
         let key = {
             let mut next = self.next_key.lock();
@@ -142,7 +139,7 @@ where
         };
         self.waiters.lock().insert(key, task);
         self.queue.lock().push_back(key);
-        block_current_preblocked_and_run_next();
+        block_current_and_run_next(reason);
     }
 
     /// Enqueue current task with a selected key and block with a specific reason.
@@ -166,9 +163,8 @@ where
         {
             let mut task_inner = task.inner_exclusive_access();
             debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
-            task_inner.task_status = TaskStatus::PreBlocked;
+            task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
-            task_inner.wake_pending = false;
         }
         let replaced = self.waiters.lock().insert(key, task);
         assert!(replaced.is_none(), "duplicate wait key");
@@ -180,16 +176,15 @@ where
             self.waiters.lock().remove(&key);
             if let Some(task) = current_task() {
                 let mut task_inner = task.inner_exclusive_access();
-                if matches!(task_inner.task_status, TaskStatus::PreBlocked) {
+                if matches!(task_inner.task_status, TaskStatus::Interruptible) {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
-                    task_inner.wake_pending = false;
                 }
             }
             return;
         }
 
-        block_current_preblocked_and_run_next();
+        block_current_and_run_next(reason);
     }
 
     fn pop_next_task_keyed(
