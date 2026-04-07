@@ -127,8 +127,9 @@ impl Ext4FileSystem {
         })
     }
 
-    pub fn root_inode(fs: &Arc<Self>) -> Inode {
-        Inode::new(Arc::new(Ext4Inode::new(Arc::clone(fs), EXT4_ROOT_INODE, true)))
+    /// 返回根目录对应的稳定内存 inode。
+    pub fn root_inode(fs: &Arc<Self>) -> Arc<Inode> {
+        Inode::from_vfs_node(Arc::new(Ext4Inode::new(Arc::clone(fs), EXT4_ROOT_INODE, true)))
     }
 }
 
@@ -274,6 +275,10 @@ impl VfsNode for Ext4Inode {
 
     fn ino(&self) -> u64 {
         self.inode_num as u64
+    }
+
+    fn fs_id(&self) -> u64 {
+        Arc::as_ptr(&self.fs) as usize as u64
     }
 
     fn nlink(&self) -> u32 {

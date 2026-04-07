@@ -2,6 +2,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use crate::errno::FS_ERRNO;
+use crate::inode_cache::get_or_create_inode;
 
 /// Linux-style inode timestamp snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +39,10 @@ pub trait VfsNode: Send + Sync + Any {
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
     /// Stable inode number for stat-like metadata.
     fn ino(&self) -> u64 {
+        0
+    }
+    /// 底层文件系统实例的稳定标识；返回 0 表示当前节点不参与 inode cache 复用。
+    fn fs_id(&self) -> u64 {
         0
     }
     /// Hard-link count for stat-like metadata.
@@ -132,12 +137,24 @@ pub struct Inode {
 }
 
 impl Inode {
-    pub fn new(inner: Arc<dyn VfsNode>) -> Self {
+    /// 创建一个未进入 inode cache 的临时内存 inode。
+    fn new(inner: Arc<dyn VfsNode>) -> Self {
         Self { inner }
     }
 
+    /// 创建一个不参与全局去重的 `Arc<Inode>`。
+    pub(crate) fn new_uncached(inner: Arc<dyn VfsNode>) -> Arc<Self> {
+        Arc::new(Self::new(inner))
+    }
+
+    /// 从底层 VFS 节点构造稳定内存 inode，对外统一走 inode cache。
+    pub fn from_vfs_node(inner: Arc<dyn VfsNode>) -> Arc<Self> {
+        get_or_create_inode(inner)
+    }
+
+    /// 将底层 VFS 节点包装为稳定内存 inode。
     fn wrap(node: Arc<dyn VfsNode>) -> Arc<Inode> {
-        Arc::new(Self::new(node))
+        Self::from_vfs_node(node)
     }
 
     pub fn ls(&self) -> Vec<String> {
@@ -188,6 +205,11 @@ impl Inode {
 
     pub fn ino(&self) -> u64 {
         self.inner.ino()
+    }
+
+    /// 返回底层文件系统实例标识。
+    pub fn fs_id(&self) -> u64 {
+        self.inner.fs_id()
     }
 
     pub fn nlink(&self) -> u32 {

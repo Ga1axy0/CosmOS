@@ -20,6 +20,7 @@ extern crate alloc;
 
 pub mod block_cache;
 pub mod block_dev;
+mod inode_cache;
 pub mod vfs;
 pub mod easyfs;
 pub mod fat32;
