@@ -43,6 +43,10 @@ pub struct TaskControlBlockInner {
     pub wait_reason: Option<WaitReason>,
     /// Last hart that ran this task.
     pub last_cpu: usize,
+    /// whether the task is running on cpu
+    pub on_cpu: bool,
+    /// whether the task is in runqueue
+    pub on_rq: bool,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
 }
@@ -80,6 +84,8 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Runnable,
                     wait_reason: None,
                     last_cpu: 0,
+                    on_cpu: false,
+                    on_rq: false,
                     exit_code: None,
                 })
             },

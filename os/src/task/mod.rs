@@ -59,6 +59,8 @@ pub fn suspend_current_and_run_next() {
     let task = take_current_task().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
+        task_inner.on_cpu = false;
+        task_inner.on_rq = false;
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
         &mut task_inner.task_cx as *mut TaskContext
@@ -73,6 +75,8 @@ pub fn block_current_and_run_next(reason: WaitReason) {
     let process = task.process.upgrade().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
+        task_inner.on_cpu = false;
+        task_inner.on_rq = false;
         task_inner.task_status = TaskStatus::Interruptible;
         task_inner.wait_reason = Some(reason);
         &mut task_inner.task_cx as *mut TaskContext
@@ -103,6 +107,8 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
     task_inner.task_status = TaskStatus::Zombie;
+    task_inner.on_cpu = false;
+    task_inner.on_rq = false;
     task_inner.res = None;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
