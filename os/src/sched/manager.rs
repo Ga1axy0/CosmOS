@@ -3,6 +3,7 @@
 use super::{ProcessControlBlock, TaskControlBlock, TaskStatus};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
+use crate::sbi::send_ipi_mask;
 use crate::sync::SpinNoIrqLock;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -33,6 +34,10 @@ impl RunQueue {
         self.runnable.pop_front()
     }
 
+    fn len(&self) -> usize {
+        self.runnable.len()
+    }
+
     fn remove_task(&mut self, task: &Arc<TaskControlBlock>) {
         if let Some((idx, _)) = self
             .runnable
@@ -57,6 +62,36 @@ lazy_static! {
 
 fn normalize_hart(hart: usize) -> usize {
     hart.min(MAX_HARTS.saturating_sub(1))
+}
+
+fn runqueue_len(hart: usize) -> usize {
+    RUN_QUEUES[normalize_hart(hart)].lock().len()
+}
+
+fn select_wakeup_hart(task: &TaskControlBlock) -> usize {
+    let current = normalize_hart(hartid());
+    let preferred = {
+        let task_inner = task.inner_exclusive_access();
+        normalize_hart(task_inner.last_cpu)
+    };
+    if preferred == current {
+        return current;
+    }
+    let preferred_len = runqueue_len(preferred);
+    let current_len = runqueue_len(current);
+    if preferred_len == 0 || preferred_len <= current_len + 1 {
+        preferred
+    } else {
+        current
+    }
+}
+
+fn resched_hart(hart: usize) {
+    let target_hart = normalize_hart(hart);
+    if target_hart == hartid() {
+        return;
+    }
+    send_ipi_mask(1usize << target_hart);
 }
 
 /// Add a task to the current hart's runqueue.
@@ -109,15 +144,22 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                 if task_inner.on_cpu {
                     None
                 } else {
+                    let target_hart = normalize_hart(task_inner.last_cpu);
                     task_inner.on_rq = true;
-                    Some(normalize_hart(task_inner.last_cpu))
+                    Some(target_hart)
                 }
             }
             TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return false,
         }
     };
+    let wake_target = wake_target.map(|_| select_wakeup_hart(&task));
     if let Some(target_hart) = wake_target {
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.last_cpu = target_hart;
+        }
         RUN_QUEUES[target_hart].lock().enqueue(task);
+        resched_hart(target_hart);
         trace!("kernel: TaskManager::wakeup_task -> hart {}", target_hart);
     } else {
         trace!("kernel: TaskManager::wakeup_task -> current cpu");
