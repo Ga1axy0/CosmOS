@@ -34,22 +34,19 @@ use crate::timer::get_time;
 use crate::mm::{MapPermission, VirtAddr};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
-use manager::fetch_task;
 use process::ProcessControlBlock;
 use switch::__switch;
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use manager::{
-    add_task, add_task_global, add_task_pre_blocked, add_task_pre_ready, pid2process,
-    promote_pre_blocked_tasks, promote_pre_ready_tasks,
-    remove_from_pid2process, remove_task, wakeup_task,
+    add_task, dequeue_task, enqueue_task_on, pid2process, pick_next_task, remove_from_pid2process,
+    remove_task, wakeup_task,
 };
 pub use action::{SignalAction, SignalActions};
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, restore_current_task, run_tasks, schedule,
-    take_current_task,
+    current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
 };
 pub use wait_queue::{WaitQueue, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
@@ -59,20 +56,14 @@ pub use task::{TaskControlBlock, TaskStatus, WaitReason};
 /// Make current task suspended and switch to the next task
 pub fn suspend_current_and_run_next() {
     current_process().pause_cpu_accounting(get_time());
-    // There must be an application running.
     let task = take_current_task().unwrap();
-
-    // ---- access current TCB exclusively
-    let mut task_inner = task.inner_exclusive_access();
-    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // 当前任务先进入预就绪状态，等本 hart 切回 idle 后再正式发布。
-    task_inner.task_status = TaskStatus::PreReady;
-    drop(task_inner);
-    // ---- release current TCB
-
-    // 延迟发布到真正的就绪队列，避免其他 hart 在本 hart 尚未切走时抢到该任务。
-    add_task_pre_ready(task);
-    // jump to scheduling cycle
+    let task_cx_ptr = {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.task_status = TaskStatus::Runnable;
+        task_inner.wait_reason = None;
+        &mut task_inner.task_cx as *mut TaskContext
+    };
+    add_task(task);
     schedule(task_cx_ptr);
 }
 
@@ -80,47 +71,13 @@ pub fn suspend_current_and_run_next() {
 pub fn block_current_and_run_next(reason: WaitReason) {
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
-    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    task_inner.task_status = TaskStatus::Blocked;
-    task_inner.wait_reason = Some(reason);
-    task_inner.wake_pending = false;
-    drop(task_inner);
-    process.pause_cpu_accounting(get_time());
-    schedule(task_cx_ptr);
-}
-
-/// Complete transition from `PreBlocked` to `Blocked` and switch out current task.
-///
-/// If a wakeup arrives before the context switch happens, the task remains
-/// running on current hart and this function returns without scheduling away.
-pub fn block_current_preblocked_and_run_next() {
-    let task = take_current_task().unwrap();
-    let process = task.process.upgrade().unwrap();
-    let task_cx_ptr: *mut TaskContext;
-    {
+    let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
-        task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-        debug_assert!(matches!(task_inner.task_status, TaskStatus::PreBlocked));
-        
-        if task_inner.wake_pending {
-            task_inner.task_status = TaskStatus::Running;
-            task_inner.wait_reason = None;
-            task_inner.wake_pending = false;
-            drop(task_inner);
-            restore_current_task(task);
-            return;
-        }
-
-        // 注意：这里不要提前发布为 Blocked。
-        // 否则在真正 __switch 之前，其他 hart 可能看到 Blocked 并把该任务唤醒入队，
-        // 导致同一任务在两个 hart 上并发执行（共享同一内核栈）。
-        task_inner.task_status = TaskStatus::PreBlocked;
-    }
+        task_inner.task_status = TaskStatus::Interruptible;
+        task_inner.wait_reason = Some(reason);
+        &mut task_inner.task_cx as *mut TaskContext
+    };
     process.pause_cpu_accounting(get_time());
-
-    // 延迟发布到 pre_blocked 队列，等本 hart 切回 idle 后再转成 Blocked/Ready。
-    add_task_pre_blocked(task);
     schedule(task_cx_ptr);
 }
 
@@ -145,6 +102,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     let tid = task_inner.res.as_ref().unwrap().tid;
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
+    task_inner.task_status = TaskStatus::Zombie;
     task_inner.res = None;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
@@ -195,7 +153,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let mut recycle_res = Vec::<TaskUserRes>::new();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
-            // if other tasks are Ready in TaskManager or waiting for a timer to be
+            // if other tasks are Runnable in TaskManager or waiting for a timer to be
             // expired, we should remove them.
             //
             // Mention that we do not need to consider Mutex/Semaphore since they
@@ -306,7 +264,10 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
             let should_wake = {
                 let task_inner = task.inner_exclusive_access();
                 matches!(task_inner.wait_reason, Some(WaitReason::Poll))
-                    && matches!(task_inner.task_status, TaskStatus::Blocked | TaskStatus::PreBlocked)
+                    && matches!(
+                        task_inner.task_status,
+                        TaskStatus::Interruptible | TaskStatus::Uninterruptible
+                    )
             };
             if should_wake {
                 wakeup_task(task);

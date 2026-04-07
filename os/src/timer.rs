@@ -192,8 +192,8 @@ pub fn check_timer() {
                 }
                 continue;
             }
-            // hart A 将任务入堆但还没标为 Blocked (即目前是 Running)，此时 timer 已经过期，被 hart B 检查。 
-            // 此时唤醒不成功，但仍然要保留 timer。
+            // 如果任务还没真正进入睡眠态（例如仍处于 Running），跨 hart 的提前检查可能先看到它。
+            // 此时唤醒不成功，但仍然要保留 timer，等下一次 tick 再尝试。
             // 这种情形应该较少，且最多损失一个时间片，是可以接受的。
             if wakeup_task(Arc::clone(&timer.task)) {
                 timers.pop();
