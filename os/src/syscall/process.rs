@@ -3,6 +3,7 @@ use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
+    hart::hartid,
     mm::{
         translated_ref, translated_refmut, translated_str,
     },
@@ -635,4 +636,22 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     -1
+}
+
+pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_getcpu",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let token = current_user_token();
+        let cpu = hartid() as u32;
+        if !cpu_ptr.is_null() {
+            translated_refmut(token, cpu_ptr).map(|slot| *slot = cpu).ok_or(ERRNO::EFAULT)?;
+        }
+        if !node_ptr.is_null() {
+            translated_refmut(token, node_ptr).map(|slot| *slot = 0).ok_or(ERRNO::EFAULT)?;
+        }
+        Ok(0)
+    })
 }

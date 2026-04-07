@@ -88,6 +88,8 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
+/// getcpu
+pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 /// times
@@ -268,6 +270,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
+        SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_GETUID => sys_getuid(),
