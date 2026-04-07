@@ -3,8 +3,11 @@
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::bootstrap_hart_id;
+use crate::config::MAX_HARTS;
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::hart::hartid;
+use crate::sync::SpinNoIrqLock;
+use lazy_static::*;
 
 /// QEMU virt PLIC base.
 const PLIC_BASE: usize = 0x0C00_0000;
@@ -18,6 +21,7 @@ const UART0_IRQ: u32 = 10;
 const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
 
 const VIRTIO_MMIO_IRQ_COUNT: u32 = 8;
+const MAX_IRQ_ID: usize = 32;
 
 #[inline(always)]
 fn priority_ptr(irq: u32) -> *mut u32 {
@@ -51,6 +55,15 @@ fn enable_irq(context: usize, irq: u32) {
     }
 }
 
+fn disable_irq(context: usize, irq: u32) {
+    unsafe {
+        let p = enable_ptr(context, irq);
+        let mut v = read_volatile(p);
+        v &= !(1u32 << (irq % 32));
+        write_volatile(p, v);
+    }
+}
+
 fn set_priority(irq: u32, prio: u32) {
     debug!("Set IRQ {} priority to {}", irq, prio);
     unsafe { write_volatile(priority_ptr(irq), prio) }
@@ -73,13 +86,36 @@ fn supervisor_context(hart_id: usize) -> usize {
     hart_id * 2 + 1
 }
 
+lazy_static! {
+    static ref IRQ_AFFINITY: SpinNoIrqLock<[usize; MAX_IRQ_ID]> =
+        SpinNoIrqLock::new([usize::MAX; MAX_IRQ_ID]);
+}
+
+fn affinity_target(irq: u32) -> usize {
+    IRQ_AFFINITY
+        .lock()
+        .get(irq as usize)
+        .copied()
+        .unwrap_or(bootstrap_hart_id())
+}
+
+fn set_irq_affinity_internal(irq: u32, hart_id: usize) {
+    let target_hart = hart_id.min(MAX_HARTS.saturating_sub(1));
+    if let Some(slot) = IRQ_AFFINITY.lock().get_mut(irq as usize) {
+        *slot = target_hart;
+    }
+}
+
 /// 初始化 PLIC 的全局优先级配置。
 ///
 /// 这部分只需要由 bootstrap hart 执行一次，不依赖具体 hart context。
 pub fn init() {
     debug!("[kernel] Initializing PLIC...");
+    let housekeeping_hart = bootstrap_hart_id();
+    set_irq_affinity_internal(UART0_IRQ, housekeeping_hart);
     set_priority(UART0_IRQ, 1);
     for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
+        set_irq_affinity_internal(irq, housekeeping_hart);
         set_priority(irq, 1);
     }
     debug!("[kernel] PLIC global priority initialized.");
@@ -90,14 +126,17 @@ pub fn init() {
 /// 每个 hart 都需要各自执行一次，使能本地 context 的 IRQ 位图并设置 threshold。
 pub fn init_hart(hart_id: usize) {
     let context = supervisor_context(hart_id);
-    if hart_id != bootstrap_hart_id() {
-        set_threshold(context, u32::MAX);
-        debug!("hart {} plic init done (external IRQs masked)", hart_id);
-        return;
+    if affinity_target(UART0_IRQ) == hart_id {
+        enable_irq(context, UART0_IRQ);
+    } else {
+        disable_irq(context, UART0_IRQ);
     }
-    enable_irq(context, UART0_IRQ);
     for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
-        enable_irq(context, irq);
+        if affinity_target(irq) == hart_id {
+            enable_irq(context, irq);
+        } else {
+            disable_irq(context, irq);
+        }
     }
     set_threshold(context, 0);
     debug!("hart {} plic init done", hart_id);
