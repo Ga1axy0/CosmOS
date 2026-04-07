@@ -192,8 +192,8 @@ pub fn main() -> i32 {
 	assert!(fd >= 0);
 	let fd = fd as usize;
 	let n = read(fd, &mut buf2);
-	assert_eq!(n, 2, "CREATE on existing should preserve existing file content");
-	assert_eq!(&buf2[..2], b"zz");
+	assert_eq!(n, 3, "CREATE on existing should preserve existing file content");
+	assert_eq!(&buf2[..3], b"zzc");
 	assert_eq!(close(fd), 0);
 
 	// ---- open error + close invalid ----
