@@ -91,6 +91,8 @@ pub fn run_tasks() {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
             task_inner.last_cpu = hartid();
+            task_inner.on_cpu = true;
+            task_inner.on_rq = false;
             drop(task_inner);
 
             processor.current = Some(task);

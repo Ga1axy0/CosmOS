@@ -69,16 +69,25 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
     let target_hart = normalize_hart(hart);
     {
         let mut task_inner = task.inner_exclusive_access();
+        if task_inner.on_rq || task_inner.on_cpu || matches!(task_inner.task_status, TaskStatus::Zombie) {
+            return;
+        }
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
         task_inner.last_cpu = target_hart;
+        task_inner.on_rq = true;
     }
     RUN_QUEUES[target_hart].lock().enqueue(task);
 }
 
 /// Pop one runnable task from the selected hart's runqueue.
 pub fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
-    RUN_QUEUES[normalize_hart(hart)].lock().dequeue()
+    let task = RUN_QUEUES[normalize_hart(hart)].lock().dequeue()?;
+    {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.on_rq = false;
+    }
+    Some(task)
 }
 
 /// Pick the next task for the selected hart.
@@ -88,19 +97,23 @@ pub fn pick_next_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
 
 /// Wake up a sleeping task and place it on its target hart runqueue.
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
-    trace!("kernel: TaskManager::wakeup_task");
     let target_hart = {
         let mut task_inner = task.inner_exclusive_access();
         match task_inner.task_status {
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {
+                if task_inner.on_rq || task_inner.on_cpu {
+                    return false;
+                }
                 task_inner.task_status = TaskStatus::Runnable;
                 task_inner.wait_reason = None;
+                task_inner.on_rq = true;
                 normalize_hart(task_inner.last_cpu)
             }
             TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return false,
         }
     };
     RUN_QUEUES[target_hart].lock().enqueue(task);
+    trace!("kernel: TaskManager::wakeup_task -> hart {}", target_hart);
     true
 }
 
@@ -109,6 +122,8 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
     for rq in RUN_QUEUES.iter() {
         rq.lock().remove_task(&task);
     }
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.on_rq = false;
 }
 
 /// Set a task to stop-wait status on the current hart, keeping its kernel

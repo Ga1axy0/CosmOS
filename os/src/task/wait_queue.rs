@@ -69,6 +69,8 @@ impl WaitQueue {
                 if matches!(task_inner.task_status, TaskStatus::Interruptible) {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
+                    task_inner.on_cpu = true;
+                    task_inner.on_rq = false;
                 }
             }
             return;
@@ -179,6 +181,8 @@ where
                 if matches!(task_inner.task_status, TaskStatus::Interruptible) {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
+                    task_inner.on_cpu = true;
+                    task_inner.on_rq = false;
                 }
             }
             return;
