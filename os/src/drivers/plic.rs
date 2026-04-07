@@ -2,6 +2,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::bootstrap_hart_id;
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::hart::hartid;
 
@@ -89,6 +90,11 @@ pub fn init() {
 /// 每个 hart 都需要各自执行一次，使能本地 context 的 IRQ 位图并设置 threshold。
 pub fn init_hart(hart_id: usize) {
     let context = supervisor_context(hart_id);
+    if hart_id != bootstrap_hart_id() {
+        set_threshold(context, u32::MAX);
+        debug!("hart {} plic init done (external IRQs masked)", hart_id);
+        return;
+    }
     enable_irq(context, UART0_IRQ);
     for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
         enable_irq(context, irq);
