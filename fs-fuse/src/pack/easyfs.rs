@@ -46,7 +46,7 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> std::io::Result<()> {
     // NOTE: The on-disk layout is defined by the `fs` crate (easy-fs).
     // The last argument is the starting data block (kept as original: 1).
     let efs = EasyFileSystem::create(block_file, total_blocks, 1);
-    let root_inode = Arc::new(EasyFileSystem::root_inode(&efs));
+    let root_inode = EasyFileSystem::root_inode(&efs);
 
     for app in apps {
         let mut host_file = File::open(&app.host_path).unwrap_or_else(|_| {

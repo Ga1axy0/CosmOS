@@ -98,7 +98,7 @@ lazy_static! {
     /// Call [`init_rootfs`] once after `mm::init()` to overlay a real
     /// filesystem and make the full directory tree accessible.
     pub static ref ROOT_INODE: Arc<Inode> =
-        Arc::new(Inode::new(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>));
+        Inode::from_vfs_node(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,21 +239,21 @@ pub fn init_rootfs() {
     {
         use fs::Fat32FileSystem;
         let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
-        let root = Arc::new(Fat32FileSystem::root_inode(&vfs));
+        let root = Fat32FileSystem::root_inode(&vfs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
     }
     #[cfg(feature = "easyfs")]
     {
         use fs::EasyFileSystem;
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
-        let root = Arc::new(EasyFileSystem::root_inode(&efs));
+        let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
     }
     #[cfg(feature = "ext4")]
     {
         use fs::Ext4FileSystem;
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
-        let root = Arc::new(Ext4FileSystem::root_inode(&efs));
+        let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
@@ -784,13 +784,13 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
             use fs::Fat32FileSystem;
             debug!("mount_device: opening FAT32 filesystem on {}", dev_path);
             let vfs = Fat32FileSystem::open(block_dev);
-            Arc::new(Fat32FileSystem::root_inode(&vfs))
+            Fat32FileSystem::root_inode(&vfs)
         }
         #[cfg(feature = "ext4")]
         "ext4" => {
             use fs::Ext4FileSystem;
             let vfs = Ext4FileSystem::open(block_dev);
-            Arc::new(Ext4FileSystem::root_inode(&vfs))
+            Ext4FileSystem::root_inode(&vfs)
         }
         _ => return Err(ERRNO::EINVAL),
     };

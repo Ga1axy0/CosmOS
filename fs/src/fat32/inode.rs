@@ -777,4 +777,23 @@ impl VfsNode for FatInode {
     fn size(&self) -> usize {
         self.inner.lock().size as usize
     }
+
+    fn ino(&self) -> u64 {
+        let inner = self.inner.lock();
+        if inner.is_dir && inner.pos.is_none() {
+            return inner.start_cluster as u64;
+        }
+        if let Some(pos) = &inner.pos {
+            // TODO：FAT32 没有天然稳定 inode 号，这里先用目录项位置近似标识。
+            ((pos.dir_start_cluster as u64) << 32) | pos.entry_offset as u64
+        } else if inner.start_cluster >= 2 {
+            (1u64 << 63) | inner.start_cluster as u64
+        } else {
+            0
+        }
+    }
+
+    fn fs_id(&self) -> u64 {
+        Arc::as_ptr(&self.fs) as usize as u64
+    }
 }
