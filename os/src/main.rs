@@ -94,9 +94,6 @@ fn clear_bss() {
 /// 不包含内存、文件系统、驱动探测这类全局一次性初始化。
 fn init_local_hart(hart_id: usize) {
     trap::init_hart();
-    if hart_id != bootstrap_hart_id() {
-        trap::disable_external_interrupt();
-    }
     timer::init_hart();
     drivers::plic::init_hart(hart_id);
     debug!("hart {} local init done", hart_id);
