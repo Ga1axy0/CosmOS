@@ -4,6 +4,7 @@ use core::cmp::Ordering;
 use core::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
 use crate::config::CLOCK_FREQ;
+use crate::bootstrap_hart_id;
 use crate::drivers::rtc;
 use crate::hart::hartid;
 use crate::poll::{self, PollTimerTag};
@@ -181,6 +182,9 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 
 /// Check if the timer has expired
 pub fn check_timer() {
+    if hartid() != bootstrap_hart_id() {
+        return;
+    }
     // trace!("kernel: check_timer");
     let current_ms = get_time_ms();
     let mut timers = TIMERS.lock();

@@ -97,23 +97,31 @@ pub fn pick_next_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
 
 /// Wake up a sleeping task and place it on its target hart runqueue.
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
-    let target_hart = {
+    let wake_target = {
         let mut task_inner = task.inner_exclusive_access();
         match task_inner.task_status {
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {
-                if task_inner.on_rq || task_inner.on_cpu {
+                if task_inner.on_rq {
                     return false;
                 }
                 task_inner.task_status = TaskStatus::Runnable;
                 task_inner.wait_reason = None;
-                task_inner.on_rq = true;
-                normalize_hart(task_inner.last_cpu)
+                if task_inner.on_cpu {
+                    None
+                } else {
+                    task_inner.on_rq = true;
+                    Some(normalize_hart(task_inner.last_cpu))
+                }
             }
             TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return false,
         }
     };
-    RUN_QUEUES[target_hart].lock().enqueue(task);
-    trace!("kernel: TaskManager::wakeup_task -> hart {}", target_hart);
+    if let Some(target_hart) = wake_target {
+        RUN_QUEUES[target_hart].lock().enqueue(task);
+        trace!("kernel: TaskManager::wakeup_task -> hart {}", target_hart);
+    } else {
+        trace!("kernel: TaskManager::wakeup_task -> current cpu");
+    }
     true
 }
 

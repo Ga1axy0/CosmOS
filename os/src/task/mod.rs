@@ -72,17 +72,29 @@ pub fn suspend_current_and_run_next() {
 /// Make current task blocked and switch to the next task.
 pub fn block_current_and_run_next(reason: WaitReason) {
     let task = take_current_task().unwrap();
-    let process = task.process.upgrade().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
-        task_inner.on_cpu = false;
-        task_inner.on_rq = false;
-        task_inner.task_status = TaskStatus::Interruptible;
-        task_inner.wait_reason = Some(reason);
-        &mut task_inner.task_cx as *mut TaskContext
+        if matches!(task_inner.task_status, TaskStatus::Runnable) {
+            task_inner.task_status = TaskStatus::Running;
+            task_inner.wait_reason = None;
+            task_inner.on_cpu = true;
+            task_inner.on_rq = false;
+            None
+        } else {
+            task_inner.on_cpu = false;
+            task_inner.on_rq = false;
+            task_inner.task_status = TaskStatus::Interruptible;
+            task_inner.wait_reason = Some(reason);
+            Some(&mut task_inner.task_cx as *mut TaskContext)
+        }
     };
+    if task_cx_ptr.is_none() {
+        current_processor().lock().set_current(task);
+        return;
+    }
+    let process = task.process.upgrade().unwrap();
     process.pause_cpu_accounting(get_time());
-    schedule(task_cx_ptr);
+    schedule(task_cx_ptr.unwrap());
 }
 
 use crate::board::QEMUExit;
