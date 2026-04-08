@@ -1,5 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use spin::Mutex;
 
 use crate::errno::FS_ERRNO;
 use crate::inode_cache::get_or_create_inode;
@@ -134,12 +135,22 @@ pub trait VfsNode: Send + Sync + Any {
 
 pub struct Inode {
     inner: Arc<dyn VfsNode>,
+    state: Mutex<InodeState>,
+}
+
+/// 稳定内存 inode 的可变运行时状态。
+struct InodeState {
+    /// 由 OS 层按需挂载的 page cache 宿主对象。
+    page_cache: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Inode {
     /// 创建一个未进入 inode cache 的临时内存 inode。
     fn new(inner: Arc<dyn VfsNode>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            state: Mutex::new(InodeState { page_cache: None }),
+        }
     }
 
     /// 创建一个不参与全局去重的 `Arc<Inode>`。
@@ -277,6 +288,29 @@ impl Inode {
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
         self.inner.rename_child(old_name, &new_parent.inner, new_name)
+    }
+
+    /// 获取当前 inode 挂载的 page cache 宿主对象。
+    pub fn page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .page_cache
+            .as_ref()
+            .and_then(|state| Arc::clone(state).downcast::<T>().ok())
+    }
+
+    /// 为当前 inode 安装 page cache 宿主对象。
+    pub fn set_page_cache_state<T: Any + Send + Sync>(&self, state: Arc<T>) {
+        self.state.lock().page_cache = Some(state);
+    }
+
+    /// 移除当前 inode 挂载的 page cache 宿主对象。
+    pub fn take_page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .page_cache
+            .take()
+            .and_then(|state| state.downcast::<T>().ok())
     }
 
     /// Returns a clone of the raw [`VfsNode`] backing this inode.

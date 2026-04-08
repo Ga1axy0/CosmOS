@@ -1,6 +1,7 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
 mod inode;
+mod page_cache;
 mod pipe;
 mod stdio;
 mod tty;
@@ -272,6 +273,13 @@ impl FileDescription {
     }
 }
 
+impl Drop for FileDescription {
+    fn drop(&mut self) {
+        // TODO：后续补齐 `fsync/msync` 后，这里可改为更细粒度的同步策略。
+        let _ = self.file.sync();
+    }
+}
+
 /// trait File for all file types
 pub trait File: Send + Sync {
     /// the file readable?
@@ -325,6 +333,10 @@ pub trait File: Send + Sync {
     }
     /// get file metadata
     fn stat(&self) -> Stat;
+    /// 将该文件对象的脏数据同步到底层存储。
+    fn sync(&self) -> Result<(), ERRNO> {
+        Ok(())
+    }
     /// Returns the canonical path used when this file was opened, if any.
     fn path(&self) -> Option<String> {
         None

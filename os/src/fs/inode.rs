@@ -1,4 +1,4 @@
-use super::{File, Stat, StatMode};
+use super::{page_cache, File, Stat, StatMode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
@@ -38,7 +38,7 @@ impl OSInode {
         let mut v: Vec<u8> = Vec::new();
         let mut offset = 0usize;
         loop {
-            let len = self.inode.read_at(offset, &mut buffer);
+            let len = page_cache::read_inode(&self.inode, offset, &mut buffer);
             if len == 0 {
                 break;
             }
@@ -53,7 +53,7 @@ impl OSInode {
     pub fn read_first_line_limited(&self, max_len: usize) -> (Vec<u8>, bool) {
         trace!("kernel: OSInode::read_first_line_limited, max_len={}", max_len);
         let mut buf = alloc::vec![0; max_len];
-        let read_len = self.inode.read_at(0, &mut buf);
+        let read_len = page_cache::read_inode(&self.inode, 0, &mut buf);
         buf.truncate(read_len);
 
         if let Some(line_end) = buf.iter().position(|&ch| ch == b'\n') {
@@ -357,7 +357,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
                 return Err(ERRNO::EEXIST);
             }
             if flags.contains(OpenFlags::TRUNC) {
-                existing.clear();
+                page_cache::truncate_inode_zero(&existing);
             }
             Ok(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
@@ -370,7 +370,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
         lookup_inode(&abs).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 debug!("open_file_at: truncating existing file at {}", abs);
-                inode.clear();
+                page_cache::truncate_inode_zero(&inode);
             }
             Arc::new(OSInode::new(inode, abs.clone()))
         }).ok_or(ERRNO::ENOENT)
@@ -444,7 +444,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         if let Some(inode) = ROOT_INODE.find(name) {
             // 与 `openat(O_CREAT)` 保持一致：只有显式 `O_TRUNC` 才清空已有文件。
             if flags.contains(OpenFlags::TRUNC) {
-                inode.clear();
+                page_cache::truncate_inode_zero(&inode);
             }
             Some(Arc::new(OSInode::new(inode, abs)))
         } else {
@@ -457,7 +457,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     } else {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
-                inode.clear();
+                page_cache::truncate_inode_zero(&inode);
             }
             Arc::new(OSInode::new(inode, abs))
         })
@@ -584,7 +584,7 @@ impl File for OSInode {
         let mut file_off = offset;
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let read_size = self.inode.read_at(file_off, *slice);
+            let read_size = page_cache::read_inode(&self.inode, file_off, *slice);
             if read_size == 0 {
                 break;
             }
@@ -600,7 +600,7 @@ impl File for OSInode {
         let mut total_write_size = 0usize;
         let mut file_off = offset;
         for slice in buf.buffers.iter() {
-            let write_size = self.inode.write_at(file_off, *slice);
+            let write_size = page_cache::write_inode(&self.inode, file_off, *slice);
             assert_eq!(write_size, slice.len());
             file_off += write_size;
             total_write_size += write_size;
@@ -685,6 +685,11 @@ impl File for OSInode {
         inode_stat(&self.inode)
     }
 
+    fn sync(&self) -> Result<(), ERRNO> {
+        page_cache::sync_inode(&self.inode);
+        Ok(())
+    }
+
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
     }
@@ -712,10 +717,10 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         gid: 0,
         rdev: 0,
         pad0: 0,
-        size: inode.size() as i64,
+        size: page_cache::cached_inode_size(inode) as i64,
         blksize: 512,
         pad1: 0,
-        blocks: (inode.size() as u64 + 511) / 512,
+        blocks: (page_cache::cached_inode_size(inode) as u64 + 511) / 512,
         atime_sec: atime.map(|t| t.sec as isize).unwrap_or(0),
         atime_nsec: atime.map(|t| t.nsec as isize).unwrap_or(0),
         mtime_sec: mtime.map(|t| t.sec as isize).unwrap_or(0),
