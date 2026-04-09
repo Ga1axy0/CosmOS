@@ -14,6 +14,7 @@ use bitflags::*;
 use fs::vfs::VfsNode;
 use fs::Inode;
 use lazy_static::*;
+use core::any::Any;
 
 // Compile-time check: exactly one filesystem backend must be selected.
 #[cfg(not(any(feature = "ext4", feature = "easyfs", feature = "fat32")))]
@@ -561,6 +562,10 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
 }
 
 impl File for OSInode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     /// file readable?
     fn readable(&self) -> bool {
         // 目录项遍历走 `getdents64`，普通 `read` 仅对常规文件开放。

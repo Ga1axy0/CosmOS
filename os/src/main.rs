@@ -45,6 +45,7 @@ pub mod hart;
 pub mod lang_items;
 pub mod klog;
 pub mod mm;
+pub mod net;
 mod poll;
 pub mod sbi;
 pub mod sync;
@@ -189,6 +190,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     info!("hart {} boot", hart_id);
     info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
+    net::init();
     timer::init_realtime_offset_from_rtc();
     probe_and_start_other_harts(hart_id);
     init_local_hart(hart_id);

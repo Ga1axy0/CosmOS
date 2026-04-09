@@ -90,6 +90,20 @@ pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_TIMES: usize = 153;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
+/// socket syscall
+pub const SYSCALL_SOCKET: usize = 198;
+/// bind syscall
+pub const SYSCALL_BIND: usize = 200;
+/// listen syscall
+pub const SYSCALL_LISTEN: usize = 201;
+/// accept syscall
+pub const SYSCALL_ACCEPT: usize = 202;
+/// connect syscall
+pub const SYSCALL_CONNECT: usize = 203;
+/// sendto syscall
+pub const SYSCALL_SENDTO: usize = 206;
+/// recvfrom syscall
+pub const SYSCALL_RECVFROM: usize = 207;
 /// getppid syscall
 pub const SYSCALL_GETPPID: usize = 173;
 /// getuid syscall
@@ -151,6 +165,7 @@ pub const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 pub const SYSCALL_CONDVAR_WAIT: usize = 473;
 
 mod fs;
+mod net;
 mod process;
 mod sync;
 mod thread;
@@ -164,6 +179,7 @@ pub mod errno;
 use core::time;
 
 use fs::*;
+use net::*;
 use process::*;
 use sync::*;
 use thread::*;
@@ -260,6 +276,27 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
+        SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
+        SYSCALL_BIND => sys_bind(args[0] as u32, args[1] as *const crate::net::SockAddrIn, args[2]),
+        SYSCALL_LISTEN => sys_listen(args[0] as u32, args[1]),
+        SYSCALL_ACCEPT => sys_accept(args[0] as u32, args[1] as *mut crate::net::SockAddrIn, args[2]),
+        SYSCALL_CONNECT => sys_connect(args[0] as u32, args[1] as *const crate::net::SockAddrIn, args[2]),
+        SYSCALL_SENDTO => sys_sendto(
+            args[0] as u32,
+            args[1] as *const u8,
+            args[2],
+            args[3],
+            args[4] as *const crate::net::SockAddrIn,
+            args[5],
+        ),
+        SYSCALL_RECVFROM => sys_recvfrom(
+            args[0] as u32,
+            args[1] as *mut u8,
+            args[2],
+            args[3],
+            args[4] as *mut crate::net::SockAddrIn,
+            args[5],
+        ),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),

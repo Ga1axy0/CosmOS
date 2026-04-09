@@ -5,6 +5,7 @@ use crate::sync::SpinNoIrqLock;
 use alloc::sync::{Arc, Weak};
 use crate::fs::{Stat,StatMode}; 
 use crate::task::{WaitQueue, WaitReason};
+use core::any::Any;
 
 /// IPC pipe
 pub struct Pipe {
@@ -120,6 +121,10 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
 }
 
 impl File for Pipe {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn readable(&self) -> bool {
         self.readable
     }
