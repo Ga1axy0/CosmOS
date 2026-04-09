@@ -40,11 +40,13 @@ const TCP_TX_BUF: usize = 8192;
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
 
+// Kernel UDP echo feature (for quick network stack testing).
+const ENABLE_KERNEL_UDP_ECHO: bool = false;
+const KERNEL_UDP_ECHO_PORT: u16 = 5555;
+
 lazy_static! {
     /// Global network stack instance.
-    pub(crate) static ref NET_STACK: SpinNoIrqLock<Option<NetStack>> = unsafe {
-        SpinNoIrqLock::new(None)
-    };
+    pub(crate) static ref NET_STACK: SpinNoIrqLock<Option<NetStack>> = SpinNoIrqLock::new(None);
 }
 
 /// Whether one immediate poll is needed due to IRQ or recent TX activity.
@@ -104,6 +106,7 @@ pub(crate) struct NetStack {
     pub(crate) sockets: SocketSet<'static>,
     pub(crate) udp_states: Vec<Arc<UdpSocketState>>,
     pub(crate) tcp_states: Vec<Arc<TcpSocketState>>,
+    pub(crate) echo_udp: Option<smoltcp::iface::SocketHandle>,
     next_ephemeral_port: u16,
 }
 
@@ -134,14 +137,34 @@ impl NetStack {
         let storage = Box::leak(storage_vec.into_boxed_slice());
         let sockets = SocketSet::new(storage);
 
-        Self {
+        let mut stack = Self {
             device,
             iface,
             sockets,
             udp_states: Vec::new(),
             tcp_states: Vec::new(),
+            echo_udp: None,
             next_ephemeral_port: EPHEMERAL_PORT_START,
+        };
+
+        // Optionally create a kernel UDP echo socket bound to the configured port.
+        if ENABLE_KERNEL_UDP_ECHO {
+            let (h, _st) = stack.create_udp_socket();
+            let bound = {
+                let socket = stack.sockets.get_mut::<udp_socket::Socket>(h);
+                socket.bind(KERNEL_UDP_ECHO_PORT).is_ok()
+            };
+            if bound {
+                stack.echo_udp = Some(h);
+                info!("[kernel] net: UDP echo enabled on port {}", KERNEL_UDP_ECHO_PORT);
+            } else {
+                // binding failed (port in use) — remove the socket we created.
+                stack.remove_udp_socket(h);
+                info!("[kernel] net: UDP echo disabled, port {} unavailable", KERNEL_UDP_ECHO_PORT);
+            }
         }
+
+        stack
     }
 
     fn poll(&mut self) {
@@ -154,6 +177,24 @@ impl NetStack {
                 if socket.can_recv() {
                     st.read_wait.wake_one();
                     ready |= POLLIN;
+
+                    // If this is the kernel echo socket, consume incoming packets and
+                    // send back the reversed payload to the sender.
+                    if self.echo_udp == Some(st.handle) {
+                        while socket.can_recv() {
+                            if let Ok((data, meta)) = socket.recv() {
+                                // Reverse the payload bytes and attempt to send back.
+                                let mut rev = Vec::from(data);
+                                rev.reverse();
+                                if socket.can_send() {
+                                    let _ = socket.send_slice(&rev, meta.endpoint);
+                                    NEED_POLL.store(true, Ordering::Release);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                 }
                 if socket.can_send() {
                     st.write_wait.wake_one();
@@ -167,15 +208,14 @@ impl NetStack {
 
         for st in self.tcp_states.iter() {
             let mut ready = 0u16;
-            let mut may_recv = true;
-            let mut open = true;
+            let mut open;
             {
                 let socket = self.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 if socket.can_recv() {
                     st.read_wait.wake_one();
                     ready |= POLLIN;
                 }
-                may_recv = socket.may_recv();
+                let may_recv = socket.may_recv();
                 if !may_recv {
                     st.read_wait.wake_all();
                     ready |= POLLIN | POLLHUP;

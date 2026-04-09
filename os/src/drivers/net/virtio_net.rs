@@ -30,6 +30,10 @@ pub struct VirtIONetDevice {
     mac: [u8; 6],
     inner: SpinNoIrqLock<VirtIONetRaw<VirtioHal, MmioTransport<'static>, QUEUE_SIZE>>,
     tx_wait_queue: WaitQueueKeyed<u16>,
+    /// TX buffers that are in-flight via non-blocking `try_send`.
+    tx_slots: SpinNoIrqLock<[Option<Vec<u8>>; QUEUE_SIZE]>,
+    /// Completion marks for blocking `send` path tokens.
+    tx_done: SpinNoIrqLock<[bool; QUEUE_SIZE]>,
     rx_slots: SpinNoIrqLock<[Option<Vec<u8>>; QUEUE_SIZE]>,
 }
 
@@ -61,6 +65,8 @@ impl VirtIONetDevice {
             mac,
             inner: SpinNoIrqLock::new(inner),
             tx_wait_queue: WaitQueueKeyed::new(),
+            tx_slots: SpinNoIrqLock::new(array::from_fn(|_| None)),
+            tx_done: SpinNoIrqLock::new(array::from_fn(|_| false)),
             rx_slots: SpinNoIrqLock::new(rx_slots),
         })
     }
@@ -83,15 +89,13 @@ impl VirtIONetDevice {
         if inner.ack_interrupt().is_empty() {
             return;
         }
-        let tx_ready = inner.poll_transmit();
         drop(inner);
-        if let Some(token) = tx_ready {
-            self.tx_wait_queue.wake_selected(token);
-        }
+        self.reclaim_tx_completions();
     }
 
     /// Returns whether TX queue can accept one packet.
     pub fn can_send(&self) -> bool {
+        self.reclaim_tx_completions();
         self.inner.lock().can_send()
     }
 
@@ -160,6 +164,11 @@ impl VirtIONetDevice {
             (token, used_len)
         };
 
+        {
+            let mut tx_done = self.tx_done.lock();
+            tx_done[token as usize] = false;
+        }
+
         self.wait_tx_token(token);
 
         // SAFETY: Same token and same tx buffer as `transmit_begin` above.
@@ -169,6 +178,90 @@ impl VirtIONetDevice {
                 .transmit_complete(token, &tx_buf[..used_len])?;
         }
         Ok(())
+    }
+
+    /// Try to send one Ethernet frame without blocking.
+    ///
+    /// Returns:
+    /// - `Ok(true)`: queued successfully.
+    /// - `Ok(false)`: TX queue currently full.
+    /// - `Err(_)`: fatal driver/API failure.
+    pub fn try_send(&self, frame: &[u8]) -> Result<bool, Error> {
+        const MAX_HEADER_PAD: usize = 32;
+
+        self.reclaim_tx_completions();
+
+        let mut tx_buf = vec![0u8; frame.len() + MAX_HEADER_PAD];
+        let token = {
+            let mut inner = self.inner.lock();
+            if !inner.can_send() {
+                return Ok(false);
+            }
+            let hdr_len = inner.fill_buffer_header(tx_buf.as_mut_slice())?;
+            let used_len = hdr_len + frame.len();
+            tx_buf[hdr_len..used_len].copy_from_slice(frame);
+            tx_buf.truncate(used_len);
+            // SAFETY: `tx_buf` is moved into `tx_slots` immediately after begin,
+            // so it lives until completion reclaim.
+            unsafe { inner.transmit_begin(tx_buf.as_slice()) }?
+        };
+
+        let idx = token as usize;
+        assert!(idx < QUEUE_SIZE, "virtio-net: tx token {} out of range", token);
+        let mut tx_slots = self.tx_slots.lock();
+        assert!(
+            tx_slots[idx].is_none(),
+            "virtio-net: duplicated non-blocking tx token {}",
+            token
+        );
+        tx_slots[idx] = Some(tx_buf);
+        Ok(true)
+    }
+
+    fn reclaim_tx_completions(&self) {
+        let mut wake_tokens = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            let mut tx_slots = self.tx_slots.lock();
+            while let Some(token) = inner.poll_transmit() {
+                let idx = token as usize;
+                if idx >= QUEUE_SIZE {
+                    warn!("virtio-net: completion token {} out of range", token);
+                    continue;
+                }
+
+                if let Some(tx_buf) = tx_slots[idx].take() {
+                    // SAFETY: buffer exactly matches begin-side storage for this token.
+                    if let Err(e) = unsafe { inner.transmit_complete(token, tx_buf.as_slice()) } {
+                        warn!(
+                            "virtio-net: non-blocking transmit_complete failed token {}: {:?}",
+                            token,
+                            e
+                        );
+                    }
+                } else {
+                    // completion of a blocking `send` token, handled by waiter after wake.
+                    wake_tokens.push(token);
+                }
+            }
+        }
+
+        if wake_tokens.is_empty() {
+            return;
+        }
+
+        {
+            let mut tx_done = self.tx_done.lock();
+            for token in wake_tokens.iter().copied() {
+                let idx = token as usize;
+                if idx < QUEUE_SIZE {
+                    tx_done[idx] = true;
+                }
+            }
+        }
+        for token in wake_tokens {
+            self.tx_wait_queue.wake_selected(token);
+        }
     }
 
     fn wait_tx_token(&self, token: u16) {
@@ -190,7 +283,16 @@ impl VirtIONetDevice {
     }
 
     fn tx_token_ready(&self, token: u16) -> bool {
-        let mut inner = self.inner.lock();
-        matches!(inner.poll_transmit(), Some(ready) if ready == token)
+        self.reclaim_tx_completions();
+        let idx = token as usize;
+        if idx >= QUEUE_SIZE {
+            return true;
+        }
+        let mut tx_done = self.tx_done.lock();
+        let ready = tx_done[idx];
+        if ready {
+            tx_done[idx] = false;
+        }
+        ready
     }
 }

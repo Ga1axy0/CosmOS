@@ -74,22 +74,21 @@ impl VirtIOBlock {
     }
 
     fn wait_token(&self, token: u16) {
-        loop {
-            if self.token_ready(token) {
-                return;
+        // Early-boot path (before scheduler): no current task, so we must poll.
+        // Evaluate this once to avoid repeatedly touching task-local lazy state
+        // from a hot spin loop.
+        if current_task().is_none() {
+            while !self.token_ready(token) {
+                spin_loop();
             }
-            if current_task().is_some() {
-                self.wait_queue
-                    .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
-                        self.token_ready(token)
-                    });
-                return;
-            }
-
-            // Early boot path: no schedulable task context exists yet,
-            // so we cannot block via wait queue and must poll completion state.
-            spin_loop();
+            return;
         }
+
+        // Task context path: park current task and wait for precise token wakeup.
+        self.wait_queue
+            .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
+                self.token_ready(token)
+            });
     }
 
     fn token_ready(&self, token: u16) -> bool {

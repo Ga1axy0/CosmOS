@@ -4,27 +4,49 @@ mod virtio_blk;
 
 pub use virtio_blk::VirtIOBlock;
 
-use crate::sync::{SpinNoIrqLock};
+use crate::sync::SpinNoIrqLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::convert::TryFrom;
 use fs::BlockDevice;
 use lazy_static::*;
 use core::ptr::NonNull;
-use virtio_drivers::{
-    transport::{DeviceType, Transport, mmio::{MmioTransport, VirtIOHeader}},
-};
+use virtio_drivers::transport::{DeviceType, mmio::{MmioTransport, VirtIOHeader}};
+
+#[inline]
+fn mmio_slot_device_type(header: NonNull<VirtIOHeader>) -> Option<DeviceType> {
+    // VirtIO MMIO register layout: magic(0x00), version(0x04), device_id(0x08).
+    const MAGIC_VALUE: u32 = 0x7472_6976;
+    const LEGACY_VERSION: u32 = 1;
+    const MODERN_VERSION: u32 = 2;
+
+    let base = header.as_ptr() as *const u32;
+    // SAFETY: caller passes an MMIO header address on the virt bus.
+    let magic = unsafe { core::ptr::read_volatile(base) };
+    if magic != MAGIC_VALUE {
+        return None;
+    }
+    // SAFETY: MMIO header word reads are volatile.
+    let version = unsafe { core::ptr::read_volatile(base.add(1)) };
+    if version != LEGACY_VERSION && version != MODERN_VERSION {
+        return None;
+    }
+    // SAFETY: MMIO header word reads are volatile.
+    let device_id = unsafe { core::ptr::read_volatile(base.add(2)) };
+    DeviceType::try_from(device_id).ok()
+}
 
 lazy_static! {
     /// Registry of all discovered block devices, keyed by name (`"vda"`, `"vdb"`, …).
     ///
     /// Must be populated by [`probe_block_devices`] before any FS initialisation.
     pub static ref BLOCK_DEVICES: SpinNoIrqLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
-        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+        SpinNoIrqLock::new(BTreeMap::new());
 
         /// VirtIO MMIO IRQ to block device mapping.
         pub static ref BLOCK_DEVICES_BY_IRQ: SpinNoIrqLock<BTreeMap<u32, Arc<VirtIOBlock>>> =
-        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+        SpinNoIrqLock::new(BTreeMap::new());
 }
 
 /// Scan the VirtIO MMIO bus slots and register every block device found.
@@ -49,18 +71,18 @@ pub fn probe_block_devices() {
         let Some(header) = NonNull::new(addr as *mut VirtIOHeader) else {
             continue;
         };
+        let device_type = mmio_slot_device_type(header);
+        if device_type != Some(DeviceType::Block) {
+            if let Some(kind) = device_type {
+                debug!("[kernel] VirtIO slot {} is {:?}, skipping", slot, kind);
+            }
+            continue;
+        }
+
         let transport = match unsafe { MmioTransport::new(header, VIRTIO_MMIO_STRIDE) } {
             Ok(t) => t,
             Err(_) => continue,
         };
-        if transport.device_type() != DeviceType::Block {
-            debug!(
-                "[kernel] VirtIO slot {} is {:?}, skipping",
-                slot,
-                transport.device_type()
-            );
-            continue;
-        }
 
         if let Some(dev) = VirtIOBlock::try_new(transport) {
             let dev = Arc::new(dev);
