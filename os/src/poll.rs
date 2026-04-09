@@ -12,7 +12,6 @@ use crate::syscall::errno::ERRNO;
 use crate::task::{TaskControlBlock, WaitQueueKeyed, WaitReason};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::array;
 use lazy_static::lazy_static;
 
 /// Readable event bit.
@@ -62,6 +61,19 @@ impl Default for KernelFdSlot {
     }
 }
 
+impl KernelFdSlot {
+    const EMPTY: Self = Self {
+        active: false,
+        generation: 0,
+        owner_pid: 0,
+        owner_fd: 0,
+        source_id: 0,
+        key_bits: 0,
+        key_bits_in: 0,
+        key_bits_out: 0,
+    };
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PollKeySlot {
     generation: u8,
@@ -83,6 +95,16 @@ impl Default for PollKeySlot {
     }
 }
 
+impl PollKeySlot {
+    const EMPTY: Self = Self {
+        generation: 0,
+        state: PollKeyState::Free,
+        task_ptr: 0,
+        owner_pid: 0,
+        rows_mask: 0,
+    };
+}
+
 #[derive(Debug)]
 struct PollRegistry {
     kernel_slots: [KernelFdSlot; MAX_KERNEL_FD],
@@ -92,10 +114,10 @@ struct PollRegistry {
 }
 
 impl PollRegistry {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            kernel_slots: array::from_fn(|_| KernelFdSlot::default()),
-            key_slots: array::from_fn(|_| PollKeySlot::default()),
+            kernel_slots: [KernelFdSlot::EMPTY; MAX_KERNEL_FD],
+            key_slots: [PollKeySlot::EMPTY; MAX_POLL_KEYS],
             next_kernel_fd: 0,
             next_key: 0,
         }
@@ -199,10 +221,12 @@ impl PollRegistry {
 }
 
 lazy_static! {
-    static ref POLL_REGISTRY: SpinNoIrqLock<PollRegistry> =
-        SpinNoIrqLock::new(PollRegistry::new());
     static ref POLL_WAIT_QUEUE: WaitQueueKeyed<u16> = WaitQueueKeyed::new();
 }
+
+// Use const static initialization for registry to avoid a large lazy-init stack
+// frame in `spin::once` (can overflow small kernel stacks on early IRQ paths).
+static POLL_REGISTRY: SpinNoIrqLock<PollRegistry> = SpinNoIrqLock::new(PollRegistry::new());
 
 #[inline]
 fn row_bit(row: usize) -> u128 {
