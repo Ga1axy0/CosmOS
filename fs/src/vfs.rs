@@ -304,6 +304,26 @@ impl Inode {
         self.state.lock().page_cache = Some(state);
     }
 
+    /// 原子地获取或安装当前 inode 挂载的 page cache 宿主对象。
+    pub fn get_or_insert_page_cache_state<T, F>(&self, init: F) -> (Arc<T>, bool)
+    where
+        T: Any + Send + Sync,
+        F: FnOnce() -> Arc<T>,
+    {
+        let mut state_guard = self.state.lock();
+        if let Some(existing) = state_guard
+            .page_cache
+            .as_ref()
+            .and_then(|state| Arc::clone(state).downcast::<T>().ok())
+        {
+            return (existing, false);
+        }
+        let state = init();
+        let erased: Arc<dyn Any + Send + Sync> = state.clone();
+        state_guard.page_cache = Some(erased);
+        (state, true)
+    }
+
     /// 移除当前 inode 挂载的 page cache 宿主对象。
     pub fn take_page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.state
