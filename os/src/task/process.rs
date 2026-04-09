@@ -206,7 +206,7 @@ impl ProcessControlBlockInner {
         self.tasks[tid].as_ref().unwrap().clone()
     }
 
-    pub fn is_zombie(&self) -> bool {
+    pub fn is_zombie(&self) -> bool {   
         self.is_zombie
     }
 }

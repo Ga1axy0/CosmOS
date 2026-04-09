@@ -41,7 +41,7 @@ const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
 
 // Kernel UDP echo feature (for quick network stack testing).
-const ENABLE_KERNEL_UDP_ECHO: bool = false;
+const ENABLE_KERNEL_UDP_ECHO: bool = true;
 const KERNEL_UDP_ECHO_PORT: u16 = 5555;
 
 lazy_static! {
@@ -382,7 +382,15 @@ impl TxToken for VirtioTxToken {
     {
         let mut buf = vec![0u8; len];
         let ret = f(buf.as_mut_slice());
-        let _ = self.dev.send(buf.as_slice());
+        match self.dev.try_send(buf.as_slice()) {
+            Ok(true) => {}
+            Ok(false) => {
+                trace!("net: tx queue busy, drop one frame");
+            }
+            Err(e) => {
+                warn!("net: try_send failed: {:?}", e);
+            }
+        }
         NEED_POLL.store(true, Ordering::Release);
         ret
     }
