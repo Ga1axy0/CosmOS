@@ -5,6 +5,7 @@
 
 #[macro_use]
 pub mod console;
+pub mod net;
 mod lang_items;
 mod syscall;
 
@@ -196,6 +197,8 @@ bitflags! {
         const DIR   = 0o040000;
         /// ordinary regular file
         const FILE  = 0o100000;
+        /// socket file
+        const SOCK  = 0o140000;
     }
 }
 
@@ -299,6 +302,50 @@ pub fn get_time() -> isize {
 
 pub fn getpid() -> isize {
     sys_getpid()
+}
+
+pub fn socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
+    sys_socket(domain, socket_type, protocol)
+}
+
+pub fn bind(fd: usize, addr: &net::SockAddrIn) -> isize {
+    sys_bind(fd, addr as *const _, core::mem::size_of::<net::SockAddrIn>())
+}
+
+pub fn listen(fd: usize, backlog: usize) -> isize {
+    sys_listen(fd, backlog)
+}
+
+pub fn accept(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
+    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
+    sys_accept(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
+}
+
+pub fn connect(fd: usize, addr: &net::SockAddrIn) -> isize {
+    sys_connect(fd, addr as *const _, core::mem::size_of::<net::SockAddrIn>())
+}
+
+pub fn sendto(fd: usize, buf: &[u8], flags: usize, addr: Option<&net::SockAddrIn>) -> isize {
+    let addr_ptr = addr.map_or(core::ptr::null(), |a| a as *const _);
+    let addrlen = if addr.is_some() {
+        core::mem::size_of::<net::SockAddrIn>()
+    } else {
+        0
+    };
+    sys_sendto(fd, buf.as_ptr(), buf.len(), flags, addr_ptr, addrlen)
+}
+
+pub fn recvfrom(
+    fd: usize,
+    buf: &mut [u8],
+    flags: usize,
+    addr_out: Option<&mut net::SockAddrIn>,
+) -> isize {
+    let (addr_ptr, addrlen) = match addr_out {
+        Some(a) => (a as *mut _, core::mem::size_of::<net::SockAddrIn>()),
+        None => (core::ptr::null_mut(), 0),
+    };
+    sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, addr_ptr, addrlen)
 }
 
 pub fn fork() -> isize {

@@ -13,6 +13,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
+use core::any::Any;
 pub use fs::vfs::InodeTime;
 
 bitflags! {
@@ -243,10 +244,18 @@ impl FileDescription {
     pub fn poll_source_id(&self) -> usize {
         self.file.poll_source_id()
     }
+
+    /// Returns the underlying file object as `Any` for downcasting.
+    pub fn as_any(&self) -> &dyn Any {
+        self.file.as_any()
+    }
 }
 
 /// trait File for all file types
-pub trait File: Send + Sync {
+pub trait File: Send + Sync + Any {
+    /// Returns this file as `Any` for runtime downcasting.
+    fn as_any(&self) -> &dyn Any;
+
     /// the file readable?
     fn readable(&self) -> bool;
     /// the file writable?
@@ -360,6 +369,8 @@ bitflags! {
         const DIR   = 0o040000;
         /// ordinary regular file
         const FILE  = 0o100000;
+        /// socket file
+        const SOCK  = 0o140000;
         /// character device
         const CHAR  = 0o020000;
         /// fifo/pipe

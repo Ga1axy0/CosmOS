@@ -27,6 +27,13 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
+pub const SYSCALL_SOCKET: usize = 198;
+pub const SYSCALL_BIND: usize = 200;
+pub const SYSCALL_LISTEN: usize = 201;
+pub const SYSCALL_ACCEPT: usize = 202;
+pub const SYSCALL_CONNECT: usize = 203;
+pub const SYSCALL_SENDTO: usize = 206;
+pub const SYSCALL_RECVFROM: usize = 207;
 pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_FORK: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
@@ -179,6 +186,54 @@ pub fn sys_get_time(time: &mut TimeVal, tz: usize) -> isize {
 
 pub fn sys_getpid() -> isize {
     syscall(SYSCALL_GETPID, [0, 0, 0])
+}
+
+pub fn sys_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
+    syscall(SYSCALL_SOCKET, [domain, socket_type, protocol])
+}
+
+pub fn sys_bind(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usize) -> isize {
+    syscall(SYSCALL_BIND, [fd, addr as usize, addrlen])
+}
+
+pub fn sys_listen(fd: usize, backlog: usize) -> isize {
+    syscall(SYSCALL_LISTEN, [fd, backlog, 0])
+}
+
+pub fn sys_accept(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
+    syscall(SYSCALL_ACCEPT, [fd, addr as usize, addrlen])
+}
+
+pub fn sys_connect(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usize) -> isize {
+    syscall(SYSCALL_CONNECT, [fd, addr as usize, addrlen])
+}
+
+pub fn sys_sendto(
+    fd: usize,
+    buf: *const u8,
+    len: usize,
+    flags: usize,
+    addr: *const crate::net::SockAddrIn,
+    addrlen: usize,
+) -> isize {
+    syscall6(
+        SYSCALL_SENDTO,
+        [fd, buf as usize, len, flags, addr as usize, addrlen],
+    )
+}
+
+pub fn sys_recvfrom(
+    fd: usize,
+    buf: *mut u8,
+    len: usize,
+    flags: usize,
+    addr: *mut crate::net::SockAddrIn,
+    addrlen: usize,
+) -> isize {
+    syscall6(
+        SYSCALL_RECVFROM,
+        [fd, buf as usize, len, flags, addr as usize, addrlen],
+    )
 }
 
 pub fn sys_fork() -> isize {

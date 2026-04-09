@@ -114,6 +114,7 @@ pub fn handle_supervisor_external_hart(hart_id: usize) {
             .contains(&irq) =>
         {
             crate::drivers::block::handle_irq(irq);
+            crate::drivers::net::handle_irq(irq);
         }
         0 => {
             // spurious

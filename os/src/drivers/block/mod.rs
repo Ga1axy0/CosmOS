@@ -7,10 +7,13 @@ pub use virtio_blk::VirtIOBlock;
 use crate::sync::{SpinNoIrqLock};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use virtio_drivers::{DeviceType, VirtIOHeader};
 use alloc::sync::Arc;
 use fs::BlockDevice;
 use lazy_static::*;
+use core::ptr::NonNull;
+use virtio_drivers::{
+    transport::{DeviceType, Transport, mmio::{MmioTransport, VirtIOHeader}},
+};
 
 lazy_static! {
     /// Registry of all discovered block devices, keyed by name (`"vda"`, `"vdb"`, …).
@@ -43,16 +46,23 @@ pub fn probe_block_devices() {
     for slot in 0..VIRTIO_MMIO_SLOTS {
         let addr = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
 
-        let hdr = unsafe { &*(addr as *const VirtIOHeader) };
-        if !hdr.verify() {
-            continue; // Bad header or no device present
-        }
-        if hdr.device_type() != DeviceType::Block {
-            debug!("[kernel] VirtIO slot {} is {:?}, skipping", slot, hdr.device_type());
-            continue; // Not a block device
+        let Some(header) = NonNull::new(addr as *mut VirtIOHeader) else {
+            continue;
+        };
+        let transport = match unsafe { MmioTransport::new(header, VIRTIO_MMIO_STRIDE) } {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if transport.device_type() != DeviceType::Block {
+            debug!(
+                "[kernel] VirtIO slot {} is {:?}, skipping",
+                slot,
+                transport.device_type()
+            );
+            continue;
         }
 
-        if let Some(dev) = VirtIOBlock::try_new(addr) {
+        if let Some(dev) = VirtIOBlock::try_new(transport) {
             let dev = Arc::new(dev);
             // let name = alloc::format!("vd{}", (b'a' + idx as u8) as char);
             let name = if idx > 0 {

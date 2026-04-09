@@ -131,6 +131,7 @@ pub fn trap_handler() -> ! {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
+            crate::net::poll();
             suspend_current_and_run_next();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
@@ -205,7 +206,7 @@ pub fn trap_from_kernel() {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
-            // crate::net::poll();
+            crate::net::poll();
         }
         _ => {
             panic!("Kernel trap: {:?}, stval = {:#x}", scause.cause(), stval);
