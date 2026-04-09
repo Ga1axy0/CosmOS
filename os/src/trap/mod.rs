@@ -200,7 +200,7 @@ pub fn trap_from_kernel() {
         Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
             // debug!("External interrupt from kernel: scause = {:?}, stval = {:#x}", scause, stval);
             crate::drivers::plic::handle_supervisor_external();
-            // crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
+            crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             // trace!("hart {} timer tick", hartid());

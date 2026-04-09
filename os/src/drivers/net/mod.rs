@@ -3,11 +3,11 @@
 mod virtio_net;
 
 use alloc::sync::Arc;
+use core::convert::TryFrom;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
 use virtio_drivers::transport::{
     DeviceType,
-    Transport,
     mmio::{MmioTransport, VirtIOHeader},
 };
 
@@ -15,11 +15,32 @@ use crate::sync::SpinNoIrqLock;
 
 pub use virtio_net::VirtIONetDevice;
 
+#[inline]
+fn mmio_slot_device_type(header: NonNull<VirtIOHeader>) -> Option<DeviceType> {
+    // VirtIO MMIO register layout: magic(0x00), version(0x04), device_id(0x08).
+    const MAGIC_VALUE: u32 = 0x7472_6976;
+    const LEGACY_VERSION: u32 = 1;
+    const MODERN_VERSION: u32 = 2;
+
+    let base = header.as_ptr() as *const u32;
+    // SAFETY: caller passes an MMIO header address on the virt bus.
+    let magic = unsafe { core::ptr::read_volatile(base) };
+    if magic != MAGIC_VALUE {
+        return None;
+    }
+    // SAFETY: MMIO header word reads are volatile.
+    let version = unsafe { core::ptr::read_volatile(base.add(1)) };
+    if version != LEGACY_VERSION && version != MODERN_VERSION {
+        return None;
+    }
+    // SAFETY: MMIO header word reads are volatile.
+    let device_id = unsafe { core::ptr::read_volatile(base.add(2)) };
+    DeviceType::try_from(device_id).ok()
+}
+
 lazy_static! {
     /// Single discovered network device on QEMU virt for now.
-    static ref NET_DEVICE: SpinNoIrqLock<Option<Arc<VirtIONetDevice>>> = unsafe {
-        SpinNoIrqLock::new(None)
-    };
+    static ref NET_DEVICE: SpinNoIrqLock<Option<Arc<VirtIONetDevice>>> = SpinNoIrqLock::new(None);
 }
 
 /// Probe all VirtIO MMIO slots and register the first network device.
@@ -34,13 +55,14 @@ pub fn probe_net_devices() {
         let Some(header) = NonNull::new(addr as *mut VirtIOHeader) else {
             continue;
         };
+        if mmio_slot_device_type(header) != Some(DeviceType::Network) {
+            continue;
+        }
+
         let transport = match unsafe { MmioTransport::new(header, VIRTIO_MMIO_STRIDE) } {
             Ok(t) => t,
             Err(_) => continue,
         };
-        if transport.device_type() != DeviceType::Network {
-            continue;
-        }
 
         let irq = VIRTIO_MMIO_IRQ_BASE + slot as u32;
         if let Some(dev) = VirtIONetDevice::try_new(transport, irq) {
