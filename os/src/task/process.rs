@@ -189,6 +189,36 @@ impl ProcessControlBlockInner {
             self.fd_table.len() - 1
         }
     }
+    /// 取走指定 fd 表项，供调用方在释放进程锁后再销毁底层文件对象。
+    pub fn take_fd(&mut self, fd: usize) -> Option<FdEntry> {
+        self.fd_table.get_mut(fd).and_then(Option::take)
+    }
+    /// 取走所有带 `FD_CLOEXEC` 的 fd 表项，供 `exec` 在锁外统一关闭。
+    pub fn take_cloexec_fds(&mut self) -> Vec<FdEntry> {
+        let mut removed = Vec::new();
+        for entry in self.fd_table.iter_mut() {
+            let should_close = entry
+                .as_ref()
+                .map(|entry| entry.flags.contains(FdFlags::CLOEXEC))
+                .unwrap_or(false);
+            if should_close {
+                if let Some(removed_entry) = entry.take() {
+                    removed.push(removed_entry);
+                }
+            }
+        }
+        removed
+    }
+    /// 取走当前进程持有的全部 fd 表项，供退出路径在锁外统一释放。
+    pub fn take_all_fds(&mut self) -> Vec<FdEntry> {
+        let mut removed = Vec::new();
+        for entry in self.fd_table.iter_mut() {
+            if let Some(removed_entry) = entry.take() {
+                removed.push(removed_entry);
+            }
+        }
+        removed
+    }
     /// allocate a new task id
     pub fn alloc_tid(&mut self) -> usize {
         self.task_res_allocator.alloc()
@@ -302,13 +332,15 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        {
+        let cloexec_entries = {
             let mut inner = self.inner_exclusive_access();
             inner.memory_set = memory_set;
             inner.vm_layout = vm_layout;
-            // 按 Linux 语义，`exec` 成功后应关闭所有带 `FD_CLOEXEC` 的 fd。
-            Self::close_cloexec_fds(&mut inner);
-        }
+            // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
+            // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
+            inner.take_cloexec_fds()
+        };
+        drop(cloexec_entries);
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
@@ -399,20 +431,6 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
-
-    /// 关闭当前进程中所有带 `FD_CLOEXEC` 的 fd 表项。
-    fn close_cloexec_fds(inner: &mut ProcessControlBlockInner) {
-        for entry in inner.fd_table.iter_mut() {
-            let should_close = entry
-                .as_ref()
-                .map(|entry| entry.flags.contains(FdFlags::CLOEXEC))
-                .unwrap_or(false);
-            if should_close {
-                *entry = None;
-            }
-        }
-    }
-
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         trace!("kernel: fork");

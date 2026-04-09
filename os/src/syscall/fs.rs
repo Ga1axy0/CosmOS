@@ -768,18 +768,32 @@ pub fn sys_close(fd: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    syscall_body!({
-        let fd = fd as usize;
-        if fd >= inner.fd_table.len() {
-            return Err(ERRNO::EBADF);
+    let closed_entry = {
+        let mut inner = process.inner_exclusive_access();
+        let mut closed_entry: Option<FdEntry> = None;
+        let result = syscall_body!({
+            let fd = fd as usize;
+            if fd >= inner.fd_table.len() {
+                return Err(ERRNO::EBADF);
+            }
+            if inner.fd_table[fd].is_none() {
+                return Err(ERRNO::EBADF);
+            }
+            // 先摘表项，等离开 `process.inner` 后再真正 drop，避免自旋锁内阻塞。
+            closed_entry = Some(
+                inner
+                    .take_fd(fd)
+                    .expect("validated fd must still exist when closing"),
+            );
+            Ok(0)
+        });
+        if result != 0 {
+            return result;
         }
-        if inner.fd_table[fd].is_none() {
-            return Err(ERRNO::EBADF);
-        }
-        inner.fd_table[fd].take();
-        Ok(0)
-    })
+        closed_entry
+    };
+    drop(closed_entry);
+    0
 }
 
 /// pipe syscall
@@ -848,31 +862,37 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    syscall_body!({
-        let oldfd = oldfd as usize;
-        let newfd = newfd as usize;
-        if oldfd >= inner.fd_table.len() {
-            return Err(ERRNO::EBADF);
-        }
-        if inner.fd_table[oldfd].is_none() {
-            return Err(ERRNO::EBADF);
-        }
-        if oldfd == newfd {
-            return Ok(newfd as isize);
-        }
-        if newfd >= inner.fd_table.len() {
-            inner.fd_table.resize(newfd + 1, None);
-        }
-        // If newfd is already open, close it first.
-        inner.fd_table[newfd].take();
-        let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
-        inner.fd_table[newfd] = Some(FdEntry {
-            desc,
-            flags: FdFlags::empty(),
+    let (result, replaced_entry) = {
+        let mut inner = process.inner_exclusive_access();
+        let mut replaced_entry: Option<FdEntry> = None;
+        let result = syscall_body!({
+            let oldfd = oldfd as usize;
+            let newfd = newfd as usize;
+            if oldfd >= inner.fd_table.len() {
+                return Err(ERRNO::EBADF);
+            }
+            if inner.fd_table[oldfd].is_none() {
+                return Err(ERRNO::EBADF);
+            }
+            if oldfd == newfd {
+                return Ok(newfd as isize);
+            }
+            if newfd >= inner.fd_table.len() {
+                inner.fd_table.resize(newfd + 1, None);
+            }
+            // 先把旧 `newfd` 表项拿出来，等离开进程自旋锁后再 drop。
+            replaced_entry = inner.take_fd(newfd);
+            let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
+            inner.fd_table[newfd] = Some(FdEntry {
+                desc,
+                flags: FdFlags::empty(),
+            });
+            Ok(newfd as isize)
         });
-        Ok(newfd as isize)
-    })
+        (result, replaced_entry)
+    };
+    drop(replaced_entry);
+    result
 }
 
 /// fstat syscall

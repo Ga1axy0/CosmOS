@@ -31,14 +31,25 @@ impl OSInode {
         trace!("kernel: OSInode::new");
         Self { path, inode }
     }
+
+    /// 返回当前普通文件对应的 page mapping；目录或不可缓存对象返回 `None`。
+    fn page_mapping(&self) -> Option<page_cache::PageMappingHandle> {
+        page_cache::mapping_for_inode(&self.inode)
+    }
+
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
         let mut buffer: Vec<u8> = alloc::vec![0; 8192];
         let mut v: Vec<u8> = Vec::new();
         let mut offset = 0usize;
+        let mapping = self.page_mapping();
         loop {
-            let len = page_cache::read_inode(&self.inode, offset, &mut buffer);
+            let len = if let Some(mapping) = mapping.as_ref() {
+                mapping.read(offset, &mut buffer)
+            } else {
+                self.inode.read_at(offset, &mut buffer)
+            };
             if len == 0 {
                 break;
             }
@@ -53,7 +64,11 @@ impl OSInode {
     pub fn read_first_line_limited(&self, max_len: usize) -> (Vec<u8>, bool) {
         trace!("kernel: OSInode::read_first_line_limited, max_len={}", max_len);
         let mut buf = alloc::vec![0; max_len];
-        let read_len = page_cache::read_inode(&self.inode, 0, &mut buf);
+        let read_len = if let Some(mapping) = self.page_mapping() {
+            mapping.read(0, &mut buf)
+        } else {
+            self.inode.read_at(0, &mut buf)
+        };
         buf.truncate(read_len);
 
         if let Some(line_end) = buf.iter().position(|&ch| ch == b'\n') {
@@ -581,10 +596,15 @@ impl File for OSInode {
         self.inode.is_dir()
     }
     fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
+        let mapping = self.page_mapping();
         let mut file_off = offset;
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let read_size = page_cache::read_inode(&self.inode, file_off, *slice);
+            let read_size = if let Some(mapping) = mapping.as_ref() {
+                mapping.read(file_off, *slice)
+            } else {
+                self.inode.read_at(file_off, *slice)
+            };
             if read_size == 0 {
                 break;
             }
@@ -597,10 +617,15 @@ impl File for OSInode {
         total_read_size
     }
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
+        let mapping = self.page_mapping();
         let mut total_write_size = 0usize;
         let mut file_off = offset;
         for slice in buf.buffers.iter() {
-            let write_size = page_cache::write_inode(&self.inode, file_off, *slice);
+            let write_size = if let Some(mapping) = mapping.as_ref() {
+                mapping.write(file_off, *slice)
+            } else {
+                self.inode.write_at(file_off, *slice)
+            };
             assert_eq!(write_size, slice.len());
             file_off += write_size;
             total_write_size += write_size;
@@ -686,7 +711,9 @@ impl File for OSInode {
     }
 
     fn sync(&self) -> Result<(), ERRNO> {
-        page_cache::sync_inode(&self.inode);
+        if let Some(mapping) = self.page_mapping() {
+            mapping.sync();
+        }
         Ok(())
     }
 
