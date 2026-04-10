@@ -43,6 +43,11 @@ lazy_static! {
     static ref NET_DEVICE: SpinNoIrqLock<Option<Arc<VirtIONetDevice>>> = SpinNoIrqLock::new(None);
 }
 
+/// Register a discovered network device (used by the unified probe).
+pub fn register_device(dev: Arc<VirtIONetDevice>) {
+    *NET_DEVICE.lock() = Some(dev);
+}
+
 /// Probe all VirtIO MMIO slots and register the first network device.
 pub fn probe_net_devices() {
     const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
