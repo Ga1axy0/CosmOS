@@ -192,7 +192,7 @@ impl VirtIONetDevice {
         self.reclaim_tx_completions();
 
         let mut tx_buf = vec![0u8; frame.len() + MAX_HEADER_PAD];
-        let token = {
+        {
             let mut inner = self.inner.lock();
             if !inner.can_send() {
                 return Ok(false);
@@ -203,31 +203,33 @@ impl VirtIONetDevice {
             tx_buf.truncate(used_len);
             // SAFETY: `tx_buf` is moved into `tx_slots` immediately after begin,
             // so it lives until completion reclaim.
-            unsafe { inner.transmit_begin(tx_buf.as_slice()) }?
-        };
+            let token = unsafe { inner.transmit_begin(tx_buf.as_slice()) }?;
 
-        let idx = token as usize;
-        assert!(idx < QUEUE_SIZE, "virtio-net: tx token {} out of range", token);
-        let mut tx_slots = self.tx_slots.lock();
-        assert!(
-            tx_slots[idx].is_none(),
-            "virtio-net: duplicated non-blocking tx token {}",
-            token
-        );
-        tx_slots[idx] = Some(tx_buf);
+            let idx = token as usize;
+            assert!(idx < QUEUE_SIZE, "virtio-net: tx token {} out of range", token);
+            let mut tx_slots = self.tx_slots.lock();
+            assert!(
+                tx_slots[idx].is_none(),
+                "virtio-net: duplicated non-blocking tx token {}",
+                token
+            );
+            tx_slots[idx] = Some(tx_buf);
+        }
         Ok(true)
     }
 
     fn reclaim_tx_completions(&self) {
-        let mut wake_tokens = Vec::new();
-        {
-            let mut inner = self.inner.lock();
-            let mut tx_slots = self.tx_slots.lock();
-            while let Some(token) = inner.poll_transmit() {
+        loop {
+            let blocking_token = {
+                let mut inner = self.inner.lock();
+                let mut tx_slots = self.tx_slots.lock();
+                let Some(token) = inner.poll_transmit() else {
+                    return;
+                };
                 let idx = token as usize;
                 if idx >= QUEUE_SIZE {
                     warn!("virtio-net: completion token {} out of range", token);
-                    continue;
+                    return;
                 }
 
                 if let Some(tx_buf) = tx_slots[idx].take() {
@@ -239,28 +241,37 @@ impl VirtIONetDevice {
                             e
                         );
                     }
+                    None
                 } else {
-                    // completion of a blocking `send` token, handled by waiter after wake.
-                    wake_tokens.push(token);
+                    // Blocking `send` path: waiter owns the original tx buffer and will
+                    // call `transmit_complete(token, ...)` after wakeup.
+                    Some(token)
                 }
-            }
-        }
+            };
 
-        if wake_tokens.is_empty() {
-            return;
-        }
+            let Some(token) = blocking_token else {
+                // Drained one non-blocking completion; keep draining until queue is empty
+                // or we hit a blocking token at the head.
+                continue;
+            };
 
-        {
-            let mut tx_done = self.tx_done.lock();
-            for token in wake_tokens.iter().copied() {
-                let idx = token as usize;
-                if idx < QUEUE_SIZE {
+            let idx = token as usize;
+            let should_wake = {
+                let mut tx_done = self.tx_done.lock();
+                if tx_done[idx] {
+                    false
+                } else {
                     tx_done[idx] = true;
+                    true
                 }
+            };
+            if should_wake {
+                self.tx_wait_queue.wake_selected(token);
             }
-        }
-        for token in wake_tokens {
-            self.tx_wait_queue.wake_selected(token);
+
+            // `poll_transmit` is peek-only. Until the blocking waiter consumes this
+            // token via `transmit_complete`, it will remain at the head.
+            return;
         }
     }
 
