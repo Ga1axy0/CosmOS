@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 use crate::fs::{AccessMode, File, FileDescription, FileStatusFlags};
@@ -197,28 +197,20 @@ pub fn sys_sendto(
         }
 
         let token = current_user_token();
-        let mut data = Vec::new();
-        data.resize(len, 0);
         let ubuf = UserBuffer::new(
             translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
         );
-        let mut off = 0usize;
-        for slice in ubuf.buffers.iter() {
-            let end = off + slice.len();
-            data[off..end].copy_from_slice(slice);
-            off = end;
-        }
 
         let fd = fd as usize;
         let n = if addr.is_null() {
-            with_udp_socket(fd, |udp| udp.send(data.as_slice()))?
+            with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
         } else {
             if addrlen < core::mem::size_of::<SockAddrIn>() {
                 return Err(ERRNO::EINVAL);
             }
             let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
             let ep = sockaddr_to_endpoint(uaddr)?;
-            with_udp_socket(fd, |udp| udp.send_to(data.as_slice(), ep))?
+            with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
         };
 
         Ok(n as isize)
@@ -247,24 +239,13 @@ pub fn sys_recvfrom(
             return Err(ERRNO::EINVAL);
         }
 
-        let fd = fd as usize;
-        let mut tmp = Vec::new();
-        tmp.resize(len, 0);
-        let (n, ep) = with_udp_socket(fd, |udp| udp.recv_from(tmp.as_mut_slice()))?;
-
         let token = current_user_token();
         let mut ubuf = UserBuffer::new(
             translated_byte_buffer(token, buf as *const u8, len).or_errno(ERRNO::EFAULT)?,
         );
-        let mut off = 0usize;
-        for slice in ubuf.buffers.iter_mut() {
-            if off >= n {
-                break;
-            }
-            let end = core::cmp::min(off + slice.len(), n);
-            slice[..(end - off)].copy_from_slice(&tmp[off..end]);
-            off = end;
-        }
+
+        let fd = fd as usize;
+        let (n, ep) = with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?;
 
         if !addr.is_null() {
             let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;

@@ -91,12 +91,15 @@ pub fn notify_irq() {
 ///
 /// Call this from a safe context (e.g. timer interrupt path or scheduler tick).
 pub fn poll() {
+    if !NEED_POLL.swap(false, Ordering::AcqRel) {
+        return;
+    }
+
     let mut guard = NET_STACK.lock();
     let Some(stack) = guard.as_mut() else {
         return;
     };
 
-    let _ = NEED_POLL.swap(false, Ordering::AcqRel);
     stack.poll();
 }
 
@@ -208,7 +211,7 @@ impl NetStack {
 
         for st in self.tcp_states.iter() {
             let mut ready = 0u16;
-            let mut open;
+            let open;
             {
                 let socket = self.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 if socket.can_recv() {
