@@ -1,8 +1,7 @@
 //! TCP socket implementation backed by smoltcp.
 
-use alloc::{sync::Arc, vec::Vec};
-use core::cmp::min;
 use core::any::Any;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use smoltcp::socket::tcp as tcp_socket;
@@ -176,9 +175,12 @@ impl TcpSocketFile {
         }
     }
 
-    fn recv_into(&self, out: &mut [u8]) -> Result<usize, ERRNO> {
+    fn recv_into_user_buffer(&self, buf: &mut UserBuffer) -> Result<usize, ERRNO> {
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
+        }
+        if buf.len() == 0 {
+            return Ok(0);
         }
         loop {
             let st = self.state();
@@ -187,7 +189,21 @@ impl TcpSocketFile {
                 let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 if socket.can_recv() {
-                    return socket.recv_slice(out).map_err(|_| ERRNO::EIO);
+                    let mut total = 0usize;
+                    for slice in buf.buffers.iter_mut() {
+                        if slice.is_empty() {
+                            continue;
+                        }
+                        if !socket.can_recv() {
+                            break;
+                        }
+                        let n = socket.recv_slice(slice).map_err(|_| ERRNO::EIO)?;
+                        total += n;
+                        if n < slice.len() {
+                            break;
+                        }
+                    }
+                    return Ok(total);
                 }
                 if !socket.may_recv() {
                     return Ok(0);
@@ -198,9 +214,12 @@ impl TcpSocketFile {
         }
     }
 
-    fn send_from(&self, data: &[u8]) -> Result<usize, ERRNO> {
+    fn send_from_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
+        }
+        if buf.len() == 0 {
+            return Ok(0);
         }
         loop {
             let st = self.state();
@@ -209,10 +228,31 @@ impl TcpSocketFile {
                 let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 if socket.can_send() {
-                    let n = socket.send_slice(data).map_err(|_| ERRNO::EIO)?;
-                    stack.poll();
-                    NEED_POLL.store(true, Ordering::Release);
-                    return Ok(n);
+                    let mut total = 0usize;
+                    for slice in buf.buffers.iter() {
+                        let mut off = 0usize;
+                        while off < slice.len() {
+                            if !socket.can_send() {
+                                break;
+                            }
+                            let n = socket
+                                .send_slice(&slice[off..])
+                                .map_err(|_| ERRNO::EIO)?;
+                            if n == 0 {
+                                return Err(ERRNO::EIO);
+                            }
+                            total += n;
+                            off += n;
+                        }
+                        if !socket.can_send() {
+                            break;
+                        }
+                    }
+                    if total > 0 {
+                        stack.poll();
+                        NEED_POLL.store(true, Ordering::Release);
+                        return Ok(total);
+                    }
                 }
                 if !socket.may_send() {
                     return Ok(0);
@@ -289,37 +329,20 @@ impl File for TcpSocketFile {
         if self.listening.load(Ordering::Acquire) {
             return 0;
         }
-        let mut tmp = Vec::new();
-        tmp.resize(buf.len(), 0);
-        let Ok(n) = self.recv_into(tmp.as_mut_slice()) else {
+        if buf.len() == 0 {
             return 0;
-        };
-        let mut off = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            if off >= n {
-                break;
-            }
-            let end = min(off + slice.len(), n);
-            slice[..(end - off)].copy_from_slice(&tmp[off..end]);
-            off = end;
         }
-        n
+        self.recv_into_user_buffer(&mut buf).unwrap_or(0)
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         if self.listening.load(Ordering::Acquire) {
             return 0;
         }
-        let total = buf.len();
-        if total == 0 {
+        if buf.len() == 0 {
             return 0;
         }
-        let mut data = Vec::new();
-        data.reserve(total);
-        for slice in buf.buffers.iter() {
-            data.extend_from_slice(slice);
-        }
-        self.send_from(data.as_slice()).unwrap_or(0)
+        self.send_from_user_buffer(&buf).unwrap_or(0)
     }
 
     fn poll(&self, events: u16) -> u16 {

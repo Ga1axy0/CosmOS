@@ -81,22 +81,45 @@ impl UdpSocketFile {
         }
     }
 
-    pub(crate) fn send(&self, data: &[u8]) -> Result<usize, ERRNO> {
-        let ep = *self.connected.lock();
-        let ep = ep.ok_or(ERRNO::EDESTADDRREQ)?;
-        self.send_to(data, ep)
+    pub(crate) fn send_user_buffer_to(&self, buf: &UserBuffer, ep: IpEndpoint) -> Result<usize, ERRNO> {
+        let total = buf.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        if buf.buffers.len() == 1 {
+            return self.send_to(buf.buffers[0], ep);
+        }
+
+        let mut data = Vec::with_capacity(total);
+        for slice in buf.buffers.iter() {
+            data.extend_from_slice(slice);
+        }
+        self.send_to(data.as_slice(), ep)
     }
 
-    pub(crate) fn recv_from(&self, out: &mut [u8]) -> Result<(usize, IpEndpoint), ERRNO> {
+    pub(crate) fn send_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
+        let ep = *self.connected.lock();
+        let ep = ep.ok_or(ERRNO::EDESTADDRREQ)?;
+        self.send_user_buffer_to(buf, ep)
+    }
+
+    pub(crate) fn recv_from_user_buffer(&self, out: &mut UserBuffer) -> Result<(usize, IpEndpoint), ERRNO> {
         loop {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
             if socket.can_recv() {
                 if let Ok((data, meta)) = socket.recv() {
-                    let n = min(out.len(), data.len());
-                    out[..n].copy_from_slice(&data[..n]);
-                    return Ok((n, meta.endpoint));
+                    let mut off = 0usize;
+                    for slice in out.buffers.iter_mut() {
+                        if off >= data.len() {
+                            break;
+                        }
+                        let end = min(off + slice.len(), data.len());
+                        slice[..(end - off)].copy_from_slice(&data[off..end]);
+                        off = end;
+                    }
+                    return Ok((off, meta.endpoint));
                 }
             }
             drop(guard);
@@ -139,34 +162,20 @@ impl File for UdpSocketFile {
     }
 
     fn read_at(&self, _offset: usize, mut buf: UserBuffer) -> usize {
-        let mut tmp = Vec::new();
-        tmp.resize(buf.len(), 0);
-        let Ok((n, _)) = self.recv_from(tmp.as_mut_slice()) else {
+        if buf.len() == 0 {
+            return 0;
+        }
+        let Ok((n, _)) = self.recv_from_user_buffer(&mut buf) else {
             return 0;
         };
-        let mut off = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            if off >= n {
-                break;
-            }
-            let end = min(off + slice.len(), n);
-            slice[..(end - off)].copy_from_slice(&tmp[off..end]);
-            off = end;
-        }
         n
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
-        let total = buf.len();
-        if total == 0 {
+        if buf.len() == 0 {
             return 0;
         }
-        let mut data = Vec::new();
-        data.reserve(total);
-        for slice in buf.buffers.iter() {
-            data.extend_from_slice(slice);
-        }
-        self.send(data.as_slice()).unwrap_or(0)
+        self.send_user_buffer(&buf).unwrap_or(0)
     }
 
     fn poll(&self, events: u16) -> u16 {
