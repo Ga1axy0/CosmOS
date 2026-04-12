@@ -211,25 +211,36 @@ impl NetStack {
 
         for st in self.tcp_states.iter() {
             let mut ready = 0u16;
+            let mut listener_source_id = None;
+            let mut listener_owned = false;
             let open;
             {
                 let socket = self.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                if socket.can_recv() {
-                    st.read_wait.wake_one();
-                    ready |= POLLIN;
-                }
-                let may_recv = socket.may_recv();
-                if !may_recv {
-                    st.read_wait.wake_all();
-                    ready |= POLLIN | POLLHUP;
-                }
-                if socket.can_send() || !socket.may_send() {
-                    st.write_wait.wake_one();
-                    ready |= POLLOUT;
+                let state = socket.state();
+                if st.is_listener_owned() {
+                    listener_owned = true;
+                    listener_source_id = tcp::queue_listener_connection_if_ready(st, state);
+                } else {
+                    if socket.can_recv() {
+                        st.read_wait.wake_one();
+                        ready |= POLLIN;
+                    }
+                    let may_recv = socket.may_recv();
+                    if !may_recv {
+                        st.read_wait.wake_all();
+                        ready |= POLLIN | POLLHUP;
+                    }
+                    if socket.can_send() || !socket.may_send() {
+                        st.write_wait.wake_one();
+                        ready |= POLLOUT;
+                    }
                 }
                 open = socket.is_open();
             }
-            if ready != 0 {
+            if let Some(source_id) = listener_source_id {
+                notify_poll_source(source_id, POLLIN);
+            }
+            if !listener_owned && ready != 0 {
                 notify_poll_source(st.source_id(), ready);
             }
             if st.orphaned.load(Ordering::Acquire) && !open {
