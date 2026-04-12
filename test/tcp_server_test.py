@@ -21,14 +21,14 @@ def tcp_client(thread_id, stats):
     for _ in range(MAX_PACKETS):
         try:
             with socket.create_connection((host, port), timeout=5) as sock:
-                msg = random_text()
+                msg = random_text(length=256)
                 sock.sendall(msg.encode())
                 data = sock.recv(1024)
                 received_msg = data.decode(errors='ignore')
                 stats.sent += 1
                 if msg == received_msg:
                     stats.success += 1
-                print(f"\033[1;32mThread {thread_id}:\033[0m Sent: {msg} | Received: {received_msg}")
+                print(f"\033[1;32mThread {thread_id}:\033[0m Sent: {msg[:16]} | Received: {received_msg[:16]} | {'Match' if msg == received_msg else 'Mismatch'}")
                 assert msg == received_msg, f"Thread {thread_id}: Mismatch - Sent '{msg}' but received '{received_msg}'"
         except Exception as e:
             print(f"\033[1;31mThread {thread_id}:\033[0m Error - {e}")

@@ -146,7 +146,7 @@ fn main() -> i32 {
         return -1;
     }
 
-    if listen(fd, 1) < 0 {
+    if listen(fd, 16) < 0 {
         println!("tcp_echo_server: listen() failed");
         let _ = close(fd);
         return -1;
