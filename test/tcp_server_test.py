@@ -33,7 +33,7 @@ def tcp_client(thread_id, stats):
         except Exception as e:
             print(f"\033[1;31mThread {thread_id}:\033[0m Error - {e}")
         finally:
-            time.sleep(0.02)
+            time.sleep(0.5)
 
 threads = []
 stats_list = [ThreadStats() for _ in range(THREAD_COUNT)]
@@ -44,7 +44,7 @@ for i in range(THREAD_COUNT):
     t = threading.Thread(target=tcp_client, args=(i, stats_list[i]))
     threads.append(t)
     t.start()
-    time.sleep(0.02)
+    time.sleep(0.5)
 
 for t in threads:
     t.join()
