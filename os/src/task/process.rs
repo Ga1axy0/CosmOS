@@ -6,8 +6,11 @@ use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
-use crate::fs::{new_stdio_files, FileDescription};
-use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
+use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
+use crate::mm::{
+    translated_refmut, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, VirtAddr, Vma,
+    KERNEL_SPACE,
+};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -624,12 +627,79 @@ impl ProcessControlBlock {
             .memory_set
             .mmap_anonymous(start, end, perm)
     }
-    /// unmap an area. return true if success
-    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+    /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
+    pub fn mmap_file(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        perm: MapPermission,
+        file: Arc<FileDescription>,
+        pgoff: usize,
+        shared: bool,
+    ) -> bool {
         self.inner
             .lock()
             .memory_set
-            .munmap_anonymous(start, end)
+            .mmap_file(start, end, perm, file, pgoff, shared)
+    }
+    /// unmap an area. return true if success
+    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        self.inner.lock().memory_set.munmap(start, end)
+    }
+    /// 处理当前进程的 file-backed 缺页。
+    pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> bool {
+        debug!(
+            "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
+            self.getpid(),
+            fault_addr,
+            access
+        );
+        let plan = {
+            let inner = self.inner.lock();
+            inner
+                .memory_set
+                .prepare_file_page_fault(VirtAddr::from(fault_addr), access)
+        };
+        let Some(plan) = plan else {
+            debug!(
+                "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
+                self.getpid(),
+                fault_addr,
+                access
+            );
+            return false;
+        };
+        let Some(inode) = plan.file.backing_inode() else {
+            return false;
+        };
+        let Some(mapping) = mapping_for_inode(&inode) else {
+            return false;
+        };
+        debug!(
+            "[mmap] page fault lazy load: pid={} vpn={:#x} page_idx={} shared={} path={:?}",
+            self.getpid(),
+            plan.vpn.0,
+            plan.page_idx,
+            plan.shared,
+            plan.file.path()
+        );
+        let page = mapping.get_page(plan.page_idx);
+        let mut inner = self.inner.lock();
+        // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
+        // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。
+        let committed = if plan.shared {
+            inner.memory_set.map_shared_file_page(&plan, page)
+        } else {
+            inner.memory_set.map_private_file_page(&plan, page)
+        };
+        debug!(
+            "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
+            self.getpid(),
+            plan.vpn.0,
+            plan.shared,
+            committed
+        );
+        committed
     }
 
     /// change permissions of a mapped range. return true if success

@@ -15,8 +15,11 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
-pub use fs::vfs::InodeTime;
 use fs::Inode;
+pub use fs::vfs::InodeTime;
+pub use page_cache::{
+    mapping_for_inode, CachePage, mark_cached_page_dirty, release_mapped_page, retain_mapped_page,
+};
 
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
@@ -193,10 +196,14 @@ impl FileDescription {
         self.file.path()
     }
 
-    /// If this `FileDescription` refers to a real filesystem inode, return it.
-    /// This forwards to the underlying `File` object's `as_inode` method.
+    /// 返回该打开文件描述关联的 inode；非 inode 类型文件返回 `None`。
     pub fn as_inode(&self) -> Option<Arc<Inode>> {
         self.file.as_inode()
+    }
+
+    /// 返回该打开文件描述最终关联的稳定 inode。
+    pub fn backing_inode(&self) -> Option<Arc<Inode>> {
+        self.file.backing_inode()
     }
 
     /// 读取目录项并推进共享目录位置。
@@ -273,13 +280,6 @@ impl FileDescription {
     }
 }
 
-impl Drop for FileDescription {
-    fn drop(&mut self) {
-        // TODO：后续补齐 `fsync/msync` 后，这里可改为更细粒度的同步策略。
-        let _ = self.file.sync();
-    }
-}
-
 /// trait File for all file types
 pub trait File: Send + Sync {
     /// the file readable?
@@ -341,14 +341,18 @@ pub trait File: Send + Sync {
     fn path(&self) -> Option<String> {
         None
     }
-    /// If this `File` is a wrapper around a real filesystem inode, return it.
-    /// Default implementation returns `None` for non-inode file types.
+    /// 返回该文件对象关联的 inode；非 inode 类型文件返回 `None`。
     fn as_inode(&self) -> Option<Arc<Inode>> {
         None
     }
     /// Change the file mode bits, if supported by this file type.
     fn chmod(&self, _mode: u32) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
+    /// 返回该文件对象最终关联的稳定 inode；不支持文件映射的对象返回 `None`。
+    fn backing_inode(&self) -> Option<Arc<Inode>> {
+        None
     }
 }
 
