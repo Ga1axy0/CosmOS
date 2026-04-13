@@ -6,12 +6,14 @@ use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
+use crate::config::PAGE_SIZE;
 use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
 use crate::mm::{
     translated_refmut, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, VirtAddr, Vma,
     KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::syscall::errno::ERRNO;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -647,7 +649,7 @@ impl ProcessControlBlock {
         self.inner.lock().memory_set.munmap(start, end)
     }
     /// 处理当前进程的 file-backed 缺页。
-    pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> bool {
+    pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> Result<(), ERRNO> {
         debug!(
             "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
             self.getpid(),
@@ -667,7 +669,7 @@ impl ProcessControlBlock {
                     self.getpid(),
                     fault_addr
                 );
-                return true;
+                return Ok(());
             }
         }
         let plan = {
@@ -683,13 +685,26 @@ impl ProcessControlBlock {
                 fault_addr,
                 access
             );
-            return false;
+            return Err(ERRNO::EFAULT);
         };
         let Some(inode) = plan.file.backing_inode() else {
-            return false;
+            return Err(ERRNO::EFAULT);
         };
         let Some(mapping) = mapping_for_inode(&inode) else {
-            return false;
+            return Err(ERRNO::EFAULT);
+        };
+        let page_start = plan.page_idx as usize * PAGE_SIZE;
+        let file_size = mapping.size();
+        if page_start >= file_size {
+            debug!(
+                "[mmap] file-backed fault beyond EOF: pid={} vpn={:#x} page_idx={} page_start={:#x} file_size={:#x}",
+                self.getpid(),
+                plan.vpn.0,
+                plan.page_idx,
+                page_start,
+                file_size
+            );
+            return Err(ERRNO::ENXIO);
         };
         debug!(
             "[mmap] page fault lazy load: pid={} vpn={:#x} page_idx={} shared={} path={:?}",
@@ -715,7 +730,11 @@ impl ProcessControlBlock {
             plan.shared,
             committed
         );
-        committed
+        if committed {
+            Ok(())
+        } else {
+            Err(ERRNO::EFAULT)
+        }
     }
 
     /// change permissions of a mapped range. return true if success

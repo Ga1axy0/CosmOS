@@ -18,6 +18,7 @@ use crate::config::TRAMPOLINE;
 use crate::hart::hartid;
 use crate::mm::PageFaultAccess;
 use crate::syscall::syscall;
+use crate::syscall::errno::ERRNO;
 use crate::task::{
     ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token, exit_current_and_run_next, suspend_current_and_run_next
 };
@@ -132,15 +133,26 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            if !current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
-                error!(
-                    "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                    scause.cause(),
-                    stval,
-                    current_trap_cx().sepc,
-                );
-                // TODO：接入 truncate/SIGBUS 语义后，文件映射越界应优先转换成 `SIGBUS`。
-                current_add_signal(SignalFlags::SIGSEGV);
+            match current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
+                Ok(()) => {}
+                Err(ERRNO::ENXIO) => {
+                    error!(
+                        "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
+                        scause.cause(),
+                        stval,
+                        current_trap_cx().sepc,
+                    );
+                    current_add_signal(SignalFlags::SIGBUS);
+                }
+                Err(_) => {
+                    error!(
+                        "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                        scause.cause(),
+                        stval,
+                        current_trap_cx().sepc,
+                    );
+                    current_add_signal(SignalFlags::SIGSEGV);
+                }
             }
         }
         Trap::Exception(Exception::LoadPageFault) => {
@@ -149,15 +161,26 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            if !current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
-                error!(
-                    "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                    scause.cause(),
-                    stval,
-                    current_trap_cx().sepc,
-                );
-                // TODO：接入 truncate/SIGBUS 语义后，文件映射越界应优先转换成 `SIGBUS`。
-                current_add_signal(SignalFlags::SIGSEGV);
+            match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
+                Ok(()) => {}
+                Err(ERRNO::ENXIO) => {
+                    error!(
+                        "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
+                        scause.cause(),
+                        stval,
+                        current_trap_cx().sepc,
+                    );
+                    current_add_signal(SignalFlags::SIGBUS);
+                }
+                Err(_) => {
+                    error!(
+                        "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                        scause.cause(),
+                        stval,
+                        current_trap_cx().sepc,
+                    );
+                    current_add_signal(SignalFlags::SIGSEGV);
+                }
             }
         }
         Trap::Exception(Exception::InstructionPageFault) => {
@@ -166,14 +189,26 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            if !current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
-                error!(
-                    "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                    scause.cause(),
-                    stval,
-                    current_trap_cx().sepc,
-                );
-                current_add_signal(SignalFlags::SIGSEGV);
+            match current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
+                Ok(()) => {}
+                Err(ERRNO::ENXIO) => {
+                    error!(
+                        "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
+                        scause.cause(),
+                        stval,
+                        current_trap_cx().sepc,
+                    );
+                    current_add_signal(SignalFlags::SIGBUS);
+                }
+                Err(_) => {
+                    error!(
+                        "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                        scause.cause(),
+                        stval,
+                        current_trap_cx().sepc,
+                    );
+                    current_add_signal(SignalFlags::SIGSEGV);
+                }
             }
         }
         Trap::Exception(Exception::StoreFault)
