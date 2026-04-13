@@ -725,6 +725,10 @@ impl File for OSInode {
         self.inode.set_mode(mode)?;
         Ok(())
     }
+
+    fn backing_inode(&self) -> Option<Arc<Inode>> {
+        Some(Arc::clone(&self.inode))
+    }
 }
 
 /// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。

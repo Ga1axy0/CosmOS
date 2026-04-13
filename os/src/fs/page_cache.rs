@@ -261,6 +261,32 @@ pub fn get_cached_page(inode: &Arc<Inode>, page_idx: u64) -> Option<Arc<SpinNoIr
     mapping_for_inode(inode).map(|mapping| mapping.get_page(page_idx))
 }
 
+/// 增加某个缓存页的共享映射计数，防止其在仍被用户页表引用时被回收。
+pub fn retain_mapped_page(page: &Arc<SpinNoIrqLock<CachePage>>) {
+    let mut page_guard = page.lock();
+    page_guard.ref_bit = true;
+    page_guard.map_count += 1;
+}
+
+/// 减少某个缓存页的共享映射计数。
+pub fn release_mapped_page(page: &Arc<SpinNoIrqLock<CachePage>>) {
+    let mut page_guard = page.lock();
+    page_guard.map_count = page_guard.map_count.saturating_sub(1);
+}
+
+/// 将一个已经通过共享映射暴露给用户态的缓存页标记为脏页。
+pub fn mark_cached_page_dirty(page: &Arc<SpinNoIrqLock<CachePage>>) {
+    let owner = {
+        let page_guard = page.lock();
+        page_guard.owner.upgrade()
+    };
+    let Some(owner) = owner else {
+        return;
+    };
+    let mut page_guard = page.lock();
+    mark_page_dirty(&owner, &mut page_guard);
+}
+
 /// 查找 inode 对应的 mapping；不存在时返回 `None`。
 fn try_get_mapping(inode: &Arc<Inode>) -> Option<PageMappingHandle> {
     inode
