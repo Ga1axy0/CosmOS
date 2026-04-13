@@ -626,8 +626,14 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
         let wait_queue = {
             let mut page_guard = page.lock();
             if page_guard.state.contains(CachePageState::DIRTY) {
-                page_guard.state.remove(CachePageState::DIRTY);
-                mapping.lock().dirty_pages.remove(&page_idx);
+                if page_guard.map_count > 0 {
+                    // 共享映射仍然存在时先保守地维持脏状态，避免写回后后续写入无法再次通知内核。
+                    // TODO：后续补齐反向映射后，可在写回前清 PTE 脏位并重新写保护，从而精确清脏。
+                    mapping.lock().dirty_pages.insert(page_idx);
+                } else {
+                    page_guard.state.remove(CachePageState::DIRTY);
+                    mapping.lock().dirty_pages.remove(&page_idx);
+                }
             }
             page_guard.state.remove(CachePageState::WRITEBACK);
             page_guard.pin_count = page_guard.pin_count.saturating_sub(1);
