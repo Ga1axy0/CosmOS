@@ -654,6 +654,22 @@ impl ProcessControlBlock {
             fault_addr,
             access
         );
+        if access == PageFaultAccess::Write {
+            let notified = {
+                let mut inner = self.inner.lock();
+                inner
+                    .memory_set
+                    .handle_shared_write_fault(VirtAddr::from(fault_addr))
+            };
+            if notified {
+                debug!(
+                    "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
+                    self.getpid(),
+                    fault_addr
+                );
+                return true;
+            }
+        }
         let plan = {
             let inner = self.inner.lock();
             inner

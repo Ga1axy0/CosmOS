@@ -539,6 +539,7 @@ impl MemorySet {
             page_idx: area.file_page_index(vpn)?,
             pgoff: file.pgoff,
             shared: file.shared,
+            access,
         };
         debug!(
             "[mmap] prepared lazy fault plan: va={:#x} vpn={:#x} page_idx={} access={:?} shared={} path={:?}",
@@ -613,8 +614,20 @@ impl MemorySet {
         if !self.can_commit_file_page_fault(plan) {
             return false;
         }
-        let pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        if plan.shared
+            && plan.map_perm.contains(MapPermission::W)
+            && plan.access != PageFaultAccess::Write
+        {
+            pte_flags.remove(PTEFlags::W);
+        }
         let ppn = page.lock().ppn();
+        if plan.shared
+            && plan.map_perm.contains(MapPermission::W)
+            && plan.access == PageFaultAccess::Write
+        {
+            mark_cached_page_dirty(&page);
+        }
         retain_mapped_page(&page);
         let area = self
             .find_vma_containing_mut(plan.vpn)
@@ -627,11 +640,58 @@ impl MemorySet {
             asm!("sfence.vma");
         }
         debug!(
-            "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} path={:?}",
+            "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} writable={} path={:?}",
             plan.vpn.0,
             plan.page_idx,
             ppn.0,
+            pte_flags.contains(PTEFlags::W),
             plan.file.path()
+        );
+        true
+    }
+
+    /// 处理共享可写页的首次写入通知缺页。
+    pub fn handle_shared_write_fault(&mut self, fault_va: VirtAddr) -> bool {
+        let vpn = fault_va.floor();
+        let Some(pte) = self.page_table.translate(vpn) else {
+            return false;
+        };
+        if pte.writable() {
+            return false;
+        }
+        let (page, path) = {
+            let Some(area) = self.find_vma_containing(vpn) else {
+                return false;
+            };
+            if !area.is_user_accessible() || !area.allows_fault_access(PageFaultAccess::Write) {
+                return false;
+            }
+            let Some(file) = area.file.as_ref() else {
+                return false;
+            };
+            if !file.shared {
+                return false;
+            }
+            let Some(page) = area.shared_pages.get(&vpn).cloned() else {
+                return false;
+            };
+            (page, file.file.path())
+        };
+        let mut new_flags = pte.flags();
+        new_flags.insert(PTEFlags::W);
+        if !self.page_table.update_flags(vpn, new_flags) {
+            return false;
+        }
+        // 首次写 fault 时立即把 page cache 页记脏，避免等待 teardown 才传播脏状态。
+        mark_cached_page_dirty(&page);
+        unsafe {
+            asm!("sfence.vma");
+        }
+        debug!(
+            "[mmap] shared write-notify fault: vpn={:#x} ppn={:#x} path={:?}",
+            vpn.0,
+            pte.ppn().0,
+            path
         );
         true
     }
@@ -894,6 +954,8 @@ pub struct FilePageFaultPlan {
     pub pgoff: usize,
     /// 是否为 `MAP_SHARED`。
     pub shared: bool,
+    /// 触发本次缺页的访问类型。
+    pub access: PageFaultAccess,
 }
 
 /// 一段带有权限、来源和页框信息的虚拟内存区域描述。
