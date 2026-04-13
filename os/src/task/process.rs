@@ -337,14 +337,17 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        let cloexec_entries = {
+        let (mut old_memory_set, cloexec_entries) = {
             let mut inner = self.inner_exclusive_access();
-            inner.memory_set = memory_set;
+            let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             inner.vm_layout = vm_layout;
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
-            inner.take_cloexec_fds()
+            let cloexec_entries = inner.take_cloexec_fds();
+            (old_memory_set, cloexec_entries)
         };
+        debug!("[mmap] exec teardown old memory_set before installing new user context");
+        old_memory_set.recycle_data_pages();
         drop(cloexec_entries);
         // then we alloc user resource for main thread again
         // since memory_set has been changed
