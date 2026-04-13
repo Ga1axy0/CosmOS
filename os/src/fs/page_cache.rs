@@ -307,7 +307,7 @@ fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> 
         }
     }
     if inserted {
-        info!(
+        debug!(
             "[page_cache] mapping miss: inode_ptr={:#x} fs_id={} ino={} size={}",
             Arc::as_ptr(inode) as usize,
             inode.fs_id(),
@@ -315,7 +315,7 @@ fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> 
             current_size
         );
     } else {
-        info!(
+        debug!(
             "[page_cache] mapping hit: inode_ptr={:#x} fs_id={} ino={}",
             Arc::as_ptr(inode) as usize,
             inode.fs_id(),
@@ -451,7 +451,7 @@ fn get_or_create_page(
     page_idx: u64,
 ) -> Arc<SpinNoIrqLock<CachePage>> {
     if let Some(page) = mapping.lock().pages.get(&page_idx).cloned() {
-        info!("[page_cache] page hit: page_idx={}", page_idx);
+        debug!("[page_cache] page hit: page_idx={}", page_idx);
         return page;
     }
 
@@ -465,7 +465,7 @@ fn get_or_create_page(
     {
         let mut mapping_guard = mapping.lock();
         if let Some(existing) = mapping_guard.pages.get(&page_idx).cloned() {
-            info!("[page_cache] page hit-after-race: page_idx={}", page_idx);
+            debug!("[page_cache] page hit-after-race: page_idx={}", page_idx);
             return existing;
         }
         mapping_guard.pages.insert(page_idx, Arc::clone(&page));
@@ -474,7 +474,7 @@ fn get_or_create_page(
     let mut manager = PAGE_CACHE_MANAGER.lock();
     manager.cached_pages += 1;
     manager.inactive.push_back(Arc::downgrade(&page));
-    info!(
+    debug!(
         "[page_cache] page miss: page_idx={} cached_pages={}",
         page_idx,
         manager.cached_pages
@@ -532,7 +532,7 @@ fn ensure_page_uptodate(
         } else {
             let bytes = ppn.get_bytes_array();
             bytes.fill(0);
-            info!(
+            debug!(
                 "[page_cache] load page: fs_id={} ino={} page_idx={} valid_bytes={}",
                 inode.fs_id(),
                 inode.ino(),
@@ -615,7 +615,7 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
             writeback_info.expect("writeback owner must provide page data");
         if valid_bytes != 0 {
             let bytes = ppn.get_bytes_array();
-            info!(
+            debug!(
                 "[page_cache] writeback page: page_idx={} valid_bytes={}",
                 page_idx,
                 valid_bytes
@@ -725,7 +725,7 @@ fn reclaim_one() -> bool {
     if removed.is_some() {
         let mut manager = PAGE_CACHE_MANAGER.lock();
         manager.cached_pages = manager.cached_pages.saturating_sub(1);
-        info!(
+        debug!(
             "[page_cache] evict page: page_idx={} cached_pages={}",
             page_idx,
             manager.cached_pages
