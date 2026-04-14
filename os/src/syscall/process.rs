@@ -147,12 +147,6 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
     sys_exit(exit_code);
 }
 
-/// yield syscall
-pub fn sys_yield() -> isize {
-    //trace!("kernel: sys_yield");
-    suspend_current_and_run_next();
-    0
-}
 /// getpid syscall
 pub fn sys_getpid() -> isize {
     trace!(
@@ -629,17 +623,6 @@ pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
         inner.robust_list.len = len;
         Ok(0)
     })
-}
-
-/// set priority syscall
-///
-/// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
 }
 
 pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
