@@ -1,7 +1,7 @@
 //! Implementation of  [`ProcessControlBlock`]
 
 use super::id::RecycleAllocator;
-use super::manager::insert_into_pid2process;
+use super::runqueue::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
