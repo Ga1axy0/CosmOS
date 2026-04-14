@@ -6,6 +6,7 @@ import time
 
 MAX_PACKETS = 100
 THREAD_COUNT = 10
+INTERVAL = 0.01
 
 def random_text(length=32):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -33,7 +34,7 @@ def tcp_client(thread_id, stats):
         except Exception as e:
             print(f"\033[1;31mThread {thread_id}:\033[0m Error - {e}")
         finally:
-            time.sleep(0.5)
+            time.sleep(INTERVAL)
 
 threads = []
 stats_list = [ThreadStats() for _ in range(THREAD_COUNT)]
@@ -44,7 +45,7 @@ for i in range(THREAD_COUNT):
     t = threading.Thread(target=tcp_client, args=(i, stats_list[i]))
     threads.append(t)
     t.start()
-    time.sleep(0.5)
+    time.sleep(INTERVAL)
 
 for t in threads:
     t.join()

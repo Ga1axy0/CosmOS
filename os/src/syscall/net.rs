@@ -15,8 +15,8 @@ use crate::syscall_body;
 use crate::task::{current_process, current_user_token, FdEntry};
 
 const AF_INET: u16 = 2;
-const SOCK_STREAM: usize = 1;
-const SOCK_DGRAM: usize = 2;
+const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
 
 fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let process = current_process();
@@ -72,9 +72,9 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
     }
 }
 
-pub fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
+pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
     syscall_body!({
-        if domain != AF_INET as usize {
+        if domain != AF_INET as i32 {
             return Err(ERRNO::EAFNOSUPPORT);
         }
 
@@ -104,9 +104,9 @@ pub fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize 
     })
 }
 
-pub fn sys_bind(fd: u32, addr: *const SockAddrIn, addrlen: usize) -> isize {
+pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
     syscall_body!({
-        if addr.is_null() || addrlen < core::mem::size_of::<SockAddrIn>() {
+        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
             return Err(ERRNO::EINVAL);
         }
         let token = current_user_token();
@@ -122,9 +122,9 @@ pub fn sys_bind(fd: u32, addr: *const SockAddrIn, addrlen: usize) -> isize {
     })
 }
 
-pub fn sys_connect(fd: u32, addr: *const SockAddrIn, addrlen: usize) -> isize {
+pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
     syscall_body!({
-        if addr.is_null() || addrlen < core::mem::size_of::<SockAddrIn>() {
+        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
             return Err(ERRNO::EINVAL);
         }
         let token = current_user_token();
@@ -140,14 +140,14 @@ pub fn sys_connect(fd: u32, addr: *const SockAddrIn, addrlen: usize) -> isize {
     })
 }
 
-pub fn sys_listen(fd: u32, backlog: usize) -> isize {
+pub fn sys_listen(fd: i32, backlog: i32) -> isize {
     syscall_body!({
-        with_tcp_socket(fd as usize, |tcp| tcp.listen(backlog))?;
+        with_tcp_socket(fd as usize, |tcp| tcp.listen(backlog as usize))?;
         Ok(0)
     })
 }
 
-pub fn sys_accept(fd: u32, addr: *mut SockAddrIn, addrlen: usize) -> isize {
+pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
     syscall_body!({
         let (accepted, peer) = with_tcp_socket(fd as usize, |tcp| tcp.accept())?;
 
@@ -165,7 +165,7 @@ pub fn sys_accept(fd: u32, addr: *mut SockAddrIn, addrlen: usize) -> isize {
         inner.fd_table[new_fd] = Some(FdEntry::new(accepted_desc));
         drop(inner);
 
-        if !addr.is_null() && addrlen >= core::mem::size_of::<SockAddrIn>() {
+        if !addr.is_null() && (addrlen as usize) >= core::mem::size_of::<SockAddrIn>() {
             if let Some(ep) = peer {
                 let token = current_user_token();
                 let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
@@ -178,12 +178,12 @@ pub fn sys_accept(fd: u32, addr: *mut SockAddrIn, addrlen: usize) -> isize {
 }
 
 pub fn sys_sendto(
-    fd: u32,
+    fd: i32,
     buf: *const u8,
     len: usize,
-    flags: usize,
+    flags: u32,
     addr: *const SockAddrIn,
-    addrlen: usize,
+    addrlen: i32,
 ) -> isize {
     syscall_body!({
         if flags != 0 {
@@ -205,7 +205,7 @@ pub fn sys_sendto(
         let n = if addr.is_null() {
             with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
         } else {
-            if addrlen < core::mem::size_of::<SockAddrIn>() {
+            if (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
                 return Err(ERRNO::EINVAL);
             }
             let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
@@ -218,12 +218,12 @@ pub fn sys_sendto(
 }
 
 pub fn sys_recvfrom(
-    fd: u32,
+    fd: i32,
     buf: *mut u8,
     len: usize,
-    flags: usize,
+    flags: u32,
     addr: *mut SockAddrIn,
-    addrlen: usize,
+    addrlen: i32,
 ) -> isize {
     syscall_body!({
         if flags != 0 {
@@ -235,7 +235,7 @@ pub fn sys_recvfrom(
         if buf.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        if !addr.is_null() && addrlen < core::mem::size_of::<SockAddrIn>() {
+        if !addr.is_null() && (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
             return Err(ERRNO::EINVAL);
         }
 
