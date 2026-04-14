@@ -157,6 +157,15 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         true
     }
+    /// 用新的物理页号和权限替换一个已经存在的页表项。
+    pub fn replace(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        let pte = match self.find_pte(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => return false,
+        };
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
+    }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn)

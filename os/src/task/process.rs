@@ -444,8 +444,13 @@ impl ProcessControlBlock {
         trace!("kernel: fork");
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
+        debug!(
+            "[cow] fork begin: parent_pid={} parent_threads={}",
+            self.getpid(),
+            parent.thread_count()
+        );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
         let vm_layout = parent.vm_layout;
         let cred = parent.cred;
         // alloc a pid
@@ -497,6 +502,11 @@ impl ProcessControlBlock {
         });
         // add child
         parent.children.push(Arc::clone(&child));
+        debug!(
+            "[cow] fork created child process: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         // create main thread of child process
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
@@ -523,6 +533,11 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack.get_top();
         trap_cx.x[10] = 0;
         drop(task_inner);
+        debug!(
+            "[cow] fork complete: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
@@ -650,6 +665,13 @@ impl ProcessControlBlock {
     /// unmap an area. return true if success
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
         self.inner.lock().memory_set.munmap(start, end)
+    }
+    /// 处理当前进程的私有页写时复制缺页。
+    pub fn handle_private_cow_fault(&self, fault_addr: usize) -> bool {
+        self.inner
+            .lock()
+            .memory_set
+            .handle_private_cow_fault(VirtAddr::from(fault_addr))
     }
     /// 处理当前进程的 file-backed 缺页。
     pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> Result<(), ERRNO> {
