@@ -41,7 +41,7 @@ pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use runqueue::{
     add_task, dequeue_task, enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio,
-    pid2process, pick_next_task, remove_from_pid2process, remove_task, wakeup_task,
+    pid2process, pick_next_task, remove_from_pid2process, remove_task, resched_hart, wakeup_task,
 };
 pub use action::{SignalAction, SignalActions};
 pub use processor::{

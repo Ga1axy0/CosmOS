@@ -107,7 +107,8 @@ fn select_target_hart(preferred_hart: usize, affinity_mask: usize) -> usize {
     }
 }
 
-fn resched_hart(hart: usize) {
+/// Request a reschedule on the selected hart, using an IPI when needed.
+pub fn resched_hart(hart: usize) {
     let target_hart = normalize_hart(hart);
     if target_hart == hartid() {
         mark_current_task_need_resched();
@@ -213,7 +214,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
         } else {
             resched_hart(target_hart);
         }
-        trace!("kernel: wakeup_task -> hart {} prio {}", target_hart, prio);
+        // trace!("kernel: wakeup_task -> hart {} prio {}", target_hart, prio);
     }
     true
 }

@@ -90,6 +90,16 @@ pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 pub const SYSCALL_CLOCK_GETRES: usize = 114;
 /// syslog syscall
 pub const SYSCALL_SYSLOG: usize = 116;
+/// sched_setscheduler syscall
+pub const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
+/// sched_getscheduler syscall
+pub const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
+/// sched_getparam syscall
+pub const SYSCALL_SCHED_GETPARAM: usize = 121;
+/// sched_setaffinity syscall
+pub const SYSCALL_SCHED_SETAFFINITY: usize = 122;
+/// sched_getaffinity syscall
+pub const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 /// yield syscall
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
@@ -220,6 +230,7 @@ pub const SYSCALL_CONDVAR_WAIT: usize = 473;
 
 mod fs;
 mod net;
+mod sched;
 mod process;
 mod sync;
 mod thread;
@@ -233,6 +244,7 @@ pub mod errno;
 
 use fs::*;
 use net::*;
+use sched::*;
 use process::*;
 use sync::*;
 use thread::*;
@@ -415,7 +427,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
-        SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
+        SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0] as isize, args[1] as *mut SchedParam),
+        SYSCALL_SCHED_SETSCHEDULER => {
+            sys_sched_setscheduler(args[0] as isize, args[1] as i32, args[2] as *const SchedParam)
+        }
+        SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0] as isize),
+        SYSCALL_SCHED_SETAFFINITY => {
+            sys_sched_setaffinity(args[0] as isize, args[1], args[2] as *const u8)
+        }
+        SYSCALL_SCHED_GETAFFINITY => {
+            sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
+        }
         SYSCALL_RENAMEAT2 => sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,
