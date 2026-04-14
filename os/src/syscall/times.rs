@@ -4,7 +4,6 @@ use crate::syscall_body;
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
 use crate::timer::set_realtime_offset_from_time_ns;
-use crate::config::CLOCK_FREQ;
 use crate::{
     config::CLOCK_FREQ,
     task::{current_process, current_task},

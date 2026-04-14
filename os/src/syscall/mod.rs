@@ -188,6 +188,8 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// get_mempolicy syscall
+pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 /// waitpid syscall
 pub const SYSCALL_WAIT4: usize = 260;
 /// renameat2 syscall
@@ -426,6 +428,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
+            args[0] as *mut i32,
+            args[1] as *mut u8,
+            args[2],
+            args[3],
+            args[4] as u32,
+        ),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0] as isize, args[1] as *mut SchedParam),
         SYSCALL_SCHED_SETSCHEDULER => {

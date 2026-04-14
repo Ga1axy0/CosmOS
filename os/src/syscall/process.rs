@@ -4,18 +4,15 @@ use crate::syscall_body;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
-    mm::{
-        translated_ref, translated_refmut, translated_str,
-    },
+    mm::{translated_ref, translated_refmut, translated_str},
     task::{
-        add_signal_to_process, current_process, current_task, current_user_token, exit_current_and_run_next,
-        pid2process, suspend_current_and_run_next, ExitReason, SignalAction, SignalFlags,
+        add_signal_to_process, current_process, current_task, current_user_token,
+        exit_current_and_run_next, pid2process, ExitReason, SignalAction, SignalFlags,
         WaitReason,
     },
 };
 
 use alloc::{string::String, vec::Vec};
-
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -38,7 +35,6 @@ const EXEC_INTERPRETER_MAX_DEPTH: usize = 4;
 const EXEC_PROBE_SIZE: usize = 256;
 /// ELF 文件头魔数。
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
-
 /// 判断当前文件是否为 ELF 映像。
 fn is_elf_image(file_data: &[u8]) -> bool {
     file_data.starts_with(ELF_MAGIC)
@@ -506,15 +502,6 @@ pub fn sys_sigreturn() -> isize {
         // 屏蔽字与正在处理信号状态的回滚。
         Err(ERRNO::ENOSYS)?
     })
-}
-
-/// change data segment size
-pub fn sys_brk(addr: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_brk",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    current_process().set_program_brk(addr) as isize
 }
 
 /// spawn syscall
