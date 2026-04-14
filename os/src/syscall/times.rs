@@ -6,6 +6,7 @@ use crate::task::current_user_token;
 use crate::timer::set_realtime_offset_from_time_ns;
 use crate::config::CLOCK_FREQ;
 use crate::{
+    config::CLOCK_FREQ,
     task::{current_process, current_task},
     timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
 };
@@ -92,7 +93,19 @@ fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
     let freq = CLOCK_FREQ as u128;
     TimeVal {
         sec: (raw_time / freq) as usize,
-        usec: ((raw_time % freq) * 1_000_000 / freq) as usize,
+        usec: ((raw_time % freq) * 1_000_000 / freq) as usize,  
+    }
+}
+/// 返回当前内核可提供的时钟分辨率。
+fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
+    match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC => {
+            let resolution_ns = 1_000_000_000u64.div_ceil(CLOCK_FREQ as u64);
+            Ok(timespec_from_ns(resolution_ns))
+        }
+        // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
+        // CLOCK_REALTIME_COARSE 等其它 clock id。
+        _ => Err(ERRNO::EINVAL),
     }
 }
 
@@ -143,6 +156,22 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
         };
         // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
         write_pod_to_user(tp, &timespec)?;
+        Ok(0)
+    })
+}
+
+/// `clock_getres(2)` 系统调用。
+pub fn sys_clock_getres(clockid: ClockId, tp: *mut Timespec) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_clock_getres clockid={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid
+    );
+    syscall_body!({
+        let resolution = clock_resolution(clockid)?;
+        if !tp.is_null() {
+            write_pod_to_user(tp, &resolution)?;
+        }
         Ok(0)
     })
 }
