@@ -37,12 +37,16 @@ pub struct TaskControlBlockInner {
     /// Save task context
     pub task_cx: TaskContext,
 
-    /// Maintain the execution status of the current process
+    /// Maintain the execution status of the current task.
     pub task_status: TaskStatus,
     /// Why this task is blocked (if blocked by a sleep queue/event).
     pub wait_reason: Option<WaitReason>,
-    /// Wakeup arrived before task fully transitioned from running to blocked.
-    pub wake_pending: bool,
+    /// Last hart that ran this task.
+    pub last_cpu: usize,
+    /// whether the task is running on cpu
+    pub on_cpu: bool,
+    /// whether the task is in runqueue
+    pub on_rq: bool,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
 }
@@ -77,9 +81,11 @@ impl TaskControlBlock {
                     res: Some(res),
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),
-                    task_status: TaskStatus::Ready,
+                    task_status: TaskStatus::Runnable,
                     wait_reason: None,
-                    wake_pending: false,
+                    last_cpu: 0,
+                    on_cpu: false,
+                    on_rq: false,
                     exit_code: None,
                 })
             },
@@ -115,16 +121,16 @@ pub enum WaitReason {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-/// The execution status of the current process
+/// Linux-like task lifecycle states.
 pub enum TaskStatus {
-    /// 已在本地 hart 上切出，等待转入真正可运行队列
-    PreReady,
-    /// 已加入等待队列，等待当前 hart 完成真正切出后进入 Blocked
-    PreBlocked,
-    /// ready to run
-    Ready,
-    /// running
+    /// Running
     Running,
-    /// blocked
-    Blocked,
+    /// Ready to run but not currently running.
+    Runnable,
+    /// Sleeping and can be woken by ordinary events/signals.
+    Interruptible,
+    /// Sleeping and should only be woken by the waited event.
+    Uninterruptible,
+    /// Exited and must not be scheduled again.
+    Zombie,
 }
