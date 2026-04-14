@@ -12,8 +12,8 @@
 #[path ="../sched/context.rs"]
 mod context;
 mod id;
-#[path = "../sched/manager.rs"]
-mod manager;
+#[path = "../sched/runqueue.rs"]
+mod runqueue;
 mod action;
 mod process;
 #[path ="../sched/processor.rs"]
@@ -28,7 +28,7 @@ mod task;
 use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::poll::task_has_inflight_keyed_poll_wait;
-use crate::task::manager::add_stopping_task;
+use crate::task::runqueue::add_stopping_task;
 use crate::timer::remove_timer;
 use crate::timer::get_time;
 use crate::mm::{MapPermission, VirtAddr};
@@ -39,7 +39,7 @@ use switch::__switch;
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub use manager::{
+pub use runqueue::{
     add_task, dequeue_task, enqueue_task_on, pid2process, pick_next_task, remove_from_pid2process,
     remove_task, wakeup_task,
 };
