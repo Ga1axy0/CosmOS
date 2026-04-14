@@ -2,7 +2,7 @@
 
 use super::id::RecycleAllocator;
 use super::runqueue::insert_into_pid2process;
-use super::TaskControlBlock;
+use super::{SchedAttr, TaskControlBlock};
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
@@ -236,7 +236,7 @@ impl ProcessControlBlockInner {
     }
     /// the count of tasks(threads) in this process
     pub fn thread_count(&self) -> usize {
-        self.tasks.len()
+        self.tasks.iter().filter(|task| task.is_some()).count()
     }
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
@@ -303,6 +303,7 @@ impl ProcessControlBlock {
             Arc::clone(&process),
             ustack_base,
             true,
+            SchedAttr::default(),
         ));
         // prepare trap_cx of main thread
         let task_inner = task.inner_exclusive_access();
@@ -504,25 +505,22 @@ impl ProcessControlBlock {
         });
         // add child
         parent.children.push(Arc::clone(&child));
-        debug!(
-            "[cow] fork created child process: parent_pid={} child_pid={}",
-            self.getpid(),
-            child.getpid()
-        );
+        let parent_task = parent.get_task(0);
+        let parent_task_inner = parent_task.inner_exclusive_access();
+        let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
+        let parent_sched_attr = parent_task_inner.sched_attr();
+        let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
+        drop(parent_task_inner);
         // create main thread of child process
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
-            parent
-                .get_task(0)
-                .inner_exclusive_access()
-                .res
-                .as_ref()
-                .unwrap()
-                .ustack_base(),
+            parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
+            parent_sched_attr,
         ));
+        task.inner_exclusive_access().cpu_affinity_mask = parent_affinity_mask;
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
@@ -598,9 +596,20 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
         parent.children.push(Arc::clone(&child));
+        let parent_task = parent.get_task(0);
+        let parent_task_inner = parent_task.inner_exclusive_access();
+        let parent_sched_attr = parent_task_inner.sched_attr();
+        let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
+        drop(parent_task_inner);
         drop(parent);
 
-        let task = Arc::new(TaskControlBlock::new(Arc::clone(&child), ustack_base, true));
+        let task = Arc::new(TaskControlBlock::new(
+            Arc::clone(&child),
+            ustack_base,
+            true,
+            parent_sched_attr,
+        ));
+        task.inner_exclusive_access().cpu_affinity_mask = parent_affinity_mask;
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();

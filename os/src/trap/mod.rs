@@ -20,7 +20,9 @@ use crate::mm::PageFaultAccess;
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
 use crate::task::{
-    ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token, exit_current_and_run_next, suspend_current_and_run_next
+    ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process,
+    current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token,
+    exit_current_and_run_next, on_timer_tick, schedule_if_needed,
 };
 use crate::timer::{check_timer, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -237,7 +239,7 @@ pub fn trap_handler() -> ! {
             set_next_trigger();
             check_timer();
             crate::net::poll();
-            suspend_current_and_run_next();
+            on_timer_tick();
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
             clear_software_interrupt_pending();
@@ -264,6 +266,7 @@ pub fn trap_handler() -> ! {
         // 非主进程才会进入这个分支，此时退出的reason是不重要的。
         exit_current_and_run_next(ExitReason::Exit(0));
     }
+    schedule_if_needed();
     trap_return();
 }
 
