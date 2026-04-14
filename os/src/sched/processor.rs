@@ -93,6 +93,7 @@ pub fn run_tasks() {
             task_inner.last_cpu = hartid();
             task_inner.on_cpu = true;
             task_inner.on_rq = false;
+            task_inner.need_resched = false;
             drop(task_inner);
 
             processor.current = Some(task);
