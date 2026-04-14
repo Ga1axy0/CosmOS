@@ -611,6 +611,14 @@ impl ProcessControlBlock {
             .munmap_anonymous(start, end)
     }
 
+    /// change permissions of a mapped range. return true if success
+    pub fn mprotect(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        self.inner
+            .lock()
+            .memory_set
+            .mprotect_range(start, end, perm)
+    }
+
     /// 返回当前进程用于 `mmap(NULL, ...)` 的默认起始基址。
     pub fn mmap_base(&self) -> usize {
         self.inner.lock().vm_layout.mmap_base
@@ -620,6 +628,7 @@ impl ProcessControlBlock {
     pub fn set_program_brk(&self, new_brk: usize) -> usize {
         let mut inner = self.inner.lock();
         let old_brk = inner.vm_layout.brk;
+        debug!("brk: old addr = {:#x}, new addr = {:#x}", old_brk, new_brk);
         // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
         if new_brk == 0 {
             return old_brk;

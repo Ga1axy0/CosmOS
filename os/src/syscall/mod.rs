@@ -74,6 +74,10 @@ pub const SYSCALL_SYSLOG: usize = 116;
 pub const SYSCALL_YIELD: usize = 124;
 /// kill syscall
 pub const SYSCALL_KILL: usize = 129;
+/// tkill syscall
+pub const SYSCALL_TKILL: usize = 130;
+/// tgkill syscall
+pub const SYSCALL_TGKILL: usize = 131;
 /// sigaction syscall
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -112,10 +116,14 @@ pub const SYSCALL_FORK: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
 pub const SYSCALL_MMAP: usize = 222;
+/// mprotect syscall
+pub const SYSCALL_MPROTECT: usize = 226;
 /// waitpid syscall
 pub const SYSCALL_WAIT4: usize = 260;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
+/// getrandom syscall
+pub const SYSCALL_GETRANDOM: usize = 278;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
 /*
@@ -154,6 +162,7 @@ mod fs;
 mod process;
 mod sync;
 mod thread;
+mod random;
 mod mman;
 mod times;
 mod utils;
@@ -161,18 +170,17 @@ mod utils;
 /// Standard error numbers and conversion traits
 pub mod errno;
 
-use core::time;
-
 use fs::*;
 use process::*;
 use sync::*;
 use thread::*;
+use crate::syscall::random::*;
 use mman::*;
 use times::*;
 pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
 
 
-use crate::{fs::Stat, syscall::{self, errno::ERRNO}};
+use crate::{fs::Stat, syscall::errno::ERRNO};
 use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
@@ -245,6 +253,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
+        SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
@@ -277,6 +286,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
         SYSCALL_RENAMEAT2 => sys_renameat2(
@@ -287,7 +297,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as u32,
         ),
         SYSCALL_SIGACTION => sys_sigaction(args[0] as i32, args[1] as *const crate::task::SignalAction, args[2] as *mut crate::task::SignalAction),
-        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
@@ -303,6 +313,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_SIGNAL => sys_condvar_signal(args[0]),
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
+        SYSCALL_TKILL => sys_tkill(args[0], args[1] as u32),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as u32),
         _ => sys_nisyscall(syscall_id, args),
     }
 }

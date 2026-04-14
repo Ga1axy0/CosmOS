@@ -333,3 +333,8 @@ pub fn mmap_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission)
 pub fn munmap_current_process(start: VirtAddr, end: VirtAddr) -> bool {
     current_process().munmap(start, end)
 }
+
+/// Change permissions on a range in current process.
+pub fn mprotect_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+    current_process().mprotect(start, end, perm)
+}

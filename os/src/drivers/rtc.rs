@@ -138,6 +138,8 @@ pub fn init() {
     rtc.init();
     let time_ns = rtc.read_time_ns();
     drop(rtc);
+    // Mix RTC-derived timestamp into kernel entropy pool so getrandom can seed early.
+    crate::random::add_entropy(&time_ns.to_le_bytes());
     RTC_READY.store(true, Ordering::Release);
     info!(
         "rtc init done, realtime = {}.{:09} s",
