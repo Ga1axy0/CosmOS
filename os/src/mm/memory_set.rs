@@ -170,6 +170,30 @@ impl MemorySet {
         );
         true
     }
+    /// 把一张已有的 page cache 页直接接入指定虚拟页，供 `fork` 继承只读文件私有映射。
+    pub fn map_existing_direct_cache_page(
+        &mut self,
+        vpn: VirtPageNum,
+        page: Arc<SpinNoIrqLock<CachePage>>,
+        flags: PTEFlags,
+    ) -> bool {
+        if self.page_table.translate(vpn).is_some() {
+            return false;
+        }
+        let Some(area) = self.find_vma_containing_mut(vpn) else {
+            return false;
+        };
+        retain_mapped_page(&page);
+        area.direct_cache_pages.insert(vpn, Arc::clone(&page));
+        self.page_table.map(vpn, page.lock().ppn(), flags);
+        debug!(
+            "[cow] install inherited direct cache page: vpn={:#x} ppn={:#x} writable={}",
+            vpn.0,
+            page.lock().ppn().0,
+            flags.contains(PTEFlags::W)
+        );
+        true
+    }
     /// 在完成分裂、删除或追加后整理可合并的相邻区域。
     /// TODO：考虑使用有序数据结构维护vmas，避免每一次都需要排序。
     pub fn merge_adjacent_vmas(&mut self) {
@@ -369,8 +393,6 @@ impl MemorySet {
             }
             // 对于可共享的私有页，`fork` 时父子先共用同一张只读页，写时再复制。
             // 对于 trap context 之类内核内部页，仍然保持直接复制，避免把内核写路径卷入 COW。
-            // TODO：当前只复制已经物化到 `data_frames` 的私有页；
-            // 已经直接映到 page cache 的只读 `MAP_PRIVATE` 页仍由子进程后续重新 fault 接入。
             let vpns: Vec<_> = user_space.vmas[area_idx].data_frames.keys().copied().collect();
             for vpn in vpns {
                 if share_private_pages {
@@ -411,6 +433,45 @@ impl MemorySet {
                     src_ppn.0,
                     dst_ppn.0
                 );
+            }
+            // 对于已经直接映到 page cache 的文件页，子进程也直接继承当前映射。
+            // `MAP_PRIVATE` 仍然保持只读，`MAP_SHARED` 在 sticky dirty 语义下保留父进程当前 `W` 状态。
+            let inherit_direct_cache_pages = user_space.vmas[area_idx].file.is_some();
+            if inherit_direct_cache_pages {
+                let file_shared = user_space.vmas[area_idx]
+                    .file
+                    .as_ref()
+                    .map(|file| file.shared)
+                    .unwrap_or(false);
+                let vpns: Vec<_> = user_space.vmas[area_idx]
+                    .direct_cache_pages
+                    .keys()
+                    .copied()
+                    .collect();
+                for vpn in vpns {
+                    if memory_set.translate(vpn).is_some() {
+                        continue;
+                    }
+                    let page = Arc::clone(
+                        user_space.vmas[area_idx]
+                            .direct_cache_pages
+                            .get(&vpn)
+                            .unwrap(),
+                    );
+                    let mut child_flags = user_space.translate(vpn).unwrap().flags();
+                    child_flags.remove(PTEFlags::D);
+                    if !file_shared {
+                        child_flags.remove(PTEFlags::W);
+                    }
+                    debug!(
+                        "[cow] fork inherit direct cache page: vpn={:#x} ppn={:#x} shared={} writable={}",
+                        vpn.0,
+                        page.lock().ppn().0,
+                        file_shared,
+                        child_flags.contains(PTEFlags::W)
+                    );
+                    let _ = memory_set.map_existing_direct_cache_page(vpn, page, child_flags);
+                }
             }
         }
         if parent_tlb_needs_flush {
