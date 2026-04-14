@@ -5,7 +5,7 @@
 //! and the replacement and transfer of control flow of different applications are executed.
 
 use super::__switch;
-use super::{fetch_task, promote_pre_blocked_tasks, promote_pre_ready_tasks, TaskStatus};
+use super::{pick_next_task, TaskStatus};
 use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
@@ -76,9 +76,7 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
 pub fn run_tasks() {
     loop {
-        promote_pre_ready_tasks();
-        promote_pre_blocked_tasks();
-        if let Some(task) = fetch_task() {
+        if let Some(task) = pick_next_task(hartid()) {
             // debug!(
             //     "kernel: hart {} run_tasks, pid[{}]",
             //     hartid(),
@@ -92,7 +90,9 @@ pub fn run_tasks() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
-            task_inner.wake_pending = false;
+            task_inner.last_cpu = hartid();
+            task_inner.on_cpu = true;
+            task_inner.on_rq = false;
             drop(task_inner);
 
             processor.current = Some(task);
@@ -128,14 +128,6 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 /// Get a copy of the current task
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     current_processor().lock().current()
-}
-
-/// Restore the current running task without context switching.
-///
-/// Used by PreBlocked fast path when a wakeup wins the race before the
-/// blocker has switched out on this hart.
-pub fn restore_current_task(task: Arc<TaskControlBlock>) {
-    current_processor().lock().set_current(task);
 }
 
 /// get current process

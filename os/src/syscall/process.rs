@@ -3,6 +3,7 @@ use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
+    hart::hartid,
     mm::{
         translated_ref, translated_refmut, translated_str,
     },
@@ -212,15 +213,7 @@ pub fn sys_fork() -> isize {
     );
     let current_process = current_process();
     let new_process = current_process.fork();
-    let new_pid = new_process.getpid();
-    // modify trap context of new_task, because it returns immediately after switching
-    let new_process_inner = new_process.inner_exclusive_access();
-    let task = new_process_inner.tasks[0].as_ref().unwrap();
-    let trap_cx = task.inner_exclusive_access().get_trap_cx();
-    // we do not have to move to next instruction since we have done it before
-    // for child process, fork returns 0
-    trap_cx.x[10] = 0;
-    new_pid as isize
+    new_process.getpid() as isize
 }
 /// sys_execve
 pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
@@ -635,4 +628,22 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     -1
+}
+
+pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_getcpu",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let token = current_user_token();
+        let cpu = hartid() as u32;
+        if !cpu_ptr.is_null() {
+            translated_refmut(token, cpu_ptr).map(|slot| *slot = cpu).ok_or(ERRNO::EFAULT)?;
+        }
+        if !node_ptr.is_null() {
+            translated_refmut(token, node_ptr).map(|slot| *slot = 0).ok_or(ERRNO::EFAULT)?;
+        }
+        Ok(0)
+    })
 }

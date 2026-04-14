@@ -68,6 +68,14 @@ static BOOT_BSS_READY: AtomicUsize = AtomicUsize::new(usize::MAX);
 static BOOTSTRAP_HART_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static BOOT_DONE: AtomicBool = AtomicBool::new(false);
 
+/// 返回负责一次性全局初始化的 bootstrap hart id。
+///
+/// 在 bootstrap hart 选举完成前返回 `usize::MAX`；正常调度阶段调用时，
+/// 该值已经稳定，可作为 housekeeping hart 的选择依据。
+pub fn bootstrap_hart_id() -> usize {
+    BOOTSTRAP_HART_ID.load(Ordering::Acquire)
+}
+
 /// 清空 `.bss` 段，保证未初始化的全局/静态数据从 0 开始。
 fn clear_bss() {
     extern "C" {

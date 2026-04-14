@@ -43,6 +43,7 @@ pub fn init_hart() {
     set_kernel_trap_entry();
     unsafe {
         sie::set_sext();
+        sie::set_ssoft();
     }
     info!("hart {} trap init done", hartid());
 }
@@ -85,6 +86,20 @@ pub fn disable_timer_interrupt() {
 pub fn disable_external_interrupt() {
     unsafe {
         sie::clear_sext();
+    }
+}
+
+/// 为当前 hart 开启 supervisor software interrupt。
+pub fn enable_software_interrupt() {
+    unsafe {
+        sie::set_ssoft();
+    }
+}
+
+/// 清除当前 hart 挂起的 supervisor software interrupt。
+pub fn clear_software_interrupt_pending() {
+    unsafe {
+        asm!("csrc sip, {}", in(reg) 1 << 1);
     }
 }
 
@@ -137,6 +152,9 @@ pub fn trap_handler() -> ! {
             set_next_trigger();
             check_timer();
             suspend_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::SupervisorSoft) => {
+            clear_software_interrupt_pending();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::drivers::plic::handle_supervisor_external();
@@ -211,6 +229,9 @@ pub fn trap_from_kernel() {
             set_next_trigger();
             check_timer();
             // crate::net::poll();
+        }
+        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
+            clear_software_interrupt_pending();
         }
         _ => {
             panic!("Kernel trap: {:?}, stval = {:#x}", scause.cause(), stval);

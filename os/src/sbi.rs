@@ -50,6 +50,10 @@ const SBI_SET_TIMER: usize = 0x5449_4D45; // "TIME"
 #[cfg(not(qemu7))]
 const SBI_SHUTDOWN: usize = 0x5352_5354; // "SRST"
 const SBI_HSM: usize = 0x0048_534D; // "HSM"
+#[cfg(qemu7)]
+const SBI_SEND_IPI: usize = 4;
+#[cfg(not(qemu7))]
+const SBI_IPI: usize = 0x0073_5049; // "sPI"
 
 /// general sbi call
 #[cfg(qemu7)]
@@ -138,6 +142,19 @@ pub fn shutdown() -> ! {
 pub fn shutdown() -> ! {
     let _ = sbi_call(SBI_SHUTDOWN, 0, 0, 0, 0);
     panic!("It should shutdown!");
+}
+
+/// 发送 IPI 到给定 hart mask。
+#[cfg(qemu7)]
+pub fn send_ipi_mask(hart_mask: usize) {
+    let hart_mask_ptr = &hart_mask as *const usize as usize;
+    sbi_call_legacy(SBI_SEND_IPI, hart_mask_ptr, 0, 0);
+}
+
+/// 发送 IPI 到给定 hart mask。
+#[cfg(not(qemu7))]
+pub fn send_ipi_mask(hart_mask: usize) {
+    let _ = sbi_call(SBI_IPI, 0, hart_mask, 0, 0);
 }
 
 /// 查询指定 hart 的 HSM 状态。
