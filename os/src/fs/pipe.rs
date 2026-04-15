@@ -142,6 +142,10 @@ impl File for Pipe {
             let loop_read = ring_buffer.available_read();
             debug!("Pipe::read: want_to_read {}, already_read {}, loop_read {}", want_to_read, already_read, loop_read);
             if loop_read == 0 {
+                // 只要本次调用已经读到数据，就立即短读返回，避免阻塞等待凑满用户缓冲区。
+                if already_read > 0 {
+                    return already_read;
+                }
                 if ring_buffer.all_write_ends_closed() {
                     return already_read;
                 }
