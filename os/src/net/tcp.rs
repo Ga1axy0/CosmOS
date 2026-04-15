@@ -450,7 +450,7 @@ impl TcpSocketFile {
                     _ => {}
                 }
             }
-            st.read_wait
+            st.write_wait
                 .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.connect_done());
         }
     }
