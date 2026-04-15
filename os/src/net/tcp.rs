@@ -224,6 +224,24 @@ impl TcpSocketFile {
         }
     }
 
+    /// Return the local endpoint of this TCP socket, or None if unavailable.
+    pub(crate) fn local_endpoint(&self) -> Option<IpEndpoint> {
+        let st = self.state();
+        let mut guard = crate::net::NET_STACK.lock();
+        let stack = guard.as_mut()?;
+        let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        socket.local_endpoint()
+    }
+
+    /// Return the remote endpoint of this TCP socket, or None if not connected.
+    pub(crate) fn remote_endpoint(&self) -> Option<IpEndpoint> {
+        let st = self.state();
+        let mut guard = crate::net::NET_STACK.lock();
+        let stack = guard.as_mut()?;
+        let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        socket.remote_endpoint()
+    }
+
     fn state(&self) -> Arc<TcpSocketState> {
         Arc::clone(&self.st.lock())
     }

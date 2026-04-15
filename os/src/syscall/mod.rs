@@ -90,20 +90,6 @@ pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_TIMES: usize = 153;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
-/// socket syscall
-pub const SYSCALL_SOCKET: usize = 198;
-/// bind syscall
-pub const SYSCALL_BIND: usize = 200;
-/// listen syscall
-pub const SYSCALL_LISTEN: usize = 201;
-/// accept syscall
-pub const SYSCALL_ACCEPT: usize = 202;
-/// connect syscall
-pub const SYSCALL_CONNECT: usize = 203;
-/// sendto syscall
-pub const SYSCALL_SENDTO: usize = 206;
-/// recvfrom syscall
-pub const SYSCALL_RECVFROM: usize = 207;
 /// getppid syscall
 pub const SYSCALL_GETPPID: usize = 173;
 /// getuid syscall
@@ -116,6 +102,26 @@ pub const SYSCALL_GETGID: usize = 176;
 pub const SYSCALL_GETEGID: usize = 177;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
+/// socket syscall
+pub const SYSCALL_SOCKET: usize = 198;
+/// socketpair syscall
+pub const SYSCALL_SOCKETPAIR: usize = 199;
+/// bind syscall
+pub const SYSCALL_BIND: usize = 200;
+/// listen syscall
+pub const SYSCALL_LISTEN: usize = 201;
+/// accept syscall
+pub const SYSCALL_ACCEPT: usize = 202;
+/// connect syscall
+pub const SYSCALL_CONNECT: usize = 203;
+/// getsockname syscall
+pub const SYSCALL_GETSOCKNAME: usize = 204;
+/// getpeername syscall
+pub const SYSCALL_GETPEERNAME: usize = 205;
+/// sendto syscall
+pub const SYSCALL_SENDTO: usize = 206;
+/// recvfrom syscall
+pub const SYSCALL_RECVFROM: usize = 207;
 /// brk syscall
 pub const SYSCALL_BRK: usize = 214;
 /// munmap syscall
@@ -188,7 +194,7 @@ use times::*;
 pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
 
 
-use crate::{fs::Stat, syscall::{self, errno::ERRNO}};
+use crate::{fs::Stat, net::SockAddrIn, syscall::{self, errno::ERRNO}};
 use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
@@ -277,16 +283,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
-        SYSCALL_BIND => sys_bind(args[0] as i32, args[1] as *const crate::net::SockAddrIn, args[2] as i32),
+        SYSCALL_SOCKETPAIR =>
+            sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as *mut i32),
+        SYSCALL_BIND => sys_bind(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
         SYSCALL_LISTEN => sys_listen(args[0] as i32, args[1] as i32),
-        SYSCALL_ACCEPT => sys_accept(args[0] as i32, args[1] as *mut crate::net::SockAddrIn, args[2] as i32),
-        SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const crate::net::SockAddrIn, args[2] as i32),
+        SYSCALL_ACCEPT => sys_accept(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
+        SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
         SYSCALL_SENDTO => sys_sendto(
             args[0] as i32,
             args[1] as *const u8,
             args[2],
             args[3] as u32,
-            args[4] as *const crate::net::SockAddrIn,
+            args[4] as *const SockAddrIn,
             args[5] as i32,
         ),
         SYSCALL_RECVFROM => sys_recvfrom(
@@ -294,7 +304,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *mut u8,
             args[2],
             args[3] as u32,
-            args[4] as *mut crate::net::SockAddrIn,
+            args[4] as *mut SockAddrIn,
             args[5] as i32,
         ),
         SYSCALL_GETPPID => sys_getppid(),

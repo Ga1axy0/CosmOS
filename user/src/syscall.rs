@@ -28,10 +28,13 @@ pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_SOCKET: usize = 198;
+pub const SYSCALL_SOCKETPAIR: usize = 199;
 pub const SYSCALL_BIND: usize = 200;
 pub const SYSCALL_LISTEN: usize = 201;
 pub const SYSCALL_ACCEPT: usize = 202;
 pub const SYSCALL_CONNECT: usize = 203;
+pub const SYSCALL_GETSOCKNAME: usize = 204;
+pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
 pub const SYSCALL_RECVFROM: usize = 207;
 pub const SYSCALL_GETTID: usize = 178;
@@ -192,6 +195,18 @@ pub fn sys_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
     syscall(SYSCALL_SOCKET, [domain, socket_type, protocol])
 }
 
+pub fn sys_socketpair(
+    domain: usize,
+    socket_type: usize,
+    protocol: usize,
+    sv: *mut i32,
+) -> isize {
+    syscall6(
+        SYSCALL_SOCKETPAIR,
+        [domain, socket_type, protocol, sv as usize, 0, 0],
+    )
+}
+
 pub fn sys_bind(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usize) -> isize {
     syscall(SYSCALL_BIND, [fd, addr as usize, addrlen])
 }
@@ -206,6 +221,14 @@ pub fn sys_accept(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) 
 
 pub fn sys_connect(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usize) -> isize {
     syscall(SYSCALL_CONNECT, [fd, addr as usize, addrlen])
+}
+
+pub fn sys_getsockname(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
+    syscall(SYSCALL_GETSOCKNAME, [fd, addr as usize, addrlen])
+}
+
+pub fn sys_getpeername(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
+    syscall(SYSCALL_GETPEERNAME, [fd, addr as usize, addrlen])
 }
 
 pub fn sys_sendto(

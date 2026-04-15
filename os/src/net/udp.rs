@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 use core::any::Any;
 
 use smoltcp::socket::udp as udp_socket;
-use smoltcp::wire::IpEndpoint;
+use smoltcp::wire::{IpEndpoint, IpAddress, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
@@ -47,6 +47,23 @@ impl UdpSocketFile {
             st,
             connected: SpinNoIrqLock::new(None),
         }
+    }
+
+    /// Return the local (bound) endpoint of this UDP socket. If not bound, returns None.
+    pub(crate) fn local_endpoint(&self) -> Option<IpEndpoint> {
+        let mut guard = crate::net::NET_STACK.lock();
+        let stack = guard.as_mut()?;
+        let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+        let listen = socket.endpoint();
+        let addr = listen
+            .addr
+            .unwrap_or(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)));
+        Some(IpEndpoint::new(addr, listen.port))
+    }
+
+    /// Return the connected peer endpoint for this UDP socket, if any.
+    pub(crate) fn peer_endpoint(&self) -> Option<IpEndpoint> {
+        *self.connected.lock()
     }
 
     pub(crate) fn bind(&self, port: u16) -> Result<(), ERRNO> {
