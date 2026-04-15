@@ -29,7 +29,10 @@ use crate::{
 
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
-pub use unix_socket::UnixSocketPairEnd;
+pub use unix_socket::{
+    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS,
+    SOL_SOCKET,
+};
 
 const RX_BUF_LEN: usize = 2048;
 const MAX_SOCKETS: usize = 64;

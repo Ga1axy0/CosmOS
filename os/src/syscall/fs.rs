@@ -235,7 +235,7 @@ fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
 }
 
 /// 从用户态复制 `iovec` 数组，避免数组跨页时直接解引用失败。
-fn copy_user_iovecs(token: usize, iov: *const IoVec, iovcnt: i32) -> Result<Vec<IoVec>, ERRNO> {
+pub fn copy_user_iovecs(token: usize, iov: *const IoVec, iovcnt: i32) -> Result<Vec<IoVec>, ERRNO> {
     if iovcnt < 0 {
         return Err(ERRNO::EINVAL);
     }
