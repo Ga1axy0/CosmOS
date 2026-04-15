@@ -1,4 +1,5 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
+use core::mem::size_of;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 use crate::fs::{
@@ -6,7 +7,9 @@ use crate::fs::{
 };
 use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, UserBuffer};
 use crate::net::{
-    SockAddrIn, TcpSocketFile, UdpSocketFile, UnixSocketPairEnd, create_tcp_socket_file, create_udp_socket_file
+    SockAddrIn, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd,
+    UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, create_tcp_socket_file,
+    create_udp_socket_file,
 };
 use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
@@ -19,6 +22,42 @@ const SOCK_DGRAM: i32 = 2;
 const SOCK_TYPE_MASK: i32 = 0x0f;
 const SOCK_NONBLOCK: i32 = 0x800;
 const SOCK_CLOEXEC: i32 = 0x80000;
+const SHUT_RD: i32 = 0;
+const SHUT_WR: i32 = 1;
+const SHUT_RDWR: i32 = 2;
+
+const MSG_CTRUNC: i32 = 0x0008;
+const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
+
+const MAX_MSG_IOV: usize = 1024;
+const MAX_MSG_CONTROL: usize = 16 * 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsgHdr {
+    pub msg_name: usize,
+    pub msg_namelen: usize,
+    pub msg_iov: usize,
+    pub msg_iovlen: usize,
+    pub msg_control: usize,
+    pub msg_controllen: usize,
+    pub msg_flags: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoVec {
+    iov_base: usize,
+    iov_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct CmsgHdr {
+    cmsg_len: usize,
+    cmsg_level: i32,
+    cmsg_type: i32,
+}
 
 fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let process = current_process();
@@ -28,6 +67,245 @@ fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     }
     let desc = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc.clone();
     Ok(desc)
+}
+
+fn with_unix_socket<R>(
+    fd: usize,
+    f: impl FnOnce(&UnixSocketPairEnd) -> Result<R, ERRNO>,
+) -> Result<R, ERRNO> {
+    let desc = get_file_description(fd)?;
+    if let Some(unix) = desc.as_any().downcast_ref::<UnixSocketPairEnd>() {
+        return f(unix);
+    }
+    if desc.as_any().downcast_ref::<UdpSocketFile>().is_some()
+        || desc.as_any().downcast_ref::<TcpSocketFile>().is_some()
+    {
+        return Err(ERRNO::EOPNOTSUPP);
+    }
+    Err(ERRNO::ENOTSOCK)
+}
+
+fn copy_user_bytes(token: usize, ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let chunks = translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| ERRNO::ENOMEM)?;
+    for chunk in chunks {
+        out.extend_from_slice(chunk);
+    }
+    if out.len() != len {
+        return Err(ERRNO::EFAULT);
+    }
+    Ok(out)
+}
+
+fn write_user_bytes(token: usize, ptr: *mut u8, src: &[u8]) -> Result<(), ERRNO> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let mut chunks = translated_byte_buffer(token, ptr as *const u8, src.len()).or_errno(ERRNO::EFAULT)?;
+    let mut copied = 0usize;
+    for chunk in chunks.iter_mut() {
+        let n = chunk.len();
+        chunk.copy_from_slice(&src[copied..copied + n]);
+        copied += n;
+    }
+    if copied != src.len() {
+        return Err(ERRNO::EFAULT);
+    }
+    Ok(())
+}
+
+fn copy_user_iovecs(token: usize, iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, ERRNO> {
+    if iovcnt == 0 {
+        return Ok(Vec::new());
+    }
+    if iovcnt > MAX_MSG_IOV {
+        return Err(ERRNO::EINVAL);
+    }
+    if iov_ptr.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let bytes_len = size_of::<IoVec>()
+        .checked_mul(iovcnt)
+        .ok_or(ERRNO::EINVAL)?;
+    let chunks = translated_byte_buffer(token, iov_ptr as *const u8, bytes_len)
+        .or_errno(ERRNO::EFAULT)?;
+
+    let mut iovecs = Vec::new();
+    iovecs.try_reserve_exact(iovcnt).map_err(|_| ERRNO::ENOMEM)?;
+
+    let mut scratch = [0u8; size_of::<IoVec>()];
+    let mut scratch_len = 0usize;
+    for chunk in chunks {
+        let mut off = 0usize;
+        while off < chunk.len() {
+            let copy_len = (size_of::<IoVec>() - scratch_len).min(chunk.len() - off);
+            scratch[scratch_len..scratch_len + copy_len]
+                .copy_from_slice(&chunk[off..off + copy_len]);
+            scratch_len += copy_len;
+            off += copy_len;
+            if scratch_len == size_of::<IoVec>() {
+                let iov = unsafe { core::ptr::read_unaligned(scratch.as_ptr() as *const IoVec) };
+                iovecs.push(iov);
+                scratch_len = 0;
+                if iovecs.len() == iovcnt {
+                    break;
+                }
+            }
+        }
+        if iovecs.len() == iovcnt {
+            break;
+        }
+    }
+
+    if scratch_len != 0 || iovecs.len() != iovcnt {
+        return Err(ERRNO::EFAULT);
+    }
+
+    Ok(iovecs)
+}
+
+fn iovecs_total_len(iovecs: &[IoVec]) -> Result<usize, ERRNO> {
+    let mut total = 0usize;
+    for iov in iovecs {
+        total = total
+            .checked_add(iov.iov_len)
+            .ok_or(ERRNO::EINVAL)?;
+    }
+    Ok(total)
+}
+
+fn iovecs_to_user_buffer(token: usize, iovecs: &[IoVec]) -> Result<UserBuffer, ERRNO> {
+    let mut buffers = Vec::new();
+    for iov in iovecs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let mut parts = translated_byte_buffer(token, iov.iov_base as *const u8, iov.iov_len)
+            .or_errno(ERRNO::EFAULT)?;
+        buffers.append(&mut parts);
+    }
+    Ok(UserBuffer::new(buffers))
+}
+
+#[inline]
+fn cmsg_align(len: usize) -> usize {
+    let align = size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+fn append_cmsg(buf: &mut Vec<u8>, level: i32, ty: i32, payload: &[u8]) {
+    let hdr_len = size_of::<CmsgHdr>();
+    let cmsg_len = hdr_len + payload.len();
+    let cmsg_space = cmsg_align(cmsg_len);
+    let start = buf.len();
+    buf.resize(start + cmsg_space, 0);
+
+    let hdr = CmsgHdr {
+        cmsg_len,
+        cmsg_level: level,
+        cmsg_type: ty,
+    };
+    let hdr_bytes = unsafe {
+        core::slice::from_raw_parts((&hdr as *const CmsgHdr) as *const u8, hdr_len)
+    };
+    buf[start..start + hdr_len].copy_from_slice(hdr_bytes);
+    buf[start + hdr_len..start + hdr_len + payload.len()].copy_from_slice(payload);
+}
+
+fn parse_rights_payload(payload: &[u8]) -> Result<Vec<Arc<FileDescription>>, ERRNO> {
+    if !payload.len().is_multiple_of(size_of::<i32>()) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let mut rights = Vec::new();
+    rights
+        .try_reserve_exact(payload.len() / size_of::<i32>())
+        .map_err(|_| ERRNO::ENOMEM)?;
+
+    for raw in payload.chunks_exact(size_of::<i32>()) {
+        let fd = i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        if fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        let fd = fd as usize;
+        let desc = inner
+            .fd_table
+            .get(fd)
+            .and_then(|entry| entry.as_ref())
+            .ok_or(ERRNO::EBADF)?
+            .desc
+            .clone();
+        rights.push(desc);
+    }
+
+    Ok(rights)
+}
+
+fn parse_send_ancillary(control_bytes: &[u8]) -> Result<UnixSocketAncillaryData, ERRNO> {
+    if control_bytes.len() > MAX_MSG_CONTROL {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let mut ancillary = UnixSocketAncillaryData::default();
+    let mut off = 0usize;
+    while off + size_of::<CmsgHdr>() <= control_bytes.len() {
+        let hdr = unsafe {
+            core::ptr::read_unaligned(control_bytes[off..].as_ptr() as *const CmsgHdr)
+        };
+        if hdr.cmsg_len < size_of::<CmsgHdr>() {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = off.checked_add(hdr.cmsg_len).ok_or(ERRNO::EINVAL)?;
+        if end > control_bytes.len() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let payload = &control_bytes[off + size_of::<CmsgHdr>()..end];
+        match (hdr.cmsg_level, hdr.cmsg_type) {
+            (SOL_SOCKET, SCM_RIGHTS) => {
+                ancillary.rights.extend(parse_rights_payload(payload)?);
+            }
+            (SOL_SOCKET, SCM_CREDENTIALS) => {
+                if payload.len() < size_of::<UnixUcred>() {
+                    return Err(ERRNO::EINVAL);
+                }
+                let process = current_process();
+                ancillary.credentials = Some(UnixUcred {
+                    pid: process.getpid() as i32,
+                    uid: process.getuid(),
+                    gid: process.getgid(),
+                });
+            }
+            _ => return Err(ERRNO::EOPNOTSUPP),
+        }
+
+        off = off.checked_add(cmsg_align(hdr.cmsg_len)).ok_or(ERRNO::EINVAL)?;
+    }
+
+    Ok(ancillary)
+}
+
+fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> Vec<i32> {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let mut out = Vec::with_capacity(rights.len());
+
+    for desc in rights {
+        let fd = inner.alloc_fd();
+        let mut entry = FdEntry::new(desc);
+        if cloexec {
+            entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[fd] = Some(entry);
+        out.push(fd as i32);
+    }
+    out
 }
 
 fn with_udp_socket<R>(fd: usize, f: impl FnOnce(&UdpSocketFile) -> Result<R, ERRNO>) -> Result<R, ERRNO> {
@@ -130,8 +408,9 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         let (ab_read, ab_write) = make_pipe();
         let (ba_read, ba_write) = make_pipe();
 
-        let end0: Arc<dyn File + Send + Sync> = Arc::new(UnixSocketPairEnd::new(ba_read, ab_write));
-        let end1: Arc<dyn File + Send + Sync> = Arc::new(UnixSocketPairEnd::new(ab_read, ba_write));
+        let (end0_raw, end1_raw) = UnixSocketPairEnd::new_pair(ba_read, ab_write, ab_read, ba_write);
+        let end0: Arc<dyn File + Send + Sync> = Arc::new(end0_raw);
+        let end1: Arc<dyn File + Send + Sync> = Arc::new(end1_raw);
 
         let status_flags = if (socket_type & SOCK_NONBLOCK) != 0 {
             FileStatusFlags::NONBLOCK
@@ -402,6 +681,145 @@ pub fn sys_recvfrom(
             let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
             *out = endpoint_to_sockaddr(ep);
         }
+
+        Ok(n as isize)
+    })
+}
+
+pub fn sys_shutdown(fd: i32, how: i32) -> isize {
+    syscall_body!({
+        if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
+            return Err(ERRNO::EINVAL);
+        }
+        with_unix_socket(fd as usize, |unix| {
+            unix.shutdown(how)?;
+            Ok(0)
+        })
+    })
+}
+
+pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
+    syscall_body!({
+        if msg.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        if flags != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+
+        let token = current_user_token();
+        let msghdr = *translated_ref(token, msg).or_errno(ERRNO::EFAULT)?;
+        if msghdr.msg_name != 0 || msghdr.msg_namelen != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        if msghdr.msg_iovlen > MAX_MSG_IOV {
+            return Err(ERRNO::EINVAL);
+        }
+        if msghdr.msg_controllen > MAX_MSG_CONTROL {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let iovecs = copy_user_iovecs(token, msghdr.msg_iov as *const IoVec, msghdr.msg_iovlen)?;
+        let total_len = iovecs_total_len(&iovecs)?;
+        let ubuf = iovecs_to_user_buffer(token, &iovecs)?;
+
+        let ancillary = if msghdr.msg_controllen == 0 {
+            UnixSocketAncillaryData::default()
+        } else {
+            if msghdr.msg_control == 0 {
+                return Err(ERRNO::EFAULT);
+            }
+            let control_bytes = copy_user_bytes(
+                token,
+                msghdr.msg_control as *const u8,
+                msghdr.msg_controllen,
+            )?;
+            parse_send_ancillary(control_bytes.as_slice())?
+        };
+
+        if total_len == 0 && !ancillary.is_empty() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let n = with_unix_socket(fd as usize, |unix| unix.sendmsg(ubuf, ancillary))?;
+        Ok(n as isize)
+    })
+}
+
+pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
+    syscall_body!({
+        if msg.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        if flags & !MSG_CMSG_CLOEXEC != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+
+        let token = current_user_token();
+        let mut msghdr = *translated_ref(token, msg as *const MsgHdr).or_errno(ERRNO::EFAULT)?;
+        if msghdr.msg_name != 0 || msghdr.msg_namelen != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        if msghdr.msg_iovlen > MAX_MSG_IOV {
+            return Err(ERRNO::EINVAL);
+        }
+        if msghdr.msg_controllen > MAX_MSG_CONTROL {
+            return Err(ERRNO::EINVAL);
+        }
+        if msghdr.msg_controllen > 0 && msghdr.msg_control == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+
+        let iovecs = copy_user_iovecs(token, msghdr.msg_iov as *const IoVec, msghdr.msg_iovlen)?;
+        let _total_len = iovecs_total_len(&iovecs)?;
+        let ubuf = iovecs_to_user_buffer(token, &iovecs)?;
+
+        let (n, ancillary) = with_unix_socket(fd as usize, |unix| unix.recvmsg(ubuf))?;
+
+        let cloexec = (flags & MSG_CMSG_CLOEXEC) != 0;
+        let control_cap = msghdr.msg_controllen;
+        let mut control_out = Vec::new();
+        let mut used = 0usize;
+        msghdr.msg_flags = 0;
+
+        if let Some(cred) = ancillary.credentials {
+            let cred_payload = unsafe {
+                core::slice::from_raw_parts(
+                    (&cred as *const UnixUcred) as *const u8,
+                    size_of::<UnixUcred>(),
+                )
+            };
+            let need = cmsg_align(size_of::<CmsgHdr>() + cred_payload.len());
+            if used + need <= control_cap {
+                append_cmsg(&mut control_out, SOL_SOCKET, SCM_CREDENTIALS, cred_payload);
+                used += need;
+            } else {
+                msghdr.msg_flags |= MSG_CTRUNC;
+            }
+        }
+
+        if !ancillary.rights.is_empty() {
+            let rights_payload_len = ancillary.rights.len() * size_of::<i32>();
+            let need = cmsg_align(size_of::<CmsgHdr>() + rights_payload_len);
+            if used + need <= control_cap {
+                let received_fds = install_received_rights(ancillary.rights, cloexec);
+                let mut payload = Vec::with_capacity(received_fds.len() * size_of::<i32>());
+                for fd in received_fds {
+                    payload.extend_from_slice(&fd.to_ne_bytes());
+                }
+                append_cmsg(&mut control_out, SOL_SOCKET, SCM_RIGHTS, payload.as_slice());
+            } else {
+                msghdr.msg_flags |= MSG_CTRUNC;
+            }
+        }
+
+        if !control_out.is_empty() {
+            write_user_bytes(token, msghdr.msg_control as *mut u8, control_out.as_slice())?;
+        }
+
+        msghdr.msg_controllen = control_out.len();
+        msghdr.msg_namelen = 0;
+        *translated_refmut(token, msg).or_errno(ERRNO::EFAULT)? = msghdr;
 
         Ok(n as isize)
     })

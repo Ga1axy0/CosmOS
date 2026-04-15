@@ -352,6 +352,18 @@ pub fn recvfrom(
     sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, addr_ptr, addrlen)
 }
 
+pub fn shutdown(fd: usize, how: usize) -> isize {
+    sys_shutdown(fd, how)
+}
+
+pub fn sendmsg(fd: usize, msg: &net::MsgHdr, flags: usize) -> isize {
+    sys_sendmsg(fd, msg as *const _, flags)
+}
+
+pub fn recvmsg(fd: usize, msg: &mut net::MsgHdr, flags: usize) -> isize {
+    sys_recvmsg(fd, msg as *mut _, flags)
+}
+
 pub fn getsockname(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
     let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
     sys_getsockname(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())

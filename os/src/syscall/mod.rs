@@ -122,6 +122,12 @@ pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
 /// recvfrom syscall
 pub const SYSCALL_RECVFROM: usize = 207;
+/// shutdown syscall
+pub const SYSCALL_SHUTDOWN: usize = 210;
+/// sendmsg syscall
+pub const SYSCALL_SENDMSG: usize = 211;
+/// recvmsg syscall
+pub const SYSCALL_RECVMSG: usize = 212;
 /// brk syscall
 pub const SYSCALL_BRK: usize = 214;
 /// munmap syscall
@@ -246,7 +252,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
-        SYSCALL_WRITEV => sys_writev(args[0] as u32, args[1] as *const IoVec, args[2] as i32),
+        SYSCALL_WRITEV =>
+            sys_writev(args[0] as u32, args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
         SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -307,6 +314,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *mut SockAddrIn,
             args[5] as i32,
         ),
+        SYSCALL_SHUTDOWN => sys_shutdown(args[0] as i32, args[1] as i32),
+        SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
+        SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
