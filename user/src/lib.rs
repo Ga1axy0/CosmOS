@@ -308,6 +308,10 @@ pub fn socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
     sys_socket(domain, socket_type, protocol)
 }
 
+pub fn socketpair(domain: usize, socket_type: usize, protocol: usize, sv: &mut [i32; 2]) -> isize {
+    sys_socketpair(domain, socket_type, protocol, sv.as_mut_ptr())
+}
+
 pub fn bind(fd: usize, addr: &net::SockAddrIn) -> isize {
     sys_bind(fd, addr as *const _, core::mem::size_of::<net::SockAddrIn>())
 }
@@ -346,6 +350,16 @@ pub fn recvfrom(
         None => (core::ptr::null_mut(), 0),
     };
     sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, addr_ptr, addrlen)
+}
+
+pub fn getsockname(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
+    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
+    sys_getsockname(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
+}
+
+pub fn getpeername(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
+    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
+    sys_getpeername(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
 }
 
 pub fn fork() -> isize {

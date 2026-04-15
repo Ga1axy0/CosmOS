@@ -1,22 +1,24 @@
 use alloc::sync::Arc;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
-use crate::fs::{AccessMode, File, FileDescription, FileStatusFlags};
+use crate::fs::{
+    make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
+};
 use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, UserBuffer};
 use crate::net::{
-    create_tcp_socket_file,
-    create_udp_socket_file,
-    SockAddrIn,
-    TcpSocketFile,
-    UdpSocketFile,
+    SockAddrIn, TcpSocketFile, UdpSocketFile, UnixSocketPairEnd, create_tcp_socket_file, create_udp_socket_file
 };
 use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
-use crate::task::{current_process, current_user_token, FdEntry};
+use crate::task::{current_process, current_user_token, FdEntry, FdFlags};
 
+const AF_UNIX: i32 = 1;
 const AF_INET: u16 = 2;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const SOCK_TYPE_MASK: i32 = 0x0f;
+const SOCK_NONBLOCK: i32 = 0x800;
+const SOCK_CLOEXEC: i32 = 0x80000;
 
 fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let process = current_process();
@@ -78,7 +80,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
             return Err(ERRNO::EAFNOSUPPORT);
         }
 
-        let base_type = socket_type & 0xf;
+        let base_type = socket_type & SOCK_TYPE_MASK;
         let file: Arc<dyn File + Send + Sync> = match base_type {
             SOCK_DGRAM => create_udp_socket_file()
                 .map(|f| f as Arc<dyn File + Send + Sync>)
@@ -101,6 +103,78 @@ pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
         let fd = inner.alloc_fd();
         inner.fd_table[fd] = Some(FdEntry::new(desc));
         Ok(fd as isize)
+    })
+}
+
+pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32) -> isize {
+    syscall_body!({
+        if sv.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        if domain != AF_UNIX {
+            return Err(ERRNO::EAFNOSUPPORT);
+        }
+        if protocol != 0 {
+            return Err(ERRNO::EPROTONOSUPPORT);
+        }
+
+        let extra_flags = socket_type & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if extra_flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let base_type = socket_type & SOCK_TYPE_MASK;
+        if base_type != SOCK_STREAM {
+            return Err(ERRNO::ESOCKTNOSUPPORT);
+        }
+
+        let (ab_read, ab_write) = make_pipe();
+        let (ba_read, ba_write) = make_pipe();
+
+        let end0: Arc<dyn File + Send + Sync> = Arc::new(UnixSocketPairEnd::new(ba_read, ab_write));
+        let end1: Arc<dyn File + Send + Sync> = Arc::new(UnixSocketPairEnd::new(ab_read, ba_write));
+
+        let status_flags = if (socket_type & SOCK_NONBLOCK) != 0 {
+            FileStatusFlags::NONBLOCK
+        } else {
+            FileStatusFlags::empty()
+        };
+        let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
+
+        let desc0 = Arc::new(FileDescription::new(
+            end0,
+            AccessMode::ReadWrite,
+            status_flags,
+            0,
+        ));
+        let desc1 = Arc::new(FileDescription::new(
+            end1,
+            AccessMode::ReadWrite,
+            status_flags,
+            0,
+        ));
+
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+
+        let fd0 = inner.alloc_fd();
+        let mut entry0 = FdEntry::new(desc0);
+        if cloexec {
+            entry0.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[fd0] = Some(entry0);
+
+        let fd1 = inner.alloc_fd();
+        let mut entry1 = FdEntry::new(desc1);
+        if cloexec {
+            entry1.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[fd1] = Some(entry1);
+        drop(inner);
+
+        let token = current_user_token();
+        *translated_refmut(token, sv).or_errno(ERRNO::EFAULT)? = fd0 as i32;
+        *translated_refmut(token, unsafe { sv.add(1) }).or_errno(ERRNO::EFAULT)? = fd1 as i32;
+        Ok(0)
     })
 }
 
@@ -177,6 +251,85 @@ pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
     })
 }
 
+pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
+    syscall_body!({
+        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let fd = fd as usize;
+
+        // Try UDP first; if fd is UDP, return local endpoint or error from UDP path.
+        match with_udp_socket(fd, |udp| {
+            let ep = udp
+                .local_endpoint()
+                .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+            let token = current_user_token();
+            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+            *out = endpoint_to_sockaddr(ep);
+            Ok(())
+        }) {
+            Ok(_) => return Ok(0),
+            Err(ERRNO::ENOTSOCK) => {
+                // fallthrough to TCP
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Try TCP
+        with_tcp_socket(fd, |tcp| {
+            let ep = tcp
+                .local_endpoint()
+                .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+            let token = current_user_token();
+            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+            *out = endpoint_to_sockaddr(ep);
+            Ok(())
+        })?;
+
+        Ok(0)
+    })
+}
+
+pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
+    syscall_body!({
+        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let fd = fd as usize;
+
+        // UDP: use connected field
+        match with_udp_socket(fd, |udp| {
+            let ep = udp.peer_endpoint().ok_or(ERRNO::ENOTCONN)?;
+            let token = current_user_token();
+            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+            *out = endpoint_to_sockaddr(ep);
+            Ok(())
+        }) {
+            Ok(_) => return Ok(0),
+            Err(ERRNO::ENOTSOCK) => {
+                // fallthrough to TCP
+            }
+            Err(e) => return Err(e),
+        }
+
+        // TCP: remote_endpoint
+        with_tcp_socket(fd, |tcp| {
+            if let Some(ep) = tcp.remote_endpoint() {
+                let token = current_user_token();
+                let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+                *out = endpoint_to_sockaddr(ep);
+                Ok(())
+            } else {
+                Err(ERRNO::ENOTCONN)
+            }
+        })?;
+
+        Ok(0)
+    })
+}
+
 pub fn sys_sendto(
     fd: i32,
     buf: *const u8,
@@ -197,9 +350,7 @@ pub fn sys_sendto(
         }
 
         let token = current_user_token();
-        let ubuf = UserBuffer::new(
-            translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
-        );
+        let ubuf = UserBuffer::new(translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?);
 
         let fd = fd as usize;
         let n = if addr.is_null() {

@@ -1,5 +1,7 @@
 //! Userspace socket ABI helpers.
 
+/// UNIX domain address family.
+pub const AF_UNIX: usize = 1;
 /// IPv4 address family.
 pub const AF_INET: usize = 2;
 /// Stream socket type.

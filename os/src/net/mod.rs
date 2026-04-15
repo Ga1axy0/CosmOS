@@ -6,6 +6,7 @@
 
 mod tcp;
 mod udp;
+mod unix_socket;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,7 @@ use crate::{
 
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
+pub use unix_socket::UnixSocketPairEnd;
 
 const RX_BUF_LEN: usize = 2048;
 const MAX_SOCKETS: usize = 64;
