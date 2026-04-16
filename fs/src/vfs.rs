@@ -49,6 +49,24 @@ pub trait VfsNode: Send + Sync + Any {
         0
     }
 
+    /// File mode bits for stat-like metadata, including permission and type bits.
+    fn mode(&self) -> Option<u32> {
+        None
+    }
+
+    /// Set file mode bits. This is used by `chmod` and `mkdir` syscalls to set permissions and type bits.
+    fn set_mode(&self, _mode: u32) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
+    /// Check whether `(uid, gid)` can access this inode with `mode` (`F_OK/R_OK/W_OK/X_OK`).
+    ///
+    /// Default implementation is permissive for backends that have not implemented
+    /// Unix permission checks yet.
+    fn check_access(&self, _uid: u32, _gid: u32, _mode: u32) -> bool {
+        true
+    }
+
     /// Create a hard link in this directory.
     fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EACCES)
@@ -131,11 +149,25 @@ impl Inode {
     }
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.create(name).map(Self::wrap)
+        self.inner.create(name).map(|i| {
+            if let Some(cur_mode) = i.mode() {
+                let perms_mask: u32 = 0x0fff; // lower 12 bits
+                let new_mode = (cur_mode & !perms_mask) | (0o644u32 & perms_mask);
+                let _ = i.set_mode(new_mode);
+            }
+            Self::wrap(i)
+        })
     }
 
     pub fn mkdir(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.mkdir(name).map(Self::wrap)
+        self.inner.mkdir(name).map(|i|{
+            if let Some(cur_mode) = i.mode() {
+                let perms_mask: u32 = 0x0fff; // lower 12 bits
+                let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
+                let _ = i.set_mode(new_mode);
+            }
+            Self::wrap(i)
+        })
     }
 
     pub fn is_dir(&self) -> bool {
@@ -164,6 +196,19 @@ impl Inode {
 
     pub fn size(&self) -> usize {
         self.inner.size()
+    }
+
+    pub fn mode(&self) -> Option<u32> {
+        self.inner.mode()
+    }
+
+    /// Set file mode bits on the underlying node.
+    pub fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
+        self.inner.set_mode(mode)
+    }
+
+    pub fn check_access(&self, uid: u32, gid: u32, mode: u32) -> bool {
+        self.inner.check_access(uid, gid, mode)
     }
 
     pub fn link(&self, old_name: &str, new_name: &str) -> Result<(), FS_ERRNO> {
