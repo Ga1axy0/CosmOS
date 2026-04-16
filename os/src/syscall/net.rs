@@ -26,6 +26,13 @@ const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
 
+const SO_TYPE: i32 = 3;
+const SO_ERROR: i32 = 4;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_PASSCRED: i32 = 16;
+const SO_ACCEPTCONN: i32 = 30;
+
 const MSG_CTRUNC: i32 = 0x0008;
 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 
@@ -350,6 +357,52 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
         sin_addr,
         sin_zero: [0; 8],
     }
+}
+
+fn socket_kind(fd: usize) -> Result<(bool, bool, bool), ERRNO> {
+    let desc = get_file_description(fd)?;
+    let is_udp = desc.as_any().downcast_ref::<UdpSocketFile>().is_some();
+    let is_tcp = desc.as_any().downcast_ref::<TcpSocketFile>().is_some();
+    let is_unix = desc.as_any().downcast_ref::<UnixSocketPairEnd>().is_some();
+    if !(is_udp || is_tcp || is_unix) {
+        return Err(ERRNO::ENOTSOCK);
+    }
+    Ok((is_udp, is_tcp, is_unix))
+}
+
+fn read_sockopt_i32(token: usize, optval: *const u8, optlen: i32) -> Result<i32, ERRNO> {
+    if optlen < size_of::<i32>() as i32 {
+        return Err(ERRNO::EINVAL);
+    }
+    if optval.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let raw = copy_user_bytes(token, optval, size_of::<i32>())?;
+    Ok(i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn write_getsockopt_value(token: usize, optval: *mut u8, optlen: *mut i32, val: &[u8]) -> Result<(), ERRNO> {
+    if optlen.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let cap_i32 = *translated_ref(token, optlen as *const i32).or_errno(ERRNO::EFAULT)?;
+    if cap_i32 < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let cap = cap_i32 as usize;
+    let copy_len = core::cmp::min(cap, val.len());
+    if copy_len > 0 {
+        if optval.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        write_user_bytes(token, optval, &val[..copy_len])?;
+    }
+    *translated_refmut(token, optlen).or_errno(ERRNO::EFAULT)? = val.len() as i32;
+    Ok(())
+}
+
+fn write_getsockopt_i32(token: usize, optval: *mut u8, optlen: *mut i32, v: i32) -> Result<(), ERRNO> {
+    write_getsockopt_value(token, optval, optlen, &v.to_ne_bytes())
 }
 
 pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
@@ -698,6 +751,158 @@ pub fn sys_shutdown(fd: i32, how: i32) -> isize {
     })
 }
 
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optlen: i32) -> isize {
+    syscall_body!({
+        let fd = fd as usize;
+        let (_is_udp, _is_tcp, is_unix) = socket_kind(fd)?;
+
+        match (level, optname) {
+            (SOL_SOCKET, SO_PASSCRED) => {
+                if !is_unix {
+                    warn!(
+                        "setsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
+                        fd, level, optname
+                    );
+                    return Ok(0);
+                }
+                let token = current_user_token();
+                let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
+                with_unix_socket(fd, |unix| {
+                    unix.set_passcred(enabled);
+                    Ok(())
+                })?;
+                Ok(0)
+            }
+            _ => {
+                warn!(
+                    "setsockopt(fd={}, level={}, optname={}) not implemented, ignored",
+                    fd,
+                    level,
+                    optname
+                );
+                Ok(0)
+            }
+        }
+    })
+}
+
+pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> isize {
+    syscall_body!({
+        let fd = fd as usize;
+        let (is_udp, is_tcp, is_unix) = socket_kind(fd)?;
+
+        match (level, optname) {
+            (SOL_SOCKET, SO_TYPE) => {
+                let socket_type = if is_udp {
+                    SOCK_DGRAM
+                } else if is_tcp || is_unix {
+                    SOCK_STREAM
+                } else {
+                    return Err(ERRNO::ENOTSOCK);
+                };
+                let token = current_user_token();
+                write_getsockopt_i32(token, optval, optlen, socket_type)?;
+                Ok(0)
+            }
+            (SOL_SOCKET, SO_ACCEPTCONN) => {
+                let mut acceptconn = 0i32;
+                if is_tcp {
+                    with_tcp_socket(fd, |tcp| {
+                        acceptconn = if tcp.is_listening() { 1 } else { 0 };
+                        Ok(())
+                    })?;
+                }
+                let token = current_user_token();
+                write_getsockopt_i32(token, optval, optlen, acceptconn)?;
+                Ok(0)
+            }
+            (SOL_SOCKET, SO_RCVBUF) => {
+                let mut size = 0i32;
+                if is_udp {
+                    with_udp_socket(fd, |udp| {
+                        size = udp.recv_buffer_size() as i32;
+                        Ok(())
+                    })?;
+                } else if is_tcp {
+                    with_tcp_socket(fd, |tcp| {
+                        size = tcp.recv_buffer_size() as i32;
+                        Ok(())
+                    })?;
+                } else if is_unix {
+                    warn!(
+                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, ignored",
+                        fd,
+                        level,
+                        optname
+                    );
+                    return Ok(0);
+                }
+                let token = current_user_token();
+                write_getsockopt_i32(token, optval, optlen, size)?;
+                Ok(0)
+            }
+            (SOL_SOCKET, SO_SNDBUF) => {
+                let mut size = 0i32;
+                if is_udp {
+                    with_udp_socket(fd, |udp| {
+                        size = udp.send_buffer_size() as i32;
+                        Ok(())
+                    })?;
+                } else if is_tcp {
+                    with_tcp_socket(fd, |tcp| {
+                        size = tcp.send_buffer_size() as i32;
+                        Ok(())
+                    })?;
+                } else if is_unix {
+                    warn!(
+                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, ignored",
+                        fd,
+                        level,
+                        optname
+                    );
+                    return Ok(0);
+                }
+                let token = current_user_token();
+                write_getsockopt_i32(token, optval, optlen, size)?;
+                Ok(0)
+            }
+            (SOL_SOCKET, SO_ERROR) => {
+                let token = current_user_token();
+                write_getsockopt_i32(token, optval, optlen, 0)?;
+                Ok(0)
+            }
+            (SOL_SOCKET, SO_PASSCRED) => {
+                if !is_unix {
+                    warn!(
+                        "getsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
+                        fd,
+                        level,
+                        optname
+                    );
+                    return Ok(0);
+                }
+                let mut enabled = 0i32;
+                with_unix_socket(fd, |unix| {
+                    enabled = if unix.passcred_enabled() { 1 } else { 0 };
+                    Ok(())
+                })?;
+                let token = current_user_token();
+                write_getsockopt_i32(token, optval, optlen, enabled)?;
+                Ok(0)
+            }
+            _ => {
+                warn!(
+                    "getsockopt(fd={}, level={}, optname={}) not implemented, ignored",
+                    fd,
+                    level,
+                    optname
+                );
+                Ok(0)
+            }
+        }
+    })
+}
+
 pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
     syscall_body!({
         if msg.is_null() {
@@ -774,7 +979,13 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         let _total_len = iovecs_total_len(&iovecs)?;
         let ubuf = iovecs_to_user_buffer(token, &iovecs)?;
 
-        let (n, ancillary) = with_unix_socket(fd as usize, |unix| unix.recvmsg(ubuf))?;
+        let (n, ancillary) = with_unix_socket(fd as usize, |unix| {
+            let (n, mut ancillary) = unix.recvmsg(ubuf)?;
+            if !unix.passcred_enabled() {
+                ancillary.credentials = None;
+            }
+            Ok((n, ancillary))
+        })?;
 
         let cloexec = (flags & MSG_CMSG_CLOEXEC) != 0;
         let control_cap = msghdr.msg_controllen;
