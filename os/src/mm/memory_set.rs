@@ -1144,7 +1144,7 @@ impl MemorySet {
             // left part
             if area_start < overlap_start {
                 let left_data_frames = area.data_frames.split_off(&overlap_start);
-                let left_shared_pages = area.shared_pages.split_off(&overlap_start);
+                let left_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_start);
                 let left_area = Vma {
                     vpn_range: VPNRange::new(area_start, overlap_start),
                     data_frames: area.data_frames,
@@ -1152,10 +1152,10 @@ impl MemorySet {
                     map_perm: area.map_perm,
                     kind: area.kind.clone(),
                     file: area.file.clone(),
-                    shared_pages: area.shared_pages,
+                    direct_cache_pages: area.direct_cache_pages,
                 };
                 area.data_frames = left_data_frames;
-                area.shared_pages = left_shared_pages;
+                area.direct_cache_pages = left_direct_cache_pages;
                 if let Some(file) = area.file.as_mut() {
                     file.pgoff += overlap_start.0 - area_start.0;
                 }
@@ -1165,7 +1165,7 @@ impl MemorySet {
             // right part exists -> split and handle middle separately
             if overlap_end < area_end {
                 let right_data_frames = area.data_frames.split_off(&overlap_end);
-                let right_shared_pages = area.shared_pages.split_off(&overlap_end);
+                let right_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_end);
                 let mut right_file = area.file.clone();
                 if let Some(file) = right_file.as_mut() {
                     file.pgoff += overlap_end.0 - area_start.0;
@@ -1177,7 +1177,7 @@ impl MemorySet {
                     map_perm: area.map_perm,
                     kind: area.kind.clone(),
                     file: right_file,
-                    shared_pages: right_shared_pages,
+                    direct_cache_pages: right_direct_cache_pages,
                 };
 
                 // update middle pages' PTE flags
