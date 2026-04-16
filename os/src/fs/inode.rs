@@ -4,7 +4,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::BlockDevNode;
+use crate::fs::devfs::{BlockDevNode, NullDevNode};
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -715,11 +715,14 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 /// Must be called **after** both [`probe_block_devices`](crate::drivers::block::probe_block_devices)
 /// and [`init_rootfs`].  The `/dev` virtual directory is created if absent.
 pub fn init_dev() {
-
-
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
+    // Register special character devices under /dev
+    let null_node = Arc::new(NullDevNode::new());
+    dev_dir.bind("null", null_node as Arc<dyn VfsNode>);
+    info!("[kernel] /dev/null registered");
 
+    // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
         let node = Arc::new(BlockDevNode::new(Arc::clone(dev)));

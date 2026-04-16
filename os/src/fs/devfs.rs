@@ -31,6 +31,61 @@ impl BlockDevNode {
     }
 }
 
+/// VFS node representing the special `/dev/null` device.
+///
+/// Reads always return EOF (0 bytes). Writes discard data and report the
+/// full write length as written.
+pub struct NullDevNode;
+
+impl NullDevNode {
+    /// Create a new `/dev/null` node.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+// SAFETY: stateless and immutable.
+unsafe impl Send for NullDevNode {}
+unsafe impl Sync for NullDevNode {}
+
+impl VfsNode for NullDevNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_dir(&self) -> bool {
+        false
+    }
+
+    fn ls(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        // /dev/null reads EOF
+        0
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        // Discard and report full length written
+        buf.len()
+    }
+}
+
 // SAFETY: single-processor kernel; `BlockDevice` is already `Send + Sync`.
 unsafe impl Send for BlockDevNode {}
 unsafe impl Sync for BlockDevNode {}
