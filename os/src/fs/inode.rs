@@ -4,7 +4,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode};
+use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode, UrandomDevNode};
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -90,9 +90,7 @@ lazy_static! {
     /// inserted into the namespace during mount operations.  Used by
     /// `ensure_virtual_dir` (to avoid recreating existing dirs) and
     /// `do_umount` (to clean up the registry).
-    static ref VIRT_DIRS: SpinNoIrqLock<BTreeMap<String, Arc<VirtualDirNode>>> =
-        // SAFETY: single-processor kernel.
-        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+    static ref VIRT_DIRS: SpinNoIrqLock<BTreeMap<String, Arc<VirtualDirNode>>> = SpinNoIrqLock::new(BTreeMap::new());
 
     /// The kernel's global root inode, backed by the virtual rootfs.
     ///
@@ -763,6 +761,12 @@ pub fn init_dev() {
     dev_dir.bind("rtc0", Arc::clone(&rtc_node));
     misc_dir.bind("rtc", rtc_node);
     info!("[kernel] /dev/rtc, /dev/rtc0 and /dev/misc/rtc registered");
+
+    // Register /dev/urandom and /dev/random (map to same CSPRNG device).
+    let urandom_node: Arc<dyn VfsNode> = Arc::new(UrandomDevNode::new());
+    dev_dir.bind("urandom", Arc::clone(&urandom_node));
+    dev_dir.bind("random", Arc::clone(&urandom_node));
+    info!("[kernel] /dev/urandom and /dev/random registered");
 
     info!("[kernel] /dev initialized");
 }

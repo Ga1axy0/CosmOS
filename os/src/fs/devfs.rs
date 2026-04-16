@@ -21,6 +21,8 @@ use crate::mm::{translated_ref, translated_refmut};
 use crate::syscall::errno::ERRNO;
 use crate::task::current_user_token;
 
+use crate::random as kernel_random;
+
 const RTC_RD_TIME: usize = 0xFFFF_FFFF_8024_7009;
 const RTC_SET_TIME: usize = 0x4024_700A;
 
@@ -411,5 +413,74 @@ impl VfsNode for RtcDevNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+}
+
+/// VFS node representing `/dev/urandom` (CSPRNG character device).
+///
+/// Reads block until the kernel RNG is seeded (initial seed), then fills the
+/// provided buffer with cryptographic random bytes via `random::fill_bytes`.
+pub struct UrandomDevNode;
+
+impl UrandomDevNode {
+    /// Create a new `/dev/urandom` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for UrandomDevNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VfsNode for UrandomDevNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_dir(&self) -> bool {
+        false
+    }
+
+    fn ls(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        // Block until RNG seeded (initial seed). Ignore error path — callers
+        // that require non-blocking semantics should use getrandom syscall.
+        debug!("UrandomDevNode::read_at");
+        let _ = kernel_random::wait_for_seed(true);
+        kernel_random::fill_bytes(buf);
+        debug!("UrandomDevNode::read_at: filled {} bytes", buf.len());
+        buf.len()
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        // Writing to /dev/urandom is a no-op in this minimal implementation.
+        0
+    }
+
+    fn mode(&self) -> Option<u32> {
+        Some(StatMode::CHAR.bits())
     }
 }
