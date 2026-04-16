@@ -4,7 +4,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, NullDevNode};
+use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode};
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -343,25 +343,29 @@ fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
 }
 
 /// Open (or optionally create) a file/directory at `path` relative to `cwd`.
-pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSInode>, ERRNO> {
     trace!("kernel: open_file_at: cwd={}, path={}, flags={:?}", cwd, path, flags);
     let abs = canonicalize(cwd, path);
     debug!("open_file_at: path = {} -> abs path = {}", path, abs);
 
     if flags.contains(OpenFlags::CREATE) {
         // Navigate to the parent directory and create the file there.
-        let (parent, name) = resolve_parent(cwd, path)?;
+        let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
         if let Some(existing) = parent.find(&name) {
             // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
+            debug!("EXCL flag valid: {}", flags.contains(OpenFlags::EXCL));
+            if flags.contains(OpenFlags::EXCL) {
+                return Err(ERRNO::EEXIST);
+            }
             if flags.contains(OpenFlags::TRUNC) {
                 existing.clear();
             }
-            Some(Arc::new(OSInode::new(existing, abs.clone())))
+            Ok(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
             parent.create(&name).map(|inode| {
                 let _ = inode.set_times_now(inode_now());
                 Arc::new(OSInode::new(inode, abs.clone()))
-            })
+            }).ok_or(ERRNO::EIO)
         }
     } else {
         lookup_inode(&abs).map(|inode| {
@@ -370,7 +374,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Option<Arc<OSIno
                 inode.clear();
             }
             Arc::new(OSInode::new(inode, abs.clone()))
-        })
+        }).ok_or(ERRNO::ENOENT)
     }
 }
 
@@ -410,6 +414,8 @@ bitflags! {
         const RDWR = 0x002;
         /// create new file
         const CREATE = 0x40;
+        /// fail if file exists
+        const EXCL = 0x80;
         /// truncate file size to 0
         const TRUNC = 0x200;
         /// open directory
@@ -606,6 +612,14 @@ impl File for OSInode {
         }
         total_write_size
     }
+
+    fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        let vfs_node = self.inode.vfs_node();
+        if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
+            return rtc.ioctl(req, arg);
+        }
+        Err(ERRNO::ENOTTY)
+    }
     /// Fill `buf` with `linux_dirent64` records from the directory.
     ///
     /// `offset` is used as an **entry index** (not a byte offset) so that
@@ -664,22 +678,33 @@ impl File for OSInode {
         true
     }
 
+    fn as_inode(&self) -> Option<Arc<Inode>> {
+        Some(Arc::clone(&self.inode))
+    }
+
     fn stat(&self) -> Stat {
+        let vfs_node = self.inode.vfs_node();
+        if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
+            return rtc.stat();
+        }
         inode_stat(&self.inode)
     }
 
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
     }
+
+    fn chmod(&self, mode: u32) -> Result<(), fs::errno::FS_ERRNO> {
+        self.inode.set_mode(mode)?;
+        Ok(())
+    }
 }
 
 /// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。
 pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
-    let mode = if inode.is_dir() {
-        StatMode::DIR
-    } else {
-        StatMode::FILE
-    };
+    let mode = StatMode::from_bits_truncate(inode.mode().unwrap_or(
+        if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() }
+    ));
     let atime = inode.atime();
     let mtime = inode.mtime();
     let ctime = inode.ctime();
@@ -729,6 +754,16 @@ pub fn init_dev() {
         dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);
         info!("[kernel] /dev/{} registered", dev_name);
     }
+
+    // Register RTC aliases for Linux userland compatibility (e.g. BusyBox hwclock).
+    let misc_dir = ensure_virtual_dir("/dev/misc")
+        .unwrap_or_else(|_| panic!("[kernel] failed to create /dev/misc"));
+    let rtc_node: Arc<dyn VfsNode> = Arc::new(RtcDevNode::new());
+    dev_dir.bind("rtc", Arc::clone(&rtc_node));
+    dev_dir.bind("rtc0", Arc::clone(&rtc_node));
+    misc_dir.bind("rtc", rtc_node);
+    info!("[kernel] /dev/rtc, /dev/rtc0 and /dev/misc/rtc registered");
+
     info!("[kernel] /dev initialized");
 }
 

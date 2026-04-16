@@ -100,7 +100,7 @@ impl TtyCore {
     pub fn new(driver: Arc<dyn CharDevice>) -> Self {
         Self {
             driver,
-            state: unsafe {
+            state: {
                 // TODO: 后续接入真正的 termios 初始化策略，而不是固定默认值。
                 SpinNoIrqLock::new(TtyState {
                     termios: Termios::default(),
@@ -216,15 +216,18 @@ impl File for TtyFile {
         self.writable
     }
 
-    fn read_at(&self, _offset: usize, mut user_buf: UserBuffer) -> usize {
-        // 当前 tty 仍沿用旧控制台模型，一次只读取一个字节。
-        // TODO: 支持按行缓冲、非阻塞和更通用的多字节读取。
-        assert_eq!(user_buf.len(), 1);
-        let ch = self.core.read_byte();
-        unsafe {
-            user_buf.buffers[0].as_mut_ptr().write_volatile(ch);
+    fn read_at(&self, _offset: usize, user_buf: UserBuffer) -> usize {
+        // 支持将用户缓冲区中的每个字节填充为独立读取的字符。
+        // TODO: 后续接入行规程、非阻塞、canonical/raw 模式语义以及信号中断。
+        let mut n = 0usize;
+        for user_ptr in user_buf.into_iter() {
+            let ch = self.core.read_byte();
+            unsafe {
+                core::ptr::write_volatile(user_ptr, ch);
+            }
+            n += 1;
         }
-        1
+        n
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {

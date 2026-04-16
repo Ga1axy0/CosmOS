@@ -8,7 +8,7 @@ use crate::{
     },
     task::{
         current_process, current_task, current_user_token,
-        mmap_current_process, munmap_current_process,
+        mmap_current_process, munmap_current_process, mprotect_current_process,
     },
 };
 
@@ -160,6 +160,57 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
             Ok(0)
         } else {
             // Unmapping an invalid/unmapped range is treated as ENOMEM.
+            Err(ERRNO::ENOMEM)
+        }
+    })
+}
+
+/// mprotect syscall
+pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mprotect",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+            return Err(ERRNO::EINVAL); // start not page-aligned
+        }
+        if len == 0 {
+            return Ok(0); // POSIX/Linux: zero-length mprotect is a successful no-op
+        }
+        let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        // PROT_* currently supports only R/W/X bits.
+        if prot & !(MMapProt::PROT_READ.bits() | MMapProt::PROT_WRITE.bits() | MMapProt::PROT_EXEC.bits()) != 0 {
+            return Err(ERRNO::EINVAL); // unknown permission bits
+        }
+
+        // Translate user PROT_* flags into internal MapPermission.
+        // If no R/W/X bits are set (e.g., PROT_NONE), treat it as a valid
+        // "no access" mapping by using an empty MapPermission, matching
+        // Linux semantics used for guard pages.
+        let mut perm = if prot & (MMapProt::PROT_READ.bits()
+            | MMapProt::PROT_WRITE.bits()
+            | MMapProt::PROT_EXEC.bits())
+            == 0
+        {
+            MapPermission::empty()
+        } else {
+            let mut p = MapPermission::U;
+            if prot & MMapProt::PROT_READ.bits() != 0 {
+                p |= MapPermission::R;
+            }
+            if prot & MMapProt::PROT_WRITE.bits() != 0 {
+                p |= MapPermission::W;
+            }
+            if prot & MMapProt::PROT_EXEC.bits() != 0 {
+                p |= MapPermission::X;
+            }
+            p
+        };
+
+        if mprotect_current_process(VirtAddr::from(start), VirtAddr::from(end), perm) {
+            Ok(0)
+        } else {
             Err(ERRNO::ENOMEM)
         }
     })

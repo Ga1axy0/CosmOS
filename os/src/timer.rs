@@ -4,6 +4,7 @@ use core::cmp::Ordering;
 use core::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
 use crate::config::CLOCK_FREQ;
+use crate::config::MAX_HARTS;
 use crate::drivers::rtc;
 use crate::hart::hartid;
 use crate::poll::{self, PollTimerTag};
@@ -12,6 +13,7 @@ use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
+use core::array;
 use lazy_static::*;
 use riscv::register::time;
 /// The number of ticks per second
@@ -135,9 +137,18 @@ impl Ord for TimerCondVar {
 }
 
 lazy_static! {
-    /// TIMERS: global instance: set of timer condvars
-    static ref TIMERS: SpinNoIrqLock<BinaryHeap<TimerCondVar>> =
-        unsafe { SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new()) };
+    /// Per-hart timer bases. Each hart scans only its own heap on timer tick.
+    static ref PER_CPU_TIMERS: [SpinNoIrqLock<BinaryHeap<TimerCondVar>>; MAX_HARTS] =
+        array::from_fn(|_| SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new()));
+}
+
+fn normalize_hart(hart: usize) -> usize {
+    hart.min(MAX_HARTS.saturating_sub(1))
+}
+
+fn timer_hart_for_task(task: &Arc<TaskControlBlock>) -> usize {
+    let task_inner = task.inner_exclusive_access();
+    normalize_hart(task_inner.last_cpu)
 }
 
 /// Add a timer
@@ -155,7 +166,8 @@ pub(crate) fn add_timer_with_poll_tag(
         "kernel:pid[{}] add_timer",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let mut timers = TIMERS.lock();
+    let target_hart = timer_hart_for_task(&task);
+    let mut timers = PER_CPU_TIMERS[target_hart].lock();
     timers.push(TimerCondVar {
         expire_ms,
         task,
@@ -167,15 +179,17 @@ pub(crate) fn add_timer_with_poll_tag(
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
     //trace!("kernel:pid[{}] remove_timer", current_task().unwrap().process.upgrade().unwrap().getpid());
     trace!("kernel: remove_timer");
-    let mut timers = TIMERS.lock();
-    let mut temp = BinaryHeap::<TimerCondVar>::new();
-    for condvar in timers.drain() {
-        if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
-            temp.push(condvar);
+    for timers in PER_CPU_TIMERS.iter() {
+        let mut timers = timers.lock();
+        let mut temp = BinaryHeap::<TimerCondVar>::new();
+        for condvar in timers.drain() {
+            if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
+                temp.push(condvar);
+            }
         }
+        timers.clear();
+        timers.append(&mut temp);
     }
-    timers.clear();
-    timers.append(&mut temp);
     trace!("kernel: remove_timer END");
 }
 
@@ -183,7 +197,7 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 pub fn check_timer() {
     // trace!("kernel: check_timer");
     let current_ms = get_time_ms();
-    let mut timers = TIMERS.lock();
+    let mut timers = PER_CPU_TIMERS[normalize_hart(hartid())].lock();
     while let Some(timer) = timers.peek() {
         if timer.expire_ms <= current_ms {
             if let Some(tag) = timer.poll_tag {
@@ -192,8 +206,8 @@ pub fn check_timer() {
                 }
                 continue;
             }
-            // hart A 将任务入堆但还没标为 Blocked (即目前是 Running)，此时 timer 已经过期，被 hart B 检查。 
-            // 此时唤醒不成功，但仍然要保留 timer。
+            // 如果任务还没真正进入睡眠态（例如仍处于 Running），跨 hart 的提前检查可能先看到它。
+            // 此时唤醒不成功，但仍然要保留 timer，等下一次 tick 再尝试。
             // 这种情形应该较少，且最多损失一个时间片，是可以接受的。
             if wakeup_task(Arc::clone(&timer.task)) {
                 timers.pop();

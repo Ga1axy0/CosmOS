@@ -1,6 +1,9 @@
-use crate::syscall::errno::ERRNO;
+use crate::mm::translated_ref;
+use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
 use crate::syscall::{write_pod_to_user, Pod};
+use crate::task::current_user_token;
+use crate::timer::set_realtime_offset_from_time_ns;
 use crate::{
     task::{current_process, current_task},
     timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
@@ -52,7 +55,7 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
 }
 
 /// get_time syscall
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+pub fn sys_get_time_of_day(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -63,7 +66,20 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
             sec: time_us / 1_000_000,
             usec: time_us % 1_000_000,
         };
-        write_pod_to_user(_ts, &timeval)?;
+        write_pod_to_user(ts, &timeval)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_set_time_of_day(tv: *const TimeVal, _tz: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_set_time_of_day",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let timeval = translated_ref(current_user_token(), tv).or_errno(ERRNO::EFAULT)?;
+        let time_us = timeval.sec * 1_000_000 + timeval.usec;
+        set_realtime_offset_from_time_ns((time_us * 1_000) as u64);
         Ok(0)
     })
 }
@@ -85,6 +101,27 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
         };
         write_pod_to_user(tp, &timespec)?;
         Ok(0)
+    })
+}
+
+pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_clock_settime clockid={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid
+    );
+    syscall_body!({
+        // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
+        // CLOCK_REALTIME_COARSE 等其它 clock id 的设置。
+        match clockid {
+            CLOCK_REALTIME => {
+                let timespec = translated_ref(current_user_token(), _tp).or_errno(ERRNO::EFAULT)?;
+                let time_ns = (timespec.tv_sec as u64) * 1_000_000_000 + (timespec.tv_nsec as u64);
+                set_realtime_offset_from_time_ns(time_ns);
+                Ok(0)
+            }
+            _ => Err(ERRNO::EINVAL),
+        }
     })
 }
 
