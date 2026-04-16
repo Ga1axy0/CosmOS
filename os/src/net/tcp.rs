@@ -224,6 +224,18 @@ impl TcpSocketFile {
         }
     }
 
+    pub(crate) fn recv_buffer_size(&self) -> usize {
+        super::TCP_RX_BUF
+    }
+
+    pub(crate) fn send_buffer_size(&self) -> usize {
+        super::TCP_TX_BUF
+    }
+
+    pub(crate) fn is_listening(&self) -> bool {
+        self.listening.load(Ordering::Acquire)
+    }
+
     /// Return the local endpoint of this TCP socket, or None if unavailable.
     pub(crate) fn local_endpoint(&self) -> Option<IpEndpoint> {
         let st = self.state();

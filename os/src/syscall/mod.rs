@@ -142,6 +142,10 @@ pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
 /// recvfrom syscall
 pub const SYSCALL_RECVFROM: usize = 207;
+/// setsockopt syscall
+pub const SYSCALL_SETSOCKOPT: usize = 208;
+/// getsockopt syscall
+pub const SYSCALL_GETSOCKOPT: usize = 209;
 /// shutdown syscall
 pub const SYSCALL_SHUTDOWN: usize = 210;
 /// sendmsg syscall
@@ -345,6 +349,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4] as *mut SockAddrIn,
             args[5] as i32,
+        ),
+        SYSCALL_SETSOCKOPT => sys_setsockopt(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *const u8,
+            args[4] as i32,
+        ),
+        SYSCALL_GETSOCKOPT => sys_getsockopt(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *mut u8,
+            args[4] as *mut i32,
         ),
         SYSCALL_SHUTDOWN => sys_shutdown(args[0] as i32, args[1] as i32),
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),

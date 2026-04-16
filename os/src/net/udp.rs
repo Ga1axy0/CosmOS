@@ -49,6 +49,14 @@ impl UdpSocketFile {
         }
     }
 
+    pub(crate) fn recv_buffer_size(&self) -> usize {
+        super::UDP_BUF
+    }
+
+    pub(crate) fn send_buffer_size(&self) -> usize {
+        super::UDP_BUF
+    }
+
     /// Return the local (bound) endpoint of this UDP socket. If not bound, returns None.
     pub(crate) fn local_endpoint(&self) -> Option<IpEndpoint> {
         let mut guard = crate::net::NET_STACK.lock();

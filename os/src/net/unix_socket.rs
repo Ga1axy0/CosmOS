@@ -58,6 +58,7 @@ struct UnixSocketPairLocalState {
     tx: Option<Arc<Pipe>>,
     read_shutdown: bool,
     write_shutdown: bool,
+    passcred: bool,
 }
 
 /// 使用两条单向 pipe 交叉组合为一个全双工端点。
@@ -87,6 +88,7 @@ impl UnixSocketPairEnd {
                 tx: Some(tx),
                 read_shutdown: false,
                 write_shutdown: false,
+                passcred: false,
             }),
             rx_meta,
             tx_meta,
@@ -251,6 +253,16 @@ impl UnixSocketPairEnd {
             _ => return Err(ERRNO::EINVAL),
         }
         Ok(())
+    }
+
+    /// Enable/disable receiving `SCM_CREDENTIALS` for this endpoint.
+    pub fn set_passcred(&self, enabled: bool) {
+        self.state.lock().passcred = enabled;
+    }
+
+    /// Whether receiving `SCM_CREDENTIALS` is enabled on this endpoint.
+    pub fn passcred_enabled(&self) -> bool {
+        self.state.lock().passcred
     }
 }
 
