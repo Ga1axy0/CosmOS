@@ -86,6 +86,30 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// `mmap` 标志位。
+    pub struct MMapFlags: usize {
+        /// 共享映射。
+        const MAP_SHARED = 0x1;
+        /// 私有映射。
+        const MAP_PRIVATE = 0x2;
+        /// 匿名映射。
+        const MAP_ANONYMOUS = 0x20;
+    }
+}
+
+bitflags! {
+    /// `mmap` 保护位。
+    pub struct MMapProt: usize {
+        /// 可读。
+        const PROT_READ = 0x1;
+        /// 可写。
+        const PROT_WRITE = 0x2;
+        /// 可执行。
+        const PROT_EXEC = 0x4;
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct TimeVal {
@@ -357,6 +381,18 @@ pub fn sleep(period_ms: usize) {
 }
 pub fn mmap(start: usize, len: usize, prot: usize) -> isize {
     sys_mmap(start, len, prot)
+}
+
+/// 完整的 `mmap` 用户态封装，支持文件映射与标志位控制。
+pub fn mmap_full(
+    start: usize,
+    len: usize,
+    prot: MMapProt,
+    flags: MMapFlags,
+    fd: usize,
+    offset: usize,
+) -> isize {
+    sys_mmap_full(start, len, prot.bits(), flags.bits(), fd, offset)
 }
 
 pub fn munmap(start: usize, len: usize) -> isize {

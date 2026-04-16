@@ -205,7 +205,19 @@ pub fn sys_brk(addr: usize) -> isize {
 }
 
 pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
-    syscall(SYSCALL_MMAP, [start, len, prot])
+    syscall6(SYSCALL_MMAP, [start, len, prot, 0, 0, 0])
+}
+
+/// `mmap` 用户态完整封装，支持文件映射所需的 6 参数形式。
+pub fn sys_mmap_full(
+    start: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: usize,
+    offset: usize,
+) -> isize {
+    syscall6(SYSCALL_MMAP, [start, len, prot, flags, fd, offset])
 }
 
 pub fn sys_munmap(start: usize, len: usize) -> isize {
