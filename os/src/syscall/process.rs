@@ -3,6 +3,7 @@ use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
+    hart::hartid,
     mm::{
         translated_ref, translated_refmut, translated_str,
     },
@@ -212,15 +213,7 @@ pub fn sys_fork() -> isize {
     );
     let current_process = current_process();
     let new_process = current_process.fork();
-    let new_pid = new_process.getpid();
-    // modify trap context of new_task, because it returns immediately after switching
-    let new_process_inner = new_process.inner_exclusive_access();
-    let task = new_process_inner.tasks[0].as_ref().unwrap();
-    let trap_cx = task.inner_exclusive_access().get_trap_cx();
-    // we do not have to move to next instruction since we have done it before
-    // for child process, fork returns 0
-    trap_cx.x[10] = 0;
-    new_pid as isize
+    new_process.getpid() as isize
 }
 /// sys_execve
 pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
@@ -369,6 +362,52 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     })
 }
 
+/// tkill syscall
+///
+/// 当前实现按“进程内 tid 索引”最小语义处理，仅支持向当前进程中的线程投递信号。
+pub fn sys_tkill(tid: usize, signal: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_tkill",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let target_exists = {
+            let inner = process.inner_exclusive_access();
+            tid < inner.tasks.len() && inner.tasks[tid].is_some()
+        };
+        if !target_exists {
+            return Err(ERRNO::ESRCH);
+        }
+        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        add_signal_to_process(&process, flag);
+        Ok(0)
+    })
+}
+
+/// tgkill syscall
+///
+/// 当前实现按“进程号 + 进程内 tid 索引”最小语义处理。
+pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_tgkill",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = pid2process(tgid).or_errno(ERRNO::ESRCH)?;
+        let target_exists = {
+            let inner = process.inner_exclusive_access();
+            tid < inner.tasks.len() && inner.tasks[tid].is_some()
+        };
+        if !target_exists {
+            return Err(ERRNO::ESRCH);
+        }
+        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        add_signal_to_process(&process, flag);
+        Ok(0)
+    })
+}
+
 /// sigaction 系统调用
 ///
 /// 为当前进程的指定信号安装/读取用户态处理动作。
@@ -405,17 +444,48 @@ pub fn sys_sigaction(
     })
 }
 
-/// sigprocmask 系统调用
+/// sigprocmask / rt_sigprocmask 系统调用
 ///
-/// 设置当前进程的信号屏蔽字。当前实现采用“整值覆盖”语义，
-/// 尚未支持 Linux 中的 SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK 三种模式。
-pub fn sys_sigprocmask(mask: u32) -> isize {
+/// Linux 语义：
+///   how == SIG_BLOCK   (0) -> mask |= set
+///   how == SIG_UNBLOCK (1) -> mask &= ~set
+///   how == SIG_SETMASK (2) -> mask = set
+/// 参数含义遵循 rt_sigprocmask: (int how, const sigset_t *set, sigset_t *oset, size_t sigsetsize)
+pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sigprocmask",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
     syscall_body!({
+        // We represent sigset as a u32 bitmask in this kernel; require user-provided
+        // buffer to be large enough to hold at least a u32.
+        if sigsetsize < core::mem::size_of::<u32>() {
+            return Err(ERRNO::EINVAL);
+        }
+
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        // TODO: 若后续补齐完整 Linux 语义，这里应改为根据 how 参数
-        // 对旧 mask 做增量更新，并向用户态返回旧值。
-        inner.signal_mask = SignalFlags::from_bits(mask).or_errno(ERRNO::EINVAL)?;
+
+        // If user requested old mask, write it out first.
+        if !oset.is_null() {
+            let old_bits = inner.signal_mask.bits();
+            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
+            *slot = old_bits;
+        }
+
+        // If user provided a new mask, apply according to `how`.
+        if !set.is_null() {
+            let new_bits = *translated_ref(token, set).or_errno(ERRNO::EFAULT)?;
+            let new_mask = SignalFlags::from_bits(new_bits).or_errno(ERRNO::EINVAL)?;
+            match how {
+                0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
+                1 => inner.signal_mask.remove(new_mask), // SIG_UNBLOCK
+                2 => inner.signal_mask = new_mask,       // SIG_SETMASK
+                _ => return Err(ERRNO::EINVAL),
+            }
+        }
+
         Ok(0)
     })
 }
@@ -467,6 +537,7 @@ pub struct UtsName {
     pub release: [u8; 65],
     pub version: [u8; 65],
     pub machine: [u8; 65],
+    pub domainname: [u8; 65],
 }
 
 impl Pod for UtsName {}
@@ -480,17 +551,22 @@ impl UtsName {
             release: [0; 65],
             version: [0; 65],
             machine: [0; 65],
+            domainname: [0; 65],
         };
-        let sysname = b"xxOS";
-        let nodename = b"xxNode";
-        let release = b"0.1";
-        let version = b"xxOS version 0.1";
+        // glibc 启动阶段会解析 release 进行最低内核版本判断，
+        // 这里返回 Linux 风格且足够新的版本串，避免误报 "kernel too old"。
+        let sysname = b"Linux";
+        let nodename = b"localhost";
+        let release = b"6.6.0";
+        let version = b"#1 SMP PREEMPT cosmOS";
         let machine = b"riscv64";
+        let domainname = b"localdomain";
         uname.sysname[..sysname.len()].copy_from_slice(sysname);
         uname.nodename[..nodename.len()].copy_from_slice(nodename);
         uname.release[..release.len()].copy_from_slice(release);
         uname.version[..version.len()].copy_from_slice(version);
         uname.machine[..machine.len()].copy_from_slice(machine);
+        uname.domainname[..domainname.len()].copy_from_slice(domainname);
         uname
     }
 }
@@ -552,4 +628,22 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     -1
+}
+
+pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_getcpu",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let token = current_user_token();
+        let cpu = hartid() as u32;
+        if !cpu_ptr.is_null() {
+            translated_refmut(token, cpu_ptr).map(|slot| *slot = cpu).ok_or(ERRNO::EFAULT)?;
+        }
+        if !node_ptr.is_null() {
+            translated_refmut(token, node_ptr).map(|slot| *slot = 0).ok_or(ERRNO::EFAULT)?;
+        }
+        Ok(0)
+    })
 }

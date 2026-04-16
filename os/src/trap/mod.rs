@@ -43,6 +43,7 @@ pub fn init_hart() {
     set_kernel_trap_entry();
     unsafe {
         sie::set_sext();
+        sie::set_ssoft();
     }
     info!("hart {} trap init done", hartid());
 }
@@ -88,6 +89,20 @@ pub fn disable_external_interrupt() {
     }
 }
 
+/// 为当前 hart 开启 supervisor software interrupt。
+pub fn enable_software_interrupt() {
+    unsafe {
+        sie::set_ssoft();
+    }
+}
+
+/// 清除当前 hart 挂起的 supervisor software interrupt。
+pub fn clear_software_interrupt_pending() {
+    unsafe {
+        asm!("csrc sip, {}", in(reg) 1 << 1);
+    }
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -125,6 +140,11 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
+            error!(
+                "[kernel] trap_handler: Illegal instruction in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                current_trap_cx().sepc,
+                stval,
+            );
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
@@ -133,6 +153,9 @@ pub fn trap_handler() -> ! {
             check_timer();
             crate::net::poll();
             suspend_current_and_run_next();
+        }
+        Trap::Interrupt(Interrupt::SupervisorSoft) => {
+            clear_software_interrupt_pending();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::drivers::plic::handle_supervisor_external();
@@ -207,6 +230,9 @@ pub fn trap_from_kernel() {
             set_next_trigger();
             check_timer();
             crate::net::poll();
+        }
+        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
+            clear_software_interrupt_pending();
         }
         _ => {
             panic!("Kernel trap: {:?}, stval = {:#x}", scause.cause(), stval);

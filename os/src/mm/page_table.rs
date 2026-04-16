@@ -137,6 +137,18 @@ impl PageTable {
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
     }
+    /// Update PTE flags for an existing mapping (preserving ppn).
+    /// Returns true if the PTE existed and was updated.
+    pub fn update_flags(&mut self, vpn: VirtPageNum, new_flags: PTEFlags) -> bool {
+        if let Some(pte) = self.find_pte(vpn) {
+            if pte.is_valid() {
+                let ppn = pte.ppn();
+                *pte = PageTableEntry::new(ppn, new_flags | PTEFlags::V);
+                return true;
+            }
+        }
+        false
+    }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn)
@@ -144,7 +156,7 @@ impl PageTable {
     }
     /// get the physical address from the virtual address
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
-        self.find_pte(va.clone().floor()).map(|pte| {
+        self.translate(va.floor()).map(|pte| {
             let aligned_pa: PhysAddr = pte.ppn().into();
             let offset = va.page_offset();
             let aligned_pa_usize: usize = aligned_pa.into();
