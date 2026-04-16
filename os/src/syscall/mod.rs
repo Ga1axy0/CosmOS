@@ -30,8 +30,14 @@ pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT: usize = 39;
 /// mount syscall
 pub const SYSCALL_MOUNT: usize = 40;
+/// faccessat syscall
+pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 pub const SYSCALL_CHDIR: usize = 49;
+/// fchmod syscall
+pub const SYSCALL_FCHMOD: usize = 52;
+/// fchmodat syscall
+pub const SYSCALL_FCHMODAT: usize = 53;
 /// openat syscall
 pub const SYSCALL_OPENAT: usize = 56;
 /// close syscall
@@ -40,10 +46,14 @@ pub const SYSCALL_CLOSE: usize = 57;
 pub const SYSCALL_PIPE2: usize = 59;
 /// getdents64 syscall
 pub const SYSCALL_GETDENTS64: usize = 61;
+/// llseek syscall
+pub const SYSCALL_LSEEK: usize = 62;
 /// read syscall
 pub const SYSCALL_READ: usize = 63;
 /// write syscall
 pub const SYSCALL_WRITE: usize = 64;
+/// readv syscall
+pub const SYSCALL_READV: usize = 65;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
 /// ppoll_time32 syscall
@@ -66,6 +76,8 @@ pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
+/// clock_settime syscall
+pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 /// clock_gettime syscall
 pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// syslog syscall
@@ -86,14 +98,16 @@ pub const SYSCALL_SIGPROCMASK: usize = 135;
 pub const SYSCALL_SIGRETURN: usize = 139;
 /// set priority syscall
 pub const SYSCALL_SET_PRIORITY: usize = 140;
+/// times syscall
+pub const SYSCALL_TIMES: usize = 153;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
-/// times
-pub const SYSCALL_TIMES: usize = 153;
+/// settimeofday syscall
+pub const SYSCALL_SETTIMEOFDAY: usize = 170;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
 /// getppid syscall
@@ -229,12 +243,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4] as *const u8,
         ),
+        SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
+        SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
+        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as i32),
         SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
+        SYSCALL_LSEEK => sys_llseek(args[0] as u32, args[1], args[2], args[3] as *mut u64, args[4] as u32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
-        SYSCALL_WRITEV => sys_writev(args[0] as u32, args[1] as *const IoVec, args[2] as i32),
+        SYSCALL_READV => sys_readv(args[0], args[1] as *const IoVec, args[2] as i32),
+        SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const IoVec, args[2] as i32),
         SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -266,6 +285,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
+        SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
@@ -285,7 +305,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const usize,
         ),
         SYSCALL_WAIT4 => sys_wait4(args[0] as isize, args[1] as *mut i32, args[2] as isize),
-        SYSCALL_GETTIMEOFDAY => sys_get_time(args[0] as *mut TimeVal, args[1]),
+        SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
+        SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
