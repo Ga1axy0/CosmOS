@@ -35,7 +35,7 @@ pub use unix_socket::{
 };
 
 const RX_BUF_LEN: usize = 2048;
-const MAX_SOCKETS: usize = 64;
+const MAX_SOCKETS: usize = 256;
 const UDP_RX_META: usize = 16;
 const UDP_TX_META: usize = 16;
 const UDP_BUF: usize = 4096;

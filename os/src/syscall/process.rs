@@ -205,6 +205,18 @@ pub fn sys_getegid() -> isize {
     process.getegid() as isize
 }
 
+pub fn sys_getsid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getsid pid:{}", process.getpid());
+    process.getsid() as isize
+}
+
+pub fn sys_setsid() -> isize {
+    trace!("kernel: sys_setsid pid:{}", current_process().getpid());
+    warn!("kernel: sys_setsid is not fully implemented, just return new sid 1");
+    1
+}
+
 /// fork child process syscall
 pub fn sys_fork() -> isize {
     trace!(

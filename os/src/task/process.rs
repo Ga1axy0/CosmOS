@@ -66,6 +66,7 @@ pub struct Credentials {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
+    pub sid: u32
 }
 
 impl Credentials {
@@ -75,6 +76,7 @@ impl Credentials {
             euid: 0,
             gid: 0,
             egid: 0,
+            sid: 0
         }
     }
 }
@@ -597,6 +599,14 @@ impl ProcessControlBlock {
 
     pub fn getegid(&self) -> u32 {
         self.inner.lock().cred.egid
+    }
+
+    pub fn setegid(&self, egid: u32) {
+        self.inner.lock().cred.egid = egid;
+    }
+
+    pub fn getsid(&self) -> u32 {
+        self.inner.lock().cred.sid
     }
 
     /// map an anonymous area with given permission, return true if success
