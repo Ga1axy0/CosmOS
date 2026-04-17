@@ -1,6 +1,7 @@
 use core::any::Any;
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use strum_macros::FromRepr;
 
 use crate::{
     fs::{File, FileDescription, Pipe, Stat, StatMode},
@@ -13,12 +14,20 @@ const POLLIN: u16 = 0x001;
 const POLLOUT: u16 = 0x004;
 const POLLHUP: u16 = 0x010;
 
-/// socket level for ancillary data.
-pub const SOL_SOCKET: i32 = 1;
 /// pass file descriptors through UNIX domain sockets.
 pub const SCM_RIGHTS: i32 = 1;
 /// pass peer credentials through UNIX domain sockets.
 pub const SCM_CREDENTIALS: i32 = 2;
+
+#[repr(i32)]
+#[derive(FromRepr)]
+#[allow(missing_docs)]
+pub enum SocketLevel {
+    IpProtoIp = 0,
+    SolSocket = 1,
+    IpProtoTcp = 6,
+    IpProtoIpv6 = 41,
+}
 
 /// Userspace-compatible credential payload for `SCM_CREDENTIALS`.
 #[repr(C)]

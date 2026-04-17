@@ -23,6 +23,7 @@ smoltcp = { version = "0.11.0", default-features = false, features = [
 	"socket-udp",
 	"socket-tcp",
 ] }
+strum_macros = "0.28.0"
 
 [features]
 fat32 = []
