@@ -1,4 +1,5 @@
 use alloc::{sync::Arc, vec::Vec};
+use strum_macros::FromRepr;
 use core::mem::size_of;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
@@ -7,9 +8,7 @@ use crate::fs::{
 };
 use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, UserBuffer};
 use crate::net::{
-    SockAddrIn, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd,
-    UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, create_tcp_socket_file,
-    create_udp_socket_file,
+    SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file, create_udp_socket_file
 };
 use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
@@ -26,12 +25,26 @@ const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
 
-const SO_TYPE: i32 = 3;
-const SO_ERROR: i32 = 4;
-const SO_SNDBUF: i32 = 7;
-const SO_RCVBUF: i32 = 8;
-const SO_PASSCRED: i32 = 16;
-const SO_ACCEPTCONN: i32 = 30;
+
+#[repr(i32)]
+#[derive(FromRepr)]
+enum PosixSocketOption {
+    SoType = 3,
+    SoError = 4,
+    SoSndBuf = 7,
+    SoRcvBuf = 8,
+    SoPassCred = 16,
+    SoAcceptConn = 30,
+}
+
+#[repr(i32)]
+#[derive(FromRepr)]
+enum PosixTcpSocketOption {
+    NoDelay = 1,
+    MaxSeg = 2,
+    Info = 11,
+    Congestion = 13,
+}
 
 const MSG_CTRUNC: i32 = 0x0008;
 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
@@ -274,11 +287,11 @@ fn parse_send_ancillary(control_bytes: &[u8]) -> Result<UnixSocketAncillaryData,
         }
 
         let payload = &control_bytes[off + size_of::<CmsgHdr>()..end];
-        match (hdr.cmsg_level, hdr.cmsg_type) {
-            (SOL_SOCKET, SCM_RIGHTS) => {
+        match (SocketLevel::from_repr(hdr.cmsg_level), hdr.cmsg_type) {
+            (Some(SocketLevel::SolSocket), SCM_RIGHTS) => {
                 ancillary.rights.extend(parse_rights_payload(payload)?);
             }
-            (SOL_SOCKET, SCM_CREDENTIALS) => {
+            (Some(SocketLevel::SolSocket), SCM_CREDENTIALS) => {
                 if payload.len() < size_of::<UnixUcred>() {
                     return Err(ERRNO::EINVAL);
                 }
@@ -763,30 +776,31 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
         let fd = fd as usize;
         let (_is_udp, _is_tcp, is_unix) = socket_kind(fd)?;
 
-        match (level, optname) {
-            (SOL_SOCKET, SO_PASSCRED) => {
-                if !is_unix {
-                    warn!(
-                        "setsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
-                        fd, level, optname
-                    );
-                    return Ok(0);
+        match SocketLevel::from_repr(level) {
+            Some(SocketLevel::SolSocket) => match PosixSocketOption::from_repr(optname) {
+                Some(PosixSocketOption::SoPassCred) => {
+                    if !is_unix {
+                        warn!(
+                            "setsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
+                            fd, level, optname
+                        );
+                        return Ok(0);
+                    }
+                    let token = current_user_token();
+                    let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
+                    with_unix_socket(fd, |unix| {
+                        unix.set_passcred(enabled);
+                        Ok(())
+                    })?;
+                    Ok(0)
                 }
-                let token = current_user_token();
-                let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
-                with_unix_socket(fd, |unix| {
-                    unix.set_passcred(enabled);
-                    Ok(())
-                })?;
-                Ok(0)
-            }
+                _ => {
+                    warn!("setsockopt(fd={}, level={}, optname={}) not implemented for SOL_SOCKET, ignored", fd, level, optname);
+                    Ok(0)
+                }
+            },
             _ => {
-                warn!(
-                    "setsockopt(fd={}, level={}, optname={}) not implemented, ignored",
-                    fd,
-                    level,
-                    optname
-                );
+                warn!("setsockopt(fd={}, level={}, optname={}) not implemented, ignored", fd, level, optname);
                 Ok(0)
             }
         }
@@ -799,104 +813,147 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
         let (is_udp, is_tcp, is_unix) = socket_kind(fd)?;
         let token = current_user_token();
 
-        match (level, optname) {
-            (SOL_SOCKET, SO_TYPE) => {
-                let socket_type = if is_udp {
-                    SOCK_DGRAM
-                } else if is_tcp || is_unix {
-                    SOCK_STREAM
-                } else {
-                    return Err(ERRNO::ENOTSOCK);
-                };
-                write_getsockopt_i32(token, optval, optlen, socket_type)?;
-                Ok(0)
-            }
-            (SOL_SOCKET, SO_ACCEPTCONN) => {
-                let mut acceptconn = 0i32;
-                if is_tcp {
-                    with_tcp_socket(fd, |tcp| {
-                        acceptconn = if tcp.is_listening() { 1 } else { 0 };
-                        Ok(())
-                    })?;
+        match SocketLevel::from_repr(level) {
+            Some(SocketLevel::SolSocket) => match PosixSocketOption::from_repr(optname) {
+                Some(PosixSocketOption::SoType) => {
+                    let socket_type = if is_udp {
+                        SOCK_DGRAM
+                    } else if is_tcp || is_unix {
+                        SOCK_STREAM
+                    } else {
+                        return Err(ERRNO::ENOTSOCK);
+                    };
+                    write_getsockopt_i32(token, optval, optlen, socket_type)?;
+                    Ok(0)
                 }
-                write_getsockopt_i32(token, optval, optlen, acceptconn)?;
-                Ok(0)
-            }
-            (SOL_SOCKET, SO_RCVBUF) => {
-                let mut size = 0i32;
-                if is_udp {
-                    with_udp_socket(fd, |udp| {
-                        size = udp.recv_buffer_size() as i32;
-                        Ok(())
-                    })?;
-                } else if is_tcp {
-                    with_tcp_socket(fd, |tcp| {
-                        size = tcp.recv_buffer_size() as i32;
-                        Ok(())
-                    })?;
-                } else if is_unix {
-                    warn!(
-                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
-                        fd,
-                        level,
-                        optname
-                    );
-                    // Provide a deterministic default value (0) instead of
-                    // leaving user memory uninitialized.
+                Some(PosixSocketOption::SoAcceptConn) => {
+                    let mut acceptconn = 0i32;
+                    if is_tcp {
+                        with_tcp_socket(fd, |tcp| {
+                            acceptconn = if tcp.is_listening() { 1 } else { 0 };
+                            Ok(())
+                        })?;
+                    }
+                    write_getsockopt_i32(token, optval, optlen, acceptconn)?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoRcvBuf) => {
+                    let mut size = 0i32;
+                    if is_udp {
+                        with_udp_socket(fd, |udp| {
+                            size = udp.recv_buffer_size() as i32;
+                            Ok(())
+                        })?;
+                    } else if is_tcp {
+                        with_tcp_socket(fd, |tcp| {
+                            size = tcp.recv_buffer_size() as i32;
+                            Ok(())
+                        })?;
+                    } else if is_unix {
+                        warn!(
+                            "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
+                            fd,
+                            level,
+                            optname
+                        );
+                        // Provide a deterministic default value (0) instead of
+                        // leaving user memory uninitialized.
+                        write_getsockopt_i32(token, optval, optlen, 0)?;
+                        return Ok(0);
+                    }
+                    write_getsockopt_i32(token, optval, optlen, size)?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoSndBuf) => {
+                    let mut size = 0i32;
+                    if is_udp {
+                        with_udp_socket(fd, |udp| {
+                            size = udp.send_buffer_size() as i32;
+                            Ok(())
+                        })?;
+                    } else if is_tcp {
+                        with_tcp_socket(fd, |tcp| {
+                            size = tcp.send_buffer_size() as i32;
+                            Ok(())
+                        })?;
+                    } else if is_unix {
+                        warn!(
+                            "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
+                            fd,
+                            level,
+                            optname
+                        );
+                        // Provide deterministic default
+                        write_getsockopt_i32(token, optval, optlen, 0)?;
+                        return Ok(0);
+                    }
+                    write_getsockopt_i32(token, optval, optlen, size)?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoError) => {
                     write_getsockopt_i32(token, optval, optlen, 0)?;
-                    return Ok(0);
+                    Ok(0)
                 }
-                write_getsockopt_i32(token, optval, optlen, size)?;
-                Ok(0)
-            }
-            (SOL_SOCKET, SO_SNDBUF) => {
-                let mut size = 0i32;
-                if is_udp {
-                    with_udp_socket(fd, |udp| {
-                        size = udp.send_buffer_size() as i32;
+                Some(PosixSocketOption::SoPassCred) => {
+                    if !is_unix {
+                        warn!(
+                            "getsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
+                            fd,
+                            level,
+                            optname
+                        );
+                        return Ok(0);
+                    }
+                    let mut enabled = 0i32;
+                    with_unix_socket(fd, |unix| {
+                        enabled = if unix.passcred_enabled() { 1 } else { 0 };
                         Ok(())
                     })?;
-                } else if is_tcp {
-                    with_tcp_socket(fd, |tcp| {
-                        size = tcp.send_buffer_size() as i32;
-                        Ok(())
-                    })?;
-                } else if is_unix {
+                    write_getsockopt_i32(token, optval, optlen, enabled)?;
+                    Ok(0)
+                }
+                _ => {
                     warn!(
-                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
+                        "getsockopt(fd={}, level={}, optname={}) not implemented for SOL_SOCKET, ignored",
                         fd,
                         level,
                         optname
                     );
-                    // Provide deterministic default
+                    unsafe {
+                        *optval = 0;
+                        *optlen = core::mem::size_of::<i32>() as i32;
+                    }
+                    Ok(0)
+                }
+            },
+            Some(SocketLevel::IpProtoIp) | Some(SocketLevel::IpProtoTcp) => match PosixTcpSocketOption::from_repr(optname) {
+                Some(PosixTcpSocketOption::NoDelay) => {
                     write_getsockopt_i32(token, optval, optlen, 0)?;
-                    return Ok(0);
+                    Ok(0)
                 }
-                write_getsockopt_i32(token, optval, optlen, size)?;
-                Ok(0)
-            }
-            (SOL_SOCKET, SO_ERROR) => {
-                write_getsockopt_i32(token, optval, optlen, 0)?;
-                Ok(0)
-            }
-            (SOL_SOCKET, SO_PASSCRED) => {
-                if !is_unix {
+                Some(PosixTcpSocketOption::MaxSeg) => {
+                    const MAX_SEGMENT_SIZE: i32 = 1666;
+                    write_getsockopt_i32(token, optval, optlen, MAX_SEGMENT_SIZE)?;
+                    Ok(0)
+                }
+                Some(PosixTcpSocketOption::Congestion) => {
+                    const CONGESTION: &str = "reno";
+                    write_getsockopt_value(token, optval, optlen, CONGESTION.as_bytes())?;
+                    Ok(0)
+                },
+                _ => {
                     warn!(
-                        "getsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
+                        "getsockopt(fd={}, level={}, optname={}) not implemented for IP/TCP, ignored",
                         fd,
                         level,
                         optname
                     );
-                    return Ok(0);
+                    // Provide a deterministic fallback instead of leaving user memory
+                    // uninitialized or attempting complex async operations here.
+                    write_getsockopt_i32(token, optval, optlen, 0)?;
+                    Ok(0)
                 }
-                let mut enabled = 0i32;
-                with_unix_socket(fd, |unix| {
-                    enabled = if unix.passcred_enabled() { 1 } else { 0 };
-                    Ok(())
-                })?;
-                write_getsockopt_i32(token, optval, optlen, enabled)?;
-                Ok(0)
-            }
+            },
             _ => {
                 warn!(
                     "getsockopt(fd={}, level={}, optname={}) not implemented, ignored",
@@ -904,12 +961,9 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     level,
                     optname
                 );
-                // Avoid leaving user memory uninitialized: if the caller
-                // provided an optlen pointer, set it to 0 to indicate no
-                // data was returned.
-                if !optlen.is_null() {
-                    *translated_refmut(token, optlen).or_errno(ERRNO::EFAULT)? = 0;
-                }
+                // Provide a deterministic fallback instead of leaving user memory
+                // uninitialized or attempting complex async operations here.
+                write_getsockopt_i32(token, optval, optlen, 0)?;
                 Ok(0)
             }
         }
@@ -1015,7 +1069,7 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
             };
             let need = cmsg_align(size_of::<CmsgHdr>() + cred_payload.len());
             if used + need <= control_cap {
-                append_cmsg(&mut control_out, SOL_SOCKET, SCM_CREDENTIALS, cred_payload);
+                append_cmsg(&mut control_out, SocketLevel::SolSocket as i32, SCM_CREDENTIALS, cred_payload);
                 used += need;
             } else {
                 msghdr.msg_flags |= MSG_CTRUNC;
@@ -1031,7 +1085,7 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
                 for fd in received_fds {
                     payload.extend_from_slice(&fd.to_ne_bytes());
                 }
-                append_cmsg(&mut control_out, SOL_SOCKET, SCM_RIGHTS, payload.as_slice());
+                append_cmsg(&mut control_out, SocketLevel::SolSocket as i32, SCM_RIGHTS, payload.as_slice());
             } else {
                 msghdr.msg_flags |= MSG_CTRUNC;
             }
