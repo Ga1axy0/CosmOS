@@ -257,6 +257,14 @@ pub fn init_rootfs() {
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
+    // Automatically make a /tmp directory if it doesn't exist, since many apps expect it.
+    if lookup_inode("/tmp").is_none() {
+        match mkdir_at("/", "/tmp") {
+            Ok(()) => info!("[kernel] created missing /tmp"),
+            Err(e) => warn!("[kernel] failed to create /tmp, errno={}", e as isize),
+        }
+    }
+
     info!("[kernel] rootfs initialised");
 }
 
