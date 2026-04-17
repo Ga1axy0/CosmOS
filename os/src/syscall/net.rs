@@ -338,7 +338,10 @@ fn sockaddr_to_endpoint(addr: &SockAddrIn) -> Result<IpEndpoint, ERRNO> {
         return Err(ERRNO::EAFNOSUPPORT);
     }
     let port = u16::from_be(addr.sin_port);
-    let ip_b = addr.sin_addr.to_be_bytes();
+    // sin_addr is stored in network byte order in user memory. When it is
+    // read into a native-endian `u32` field, using `to_ne_bytes` yields the
+    // correct sequence of address octets across endiannesses.
+    let ip_b = addr.sin_addr.to_ne_bytes();
     let ip = Ipv4Address::new(ip_b[0], ip_b[1], ip_b[2], ip_b[3]);
     Ok(IpEndpoint::new(IpAddress::Ipv4(ip), port))
 }
@@ -347,7 +350,11 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
     let (sin_addr, sin_port) = match ep.addr {
         IpAddress::Ipv4(v4) => {
             let b = v4.as_bytes();
-            (u32::from_be_bytes([b[0], b[1], b[2], b[3]]), ep.port.to_be())
+            // Construct the `u32` such that the in-memory bytes of the
+            // `SockAddrIn` match the network-order octets expected by C
+            // programs. `from_ne_bytes` makes this correct on both little
+            // and big endian hosts.
+            (u32::from_ne_bytes([b[0], b[1], b[2], b[3]]), ep.port.to_be())
         }
         _ => (0, ep.port.to_be()),
     };
@@ -790,6 +797,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
     syscall_body!({
         let fd = fd as usize;
         let (is_udp, is_tcp, is_unix) = socket_kind(fd)?;
+        let token = current_user_token();
 
         match (level, optname) {
             (SOL_SOCKET, SO_TYPE) => {
@@ -800,7 +808,6 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 } else {
                     return Err(ERRNO::ENOTSOCK);
                 };
-                let token = current_user_token();
                 write_getsockopt_i32(token, optval, optlen, socket_type)?;
                 Ok(0)
             }
@@ -812,7 +819,6 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                         Ok(())
                     })?;
                 }
-                let token = current_user_token();
                 write_getsockopt_i32(token, optval, optlen, acceptconn)?;
                 Ok(0)
             }
@@ -830,14 +836,16 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     })?;
                 } else if is_unix {
                     warn!(
-                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, ignored",
+                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
                         fd,
                         level,
                         optname
                     );
+                    // Provide a deterministic default value (0) instead of
+                    // leaving user memory uninitialized.
+                    write_getsockopt_i32(token, optval, optlen, 0)?;
                     return Ok(0);
                 }
-                let token = current_user_token();
                 write_getsockopt_i32(token, optval, optlen, size)?;
                 Ok(0)
             }
@@ -855,19 +863,19 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     })?;
                 } else if is_unix {
                     warn!(
-                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, ignored",
+                        "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
                         fd,
                         level,
                         optname
                     );
+                    // Provide deterministic default
+                    write_getsockopt_i32(token, optval, optlen, 0)?;
                     return Ok(0);
                 }
-                let token = current_user_token();
                 write_getsockopt_i32(token, optval, optlen, size)?;
                 Ok(0)
             }
             (SOL_SOCKET, SO_ERROR) => {
-                let token = current_user_token();
                 write_getsockopt_i32(token, optval, optlen, 0)?;
                 Ok(0)
             }
@@ -886,7 +894,6 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     enabled = if unix.passcred_enabled() { 1 } else { 0 };
                     Ok(())
                 })?;
-                let token = current_user_token();
                 write_getsockopt_i32(token, optval, optlen, enabled)?;
                 Ok(0)
             }
@@ -897,6 +904,12 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     level,
                     optname
                 );
+                // Avoid leaving user memory uninitialized: if the caller
+                // provided an optlen pointer, set it to 0 to indicate no
+                // data was returned.
+                if !optlen.is_null() {
+                    *translated_refmut(token, optlen).or_errno(ERRNO::EFAULT)? = 0;
+                }
                 Ok(0)
             }
         }
