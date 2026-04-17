@@ -56,6 +56,8 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_READV: usize = 65;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
+/// pselect6_time32 syscall
+pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
 pub const SYSCALL_PPOLL_TIME32: usize = 73;
 /// newfstatat syscall
@@ -302,6 +304,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as *const Timespec,
             args[3] as i32,
+        ),
+        SYSCALL_PSELECT6_TIME32 => sys_pselect6_time32(
+            args[0] as i32,
+            args[1] as *mut usize,
+            args[2] as *mut usize,
+            args[3] as *mut usize,
+            args[4] as *const OldTimespec32,
+            args[5] as *const u8,
         ),
         SYSCALL_PPOLL_TIME32 => sys_ppoll_time32(
             args[0] as *mut PollFd,
