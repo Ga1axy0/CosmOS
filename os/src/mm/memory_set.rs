@@ -5,11 +5,15 @@ use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE};
+use crate::fs::{
+    mark_cached_page_dirty, release_mapped_page, retain_mapped_page, CachePage, FileDescription,
+};
 use crate::sync::{SpinNoIrqLock};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -89,7 +93,7 @@ impl MemorySet {
             .enumerate()
             .find(|(_, area)| area.start_vpn() == start_vpn)
         {
-            area.unmap(&mut self.page_table);
+            area.teardown(&mut self.page_table);
             self.vmas.remove(idx);
             unsafe {
                 asm!("sfence.vma");
@@ -108,20 +112,86 @@ impl MemorySet {
     pub fn find_vma(&self, start_vpn: VirtPageNum) -> Option<&Vma> {
         self.vmas.iter().find(|vma| vma.start_vpn() == start_vpn)
     }
+    /// 按任意落点虚拟页查找所属区域。
+    pub fn find_vma_containing(&self, vpn: VirtPageNum) -> Option<&Vma> {
+        self.vmas.iter().find(|vma| vma.contains_vpn(vpn))
+    }
     /// 按起始虚拟页号查找一段可变区域，供扩缩容等操作复用。
     pub fn find_vma_mut(&mut self, start_vpn: VirtPageNum) -> Option<&mut Vma> {
         self.vmas.iter_mut().find(|vma| vma.start_vpn() == start_vpn)
+    }
+    /// 按任意落点虚拟页查找可变区域。
+    pub fn find_vma_containing_mut(&mut self, vpn: VirtPageNum) -> Option<&mut Vma> {
+        self.vmas.iter_mut().find(|vma| vma.contains_vpn(vpn))
     }
     /// 将一段区域登记到地址空间并立即建立页表映射；若与现有区域冲突则失败。
     pub fn insert_vma(&mut self, mut vma: Vma, data: Option<&[u8]>) -> bool {
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
             return false;
         }
-        vma.map(&mut self.page_table);
+        if vma.should_eager_map() {
+            vma.map(&mut self.page_table);
+        }
         if let Some(data) = data {
             vma.copy_data(&mut self.page_table, data);
         }
         self.vmas.push(vma);
+        true
+    }
+    /// 仅登记一段 VMA 元数据，不立即建立页表映射。
+    pub fn register_vma_metadata(&mut self, vma: Vma) -> bool {
+        if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
+            return false;
+        }
+        self.vmas.push(vma);
+        true
+    }
+    /// 把一张已有私有页接入指定虚拟页，供 `fork` 共享与后续 COW 使用。
+    pub fn map_existing_private_page(
+        &mut self,
+        vpn: VirtPageNum,
+        page: Arc<PrivatePage>,
+        flags: PTEFlags,
+    ) -> bool {
+        if self.page_table.translate(vpn).is_some() {
+            return false;
+        }
+        let Some(area) = self.find_vma_containing_mut(vpn) else {
+            return false;
+        };
+        area.data_frames.insert(vpn, Arc::clone(&page));
+        self.page_table.map(vpn, page.ppn(), flags);
+        debug!(
+            "[cow] install shared private page: vpn={:#x} ppn={:#x} writable={} cow={}",
+            vpn.0,
+            page.ppn().0,
+            flags.contains(PTEFlags::W),
+            page.is_cow()
+        );
+        true
+    }
+    /// 把一张已有的 page cache 页直接接入指定虚拟页，供 `fork` 继承只读文件私有映射。
+    pub fn map_existing_direct_cache_page(
+        &mut self,
+        vpn: VirtPageNum,
+        page: Arc<SpinNoIrqLock<CachePage>>,
+        flags: PTEFlags,
+    ) -> bool {
+        if self.page_table.translate(vpn).is_some() {
+            return false;
+        }
+        let Some(area) = self.find_vma_containing_mut(vpn) else {
+            return false;
+        };
+        retain_mapped_page(&page);
+        area.direct_cache_pages.insert(vpn, Arc::clone(&page));
+        self.page_table.map(vpn, page.lock().ppn(), flags);
+        debug!(
+            "[cow] install inherited direct cache page: vpn={:#x} ppn={:#x} writable={}",
+            vpn.0,
+            page.lock().ppn().0,
+            flags.contains(PTEFlags::W)
+        );
         true
     }
     /// 在完成分裂、删除或追加后整理可合并的相邻区域。
@@ -294,22 +364,122 @@ impl MemorySet {
         ))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
-    pub fn from_existed_user(user_space: &Self) -> Self {
+    pub fn from_existed_user(user_space: &mut Self) -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
+        let mut parent_tlb_needs_flush = false;
+        debug!(
+            "[cow] fork clone address space: parent_vmas={}",
+            user_space.vmas.len()
+        );
         // copy data sections/trap_context/user_stack
-        for area in user_space.vmas.iter() {
-            let new_area = area.clone_metadata();
-            let _ = memory_set.insert_vma(new_area, None);
-            // copy data from another space
-            for vpn in area.vpn_range {
+        for area_idx in 0..user_space.vmas.len() {
+            let share_private_pages = user_space.vmas[area_idx].supports_private_page_sharing();
+            let new_area = user_space.vmas[area_idx].clone_metadata();
+            debug!(
+                "[cow] fork inspect VMA: start={:#x} end={:#x} kind={:?} share_private_pages={} private_pages={} direct_cache_pages={}",
+                user_space.vmas[area_idx].start_vpn().0,
+                user_space.vmas[area_idx].end_vpn().0,
+                user_space.vmas[area_idx].kind,
+                share_private_pages,
+                user_space.vmas[area_idx].data_frames.len(),
+                user_space.vmas[area_idx].direct_cache_pages.len()
+            );
+            if share_private_pages {
+                let _ = memory_set.register_vma_metadata(new_area);
+            } else {
+                let _ = memory_set.insert_vma(new_area, None);
+            }
+            // 对于可共享的私有页，`fork` 时父子先共用同一张只读页，写时再复制。
+            // 对于 trap context 之类内核内部页，仍然保持直接复制，避免把内核写路径卷入 COW。
+            let vpns: Vec<_> = user_space.vmas[area_idx].data_frames.keys().copied().collect();
+            for vpn in vpns {
+                if share_private_pages {
+                    let page = Arc::clone(user_space.vmas[area_idx].data_frames.get(&vpn).unwrap());
+                    let mut child_flags = user_space.translate(vpn).unwrap().flags();
+                    child_flags.remove(PTEFlags::D);
+                    if user_space.vmas[area_idx].map_perm.contains(MapPermission::W) {
+                        // 将父子双方都降为只读，后续写入通过缺页走 COW。
+                        page.set_cow(true);
+                        child_flags.remove(PTEFlags::W);
+                        let _ = user_space.page_table.update_flags(vpn, child_flags);
+                        parent_tlb_needs_flush = true;
+                    }
+                    debug!(
+                        "[cow] fork share private page: vpn={:#x} ppn={:#x} writable={} child_writable={} cow={}",
+                        vpn.0,
+                        page.ppn().0,
+                        user_space.vmas[area_idx].map_perm.contains(MapPermission::W),
+                        child_flags.contains(PTEFlags::W),
+                        page.is_cow()
+                    );
+                    let _ = memory_set.map_existing_private_page(vpn, page, child_flags);
+                    continue;
+                }
+                if memory_set.translate(vpn).is_none() {
+                    if !memory_set.map_private_page_in_vma(vpn) {
+                        continue;
+                    }
+                }
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
                 dst_ppn
                     .get_bytes_array()
                     .copy_from_slice(src_ppn.get_bytes_array());
+                debug!(
+                    "[cow] fork copy private page directly: vpn={:#x} src_ppn={:#x} dst_ppn={:#x}",
+                    vpn.0,
+                    src_ppn.0,
+                    dst_ppn.0
+                );
             }
+            // 对于已经直接映到 page cache 的文件页，子进程也直接继承当前映射。
+            // `MAP_PRIVATE` 仍然保持只读，`MAP_SHARED` 在 sticky dirty 语义下保留父进程当前 `W` 状态。
+            let inherit_direct_cache_pages = user_space.vmas[area_idx].file.is_some();
+            if inherit_direct_cache_pages {
+                let file_shared = user_space.vmas[area_idx]
+                    .file
+                    .as_ref()
+                    .map(|file| file.shared)
+                    .unwrap_or(false);
+                let vpns: Vec<_> = user_space.vmas[area_idx]
+                    .direct_cache_pages
+                    .keys()
+                    .copied()
+                    .collect();
+                for vpn in vpns {
+                    if memory_set.translate(vpn).is_some() {
+                        continue;
+                    }
+                    let page = Arc::clone(
+                        user_space.vmas[area_idx]
+                            .direct_cache_pages
+                            .get(&vpn)
+                            .unwrap(),
+                    );
+                    let mut child_flags = user_space.translate(vpn).unwrap().flags();
+                    child_flags.remove(PTEFlags::D);
+                    if !file_shared {
+                        child_flags.remove(PTEFlags::W);
+                    }
+                    debug!(
+                        "[cow] fork inherit direct cache page: vpn={:#x} ppn={:#x} shared={} writable={}",
+                        vpn.0,
+                        page.lock().ppn().0,
+                        file_shared,
+                        child_flags.contains(PTEFlags::W)
+                    );
+                    let _ = memory_set.map_existing_direct_cache_page(vpn, page, child_flags);
+                }
+            }
+        }
+        if parent_tlb_needs_flush {
+            // TODO: SMP 下需要对同一地址空间正在其他 hart 上运行的线程做远端 TLB shootdown。
+            unsafe {
+                asm!("sfence.vma");
+            }
+            debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
         memory_set
     }
@@ -328,6 +498,9 @@ impl MemorySet {
 
     ///Remove all VMAs
     pub fn recycle_data_pages(&mut self) {
+        for area in self.vmas.iter_mut() {
+            area.teardown(&mut self.page_table);
+        }
         self.vmas.clear();
     }
 
@@ -368,6 +541,12 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) -> bool {
+        debug!(
+            "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} eager=true",
+            usize::from(start_va),
+            usize::from(end_va),
+            permission
+        );
         if !self.insert_vma(Vma::new_anonymous(start_va, end_va, permission), None) {
             return false;
         }
@@ -377,22 +556,50 @@ impl MemorySet {
         true
     }
 
-    /// unmap an anonymous area, return true if success
-    pub fn munmap_anonymous(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    /// 登记一个 file-backed 映射区域；真正装页推迟到缺页异常时处理。
+    pub fn mmap_file(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        file: Arc<FileDescription>,
+        pgoff: usize,
+        shared: bool,
+    ) -> bool {
+        debug!(
+            "[mmap] register file VMA: start={:#x} end={:#x} perm={:?} pgoff={} shared={} lazy=true path={:?}",
+            usize::from(start_va),
+            usize::from(end_va),
+            permission,
+            pgoff,
+            shared,
+            file.path()
+        );
+        if !self.insert_vma(Vma::new_file(start_va, end_va, permission, file, pgoff, shared), None) {
+            return false;
+        }
+        unsafe {
+            asm!("sfence.vma");
+        }
+        true
+    }
+
+    /// 按给定用户区间拆除映射，支持匿名区域与文件映射区域。
+    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
+        debug!(
+            "[munmap] begin teardown: start={:#x} end={:#x} start_vpn={:#x} end_vpn={:#x}",
+            usize::from(start_va),
+            usize::from(end_va),
+            start_vpn.0,
+            end_vpn.0
+        );
         for vpn in VPNRange::new(start_vpn, end_vpn) {
-            let Some(pte) = self.page_table.translate(vpn) else {
+            let Some(area) = self.find_vma_containing(vpn) else {
                 return false;
             };
-            if !pte.flags().contains(PTEFlags::U) {
-                return false;
-            }
-            if !self
-                .vmas
-                .iter()
-                .any(|area| area.is_anonymous_framed_containing(vpn))
-            {
+            if !area.is_user_accessible() {
                 return false;
             }
         }
@@ -417,33 +624,33 @@ impl MemorySet {
                 continue;
             }
 
+            debug!(
+                "[munmap] overlap VMA: area_start={:#x} area_end={:#x} overlap_start={:#x} overlap_end={:#x} file_backed={} direct_cache_pages={} private_pages={}",
+                area_start.0,
+                area_end.0,
+                overlap_start.0,
+                overlap_end.0,
+                area.file.is_some(),
+                area.direct_cache_pages.len(),
+                area.data_frames.len()
+            );
+
             for vpn in VPNRange::new(overlap_start, overlap_end) {
-                area.unmap_one(&mut self.page_table, vpn);
+                area.unmap_present_one(&mut self.page_table, vpn);
             }
 
             if area_start < overlap_start {
-                let left_data_frames = area.data_frames.split_off(&overlap_start);
-                let left_area = Vma {
-                    vpn_range: VPNRange::new(area_start, overlap_start),
-                    data_frames: area.data_frames,
-                    map_type: area.map_type,
-                    map_perm: area.map_perm,
-                    kind: area.kind.clone(),
-                };
-                area.data_frames = left_data_frames;
-                new_areas.push(left_area);
+                if let Some(left_tail) = area.split_off(overlap_start) {
+                    let overlap_area = left_tail;
+                    new_areas.push(area);
+                    area = overlap_area;
+                }
             }
 
             if overlap_end < area_end {
-                let right_data_frames = area.data_frames.split_off(&overlap_end);
-                let right_area = Vma {
-                    vpn_range: VPNRange::new(overlap_end, area_end),
-                    data_frames: right_data_frames,
-                    map_type: area.map_type,
-                    map_perm: area.map_perm,
-                    kind: area.kind.clone(),
-                };
-                new_areas.push(right_area);
+                if let Some(right_area) = area.split_off(overlap_end) {
+                    new_areas.push(right_area);
+                }
             }
         }
         self.vmas = new_areas;
@@ -451,6 +658,397 @@ impl MemorySet {
         unsafe {
             asm!("sfence.vma");
         }
+        debug!(
+            "[munmap] complete teardown: start_vpn={:#x} end_vpn={:#x}",
+            start_vpn.0,
+            end_vpn.0
+        );
+        true
+    }
+
+    /// 为 file-backed 缺页生成锁外慢路径所需的最小计划。
+    pub fn prepare_file_page_fault(
+        &self,
+        fault_va: VirtAddr,
+        access: PageFaultAccess,
+    ) -> Option<FilePageFaultPlan> {
+        let vpn = fault_va.floor();
+        if self.page_table.translate(vpn).is_some() {
+            return None;
+        }
+        let area = self.find_vma_containing(vpn)?;
+        if !area.is_user_accessible() || !area.allows_fault_access(access) {
+            return None;
+        }
+        let file = area.file.as_ref()?;
+        let plan = FilePageFaultPlan {
+            vpn,
+            vma_start: area.start_vpn(),
+            vma_end: area.end_vpn(),
+            map_perm: area.map_perm,
+            file: Arc::clone(&file.file),
+            page_idx: area.file_page_index(vpn)?,
+            pgoff: file.pgoff,
+            shared: file.shared,
+            access,
+        };
+        debug!(
+            "[mmap] prepared lazy fault plan: va={:#x} vpn={:#x} page_idx={} access={:?} shared={} path={:?}",
+            usize::from(fault_va),
+            plan.vpn.0,
+            plan.page_idx,
+            access,
+            plan.shared,
+            plan.file.path()
+        );
+        Some(plan)
+    }
+
+    /// 检查某个缺页计划在慢路径返回后是否仍然与当前地址空间匹配。
+    pub fn can_commit_file_page_fault(&self, plan: &FilePageFaultPlan) -> bool {
+        if self.page_table.translate(plan.vpn).is_some() {
+            return true;
+        }
+        let Some(area) = self.find_vma_containing(plan.vpn) else {
+            return false;
+        };
+        let Some(file) = area.file.as_ref() else {
+            return false;
+        };
+        area.start_vpn() == plan.vma_start
+            && area.end_vpn() == plan.vma_end
+            && area.map_perm == plan.map_perm
+            && file.pgoff == plan.pgoff
+            && file.shared == plan.shared
+            && Arc::ptr_eq(&file.file, &plan.file)
+            && area.file_page_index(plan.vpn) == Some(plan.page_idx)
+    }
+
+    /// 在命中的 `Framed` 区域内为单个页分配私有页框并建立映射。
+    pub fn map_private_page_in_vma(&mut self, vpn: VirtPageNum) -> bool {
+        if self.page_table.translate(vpn).is_some() {
+            return true;
+        }
+        let Some(idx) = self.vmas.iter().position(|vma| vma.contains_vpn(vpn)) else {
+            return false;
+        };
+        let map_type = self.vmas[idx].map_type;
+        let map_perm = self.vmas[idx].map_perm;
+        let ppn = match map_type {
+            MapType::Identical => PhysPageNum(vpn.0),
+            MapType::Framed => {
+                let frame = frame_alloc().unwrap();
+                let page = Arc::new(PrivatePage::new(frame));
+                let ppn = page.ppn();
+                debug!(
+                    "[mmap] allocate private frame for lazy fault: vpn={:#x} ppn={:#x}",
+                    vpn.0,
+                    ppn.0
+                );
+                self.vmas[idx].data_frames.insert(vpn, page);
+                ppn
+            }
+        };
+        let pte_flags = PTEFlags::from_bits(map_perm.bits).unwrap();
+        self.page_table.map(vpn, ppn, pte_flags);
+        true
+    }
+
+    /// 把一个 page cache 页直接映射进用户页表，供 `MAP_SHARED` 使用。
+    pub fn map_shared_file_page(
+        &mut self,
+        plan: &FilePageFaultPlan,
+        page: Arc<SpinNoIrqLock<CachePage>>,
+    ) -> bool {
+        if self.page_table.translate(plan.vpn).is_some() {
+            return true;
+        }
+        if !self.can_commit_file_page_fault(plan) {
+            return false;
+        }
+        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        if plan.shared
+            && plan.map_perm.contains(MapPermission::W)
+            && plan.access != PageFaultAccess::Write
+        {
+            pte_flags.remove(PTEFlags::W);
+        }
+        let ppn = page.lock().ppn();
+        if plan.shared
+            && plan.map_perm.contains(MapPermission::W)
+            && plan.access == PageFaultAccess::Write
+        {
+            mark_cached_page_dirty(&page);
+        }
+        retain_mapped_page(&page);
+        let area = self
+            .find_vma_containing_mut(plan.vpn)
+            .expect("validated file fault VMA disappeared");
+        if let Some(old_page) = area.direct_cache_pages.insert(plan.vpn, Arc::clone(&page)) {
+            release_mapped_page(&old_page);
+        }
+        self.page_table.map(plan.vpn, ppn, pte_flags);
+        unsafe {
+            asm!("sfence.vma");
+        }
+        debug!(
+            "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} writable={} path={:?}",
+            plan.vpn.0,
+            plan.page_idx,
+            ppn.0,
+            pte_flags.contains(PTEFlags::W),
+            plan.file.path()
+        );
+        true
+    }
+
+    /// 将 file-backed `MAP_PRIVATE` 的缓存页以只读方式直接接入页表。
+    fn map_private_file_cache_page(
+        &mut self,
+        plan: &FilePageFaultPlan,
+        page: Arc<SpinNoIrqLock<CachePage>>,
+    ) -> bool {
+        if self.page_table.translate(plan.vpn).is_some() {
+            return true;
+        }
+        if !self.can_commit_file_page_fault(plan) {
+            return false;
+        }
+        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        pte_flags.remove(PTEFlags::W);
+        pte_flags.remove(PTEFlags::D);
+        let ppn = page.lock().ppn();
+        retain_mapped_page(&page);
+        let area = self
+            .find_vma_containing_mut(plan.vpn)
+            .expect("validated private file fault VMA disappeared");
+        if let Some(old_page) = area.direct_cache_pages.insert(plan.vpn, Arc::clone(&page)) {
+            release_mapped_page(&old_page);
+        }
+        self.page_table.map(plan.vpn, ppn, pte_flags);
+        unsafe {
+            asm!("sfence.vma");
+        }
+        debug!(
+            "[cow] install MAP_PRIVATE readonly cache page: vpn={:#x} page_idx={} ppn={:#x} access={:?} path={:?}",
+            plan.vpn.0,
+            plan.page_idx,
+            ppn.0,
+            plan.access,
+            plan.file.path()
+        );
+        true
+    }
+
+    /// 处理共享可写页的首次写入通知缺页。
+    pub fn handle_shared_write_fault(&mut self, fault_va: VirtAddr) -> bool {
+        let vpn = fault_va.floor();
+        let Some(pte) = self.page_table.translate(vpn) else {
+            return false;
+        };
+        if pte.writable() {
+            return false;
+        }
+        let (page, path) = {
+            let Some(area) = self.find_vma_containing(vpn) else {
+                return false;
+            };
+            if !area.is_user_accessible() || !area.allows_fault_access(PageFaultAccess::Write) {
+                return false;
+            }
+            let Some(file) = area.file.as_ref() else {
+                return false;
+            };
+            if !file.shared {
+                return false;
+            }
+            let Some(page) = area.direct_cache_pages.get(&vpn).cloned() else {
+                return false;
+            };
+            (page, file.file.path())
+        };
+        let mut new_flags = pte.flags();
+        new_flags.insert(PTEFlags::W);
+        if !self.page_table.update_flags(vpn, new_flags) {
+            return false;
+        }
+        // 首次写 fault 时立即把 page cache 页记脏，避免等待 teardown 才传播脏状态。
+        mark_cached_page_dirty(&page);
+        unsafe {
+            asm!("sfence.vma");
+        }
+        debug!(
+            "[mmap] shared write-notify fault: vpn={:#x} ppn={:#x} path={:?}",
+            vpn.0,
+            pte.ppn().0,
+            path
+        );
+        true
+    }
+
+    /// 处理私有页的写时复制缺页。
+    pub fn handle_private_cow_fault(&mut self, fault_va: VirtAddr) -> bool {
+        let vpn = fault_va.floor();
+        let Some(pte) = self.page_table.translate(vpn) else {
+            return false;
+        };
+        if pte.writable() {
+            return false;
+        }
+        let file_private_cache_page = {
+            let Some(area) = self.find_vma_containing(vpn) else {
+                return false;
+            };
+            if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
+                return false;
+            }
+            match area.file.as_ref() {
+                Some(file) if !file.shared => area.direct_cache_pages.get(&vpn).cloned(),
+                _ => None,
+            }
+        };
+        if let Some(cache_page) = file_private_cache_page {
+            let path = self
+                .find_vma_containing(vpn)
+                .and_then(|area| area.file.as_ref().and_then(|file| file.file.path()));
+            let new_page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
+            new_page
+                .ppn()
+                .get_bytes_array()
+                .copy_from_slice(cache_page.lock().ppn().get_bytes_array());
+            let mut writable_flags = pte.flags();
+            writable_flags.insert(PTEFlags::W);
+            writable_flags.remove(PTEFlags::D);
+            let Some(area) = self.find_vma_containing_mut(vpn) else {
+                return false;
+            };
+            area.direct_cache_pages.remove(&vpn);
+            area.data_frames.insert(vpn, Arc::clone(&new_page));
+            if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
+                return false;
+            }
+            release_mapped_page(&cache_page);
+            // TODO: SMP 下这里还需要远端 hart 的 TLB shootdown，保证其他核能看到新的物理页映射。
+            unsafe {
+                asm!("sfence.vma");
+            }
+            debug!(
+                "[cow] materialize MAP_PRIVATE page on write fault: vpn={:#x} cache_ppn={:#x} new_ppn={:#x} path={:?}",
+                vpn.0,
+                cache_page.lock().ppn().0,
+                new_page.ppn().0,
+                path
+            );
+            return true;
+        }
+        let (page, path) = {
+            let Some(area) = self.find_vma_containing(vpn) else {
+                return false;
+            };
+            if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
+                return false;
+            }
+            let Some(page) = area.data_frames.get(&vpn).cloned() else {
+                return false;
+            };
+            if !page.is_cow() {
+                return false;
+            }
+            (page, area.file.as_ref().and_then(|file| file.file.path()))
+        };
+        let mut writable_flags = pte.flags();
+        writable_flags.insert(PTEFlags::W);
+        writable_flags.remove(PTEFlags::D);
+        debug!(
+            "[cow] private write fault hit: vpn={:#x} ppn={:#x} refcnt={} cow={} path={:?}",
+            vpn.0,
+            page.ppn().0,
+            Arc::strong_count(&page),
+            page.is_cow(),
+            path
+        );
+
+        // TODO: 这里暂时用 `Arc::strong_count` 近似判断是否仍有其他地址空间共享该页；
+        // 后续若引入更复杂的页生命周期管理，需要改成显式引用计数或反向映射。
+        // `page` 此时至少被当前 VMA 和局部变量各持有一次；若强引用数不超过 2，说明已经没有其他地址空间共享它。
+        if Arc::strong_count(&page) <= 2 {
+            page.set_cow(false);
+            if !self.page_table.update_flags(vpn, writable_flags) {
+                return false;
+            }
+            // TODO: SMP 下这里还需要远端 hart 的 TLB shootdown，保证其他核不会继续使用旧的只读缓存。
+            unsafe {
+                asm!("sfence.vma");
+            }
+            debug!(
+                "[cow] reuse exclusive private page: vpn={:#x} ppn={:#x} path={:?}",
+                vpn.0,
+                page.ppn().0,
+                path
+            );
+            return true;
+        }
+
+        let new_page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
+        new_page
+            .ppn()
+            .get_bytes_array()
+            .copy_from_slice(page.ppn().get_bytes_array());
+        let Some(area) = self.find_vma_containing_mut(vpn) else {
+            return false;
+        };
+        area.data_frames.insert(vpn, Arc::clone(&new_page));
+        if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
+            return false;
+        }
+        // TODO: SMP 下这里还需要远端 hart 的 TLB shootdown，保证其他核能看到新的物理页映射。
+        unsafe {
+            asm!("sfence.vma");
+        }
+        debug!(
+            "[cow] copy private page on write fault: vpn={:#x} old_ppn={:#x} new_ppn={:#x} path={:?}",
+            vpn.0,
+            page.ppn().0,
+            new_page.ppn().0,
+            path
+        );
+        true
+    }
+
+    /// 为 `MAP_PRIVATE` 缺页分配私有页框，并以 page cache 作为填充源。
+    pub fn map_private_file_page(
+        &mut self,
+        plan: &FilePageFaultPlan,
+        page: Arc<SpinNoIrqLock<CachePage>>,
+    ) -> bool {
+        if self.page_table.translate(plan.vpn).is_some() {
+            return true;
+        }
+        if !self.can_commit_file_page_fault(plan) {
+            return false;
+        }
+        if plan.access != PageFaultAccess::Write {
+            // 首次读/执行缺页先共享只读 page cache 页，首次写再通过 COW 物化私有页。
+            return self.map_private_file_cache_page(plan, page);
+        }
+        if !self.map_private_page_in_vma(plan.vpn) {
+            return false;
+        }
+        let dst_ppn = self.page_table.translate(plan.vpn).unwrap().ppn();
+        let dst = dst_ppn.get_bytes_array();
+        let page_guard = page.lock();
+        let src = page_guard.ppn().get_bytes_array();
+        dst.copy_from_slice(src);
+        unsafe {
+            asm!("sfence.vma");
+        }
+        debug!(
+            "[cow] materialize MAP_PRIVATE page on first write fault: vpn={:#x} page_idx={} dst_ppn={:#x} path={:?}",
+            plan.vpn.0,
+            plan.page_idx,
+            dst_ppn.0,
+            plan.file.path()
+        );
         true
     }
 
@@ -546,26 +1144,40 @@ impl MemorySet {
             // left part
             if area_start < overlap_start {
                 let left_data_frames = area.data_frames.split_off(&overlap_start);
+                let left_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_start);
                 let left_area = Vma {
                     vpn_range: VPNRange::new(area_start, overlap_start),
                     data_frames: area.data_frames,
                     map_type: area.map_type,
                     map_perm: area.map_perm,
                     kind: area.kind.clone(),
+                    file: area.file.clone(),
+                    direct_cache_pages: area.direct_cache_pages,
                 };
                 area.data_frames = left_data_frames;
+                area.direct_cache_pages = left_direct_cache_pages;
+                if let Some(file) = area.file.as_mut() {
+                    file.pgoff += overlap_start.0 - area_start.0;
+                }
                 new_areas.push(left_area);
             }
 
             // right part exists -> split and handle middle separately
             if overlap_end < area_end {
                 let right_data_frames = area.data_frames.split_off(&overlap_end);
+                let right_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_end);
+                let mut right_file = area.file.clone();
+                if let Some(file) = right_file.as_mut() {
+                    file.pgoff += overlap_end.0 - area_start.0;
+                }
                 let right_area = Vma {
                     vpn_range: VPNRange::new(overlap_end, area_end),
                     data_frames: right_data_frames,
                     map_type: area.map_type,
                     map_perm: area.map_perm,
                     kind: area.kind.clone(),
+                    file: right_file,
+                    direct_cache_pages: right_direct_cache_pages,
                 };
 
                 // update middle pages' PTE flags
@@ -621,10 +1233,85 @@ pub enum VmaKind {
     /// 普通匿名映射区域。
     Anonymous,
     /// 文件映射区域。
-    File {
-        /// 文件映射在底层对象中的页对齐偏移。
-        offset: usize,
-    },
+    File,
+}
+
+/// 文件映射区域附带的底层对象信息。
+#[derive(Clone)]
+pub struct FileVma {
+    /// 建立映射时引用的打开文件描述。
+    pub file: Arc<FileDescription>,
+    /// 文件页偏移，单位为页。
+    pub pgoff: usize,
+    /// 是否为 `MAP_SHARED` 映射。
+    pub shared: bool,
+}
+
+/// 页错误对应的访问类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageFaultAccess {
+    /// 读缺页。
+    Read,
+    /// 写缺页。
+    Write,
+    /// 指令取值缺页。
+    Exec,
+}
+
+/// file-backed 缺页在锁外执行慢路径时携带的最小计划。
+#[derive(Clone)]
+pub struct FilePageFaultPlan {
+    /// 发生缺页的虚拟页号。
+    pub vpn: VirtPageNum,
+    /// 发生缺页时命中的 VMA 起始页号。
+    pub vma_start: VirtPageNum,
+    /// 发生缺页时命中的 VMA 结束页号。
+    pub vma_end: VirtPageNum,
+    /// 缺页区域的访问权限。
+    pub map_perm: MapPermission,
+    /// 建立映射时持有的打开文件描述。
+    pub file: Arc<FileDescription>,
+    /// 缺页对应的文件页号。
+    pub page_idx: u64,
+    /// 建立映射时的文件页偏移。
+    pub pgoff: usize,
+    /// 是否为 `MAP_SHARED`。
+    pub shared: bool,
+    /// 触发本次缺页的访问类型。
+    pub access: PageFaultAccess,
+}
+
+/// 一张可在多个地址空间之间共享的私有页。
+pub struct PrivatePage {
+    /// 实际承载数据的物理页框。
+    frame: FrameTracker,
+    /// 当前页是否处于写时复制保护状态。
+    cow: AtomicBool,
+}
+
+impl PrivatePage {
+    /// 基于新分配的页框创建一张私有页。
+    pub fn new(frame: FrameTracker) -> Self {
+        Self {
+            frame,
+            cow: AtomicBool::new(false),
+        }
+    }
+
+    /// 返回当前私有页对应的物理页号。
+    pub fn ppn(&self) -> PhysPageNum {
+        self.frame.ppn
+    }
+
+    /// 设置当前页是否启用 COW。
+    pub fn set_cow(&self, cow: bool) {
+        self.cow.store(cow, Ordering::Release);
+    }
+
+    /// 判断当前页是否正处于 COW 保护状态。
+    pub fn is_cow(&self) -> bool {
+        self.cow.load(Ordering::Acquire)
+    }
 }
 
 /// 一段带有权限、来源和页框信息的虚拟内存区域描述。
@@ -632,13 +1319,18 @@ pub struct Vma {
     /// 覆盖的虚拟页号半开区间。
     pub vpn_range: VPNRange,
     /// 对于 framed 映射，记录每个虚拟页对应的物理页框。
-    pub data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    pub data_frames: BTreeMap<VirtPageNum, Arc<PrivatePage>>,
     /// 该区域采用的映射方式。
     pub map_type: MapType,
     /// 该区域在页表中的访问权限。
     pub map_perm: MapPermission,
     /// 该区域在地址空间中的用途标签。
     pub kind: VmaKind,
+    /// 文件映射附带的底层对象信息；匿名区域为 `None`。
+    pub file: Option<FileVma>,
+    /// 当前直接映射到用户页表的 page cache 页。
+    /// `MAP_SHARED` 与首次只读接入的 `MAP_PRIVATE` 都会使用这里记录映射关系。
+    pub direct_cache_pages: BTreeMap<VirtPageNum, Arc<SpinNoIrqLock<CachePage>>>,
 }
 
 impl Vma {
@@ -658,6 +1350,8 @@ impl Vma {
             map_type,
             map_perm,
             kind,
+            file: None,
+            direct_cache_pages: BTreeMap::new(),
         }
     }
     /// 为 ELF 装载段创建一段带有用户态访问语义的区域描述。
@@ -703,15 +1397,23 @@ impl Vma {
         start_va: VirtAddr,
         end_va: VirtAddr,
         map_perm: MapPermission,
-        offset: usize,
+        file: Arc<FileDescription>,
+        pgoff: usize,
+        shared: bool,
     ) -> Self {
-        Self::new(
+        let mut vma = Self::new(
             start_va,
             end_va,
             MapType::Framed,
             map_perm,
-            VmaKind::File { offset },
-        )
+            VmaKind::File,
+        );
+        vma.file = Some(FileVma {
+            file,
+            pgoff,
+            shared,
+        });
+        vma
     }
     /// 复制一份仅包含区间属性的区域元数据，不携带已有物理页分配结果。
     pub fn clone_metadata(&self) -> Self {
@@ -721,6 +1423,8 @@ impl Vma {
             map_type: self.map_type,
             map_perm: self.map_perm,
             kind: self.kind.clone(),
+            file: self.file.clone(),
+            direct_cache_pages: BTreeMap::new(),
         }
     }
     /// 返回该区域覆盖的起始虚拟页号，便于统一做区间级操作。
@@ -757,6 +1461,8 @@ impl Vma {
             && self.map_type == other.map_type
             && self.map_perm == other.map_perm
             && self.kind == other.kind
+            && self.file.is_none()
+            && other.file.is_none()
     }
     /// 将一段可合并的相邻区域吸收到当前区域中，并保留已有映射页信息。
     pub fn absorb(&mut self, other: Self) {
@@ -764,11 +1470,104 @@ impl Vma {
         self.vpn_range = VPNRange::new(self.start_vpn(), other.end_vpn());
         self.data_frames.extend(other.data_frames);
     }
+    /// 判断当前区域中的私有页是否适合在 `fork` 时共享。
+    pub fn supports_private_page_sharing(&self) -> bool {
+        if self.map_type != MapType::Framed {
+            return false;
+        }
+        if matches!(self.kind, VmaKind::TrapContext { .. }) {
+            return false;
+        }
+        !matches!(self.file.as_ref(), Some(file) if file.shared)
+    }
     /// 判断指定虚拟页是否属于匿名帧映射区域，供当前匿名 unmap 逻辑复用。
     pub fn is_anonymous_framed_containing(&self, vpn: VirtPageNum) -> bool {
         self.map_type == MapType::Framed
             && matches!(self.kind, VmaKind::Anonymous)
             && self.contains_vpn(vpn)
+    }
+    /// 判断当前区域是否允许指定类型的缺页访问。
+    pub fn allows_fault_access(&self, access: PageFaultAccess) -> bool {
+        match access {
+            PageFaultAccess::Read => self.map_perm.contains(MapPermission::R),
+            PageFaultAccess::Write => self.map_perm.contains(MapPermission::W),
+            PageFaultAccess::Exec => self.map_perm.contains(MapPermission::X),
+        }
+    }
+    /// 判断当前区域是否需要在建 VMA 时立即分配并建立页表映射。
+    pub fn should_eager_map(&self) -> bool {
+        self.file.is_none()
+    }
+    /// 计算某个虚拟页在底层文件中的页号。
+    pub fn file_page_index(&self, vpn: VirtPageNum) -> Option<u64> {
+        let file = self.file.as_ref()?;
+        let delta = vpn.0.checked_sub(self.start_vpn().0)?;
+        Some((file.pgoff + delta) as u64)
+    }
+    /// 从当前区域中按 `split_vpn` 处分裂出右半部分区域。
+    pub fn split_off(&mut self, split_vpn: VirtPageNum) -> Option<Self> {
+        if split_vpn <= self.start_vpn() || split_vpn >= self.end_vpn() {
+            return None;
+        }
+        let old_end = self.end_vpn();
+        let right_data_frames = self.data_frames.split_off(&split_vpn);
+        let right_direct_cache_pages = self.direct_cache_pages.split_off(&split_vpn);
+        let mut right_file = self.file.clone();
+        if let Some(file) = right_file.as_mut() {
+            file.pgoff += split_vpn.0 - self.start_vpn().0;
+        }
+        self.vpn_range = VPNRange::new(self.start_vpn(), split_vpn);
+        Some(Self {
+            vpn_range: VPNRange::new(split_vpn, old_end),
+            data_frames: right_data_frames,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+            kind: self.kind.clone(),
+            file: right_file,
+            direct_cache_pages: right_direct_cache_pages,
+        })
+    }
+    /// 按当前实际已经建立的映射状态拆除单页映射。
+    pub fn unmap_present_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        if let Some(page) = self.direct_cache_pages.remove(&vpn) {
+            let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
+            debug!(
+                "[munmap] release file cache mapping: vpn={:#x} shared={}",
+                vpn.0,
+                shared_file_mapping
+            );
+            if let Some(old_pte) = page_table.clear(vpn) {
+                if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
+                    mark_cached_page_dirty(&page);
+                }
+            }
+            release_mapped_page(&page);
+            return;
+        }
+        if self.map_type == MapType::Framed {
+            debug!(
+                "[munmap] release private frame mapping: vpn={:#x}",
+                vpn.0
+            );
+            self.data_frames.remove(&vpn);
+        }
+        let _ = page_table.clear(vpn);
+    }
+    /// 依据当前区域实际映射状态拆除全部页表项。
+    pub fn teardown(&mut self, page_table: &mut PageTable) {
+        let shared_vpns: alloc::vec::Vec<_> = self.direct_cache_pages.keys().copied().collect();
+        for vpn in shared_vpns {
+            self.unmap_present_one(page_table, vpn);
+        }
+        let framed_vpns: alloc::vec::Vec<_> = self.data_frames.keys().copied().collect();
+        for vpn in framed_vpns {
+            self.unmap_present_one(page_table, vpn);
+        }
+        if self.map_type == MapType::Identical {
+            for vpn in self.vpn_range {
+                let _ = page_table.clear(vpn);
+            }
+        }
     }
     /// 为指定虚拟页建立单页映射，并在需要时分配新的物理页框。
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -778,9 +1577,9 @@ impl Vma {
                 ppn = PhysPageNum(vpn.0);
             }
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
-                ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
+                let page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
+                ppn = page.ppn();
+                self.data_frames.insert(vpn, page);
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();

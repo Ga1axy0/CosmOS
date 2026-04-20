@@ -1,7 +1,9 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use spin::Mutex;
 
 use crate::errno::FS_ERRNO;
+use crate::inode_cache::get_or_create_inode;
 
 /// Linux-style inode timestamp snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,10 +36,18 @@ pub trait VfsNode: Send + Sync + Any {
     /// Returns true if this node is a directory.
     fn is_dir(&self) -> bool;
     fn clear(&self);
+    /// 调整常规文件逻辑长度。
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
     /// Stable inode number for stat-like metadata.
     fn ino(&self) -> u64 {
+        0
+    }
+    /// 底层文件系统实例的稳定标识；返回 0 表示当前节点不参与 inode cache 复用。
+    fn fs_id(&self) -> u64 {
         0
     }
     /// Hard-link count for stat-like metadata.
@@ -129,15 +139,37 @@ pub trait VfsNode: Send + Sync + Any {
 
 pub struct Inode {
     inner: Arc<dyn VfsNode>,
+    state: Mutex<InodeState>,
+}
+
+/// 稳定内存 inode 的可变运行时状态。
+struct InodeState {
+    /// 由 OS 层按需挂载的 page cache 宿主对象。
+    page_cache: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Inode {
-    pub fn new(inner: Arc<dyn VfsNode>) -> Self {
-        Self { inner }
+    /// 创建一个未进入 inode cache 的临时内存 inode。
+    fn new(inner: Arc<dyn VfsNode>) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(InodeState { page_cache: None }),
+        }
     }
 
+    /// 创建一个不参与全局去重的 `Arc<Inode>`。
+    pub(crate) fn new_uncached(inner: Arc<dyn VfsNode>) -> Arc<Self> {
+        Arc::new(Self::new(inner))
+    }
+
+    /// 从底层 VFS 节点构造稳定内存 inode，对外统一走 inode cache。
+    pub fn from_vfs_node(inner: Arc<dyn VfsNode>) -> Arc<Self> {
+        get_or_create_inode(inner)
+    }
+
+    /// 将底层 VFS 节点包装为稳定内存 inode。
     fn wrap(node: Arc<dyn VfsNode>) -> Arc<Inode> {
-        Arc::new(Self::new(node))
+        Self::from_vfs_node(node)
     }
 
     pub fn ls(&self) -> Vec<String> {
@@ -178,6 +210,11 @@ impl Inode {
         self.inner.clear()
     }
 
+    /// 调整 inode 对应常规文件的逻辑长度。
+    pub fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
+        self.inner.truncate(new_size)
+    }
+
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         self.inner.read_at(offset, buf)
     }
@@ -188,6 +225,11 @@ impl Inode {
 
     pub fn ino(&self) -> u64 {
         self.inner.ino()
+    }
+
+    /// 返回底层文件系统实例标识。
+    pub fn fs_id(&self) -> u64 {
+        self.inner.fs_id()
     }
 
     pub fn nlink(&self) -> u32 {
@@ -255,6 +297,49 @@ impl Inode {
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
         self.inner.rename_child(old_name, &new_parent.inner, new_name)
+    }
+
+    /// 获取当前 inode 挂载的 page cache 宿主对象。
+    pub fn page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .page_cache
+            .as_ref()
+            .and_then(|state| Arc::clone(state).downcast::<T>().ok())
+    }
+
+    /// 为当前 inode 安装 page cache 宿主对象。
+    pub fn set_page_cache_state<T: Any + Send + Sync>(&self, state: Arc<T>) {
+        self.state.lock().page_cache = Some(state);
+    }
+
+    /// 原子地获取或安装当前 inode 挂载的 page cache 宿主对象。
+    pub fn get_or_insert_page_cache_state<T, F>(&self, init: F) -> (Arc<T>, bool)
+    where
+        T: Any + Send + Sync,
+        F: FnOnce() -> Arc<T>,
+    {
+        let mut state_guard = self.state.lock();
+        if let Some(existing) = state_guard
+            .page_cache
+            .as_ref()
+            .and_then(|state| Arc::clone(state).downcast::<T>().ok())
+        {
+            return (existing, false);
+        }
+        let state = init();
+        let erased: Arc<dyn Any + Send + Sync> = state.clone();
+        state_guard.page_cache = Some(erased);
+        (state, true)
+    }
+
+    /// 移除当前 inode 挂载的 page cache 宿主对象。
+    pub fn take_page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .page_cache
+            .take()
+            .and_then(|state| state.downcast::<T>().ok())
     }
 
     /// Returns a clone of the raw [`VfsNode`] backing this inode.

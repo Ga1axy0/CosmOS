@@ -30,6 +30,10 @@ pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT: usize = 39;
 /// mount syscall
 pub const SYSCALL_MOUNT: usize = 40;
+/// truncate syscall
+pub const SYSCALL_TRUNCATE: usize = 45;
+/// ftruncate syscall
+pub const SYSCALL_FTRUNCATE: usize = 46;
 /// faccessat syscall
 pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
@@ -281,6 +285,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4] as *const u8,
         ),
+        SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
+        SYSCALL_FTRUNCATE => sys_ftruncate(args[0] as u32, args[1] as isize),
         SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
         SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as i32),

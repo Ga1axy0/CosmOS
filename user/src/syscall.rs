@@ -7,6 +7,8 @@ pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
+pub const SYSCALL_TRUNCATE: usize = 45;
+pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_CHDIR: usize = 49;
 pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
@@ -145,6 +147,16 @@ pub fn sys_linkat(
 
 pub fn sys_unlinkat(dirfd: usize, path: &str, flags: usize) -> isize {
     syscall(SYSCALL_UNLINKAT, [dirfd, path.as_ptr() as usize, flags])
+}
+
+/// `truncate` 用户态封装：按路径调整文件长度。
+pub fn sys_truncate(path: &str, len: isize) -> isize {
+    syscall(SYSCALL_TRUNCATE, [path.as_ptr() as usize, len as usize, 0])
+}
+
+/// `ftruncate` 用户态封装：按文件描述符调整文件长度。
+pub fn sys_ftruncate(fd: usize, len: isize) -> isize {
+    syscall(SYSCALL_FTRUNCATE, [fd, len as usize, 0])
 }
 
 pub fn sys_fstat(fd: usize, st: &mut Stat) -> isize {
@@ -298,7 +310,19 @@ pub fn sys_brk(addr: usize) -> isize {
 }
 
 pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
-    syscall(SYSCALL_MMAP, [start, len, prot])
+    syscall6(SYSCALL_MMAP, [start, len, prot, 0, 0, 0])
+}
+
+/// `mmap` 用户态完整封装，支持文件映射所需的 6 参数形式。
+pub fn sys_mmap_full(
+    start: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: usize,
+    offset: usize,
+) -> isize {
+    syscall6(SYSCALL_MMAP, [start, len, prot, flags, fd, offset])
 }
 
 pub fn sys_munmap(start: usize, len: usize) -> isize {

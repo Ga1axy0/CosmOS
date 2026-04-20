@@ -6,6 +6,7 @@ use crate::{
     BlockDevice, EasyFileSystem,
     block_cache::get_block_cache,
     easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType},
+    errno::FS_ERRNO,
     vfs::{Inode, VfsNode},
 };
 
@@ -187,6 +188,11 @@ impl VfsNode for EasyInode {
         });
     }
 
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        // TODO：补齐 EasyFS 的通用 truncate 语义，包括缩容回收与扩容补零。
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let _fs = self.fs.lock();
         self.read_disk_inode(|disk_inode| disk_inode.read_at(offset, buf, &self.block_device))
@@ -203,15 +209,24 @@ impl VfsNode for EasyInode {
     fn size(&self) -> usize {
         self.read_disk_inode(|disk_inode| disk_inode.size as usize)
     }
+
+    fn ino(&self) -> u64 {
+        ((self.block_id as u64) << 32) | self.block_offset as u64
+    }
+
+    fn fs_id(&self) -> u64 {
+        Arc::as_ptr(&self.fs) as usize as u64
+    }
 }
 
 impl EasyFileSystem {
-    pub fn root_inode(efs: &Arc<Mutex<Self>>) -> Inode {
+    /// 返回根目录对应的稳定内存 inode。
+    pub fn root_inode(efs: &Arc<Mutex<Self>>) -> Arc<Inode> {
         let block_device = Arc::clone(&efs.lock().block_device);
         // acquire efs lock temporarily
         let (block_id, block_offset) = efs.lock().get_disk_inode_pos(0);
         // release efs lock
-        Inode::new(Arc::new(EasyInode::new(
+        Inode::from_vfs_node(Arc::new(EasyInode::new(
             block_id,
             block_offset,
             Arc::clone(efs),
