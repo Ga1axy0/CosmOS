@@ -8,7 +8,7 @@ mod tcp;
 mod udp;
 mod unix_socket;
 
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use lazy_static::lazy_static;
@@ -43,6 +43,16 @@ const TCP_TX_BUF: usize = 8192;
 
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
+
+const LOOPBACK_OCTET: u8 = 127;
+
+const ETH_HEADER_LEN: usize = 14;
+const ETH_TYPE_IPV4: u16 = 0x0800;
+const ETH_TYPE_ARP: u16 = 0x0806;
+
+const ARP_FRAME_LEN: usize = ETH_HEADER_LEN + 28;
+const ARP_OP_REQUEST: u16 = 1;
+const ARP_OP_REPLY: u16 = 2;
 
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
@@ -134,6 +144,13 @@ impl NetStack {
             if addrs.iter().all(|a| *a != cidr) {
                 let _ = addrs.push(cidr);
             }
+
+            // Add loopback IPv4 on the same interface so smoltcp can pick
+            // a loopback source address for 127/8 destinations.
+            let loopback = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), 8);
+            if addrs.iter().all(|a| *a != loopback) {
+                let _ = addrs.push(loopback);
+            }
         });
         let _ = iface
             .routes_mut()
@@ -175,6 +192,7 @@ impl NetStack {
     }
 
     fn poll(&mut self) {
+        debug!("net: polling smoltcp stack");
         let _ = self.iface.poll(now(), &mut self.device, &mut self.sockets);
 
         for st in self.udp_states.iter() {
@@ -325,9 +343,36 @@ fn now() -> Instant {
     Instant::from_millis(get_time_ms() as i64)
 }
 
+#[inline]
+fn is_loopback_ipv4_bytes(ip: &[u8]) -> bool {
+    ip.len() == 4 && ip[0] == LOOPBACK_OCTET
+}
+
+struct LoopbackDataplane {
+    rxq: SpinNoIrqLock<VecDeque<Vec<u8>>>,
+}
+
+impl LoopbackDataplane {
+    fn new() -> Self {
+        Self {
+            rxq: SpinNoIrqLock::new(VecDeque::new()),
+        }
+    }
+
+    fn push_rx(&self, frame: Vec<u8>) {
+        self.rxq.lock().push_back(frame);
+    }
+
+    fn pop_rx(&self) -> Option<Vec<u8>> {
+        self.rxq.lock().pop_front()
+    }
+}
+
 struct VirtioSmoltcpDevice {
     dev: Arc<drivers::net::VirtIONetDevice>,
     caps: DeviceCapabilities,
+    loopback: Arc<LoopbackDataplane>,
+    mac: [u8; 6],
 }
 
 impl VirtioSmoltcpDevice {
@@ -335,7 +380,12 @@ impl VirtioSmoltcpDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1500;
-        Self { dev, caps }
+        Self {
+            mac: dev.mac_address(),
+            dev,
+            caps,
+            loopback: Arc::new(LoopbackDataplane::new()),
+        }
     }
 }
 
@@ -354,6 +404,17 @@ impl Device for VirtioSmoltcpDevice {
     }
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(buf) = self.loopback.pop_rx() {
+            return Some((
+                VirtioRxToken { buf },
+                VirtioTxToken {
+                    dev: Arc::clone(&self.dev),
+                    loopback: Arc::clone(&self.loopback),
+                    mac: self.mac,
+                },
+            ));
+        }
+
         let mut buf = vec![0u8; RX_BUF_LEN];
         let len = self.dev.try_recv(buf.as_mut_slice())?;
         buf.truncate(len);
@@ -361,6 +422,8 @@ impl Device for VirtioSmoltcpDevice {
             VirtioRxToken { buf },
             VirtioTxToken {
                 dev: Arc::clone(&self.dev),
+                loopback: Arc::clone(&self.loopback),
+                mac: self.mac,
             },
         ))
     }
@@ -369,6 +432,8 @@ impl Device for VirtioSmoltcpDevice {
         if self.dev.can_send() {
             Some(VirtioTxToken {
                 dev: Arc::clone(&self.dev),
+                loopback: Arc::clone(&self.loopback),
+                mac: self.mac,
             })
         } else {
             None
@@ -391,6 +456,8 @@ impl RxToken for VirtioRxToken {
 
 struct VirtioTxToken {
     dev: Arc<drivers::net::VirtIONetDevice>,
+    loopback: Arc<LoopbackDataplane>,
+    mac: [u8; 6],
 }
 
 impl TxToken for VirtioTxToken {
@@ -400,6 +467,12 @@ impl TxToken for VirtioTxToken {
     {
         let mut buf = vec![0u8; len];
         let ret = f(buf.as_mut_slice());
+
+        if self.try_handle_loopback_tx(buf.as_slice()) {
+            NEED_POLL.store(true, Ordering::Release);
+            return ret;
+        }
+
         match self.dev.try_send(buf.as_slice()) {
             Ok(true) => {}
             Ok(false) => {
@@ -411,5 +484,92 @@ impl TxToken for VirtioTxToken {
         }
         NEED_POLL.store(true, Ordering::Release);
         ret
+    }
+}
+
+impl VirtioTxToken {
+    fn try_handle_loopback_tx(&self, frame: &[u8]) -> bool {
+        if frame.len() < ETH_HEADER_LEN {
+            return false;
+        }
+
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        match ethertype {
+            ETH_TYPE_IPV4 => self.handle_ipv4_loopback(frame),
+            ETH_TYPE_ARP => self.handle_arp_loopback(frame),
+            _ => false,
+        }
+    }
+
+    fn handle_ipv4_loopback(&self, frame: &[u8]) -> bool {
+        const IPV4_MIN_HEADER_LEN: usize = 20;
+
+        if frame.len() < ETH_HEADER_LEN + IPV4_MIN_HEADER_LEN {
+            return false;
+        }
+
+        let ihl = ((frame[ETH_HEADER_LEN] & 0x0f) as usize) * 4;
+        if ihl < IPV4_MIN_HEADER_LEN || frame.len() < ETH_HEADER_LEN + ihl {
+            return false;
+        }
+
+        let dst_ip = &frame[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20];
+        if !is_loopback_ipv4_bytes(dst_ip) {
+            return false;
+        }
+
+        let mut looped = frame.to_vec();
+        looped[..6].copy_from_slice(&self.mac);
+        looped[6..12].copy_from_slice(&self.mac);
+        self.loopback.push_rx(looped);
+        true
+    }
+
+    fn handle_arp_loopback(&self, frame: &[u8]) -> bool {
+        if frame.len() < ARP_FRAME_LEN {
+            return false;
+        }
+
+        // Ethernet(1)/IPv4(0x0800), hlen=6, plen=4
+        if frame[14..20] != [0x00, 0x01, 0x08, 0x00, 0x06, 0x04] {
+            return false;
+        }
+
+        let op = u16::from_be_bytes([frame[20], frame[21]]);
+        let sender_mac = &frame[22..28];
+        let sender_ip = &frame[28..32];
+        let target_ip = &frame[38..42];
+
+        let target_is_loopback = is_loopback_ipv4_bytes(target_ip);
+        let sender_is_loopback = is_loopback_ipv4_bytes(sender_ip);
+
+        // Resolve loopback ARP locally: synthesize ARP reply and enqueue it
+        // into our software RX path.
+        if op == ARP_OP_REQUEST && target_is_loopback {
+            let mut reply = frame.to_vec();
+
+            // Ethernet header
+            reply[..6].copy_from_slice(sender_mac);
+            reply[6..12].copy_from_slice(&self.mac);
+
+            // ARP payload
+            reply[20..22].copy_from_slice(&ARP_OP_REPLY.to_be_bytes());
+            reply[22..28].copy_from_slice(&self.mac);
+            reply[28..32].copy_from_slice(target_ip);
+            reply[32..38].copy_from_slice(sender_mac);
+            reply[38..42].copy_from_slice(sender_ip);
+
+            self.loopback.push_rx(reply);
+            return true;
+        }
+
+        // A request with loopback sender protocol address must never be sent
+        // onto external Ethernet.
+        if op == ARP_OP_REQUEST && sender_is_loopback {
+            trace!("net: drop external ARP request with loopback sender IP");
+            return true;
+        }
+
+        false
     }
 }
