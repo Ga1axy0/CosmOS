@@ -1,7 +1,7 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, canonicalize, do_umount,
-    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device,
+    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device, truncate_inode,
     rename_at,
     open_file_at, unlinkat,
 };
@@ -232,6 +232,14 @@ fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
         return Err(ERRNO::EACCES);
     }
     Ok(desc)
+}
+
+/// 解析 truncate 系统调用传入的目标长度。
+fn parse_truncate_len(len: isize) -> Result<usize, ERRNO> {
+    if len < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(len as usize)
 }
 
 /// 从用户态复制 `iovec` 数组，避免数组跨页时直接解引用失败。
@@ -758,6 +766,58 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
         entry.flags = fd_flags;
         inner.fd_table[fd] = Some(entry);
         Ok(fd as isize)
+    })
+}
+
+/// `truncate(2)`：按路径调整常规文件长度。
+pub fn sys_truncate(path: *const u8, len: isize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_truncate",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let new_size = parse_truncate_len(len)?;
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        debug!("sys_truncate: path='{}', new_size={}", path, new_size);
+        let target = resolve_at_target(AT_FDCWD, path.as_str(), 0)?;
+        match target {
+            ResolvedAtTarget::Inode(inode) => {
+                debug!(
+                    "sys_truncate: resolved inode fs_id={} ino={}",
+                    inode.fs_id(),
+                    inode.ino()
+                );
+                truncate_inode(&inode, new_size).map_err(ERRNO::from)?;
+                Ok(0)
+            }
+            ResolvedAtTarget::FileDesc(_) => Err(ERRNO::EINVAL),
+        }
+    })
+}
+
+/// `ftruncate(2)`：按已打开文件描述调整常规文件长度。
+pub fn sys_ftruncate(fd: u32, len: isize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_ftruncate",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let new_size = parse_truncate_len(len)?;
+        let desc = get_writable_file(fd as usize)?;
+        debug!("sys_ftruncate: fd={}, new_size={}", fd, new_size);
+        if let Some(inode) = desc.backing_inode() {
+            debug!(
+                "sys_ftruncate: backing inode fs_id={} ino={}",
+                inode.fs_id(),
+                inode.ino()
+            );
+        }
+        desc.truncate(new_size)?;
+        Ok(0)
     })
 }
 

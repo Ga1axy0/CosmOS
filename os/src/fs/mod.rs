@@ -18,7 +18,8 @@ use crate::syscall::Pod;
 use fs::Inode;
 pub use fs::vfs::InodeTime;
 pub use page_cache::{
-    mapping_for_inode, CachePage, mark_cached_page_dirty, release_mapped_page, retain_mapped_page,
+    mapping_for_inode, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
+    retain_mapped_page,
 };
 
 bitflags! {
