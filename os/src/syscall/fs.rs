@@ -5,10 +5,10 @@ use crate::fs::{
     rename_at,
     open_file_at, unlinkat,
 };
-use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
+use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
-use crate::syscall::{write_bytes_to_user, write_pod_to_user};
+use crate::syscall::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
@@ -960,12 +960,11 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
         "kernel:pid[{}] sys_write",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
         Ok(desc.write(UserBuffer::new(
-            translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
+            translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?,
         )) as isize)
     })
 }
@@ -987,7 +986,11 @@ pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                 continue;
             }
             let user_buf = UserBuffer::new(
-                translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len).or_errno(ERRNO::EFAULT)?,
+                translated_byte_buffer_with_access(
+                    iovec.iov_base as *const u8,
+                    iovec.iov_len,
+                    PageFaultAccess::Write,
+                )?,
             );
             let read = desc.read(user_buf);
             read_total = read_total.checked_add(read).ok_or(ERRNO::EINVAL)?;
@@ -1025,8 +1028,11 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                 continue;
             }
             let user_buf = UserBuffer::new(
-                translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len)
-                    .or_errno(ERRNO::EFAULT)?,
+                translated_byte_buffer_with_access(
+                    iovec.iov_base as *const u8,
+                    iovec.iov_len,
+                    PageFaultAccess::Read,
+                )?,
             );
             let written = desc.write(user_buf);
             completed += written;
@@ -1046,13 +1052,12 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
         "kernel:pid[{}] sys_read",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
         let desc = get_readable_file(fd)?;
         trace!("kernel: sys_read .. desc.read");
         Ok(desc.read(UserBuffer::new(
-            translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
+            translated_byte_buffer_with_access(buf, len, PageFaultAccess::Write)?,
         )) as isize)
     })
 }
