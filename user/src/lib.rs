@@ -286,6 +286,17 @@ pub fn unlink(path: &str) -> isize {
     sys_unlinkat(AT_FDCWD as usize, path.as_str(), 0)
 }
 
+/// 按路径调整常规文件长度。
+pub fn truncate(path: &str, len: isize) -> isize {
+    let path = to_cstring(path);
+    sys_truncate(path.as_str(), len)
+}
+
+/// 按文件描述符调整常规文件长度。
+pub fn ftruncate(fd: usize, len: isize) -> isize {
+    sys_ftruncate(fd, len)
+}
+
 pub fn fstat(fd: usize, st: &mut Stat) -> isize {
     sys_fstat(fd, st)
 }

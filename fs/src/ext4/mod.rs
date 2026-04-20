@@ -170,6 +170,12 @@ impl Ext4Inode {
 
         let ext4 = self.fs.ext4.lock();
         let old_size = ext4.get_inode_ref(self.inode_num).inode.size() as usize;
+        debug!(
+            "Ext4Inode truncate: ino={} old_size={} new_size={}",
+            self.inode_num,
+            old_size,
+            new_size
+        );
         if old_size == new_size {
             return Ok(());
         }
@@ -181,6 +187,12 @@ impl Ext4Inode {
             if new_size > 0 && tail_off != 0 {
                 let zero_len = BLOCK_SIZE - tail_off;
                 // 先把保留尾块的新 EOF 之后部分清零，避免未来再次扩容时旧数据重新可见。
+                debug!(
+                    "Ext4Inode truncate shrink tail: ino={} zero_from={} zero_len={}",
+                    self.inode_num,
+                    new_size,
+                    zero_len
+                );
                 ext4.write_at(self.inode_num, new_size, &zero_block[..zero_len])?;
             }
 
@@ -189,6 +201,12 @@ impl Ext4Inode {
             let new_blocks = ((new_size as u64) + block_size - 1) / block_size;
             let old_blocks = ((old_size as u64) + block_size - 1) / block_size;
             if old_blocks > new_blocks {
+                debug!(
+                    "Ext4Inode truncate shrink blocks: ino={} old_blocks={} new_blocks={}",
+                    self.inode_num,
+                    old_blocks,
+                    new_blocks
+                );
                 ext4.extent_remove_space(&mut inode_ref, new_blocks as u32, u32::MAX)?;
             }
             inode_ref.inode.set_size(new_size as u64);
@@ -200,6 +218,12 @@ impl Ext4Inode {
         let mut cursor = old_size;
         while cursor < new_size {
             let chunk_len = min(BLOCK_SIZE, new_size - cursor);
+            debug!(
+                "Ext4Inode truncate grow chunk: ino={} off={} len={}",
+                self.inode_num,
+                cursor,
+                chunk_len
+            );
             ext4.write_at(self.inode_num, cursor, &zero_block[..chunk_len])?;
             cursor += chunk_len;
         }

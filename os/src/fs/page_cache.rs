@@ -234,6 +234,13 @@ pub fn write_inode(inode: &Arc<Inode>, offset: usize, buf: &[u8]) -> usize {
 
 /// 调整 inode 逻辑长度，并同步更新对应 page cache。
 pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRNO> {
+    debug!(
+        "[page_cache] truncate inode: fs_id={} ino={} old_size={} new_size={}",
+        inode.fs_id(),
+        inode.ino(),
+        cached_inode_size(inode),
+        new_size
+    );
     if let Some(mapping) = mapping_for_inode(inode) {
         mapping.truncate(new_size);
         return Ok(());
@@ -421,8 +428,18 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
 
     let old_size = mapping.lock().size;
     if old_size == new_size {
+        debug!(
+            "[page_cache] truncate skip: old_size == new_size == {}",
+            new_size
+        );
         return;
     }
+
+    debug!(
+        "[page_cache] truncate mapping: old_size={} new_size={}",
+        old_size,
+        new_size
+    );
 
     // 这里底层 inode truncate 失败时直接 panic，避免 page cache 与底层长度分离。
     if inode.truncate(new_size).is_err() {
@@ -458,6 +475,11 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
                 .map(|(&idx, _)| idx)
                 .collect();
             let removed_cnt = removed_indices.len();
+            debug!(
+                "[page_cache] truncate shrink: first_removed_idx={} removed_pages={}",
+                first_removed_idx,
+                removed_cnt
+            );
             for page_idx in removed_indices {
                 mapping_guard.pages.remove(&page_idx);
                 mapping_guard.dirty_pages.remove(&page_idx);
@@ -480,6 +502,11 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
         if let Some(tail_page) = tail_page {
             let mut page_guard = tail_page.lock();
             let bytes = page_guard.ppn().get_bytes_array();
+            debug!(
+                "[page_cache] truncate shrink tail: page_idx={} keep_bytes={}",
+                new_tail_idx,
+                new_tail_valid
+            );
             bytes[new_tail_valid..].fill(0);
             page_guard.valid_bytes = min(page_guard.valid_bytes, new_tail_valid);
             page_guard.state.insert(CachePageState::UPTODATE);
@@ -495,6 +522,12 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
                 let new_valid = page_valid_bytes_for_size(new_size, old_tail_idx);
                 if new_valid > old_tail_valid {
                     let bytes = page_guard.ppn().get_bytes_array();
+                    debug!(
+                        "[page_cache] truncate grow tail: page_idx={} zero_range=[{}..{})",
+                        old_tail_idx,
+                        old_tail_valid,
+                        new_valid
+                    );
                     bytes[old_tail_valid..new_valid].fill(0);
                     page_guard.valid_bytes = max(page_guard.valid_bytes, new_valid);
                     page_guard.state.insert(CachePageState::UPTODATE);
