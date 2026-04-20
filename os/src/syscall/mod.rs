@@ -235,7 +235,7 @@ use thread::*;
 use crate::syscall::random::*;
 use mman::*;
 use times::*;
-pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
+pub(crate) use utils::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 
 
 use crate::{fs::Stat, net::SockAddrIn, syscall::errno::ERRNO};
