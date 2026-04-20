@@ -1,9 +1,9 @@
 use crate::{
-    syscall::errno::{OrErrno, ERRNO},
+    syscall::errno::ERRNO,
     syscall_body,
     config::{PAGE_SIZE, PAGE_SIZE_BITS, TRAP_CONTEXT_BASE},
     mm::{
-        translated_byte_buffer, MapPermission,
+        MapPermission,
         VirtAddr,
     },
     task::{
@@ -37,6 +37,17 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
+        let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
+        debug!(
+            "[mmap] request: pid={} addr={:#x} len={} prot={:#x} flags={:#x} fd={} offset={:#x}",
+            pid,
+            addr,
+            len,
+            prot,
+            flags,
+            fd,
+            offset
+        );
         if addr & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
             return Err(ERRNO::EINVAL); // addr not page-aligned
         }
@@ -77,37 +88,21 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         }
 
 
-        //if user did not specify addr.
-        let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let map_addr = if addr == 0 {
-            // Linux-style mmap(NULL, ...): choose a free user VA automatically.
-            let step = len_aligned.max(PAGE_SIZE);
-            let mut probe = current_process().mmap_base();
-            let limit = TRAP_CONTEXT_BASE.saturating_sub(step);
-            let mut chosen: Option<usize> = None;
-            while probe <= limit {
-                let probe_end = probe.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
-                if mmap_current_process(VirtAddr::from(probe), VirtAddr::from(probe_end), perm) {
-                    chosen = Some(probe);
-                    break;
-                }
-                probe = probe.saturating_add(step);
-            }
-            chosen.ok_or(ERRNO::ENOMEM)?
-        } else {
-            if !mmap_current_process(VirtAddr::from(addr), VirtAddr::from(end), perm) {
-                return Err(ERRNO::ENOMEM);
-            }
-            addr
-        };
-
+        // if user did not specify addr.
+        // 对齐前先检查溢出，避免超大长度把探测步长算错。
+        let len_aligned = len
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(ERRNO::EOVERFLOW)?
+            & !(PAGE_SIZE - 1);
+        let process = current_process();
         let native_compat = flags == 0 && fd == 0 && offset == 0;
+        let mut file_desc = None;
+        let mut is_shared = false;
         if !native_compat {
             let mmap_flags = MMapFlags::from_bits_truncate(flags);
             let is_anon = mmap_flags.contains(MMapFlags::MAP_ANONYMOUS);
-            let is_shared = mmap_flags.contains(MMapFlags::MAP_SHARED);
+            is_shared = mmap_flags.contains(MMapFlags::MAP_SHARED);
             if !is_anon {
-                let process = current_process();
                 let file = {
                     let inner = process.inner_exclusive_access();
                     inner
@@ -126,13 +121,84 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                 if is_shared && (prot & MMapProt::PROT_WRITE.bits()) != 0 && !file.writable() {
                     return Err(ERRNO::EACCES);
                 }
-                // Best-effort file-backed behavior: preload mapping bytes from file at `offset`.
-                let token = current_user_token();
-                let dst =
-                    translated_byte_buffer(token, map_addr as *const u8, len).or_errno(ERRNO::EFAULT)?;
-                let _ = file.read_at(offset, crate::mm::UserBuffer::new(dst));
+                if file.backing_inode().is_none() {
+                    // TODO：后续若要支持设备文件专用 mmap，这里需要分派到对应驱动。
+                    return Err(ERRNO::ENODEV);
+                }
+                file_desc = Some(file);
             }
         }
+        let map_addr = if addr == 0 {
+            // Linux-style mmap(NULL, ...): choose a free user VA automatically.
+            let step = len_aligned.max(PAGE_SIZE);
+            let mut probe = process.mmap_base();
+            let limit = TRAP_CONTEXT_BASE.saturating_sub(step);
+            let mut chosen: Option<usize> = None;
+            while probe <= limit {
+                let probe_end = probe.checked_add(step).ok_or(ERRNO::EOVERFLOW)?;
+                let mapped = if let Some(file) = file_desc.as_ref() {
+                    process.mmap_file(
+                        VirtAddr::from(probe),
+                        VirtAddr::from(probe_end),
+                        perm,
+                        file.clone(),
+                        offset / PAGE_SIZE,
+                        is_shared,
+                    )
+                } else {
+                    process.mmap(VirtAddr::from(probe), VirtAddr::from(probe_end), perm)
+                };
+                if mapped {
+                    debug!(
+                        "[mmap] auto-selected range: pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
+                        pid,
+                        probe,
+                        probe_end,
+                        file_desc.is_some(),
+                        is_shared,
+                        file_desc.is_some()
+                    );
+                    chosen = Some(probe);
+                    break;
+                }
+                probe = probe.saturating_add(step);
+            }
+            chosen.ok_or(ERRNO::ENOMEM)?
+        } else {
+            let mapped = if let Some(file) = file_desc.as_ref() {
+                process.mmap_file(
+                    VirtAddr::from(addr),
+                    VirtAddr::from(end),
+                    perm,
+                    file.clone(),
+                    offset / PAGE_SIZE,
+                    is_shared,
+                )
+            } else {
+                process.mmap(VirtAddr::from(addr), VirtAddr::from(end), perm)
+            };
+            if !mapped {
+                return Err(ERRNO::ENOMEM);
+            }
+            debug!(
+                "[mmap] fixed range registered: pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
+                pid,
+                addr,
+                end,
+                file_desc.is_some(),
+                is_shared,
+                file_desc.is_some()
+            );
+            addr
+        };
+
+        debug!(
+            "[mmap] complete: pid={} mapped_addr={:#x} len_aligned={} native_compat={}",
+            pid,
+            map_addr,
+            len_aligned,
+            native_compat
+        );
 
         if native_compat {
             Ok(0)
@@ -149,6 +215,13 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
+        let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
+        debug!(
+            "[munmap] request: pid={} start={:#x} len={}",
+            pid,
+            start,
+            len
+        );
         if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
             return Err(ERRNO::EINVAL); // start not page-aligned
         }
@@ -157,6 +230,12 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         }
         let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
         if munmap_current_process(VirtAddr::from(start), VirtAddr::from(end)) {
+            debug!(
+                "[munmap] complete: pid={} start={:#x} end={:#x}",
+                pid,
+                start,
+                end
+            );
             Ok(0)
         } else {
             // Unmapping an invalid/unmapped range is treated as ENOMEM.

@@ -51,8 +51,8 @@ impl Fat32FileSystem {
         &self.inner
     }
 
-    /// Root directory inode.
-    pub fn root_inode(fs: &Arc<Self>) -> Inode {
-        Inode::new(Arc::new(inode::FatInode::new_root(Arc::clone(fs))) as Arc<dyn VfsNode>)
+    /// 返回根目录对应的稳定内存 inode。
+    pub fn root_inode(fs: &Arc<Self>) -> Arc<Inode> {
+        Inode::from_vfs_node(Arc::new(inode::FatInode::new_root(Arc::clone(fs))) as Arc<dyn VfsNode>)
     }
 }

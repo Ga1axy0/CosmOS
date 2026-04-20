@@ -1,6 +1,7 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
 mod inode;
+mod page_cache;
 mod pipe;
 mod stdio;
 mod tty;
@@ -16,7 +17,10 @@ use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use core::any::Any;
 pub use fs::vfs::InodeTime;
-use fs::Inode;
+pub use page_cache::{
+    mapping_for_inode, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
+    retain_mapped_page,
+};
 
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
@@ -157,6 +161,11 @@ impl FileDescription {
         self.file.write_at(offset, buf)
     }
 
+    /// 调整底层文件对象的逻辑长度。
+    pub fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
+        self.file.truncate(new_size)
+    }
+
     /// 获取当前 `F_GETFL` 可见状态值。
     pub fn status_bits(&self) -> i32 {
         let inner = self.inner.lock();
@@ -193,10 +202,14 @@ impl FileDescription {
         self.file.path()
     }
 
-    /// If this `FileDescription` refers to a real filesystem inode, return it.
-    /// This forwards to the underlying `File` object's `as_inode` method.
+    /// 返回该打开文件描述关联的 inode；非 inode 类型文件返回 `None`。
     pub fn as_inode(&self) -> Option<Arc<Inode>> {
         self.file.as_inode()
+    }
+
+    /// 返回该打开文件描述最终关联的稳定 inode。
+    pub fn backing_inode(&self) -> Option<Arc<Inode>> {
+        self.file.backing_inode()
     }
 
     /// 读取目录项并推进共享目录位置。
@@ -295,6 +308,10 @@ pub trait File: Send + Sync + Any {
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
     }
+    /// 调整文件逻辑长度。
+    fn truncate(&self, _new_size: usize) -> Result<(), ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
+    }
     /// Query readiness for a subset of poll events.
     ///
     /// Input `events` is a bitmask compatible with Linux `poll(2)` bits
@@ -334,18 +351,26 @@ pub trait File: Send + Sync + Any {
     }
     /// get file metadata
     fn stat(&self) -> Stat;
+    /// 将该文件对象的脏数据同步到底层存储。
+    fn sync(&self) -> Result<(), ERRNO> {
+        Ok(())
+    }
     /// Returns the canonical path used when this file was opened, if any.
     fn path(&self) -> Option<String> {
         None
     }
-    /// If this `File` is a wrapper around a real filesystem inode, return it.
-    /// Default implementation returns `None` for non-inode file types.
+    /// 返回该文件对象关联的 inode；非 inode 类型文件返回 `None`。
     fn as_inode(&self) -> Option<Arc<Inode>> {
         None
     }
     /// Change the file mode bits, if supported by this file type.
     fn chmod(&self, _mode: u32) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
+    /// 返回该文件对象最终关联的稳定 inode；不支持文件映射的对象返回 `None`。
+    fn backing_inode(&self) -> Option<Arc<Inode>> {
+        None
     }
 }
 

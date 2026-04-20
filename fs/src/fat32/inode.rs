@@ -4,6 +4,7 @@ use spin::Mutex;
 
 use crate::{BLOCK_SZ, fat32::dir::DirAttr};
 use crate::block_cache::get_block_cache;
+use crate::errno::FS_ERRNO;
 use crate::vfs::VfsNode;
 
 use super::{Fat32FileSystem, dir, fat};
@@ -729,6 +730,11 @@ impl VfsNode for FatInode {
         }
     }
 
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        // TODO：补齐 FAT32 的通用 truncate 语义，包括尾簇裁剪、扩容补零与目录项同步。
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let inner = self.inner.lock();
         if inner.is_dir {
@@ -776,5 +782,24 @@ impl VfsNode for FatInode {
 
     fn size(&self) -> usize {
         self.inner.lock().size as usize
+    }
+
+    fn ino(&self) -> u64 {
+        let inner = self.inner.lock();
+        if inner.is_dir && inner.pos.is_none() {
+            return inner.start_cluster as u64;
+        }
+        if let Some(pos) = &inner.pos {
+            // TODO：FAT32 没有天然稳定 inode 号，这里先用目录项位置近似标识。
+            ((pos.dir_start_cluster as u64) << 32) | pos.entry_offset as u64
+        } else if inner.start_cluster >= 2 {
+            (1u64 << 63) | inner.start_cluster as u64
+        } else {
+            0
+        }
+    }
+
+    fn fs_id(&self) -> u64 {
+        Arc::as_ptr(&self.fs) as usize as u64
     }
 }

@@ -1,4 +1,4 @@
-use super::{File, Stat, StatMode};
+use super::{page_cache, File, Stat, StatMode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
@@ -32,14 +32,25 @@ impl OSInode {
         trace!("kernel: OSInode::new");
         Self { path, inode }
     }
+
+    /// 返回当前普通文件对应的 page mapping；目录或不可缓存对象返回 `None`。
+    fn page_mapping(&self) -> Option<page_cache::PageMappingHandle> {
+        page_cache::mapping_for_inode(&self.inode)
+    }
+
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
         let mut buffer: Vec<u8> = alloc::vec![0; 8192];
         let mut v: Vec<u8> = Vec::new();
         let mut offset = 0usize;
+        let mapping = self.page_mapping();
         loop {
-            let len = self.inode.read_at(offset, &mut buffer);
+            let len = if let Some(mapping) = mapping.as_ref() {
+                mapping.read(offset, &mut buffer)
+            } else {
+                self.inode.read_at(offset, &mut buffer)
+            };
             if len == 0 {
                 break;
             }
@@ -54,7 +65,11 @@ impl OSInode {
     pub fn read_first_line_limited(&self, max_len: usize) -> (Vec<u8>, bool) {
         trace!("kernel: OSInode::read_first_line_limited, max_len={}", max_len);
         let mut buf = alloc::vec![0; max_len];
-        let read_len = self.inode.read_at(0, &mut buf);
+        let read_len = if let Some(mapping) = self.page_mapping() {
+            mapping.read(0, &mut buf)
+        } else {
+            self.inode.read_at(0, &mut buf)
+        };
         buf.truncate(read_len);
 
         if let Some(line_end) = buf.iter().position(|&ch| ch == b'\n') {
@@ -97,7 +112,7 @@ lazy_static! {
     /// Call [`init_rootfs`] once after `mm::init()` to overlay a real
     /// filesystem and make the full directory tree accessible.
     pub static ref ROOT_INODE: Arc<Inode> =
-        Arc::new(Inode::new(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>));
+        Inode::from_vfs_node(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,21 +253,21 @@ pub fn init_rootfs() {
     {
         use fs::Fat32FileSystem;
         let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
-        let root = Arc::new(Fat32FileSystem::root_inode(&vfs));
+        let root = Fat32FileSystem::root_inode(&vfs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
     }
     #[cfg(feature = "easyfs")]
     {
         use fs::EasyFileSystem;
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
-        let root = Arc::new(EasyFileSystem::root_inode(&efs));
+        let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
     }
     #[cfg(feature = "ext4")]
     {
         use fs::Ext4FileSystem;
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
-        let root = Arc::new(Ext4FileSystem::root_inode(&efs));
+        let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
@@ -364,7 +379,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
                 return Err(ERRNO::EEXIST);
             }
             if flags.contains(OpenFlags::TRUNC) {
-                existing.clear();
+                page_cache::truncate_inode(&existing, 0).map_err(ERRNO::from)?;
             }
             Ok(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
@@ -377,10 +392,10 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
         lookup_inode(&abs).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 debug!("open_file_at: truncating existing file at {}", abs);
-                inode.clear();
+                page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
-            Arc::new(OSInode::new(inode, abs.clone()))
-        }).ok_or(ERRNO::ENOENT)
+            Ok(Arc::new(OSInode::new(inode, abs.clone())))
+        }).ok_or(ERRNO::ENOENT)?
     }
 }
 
@@ -451,7 +466,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         if let Some(inode) = ROOT_INODE.find(name) {
             // 与 `openat(O_CREAT)` 保持一致：只有显式 `O_TRUNC` 才清空已有文件。
             if flags.contains(OpenFlags::TRUNC) {
-                inode.clear();
+                page_cache::truncate_inode(&inode, 0).ok()?;
             }
             Some(Arc::new(OSInode::new(inode, abs)))
         } else {
@@ -464,10 +479,11 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     } else {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
-                inode.clear();
+                page_cache::truncate_inode(&inode, 0).ok()?;
             }
-            Arc::new(OSInode::new(inode, abs))
+            Some(Arc::new(OSInode::new(inode, abs)))
         })
+        .flatten()
     }
 }
 
@@ -592,10 +608,15 @@ impl File for OSInode {
         self.inode.is_dir()
     }
     fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
+        let mapping = self.page_mapping();
         let mut file_off = offset;
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
-            let read_size = self.inode.read_at(file_off, *slice);
+            let read_size = if let Some(mapping) = mapping.as_ref() {
+                mapping.read(file_off, *slice)
+            } else {
+                self.inode.read_at(file_off, *slice)
+            };
             if read_size == 0 {
                 break;
             }
@@ -608,15 +629,24 @@ impl File for OSInode {
         total_read_size
     }
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
+        let mapping = self.page_mapping();
         let mut total_write_size = 0usize;
         let mut file_off = offset;
         for slice in buf.buffers.iter() {
-            let write_size = self.inode.write_at(file_off, *slice);
+            let write_size = if let Some(mapping) = mapping.as_ref() {
+                mapping.write(file_off, *slice)
+            } else {
+                self.inode.write_at(file_off, *slice)
+            };
             assert_eq!(write_size, slice.len());
             file_off += write_size;
             total_write_size += write_size;
         }
         total_write_size
+    }
+
+    fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
+        page_cache::truncate_inode(&self.inode, new_size).map_err(ERRNO::from)
     }
 
     fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
@@ -696,6 +726,13 @@ impl File for OSInode {
         inode_stat(&self.inode)
     }
 
+    fn sync(&self) -> Result<(), ERRNO> {
+        if let Some(mapping) = self.page_mapping() {
+            mapping.sync();
+        }
+        Ok(())
+    }
+
     fn path(&self) -> Option<String> {
         Some(self.path.clone())
     }
@@ -703,6 +740,10 @@ impl File for OSInode {
     fn chmod(&self, mode: u32) -> Result<(), fs::errno::FS_ERRNO> {
         self.inode.set_mode(mode)?;
         Ok(())
+    }
+
+    fn backing_inode(&self) -> Option<Arc<Inode>> {
+        Some(Arc::clone(&self.inode))
     }
 }
 
@@ -723,10 +764,10 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         gid: 0,
         rdev: 0,
         pad0: 0,
-        size: inode.size() as i64,
+        size: page_cache::cached_inode_size(inode) as i64,
         blksize: 512,
         pad1: 0,
-        blocks: (inode.size() as u64 + 511) / 512,
+        blocks: (page_cache::cached_inode_size(inode) as u64 + 511) / 512,
         atime_sec: atime.map(|t| t.sec as isize).unwrap_or(0),
         atime_nsec: atime.map(|t| t.nsec as isize).unwrap_or(0),
         mtime_sec: mtime.map(|t| t.sec as isize).unwrap_or(0),
@@ -804,13 +845,13 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
             use fs::Fat32FileSystem;
             debug!("mount_device: opening FAT32 filesystem on {}", dev_path);
             let vfs = Fat32FileSystem::open(block_dev);
-            Arc::new(Fat32FileSystem::root_inode(&vfs))
+            Fat32FileSystem::root_inode(&vfs)
         }
         #[cfg(feature = "ext4")]
         "ext4" => {
             use fs::Ext4FileSystem;
             let vfs = Ext4FileSystem::open(block_dev);
-            Arc::new(Ext4FileSystem::root_inode(&vfs))
+            Ext4FileSystem::root_inode(&vfs)
         }
         _ => return Err(ERRNO::EINVAL),
     };
