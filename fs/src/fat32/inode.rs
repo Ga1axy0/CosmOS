@@ -4,6 +4,7 @@ use spin::Mutex;
 
 use crate::{BLOCK_SZ, fat32::dir::DirAttr};
 use crate::block_cache::get_block_cache;
+use crate::errno::FS_ERRNO;
 use crate::vfs::VfsNode;
 
 use super::{Fat32FileSystem, dir, fat};
@@ -727,6 +728,11 @@ impl VfsNode for FatInode {
         if let Some(pos) = &inner.pos {
             self.update_dirent_after_change(pos, 0, 0);
         }
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        // TODO：补齐 FAT32 的通用 truncate 语义，包括尾簇裁剪、扩容补零与目录项同步。
+        Err(FS_ERRNO::EOPNOTSUPP)
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {

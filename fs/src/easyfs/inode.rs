@@ -6,6 +6,7 @@ use crate::{
     BlockDevice, EasyFileSystem,
     block_cache::get_block_cache,
     easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType},
+    errno::FS_ERRNO,
     vfs::{Inode, VfsNode},
 };
 
@@ -185,6 +186,11 @@ impl VfsNode for EasyInode {
                 fs.dealloc_data(data_block);
             }
         });
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        // TODO：补齐 EasyFS 的通用 truncate 语义，包括缩容回收与扩容补零。
+        Err(FS_ERRNO::EOPNOTSUPP)
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {

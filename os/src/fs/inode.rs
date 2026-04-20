@@ -633,6 +633,11 @@ impl File for OSInode {
         total_write_size
     }
 
+    fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
+        // TODO：后续接入通用 page cache truncate 后，这里需要先同步失效 cache 与共享映射。
+        self.inode.truncate(new_size).map_err(ERRNO::from)
+    }
+
     fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
         let vfs_node = self.inode.vfs_node();
         if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {

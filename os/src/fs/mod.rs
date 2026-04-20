@@ -160,6 +160,11 @@ impl FileDescription {
         self.file.write_at(offset, buf)
     }
 
+    /// 调整底层文件对象的逻辑长度。
+    pub fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
+        self.file.truncate(new_size)
+    }
+
     /// 获取当前 `F_GETFL` 可见状态值。
     pub fn status_bits(&self) -> i32 {
         let inner = self.inner.lock();
@@ -293,6 +298,10 @@ pub trait File: Send + Sync {
     /// 向固定偏移写入数据。
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
+    }
+    /// 调整文件逻辑长度。
+    fn truncate(&self, _new_size: usize) -> Result<(), ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
     }
     /// Query readiness for a subset of poll events.
     ///

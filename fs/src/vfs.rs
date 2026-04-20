@@ -36,6 +36,10 @@ pub trait VfsNode: Send + Sync + Any {
     /// Returns true if this node is a directory.
     fn is_dir(&self) -> bool;
     fn clear(&self);
+    /// 调整常规文件逻辑长度。
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
     /// Stable inode number for stat-like metadata.
@@ -204,6 +208,11 @@ impl Inode {
 
     pub fn clear(&self) {
         self.inner.clear()
+    }
+
+    /// 调整 inode 对应常规文件的逻辑长度。
+    pub fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
+        self.inner.truncate(new_size)
     }
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {

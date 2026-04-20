@@ -1,5 +1,6 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
+use core::cmp::min;
 use log::debug;
 use spin::Mutex;
 
@@ -9,7 +10,7 @@ use crate::vfs::{Inode, InodeTime, VfsNode};
 use crate::BLOCK_SZ;
 
 use ext4_rs::{
-    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType
+    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType, BLOCK_SIZE
 };
 
 /// Adapts the OS block-id based device into ext4_rs offset-based IO.
@@ -140,6 +141,7 @@ pub struct Ext4Inode {
 }
 
 impl Ext4Inode {
+    /// 创建新的 ext4 内存 inode 包装对象。
     fn new(fs: Arc<Ext4FileSystem>, inode_num: u32, is_dir: bool) -> Self {
         Self {
             fs,
@@ -148,6 +150,7 @@ impl Ext4Inode {
         }
     }
 
+    /// 查询目录项元数据，返回 `(inode 编号, 是否目录)`。
     fn lookup_child_meta(&self, name: &str) -> Option<(u32, bool)> {
         if !self.is_dir {
             return None;
@@ -159,6 +162,55 @@ impl Ext4Inode {
             .map(|de| (de.inode, de.get_de_type() == 2))
     }
 
+    /// 在 ext4 后端内实现完整 truncate 语义。
+    fn truncate_file(&self, new_size: usize) -> Result<(), FS_ERRNO> {
+        if self.is_dir {
+            return Err(FS_ERRNO::EISDIR);
+        }
+
+        let ext4 = self.fs.ext4.lock();
+        let old_size = ext4.get_inode_ref(self.inode_num).inode.size() as usize;
+        if old_size == new_size {
+            return Ok(());
+        }
+
+        let zero_block = [0u8; BLOCK_SIZE];
+
+        if new_size < old_size {
+            let tail_off = new_size % BLOCK_SIZE;
+            if new_size > 0 && tail_off != 0 {
+                let zero_len = BLOCK_SIZE - tail_off;
+                // 先把保留尾块的新 EOF 之后部分清零，避免未来再次扩容时旧数据重新可见。
+                ext4.write_at(self.inode_num, new_size, &zero_block[..zero_len])?;
+            }
+
+            let mut inode_ref = ext4.get_inode_ref(self.inode_num);
+            let block_size = BLOCK_SIZE as u64;
+            let new_blocks = ((new_size as u64) + block_size - 1) / block_size;
+            let old_blocks = ((old_size as u64) + block_size - 1) / block_size;
+            if old_blocks > new_blocks {
+                ext4.extent_remove_space(&mut inode_ref, new_blocks as u32, u32::MAX)?;
+            }
+            inode_ref.inode.set_size(new_size as u64);
+            ext4.write_back_inode(&mut inode_ref);
+            return Ok(());
+        }
+
+        // TODO：当前扩容采用显式补零，语义完整但不是稀疏文件实现，后续可按需优化。
+        let mut cursor = old_size;
+        while cursor < new_size {
+            let chunk_len = min(BLOCK_SIZE, new_size - cursor);
+            ext4.write_at(self.inode_num, cursor, &zero_block[..chunk_len])?;
+            cursor += chunk_len;
+        }
+
+        let mut inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref.inode.set_size(new_size as u64);
+        ext4.write_back_inode(&mut inode_ref);
+        Ok(())
+    }
+
+    /// 将目录项从当前目录重命名到新父目录。
     fn rename_child_to(&self, old_name: &str, new_parent: &Self, new_name: &str) -> Result<(), FS_ERRNO> {
         if !self.is_dir || !new_parent.is_dir {
             return Err(FS_ERRNO::ENOTDIR);
@@ -254,13 +306,11 @@ impl VfsNode for Ext4Inode {
     }
 
     fn clear(&self) {
-        if self.is_dir {
-            return;
-        }
-        let ext4 = self.fs.ext4.lock();
-        let mut inode_ref = ext4.get_inode_ref(self.inode_num);
-        // let _ = ext4.truncate_inode(&mut inode_ref, 0);
-        ext4.truncate_inode(&mut inode_ref, 0).unwrap();
+        let _ = self.truncate_file(0);
+    }
+
+    fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
+        self.truncate_file(new_size)
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
