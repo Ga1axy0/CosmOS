@@ -10,7 +10,7 @@ pub mod devfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use fs::errno::FS_ERRNO;
+use fs::{Inode, errno::FS_ERRNO};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
