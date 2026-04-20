@@ -88,16 +88,19 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         }
 
 
-        //if user did not specify addr.
-        let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // if user did not specify addr.
+        // 对齐前先检查溢出，避免超大长度把探测步长算错。
+        let len_aligned = len
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(ERRNO::EOVERFLOW)?
+            & !(PAGE_SIZE - 1);
         let process = current_process();
         let native_compat = flags == 0 && fd == 0 && offset == 0;
         let mut file_desc = None;
         let mut is_shared = false;
-        let is_anon;
         if !native_compat {
             let mmap_flags = MMapFlags::from_bits_truncate(flags);
-            is_anon = mmap_flags.contains(MMapFlags::MAP_ANONYMOUS);
+            let is_anon = mmap_flags.contains(MMapFlags::MAP_ANONYMOUS);
             is_shared = mmap_flags.contains(MMapFlags::MAP_SHARED);
             if !is_anon {
                 let file = {
@@ -132,7 +135,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             let limit = TRAP_CONTEXT_BASE.saturating_sub(step);
             let mut chosen: Option<usize> = None;
             while probe <= limit {
-                let probe_end = probe.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+                let probe_end = probe.checked_add(step).ok_or(ERRNO::EOVERFLOW)?;
                 let mapped = if let Some(file) = file_desc.as_ref() {
                     process.mmap_file(
                         VirtAddr::from(probe),

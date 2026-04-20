@@ -780,11 +780,8 @@ pub fn sys_close(fd: u32) -> isize {
                 return Err(ERRNO::EBADF);
             }
             // 先摘表项，等离开 `process.inner` 后再真正 drop，避免自旋锁内阻塞。
-            closed_entry = Some(
-                inner
-                    .take_fd(fd)
-                    .expect("validated fd must still exist when closing"),
-            );
+            let entry = inner.take_fd(fd).ok_or(ERRNO::EBADF)?;
+            closed_entry = Some(entry);
             Ok(0)
         });
         if result != 0 {

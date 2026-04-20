@@ -749,7 +749,16 @@ fn alloc_cache_frame() -> FrameTracker {
         return frame;
     }
     reclaim_if_needed();
-    // TODO：后续可继续接入更积极的回收/等待策略；当前先在彻底无页时直接报错。
+    if let Some(frame) = frame_alloc() {
+        return frame;
+    }
+    // 分配失败时再主动推进回收，避免 cache 尚未超过高水位时错过可回收页。
+    while reclaim_one() {
+        if let Some(frame) = frame_alloc() {
+            return frame;
+        }
+    }
+    // TODO：后续可继续接入更积极的回收/等待策略；当前在无可回收页且彻底无页时直接报错。
     frame_alloc().expect("page cache out of memory")
 }
 
