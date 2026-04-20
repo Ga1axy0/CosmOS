@@ -372,7 +372,7 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
                 return Err(ERRNO::EEXIST);
             }
             if flags.contains(OpenFlags::TRUNC) {
-                page_cache::truncate_inode_zero(&existing);
+                page_cache::truncate_inode(&existing, 0).map_err(ERRNO::from)?;
             }
             Ok(Arc::new(OSInode::new(existing, abs.clone())))
         } else {
@@ -385,10 +385,10 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
         lookup_inode(&abs).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 debug!("open_file_at: truncating existing file at {}", abs);
-                page_cache::truncate_inode_zero(&inode);
+                page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
-            Arc::new(OSInode::new(inode, abs.clone()))
-        }).ok_or(ERRNO::ENOENT)
+            Ok(Arc::new(OSInode::new(inode, abs.clone())))
+        }).ok_or(ERRNO::ENOENT)?
     }
 }
 
@@ -459,7 +459,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         if let Some(inode) = ROOT_INODE.find(name) {
             // 与 `openat(O_CREAT)` 保持一致：只有显式 `O_TRUNC` 才清空已有文件。
             if flags.contains(OpenFlags::TRUNC) {
-                page_cache::truncate_inode_zero(&inode);
+                page_cache::truncate_inode(&inode, 0).ok()?;
             }
             Some(Arc::new(OSInode::new(inode, abs)))
         } else {
@@ -472,10 +472,11 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     } else {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
-                page_cache::truncate_inode_zero(&inode);
+                page_cache::truncate_inode(&inode, 0).ok()?;
             }
-            Arc::new(OSInode::new(inode, abs))
+            Some(Arc::new(OSInode::new(inode, abs)))
         })
+        .flatten()
     }
 }
 
@@ -634,8 +635,7 @@ impl File for OSInode {
     }
 
     fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
-        // TODO：后续接入通用 page cache truncate 后，这里需要先同步失效 cache 与共享映射。
-        self.inode.truncate(new_size).map_err(ERRNO::from)
+        page_cache::truncate_inode(&self.inode, new_size).map_err(ERRNO::from)
     }
 
     fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {

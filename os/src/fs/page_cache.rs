@@ -3,6 +3,7 @@ use alloc::sync::{Arc, Weak};
 use bitflags::bitflags;
 use core::cmp::{max, min};
 
+use fs::errno::FS_ERRNO;
 use fs::Inode;
 use lazy_static::lazy_static;
 
@@ -134,11 +135,9 @@ impl PageMappingHandle {
         sync_mapping(&self.inner);
     }
 
-    /// 将当前文件截断到 0，并失效已有缓存页。
-    ///
-    /// TODO：当前只接入“截断到 0”；后续补齐任意长度 `truncate/ftruncate` 时，需要扩展成通用区间失效。
-    pub fn truncate_zero(&self) {
-        truncate_mapping_zero(&self.inner);
+    /// 调整当前文件长度，并同步更新已有缓存页。
+    pub fn truncate(&self, new_size: usize) {
+        truncate_mapping(&self.inner, new_size);
     }
 
     /// 获取指定文件页号对应的缓存页，供后续 `mmap` 缺页路径复用。
@@ -233,14 +232,15 @@ pub fn write_inode(inode: &Arc<Inode>, offset: usize, buf: &[u8]) -> usize {
         .write(offset, buf)
 }
 
-/// 将 inode 截断到 0，并丢弃对应的缓存页。
-pub fn truncate_inode_zero(inode: &Arc<Inode>) {
+/// 调整 inode 逻辑长度，并同步更新对应 page cache。
+pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRNO> {
     if let Some(mapping) = mapping_for_inode(inode) {
-        mapping.truncate_zero();
-        return;
+        mapping.truncate(new_size);
+        return Ok(());
     }
-    inode.clear();
+    inode.truncate(new_size)?;
     // TODO：后续接入 `mmap(MAP_SHARED)` 后，这里还需要同步失效用户态映射。
+    Ok(())
 }
 
 /// 将某个 inode 的脏页全部同步到底层文件。
@@ -409,8 +409,8 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
     done
 }
 
-/// 将当前 mapping 截断到 0，并清空已有缓存页。
-fn truncate_mapping_zero(mapping: &Arc<SpinNoIrqLock<PageMapping>>) {
+/// 调整当前 mapping 长度，并同步更新已有缓存页。
+fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) {
     let inode = {
         let mapping_guard = mapping.lock();
         mapping_guard
@@ -419,19 +419,90 @@ fn truncate_mapping_zero(mapping: &Arc<SpinNoIrqLock<PageMapping>>) {
             .expect("page cache inode disappeared")
     };
 
+    let old_size = mapping.lock().size;
+    if old_size == new_size {
+        return;
+    }
+
+    // 这里底层 inode truncate 失败时直接 panic，避免 page cache 与底层长度分离。
+    if inode.truncate(new_size).is_err() {
+        panic!("page cache truncate must stay consistent with backing inode");
+    }
+
+    let old_last_valid = old_size.saturating_sub(1);
+    let new_last_valid = new_size.saturating_sub(1);
+    let old_tail_idx = file_page_index(old_last_valid);
+    let new_tail_idx = file_page_index(new_last_valid);
+    let new_tail_valid = if new_size == 0 {
+        0
+    } else {
+        page_valid_bytes_for_size(new_size, new_tail_idx)
+    };
+
+    // 对于truncate缩小的情况，被丢弃的页即使是脏的也无需写回，最终总是要被丢弃的。
     let removed_pages = {
         let mut mapping_guard = mapping.lock();
-        let removed_pages = mapping_guard.pages.len();
-        mapping_guard.pages.clear();
-        mapping_guard.dirty_pages.clear();
-        mapping_guard.size = 0;
-        removed_pages
+        mapping_guard.size = new_size;
+
+        if new_size < old_size {
+            let first_removed_idx = if new_size == 0 {
+                0
+            } else if new_tail_valid == PAGE_SIZE {
+                new_tail_idx.saturating_add(1)
+            } else {
+                new_tail_idx.saturating_add(1)
+            };
+            let removed_indices: alloc::vec::Vec<_> = mapping_guard
+                .pages
+                .range(first_removed_idx..)
+                .map(|(&idx, _)| idx)
+                .collect();
+            let removed_cnt = removed_indices.len();
+            for page_idx in removed_indices {
+                mapping_guard.pages.remove(&page_idx);
+                mapping_guard.dirty_pages.remove(&page_idx);
+            }
+            if new_size == 0 {
+                mapping_guard.dirty_pages.clear();
+            }
+            removed_cnt
+        } else {
+            0
+        }
     };
     {
         let mut manager = PAGE_CACHE_MANAGER.lock();
         manager.cached_pages = manager.cached_pages.saturating_sub(removed_pages);
     }
-    inode.clear();
+
+    if new_size < old_size && new_size > 0 {
+        let tail_page = mapping.lock().pages.get(&new_tail_idx).cloned();
+        if let Some(tail_page) = tail_page {
+            let mut page_guard = tail_page.lock();
+            let bytes = page_guard.ppn().get_bytes_array();
+            bytes[new_tail_valid..].fill(0);
+            page_guard.valid_bytes = min(page_guard.valid_bytes, new_tail_valid);
+            page_guard.state.insert(CachePageState::UPTODATE);
+        }
+    }
+
+    if new_size > old_size && old_size > 0 {
+        let old_tail_valid = page_valid_bytes_for_size(old_size, old_tail_idx);
+        if old_tail_valid < PAGE_SIZE {
+            let tail_page = mapping.lock().pages.get(&old_tail_idx).cloned();
+            if let Some(tail_page) = tail_page {
+                let mut page_guard = tail_page.lock();
+                let new_valid = page_valid_bytes_for_size(new_size, old_tail_idx);
+                if new_valid > old_tail_valid {
+                    let bytes = page_guard.ppn().get_bytes_array();
+                    bytes[old_tail_valid..new_valid].fill(0);
+                    page_guard.valid_bytes = max(page_guard.valid_bytes, new_valid);
+                    page_guard.state.insert(CachePageState::UPTODATE);
+                }
+            }
+        }
+    }
+
     // TODO：接入 `mmap(MAP_SHARED)` 后，truncate 还需要先失效用户页表，再允许共享页离开 cache。
 }
 
