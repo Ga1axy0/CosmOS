@@ -540,8 +540,10 @@ pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         let ep = sockaddr_to_endpoint(uaddr)?;
 
         let fd = fd as usize;
-        if with_udp_socket(fd, |udp| udp.bind(ep.port)).is_ok() {
-            return Ok(0);
+        match with_udp_socket(fd, |udp| udp.bind(ep)) {
+            Ok(()) => return Ok(0),
+            Err(ERRNO::ENOTSOCK) => {}
+            Err(e) => return Err(e),
         }
         with_tcp_socket(fd, |tcp| tcp.bind(ep.port))?;
         Ok(0)
@@ -558,8 +560,10 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         let ep = sockaddr_to_endpoint(uaddr)?;
 
         let fd = fd as usize;
-        if with_udp_socket(fd, |udp| udp.connect(ep)).is_ok() {
-            return Ok(0);
+        match with_udp_socket(fd, |udp| udp.connect(ep)) {
+            Ok(()) => return Ok(0),
+            Err(ERRNO::ENOTSOCK) => {}
+            Err(e) => return Err(e),
         }
         with_tcp_socket(fd, |tcp| tcp.connect(ep))?;
         Ok(0)
