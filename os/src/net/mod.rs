@@ -9,7 +9,7 @@ mod udp;
 mod unix_socket;
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use smoltcp::{
@@ -17,7 +17,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp as tcp_socket, udp as udp_socket},
     time::Instant,
-    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address},
+    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address},
 };
 
 use crate::{
@@ -44,6 +44,8 @@ const TCP_TX_BUF: usize = 8192;
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
 
+const NO_POLL_DEADLINE_MS: u64 = u64::MAX;
+
 const LOOPBACK_OCTET: u8 = 127;
 
 const ETH_HEADER_LEN: usize = 14;
@@ -65,6 +67,9 @@ lazy_static! {
 
 /// Whether one immediate poll is needed due to IRQ or recent TX activity.
 pub(crate) static NEED_POLL: AtomicBool = AtomicBool::new(false);
+/// Next soft deadline (ms since boot) for calling into smoltcp.
+/// `u64::MAX` means no timer-driven deadline currently exists.
+pub(crate) static NEXT_POLL_DEADLINE_MS: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_MS);
 
 /// Userspace-visible IPv4 socket address layout.
 ///
@@ -93,19 +98,26 @@ pub fn init() {
     let stack = NetStack::new(dev);
     *NET_STACK.lock() = Some(stack);
     NEED_POLL.store(true, Ordering::Release);
+    NEXT_POLL_DEADLINE_MS.store(0, Ordering::Release);
     info!("[kernel] net: smoltcp stack initialized");
 }
 
 /// Notify the net stack that one NIC IRQ has arrived.
 pub fn notify_irq() {
     NEED_POLL.store(true, Ordering::Release);
+    NEXT_POLL_DEADLINE_MS.store(0, Ordering::Release);
 }
 
 /// Poll network stack once.
 ///
 /// Call this from a safe context (e.g. timer interrupt path or scheduler tick).
 pub fn poll() {
-    if !NEED_POLL.swap(false, Ordering::AcqRel) {
+    let now_ms = get_time_ms() as u64;
+    let need_immediate = NEED_POLL.swap(false, Ordering::AcqRel);
+    let deadline_ms = NEXT_POLL_DEADLINE_MS.load(Ordering::Acquire);
+    let deadline_due = deadline_ms != NO_POLL_DEADLINE_MS && now_ms >= deadline_ms;
+
+    if !need_immediate && !deadline_due {
         return;
     }
 
@@ -176,7 +188,9 @@ impl NetStack {
             let (h, _st) = stack.create_udp_socket();
             let bound = {
                 let socket = stack.sockets.get_mut::<udp_socket::Socket>(h);
-                socket.bind(KERNEL_UDP_ECHO_PORT).is_ok()
+                socket
+                    .bind(KERNEL_UDP_ECHO_PORT)
+                    .is_ok()
             };
             if bound {
                 stack.echo_udp = Some(h);
@@ -192,8 +206,9 @@ impl NetStack {
     }
 
     fn poll(&mut self) {
-        debug!("net: polling smoltcp stack");
-        let _ = self.iface.poll(now(), &mut self.device, &mut self.sockets);
+        // print!("p");
+        let ts = now();
+        let _ = self.iface.poll(ts, &mut self.device, &mut self.sockets);
 
         for st in self.udp_states.iter() {
             let mut ready = 0u16;
@@ -290,6 +305,23 @@ impl NetStack {
             }
             self.tcp_states
                 .retain(|st| !remove_tcp.iter().any(|h| *h == st.handle));
+        }
+
+        self.refresh_poll_deadline(ts);
+    }
+
+    fn refresh_poll_deadline(&mut self, ts: Instant) {
+        let next = self
+            .iface
+            .poll_at(ts, &self.sockets)
+            .map(|t| t.total_millis().max(0) as u64)
+            .unwrap_or(NO_POLL_DEADLINE_MS);
+        NEXT_POLL_DEADLINE_MS.store(next, Ordering::Release);
+
+        // Keep liveness for immediate work units (e.g. handshake progress)
+        // even when there's no external IRQ.
+        if next != NO_POLL_DEADLINE_MS && (get_time_ms() as u64) >= next {
+            NEED_POLL.store(true, Ordering::Release);
         }
     }
 

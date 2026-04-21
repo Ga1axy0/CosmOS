@@ -1,12 +1,12 @@
 //! UDP socket implementation backed by smoltcp.
 
 use alloc::{sync::Arc, vec::Vec};
+use core::any::Any;
 use core::cmp::min;
 use core::sync::atomic::Ordering;
-use core::any::Any;
 
 use smoltcp::socket::udp as udp_socket;
-use smoltcp::wire::{IpEndpoint, IpAddress, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
@@ -15,6 +15,28 @@ use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::task::{WaitQueue, WaitReason};
+
+const LOOPBACK_V4_OCTET: u8 = 127;
+
+#[inline]
+fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
+    let addr = if ep.addr.is_unspecified() {
+        None
+    } else {
+        Some(ep.addr)
+    };
+    IpListenEndpoint { addr, port: ep.port }
+}
+
+#[inline]
+fn loopback_source_addr_for_peer(peer: IpEndpoint) -> Option<IpAddress> {
+    match peer.addr {
+        IpAddress::Ipv4(v4) if v4.as_bytes()[0] == LOOPBACK_V4_OCTET => {
+            Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)))
+        }
+        _ => None,
+    }
+}
 
 pub(crate) struct UdpSocketState {
     pub(crate) handle: smoltcp::iface::SocketHandle,
@@ -74,28 +96,57 @@ impl UdpSocketFile {
         *self.connected.lock()
     }
 
-    pub(crate) fn bind(&self, port: u16) -> Result<(), ERRNO> {
-        if port == 0 {
+    pub(crate) fn bind(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
+        if ep.port == 0 {
             return Err(ERRNO::EINVAL);
         }
+        let bind_ep = listen_endpoint_from_bind(ep);
         let mut guard = NET_STACK.lock();
         let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
         let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
-        socket.bind(port).map_err(|_| ERRNO::EADDRINUSE)
+        socket.bind(bind_ep).map_err(|_| ERRNO::EADDRINUSE)
     }
 
     pub(crate) fn connect(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
+        {
+            let mut guard = NET_STACK.lock();
+            let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            self.ensure_bound_for_send_locked(stack, ep)?;
+        }
         *self.connected.lock() = Some(ep);
         Ok(())
+    }
+
+    fn ensure_bound_for_send_locked(
+        &self,
+        stack: &mut crate::net::NetStack,
+        peer: IpEndpoint,
+    ) -> Result<(), ERRNO> {
+        let already_bound = {
+            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+            socket.endpoint().port != 0
+        };
+        if already_bound {
+            return Ok(());
+        }
+
+        let local = IpListenEndpoint {
+            addr: loopback_source_addr_for_peer(peer),
+            port: stack.alloc_ephemeral_port(),
+        };
+        let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+        socket.bind(local).map_err(|_| ERRNO::EADDRINUSE)
     }
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
         loop {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            self.ensure_bound_for_send_locked(stack, ep)?;
             let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
             if socket.can_send() {
                 socket.send_slice(data, ep).map_err(|_| ERRNO::ENOBUFS)?;
+                stack.poll();
                 NEED_POLL.store(true, Ordering::Release);
                 return Ok(data.len());
             }

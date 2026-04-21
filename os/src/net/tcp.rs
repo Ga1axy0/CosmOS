@@ -9,7 +9,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use smoltcp::socket::tcp as tcp_socket;
-use smoltcp::wire::IpEndpoint;
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
@@ -24,6 +24,17 @@ const SOMAXCONN: usize = 128;
 #[inline]
 fn normalize_backlog(backlog: usize) -> usize {
     backlog.clamp(1, SOMAXCONN)
+}
+
+#[inline]
+fn loopback_connect_local_endpoint(remote: IpEndpoint, port: u16) -> IpListenEndpoint {
+    let addr = match remote.addr {
+        IpAddress::Ipv4(v4) if v4.as_bytes()[0] == 127 => {
+            Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)))
+        }
+        _ => None,
+    };
+    IpListenEndpoint { addr, port }
 }
 
 pub(crate) struct TcpListenerShared {
@@ -439,8 +450,9 @@ impl TcpSocketFile {
 
             let st = self.state();
             let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+            let local_ep = loopback_connect_local_endpoint(ep, local_port);
             socket
-                .connect(stack.iface.context(), ep, local_port)
+                .connect(stack.iface.context(), ep, local_ep)
                 .map_err(|_| ERRNO::EADDRINUSE)?;
 
             stack.poll();
@@ -463,7 +475,7 @@ impl TcpSocketFile {
                 }
             }
             st.write_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.connect_done());
+                .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.connect_done());
         }
     }
 
