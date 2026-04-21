@@ -1818,21 +1818,26 @@ pub fn sys_pselect6_time32(
         let write_set = copy_user_fdset_words(token, writefds as *const usize, nfds)?;
         let except_set = copy_user_fdset_words(token, exceptfds as *const usize, nfds)?;
 
+        
         validate_pselect_fds(
             nfds,
             read_set.as_deref(),
             write_set.as_deref(),
             except_set.as_deref(),
         )?;
-
+        
         let (mut pollfds, metas) = build_pselect_pollfds(
             nfds,
             read_set.as_deref(),
             write_set.as_deref(),
             except_set.as_deref(),
         )?;
-
+        
         let timeout_ms = parse_timeout_ms(token, tmo_p)?;
+        debug!(
+            "sys_pselect6_time32: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
+            nfds, read_set, write_set, except_set, timeout_ms, sigmask
+        );
         let deadline = timeout_ms_to_deadline(timeout_ms)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
         let (sigmask_ptr, sigsetsize) = parse_pselect_sigmask_arg(token, sigmask)?;
