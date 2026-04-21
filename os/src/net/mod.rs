@@ -33,13 +33,13 @@ pub use unix_socket::{
     UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SocketLevel
 };
 
-const RX_BUF_LEN: usize = 2048;
+const RX_BUF_LEN: usize = 8 * 1024;
 const MAX_SOCKETS: usize = 256;
-const UDP_RX_META: usize = 16;
-const UDP_TX_META: usize = 16;
-const UDP_BUF: usize = 4096;
-const TCP_RX_BUF: usize = 8192;
-const TCP_TX_BUF: usize = 8192;
+const UDP_RX_META: usize = 128;
+const UDP_TX_META: usize = 128;
+const UDP_BUF: usize = 16 * 1024;
+const TCP_RX_BUF: usize = 32 * 1024;
+const TCP_TX_BUF: usize = 32 * 1024;
 
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
@@ -112,6 +112,7 @@ pub fn notify_irq() {
 ///
 /// Call this from a safe context (e.g. timer interrupt path or scheduler tick).
 pub fn poll() {
+    // print!("p");
     let now_ms = get_time_ms() as u64;
     let need_immediate = NEED_POLL.swap(false, Ordering::AcqRel);
     let deadline_ms = NEXT_POLL_DEADLINE_MS.load(Ordering::Acquire);
