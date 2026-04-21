@@ -129,7 +129,7 @@ run-inner:
 		-nographic \
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777 \
+		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778,hostfwd=udp::7778-:7778 \
         -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
         -device virtio-net-device,netdev=net0,id=net0 \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \

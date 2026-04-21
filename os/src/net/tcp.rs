@@ -480,6 +480,7 @@ impl TcpSocketFile {
     }
 
     fn recv_into_user_buffer(&self, buf: &mut UserBuffer) -> Result<usize, ERRNO> {
+        debug!("tcp recv_into_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
         }
@@ -502,6 +503,7 @@ impl TcpSocketFile {
                             break;
                         }
                         let n = socket.recv_slice(slice).map_err(|_| ERRNO::EIO)?;
+                        debug!("tcp recv_into_user_buffer: recv {} bytes: {:?}", n, slice);
                         total += n;
                         if n < slice.len() {
                             break;
@@ -510,8 +512,16 @@ impl TcpSocketFile {
                     return Ok(total);
                 }
                 if !socket.may_recv() {
+                    debug!("tcp recv eof: source_id={} buf_len={}", st.source_id(), buf.len());
                     return Ok(0);
                 }
+                debug!(
+                    "tcp recv wait: source_id={} buf_len={} can_recv={} may_recv={}",
+                    st.source_id(),
+                    buf.len(),
+                    socket.can_recv(),
+                    socket.may_recv()
+                );
             }
             st.read_wait
                 .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
@@ -519,6 +529,8 @@ impl TcpSocketFile {
     }
 
     fn send_from_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
+        debug!("tcp send_from_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
+
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
         }
@@ -645,10 +657,20 @@ impl File for TcpSocketFile {
             if (events & POLLIN) != 0 && listener.has_pending() {
                 ready |= POLLIN;
             }
+            if ready != 0 {
+                debug!(
+                    "tcp poll(listening): source_id={} events={:#x} ready={:#x} pending={}",
+                    listener.source_id(),
+                    events,
+                    ready,
+                    listener.has_pending()
+                );
+            }
             return ready;
         }
 
         let st = self.state();
+        let source_id = st.source_id();
         let mut guard = NET_STACK.lock();
         let Some(stack) = guard.as_mut() else {
             return POLLHUP;
@@ -666,6 +688,19 @@ impl File for TcpSocketFile {
 
         if (events & POLLOUT) != 0 && (socket.can_send() || !socket.may_send()) {
             ready |= POLLOUT;
+        }
+
+        if ready != 0 {
+            debug!(
+                "tcp poll: source_id={} events={:#x} ready={:#x} can_recv={} may_recv={} can_send={} may_send={}",
+                source_id,
+                events,
+                ready,
+                socket.can_recv(),
+                socket.may_recv(),
+                socket.can_send(),
+                socket.may_send()
+            );
         }
 
         ready

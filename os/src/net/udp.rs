@@ -139,6 +139,7 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
+        debug!("udp send_to: data_len={} ep={}", data.len(), ep);
         loop {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
