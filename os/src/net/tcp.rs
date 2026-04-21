@@ -29,7 +29,7 @@ fn normalize_backlog(backlog: usize) -> usize {
 #[inline]
 fn loopback_connect_local_endpoint(remote: IpEndpoint, port: u16) -> IpListenEndpoint {
     let addr = match remote.addr {
-        IpAddress::Ipv4(v4) if v4.as_bytes()[0] == 127 => {
+        IpAddress::Ipv4(v4) if v4.is_loopback() => {
             Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)))
         }
         _ => None,

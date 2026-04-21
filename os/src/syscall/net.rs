@@ -362,14 +362,13 @@ fn sockaddr_to_endpoint(addr: &SockAddrIn) -> Result<IpEndpoint, ERRNO> {
 fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
     let (sin_addr, sin_port) = match ep.addr {
         IpAddress::Ipv4(v4) => {
-            let b = v4.as_bytes();
+            let b = v4.octets();
             // Construct the `u32` such that the in-memory bytes of the
             // `SockAddrIn` match the network-order octets expected by C
             // programs. `from_ne_bytes` makes this correct on both little
             // and big endian hosts.
             (u32::from_ne_bytes([b[0], b[1], b[2], b[3]]), ep.port.to_be())
         }
-        _ => (0, ep.port.to_be()),
     };
     SockAddrIn {
         sin_family: AF_INET,

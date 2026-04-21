@@ -17,7 +17,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp as tcp_socket, udp as udp_socket},
     time::Instant,
-    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address},
+    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address},
 };
 
 use crate::{
@@ -479,11 +479,11 @@ struct VirtioRxToken {
 }
 
 impl RxToken for VirtioRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(self.buf.as_mut_slice())
+        f(self.buf.as_slice())
     }
 }
 
@@ -499,14 +499,14 @@ impl TxToken for VirtioTxToken {
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut buf = vec![0u8; len];
-        let ret = f(buf.as_mut_slice());
+        let ret = f(&mut buf);
 
-        if self.try_handle_loopback_tx(buf.as_slice()) {
+        if self.try_handle_loopback_tx(&buf) {
             NEED_POLL.store(true, Ordering::Release);
             return ret;
         }
 
-        match self.dev.try_send(buf.as_slice()) {
+        match self.dev.try_send(&buf) {
             Ok(true) => {}
             Ok(false) => {
                 trace!("net: tx queue busy, drop one frame");
