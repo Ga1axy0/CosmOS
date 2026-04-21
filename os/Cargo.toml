@@ -16,7 +16,7 @@ xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
 fs = { path = "../fs" }
 hashbrown = "0.12.3"
-smoltcp = { version = "0.11.0", default-features = false, features = [
+smoltcp = { version = "0.13.0", default-features = false, features = [
 	"alloc",
 	"medium-ethernet",
 	"proto-ipv4",

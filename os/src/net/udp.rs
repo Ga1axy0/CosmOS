@@ -16,8 +16,6 @@ use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::task::{WaitQueue, WaitReason};
 
-const LOOPBACK_V4_OCTET: u8 = 127;
-
 #[inline]
 fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
     let addr = if ep.addr.is_unspecified() {
@@ -31,7 +29,7 @@ fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
 #[inline]
 fn loopback_source_addr_for_peer(peer: IpEndpoint) -> Option<IpAddress> {
     match peer.addr {
-        IpAddress::Ipv4(v4) if v4.as_bytes()[0] == LOOPBACK_V4_OCTET => {
+        IpAddress::Ipv4(v4) if v4.is_loopback() => {
             Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)))
         }
         _ => None,
