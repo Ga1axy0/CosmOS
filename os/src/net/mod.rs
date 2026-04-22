@@ -4,11 +4,12 @@
 //! - Driver side uses VirtIO token-based completion.
 //! - Socket side uses per-socket wait queues + poll source notifications.
 
+mod loopback;
 mod tcp;
 mod udp;
 mod unix_socket;
 
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
@@ -17,7 +18,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp as tcp_socket, udp as udp_socket},
     time::Instant,
-    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address},
+    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
 };
 
 use crate::{
@@ -33,28 +34,18 @@ pub use unix_socket::{
     UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SocketLevel
 };
 
-const RX_BUF_LEN: usize = 8 * 1024;
+const RX_BUF_LEN: usize = 32 * 1024;
 const MAX_SOCKETS: usize = 256;
-const UDP_RX_META: usize = 128;
-const UDP_TX_META: usize = 128;
-const UDP_BUF: usize = 16 * 1024;
-const TCP_RX_BUF: usize = 32 * 1024;
-const TCP_TX_BUF: usize = 32 * 1024;
+const UDP_RX_META: usize = 512;
+const UDP_TX_META: usize = 512;
+const UDP_BUF: usize = 64 * 1024;
+const TCP_RX_BUF: usize = 128 * 1024;
+const TCP_TX_BUF: usize = 128 * 1024;
 
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
 
 const NO_POLL_DEADLINE_MS: u64 = u64::MAX;
-
-const LOOPBACK_OCTET: u8 = 127;
-
-const ETH_HEADER_LEN: usize = 14;
-const ETH_TYPE_IPV4: u16 = 0x0800;
-const ETH_TYPE_ARP: u16 = 0x0806;
-
-const ARP_FRAME_LEN: usize = ETH_HEADER_LEN + 28;
-const ARP_OP_REQUEST: u16 = 1;
-const ARP_OP_REPLY: u16 = 2;
 
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
@@ -131,7 +122,7 @@ pub fn poll() {
 }
 
 pub(crate) struct NetStack {
-    device: VirtioSmoltcpDevice,
+    device: MultiDevice,
     pub(crate) iface: Interface,
     pub(crate) sockets: SocketSet<'static>,
     pub(crate) udp_states: Vec<Arc<UdpSocketState>>,
@@ -145,21 +136,21 @@ impl NetStack {
         let mac = dev.mac_address();
         let eth = EthernetAddress(mac);
 
-        let mut device = VirtioSmoltcpDevice::new(dev);
+        let mut device = MultiDevice::new(dev);
         let now = now();
         let mut cfg = Config::new(HardwareAddress::Ethernet(eth));
         cfg.random_seed = 0x5A5A_1234;
         let mut iface = Interface::new(cfg, &mut device, now);
 
-        // QEMU user networking defaults.
+        // Configure both external and loopback addresses on the same interface
         iface.update_ip_addrs(|addrs| {
-            let cidr = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)), 24);
-            if addrs.iter().all(|a| *a != cidr) {
-                let _ = addrs.push(cidr);
+            // External network (QEMU user networking)
+            let external = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)), 24);
+            if addrs.iter().all(|a| *a != external) {
+                let _ = addrs.push(external);
             }
 
-            // Add loopback IPv4 on the same interface so smoltcp can pick
-            // a loopback source address for 127/8 destinations.
+            // Loopback address
             let loopback = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), 8);
             if addrs.iter().all(|a| *a != loopback) {
                 let _ = addrs.push(loopback);
@@ -209,13 +200,16 @@ impl NetStack {
     fn poll(&mut self) {
         // print!("p");
         let ts = now();
-        let _ = self.iface.poll(ts, &mut self.device, &mut self.sockets);
+        debug!("NetStack::poll called, loopback queue len={}", self.device.loopback.queue.len());
+        let poll_result = self.iface.poll(ts, &mut self.device, &mut self.sockets);
+        debug!("NetStack::poll result={:?}, loopback queue len after={}", poll_result, self.device.loopback.queue.len());
 
         for st in self.udp_states.iter() {
             let mut ready = 0u16;
             {
                 let socket = self.sockets.get_mut::<udp_socket::Socket>(st.handle);
                 if socket.can_recv() {
+                    debug!("UDP socket {:?} can_recv, endpoint={:?}", st.handle, socket.endpoint());
                     st.read_wait.wake_one();
                     ready |= POLLIN;
 
@@ -338,6 +332,7 @@ impl NetStack {
             udp_socket::PacketBuffer::new(tx_meta, tx_buf),
         );
         let handle = self.sockets.add(udp);
+        debug!("Created UDP socket with handle {:?}", handle);
         let st = Arc::new(UdpSocketState::new(handle));
         self.udp_states.push(Arc::clone(&st));
         (handle, st)
@@ -376,35 +371,163 @@ fn now() -> Instant {
     Instant::from_millis(get_time_ms() as i64)
 }
 
-#[inline]
-fn is_loopback_ipv4_bytes(ip: &[u8]) -> bool {
-    ip.len() == 4 && ip[0] == LOOPBACK_OCTET
+/// Multi-device that routes packets between VirtIO (external) and Loopback (local).
+struct MultiDevice {
+    virtio: VirtioSmoltcpDevice,
+    loopback: loopback::Loopback,
 }
 
-struct LoopbackDataplane {
-    rxq: SpinNoIrqLock<VecDeque<Vec<u8>>>,
-}
-
-impl LoopbackDataplane {
-    fn new() -> Self {
+impl MultiDevice {
+    fn new(virtio_dev: Arc<drivers::net::VirtIONetDevice>) -> Self {
         Self {
-            rxq: SpinNoIrqLock::new(VecDeque::new()),
+            virtio: VirtioSmoltcpDevice::new(virtio_dev),
+            loopback: loopback::Loopback::new(Medium::Ethernet),
         }
     }
+}
 
-    fn push_rx(&self, frame: Vec<u8>) {
-        self.rxq.lock().push_back(frame);
+impl Device for MultiDevice {
+    type RxToken<'a> = MultiRxToken where Self: 'a;
+    type TxToken<'a> = MultiTxToken<'a> where Self: 'a;
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.virtio.capabilities()
     }
 
-    fn pop_rx(&self) -> Option<Vec<u8>> {
-        self.rxq.lock().pop_front()
+    fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Try loopback first for lower latency on local traffic
+        if let Some((rx, _tx)) = self.loopback.receive(timestamp) {
+            return Some((
+                MultiRxToken::Loopback(rx),
+                MultiTxToken {
+                    virtio: &mut self.virtio,
+                    loopback: &mut self.loopback,
+                },
+            ));
+        }
+
+        // Then try VirtIO
+        if let Some((rx, _tx)) = self.virtio.receive(timestamp) {
+            return Some((
+                MultiRxToken::Virtio(rx),
+                MultiTxToken {
+                    virtio: &mut self.virtio,
+                    loopback: &mut self.loopback,
+                },
+            ));
+        }
+
+        None
+    }
+
+    fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // We can always transmit (will route based on destination)
+        let virtio_can = self.virtio.transmit(timestamp).is_some();
+        let loopback_can = self.loopback.transmit(timestamp).is_some();
+
+        if virtio_can || loopback_can {
+            debug!("MultiDevice::transmit: virtio_can={}, loopback_can={}", virtio_can, loopback_can);
+            Some(MultiTxToken {
+                virtio: &mut self.virtio,
+                loopback: &mut self.loopback,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+enum MultiRxToken {
+    Virtio(VirtioRxToken),
+    Loopback(loopback::RxToken),
+}
+
+impl RxToken for MultiRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        match self {
+            MultiRxToken::Virtio(token) => token.consume(f),
+            MultiRxToken::Loopback(token) => token.consume(f),
+        }
+    }
+}
+
+struct MultiTxToken<'a> {
+    virtio: &'a mut VirtioSmoltcpDevice,
+    loopback: &'a mut loopback::Loopback,
+}
+
+impl<'a> TxToken for MultiTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buf = vec![0u8; len];
+        let ret = f(&mut buf);
+
+        // Route based on destination: check if it's a loopback packet
+        let is_loopback = if buf.len() >= 34 {
+            let ethertype = u16::from_be_bytes([buf[12], buf[13]]);
+            match ethertype {
+                0x0800 => {
+                    // IPv4: check destination IP (buf[30] is first byte of dest IP)
+                    buf[30] == 127
+                }
+                0x0806 => {
+                    // ARP: check target protocol address (TPA)
+                    // ARP frame structure:
+                    // [14-15] Hardware type
+                    // [16-17] Protocol type
+                    // [18] Hardware address length
+                    // [19] Protocol address length
+                    // [20-21] Operation
+                    // [22-27] Sender hardware address (SHA)
+                    // [28-31] Sender protocol address (SPA)
+                    // [32-37] Target hardware address (THA)
+                    // [38-41] Target protocol address (TPA)
+                    if buf.len() >= 42 {
+                        // Check if TPA (target IP) is 127.x.x.x
+                        buf[38] == 127
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        debug!("Consume token of len {}, loopback: {}, buf[12] = {:x}, buf[13] = {:x}, buf[30] = {:x}", len, is_loopback, buf[12], buf[13], buf[30]);
+
+        if is_loopback {
+            // Directly push to loopback queue (our custom Loopback has a public queue field)
+            debug!("Pushing to loopback queue, current len={}", self.loopback.queue.len());
+            self.loopback.queue.push_back(buf);
+            debug!("Loopback queue len after push={}", self.loopback.queue.len());
+        } else {
+            // Send to VirtIO using the standard path
+            match self.virtio.dev.try_send(&buf) {
+                Ok(true) => {}
+                Ok(false) => {
+                    trace!("net: tx queue busy, drop one frame");
+                }
+                Err(e) => {
+                    warn!("net: try_send failed: {:?}", e);
+                }
+            }
+        }
+
+        NEED_POLL.store(true, Ordering::Release);
+        ret
     }
 }
 
 struct VirtioSmoltcpDevice {
     dev: Arc<drivers::net::VirtIONetDevice>,
     caps: DeviceCapabilities,
-    loopback: Arc<LoopbackDataplane>,
     mac: [u8; 6],
 }
 
@@ -417,7 +540,6 @@ impl VirtioSmoltcpDevice {
             mac: dev.mac_address(),
             dev,
             caps,
-            loopback: Arc::new(LoopbackDataplane::new()),
         }
     }
 }
@@ -437,17 +559,6 @@ impl Device for VirtioSmoltcpDevice {
     }
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buf) = self.loopback.pop_rx() {
-            return Some((
-                VirtioRxToken { buf },
-                VirtioTxToken {
-                    dev: Arc::clone(&self.dev),
-                    loopback: Arc::clone(&self.loopback),
-                    mac: self.mac,
-                },
-            ));
-        }
-
         let mut buf = vec![0u8; RX_BUF_LEN];
         let len = self.dev.try_recv(buf.as_mut_slice())?;
         buf.truncate(len);
@@ -455,8 +566,6 @@ impl Device for VirtioSmoltcpDevice {
             VirtioRxToken { buf },
             VirtioTxToken {
                 dev: Arc::clone(&self.dev),
-                loopback: Arc::clone(&self.loopback),
-                mac: self.mac,
             },
         ))
     }
@@ -465,8 +574,6 @@ impl Device for VirtioSmoltcpDevice {
         if self.dev.can_send() {
             Some(VirtioTxToken {
                 dev: Arc::clone(&self.dev),
-                loopback: Arc::clone(&self.loopback),
-                mac: self.mac,
             })
         } else {
             None
@@ -489,8 +596,6 @@ impl RxToken for VirtioRxToken {
 
 struct VirtioTxToken {
     dev: Arc<drivers::net::VirtIONetDevice>,
-    loopback: Arc<LoopbackDataplane>,
-    mac: [u8; 6],
 }
 
 impl TxToken for VirtioTxToken {
@@ -500,11 +605,6 @@ impl TxToken for VirtioTxToken {
     {
         let mut buf = vec![0u8; len];
         let ret = f(&mut buf);
-
-        if self.try_handle_loopback_tx(&buf) {
-            NEED_POLL.store(true, Ordering::Release);
-            return ret;
-        }
 
         match self.dev.try_send(&buf) {
             Ok(true) => {}
@@ -517,92 +617,5 @@ impl TxToken for VirtioTxToken {
         }
         NEED_POLL.store(true, Ordering::Release);
         ret
-    }
-}
-
-impl VirtioTxToken {
-    fn try_handle_loopback_tx(&self, frame: &[u8]) -> bool {
-        if frame.len() < ETH_HEADER_LEN {
-            return false;
-        }
-
-        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-        match ethertype {
-            ETH_TYPE_IPV4 => self.handle_ipv4_loopback(frame),
-            ETH_TYPE_ARP => self.handle_arp_loopback(frame),
-            _ => false,
-        }
-    }
-
-    fn handle_ipv4_loopback(&self, frame: &[u8]) -> bool {
-        const IPV4_MIN_HEADER_LEN: usize = 20;
-
-        if frame.len() < ETH_HEADER_LEN + IPV4_MIN_HEADER_LEN {
-            return false;
-        }
-
-        let ihl = ((frame[ETH_HEADER_LEN] & 0x0f) as usize) * 4;
-        if ihl < IPV4_MIN_HEADER_LEN || frame.len() < ETH_HEADER_LEN + ihl {
-            return false;
-        }
-
-        let dst_ip = &frame[ETH_HEADER_LEN + 16..ETH_HEADER_LEN + 20];
-        if !is_loopback_ipv4_bytes(dst_ip) {
-            return false;
-        }
-
-        let mut looped = frame.to_vec();
-        looped[..6].copy_from_slice(&self.mac);
-        looped[6..12].copy_from_slice(&self.mac);
-        self.loopback.push_rx(looped);
-        true
-    }
-
-    fn handle_arp_loopback(&self, frame: &[u8]) -> bool {
-        if frame.len() < ARP_FRAME_LEN {
-            return false;
-        }
-
-        // Ethernet(1)/IPv4(0x0800), hlen=6, plen=4
-        if frame[14..20] != [0x00, 0x01, 0x08, 0x00, 0x06, 0x04] {
-            return false;
-        }
-
-        let op = u16::from_be_bytes([frame[20], frame[21]]);
-        let sender_mac = &frame[22..28];
-        let sender_ip = &frame[28..32];
-        let target_ip = &frame[38..42];
-
-        let target_is_loopback = is_loopback_ipv4_bytes(target_ip);
-        let sender_is_loopback = is_loopback_ipv4_bytes(sender_ip);
-
-        // Resolve loopback ARP locally: synthesize ARP reply and enqueue it
-        // into our software RX path.
-        if op == ARP_OP_REQUEST && target_is_loopback {
-            let mut reply = frame.to_vec();
-
-            // Ethernet header
-            reply[..6].copy_from_slice(sender_mac);
-            reply[6..12].copy_from_slice(&self.mac);
-
-            // ARP payload
-            reply[20..22].copy_from_slice(&ARP_OP_REPLY.to_be_bytes());
-            reply[22..28].copy_from_slice(&self.mac);
-            reply[28..32].copy_from_slice(target_ip);
-            reply[32..38].copy_from_slice(sender_mac);
-            reply[38..42].copy_from_slice(sender_ip);
-
-            self.loopback.push_rx(reply);
-            return true;
-        }
-
-        // A request with loopback sender protocol address must never be sent
-        // onto external Ethernet.
-        if op == ARP_OP_REQUEST && sender_is_loopback {
-            trace!("net: drop external ARP request with loopback sender IP");
-            return true;
-        }
-
-        false
     }
 }

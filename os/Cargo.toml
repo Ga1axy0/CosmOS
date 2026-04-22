@@ -16,12 +16,14 @@ xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
 fs = { path = "../fs" }
 hashbrown = "0.12.3"
-smoltcp = { version = "0.13.0", default-features = false, features = [
+smoltcp = { git = "https://github.com/KyleMao2023/smoltcp", branch = "udp-fix", default-features = false, features = [
 	"alloc",
 	"medium-ethernet",
 	"proto-ipv4",
+	"proto-ipv4-fragmentation",
 	"socket-udp",
 	"socket-tcp",
+	"fragmentation-buffer-size-16384",
 ] }
 strum_macros = "0.28.0"
 
