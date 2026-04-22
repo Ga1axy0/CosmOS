@@ -99,19 +99,35 @@ impl UdpSocketFile {
             return Err(ERRNO::EINVAL);
         }
         let bind_ep = listen_endpoint_from_bind(ep);
+        debug!("UDP socket {:?} binding to {:?}", self.st.handle, bind_ep);
         let mut guard = NET_STACK.lock();
         let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
         let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
-        socket.bind(bind_ep).map_err(|_| ERRNO::EADDRINUSE)
+        match socket.bind(bind_ep) {
+            Ok(()) => {
+                debug!("UDP socket {:?} bind succeeded", self.st.handle);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("UDP socket {:?} bind failed: {:?}", self.st.handle, e);
+                Err(ERRNO::EADDRINUSE)
+            }
+        }
     }
 
     pub(crate) fn connect(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
+        debug!("UDP socket {:?} connecting to {:?}", self.st.handle, ep);
         {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             self.ensure_bound_for_send_locked(stack, ep)?;
+
+            // Call smoltcp's connect to enable source filtering
+            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+            socket.connect(ep).map_err(|_| ERRNO::EINVAL)?;
         }
         *self.connected.lock() = Some(ep);
+        debug!("UDP socket {:?} connect succeeded", self.st.handle);
         Ok(())
     }
 
@@ -137,18 +153,37 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
-        debug!("udp send_to: data_len={} ep={}", data.len(), ep);
+        debug!("udp send_to: data_len={} ep={} handle={:?}", data.len(), ep, self.st.handle);
         loop {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             self.ensure_bound_for_send_locked(stack, ep)?;
             let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
-            if socket.can_send() {
-                socket.send_slice(data, ep).map_err(|_| ERRNO::ENOBUFS)?;
-                stack.poll();
-                NEED_POLL.store(true, Ordering::Release);
-                return Ok(data.len());
+
+            // Check if socket can send
+            let can_send = socket.can_send();
+            debug!("udp socket {:?} can_send={}, endpoint={:?}", self.st.handle, can_send, socket.endpoint());
+
+            if can_send {
+                match socket.send_slice(data, ep) {
+                    Ok(()) => {
+                        debug!("udp send_slice succeeded for socket {:?}, calling poll", self.st.handle);
+
+                        // Check socket state after send
+                        let has_data = socket.can_send(); // This checks if there's room, not if there's data to send
+                        debug!("udp socket {:?} state after send: can_send={}", self.st.handle, has_data);
+
+                        stack.poll();
+                        NEED_POLL.store(true, Ordering::Release);
+                        return Ok(data.len());
+                    }
+                    Err(e) => {
+                        warn!("udp send_slice failed for socket {:?}: {:?}", self.st.handle, e);
+                        return Err(ERRNO::ENOBUFS);
+                    }
+                }
             }
+            debug!("udp socket {:?} cannot send, waiting", self.st.handle);
             drop(guard);
             self.st
                 .write_wait

@@ -429,6 +429,7 @@ impl TcpSocketFile {
     }
 
     pub(crate) fn connect(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
+        debug!("Tcp connect: {}", ep);
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
         }
@@ -480,7 +481,7 @@ impl TcpSocketFile {
     }
 
     fn recv_into_user_buffer(&self, buf: &mut UserBuffer) -> Result<usize, ERRNO> {
-        debug!("tcp recv_into_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
+        // debug!("tcp recv_into_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
         }
@@ -503,7 +504,6 @@ impl TcpSocketFile {
                             break;
                         }
                         let n = socket.recv_slice(slice).map_err(|_| ERRNO::EIO)?;
-                        debug!("tcp recv_into_user_buffer: recv {} bytes: {:?}", n, slice);
                         total += n;
                         if n < slice.len() {
                             break;
@@ -529,7 +529,7 @@ impl TcpSocketFile {
     }
 
     fn send_from_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
-        debug!("tcp send_from_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
+        // debug!("tcp send_from_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
 
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
