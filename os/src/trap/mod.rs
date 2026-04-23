@@ -244,7 +244,7 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::drivers::plic::handle_supervisor_external();
-            // crate::net::poll();
+            crate::net::poll();
         }
         _ => {
             panic!(

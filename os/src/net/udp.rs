@@ -153,7 +153,7 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
-        debug!("udp send_to: data_len={} ep={} handle={:?}", data.len(), ep, self.st.handle);
+        trace!("udp send_to: data_len={} ep={} handle={:?}", data.len(), ep, self.st.handle);
         loop {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
@@ -162,16 +162,15 @@ impl UdpSocketFile {
 
             // Check if socket can send
             let can_send = socket.can_send();
-            debug!("udp socket {:?} can_send={}, endpoint={:?}", self.st.handle, can_send, socket.endpoint());
 
             if can_send {
                 match socket.send_slice(data, ep) {
                     Ok(()) => {
-                        debug!("udp send_slice succeeded for socket {:?}, calling poll", self.st.handle);
+                        trace!("udp send_slice succeeded for socket {:?}, calling poll", self.st.handle);
 
                         // Check socket state after send
                         let has_data = socket.can_send(); // This checks if there's room, not if there's data to send
-                        debug!("udp socket {:?} state after send: can_send={}", self.st.handle, has_data);
+                        trace!("udp socket {:?} state after send: can_send={}", self.st.handle, has_data);
 
                         stack.poll();
                         NEED_POLL.store(true, Ordering::Release);

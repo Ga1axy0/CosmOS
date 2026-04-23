@@ -361,7 +361,7 @@ pub(crate) fn wait_poll_key(handle: PollWaitHandle) {
 
 /// Notify readiness for a source id and wake interested wait keys.
 pub(crate) fn notify_poll_source(source_id: usize, ready_mask: u16) {
-    debug!("notify_poll_source: source_id={}, ready_mask={:#x}", source_id, ready_mask);
+    // debug!("notify_poll_source: source_id={}, ready_mask={:#x}", source_id, ready_mask);
     let mut wait_keys = Vec::new();
     {
         let mut registry = POLL_REGISTRY.lock();

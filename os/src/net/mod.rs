@@ -200,16 +200,15 @@ impl NetStack {
     fn poll(&mut self) {
         // print!("p");
         let ts = now();
-        debug!("NetStack::poll called, loopback queue len={}", self.device.loopback.queue.len());
         let poll_result = self.iface.poll(ts, &mut self.device, &mut self.sockets);
-        debug!("NetStack::poll result={:?}, loopback queue len after={}", poll_result, self.device.loopback.queue.len());
+        trace!("NetStack::poll result={:?}, loopback queue len after={}", poll_result, self.device.loopback.queue.len());
 
         for st in self.udp_states.iter() {
             let mut ready = 0u16;
             {
                 let socket = self.sockets.get_mut::<udp_socket::Socket>(st.handle);
                 if socket.can_recv() {
-                    debug!("UDP socket {:?} can_recv, endpoint={:?}", st.handle, socket.endpoint());
+                    // debug!("UDP socket {:?} can_recv, endpoint={:?}", st.handle, socket.endpoint());
                     st.read_wait.wake_one();
                     ready |= POLLIN;
 
@@ -332,7 +331,7 @@ impl NetStack {
             udp_socket::PacketBuffer::new(tx_meta, tx_buf),
         );
         let handle = self.sockets.add(udp);
-        debug!("Created UDP socket with handle {:?}", handle);
+        trace!("Created UDP socket with handle {:?}", handle);
         let st = Arc::new(UdpSocketState::new(handle));
         self.udp_states.push(Arc::clone(&st));
         (handle, st)
@@ -426,7 +425,6 @@ impl Device for MultiDevice {
         let loopback_can = self.loopback.transmit(timestamp).is_some();
 
         if virtio_can || loopback_can {
-            debug!("MultiDevice::transmit: virtio_can={}, loopback_can={}", virtio_can, loopback_can);
             Some(MultiTxToken {
                 virtio: &mut self.virtio,
                 loopback: &mut self.loopback,
@@ -500,13 +498,13 @@ impl<'a> TxToken for MultiTxToken<'a> {
             false
         };
 
-        debug!("Consume token of len {}, loopback: {}, buf[12] = {:x}, buf[13] = {:x}, buf[30] = {:x}", len, is_loopback, buf[12], buf[13], buf[30]);
+        trace!("Consume token of len {}, loopback: {}, buf[12] = {:x}, buf[13] = {:x}, buf[30] = {:x}", len, is_loopback, buf[12], buf[13], buf[30]);
 
         if is_loopback {
             // Directly push to loopback queue (our custom Loopback has a public queue field)
-            debug!("Pushing to loopback queue, current len={}", self.loopback.queue.len());
+            trace!("Pushing to loopback queue, current len={}", self.loopback.queue.len());
             self.loopback.queue.push_back(buf);
-            debug!("Loopback queue len after push={}", self.loopback.queue.len());
+            trace!("Loopback queue len after push={}", self.loopback.queue.len());
         } else {
             // Send to VirtIO using the standard path
             match self.virtio.dev.try_send(&buf) {
