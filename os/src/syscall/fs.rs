@@ -1834,10 +1834,10 @@ pub fn sys_pselect6_time32(
         )?;
         
         let timeout_ms = parse_timeout_ms(token, tmo_p)?;
-        debug!(
-            "sys_pselect6_time32: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
-            nfds, read_set, write_set, except_set, timeout_ms, sigmask
-        );
+        // debug!(
+        //     "sys_pselect6_time32: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
+        //     nfds, read_set, write_set, except_set, timeout_ms, sigmask
+        // );
         let deadline = timeout_ms_to_deadline(timeout_ms)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
         let (sigmask_ptr, sigsetsize) = parse_pselect_sigmask_arg(token, sigmask)?;

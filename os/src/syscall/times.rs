@@ -141,7 +141,7 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
             // CLOCK_REALTIME_COARSE 等其它 clock id。
             _ => return Err(ERRNO::EINVAL),
         };
-        debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
+        // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
         write_pod_to_user(tp, &timespec)?;
         Ok(0)
     })
