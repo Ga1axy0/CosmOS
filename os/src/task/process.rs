@@ -6,9 +6,14 @@ use super::TaskControlBlock;
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
-use crate::fs::{new_stdio_files, FileDescription};
-use crate::mm::{translated_refmut, MapPermission, MemorySet, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE};
+use crate::config::PAGE_SIZE;
+use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
+use crate::mm::{
+    translated_refmut, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, VirtAddr, Vma,
+    KERNEL_SPACE,
+};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::syscall::errno::ERRNO;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -189,6 +194,36 @@ impl ProcessControlBlockInner {
             self.fd_table.len() - 1
         }
     }
+    /// 取走指定 fd 表项，供调用方在释放进程锁后再销毁底层文件对象。
+    pub fn take_fd(&mut self, fd: usize) -> Option<FdEntry> {
+        self.fd_table.get_mut(fd).and_then(Option::take)
+    }
+    /// 取走所有带 `FD_CLOEXEC` 的 fd 表项，供 `exec` 在锁外统一关闭。
+    pub fn take_cloexec_fds(&mut self) -> Vec<FdEntry> {
+        let mut removed = Vec::new();
+        for entry in self.fd_table.iter_mut() {
+            let should_close = entry
+                .as_ref()
+                .map(|entry| entry.flags.contains(FdFlags::CLOEXEC))
+                .unwrap_or(false);
+            if should_close {
+                if let Some(removed_entry) = entry.take() {
+                    removed.push(removed_entry);
+                }
+            }
+        }
+        removed
+    }
+    /// 取走当前进程持有的全部 fd 表项，供退出路径在锁外统一释放。
+    pub fn take_all_fds(&mut self) -> Vec<FdEntry> {
+        let mut removed = Vec::new();
+        for entry in self.fd_table.iter_mut() {
+            if let Some(removed_entry) = entry.take() {
+                removed.push(removed_entry);
+            }
+        }
+        removed
+    }
     /// allocate a new task id
     pub fn alloc_tid(&mut self) -> usize {
         self.task_res_allocator.alloc()
@@ -302,13 +337,18 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        {
+        let (mut old_memory_set, cloexec_entries) = {
             let mut inner = self.inner_exclusive_access();
-            inner.memory_set = memory_set;
+            let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             inner.vm_layout = vm_layout;
-            // 按 Linux 语义，`exec` 成功后应关闭所有带 `FD_CLOEXEC` 的 fd。
-            Self::close_cloexec_fds(&mut inner);
-        }
+            // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
+            // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
+            let cloexec_entries = inner.take_cloexec_fds();
+            (old_memory_set, cloexec_entries)
+        };
+        debug!("[mmap] exec teardown old memory_set before installing new user context");
+        old_memory_set.recycle_data_pages();
+        drop(cloexec_entries);
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
@@ -399,27 +439,18 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
-
-    /// 关闭当前进程中所有带 `FD_CLOEXEC` 的 fd 表项。
-    fn close_cloexec_fds(inner: &mut ProcessControlBlockInner) {
-        for entry in inner.fd_table.iter_mut() {
-            let should_close = entry
-                .as_ref()
-                .map(|entry| entry.flags.contains(FdFlags::CLOEXEC))
-                .unwrap_or(false);
-            if should_close {
-                *entry = None;
-            }
-        }
-    }
-
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         trace!("kernel: fork");
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
+        debug!(
+            "[cow] fork begin: parent_pid={} parent_threads={}",
+            self.getpid(),
+            parent.thread_count()
+        );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
         let vm_layout = parent.vm_layout;
         let cred = parent.cred;
         // alloc a pid
@@ -471,6 +502,11 @@ impl ProcessControlBlock {
         });
         // add child
         parent.children.push(Arc::clone(&child));
+        debug!(
+            "[cow] fork created child process: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         // create main thread of child process
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
@@ -497,6 +533,11 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack.get_top();
         trap_cx.x[10] = 0;
         drop(task_inner);
+        debug!(
+            "[cow] fork complete: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
@@ -606,12 +647,119 @@ impl ProcessControlBlock {
             .memory_set
             .mmap_anonymous(start, end, perm)
     }
-    /// unmap an area. return true if success
-    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+    /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
+    pub fn mmap_file(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        perm: MapPermission,
+        file: Arc<FileDescription>,
+        pgoff: usize,
+        shared: bool,
+    ) -> bool {
         self.inner
             .lock()
             .memory_set
-            .munmap_anonymous(start, end)
+            .mmap_file(start, end, perm, file, pgoff, shared)
+    }
+    /// unmap an area. return true if success
+    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        self.inner.lock().memory_set.munmap(start, end)
+    }
+    /// 处理当前进程的私有页写时复制缺页。
+    pub fn handle_private_cow_fault(&self, fault_addr: usize) -> bool {
+        self.inner
+            .lock()
+            .memory_set
+            .handle_private_cow_fault(VirtAddr::from(fault_addr))
+    }
+    /// 处理当前进程的 file-backed 缺页。
+    pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> Result<(), ERRNO> {
+        debug!(
+            "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
+            self.getpid(),
+            fault_addr,
+            access
+        );
+        if access == PageFaultAccess::Write {
+            let notified = {
+                let mut inner = self.inner.lock();
+                inner
+                    .memory_set
+                    .handle_shared_write_fault(VirtAddr::from(fault_addr))
+            };
+            if notified {
+                debug!(
+                    "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
+                    self.getpid(),
+                    fault_addr
+                );
+                return Ok(());
+            }
+        }
+        let plan = {
+            let inner = self.inner.lock();
+            inner
+                .memory_set
+                .prepare_file_page_fault(VirtAddr::from(fault_addr), access)
+        };
+        let Some(plan) = plan else {
+            debug!(
+                "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
+                self.getpid(),
+                fault_addr,
+                access
+            );
+            return Err(ERRNO::EFAULT);
+        };
+        let Some(inode) = plan.file.backing_inode() else {
+            return Err(ERRNO::EFAULT);
+        };
+        let Some(mapping) = mapping_for_inode(&inode) else {
+            return Err(ERRNO::EFAULT);
+        };
+        let page_start = plan.page_idx as usize * PAGE_SIZE;
+        let file_size = mapping.size();
+        if page_start >= file_size {
+            debug!(
+                "[mmap] file-backed fault beyond EOF: pid={} vpn={:#x} page_idx={} page_start={:#x} file_size={:#x}",
+                self.getpid(),
+                plan.vpn.0,
+                plan.page_idx,
+                page_start,
+                file_size
+            );
+            return Err(ERRNO::ENXIO);
+        };
+        debug!(
+            "[mmap] page fault lazy load: pid={} vpn={:#x} page_idx={} shared={} path={:?}",
+            self.getpid(),
+            plan.vpn.0,
+            plan.page_idx,
+            plan.shared,
+            plan.file.path()
+        );
+        let page = mapping.get_page(plan.page_idx);
+        let mut inner = self.inner.lock();
+        // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
+        // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。
+        let committed = if plan.shared {
+            inner.memory_set.map_shared_file_page(&plan, page)
+        } else {
+            inner.memory_set.map_private_file_page(&plan, page)
+        };
+        debug!(
+            "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
+            self.getpid(),
+            plan.vpn.0,
+            plan.shared,
+            committed
+        );
+        if committed {
+            Ok(())
+        } else {
+            Err(ERRNO::EFAULT)
+        }
     }
 
     /// change permissions of a mapped range. return true if success

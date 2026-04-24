@@ -1,7 +1,7 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, canonicalize, do_umount,
-    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device,
+    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device, truncate_inode,
     rename_at,
     open_file_at, unlinkat,
 };
@@ -232,6 +232,14 @@ fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
         return Err(ERRNO::EACCES);
     }
     Ok(desc)
+}
+
+/// 解析 truncate 系统调用传入的目标长度。
+fn parse_truncate_len(len: isize) -> Result<usize, ERRNO> {
+    if len < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(len as usize)
 }
 
 /// 从用户态复制 `iovec` 数组，避免数组跨页时直接解引用失败。
@@ -761,6 +769,58 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
     })
 }
 
+/// `truncate(2)`：按路径调整常规文件长度。
+pub fn sys_truncate(path: *const u8, len: isize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_truncate",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let new_size = parse_truncate_len(len)?;
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        debug!("sys_truncate: path='{}', new_size={}", path, new_size);
+        let target = resolve_at_target(AT_FDCWD, path.as_str(), 0)?;
+        match target {
+            ResolvedAtTarget::Inode(inode) => {
+                debug!(
+                    "sys_truncate: resolved inode fs_id={} ino={}",
+                    inode.fs_id(),
+                    inode.ino()
+                );
+                truncate_inode(&inode, new_size).map_err(ERRNO::from)?;
+                Ok(0)
+            }
+            ResolvedAtTarget::FileDesc(_) => Err(ERRNO::EINVAL),
+        }
+    })
+}
+
+/// `ftruncate(2)`：按已打开文件描述调整常规文件长度。
+pub fn sys_ftruncate(fd: u32, len: isize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_ftruncate",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let new_size = parse_truncate_len(len)?;
+        let desc = get_writable_file(fd as usize)?;
+        debug!("sys_ftruncate: fd={}, new_size={}", fd, new_size);
+        if let Some(inode) = desc.backing_inode() {
+            debug!(
+                "sys_ftruncate: backing inode fs_id={} ino={}",
+                inode.fs_id(),
+                inode.ino()
+            );
+        }
+        desc.truncate(new_size)?;
+        Ok(0)
+    })
+}
+
 /// close syscall
 pub fn sys_close(fd: u32) -> isize {
     trace!(
@@ -768,18 +828,29 @@ pub fn sys_close(fd: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    syscall_body!({
-        let fd = fd as usize;
-        if fd >= inner.fd_table.len() {
-            return Err(ERRNO::EBADF);
+    let closed_entry = {
+        let mut inner = process.inner_exclusive_access();
+        let mut closed_entry: Option<FdEntry> = None;
+        let result = syscall_body!({
+            let fd = fd as usize;
+            if fd >= inner.fd_table.len() {
+                return Err(ERRNO::EBADF);
+            }
+            if inner.fd_table[fd].is_none() {
+                return Err(ERRNO::EBADF);
+            }
+            // 先摘表项，等离开 `process.inner` 后再真正 drop，避免自旋锁内阻塞。
+            let entry = inner.take_fd(fd).ok_or(ERRNO::EBADF)?;
+            closed_entry = Some(entry);
+            Ok(0)
+        });
+        if result != 0 {
+            return result;
         }
-        if inner.fd_table[fd].is_none() {
-            return Err(ERRNO::EBADF);
-        }
-        inner.fd_table[fd].take();
-        Ok(0)
-    })
+        closed_entry
+    };
+    drop(closed_entry);
+    0
 }
 
 /// pipe syscall
@@ -848,31 +919,37 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    syscall_body!({
-        let oldfd = oldfd as usize;
-        let newfd = newfd as usize;
-        if oldfd >= inner.fd_table.len() {
-            return Err(ERRNO::EBADF);
-        }
-        if inner.fd_table[oldfd].is_none() {
-            return Err(ERRNO::EBADF);
-        }
-        if oldfd == newfd {
-            return Ok(newfd as isize);
-        }
-        if newfd >= inner.fd_table.len() {
-            inner.fd_table.resize(newfd + 1, None);
-        }
-        // If newfd is already open, close it first.
-        inner.fd_table[newfd].take();
-        let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
-        inner.fd_table[newfd] = Some(FdEntry {
-            desc,
-            flags: FdFlags::empty(),
+    let (result, replaced_entry) = {
+        let mut inner = process.inner_exclusive_access();
+        let mut replaced_entry: Option<FdEntry> = None;
+        let result = syscall_body!({
+            let oldfd = oldfd as usize;
+            let newfd = newfd as usize;
+            if oldfd >= inner.fd_table.len() {
+                return Err(ERRNO::EBADF);
+            }
+            if inner.fd_table[oldfd].is_none() {
+                return Err(ERRNO::EBADF);
+            }
+            if oldfd == newfd {
+                return Ok(newfd as isize);
+            }
+            if newfd >= inner.fd_table.len() {
+                inner.fd_table.resize(newfd + 1, None);
+            }
+            // 先把旧 `newfd` 表项拿出来，等离开进程自旋锁后再 drop。
+            replaced_entry = inner.take_fd(newfd);
+            let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
+            inner.fd_table[newfd] = Some(FdEntry {
+                desc,
+                flags: FdFlags::empty(),
+            });
+            Ok(newfd as isize)
         });
-        Ok(newfd as isize)
-    })
+        (result, replaced_entry)
+    };
+    drop(replaced_entry);
+    result
 }
 
 /// fstat syscall
