@@ -137,17 +137,34 @@ impl PageTable {
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
     }
-    /// Update PTE flags for an existing mapping (preserving ppn).
-    /// Returns true if the PTE existed and was updated.
-    pub fn update_flags(&mut self, vpn: VirtPageNum, new_flags: PTEFlags) -> bool {
-        if let Some(pte) = self.find_pte(vpn) {
-            if pte.is_valid() {
-                let ppn = pte.ppn();
-                *pte = PageTableEntry::new(ppn, new_flags | PTEFlags::V);
-                return true;
-            }
+    /// 清除一个已经存在的页表项，并返回旧值；若原本未映射则返回 `None`。
+    pub fn clear(&mut self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+        let pte = self.find_pte(vpn)?;
+        if !pte.is_valid() {
+            return None;
         }
-        false
+        let old = *pte;
+        *pte = PageTableEntry::empty();
+        Some(old)
+    }
+    /// 仅更新一个已经存在页表项的权限位，保持物理页号不变。
+    pub fn update_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        let pte = match self.find_pte(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => return false,
+        };
+        let ppn = pte.ppn();
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
+    }
+    /// 用新的物理页号和权限替换一个已经存在的页表项。
+    pub fn replace(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        let pte = match self.find_pte(vpn) {
+            Some(pte) if pte.is_valid() => pte,
+            _ => return false,
+        };
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {

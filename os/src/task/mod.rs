@@ -190,17 +190,22 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(process_inner);
         recycle_res.clear();
 
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.children.clear();
-        // deallocate other data in user space i.e. program code/data section
-        process_inner.memory_set.recycle_data_pages();
-        // drop file descriptors
-        process_inner.fd_table.clear();
-        // remove all tasks
-        process_inner.tasks.clear();
+        let (closed_fds, parent_weak) = {
+            let mut process_inner = process.inner_exclusive_access();
+            process_inner.children.clear();
+            // deallocate other data in user space i.e. program code/data section
+            process_inner.memory_set.recycle_data_pages();
+            // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
+            let closed_fds = process_inner.take_all_fds();
+            process_inner.fd_table.clear();
+            // remove all tasks
+            process_inner.tasks.clear();
 
-        let parent_weak = process_inner.parent.clone();
-        
+            let parent_weak = process_inner.parent.clone();
+            (closed_fds, parent_weak)
+        };
+        drop(closed_fds);
+
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
             parent.wait_exit_queue.wake_one();
         }

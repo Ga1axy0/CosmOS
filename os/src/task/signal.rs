@@ -123,6 +123,8 @@ impl SignalFlags {
             Some((4, "Illegal Instruction, SIGILL=4"))
         } else if self.contains(Self::SIGABRT) {
             Some((6, "Aborted, SIGABRT=6"))
+        } else if self.contains(Self::SIGBUS) {
+            Some((7, "Bus Error, SIGBUS=7"))
         } else if self.contains(Self::SIGFPE) {
             Some((8, "Erroneous Arithmetic Operation, SIGFPE=8"))
         } else if self.contains(Self::SIGSEGV) {
