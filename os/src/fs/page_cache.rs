@@ -557,7 +557,7 @@ fn get_or_create_page(
     page_idx: u64,
 ) -> Arc<SpinNoIrqLock<CachePage>> {
     if let Some(page) = mapping.lock().pages.get(&page_idx).cloned() {
-        debug!("[page_cache] page hit: page_idx={}", page_idx);
+        // debug!("[page_cache] page hit: page_idx={}", page_idx);
         return page;
     }
 
@@ -580,11 +580,11 @@ fn get_or_create_page(
     let mut manager = PAGE_CACHE_MANAGER.lock();
     manager.cached_pages += 1;
     manager.inactive.push_back(Arc::downgrade(&page));
-    debug!(
-        "[page_cache] page miss: page_idx={} cached_pages={}",
-        page_idx,
-        manager.cached_pages
-    );
+    // debug!(
+    //     "[page_cache] page miss: page_idx={} cached_pages={}",
+    //     page_idx,
+    //     manager.cached_pages
+    // );
     drop(manager);
     page
 }
@@ -638,13 +638,13 @@ fn ensure_page_uptodate(
         } else {
             let bytes = ppn.get_bytes_array();
             bytes.fill(0);
-            debug!(
-                "[page_cache] load page: fs_id={} ino={} page_idx={} valid_bytes={}",
-                inode.fs_id(),
-                inode.ino(),
-                page_idx,
-                valid_bytes
-            );
+            // debug!(
+            //     "[page_cache] load page: fs_id={} ino={} page_idx={} valid_bytes={}",
+            //     inode.fs_id(),
+            //     inode.ino(),
+            //     page_idx,
+            //     valid_bytes
+            // );
             // TODO：后续接入通用 truncate 后，需要避免装页与截断并发时把旧数据重新提交回 cache。
             inode.read_at(page_start_off, &mut bytes[..valid_bytes])
         };

@@ -20,6 +20,9 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 pub const USER_MMAP_BASE: usize = 0x1000_0000;
 /// default base address for the main thread's user stack region
 pub const USER_STACK_BASE: usize = 0x0800_0000;
+/// base address for loading dynamic linker (interpreter)
+/// placed between stack and mmap region to avoid conflicts
+pub const INTERP_BASE: usize = 0x4000_0000;
 /// the virtual addr of trapoline
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context

@@ -19,8 +19,8 @@ pub use frame_allocator::{frame_alloc, frame_dealloc, FrameTracker};
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
-    DeferredUserReclaim, InodeKey, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout,
-    Vma, VmaKind, KERNEL_SPACE,
+    DeferredUserReclaim, ElfLoadInfo, InodeKey, MapPermission, MemorySet, PageFaultAccess,
+    UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
 pub use tlb_shootdown::{
     clear_deferred, deferred_frame_count, deferred_range_count, defer_release, flush_deferred,

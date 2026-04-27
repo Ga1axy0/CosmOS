@@ -7,7 +7,7 @@ use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::PAGE_SIZE;
-use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
+use crate::fs::{mapping_for_inode, new_stdio_files, File, FileDescription};
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
     MapPermission, MemorySet, PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma,
@@ -18,6 +18,7 @@ use crate::syscall::errno::ERRNO;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 
 bitflags! {
@@ -259,7 +260,8 @@ impl ProcessControlBlock {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
         // assert that initproc is always valid elf
-        let (memory_set, user_layout, entry_point) = MemorySet::from_elf(elf_data).unwrap();
+        let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data).unwrap();
+        let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // allocate a pid
@@ -333,9 +335,109 @@ impl ProcessControlBlock {
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) -> Result<(), ()> {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        trace!("kernel: exec .. MemorySet::from_elf");
-        let (memory_set, user_layout, entry_point) = MemorySet::from_elf(elf_data)?;
+
+        // 首先加载原始程序
+        trace!("kernel: exec .. MemorySet::from_elf for application");
+        let (mut memory_set, user_layout, app_load_info) = MemorySet::from_elf(elf_data)?;
+
+        // 获取当前进程的cwd，用于打开动态链接器
+        let cwd = self.inner_exclusive_access().cwd.clone();
+
+        // 决定最终入口点和auxv
+        let (final_entry, auxv_extra) = if let Some(interp_path) = &app_load_info.interp_path {
+            debug!("Dynamic linking required, loading interpreter: {}", interp_path);
+
+            // 加载动态链接器到同一地址空间
+            // 使用 open_file_at 以支持相对路径（虽然INTERP通常是绝对路径）
+            let interp_inode = crate::fs::open_file_at(
+                cwd.as_str(),
+                interp_path.as_str(),
+                crate::fs::OpenFlags::RDONLY
+            ).map_err(|e| {
+                warn!("Failed to open dynamic linker: {}", interp_path);
+            })?;
+
+            if interp_inode.is_dir() {
+                warn!("Dynamic linker path is a directory: {}", interp_path);
+                return Err(());
+            }
+
+            let interp_data = interp_inode.read_all();
+
+            // 解析动态链接器ELF
+            let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ())?;
+            let interp_entry = interp_elf.header.pt2.entry_point() as usize;
+            let ph_count = interp_elf.header.pt2.ph_count();
+
+            // 动态链接器通常是位置无关的（PIE），需要重定位到不冲突的基地址
+            // 使用 INTERP_BASE 作为加载基地址
+            let interp_base = crate::config::INTERP_BASE;
+            debug!("Loading interpreter at base address: {:#x}", interp_base);
+            debug!("Interpreter original entry: {:#x}", interp_entry);
+
+            // 将动态链接器的LOAD段加载到内存，所有地址加上 interp_base
+            for i in 0..ph_count {
+                let ph = interp_elf.program_header(i).map_err(|_| ())?;
+                if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                    // 原始虚拟地址 + 基地址 = 实际加载地址
+                    let start_va: VirtAddr = (interp_base + ph.virtual_addr() as usize).into();
+                    let end_va: VirtAddr = (interp_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
+                    let mut map_perm = MapPermission::U;
+                    let ph_flags = ph.flags();
+                    if ph_flags.is_read() {
+                        map_perm |= MapPermission::R;
+                    }
+                    if ph_flags.is_write() {
+                        map_perm |= MapPermission::W;
+                    }
+                    if ph_flags.is_execute() {
+                        map_perm |= MapPermission::X;
+                    }
+
+                    debug!("mapping interpreter segment: [{:#x}, {:#x}) with flags {:?}",
+                        usize::from(start_va), usize::from(end_va), map_perm);
+
+                    let vma = Vma::new_elf(start_va, end_va, map_perm);
+                    let page_off = start_va.page_offset();
+                    let raw = &interp_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
+                    let padded: Vec<u8>;
+                    let seg_data: &[u8] = if page_off != 0 {
+                        let mut buf = alloc::vec![0u8; page_off + raw.len()];
+                        buf[page_off..].copy_from_slice(raw);
+                        padded = buf;
+                        &padded
+                    } else {
+                        raw
+                    };
+                    if !memory_set.insert_vma(vma, Some(seg_data)) {
+                        warn!("Failed to insert interpreter VMA at [{:#x}, {:#x})",
+                            usize::from(start_va), usize::from(end_va));
+                        return Err(());
+                    }
+                }
+            }
+
+            // 入口点也需要重定位
+            let relocated_entry = interp_base + interp_entry;
+            debug!("Interpreter relocated entry: {:#x}", relocated_entry);
+            debug!("App PHDR vaddr: {:#x}, phnum: {}", app_load_info.phdr_vaddr, app_load_info.phnum);
+
+            // 构造auxv：告诉动态链接器原程序的信息
+            let auxv_extra = vec![
+                (3usize, app_load_info.phdr_vaddr),  // AT_PHDR
+                (4usize, app_load_info.phent_size),  // AT_PHENT
+                (5usize, app_load_info.phnum),       // AT_PHNUM
+                (9usize, app_load_info.entry_point), // AT_ENTRY
+                (7usize, interp_base),               // AT_BASE - 动态链接器实际加载的基地址
+            ];
+
+            (relocated_entry, auxv_extra)
+        } else {
+            // 静态链接程序
+            debug!("Static linking, using application entry directly");
+            (app_load_info.entry_point, vec![])
+        };
+
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
@@ -373,8 +475,9 @@ impl ProcessControlBlock {
         //   [sp+(argc+4)*8]   4096            |
         //   [sp+(argc+5)*8]   AT_RANDOM = 25  | auxv
         //   [sp+(argc+6)*8]   &random[0]      |
-        //   [sp+(argc+7)*8]   AT_NULL = 0     |
-        //   [sp+(argc+8)*8]   0              /
+        //   [sp+(argc+7)*8]   ... (dynamic linking auxv if needed)
+        //   [sp+(argc+?)*8]   AT_NULL = 0     |
+        //   [sp+(argc+?)*8]   0              /
         //   [above + 16 bytes random data, 16-byte aligned]  argument strings
         trace!("kernel: exec .. push arguments on user stack");
         let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
@@ -406,9 +509,23 @@ impl ProcessControlBlock {
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
         let at_random_ptr = user_sp; // pointer to the 16 pseudo-random bytes above
 
-        // 4. Push auxv in reverse order so the in-memory layout (low → high) reads:
-        //    AT_PAGESZ(6), PAGE_SIZE, AT_RANDOM(25), at_random_ptr, AT_NULL(0), 0
-        for &word in &[0usize, 0, at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
+        // 4. Push auxv in reverse order
+        // First push AT_NULL terminator
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
+
+        // Push dynamic linking auxv if present (in reverse order)
+        for &(tag, val) in auxv_extra.iter().rev() {
+            user_sp -= core::mem::size_of::<usize>();
+            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = val;
+            user_sp -= core::mem::size_of::<usize>();
+            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = tag;
+        }
+
+        // Push standard auxv entries
+        for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
             user_sp -= core::mem::size_of::<usize>();
             *translated_refmut(new_token, user_sp as *mut usize).unwrap() = word;
         }
@@ -431,9 +548,9 @@ impl ProcessControlBlock {
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
 
         // initialize trap_cx
-        trace!("kernel: exec .. initialize trap_cx");
+        trace!("kernel: exec .. initialize trap_cx with entry={:#x}", final_entry);
         let mut trap_cx = TrapContext::app_init_context(
-            entry_point,
+            final_entry,
             user_sp,
             KERNEL_SPACE.lock().token(),
             task.kstack.get_top(),
@@ -451,11 +568,11 @@ impl ProcessControlBlock {
         trace!("kernel: fork");
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        debug!(
-            "[cow] fork begin: parent_pid={} parent_threads={}",
-            self.getpid(),
-            parent.thread_count()
-        );
+        // debug!(
+        //     "[cow] fork begin: parent_pid={} parent_threads={}",
+        //     self.getpid(),
+        //     parent.thread_count()
+        // );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let (memory_set, parent_tlb_needs_flush) =
             MemorySet::from_existed_user(&mut parent.memory_set);
@@ -563,11 +680,11 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack.get_top();
         trap_cx.x[10] = 0;
         drop(task_inner);
-        debug!(
-            "[cow] fork complete: parent_pid={} child_pid={}",
-            self.getpid(),
-            child.getpid()
-        );
+        // debug!(
+        //     "[cow] fork complete: parent_pid={} child_pid={}",
+        //     self.getpid(),
+        //     child.getpid()
+        // );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
@@ -576,7 +693,8 @@ impl ProcessControlBlock {
 
     /// Create a child process directly from elf image.
     pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ()> {
-        let (memory_set, user_layout, entry_point) = MemorySet::from_elf(elf_data)?;
+        let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data)?;
+        let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         let mut parent = self.inner_exclusive_access();
