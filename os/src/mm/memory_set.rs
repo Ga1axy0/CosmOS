@@ -11,6 +11,7 @@ use crate::fs::{
 use crate::sync::{SpinNoIrqLock};
 use crate::task::ProcessControlBlock;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -30,6 +31,20 @@ extern "C" {
     fn ebss();
     fn ekernel();
     fn strampoline();
+}
+
+/// ELF 加载结果，包含动态链接所需的额外信息
+pub struct ElfLoadInfo {
+    /// 程序入口点
+    pub entry_point: usize,
+    /// 程序头表在内存中的地址（用于 AT_PHDR）
+    pub phdr_vaddr: usize,
+    /// 程序头表项大小（用于 AT_PHENT）
+    pub phent_size: usize,
+    /// 程序头表项数量（用于 AT_PHNUM）
+    pub phnum: usize,
+    /// 动态链接器路径（如果存在 INTERP 段）
+    pub interp_path: Option<String>,
 }
 
 lazy_static! {
@@ -416,13 +431,13 @@ impl MemorySet {
         };
         area.data_frames.insert(vpn, Arc::clone(&page));
         self.page_table.map(vpn, page.ppn(), flags);
-        debug!(
-            "[cow] install shared private page: vpn={:#x} ppn={:#x} writable={} cow={}",
-            vpn.0,
-            page.ppn().0,
-            flags.contains(PTEFlags::W),
-            page.is_cow()
-        );
+        // debug!(
+        //     "[cow] install shared private page: vpn={:#x} ppn={:#x} writable={} cow={}",
+        //     vpn.0,
+        //     page.ppn().0,
+        //     flags.contains(PTEFlags::W),
+        //     page.is_cow()
+        // );
         true
     }
     /// 把一张已有的 page cache 页直接接入指定虚拟页，供 `fork` 继承只读文件私有映射。
@@ -441,12 +456,12 @@ impl MemorySet {
         retain_mapped_page(&page);
         area.direct_cache_pages.insert(vpn, Arc::clone(&page));
         self.page_table.map(vpn, page.lock().ppn(), flags);
-        debug!(
-            "[cow] install inherited direct cache page: vpn={:#x} ppn={:#x} writable={}",
-            vpn.0,
-            page.lock().ppn().0,
-            flags.contains(PTEFlags::W)
-        );
+        // debug!(
+        //     "[cow] install inherited direct cache page: vpn={:#x} ppn={:#x} writable={}",
+        //     vpn.0,
+        //     page.lock().ppn().0,
+        //     flags.contains(PTEFlags::W)
+        // );
         true
     }
     /// 在完成分裂、删除或追加后整理可合并的相邻区域。
@@ -555,7 +570,8 @@ impl MemorySet {
         memory_set
     }
     /// Include ELF segments and trampoline, and compute initial process VM layout.
-    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, usize), ()> {
+    /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo)
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), ()> {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -566,11 +582,46 @@ impl MemorySet {
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
         let mut max_end_vpn = VirtPageNum(0);
+
+        // 收集动态链接信息
+        let mut interp_path: Option<String> = None;
+        let phdr_vaddr = elf_header.pt2.ph_offset() as usize; // 程序头表文件偏移
+        let mut phdr_load_vaddr: Option<usize> = None; // 程序头表加载后的虚拟地址
+
         for i in 0..ph_count {
             let ph = elf.program_header(i).map_err(|_| ())?;
+
+            // 检查 INTERP 段
+            if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+                debug!("Found INTERP segment in ELF program header");
+                let offset = ph.offset() as usize;
+                let size = ph.file_size() as usize;
+                if size > 0 && offset + size <= elf_data.len() {
+                    let interp_bytes = &elf_data[offset..offset + size];
+                    // INTERP 段内容是以 null 结尾的字符串
+                    let end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+                    if let Ok(path) = core::str::from_utf8(&interp_bytes[..end]) {
+                        interp_path = Some(String::from(path));
+                        debug!("Found INTERP segment: {}", path);
+                    }
+                }
+            }
+
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+
+                // 检查程序头表是否在这个 LOAD 段内
+                if phdr_load_vaddr.is_none() {
+                    let seg_file_start = ph.offset() as usize;
+                    let seg_file_end = seg_file_start + ph.file_size() as usize;
+                    if phdr_vaddr >= seg_file_start && phdr_vaddr < seg_file_end {
+                        // 程序头表在此段内，计算其虚拟地址
+                        let offset_in_seg = phdr_vaddr - seg_file_start;
+                        phdr_load_vaddr = Some(ph.virtual_addr() as usize + offset_in_seg);
+                    }
+                }
+
                 let mut map_perm = MapPermission::U;
                 let ph_flags = ph.flags();
                 if ph_flags.is_read() {
@@ -612,11 +663,16 @@ impl MemorySet {
             ustack_base: USER_STACK_BASE,
             start_stack: USER_STACK_BASE + USER_STACK_SIZE,
         };
-        Ok((
-            memory_set,
-            layout,
-            elf.header.pt2.entry_point() as usize,
-        ))
+
+        let load_info = ElfLoadInfo {
+            entry_point: elf.header.pt2.entry_point() as usize,
+            phdr_vaddr: phdr_load_vaddr.unwrap_or(0),
+            phent_size: elf.header.pt2.ph_entry_size() as usize,
+            phnum: ph_count as usize,
+            interp_path,
+        };
+
+        Ok((memory_set, layout, load_info))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &mut Self) -> (Self, bool) {
@@ -632,15 +688,15 @@ impl MemorySet {
         for area_idx in 0..user_space.vmas.len() {
             let share_private_pages = user_space.vmas[area_idx].supports_private_page_sharing();
             let new_area = user_space.vmas[area_idx].clone_metadata();
-            debug!(
-                "[cow] fork inspect VMA: start={:#x} end={:#x} kind={:?} share_private_pages={} private_pages={} direct_cache_pages={}",
-                user_space.vmas[area_idx].start_vpn().0,
-                user_space.vmas[area_idx].end_vpn().0,
-                user_space.vmas[area_idx].kind,
-                share_private_pages,
-                user_space.vmas[area_idx].data_frames.len(),
-                user_space.vmas[area_idx].direct_cache_pages.len()
-            );
+            // debug!(
+            //     "[cow] fork inspect VMA: start={:#x} end={:#x} kind={:?} share_private_pages={} private_pages={} direct_cache_pages={}",
+            //     user_space.vmas[area_idx].start_vpn().0,
+            //     user_space.vmas[area_idx].end_vpn().0,
+            //     user_space.vmas[area_idx].kind,
+            //     share_private_pages,
+            //     user_space.vmas[area_idx].data_frames.len(),
+            //     user_space.vmas[area_idx].direct_cache_pages.len()
+            // );
             if share_private_pages {
                 let _ = memory_set.register_vma_metadata(new_area);
             } else {
@@ -661,14 +717,14 @@ impl MemorySet {
                         let _ = user_space.page_table.update_flags(vpn, child_flags);
                         parent_tlb_needs_flush = true;
                     }
-                    debug!(
-                        "[cow] fork share private page: vpn={:#x} ppn={:#x} writable={} child_writable={} cow={}",
-                        vpn.0,
-                        page.ppn().0,
-                        user_space.vmas[area_idx].map_perm.contains(MapPermission::W),
-                        child_flags.contains(PTEFlags::W),
-                        page.is_cow()
-                    );
+                    // debug!(
+                    //     "[cow] fork share private page: vpn={:#x} ppn={:#x} writable={} child_writable={} cow={}",
+                    //     vpn.0,
+                    //     page.ppn().0,
+                    //     user_space.vmas[area_idx].map_perm.contains(MapPermission::W),
+                    //     child_flags.contains(PTEFlags::W),
+                    //     page.is_cow()
+                    // );
                     let _ = memory_set.map_existing_private_page(vpn, page, child_flags);
                     continue;
                 }
@@ -924,13 +980,13 @@ impl MemorySet {
     ) -> Option<UserReleaseBatch> {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
-        debug!(
-            "[munmap] begin teardown: start={:#x} end={:#x} start_vpn={:#x} end_vpn={:#x}",
-            usize::from(start_va),
-            usize::from(end_va),
-            start_vpn.0,
-            end_vpn.0
-        );
+        // debug!(
+        //     "[munmap] begin teardown: start={:#x} end={:#x} start_vpn={:#x} end_vpn={:#x}",
+        //     usize::from(start_va),
+        //     usize::from(end_va),
+        //     start_vpn.0,
+        //     end_vpn.0
+        // );
         for vpn in VPNRange::new(start_vpn, end_vpn) {
             let Some(area) = self.find_vma_containing(vpn) else {
                 return None;
@@ -961,16 +1017,16 @@ impl MemorySet {
                 continue;
             }
 
-            debug!(
-                "[munmap] overlap VMA: area_start={:#x} area_end={:#x} overlap_start={:#x} overlap_end={:#x} file_backed={} direct_cache_pages={} private_pages={}",
-                area_start.0,
-                area_end.0,
-                overlap_start.0,
-                overlap_end.0,
-                area.file.is_some(),
-                area.direct_cache_pages.len(),
-                area.data_frames.len()
-            );
+            // debug!(
+            //     "[munmap] overlap VMA: area_start={:#x} area_end={:#x} overlap_start={:#x} overlap_end={:#x} file_backed={} direct_cache_pages={} private_pages={}",
+            //     area_start.0,
+            //     area_end.0,
+            //     overlap_start.0,
+            //     overlap_end.0,
+            //     area.file.is_some(),
+            //     area.direct_cache_pages.len(),
+            //     area.data_frames.len()
+            // );
 
             for vpn in VPNRange::new(overlap_start, overlap_end) {
                 area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
@@ -1296,14 +1352,14 @@ impl MemorySet {
         let mut writable_flags = pte.flags();
         writable_flags.insert(PTEFlags::W);
         writable_flags.remove(PTEFlags::D);
-        debug!(
-            "[cow] private write fault hit: vpn={:#x} ppn={:#x} refcnt={} cow={} path={:?}",
-            vpn.0,
-            page.ppn().0,
-            Arc::strong_count(&page),
-            page.is_cow(),
-            path
-        );
+        // debug!(
+        //     "[cow] private write fault hit: vpn={:#x} ppn={:#x} refcnt={} cow={} path={:?}",
+        //     vpn.0,
+        //     page.ppn().0,
+        //     Arc::strong_count(&page),
+        //     page.is_cow(),
+        //     path
+        // );
 
         // TODO: 这里暂时用 `Arc::strong_count` 近似判断是否仍有其他地址空间共享该页；
         // 后续若引入更复杂的页生命周期管理，需要改成显式引用计数或反向映射。

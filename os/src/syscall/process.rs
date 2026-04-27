@@ -82,6 +82,8 @@ fn resolve_exec_image(
     argv: Vec<String>,
     depth: usize,
 ) -> Result<ResolvedExecImage, ERRNO> {
+    debug!("Resolving exec image: path='{}', argv={:?}, depth={}", path, argv, depth);
+
     if depth >= EXEC_INTERPRETER_MAX_DEPTH {
         return Err(ERRNO::ELOOP);
     }
@@ -94,6 +96,11 @@ fn resolve_exec_image(
 
     // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
     let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    debug!(
+        "First line of exec target: {:?}, complete={}",
+        core::str::from_utf8(&first_line).unwrap_or("<invalid utf-8>"),
+        first_line_complete
+    );
     if is_elf_image(&first_line) {
         let file_data = inode.read_all();
         return Ok(ResolvedExecImage {
@@ -251,7 +258,9 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
 
         let process = current_process();
         let cwd = process.inner_exclusive_access().cwd.clone();
+        debug!(" ------------------- Resolve -----------------------");
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
+        debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage { elf_data, argv } = resolved;
         let argc = argv.len();
         process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
