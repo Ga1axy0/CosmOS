@@ -11,7 +11,7 @@ mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
 mod page_table;
-mod tlb_deferred;
+mod tlb_shootdown;
 
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
@@ -21,7 +21,7 @@ pub use memory_set::{
     kernel_token, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind,
     KERNEL_SPACE,
 };
-pub use tlb_deferred::{
+pub use tlb_shootdown::{
     clear_deferred_kernel_recycle_state, deferred_kernel_frame_count,
     deferred_kernel_va_range_count, has_deferred_kernel_recycle_work,
     kernel_va_range_requires_flush, note_deferred_kernel_va_release,
