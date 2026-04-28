@@ -12,9 +12,10 @@ use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, wri
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
-    block_current_and_run_next, current_process, current_task, current_user_token, FdEntry,
+    current_process, current_task, current_user_token, FdEntry,
     FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
+use crate::sched::block_current_and_run_next;
 use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;

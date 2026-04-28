@@ -5,10 +5,13 @@ use crate::{
     config::MAX_HARTS,
     hart::hartid,
     mm::{translated_byte_buffer, translated_ref},
+    sched::{
+        mark_current_task_need_resched, suspend_current_and_run_next,
+    },
     task::{
         current_process, current_task, current_user_token, enqueue_task_on,
-        mark_current_task_need_resched, pid2process, remove_task, resched_hart,
-        suspend_current_and_run_next, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+        pid2process, remove_task, resched_hart, SchedPolicy, SCHED_RT_PRIO_MAX,
+        SCHED_RT_PRIO_MIN,
     },
 };
 

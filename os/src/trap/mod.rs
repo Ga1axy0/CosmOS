@@ -20,11 +20,11 @@ use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
+use crate::sched::{on_timer_tick, schedule_if_needed};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
     current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next, on_timer_tick,
-    schedule_if_needed,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
 };
 use crate::timer::{check_timer, get_realtime_ns, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};

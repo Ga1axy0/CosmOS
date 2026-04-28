@@ -1,9 +1,9 @@
 //! Mutex (spin-like and blocking(sleep))
 
 use super::SpinNoIrqLock;
+use crate::sched::suspend_current_and_run_next;
 use crate::task::WaitQueue;
 use crate::task::WaitReason;
-use crate::task::suspend_current_and_run_next;
 
 /// Mutex trait
 pub trait Mutex: Sync + Send {

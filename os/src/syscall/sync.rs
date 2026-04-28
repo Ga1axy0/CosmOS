@@ -1,8 +1,9 @@
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
+use crate::sched::block_current_and_run_next;
 use crate::task::{
-    WaitReason, block_current_and_run_next, current_process, current_task
+    WaitReason, current_process, current_task, current_user_token
 };
 use crate::timer::{add_timer, get_time_ms};
 use crate::syscall::errno::ERRNO;
