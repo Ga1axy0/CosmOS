@@ -103,15 +103,15 @@ impl Drop for KernelStack {
     fn drop(&mut self) {
         let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
-        KERNEL_SPACE
+        let deferred_frames = KERNEL_SPACE
             .lock()
-            .remove_vma_with_start_vpn(kernel_stack_bottom_va.into());
-        // 这里先只统计 deferred 状态；真正的页框延迟回收到下一步接入 global flush
-        // 与独立 deferred frame 池时再补齐。
+            .remove_vma_with_start_vpn_deferred(kernel_stack_bottom_va.into());
+        // 这里先把拆下来的页框挂到 deferred 容器里；真正的 global TLB flush
+        // 与批量并回 frame allocator 的同步点在下一步接入。
         note_deferred_kernel_va_release(
             kernel_stack_bottom,
             kernel_stack_bottom + KERNEL_STACK_SIZE,
-            KERNEL_STACK_SIZE / PAGE_SIZE,
+            deferred_frames,
         );
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
     }

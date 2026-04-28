@@ -1,5 +1,6 @@
 //! Deferred TLB recycle state for kernel-space resources.
 
+use super::FrameTracker;
 use crate::sync::SpinNoIrqLock;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -22,8 +23,8 @@ pub struct DeferredKernelRecycleState {
     deferred_va_ranges: Vec<DeferredVaRange>,
     /// 当前 deferred 区间数量。
     deferred_va_range_count: usize,
-    /// 当前累计待 flush 的页数统计。
-    deferred_frame_count: usize,
+    /// 记录尚未经过全局 flush 的页框。
+    deferred_frames: Vec<FrameTracker>,
 }
 
 impl DeferredKernelRecycleState {
@@ -32,7 +33,7 @@ impl DeferredKernelRecycleState {
         Self {
             deferred_va_ranges: Vec::new(),
             deferred_va_range_count: 0,
-            deferred_frame_count: 0,
+            deferred_frames: Vec::new(),
         }
     }
 
@@ -42,7 +43,7 @@ impl DeferredKernelRecycleState {
     }
 
     /// 记录一个进入 deferred 状态的内核虚拟地址区间。
-    fn mark_va_range_deferred(&mut self, mut range: DeferredVaRange, frame_count: usize) {
+    fn mark_va_range_deferred(&mut self, mut range: DeferredVaRange, mut frames: Vec<FrameTracker>) {
         if range.start >= range.end {
             return;
         }
@@ -70,7 +71,7 @@ impl DeferredKernelRecycleState {
         }
         self.deferred_va_ranges.insert(idx, range);
         self.deferred_va_range_count += 1;
-        self.deferred_frame_count = self.deferred_frame_count.saturating_add(frame_count);
+        self.deferred_frames.append(&mut frames);
     }
 
     /// 判断给定虚拟地址区间是否仍然处于 deferred 状态。
@@ -91,11 +92,15 @@ lazy_static! {
         SpinNoIrqLock::new(DeferredKernelRecycleState::new());
 }
 
-/// 记录一个被释放的内核虚拟地址区间，等待后续全局 TLB flush 处理。
-pub fn note_deferred_kernel_va_release(start: usize, end: usize, frame_count: usize) {
+/// 记录一个被释放的内核虚拟地址区间及其页框，等待后续全局 TLB flush 处理。
+pub fn note_deferred_kernel_va_release(
+    start: usize,
+    end: usize,
+    frames: Vec<FrameTracker>,
+) {
     DEFERRED_KERNEL_RECYCLE_STATE
         .lock()
-        .mark_va_range_deferred(DeferredVaRange { start, end }, frame_count);
+        .mark_va_range_deferred(DeferredVaRange { start, end }, frames);
 }
 
 /// 判断给定内核虚拟地址区间在当前是否仍要求先做全局 TLB flush。
@@ -114,13 +119,13 @@ pub fn deferred_kernel_va_range_count() -> usize {
 
 /// 返回当前待 flush 的 deferred 页数统计。
 pub fn deferred_kernel_frame_count() -> usize {
-    DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_frame_count
+    DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_frames.len()
 }
 
 /// 判断当前是否存在待后续全局 flush 处理的内核态延迟回收状态。
 pub fn has_deferred_kernel_recycle_work() -> bool {
     let state = DEFERRED_KERNEL_RECYCLE_STATE.lock();
-    state.deferred_va_range_count != 0 || state.deferred_frame_count != 0
+    state.deferred_va_range_count != 0 || !state.deferred_frames.is_empty()
 }
 
 /// 清空当前所有 deferred 统计状态。
@@ -131,5 +136,5 @@ pub fn clear_deferred_kernel_recycle_state() {
     let mut state = DEFERRED_KERNEL_RECYCLE_STATE.lock();
     state.deferred_va_ranges.clear();
     state.deferred_va_range_count = 0;
-    state.deferred_frame_count = 0;
+    state.deferred_frames.clear();
 }
