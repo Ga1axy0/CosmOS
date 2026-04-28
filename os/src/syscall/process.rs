@@ -420,10 +420,6 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
 }
 
 /// sigaction 系统调用
-///
-/// 为当前进程的指定信号安装/读取用户态处理动作。
-/// 当前仅完成动作表的存取与基础参数校验，还没有把用户态 handler
-/// 真正接入 trap 返回路径。
 pub fn sys_sigaction(
     signum: i32,
     action: *const SignalAction,
@@ -446,8 +442,6 @@ pub fn sys_sigaction(
             *old = *slot;
         }
         if !action.is_null() {
-            // TODO: 接入用户态 signal handler 分发后，需要在这里补充
-            // 对 handler/mask 组合语义的进一步约束校验。
             let new_action = *translated_ref(token, action).or_errno(ERRNO::EFAULT)?;
             *slot = new_action;
         }
@@ -502,14 +496,53 @@ pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: us
 }
 
 /// sigreturn 系统调用
-///
-/// 供用户态 signal handler 返回内核并恢复被中断现场。
-/// 当前仅保留 syscall 框架，尚未实现 signal frame / trap context 恢复。
 pub fn sys_sigreturn() -> isize {
     syscall_body!({
-        // TODO: 实现用户态 signal frame 恢复，包括 trap context、
-        // 屏蔽字与正在处理信号状态的回滚。
-        Err(ERRNO::ENOSYS)?
+        // Restore the trap context and signal mask from the user stack
+        let trap_cx = crate::task::current_trap_cx();
+        let user_sp = trap_cx.x[2]; // Current sp
+
+        // The stack layout (from handle_signals):
+        // [aligned sp] -> [old_mask] -> [signum] -> [saved_trap_cx]
+        let token = current_user_token();
+
+        // Calculate pointers (reverse order from handle_signals)
+        let mut ptr = user_sp;
+
+        // Read old mask
+        let old_mask_ptr = ptr;
+        ptr += core::mem::size_of::<crate::task::SignalFlags>();
+
+        // Read signum (we don't need it for restoration)
+        ptr += core::mem::size_of::<usize>();
+
+        // Read saved trap context
+        let saved_trap_cx_ptr = ptr;
+
+        // Restore the old signal mask
+        let old_mask_opt = unsafe {
+            crate::mm::translated_ref(token, old_mask_ptr as *const crate::task::SignalFlags)
+        };
+        if let Some(old_mask) = old_mask_opt {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            inner.signal_mask = *old_mask;
+        } else {
+            return Err(ERRNO::EFAULT);
+        }
+
+        // Restore the trap context
+        let saved_cx_opt = unsafe {
+            crate::mm::translated_ref(token, saved_trap_cx_ptr as *const crate::trap::TrapContext)
+        };
+        if let Some(saved_cx) = saved_cx_opt {
+            *trap_cx = *saved_cx;
+        } else {
+            return Err(ERRNO::EFAULT);
+        }
+
+        // Return the original a0 value (which was saved in the trap context)
+        Ok(trap_cx.x[10] as isize)
     })
 }
 
