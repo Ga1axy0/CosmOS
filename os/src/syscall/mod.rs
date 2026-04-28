@@ -82,6 +82,10 @@ pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
+/// getitimer syscall
+pub const SYSCALL_GETITIMER: usize = 102;
+/// setitimer syscall
+pub const SYSCALL_SETITIMER: usize = 103;
 /// clock_settime syscall
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 /// clock_gettime syscall
@@ -356,6 +360,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as i32, args[1] as *mut OldItimerval),
+        SYSCALL_SETITIMER => sys_setitimer(
+            args[0] as i32,
+            args[1] as *const OldItimerval,
+            args[2] as *mut OldItimerval,
+        ),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),

@@ -6,7 +6,7 @@ use super::{SchedAttr, TaskControlBlock};
 use super::{add_task, SignalActions, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
-use crate::config::PAGE_SIZE;
+use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::fs::{mapping_for_inode, new_stdio_files, File, FileDescription};
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
@@ -20,6 +20,9 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+
+/// 每秒对应的纳秒数。
+const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 bitflags! {
     /// fd 表项级别的标志位。
@@ -142,6 +145,12 @@ pub struct ProcessControlBlockInner {
     pub accounting_state: CpuAccountingState,
     /// Timestamp of the last accounting state transition.
     pub accounting_timestamp: usize,
+    /// `ITIMER_REAL`：基于 `CLOCK_REALTIME`（墙钟时间）。
+    pub itimer_real: ItimerState,
+    /// `ITIMER_VIRTUAL`：基于进程用户态 CPU 时间。
+    pub itimer_virtual: ItimerState,
+    /// `ITIMER_PROF`：基于进程用户态 + 内核态 CPU 时间。
+    pub itimer_prof: ItimerState,
     /// Robust list
     pub robust_list: RobustList,
 }
@@ -156,6 +165,46 @@ pub enum CpuAccountingState {
     Inactive,
     User,
     Kernel,
+}
+
+/// 进程级 interval timer 状态。
+///
+/// `deadline_ns == 0` 表示该 timer 当前未启用。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ItimerState {
+    /// 周期重装载间隔，单位：纳秒。
+    pub interval_ns: u64,
+    /// 下一次到期绝对时间，单位：纳秒（所在时钟域）。
+    pub deadline_ns: u64,
+}
+
+#[inline]
+fn raw_counter_to_ns(raw: usize) -> u64 {
+    ((raw as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+}
+
+#[inline]
+fn itimer_remaining_ns(deadline_ns: u64, now_ns: u64) -> u64 {
+    if deadline_ns == 0 || deadline_ns <= now_ns {
+        0
+    } else {
+        deadline_ns - now_ns
+    }
+}
+
+#[inline]
+fn rearm_itimer_after_expire(timer: &mut ItimerState, now_ns: u64) {
+    if timer.deadline_ns == 0 || timer.deadline_ns > now_ns {
+        return;
+    }
+    if timer.interval_ns == 0 {
+        timer.deadline_ns = 0;
+        return;
+    }
+    let elapsed = now_ns.saturating_sub(timer.deadline_ns);
+    let periods = elapsed / timer.interval_ns + 1;
+    let advance = timer.interval_ns.saturating_mul(periods);
+    timer.deadline_ns = timer.deadline_ns.saturating_add(advance);
 }
 
 /// 进程级虚拟内存边界信息，用于协调 heap、mmap 和主线程栈布局。
@@ -296,6 +345,9 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    itimer_real: ItimerState::default(),
+                    itimer_virtual: ItimerState::default(),
+                    itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
                 })
             },
@@ -629,6 +681,9 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    itimer_real: ItimerState::default(),
+                    itimer_virtual: ItimerState::default(),
+                    itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
                 })
             },
@@ -738,6 +793,9 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    itimer_real: ItimerState::default(),
+                    itimer_virtual: ItimerState::default(),
+                    itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
                 })
             },
@@ -1172,6 +1230,130 @@ impl ProcessControlBlock {
             inner.child_user_time,
             inner.child_kernel_time,
         )
+    }
+
+    /// 按指定 itimer 类型读取“剩余时间 + 周期间隔”。
+    ///
+    /// 返回值均为纳秒。
+    pub fn get_itimer_state(
+        &self,
+        which: i32,
+        now_raw: usize,
+        now_realtime_ns: u64,
+    ) -> Result<(u64, u64), ERRNO> {
+        let inner = self.inner.lock();
+        let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
+        let (user_raw, kernel_raw) = match inner.accounting_state {
+            CpuAccountingState::User => (
+                inner.user_time.saturating_add(active_delta),
+                inner.kernel_time,
+            ),
+            CpuAccountingState::Kernel => (
+                inner.user_time,
+                inner.kernel_time.saturating_add(active_delta),
+            ),
+            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
+        };
+        let user_ns = raw_counter_to_ns(user_raw);
+        let kernel_ns = raw_counter_to_ns(kernel_raw);
+        let (timer, now_ns) = match which {
+            0 => (&inner.itimer_real, now_realtime_ns),
+            1 => (&inner.itimer_virtual, user_ns),
+            2 => (&inner.itimer_prof, user_ns.saturating_add(kernel_ns)),
+            _ => return Err(ERRNO::EINVAL),
+        };
+        Ok((
+            itimer_remaining_ns(timer.deadline_ns, now_ns),
+            timer.interval_ns,
+        ))
+    }
+
+    /// 按指定 itimer 类型设置 timer。
+    ///
+    /// - `new_value = None`：仅查询旧值（等价 `setitimer(value=NULL, ovalue=...)` 的内核侧状态读取）。
+    /// - `new_value = Some((value_ns, interval_ns))`：应用新值，并返回旧值。
+    ///
+    /// 返回旧值 `(old_value_ns, old_interval_ns)`，单位均为纳秒。
+    pub fn set_itimer_state(
+        &self,
+        which: i32,
+        now_raw: usize,
+        now_realtime_ns: u64,
+        new_value: Option<(u64, u64)>,
+    ) -> Result<(u64, u64), ERRNO> {
+        let mut inner = self.inner.lock();
+        let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
+        let (user_raw, kernel_raw) = match inner.accounting_state {
+            CpuAccountingState::User => (
+                inner.user_time.saturating_add(active_delta),
+                inner.kernel_time,
+            ),
+            CpuAccountingState::Kernel => (
+                inner.user_time,
+                inner.kernel_time.saturating_add(active_delta),
+            ),
+            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
+        };
+        let user_ns = raw_counter_to_ns(user_raw);
+        let kernel_ns = raw_counter_to_ns(kernel_raw);
+        let (timer, now_ns) = match which {
+            0 => (&mut inner.itimer_real, now_realtime_ns),
+            1 => (&mut inner.itimer_virtual, user_ns),
+            2 => (&mut inner.itimer_prof, user_ns.saturating_add(kernel_ns)),
+            _ => return Err(ERRNO::EINVAL),
+        };
+
+        let old = (
+            itimer_remaining_ns(timer.deadline_ns, now_ns),
+            timer.interval_ns,
+        );
+
+        if let Some((new_value_ns, new_interval_ns)) = new_value {
+            timer.interval_ns = new_interval_ns;
+            timer.deadline_ns = if new_value_ns == 0 {
+                0
+            } else {
+                now_ns.saturating_add(new_value_ns)
+            };
+        }
+
+        Ok(old)
+    }
+
+    /// 在一个时钟 tick 上推进进程级 interval timers，并返回本次应投递的信号集合。
+    pub fn consume_expired_itimers(&self, now_raw: usize, now_realtime_ns: u64) -> SignalFlags {
+        let mut inner = self.inner.lock();
+        let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
+        let (user_raw, kernel_raw) = match inner.accounting_state {
+            CpuAccountingState::User => (
+                inner.user_time.saturating_add(active_delta),
+                inner.kernel_time,
+            ),
+            CpuAccountingState::Kernel => (
+                inner.user_time,
+                inner.kernel_time.saturating_add(active_delta),
+            ),
+            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
+        };
+        let user_ns = raw_counter_to_ns(user_raw);
+        let prof_ns = user_ns.saturating_add(raw_counter_to_ns(kernel_raw));
+
+        let mut pending = SignalFlags::empty();
+
+        if inner.itimer_real.deadline_ns != 0 && inner.itimer_real.deadline_ns <= now_realtime_ns {
+            pending |= SignalFlags::SIGALRM;
+            rearm_itimer_after_expire(&mut inner.itimer_real, now_realtime_ns);
+        }
+        if inner.itimer_virtual.deadline_ns != 0 && inner.itimer_virtual.deadline_ns <= user_ns {
+            pending |= SignalFlags::SIGVTALRM;
+            rearm_itimer_after_expire(&mut inner.itimer_virtual, user_ns);
+        }
+        if inner.itimer_prof.deadline_ns != 0 && inner.itimer_prof.deadline_ns <= prof_ns {
+            pending |= SignalFlags::SIGPROF;
+            rearm_itimer_after_expire(&mut inner.itimer_prof, prof_ns);
+        }
+
+        pending
     }
 
 }

@@ -1,6 +1,6 @@
 use crate::SignalAction;
 
-use super::{Stat, TimeVal};
+use super::{Itimerval, Stat, TimeVal};
 
 pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_DUP: usize = 23;
@@ -21,6 +21,8 @@ pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_SLEEP: usize = 101;
+pub const SYSCALL_GETITIMER: usize = 102;
+pub const SYSCALL_SETITIMER: usize = 103;
 pub const SYSCALL_YIELD: usize = 124;
 pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_SIGACTION: usize = 134;
@@ -192,6 +194,17 @@ pub fn sys_exit(exit_code: i32) -> ! {
 
 pub fn sys_sleep(sleep_ms: usize) -> isize {
     syscall(SYSCALL_SLEEP, [sleep_ms, 0, 0])
+}
+
+pub fn sys_getitimer(which: i32, value: *mut Itimerval) -> isize {
+    syscall(SYSCALL_GETITIMER, [which as usize, value as usize, 0])
+}
+
+pub fn sys_setitimer(which: i32, value: *const Itimerval, ovalue: *mut Itimerval) -> isize {
+    syscall(
+        SYSCALL_SETITIMER,
+        [which as usize, value as usize, ovalue as usize],
+    )
 }
 
 pub fn sys_yield() -> isize {
