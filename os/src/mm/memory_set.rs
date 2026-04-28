@@ -100,6 +100,29 @@ impl MemorySet {
             }
         }
     }
+    /// 根据起始虚拟页号删除一段 framed 区域，并返回其中拆下的页框。
+    ///
+    /// 当前只为 kernel stack 的 deferred frame 回收准备。
+    /// TODO：若后续要让更多内核态映射复用这条路径，需要补齐 direct cache page
+    /// 与共享私有页的语义约束。
+    pub fn remove_vma_with_start_vpn_deferred(
+        &mut self,
+        start_vpn: VirtPageNum,
+    ) -> Vec<FrameTracker> {
+        let Some(idx) = self
+            .vmas
+            .iter()
+            .position(|area| area.start_vpn() == start_vpn)
+        else {
+            return Vec::new();
+        };
+        let mut area = self.vmas.remove(idx);
+        let frames = area.teardown_deferred(&mut self.page_table);
+        unsafe {
+            asm!("sfence.vma");
+        }
+        frames
+    }
     /// 判断给定区间是否与当前地址空间中的任意区域重叠。
     pub fn overlaps_vma_range(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
         self.vmas.iter().any(|vma| {
@@ -1312,6 +1335,11 @@ impl PrivatePage {
     pub fn is_cow(&self) -> bool {
         self.cow.load(Ordering::Acquire)
     }
+
+    /// 消费当前私有页并返回底层页框。
+    pub fn into_frame(self) -> FrameTracker {
+        self.frame
+    }
 }
 
 /// 一段带有权限、来源和页框信息的虚拟内存区域描述。
@@ -1568,6 +1596,36 @@ impl Vma {
                 let _ = page_table.clear(vpn);
             }
         }
+    }
+    /// 依据当前区域实际映射状态拆除全部页表项，并返回 framed 私有页对应的页框。
+    ///
+    /// 当前调用方只覆盖 kernel stack，因此这里要求每张私有页都具有独占所有权。
+    /// TODO：若未来需要推广到更一般的 deferred reclaim，应补齐共享私有页与
+    /// direct cache page 的处理分支。
+    pub fn teardown_deferred(&mut self, page_table: &mut PageTable) -> Vec<FrameTracker> {
+        let shared_vpns: alloc::vec::Vec<_> = self.direct_cache_pages.keys().copied().collect();
+        for vpn in shared_vpns {
+            self.unmap_present_one(page_table, vpn);
+        }
+        let framed_vpns: alloc::vec::Vec<_> = self.data_frames.keys().copied().collect();
+        let mut frames = Vec::with_capacity(framed_vpns.len());
+        for vpn in framed_vpns {
+            let Some(page) = self.data_frames.remove(&vpn) else {
+                continue;
+            };
+            let _ = page_table.clear(vpn);
+            let page = match Arc::try_unwrap(page) {
+                Ok(page) => page,
+                Err(_) => panic!("deferred framed reclaim requires exclusive page ownership"),
+            };
+            frames.push(page.into_frame());
+        }
+        if self.map_type == MapType::Identical {
+            for vpn in self.vpn_range {
+                let _ = page_table.clear(vpn);
+            }
+        }
+        frames
     }
     /// 为指定虚拟页建立单页映射，并在需要时分配新的物理页框。
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
