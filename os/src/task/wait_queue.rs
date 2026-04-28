@@ -95,8 +95,8 @@ impl WaitQueue {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
                     task_inner.current_wq_handle = None;
-                    task_inner.on_cpu = true;
-                    task_inner.on_rq = false;
+                    task_inner.sched.on_cpu = true;
+                    task_inner.sched.on_rq = false;
                 }
             }
             return;
@@ -244,8 +244,8 @@ where
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
                     task_inner.current_wq_handle = None;
-                    task_inner.on_cpu = true;
-                    task_inner.on_rq = false;
+                    task_inner.sched.on_cpu = true;
+                    task_inner.sched.on_rq = false;
                 }
             }
             return;

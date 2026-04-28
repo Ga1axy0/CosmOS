@@ -9,16 +9,8 @@
 //! Be careful when you see [`__switch`]. Control flow around this function
 //! might not be what you expect.
 
-#[path ="../sched/context.rs"]
-mod context;
 mod id;
-#[path = "../sched/runqueue.rs"]
-mod runqueue;
 mod process;
-#[path ="../sched/processor.rs"]
-mod processor;
-#[path ="../sched/switch.rs"]
-mod switch;
 mod wait_queue;
 #[allow(clippy::module_inception)]
 mod task;
@@ -26,34 +18,29 @@ mod task;
 use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::poll::task_has_inflight_keyed_poll_wait;
-use crate::task::runqueue::add_stopping_task;
-use crate::timer::remove_timer;
-use crate::timer::get_time;
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
+use crate::timer::get_time;
+use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
-use switch::__switch;
-
-pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub use runqueue::{
-    add_task, dequeue_task, enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio,
-    pid2process, pick_next_task, remove_from_pid2process, remove_task, resched_hart, wakeup_task,
+pub use crate::sched::{
+    add_stopping_task, add_task, current_kstack_top, current_process, current_processor,
+    current_task, current_trap_cx, current_trap_cx_user_va, current_user_token, dequeue_task,
+    enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio, pid2process,
+    pick_next_task, remove_from_pid2process, remove_task, resched_hart, run_tasks, schedule,
+    take_current_task, wakeup_task, TaskContext,
 };
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
     SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
 };
-pub use processor::{
-    current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
-};
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
 pub use task::{
-    all_cpu_affinity_mask, SchedAttr, SchedPolicy, TaskControlBlock, TaskStatus, WaitReason,
-    DEFAULT_TIME_SLICE_TICKS, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+    all_cpu_affinity_mask, SchedAttr, SchedPolicy, TaskControlBlock, TaskSchedState, TaskStatus,
+    WaitReason, DEFAULT_TIME_SLICE_TICKS, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
 };
 
 /// Make current task suspended and switch to the next task
@@ -62,11 +49,11 @@ pub fn suspend_current_and_run_next() {
     let task = take_current_task().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
-        task_inner.on_cpu = false;
-        task_inner.on_rq = false;
+        task_inner.sched.on_cpu = false;
+        task_inner.sched.on_rq = false;
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
-        task_inner.need_resched = false;
+        task_inner.sched.need_resched = false;
         &mut task_inner.task_cx as *mut TaskContext
     };
     add_task(task);
@@ -79,11 +66,11 @@ pub fn suspend_current_and_run_next_with_slice_reset(reset_slice: bool) {
     let task = take_current_task().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
-        task_inner.on_cpu = false;
-        task_inner.on_rq = false;
+        task_inner.sched.on_cpu = false;
+        task_inner.sched.on_rq = false;
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
-        task_inner.need_resched = false;
+        task_inner.sched.need_resched = false;
         if reset_slice {
             task_inner.reset_time_slice();
         }
@@ -102,16 +89,16 @@ pub fn block_current_and_run_next(reason: WaitReason) {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
             task_inner.current_wq_handle = None;
-            task_inner.on_cpu = true;
-            task_inner.on_rq = false;
-            task_inner.need_resched = false;
+            task_inner.sched.on_cpu = true;
+            task_inner.sched.on_rq = false;
+            task_inner.sched.need_resched = false;
             None
         } else {
-            task_inner.on_cpu = false;
-            task_inner.on_rq = false;
+            task_inner.sched.on_cpu = false;
+            task_inner.sched.on_rq = false;
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
-            task_inner.need_resched = false;
+            task_inner.sched.need_resched = false;
             Some(&mut task_inner.task_cx as *mut TaskContext)
         }
     };
@@ -146,9 +133,9 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
     task_inner.task_status = TaskStatus::Zombie;
-    task_inner.on_cpu = false;
-    task_inner.on_rq = false;
-    task_inner.need_resched = false;
+    task_inner.sched.on_cpu = false;
+    task_inner.sched.on_rq = false;
+    task_inner.sched.need_resched = false;
     task_inner.res = None;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
@@ -255,14 +242,14 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
 /// Mark the current task for deferred rescheduling.
 pub fn mark_current_task_need_resched() {
     if let Some(task) = current_task() {
-        task.inner_exclusive_access().need_resched = true;
+        task.inner_exclusive_access().sched.need_resched = true;
     }
 }
 
 /// Returns whether the current task has a pending reschedule request.
 pub fn current_task_need_resched() -> bool {
     current_task()
-        .map(|task| task.inner_exclusive_access().need_resched)
+        .map(|task| task.inner_exclusive_access().sched.need_resched)
         .unwrap_or(false)
 }
 
@@ -280,19 +267,21 @@ pub fn on_timer_tick() {
     };
     let hart = crate::hart::hartid();
     let mut task_inner = task.inner_exclusive_access();
-    if !matches!(task_inner.task_status, TaskStatus::Running) || !matches!(task_inner.policy, SchedPolicy::Rr) {
+    if !matches!(task_inner.task_status, TaskStatus::Running)
+        || !matches!(task_inner.sched.policy, SchedPolicy::Rr)
+    {
         return;
     }
-    if task_inner.remaining_slice_ticks > 0 {
-        task_inner.remaining_slice_ticks -= 1;
+    if task_inner.sched.remaining_slice_ticks > 0 {
+        task_inner.sched.remaining_slice_ticks -= 1;
     }
-    if task_inner.remaining_slice_ticks > 0 {
+    if task_inner.sched.remaining_slice_ticks > 0 {
         return;
     }
-    let prio = task_inner.rt_priority;
+    let prio = task_inner.sched.rt_priority;
     task_inner.reset_time_slice();
     if has_runnable_task_at_or_above(hart, prio) {
-        task_inner.need_resched = true;
+        task_inner.sched.need_resched = true;
     }
 }
 
@@ -400,7 +389,7 @@ pub fn current_add_signal(signal: SignalBit) {
 /// 扫描所有进程的 interval timer，到期则投递对应信号。
 pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
     let processes: Vec<Arc<ProcessControlBlock>> = {
-        let map = self::runqueue::PID2PCB.lock();
+        let map = crate::sched::PID2PCB.lock();
         map.values().cloned().collect()
     };
 

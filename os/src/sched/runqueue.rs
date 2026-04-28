@@ -1,11 +1,14 @@
 //! Per-hart RT runqueue management for phase 1 SCHED_RR.
 
-use super::{current_task, mark_current_task_need_resched, ProcessControlBlock, SCHED_RT_PRIO_MAX};
-use super::{all_cpu_affinity_mask, TaskControlBlock, TaskStatus};
+use super::current_task;
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
 use crate::sbi::send_ipi_mask;
 use crate::sync::SpinNoIrqLock;
+use crate::task::{
+    all_cpu_affinity_mask, mark_current_task_need_resched, ProcessControlBlock,
+    SCHED_RT_PRIO_MAX, TaskControlBlock, TaskStatus,
+};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::array;
@@ -120,9 +123,9 @@ pub fn resched_hart(hart: usize) {
 fn maybe_preempt_current_on_this_hart(incoming_prio: u8) {
     if let Some(task) = current_task() {
         let task_inner = task.inner_exclusive_access();
-        if task_inner.on_cpu
+        if task_inner.sched.on_cpu
             && matches!(task_inner.task_status, TaskStatus::Running)
-            && incoming_prio > task_inner.rt_priority
+            && incoming_prio > task_inner.sched.rt_priority
         {
             drop(task_inner);
             mark_current_task_need_resched();
@@ -151,15 +154,18 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
     let (target_hart, prio) = {
         let mut task_inner = task.inner_exclusive_access();
-        if task_inner.on_rq || task_inner.on_cpu || matches!(task_inner.task_status, TaskStatus::Zombie) {
+        if task_inner.sched.on_rq
+            || task_inner.sched.on_cpu
+            || matches!(task_inner.task_status, TaskStatus::Zombie)
+        {
             return;
         }
-        let target_hart = select_target_hart(hart, task_inner.cpu_affinity_mask);
+        let target_hart = select_target_hart(hart, task_inner.sched.cpu_affinity_mask);
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
-        task_inner.last_cpu = target_hart;
-        task_inner.on_rq = true;
-        (target_hart, task_inner.rt_priority)
+        task_inner.sched.last_cpu = target_hart;
+        task_inner.sched.on_rq = true;
+        (target_hart, task_inner.sched.rt_priority)
     };
     RUN_QUEUES[target_hart].lock().enqueue(task, prio);
 }
@@ -169,7 +175,7 @@ pub fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
     let task = RUN_QUEUES[normalize_hart(hart)].lock().dequeue_highest()?;
     {
         let mut task_inner = task.inner_exclusive_access();
-        task_inner.on_rq = false;
+        task_inner.sched.on_rq = false;
     }
     Some(task)
 }
@@ -185,19 +191,22 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
         let mut task_inner = task.inner_exclusive_access();
         match task_inner.task_status {
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {
-                if task_inner.on_rq {
+                if task_inner.sched.on_rq {
                     return false;
                 }
                 task_inner.task_status = TaskStatus::Runnable;
                 task_inner.wait_reason = None;
                 task_inner.current_wq_handle = None;
                 task_inner.reset_time_slice();
-                if task_inner.on_cpu {
+                if task_inner.sched.on_cpu {
                     None
                 } else {
-                    let target_hart = select_target_hart(task_inner.last_cpu, task_inner.cpu_affinity_mask);
-                    task_inner.on_rq = true;
-                    task_inner.last_cpu = target_hart;
+                    let target_hart = select_target_hart(
+                        task_inner.sched.last_cpu,
+                        task_inner.sched.cpu_affinity_mask,
+                    );
+                    task_inner.sched.on_rq = true;
+                    task_inner.sched.last_cpu = target_hart;
                     Some(target_hart)
                 }
             }
@@ -207,7 +216,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
     if let Some(target_hart) = wake_target {
         let prio = {
             let task_inner = task.inner_exclusive_access();
-            task_inner.rt_priority
+            task_inner.sched.rt_priority
         };
         RUN_QUEUES[target_hart].lock().enqueue(Arc::clone(&task), prio);
         if target_hart == hartid() {
@@ -224,7 +233,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
 pub fn remove_task(task: Arc<TaskControlBlock>) {
     let prio = {
         let task_inner = task.inner_exclusive_access();
-        task_inner.rt_priority
+        task_inner.sched.rt_priority
     };
     for rq in RUN_QUEUES.iter() {
         if rq.lock().remove_task(&task, prio) {
@@ -232,7 +241,7 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
         }
     }
     let mut task_inner = task.inner_exclusive_access();
-    task_inner.on_rq = false;
+    task_inner.sched.on_rq = false;
 }
 
 /// Set a task to stop-wait status on the current hart, keeping its kernel
@@ -244,18 +253,18 @@ pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
 
 /// Get process by pid.
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
-    let map = PID2PCB.lock();
+    let map = (*PID2PCB).lock();
     map.get(&pid).map(Arc::clone)
 }
 
 /// Insert item(pid, pcb) into PID2PCB map.
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
-    PID2PCB.lock().insert(pid, process);
+    (*PID2PCB).lock().insert(pid, process);
 }
 
 /// Remove item(pid, _some_pcb) from PID2PCB map.
 pub fn remove_from_pid2process(pid: usize) {
-    let mut map = PID2PCB.lock();
+    let mut map = (*PID2PCB).lock();
     if map.remove(&pid).is_none() {
         panic!("cannot find pid {} in pid2task!", pid);
     }

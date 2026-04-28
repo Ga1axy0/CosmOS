@@ -156,7 +156,7 @@ fn normalize_hart(hart: usize) -> usize {
 
 fn timer_hart_for_task(task: &Arc<TaskControlBlock>) -> usize {
     let task_inner = task.inner_exclusive_access();
-    normalize_hart(task_inner.last_cpu)
+    normalize_hart(task_inner.sched.last_cpu)
 }
 
 /// Add a timer
