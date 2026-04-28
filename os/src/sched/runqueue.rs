@@ -150,6 +150,16 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     enqueue_task_on(task, hartid());
 }
 
+/// Publish a fully initialized task to the scheduler on the current hart.
+pub fn activate_task(task: Arc<TaskControlBlock>) {
+    add_task(task);
+}
+
+/// Publish a fully initialized task to the scheduler on a selected hart.
+pub fn activate_task_on(task: Arc<TaskControlBlock>, hart: usize) {
+    enqueue_task_on(task, hart);
+}
+
 /// Add a task to a specific hart's runqueue.
 pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
     let (target_hart, prio) = {

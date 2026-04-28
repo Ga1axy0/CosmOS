@@ -3,7 +3,8 @@
 
 use super::id::RecycleAllocator;
 use super::{SchedAttr, TaskControlBlock};
-use super::{add_task, SignalAction, SignalActions, SignalBit, SIG_IGN};
+use crate::sched::activate_task;
+use super::{SignalAction, SignalActions, SignalBit, SIG_IGN};
 use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
@@ -430,6 +431,31 @@ impl ProcessControlBlock {
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
     }
+    /// Construct a task owned by this process without publishing it to the scheduler.
+    pub fn create_task(
+        self: &Arc<Self>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+        sched_attr: SchedAttr,
+    ) -> Arc<TaskControlBlock> {
+        Arc::new(TaskControlBlock::new(
+            Arc::clone(self),
+            ustack_base,
+            alloc_user_res,
+            sched_attr,
+        ))
+    }
+
+    /// Attach a created task to this process's task table without scheduling it.
+    pub fn attach_task(self: &Arc<Self>, task: Arc<TaskControlBlock>) {
+        let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+        let mut inner = self.inner_exclusive_access();
+        while inner.tasks.len() <= tid {
+            inner.tasks.push(None);
+        }
+        inner.tasks[tid] = Some(task);
+    }
+
     /// new process from elf file
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         trace!("kernel: ProcessControlBlock::new");
@@ -479,12 +505,7 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&process),
-            ustack_base,
-            true,
-            SchedAttr::default(),
-        ));
+        let task = process.create_task(ustack_base, true, SchedAttr::default());
         // prepare trap_cx of main thread
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
@@ -500,12 +521,10 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
         // add main thread to the process
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(process_inner);
+        process.attach_task(Arc::clone(&task));
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
-        // add main thread to scheduler
-        add_task(task);
+        // publish main thread to scheduler only after the process/task state is fully initialized
+        activate_task(task);
         process
     }
 
@@ -801,20 +820,19 @@ impl ProcessControlBlock {
         );
         child.register_existing_file_mappings();
         // create main thread of child process
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&child),
+        let task = child.create_task(
             parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
             parent_sched_attr,
-        ));
+        );
         task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
-        // attach task to child process
-        let mut child_inner = child.inner_exclusive_access();
-        child_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(child_inner);
-        // 在发布到调度器前修正子进程 trap context，避免 SMP 下子进程过早运行。
+        // attach task to child process before publishing it
+        child.attach_task(Arc::clone(&task));
+        // Finalize the child's trap context before publishing it to the scheduler.
+        // Otherwise, on SMP the child may run on another hart before `sys_fork`
+        // patches the inherited return register, breaking fork semantics.
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
@@ -846,8 +864,7 @@ impl ProcessControlBlock {
             child.getpid()
         );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        // add this thread to scheduler
-        add_task(task);
+        activate_task(task);
         child
     }
 
@@ -913,12 +930,7 @@ impl ProcessControlBlock {
         drop(parent_task_inner);
         drop(parent);
 
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&child),
-            ustack_base,
-            true,
-            parent_sched_attr,
-        ));
+        let task = child.create_task(ustack_base, true, parent_sched_attr);
         task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
@@ -934,11 +946,9 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
 
-        let mut child_inner = child.inner.lock();
-        child_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(child_inner);
+        child.attach_task(Arc::clone(&task));
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        add_task(task);
+        activate_task(task);
         Ok(child)
     }
     /// get pid
