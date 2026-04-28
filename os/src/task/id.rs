@@ -2,7 +2,10 @@
 
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE};
+use crate::mm::{
+    kernel_va_range_requires_flush, note_deferred_kernel_va_release, MapPermission, PhysPageNum,
+    VirtAddr, Vma, KERNEL_SPACE,
+};
 use crate::sync::{SpinNoIrqLock};
 use alloc::{
     sync::{Arc, Weak},
@@ -84,6 +87,10 @@ pub struct KernelStack(pub usize);
 pub fn kstack_alloc() -> KernelStack {
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
+    if kernel_va_range_requires_flush(kstack_bottom, kstack_top) {
+        // TODO：接入真正的 global TLB flush 后，这里应先完成一次全局同步，
+        // 再允许复用曾经进入 deferred 状态的 kernel stack 虚拟地址区间。
+    }
     KERNEL_SPACE.lock().insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
@@ -99,6 +106,13 @@ impl Drop for KernelStack {
         KERNEL_SPACE
             .lock()
             .remove_vma_with_start_vpn(kernel_stack_bottom_va.into());
+        // 这里先只统计 deferred 状态；真正的页框延迟回收到下一步接入 global flush
+        // 与独立 deferred frame 池时再补齐。
+        note_deferred_kernel_va_release(
+            kernel_stack_bottom,
+            kernel_stack_bottom + KERNEL_STACK_SIZE,
+            KERNEL_STACK_SIZE / PAGE_SIZE,
+        );
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
     }
 }
