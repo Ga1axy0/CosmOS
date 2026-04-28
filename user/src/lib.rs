@@ -112,7 +112,7 @@ bitflags! {
 }
 
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
@@ -123,6 +123,17 @@ impl TimeVal {
         Self::default()
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Itimerval {
+    pub it_interval: TimeVal,
+    pub it_value: TimeVal,
+}
+
+pub const ITIMER_REAL: i32 = 0;
+pub const ITIMER_VIRTUAL: i32 = 1;
+pub const ITIMER_PROF: i32 = 2;
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum TaskStatus {
@@ -333,6 +344,22 @@ pub fn get_time() -> isize {
         0 => ((time.sec & 0xffff) * 1000 + time.usec / 1000) as isize,
         _ => -1,
     }
+}
+
+pub fn getitimer(which: i32, value: &mut Itimerval) -> isize {
+    sys_getitimer(which, value as *mut _)
+}
+
+pub fn setitimer(
+    which: i32,
+    value: Option<&Itimerval>,
+    old_value: Option<&mut Itimerval>,
+) -> isize {
+    sys_setitimer(
+        which,
+        value.map_or(core::ptr::null(), |v| v as *const _),
+        old_value.map_or(core::ptr::null_mut(), |v| v as *mut _),
+    )
 }
 
 pub fn getpid() -> isize {

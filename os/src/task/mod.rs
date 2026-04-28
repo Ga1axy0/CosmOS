@@ -380,6 +380,21 @@ pub fn current_add_signal(signal: SignalFlags) {
     add_signal_to_process(&process, signal);
 }
 
+/// 扫描所有进程的 interval timer，到期则投递对应信号。
+pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
+    let processes: Vec<Arc<ProcessControlBlock>> = {
+        let map = self::manager::PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+
+    for process in processes {
+        let pending = process.consume_expired_itimers(now_raw, now_realtime_ns);
+        if !pending.is_empty() {
+            add_signal_to_process(&process, pending);
+        }
+    }
+}
+
 /// the inactive(blocked) tasks are removed when the PCB is deallocated.(called by exit_current_and_run_next)
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_task(Arc::clone(&task));

@@ -20,11 +20,12 @@ use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
 use crate::task::{
-    ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process,
-    current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token,
-    exit_current_and_run_next, on_timer_tick, schedule_if_needed,
+    ExitReason, SignalFlags, check_fatal_signals_of_current, check_itimers_of_all_processes,
+    current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next, on_timer_tick,
+    schedule_if_needed,
 };
-use crate::timer::{check_timer, get_time, set_next_trigger};
+use crate::timer::{check_timer, get_realtime_ns, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
@@ -238,6 +239,8 @@ pub fn trap_handler() -> ! {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
+            let now_raw = get_time();
+            check_itimers_of_all_processes(now_raw, get_realtime_ns());
             crate::net::poll();
             on_timer_tick();
         }
@@ -318,6 +321,8 @@ pub fn trap_from_kernel() {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
+            let now_raw = get_time();
+            check_itimers_of_all_processes(now_raw, get_realtime_ns());
             crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
