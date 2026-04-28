@@ -88,7 +88,7 @@ fn read_cpu_affinity_mask(
 pub fn sys_yield() -> isize {
     if crate::task::has_runnable_task_at_or_above(
         hartid(),
-        current_task().unwrap().inner_exclusive_access().rt_priority,
+        current_task().unwrap().inner_exclusive_access().sched.rt_priority,
     ) {
         suspend_current_and_run_next();
     }
@@ -99,13 +99,13 @@ fn resched_task_if_running(task: &Arc<crate::task::TaskControlBlock>, is_current
     let target_is_current = is_current || current_task().is_some_and(|current| Arc::ptr_eq(&current, task));
     let running_hart = {
         let task_inner = task.inner_exclusive_access();
-        if !task_inner.on_cpu {
+        if !task_inner.sched.on_cpu {
             return;
         }
         if target_is_current {
             None
         } else {
-            Some(task_inner.last_cpu)
+            Some(task_inner.sched.last_cpu)
         }
     };
     if let Some(hart) = running_hart {
@@ -136,15 +136,19 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
         };
         let (was_on_rq, was_on_cpu, last_cpu) = {
             let task_inner = task.inner_exclusive_access();
-            (task_inner.on_rq, task_inner.on_cpu, task_inner.last_cpu)
+            (
+                task_inner.sched.on_rq,
+                task_inner.sched.on_cpu,
+                task_inner.sched.last_cpu,
+            )
         };
         if was_on_rq {
             remove_task(task.clone());
         }
         {
             let mut task_inner = task.inner_exclusive_access();
-            task_inner.policy = SchedPolicy::Rr;
-            task_inner.rt_priority = priority as u8;
+            task_inner.sched.policy = SchedPolicy::Rr;
+            task_inner.sched.rt_priority = priority as u8;
             task_inner.reset_time_slice();
         }
         if was_on_rq {
@@ -168,7 +172,7 @@ pub fn sys_sched_getscheduler(pid: isize) -> isize {
             task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
         };
         let task_inner = task.inner_exclusive_access();
-        Ok(task_inner.policy as isize)
+        Ok(task_inner.sched.policy as isize)
     })
 }
 
@@ -182,7 +186,7 @@ pub fn sys_sched_getparam(pid: isize, param: *mut SchedParam) -> isize {
         } else {
             task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
         };
-        let sched_priority = task.inner_exclusive_access().rt_priority as i32;
+        let sched_priority = task.inner_exclusive_access().sched.rt_priority as i32;
         write_pod_to_user(param, &SchedParam { sched_priority }).or_errno(ERRNO::EFAULT)?;
         Ok(0)
     })
@@ -203,10 +207,11 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: *const u8) -> 
         let (was_on_rq, was_on_cpu, current_hart, needs_migration) = {
             let task_inner = task.inner_exclusive_access();
             (
-                task_inner.on_rq,
-                task_inner.on_cpu,
-                task_inner.last_cpu,
-                affinity_mask & (1usize << task_inner.last_cpu.min(MAX_HARTS.saturating_sub(1)))
+                task_inner.sched.on_rq,
+                task_inner.sched.on_cpu,
+                task_inner.sched.last_cpu,
+                affinity_mask
+                    & (1usize << task_inner.sched.last_cpu.min(MAX_HARTS.saturating_sub(1)))
                     == 0,
             )
         };
@@ -215,15 +220,15 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: *const u8) -> 
         }
         {
             let mut task_inner = task.inner_exclusive_access();
-            task_inner.cpu_affinity_mask = affinity_mask;
+            task_inner.sched.cpu_affinity_mask = affinity_mask;
             if needs_migration && !was_on_cpu {
-                task_inner.last_cpu = first_cpu_in_mask(affinity_mask);
+                task_inner.sched.last_cpu = first_cpu_in_mask(affinity_mask);
             }
         }
         if was_on_rq {
             let target_hart = {
                 let task_inner = task.inner_exclusive_access();
-                task_inner.last_cpu
+                task_inner.sched.last_cpu
             };
             enqueue_task_on(task, target_hart);
             mark_current_task_need_resched();
@@ -252,7 +257,7 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> is
         } else {
             task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
         };
-        let affinity_mask = task.inner_exclusive_access().cpu_affinity_mask & online_cpu_mask();
+        let affinity_mask = task.inner_exclusive_access().sched.cpu_affinity_mask & online_cpu_mask();
         let mut mask_bytes = Vec::new();
         mask_bytes.resize(cpusetsize, 0);
         for (idx, slot) in mask_bytes.iter_mut().take(kernel_mask_size).enumerate() {

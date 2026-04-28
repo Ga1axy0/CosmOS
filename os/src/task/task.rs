@@ -2,7 +2,8 @@
 
 use super::id::TaskUserRes;
 use super::wait_queue::WaitQueueHandle;
-use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
+use super::{kstack_alloc, KernelStack, ProcessControlBlock};
+use crate::sched::TaskContext;
 use crate::config::MAX_HARTS;
 use crate::trap::TrapContext;
 use crate::{mm::PhysPageNum};
@@ -64,6 +65,59 @@ impl Default for SchedAttr {
     }
 }
 
+/// Scheduler-owned mutable runtime state associated with one task.
+pub struct TaskSchedState {
+    /// Last hart that ran this task.
+    pub last_cpu: usize,
+    /// Whether the task is currently running on a CPU.
+    pub on_cpu: bool,
+    /// Whether the task is currently queued on a runqueue.
+    pub on_rq: bool,
+    /// Current scheduling policy.
+    pub policy: SchedPolicy,
+    /// Real-time priority. Larger value means higher priority.
+    pub rt_priority: u8,
+    /// Configured round-robin time slice, in timer ticks.
+    pub time_slice_ticks: u32,
+    /// Remaining time slice budget, in timer ticks.
+    pub remaining_slice_ticks: u32,
+    /// Deferred reschedule request handled at safe scheduling points.
+    pub need_resched: bool,
+    /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
+    pub cpu_affinity_mask: usize,
+}
+
+impl TaskSchedState {
+    /// Create a new `TaskSchedState` with the given scheduling attributes and default values.
+    pub fn new(sched_attr: SchedAttr) -> Self {
+        Self {
+            last_cpu: 0,
+            on_cpu: false,
+            on_rq: false,
+            policy: sched_attr.policy,
+            rt_priority: sched_attr.rt_priority,
+            time_slice_ticks: sched_attr.time_slice_ticks,
+            remaining_slice_ticks: sched_attr.time_slice_ticks,
+            need_resched: false,
+            cpu_affinity_mask: all_cpu_affinity_mask(),
+        }
+    }
+
+    /// Get the scheduling attributes corresponding to the current state.
+    pub fn sched_attr(&self) -> SchedAttr {
+        SchedAttr {
+            policy: self.policy,
+            rt_priority: self.rt_priority,
+            time_slice_ticks: self.time_slice_ticks,
+        }
+    }
+
+    /// Reset the remaining time slice to the full length according to the current scheduling attributes.
+    pub fn reset_time_slice(&mut self) {
+        self.remaining_slice_ticks = self.time_slice_ticks;
+    }
+}
+
 /// Task control block structure
 pub struct TaskControlBlock {
     /// immutable
@@ -98,26 +152,10 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// Why this task is blocked (if blocked by a sleep queue/event).
     pub wait_reason: Option<WaitReason>,
-    /// Last hart that ran this task.
-    pub last_cpu: usize,
-    /// whether the task is running on cpu
-    pub on_cpu: bool,
-    /// whether the task is in runqueue
-    pub on_rq: bool,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
-    /// Current scheduling policy.
-    pub policy: SchedPolicy,
-    /// Real-time priority. Larger value means higher priority.
-    pub rt_priority: u8,
-    /// Configured round-robin time slice, in timer ticks.
-    pub time_slice_ticks: u32,
-    /// Remaining time slice budget, in timer ticks.
-    pub remaining_slice_ticks: u32,
-    /// Deferred reschedule request handled at safe scheduling points.
-    pub need_resched: bool,
-    /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
-    pub cpu_affinity_mask: usize,
+    /// Scheduler-private mutable runtime state.
+    pub sched: TaskSchedState,
     /// Handle to the WaitQueue this task is currently sleeping in (if any).
     /// Used by signal delivery to properly remove the task from the queue.
     pub current_wq_handle: Option<WaitQueueHandle>,
@@ -134,15 +172,11 @@ impl TaskControlBlockInner {
     }
 
     pub fn sched_attr(&self) -> SchedAttr {
-        SchedAttr {
-            policy: self.policy,
-            rt_priority: self.rt_priority,
-            time_slice_ticks: self.time_slice_ticks,
-        }
+        self.sched.sched_attr()
     }
 
     pub fn reset_time_slice(&mut self) {
-        self.remaining_slice_ticks = self.time_slice_ticks;
+        self.sched.reset_time_slice();
     }
 }
 
@@ -158,28 +192,20 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();
         let kstack_top = kstack.get_top();
-            Self {
-                process: Arc::downgrade(&process),
-                kstack,
-                inner: SpinNoIrqLock::new(TaskControlBlockInner {
-                        res: Some(res),
-                        trap_cx_ppn,
-                        task_cx: TaskContext::goto_trap_return(kstack_top),
-                        task_status: TaskStatus::Runnable,
-                        wait_reason: None,
-                        last_cpu: 0,
-                        on_cpu: false,
-                        on_rq: false,
-                        exit_code: None,
-                        policy: sched_attr.policy,
-                        rt_priority: sched_attr.rt_priority,
-                        time_slice_ticks: sched_attr.time_slice_ticks,
-                        remaining_slice_ticks: sched_attr.time_slice_ticks,
-                        need_resched: false,
-                        cpu_affinity_mask: all_cpu_affinity_mask(),
-                        current_wq_handle: None,
-                    }),
-            }
+        Self {
+            process: Arc::downgrade(&process),
+            kstack,
+            inner: SpinNoIrqLock::new(TaskControlBlockInner {
+                res: Some(res),
+                trap_cx_ppn,
+                task_cx: TaskContext::goto_trap_return(kstack_top),
+                task_status: TaskStatus::Runnable,
+                wait_reason: None,
+                exit_code: None,
+                sched: TaskSchedState::new(sched_attr),
+                current_wq_handle: None,
+            }),
+        }
     }
 }
 

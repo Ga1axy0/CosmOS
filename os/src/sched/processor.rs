@@ -5,11 +5,11 @@
 //! and the replacement and transfer of control flow of different applications are executed.
 
 use super::__switch;
-use super::{pick_next_task, TaskStatus};
-use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
+use super::{pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
 use crate::sync::SpinNoIrqLock;
+use crate::task::{ProcessControlBlock, TaskControlBlock, TaskStatus, INITPROC};
 use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
@@ -90,10 +90,10 @@ pub fn run_tasks() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
-            task_inner.last_cpu = hartid();
-            task_inner.on_cpu = true;
-            task_inner.on_rq = false;
-            task_inner.need_resched = false;
+            task_inner.sched.last_cpu = hartid();
+            task_inner.sched.on_cpu = true;
+            task_inner.sched.on_rq = false;
+            task_inner.sched.need_resched = false;
             drop(task_inner);
 
             processor.current = Some(task);
@@ -105,7 +105,7 @@ pub fn run_tasks() {
             }
         } else {
             // idle: enable interrupts and wait for next interrupt (timer/UART/etc.)
-            if super::INITPROC.inner_exclusive_access().is_zombie() {
+            if INITPROC.inner_exclusive_access().is_zombie() {
                 info!("Goodbye!");
                 crate::sbi::shutdown();
             }

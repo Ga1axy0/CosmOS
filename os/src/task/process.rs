@@ -2,9 +2,9 @@
 #![allow(deprecated)]
 
 use super::id::RecycleAllocator;
-use super::runqueue::insert_into_pid2process;
 use super::{SchedAttr, TaskControlBlock};
 use super::{add_task, SignalAction, SignalActions, SignalBit, SIG_IGN};
+use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
@@ -69,6 +69,7 @@ pub struct ProcessControlBlock {
     pub pid: PidHandle,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
+    /// wait queue for wait4/waitpid
     pub wait_exit_queue: Arc<WaitQueue>,
 }
 
@@ -781,7 +782,7 @@ impl ProcessControlBlock {
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
+        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         drop(parent_task_inner);
         drop(parent);
         if parent_mask != 0 {
@@ -808,7 +809,7 @@ impl ProcessControlBlock {
             false,
             parent_sched_attr,
         ));
-        task.inner_exclusive_access().cpu_affinity_mask = parent_affinity_mask;
+        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
@@ -908,7 +909,7 @@ impl ProcessControlBlock {
         let parent_task = parent.get_task(0);
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
+        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         drop(parent_task_inner);
         drop(parent);
 
@@ -918,7 +919,7 @@ impl ProcessControlBlock {
             true,
             parent_sched_attr,
         ));
-        task.inner_exclusive_access().cpu_affinity_mask = parent_affinity_mask;
+        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
@@ -944,19 +945,19 @@ impl ProcessControlBlock {
     pub fn getpid(&self) -> usize {
         self.pid.0
     }
-
+    /// get uid
     pub fn getuid(&self) -> u32 {
         self.inner.lock().cred.uid
     }
-
+    /// get euid
     pub fn geteuid(&self) -> u32 {
         self.inner.lock().cred.euid
     }
-
+    /// get gid
     pub fn getgid(&self) -> u32 {
         self.inner.lock().cred.gid
     }
-
+    /// get egid
     pub fn getegid(&self) -> u32 {
         self.inner.lock().cred.egid
     }

@@ -35,8 +35,8 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         sched_attr,
     ));
     {
-        let affinity_mask = task.inner_exclusive_access().cpu_affinity_mask;
-        new_task.inner_exclusive_access().cpu_affinity_mask = affinity_mask;
+        let affinity_mask = task.inner_exclusive_access().sched.cpu_affinity_mask;
+        new_task.inner_exclusive_access().sched.cpu_affinity_mask = affinity_mask;
     }
     // add new task to scheduler
     add_task(Arc::clone(&new_task));
