@@ -1,8 +1,9 @@
 /// Keyed wait queue supporting wakeup by selected key.
 use super::{
-    block_current_and_run_next, current_task, wakeup_task, TaskControlBlock, TaskStatus,
+    current_task, wakeup_task, TaskControlBlock, TaskStatus,
     WaitReason,
 };
+use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
 use alloc::{
     collections::{VecDeque},

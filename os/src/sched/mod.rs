@@ -3,11 +3,17 @@
 //! This module owns CPU-local scheduling state and context switching
 //! primitives. Task and process object definitions remain under `task`.
 
+mod api;
 mod context;
 mod processor;
 mod runqueue;
 mod switch;
 
+pub use api::{
+    block_current_and_run_next, current_task_need_resched, mark_current_task_need_resched,
+    on_timer_tick, schedule_if_needed, suspend_current_and_run_next,
+    suspend_current_and_run_next_with_slice_reset,
+};
 pub use context::TaskContext;
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
