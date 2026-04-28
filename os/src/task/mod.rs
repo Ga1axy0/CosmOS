@@ -321,6 +321,31 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     pending.check_error()
 }
 
+/// Check and handle non-fatal signals for the current process.
+/// Returns Some((signum, handler, mask)) if a signal needs to be handled.
+pub fn check_signals_of_current() -> Option<(i32, usize, SignalFlags)> {
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    let pending = process_inner.pending_signals & !process_inner.signal_mask;
+
+    // Find the first pending signal
+    for signum in 1..=MAX_SIG {
+        let flag = SignalFlags::from_bits(1 << signum);
+        if let Some(flag) = flag {
+            if pending.contains(flag) {
+                let action = process_inner.signal_actions.table[signum];
+                // Check if there's a user-defined handler
+                if action.handler != 0 && action.handler != 1 {
+                    // Clear the signal from pending
+                    process_inner.pending_signals &= !flag;
+                    return Some((signum as i32, action.handler, action.mask));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
 pub fn current_process_is_zombie() -> bool {
     let process = current_process();
