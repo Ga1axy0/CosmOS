@@ -7,7 +7,7 @@ use crate::{
     block_cache::get_block_cache,
     easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType},
     errno::FS_ERRNO,
-    vfs::{Inode, VfsNode},
+    vfs::{Inode, VfsAttrs, VfsNode},
 };
 
 /// EasyFS-backed inode implementation.
@@ -188,6 +188,21 @@ impl VfsNode for EasyInode {
 
     fn is_dir(&self) -> bool {
         self.read_disk_inode(|d| d.is_dir())
+    }
+
+    fn stat_attrs(&self) -> VfsAttrs {
+        let (is_dir, size) =
+            self.read_disk_inode(|di| (di.is_dir(), di.size as usize));
+        let ino = ((self.block_id as u64) << 32) | self.block_offset as u64;
+        VfsAttrs {
+            mode: if is_dir { Some(0o40755) } else { Some(0o100644) },
+            ino,
+            nlink: 1,
+            size,
+            atime: None,
+            mtime: None,
+            ctime: None,
+        }
     }
 
     fn clear(&self) {

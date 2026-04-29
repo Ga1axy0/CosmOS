@@ -22,6 +22,19 @@ impl InodeTime {
     }
 }
 
+/// Batched inode attribute snapshot — read in one call to avoid repeated
+/// lock acquisitions in the backend.
+#[derive(Clone, Debug)]
+pub struct VfsAttrs {
+    pub mode: Option<u32>,
+    pub ino: u64,
+    pub nlink: u32,
+    pub size: usize,
+    pub atime: Option<InodeTime>,
+    pub mtime: Option<InodeTime>,
+    pub ctime: Option<InodeTime>,
+}
+
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
@@ -126,6 +139,22 @@ pub trait VfsNode: Send + Sync + Any {
     /// Update `atime`/`mtime`/`ctime` to the same timestamp.
     fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
         self.set_times(Some(now), Some(now), Some(now))
+    }
+
+    /// Read all stat-relevant attributes in one shot.
+    ///
+    /// The default implementation calls individual getters; backends should
+    /// override this to batch the reads under a single lock acquisition.
+    fn stat_attrs(&self) -> VfsAttrs {
+        VfsAttrs {
+            mode: self.mode(),
+            ino: self.ino(),
+            nlink: self.nlink(),
+            size: self.size(),
+            atime: self.atime(),
+            mtime: self.mtime(),
+            ctime: self.ctime(),
+        }
     }
 
     /// Rename or move a child entry from this directory to `new_parent/new_name`.
@@ -252,6 +281,11 @@ impl Inode {
     /// 返回底层文件系统实例标识。
     pub fn fs_id(&self) -> u64 {
         self.inner.fs_id()
+    }
+
+    /// Read all stat-relevant attributes in one call.
+    pub fn stat_attrs(&self) -> VfsAttrs {
+        self.inner.stat_attrs()
     }
 
     pub fn nlink(&self) -> u32 {

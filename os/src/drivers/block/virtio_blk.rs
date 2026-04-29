@@ -21,6 +21,7 @@ impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
+        // debug!("Submitting VirtIOBlk read for block_id {}", block_id);
         let token = unsafe {
             self.inner
                 .lock()
