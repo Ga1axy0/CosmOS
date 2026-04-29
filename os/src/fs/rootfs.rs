@@ -35,6 +35,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
+use fs::remove_dentry;
 use fs::vfs::{InodeTime, VfsNode};
 use lazy_static::*;
 
@@ -112,13 +113,20 @@ impl VirtualDirNode {
             .lock()
             .mounts
             .insert(String::from(name), node);
+        // Invalidate cached overlay dentry at this name.
+        remove_dentry(u64::MAX, self.ino, name);
     }
 
     /// Remove the explicit binding for `name`.
     ///
     /// Returns `true` if the binding existed and was removed.
     pub fn unbind(&self, name: &str) -> bool {
-        self.inner.lock().mounts.remove(name).is_some()
+        let existed = self.inner.lock().mounts.remove(name).is_some();
+        if existed {
+            // Invalidate cached mount dentry at this name.
+            remove_dentry(u64::MAX, self.ino, name);
+        }
+        existed
     }
 
     /// If the overlay contains a *directory* child named `name`, return it.
@@ -154,6 +162,11 @@ impl VfsNode for VirtualDirNode {
 
     fn is_dir(&self) -> bool {
         true
+    }
+
+    fn fs_id(&self) -> u64 {
+        // Use a sentinel so the dentry cache covers virtual-directory lookups.
+        u64::MAX
     }
 
     fn ino(&self) -> u64 {
