@@ -744,31 +744,39 @@ impl File for OSInode {
 
 /// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。
 pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
-    let mode = StatMode::from_bits_truncate(inode.mode().unwrap_or(
-        if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() }
+    // Read all attributes in one batched call (single lock acquisition for
+    // backends like ext4, instead of one per field).
+    let attrs = inode.stat_attrs();
+    let is_dir = inode.is_dir();
+    let mode = StatMode::from_bits_truncate(attrs.mode.unwrap_or(
+        if is_dir { StatMode::DIR.bits() } else { StatMode::FILE.bits() }
     ));
-    let atime = inode.atime();
-    let mtime = inode.mtime();
-    let ctime = inode.ctime();
+    // Prefer the page-cache size for regular files that have dirty mappings;
+    // fall back to the batched attribute read otherwise.
+    let size = if !is_dir {
+        page_cache::cached_inode_size_fast(inode, attrs.size)
+    } else {
+        attrs.size
+    };
     Stat {
         dev: 0,
-        ino: inode.ino(),
+        ino: attrs.ino,
         mode,
-        nlink: inode.nlink(),
+        nlink: attrs.nlink,
         uid: 0,
         gid: 0,
         rdev: 0,
         pad0: 0,
-        size: page_cache::cached_inode_size(inode) as i64,
+        size: size as i64,
         blksize: 512,
         pad1: 0,
-        blocks: (page_cache::cached_inode_size(inode) as u64 + 511) / 512,
-        atime_sec: atime.map(|t| t.sec as isize).unwrap_or(0),
-        atime_nsec: atime.map(|t| t.nsec as isize).unwrap_or(0),
-        mtime_sec: mtime.map(|t| t.sec as isize).unwrap_or(0),
-        mtime_nsec: mtime.map(|t| t.nsec as isize).unwrap_or(0),
-        ctime_sec: ctime.map(|t| t.sec as isize).unwrap_or(0),
-        ctime_nsec: ctime.map(|t| t.nsec as isize).unwrap_or(0),
+        blocks: (size as u64 + 511) / 512,
+        atime_sec: attrs.atime.map(|t| t.sec as isize).unwrap_or(0),
+        atime_nsec: attrs.atime.map(|t| t.nsec as isize).unwrap_or(0),
+        mtime_sec: attrs.mtime.map(|t| t.sec as isize).unwrap_or(0),
+        mtime_nsec: attrs.mtime.map(|t| t.nsec as isize).unwrap_or(0),
+        ctime_sec: attrs.ctime.map(|t| t.sec as isize).unwrap_or(0),
+        ctime_nsec: attrs.ctime.map(|t| t.nsec as isize).unwrap_or(0),
         unused: [0; 2],
     }
 }

@@ -198,6 +198,19 @@ pub fn cached_inode_size(inode: &Arc<Inode>) -> usize {
     inode.size()
 }
 
+/// Like [`cached_inode_size`], but uses `fs_size` as the fallback instead of
+/// calling `inode.size()` again.  Useful when the caller already has a
+/// batched-read size and wants to avoid a redundant lock acquisition.
+pub fn cached_inode_size_fast(inode: &Arc<Inode>, fs_size: usize) -> usize {
+    if !is_inode_page_cacheable(inode) {
+        return fs_size;
+    }
+    if let Some(mapping) = try_get_mapping(inode) {
+        return mapping.size();
+    }
+    fs_size
+}
+
 /// 获取当前 inode 对应的稳定 page mapping 句柄。
 pub fn mapping_for_inode(inode: &Arc<Inode>) -> Option<PageMappingHandle> {
     if !is_inode_page_cacheable(inode) {

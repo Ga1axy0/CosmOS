@@ -57,7 +57,6 @@ impl DentryCache {
         if let Some(entry) = self.table.get_mut(&key) {
             if let Some(child) = entry.child.upgrade() {
                 entry.ref_bit = true;
-                debug!("Cache hit: {:?} → Inode({})", key, child.ino());
                 return Some(child);
             }
             // Weak reference expired — drop the stale entry.

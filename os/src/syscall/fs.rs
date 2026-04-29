@@ -15,7 +15,7 @@ use crate::task::{
     block_current_and_run_next, current_process, current_task, current_user_token, FdEntry,
     FdFlags, WaitReason,
 };
-use crate::timer::get_realtime_ns;
+use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1383,11 +1383,18 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
                 }
             }
         }
+let time1 = get_time_us();
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
         let abs_path = canonicalize(cwd.as_str(), path.as_str());
+let time2 = get_time_us();
         let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+let time3 = get_time_us();
         let stat = inode_stat(&inode);
+let time4 = get_time_us();
         write_pod_to_user(st, &stat)?;
+let time5 = get_time_us();
+        debug!("sys_newfstatat: resolve_dirfd_base & canonicalize = {}us, lookup_inode = {}us, inode_stat = {}us, write_pod_to_user = {}us",
+            time2 - time1, time3 - time2, time4 - time3, time5 - time4);
         Ok(0)
     })
 }
