@@ -479,7 +479,7 @@ impl VfsNode for FatInode {
         self
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         let inner = self.inner.lock();
         if !inner.is_dir {
             return Vec::new();
@@ -489,8 +489,11 @@ impl VfsNode for FatInode {
 
         self.iter_dir(dir_cluster)
             .into_iter()
-            .map(|e| e.name_string())
-            .filter(|name| name != "." && name != "..")
+            .filter(|e| {
+                let name = e.name_string();
+                name != "." && name != ".."
+            })
+            .map(|e| (e.name_string(), e.sfn.is_dir()))
             .collect()
     }
 

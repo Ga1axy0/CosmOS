@@ -27,7 +27,8 @@ impl InodeTime {
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
 pub trait VfsNode: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
-    fn ls(&self) -> Vec<String>;
+    /// List directory entries as `(name, is_dir)` pairs.
+    fn ls(&self) -> Vec<(String, bool)>;
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Create a sub-directory named `name` inside this directory.
@@ -172,7 +173,7 @@ impl Inode {
         Self::from_vfs_node(node)
     }
 
-    pub fn ls(&self) -> Vec<String> {
+    pub fn ls(&self) -> Vec<(String, bool)> {
         self.inner.ls()
     }
 
