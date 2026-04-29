@@ -56,6 +56,10 @@ fn prefault_user_pages(
                     page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
                     continue;
                 }
+                if process.handle_lazy_heap_fault(page_start, access) {
+                    page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
+                    continue;
+                }
                 match process.handle_file_page_fault(page_start, access) {
                     Ok(()) => {}
                     // 用户态缺页此场景会被视为 SIGBUS，这里按 copyin/copyout 语义返回 EFAULT。

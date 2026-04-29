@@ -127,14 +127,14 @@ impl PageTable {
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
         let pte = self.find_pte_create(vpn).unwrap();
-        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
-        assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
+        debug_assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
     }
     /// 清除一个已经存在的页表项，并返回旧值；若原本未映射则返回 `None`。
