@@ -136,7 +136,9 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            if !current_process().handle_private_cow_fault(stval) {
+            if !current_process().handle_private_cow_fault(stval)
+                && !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Write)
+            {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
@@ -166,25 +168,27 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
-                Ok(()) => {}
-                Err(ERRNO::ENXIO) => {
-                    error!(
-                        "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
-                        scause.cause(),
-                        stval,
-                        current_trap_cx().sepc,
-                    );
-                    current_add_signal(SignalFlags::SIGBUS);
-                }
-                Err(_) => {
-                    error!(
-                        "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                        scause.cause(),
-                        stval,
-                        current_trap_cx().sepc,
-                    );
-                    current_add_signal(SignalFlags::SIGSEGV);
+            if !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Read) {
+                match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
+                    Ok(()) => {}
+                    Err(ERRNO::ENXIO) => {
+                        error!(
+                            "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
+                            scause.cause(),
+                            stval,
+                            current_trap_cx().sepc,
+                        );
+                        current_add_signal(SignalFlags::SIGBUS);
+                    }
+                    Err(_) => {
+                        error!(
+                            "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                            scause.cause(),
+                            stval,
+                            current_trap_cx().sepc,
+                        );
+                        current_add_signal(SignalFlags::SIGSEGV);
+                    }
                 }
             }
         }

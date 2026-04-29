@@ -900,23 +900,62 @@ impl MemorySet {
         batch
     }
 
-    /// append the area to new_end
-    #[allow(unused)]
-    pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
-        let new_end_vpn = new_end.ceil();
-        let old_end_vpn = match self.find_vma(start.floor()) {
-            Some(area) => area.end_vpn(),
-            None => return false,
-        };
-        if self.overlaps_vma_range(old_end_vpn, new_end_vpn) {
-            return false;
-        }
+    /// 将一段 VMA 收缩到新的上界，只拆除已经实际映射的尾部页。
+    pub fn shrink_metadata_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(idx) = self.vmas.iter().position(|vma| vma.start_vpn() == start.floor()) {
-            self.vmas[idx].append_to(&mut self.page_table, new_end.ceil());
+            self.vmas[idx].shrink_present_to(&mut self.page_table, new_end.ceil());
+            unsafe {
+                asm!("sfence.vma");
+            }
             true
         } else {
             false
         }
+    }
+
+    /// append the area to new_end
+    #[allow(unused)]
+    pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        let new_end_vpn = new_end.ceil();
+        let start_vpn = start.floor();
+
+        // 一次遍历完成所有检查
+        let mut heap_idx = None;
+        let mut old_end_vpn = None;
+        for (idx, vma) in self.vmas.iter().enumerate() {
+            if vma.start_vpn() == start_vpn {
+                heap_idx = Some(idx);
+                old_end_vpn = Some(vma.end_vpn());
+                break;
+            }
+        }
+
+        let (idx, old_end) = match (heap_idx, old_end_vpn) {
+            (Some(i), Some(end)) => (i, end),
+            _ => return false,
+        };
+
+        if self.overlaps_vma_range(old_end, new_end_vpn) {
+            return false;
+        }
+
+        self.vmas[idx].append_to(&mut self.page_table, new_end.ceil());
+        true
+    }
+
+    /// 将一段 VMA 的元数据扩展到新的上界，不立即补齐页表映射。
+    pub fn append_metadata_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        let new_end_vpn = new_end.ceil();
+        let start_vpn = start.floor();
+        let Some(idx) = self.vmas.iter().position(|vma| vma.start_vpn() == start_vpn) else {
+            return false;
+        };
+        let old_end = self.vmas[idx].end_vpn();
+        if self.overlaps_vma_range(old_end, new_end_vpn) {
+            return false;
+        }
+        self.vmas[idx].vpn_range = VPNRange::new(start_vpn, new_end_vpn);
+        true
     }
 
     /// map an anonymous area with given permission, return true if success
@@ -1125,7 +1164,7 @@ impl MemorySet {
         };
         let map_type = self.vmas[idx].map_type;
         let map_perm = self.vmas[idx].map_perm;
-        let ppn = match map_type {
+        let ppn: PhysPageNum = match map_type {
             MapType::Identical => PhysPageNum(vpn.0),
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
@@ -1143,6 +1182,27 @@ impl MemorySet {
         let pte_flags = PTEFlags::from_bits(map_perm.bits).unwrap();
         self.page_table.map(vpn, ppn, pte_flags);
         true
+    }
+
+    /// 在 heap VMA 内按需分配并映射一个私有页。
+    pub fn handle_lazy_heap_fault(&mut self, fault_va: VirtAddr, access: PageFaultAccess) -> bool {
+        let vpn = fault_va.floor();
+        if self.page_table.translate(vpn).is_some() {
+            return true;
+        }
+        let Some(area) = self.find_vma_containing(vpn) else {
+            return false;
+        };
+        if !area.is_heap() || !area.is_user_accessible() || !area.allows_fault_access(access) {
+            return false;
+        }
+        let committed = self.map_private_page_in_vma(vpn);
+        if committed {
+            unsafe {
+                asm!("sfence.vma");
+            }
+        }
+        committed
     }
 
     /// 把一个 page cache 页直接映射进用户页表，供 `MAP_SHARED` 使用。
@@ -1487,8 +1547,7 @@ impl MemorySet {
             user_ranges.push((overlap_start, overlap_end));
         }
 
-        // Now walk pages once, checking mapping, user PTE flag and that each page lies
-        // within some user-accessible VMA range.
+        // Now walk pages once, checking that each page lies within a user-accessible VMA range.
         let mut range_idx = 0usize;
         let mut current_range = user_ranges.get(range_idx).cloned();
         for vpn in VPNRange::new(start_vpn, end_vpn) {
@@ -1508,12 +1567,10 @@ impl MemorySet {
                 // Hole in user-accessible coverage.
                 return false;
             }
-            // Page must be mapped and user-accessible in the page table.
-            let Some(pte) = self.page_table.translate(vpn) else {
-                return false;
-            };
-            if !pte.flags().contains(PTEFlags::U) {
-                return false;
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if !pte.flags().contains(PTEFlags::U) {
+                    return false;
+                }
             }
         }
 
@@ -1572,7 +1629,9 @@ impl MemorySet {
                 // update middle pages' PTE flags
                 let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
                 for vpn in VPNRange::new(overlap_start, overlap_end) {
-                    self.page_table.update_flags(vpn, pte_flags);
+                    if self.page_table.translate(vpn).is_some() {
+                        self.page_table.update_flags(vpn, pte_flags);
+                    }
                 }
 
                 area.vpn_range = VPNRange::new(overlap_start, overlap_end);
@@ -1583,7 +1642,9 @@ impl MemorySet {
                 // no right split, area becomes the middle area
                 let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
                 for vpn in VPNRange::new(overlap_start, overlap_end) {
-                    self.page_table.update_flags(vpn, pte_flags);
+                    if self.page_table.translate(vpn).is_some() {
+                        self.page_table.update_flags(vpn, pte_flags);
+                    }
                 }
                 area.vpn_range = VPNRange::new(overlap_start, overlap_end);
                 area.map_perm = permission;
@@ -2042,6 +2103,15 @@ impl Vma {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
+
+    /// 将当前区域收缩到新的上界，只拆除尾部已实际映射的页。
+    pub fn shrink_present_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
+            self.unmap_present_one(page_table, vpn);
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+
     #[allow(unused)]
     /// 将当前区域向高地址扩展到新的上界，并补齐新增页映射。
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {

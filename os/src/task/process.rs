@@ -24,7 +24,6 @@ use alloc::vec::Vec;
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
-bitflags! {
     /// fd 表项级别的标志位。
     pub struct FdFlags: u32 {
         /// `exec` 成功后自动关闭该 fd。
@@ -42,102 +41,51 @@ pub struct FdEntry {
 }
 
 impl FdEntry {
-    /// 基于文件对象创建默认 fd 表项。
-    pub fn new(desc: Arc<FileDescription>) -> Self {
-        Self {
-            desc,
-            // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
-            flags: FdFlags::empty(),
+
+            let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
+            let new_brk_va = VirtAddr::from(new_brk);
+            let old_brk_va = VirtAddr::from(old_brk);
+            let old_end_vpn = old_brk_va.ceil();
+            let new_end_vpn = new_brk_va.ceil();
+            let mut batch = None;
+
+            if new_brk > old_brk {
+                let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
+                    || inner.memory_set.register_vma_metadata(Vma::new_heap(
+                        heap_start,
+                        new_brk_va,
+                        MapPermission::R | MapPermission::W | MapPermission::U,
+                    ));
+                if !success {
+                    return old_brk;
+                }
+            } else if new_brk == inner.vm_layout.start_brk {
+                batch = Some(inner
+                    .memory_set
+                    .remove_vma_with_start_vpn_user_deferred(heap_start.floor()));
+            } else if old_end_vpn != new_end_vpn {
+                let Some(shrink_batch) = inner.memory_set.shrink_to_deferred(heap_start, new_brk_va) else {
+                    return old_brk;
+                };
+                batch = Some(shrink_batch);
+            }
+
+            inner.vm_layout.brk = new_brk;
+            let reclaim = batch.map(|batch| {
+                // 锁内快照仍在用户态运行该 mm 的 hart，锁外等待 shootdown ack。
+                DeferredUserReclaim::new(
+                    inner.memory_set.token(),
+                    inner.memory_set.loaded_user_harts(),
+                    batch,
+                )
+            });
+            (new_brk, reclaim)
+        };
+        if let Some(reclaim) = reclaim {
+            reclaim.flush_then_release();
         }
+        result_brk
     }
-}
-
-/// Process termination reason preserved for wait4/waitpid encoding.
-#[derive(Debug, Clone, Copy)]
-pub enum ExitReason {
-    /// Process terminated via `exit(code)`.
-    Exit(i32),
-    /// Process terminated by a signal number.
-    Signal(u32),
-}
-
-/// Process Control Block
-pub struct ProcessControlBlock {
-    /// immutable
-    pub pid: PidHandle,
-    /// mutable
-    inner: SpinNoIrqLock<ProcessControlBlockInner>,
-    pub wait_exit_queue: Arc<WaitQueue>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Credentials {
-    pub uid: u32,
-    pub euid: u32,
-    pub gid: u32,
-    pub egid: u32,
-    pub sid: u32
-}
-
-impl Credentials {
-    pub const fn root() -> Self {
-        Self {
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
-            sid: 0
-        }
-    }
-}
-
-/// Inner of Process Control Block
-pub struct ProcessControlBlockInner {
-    /// is zombie?
-    pub is_zombie: bool,
-    /// memory set(address space)
-    pub memory_set: MemorySet,
-    /// process virtual memory layout metadata
-    pub vm_layout: ProcessVmLayout,
-    /// parent process
-    pub parent: Option<Weak<ProcessControlBlock>>,
-    /// children process
-    pub children: Vec<Arc<ProcessControlBlock>>,
-    /// exit reason observed by wait4/waitpid
-    pub exit_reason: ExitReason,
-    /// file descriptor table
-    pub fd_table: Vec<Option<FdEntry>>,
-    /// pending process signals
-    pub pending_signals: SignalFlags,
-    /// blocked process signals
-    pub signal_mask: SignalFlags,
-    /// installed signal actions
-    pub signal_actions: SignalActions,
-    /// tasks(also known as threads)
-    pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
-    /// task resource allocator
-    pub task_res_allocator: RecycleAllocator,
-    /// mutex list
-    pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
-    /// semaphore list
-    pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
-    /// condvar list
-    pub condvar_list: Vec<Option<Arc<Condvar>>>,
-    /// deadlock_enabled
-    pub deadlock_enabled: bool,
-    /// deadlock detector for mutex resources
-    pub mutex_detector: DeadlockDetector,
-    /// deadlock detector for semaphore resources
-    pub semaphore_detector: DeadlockDetector,
-    /// current working directory (absolute path)
-    pub cwd: String,
-    /// process credentials
-    pub cred: Credentials,
-    /// CPU time spent in user mode for this process (raw timer counter units)
-    pub user_time: usize,
-    /// CPU time spent in kernel mode for this process (raw timer counter units)
-    pub kernel_time: usize,
-    /// waited-for children's aggregated user time (raw timer counter units)
     pub child_user_time: usize,
     /// waited-for children's aggregated kernel time (raw timer counter units)
     pub child_kernel_time: usize,
@@ -956,6 +904,13 @@ impl ProcessControlBlock {
         reclaim.flush_then_release();
         true
     }
+    /// 处理当前进程的 heap 懒分配缺页。
+    pub fn handle_lazy_heap_fault(&self, fault_addr: usize, access: PageFaultAccess) -> bool {
+        self.inner
+            .lock()
+            .memory_set
+            .handle_lazy_heap_fault(VirtAddr::from(fault_addr), access)
+    }
     /// 处理当前进程的 file-backed 缺页。
     pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> Result<(), ERRNO> {
         debug!(
@@ -1082,6 +1037,7 @@ impl ProcessControlBlock {
 
     /// 按目标地址调整程序 break，返回调整后的当前 break。
     pub fn set_program_brk(&self, new_brk: usize) -> usize {
+<<<<<<< HEAD
         let (result_brk, reclaim) = {
             let mut inner = self.inner.lock();
             let old_brk = inner.vm_layout.brk;
@@ -1099,6 +1055,50 @@ impl ProcessControlBlock {
             if new_brk == old_brk {
                 return old_brk;
             }
+=======
+        let mut inner = self.inner.lock();
+        let old_brk = inner.vm_layout.brk;
+        debug!("brk: old addr = {:#x}, new addr = {:#x}", old_brk, new_brk);
+        // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
+        if new_brk == 0 {
+            return old_brk;
+        }
+        if new_brk < inner.vm_layout.start_brk
+            || new_brk >= inner.vm_layout.mmap_base
+            || new_brk >= inner.vm_layout.start_stack
+        {
+            return old_brk;
+        }
+        if new_brk == old_brk {
+            return old_brk;
+        }
+
+        let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
+        let new_brk_va = VirtAddr::from(new_brk);
+        let old_brk_va = VirtAddr::from(old_brk);
+        let old_end_vpn = old_brk_va.ceil();
+        let new_end_vpn = new_brk_va.ceil();
+
+        if new_brk > old_brk {
+            let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
+                || inner.memory_set.register_vma_metadata(Vma::new_heap(
+                    heap_start,
+                    new_brk_va,
+                    MapPermission::R | MapPermission::W | MapPermission::U,
+                ));
+            if !success && old_end_vpn != new_end_vpn {
+                return old_brk;
+            }
+        } else if new_brk == inner.vm_layout.start_brk {
+            inner
+                .memory_set
+                .remove_vma_with_start_vpn(heap_start.floor());
+        } else if old_end_vpn != new_end_vpn
+            && !inner.memory_set.shrink_metadata_to(heap_start, new_brk_va)
+        {
+            return old_brk;
+        }
+>>>>>>> 521032a (perf: Make `brk` heap allocation lazy.)
 
             let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
             let new_brk_va = VirtAddr::from(new_brk);
