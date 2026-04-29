@@ -203,7 +203,7 @@ impl VfsNode for NullDevNode {
         false
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
 
@@ -245,7 +245,7 @@ impl VfsNode for BlockDevNode {
         false
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
 
@@ -389,7 +389,7 @@ impl VfsNode for RtcDevNode {
         false
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
 
@@ -444,7 +444,7 @@ impl VfsNode for UrandomDevNode {
         false
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
 

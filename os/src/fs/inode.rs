@@ -286,7 +286,7 @@ pub fn init_rootfs() {
 /// List all apps in the root directory
 pub fn list_apps() {
     println!("/**** APPS ****");
-    for app in ROOT_INODE.ls() {
+    for (app, _) in ROOT_INODE.ls() {
         println!("{}", app);
     }
     println!("**************/");
@@ -673,12 +673,11 @@ impl File for OSInode {
         if !self.inode.is_dir() {
             return 0;
         }
-        let inode = Arc::clone(&self.inode);
-        let entries = inode.ls();
+        let entries = self.inode.ls();
         let start_idx = offset; // entry index, not byte offset
         let mut written = 0usize;
 
-        for (i, name) in entries.iter().enumerate().skip(start_idx) {
+        for (i, (name, is_dir)) in entries.iter().enumerate().skip(start_idx) {
             let name_bytes = name.as_bytes();
             // reclen must be a multiple of 8
             let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
@@ -692,12 +691,8 @@ impl File for OSInode {
             buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
             // d_reclen (u16)
             buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            // d_type (u8): check with find() to determine DIR or regular file
-            let dtype: u8 = if let Some(child) = inode.find(name) {
-                if child.is_dir() { 4 } else { 8 }
-            } else {
-                0
-            };
+            // d_type (u8): DT_DIR=4, DT_REG=8
+            let dtype: u8 = if *is_dir { 4 } else { 8 };
             buf[written + 18] = dtype;
             // d_name: null-terminated, zero-padded to reclen
             buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);

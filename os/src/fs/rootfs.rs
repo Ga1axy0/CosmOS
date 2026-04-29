@@ -168,9 +168,9 @@ impl VfsNode for VirtualDirNode {
     // Directory enumeration
     // -----------------------------------------------------------------------
 
-    fn ls(&self) -> Vec<String> {
-        // Phase 1: collect names from overlay (drop borrow before phase 2).
-        let overlay_names: Vec<String> = {
+    fn ls(&self) -> Vec<(String, bool)> {
+        // Phase 1: collect (name, is_dir) from overlay.
+        let mut entries: Vec<(String, bool)> = {
             let inner = self.inner.lock();
             match inner.overlay.as_ref() {
                 Some(ov) => ov.ls(),
@@ -179,18 +179,21 @@ impl VfsNode for VirtualDirNode {
         };
 
         // Phase 2: add explicit mount names that the overlay doesn't list.
-        let mount_keys: Vec<String> = {
+        let mount_entries: Vec<(String, bool)> = {
             let inner = self.inner.lock();
-            inner.mounts.keys().cloned().collect()
+            inner
+                .mounts
+                .iter()
+                .map(|(name, node)| (name.clone(), node.is_dir()))
+                .collect()
         };
 
-        let mut names = overlay_names;
-        for key in mount_keys {
-            if !names.contains(&key) {
-                names.push(key);
+        for (key, is_dir) in mount_entries {
+            if !entries.iter().any(|(name, _)| name == &key) {
+                entries.push((key, is_dir));
             }
         }
-        names
+        entries
     }
 
     // -----------------------------------------------------------------------

@@ -87,21 +87,35 @@ impl VfsNode for EasyInode {
         self
     }
 
-    fn ls(&self) -> Vec<String> {
-        let _fs = self.fs.lock();
-        self.read_disk_inode(|disk_inode| {
-            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
-            let mut v: Vec<String> = Vec::new();
-            for i in 0..file_count {
-                let mut dirent = DirEntry::empty();
-                assert_eq!(
-                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device,),
-                    DIRENT_SZ,
-                );
-                v.push(String::from(dirent.name()));
-            }
-            v
-        })
+    fn ls(&self) -> Vec<(String, bool)> {
+        // Phase 1: collect (name, block_id, block_offset) while holding the fs lock.
+        let entries: Vec<(String, u32, usize)> = {
+            let fs = self.fs.lock();
+            self.read_disk_inode(|disk_inode| {
+                let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+                let mut v = Vec::new();
+                for i in 0..file_count {
+                    let mut dirent = DirEntry::empty();
+                    assert_eq!(
+                        disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                        DIRENT_SZ,
+                    );
+                    let inode_id = dirent.inode_id();
+                    let pos = fs.get_disk_inode_pos(inode_id);
+                    v.push((String::from(dirent.name()), pos.0, pos.1));
+                }
+                v
+            })
+        };
+        // Phase 2: resolve is_dir for each child without holding any locks.
+        entries
+            .into_iter()
+            .map(|(name, block_id, block_offset)| {
+                let child = Self::new(block_id, block_offset, self.fs.clone(), self.block_device.clone());
+                let is_dir = child.read_disk_inode(|di| di.is_dir());
+                (name, is_dir)
+            })
+            .collect()
     }
 
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {

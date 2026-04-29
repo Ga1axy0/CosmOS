@@ -285,7 +285,7 @@ impl VfsNode for Ext4Inode {
         self
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         if !self.is_dir {
             return Vec::new();
         }
@@ -293,8 +293,11 @@ impl VfsNode for Ext4Inode {
         ext4
             .ext4_dir_get_entries(self.inode_num)
             .into_iter()
-            .map(|de| de.get_name())
-            .filter(|name| name != "." && name != "..")
+            .filter(|de| {
+                let name = de.get_name();
+                name != "." && name != ".."
+            })
+            .map(|de| (de.get_name(), de.get_de_type() == 2))
             .collect()
     }
 
