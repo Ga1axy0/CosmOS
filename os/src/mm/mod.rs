@@ -22,9 +22,9 @@ pub use memory_set::{
     KERNEL_SPACE,
 };
 pub use tlb_shootdown::{
-    clear_deferred_kernel_recycle_state, deferred_kernel_frame_count,
-    deferred_kernel_va_range_count, has_deferred_kernel_recycle_work,
-    kernel_va_range_requires_flush, note_deferred_kernel_va_release,
+    clear_deferred, deferred_frame_count, deferred_range_count, defer_release, flush_deferred,
+    handle_ipi, has_deferred, mark_online, needs_flush, online_mask, shootdown,
+    shootdown_global, take_deferred, DeferredBatch, ShootdownKind,
 };
 use page_table::PTEFlags;
 pub use page_table::{
