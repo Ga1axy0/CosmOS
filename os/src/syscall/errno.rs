@@ -1,5 +1,6 @@
 #[repr(i32)]
 #[allow(missing_docs)]
+#[derive(Debug)]
 pub enum ERRNO {
     EPERM = 1,         // Operation not permitted
     ENOENT = 2,        // No such file or directory

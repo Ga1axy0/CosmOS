@@ -242,6 +242,7 @@ mod sync;
 mod thread;
 mod random;
 mod mman;
+mod signal;
 mod times;
 mod utils;
 
@@ -256,6 +257,7 @@ use sync::*;
 use thread::*;
 use crate::syscall::random::*;
 use mman::*;
+use signal::*;
 use times::*;
 pub(crate) use utils::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 
@@ -279,7 +281,10 @@ macro_rules! syscall_body {
         let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
         match result {
             Ok(v) => v,
-            Err(e) => -(e as isize),
+            Err(e) => {
+                warn!("syscall error: {:?}", e);
+                -(e as isize)
+            },
         }
     }};
 }
@@ -464,7 +469,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
-        SYSCALL_SIGACTION => sys_sigaction(args[0] as i32, args[1] as *const crate::task::SignalAction, args[2] as *mut crate::task::SignalAction),
+        SYSCALL_SIGACTION => sys_sigaction(
+            args[0] as i32,
+            args[1] as *const crate::task::SignalAction,
+            args[2] as *mut crate::task::SignalAction,
+            args[3], // sigsetsize
+        ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),

@@ -14,11 +14,9 @@ mod context;
 mod id;
 #[path = "../sched/runqueue.rs"]
 mod runqueue;
-mod action;
 mod process;
 #[path ="../sched/processor.rs"]
 mod processor;
-mod signal;
 #[path ="../sched/switch.rs"]
 mod switch;
 mod wait_queue;
@@ -42,7 +40,10 @@ pub use runqueue::{
     add_task, dequeue_task, enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio,
     pid2process, pick_next_task, remove_from_pid2process, remove_task, resched_hart, wakeup_task,
 };
-pub use action::{SignalAction, SignalActions};
+pub use crate::signal::{
+    check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
+    SignalActions, SignalFlags, StackT, UContext, SIG_DFL, SIG_IGN,
+};
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
@@ -50,7 +51,6 @@ pub use processor::{
 pub use wait_queue::{WaitQueue, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
-pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{
     all_cpu_affinity_mask, SchedAttr, SchedPolicy, TaskControlBlock, TaskStatus, WaitReason,
     DEFAULT_TIME_SLICE_TICKS, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
@@ -321,30 +321,7 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     pending.check_error()
 }
 
-/// Check and handle non-fatal signals for the current process.
-/// Returns Some((signum, handler, mask)) if a signal needs to be handled.
-pub fn check_signals_of_current() -> Option<(i32, usize, SignalFlags)> {
-    let process = current_process();
-    let mut process_inner = process.inner_exclusive_access();
-    let pending = process_inner.pending_signals & !process_inner.signal_mask;
 
-    // Find the first pending signal
-    for signum in 1..=MAX_SIG {
-        let flag = SignalFlags::from_bits(1 << signum);
-        if let Some(flag) = flag {
-            if pending.contains(flag) {
-                let action = process_inner.signal_actions.table[signum];
-                // Check if there's a user-defined handler
-                if action.handler != 0 && action.handler != 1 {
-                    // Clear the signal from pending
-                    process_inner.pending_signals &= !flag;
-                    return Some((signum as i32, action.handler, action.mask));
-                }
-            }
-        }
-    }
-    None
-}
 
 /// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
 pub fn current_process_is_zombie() -> bool {
@@ -408,7 +385,7 @@ pub fn current_add_signal(signal: SignalFlags) {
 /// 扫描所有进程的 interval timer，到期则投递对应信号。
 pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
     let processes: Vec<Arc<ProcessControlBlock>> = {
-        let map = self::manager::PID2PCB.lock();
+        let map = self::runqueue::PID2PCB.lock();
         map.values().cloned().collect()
     };
 

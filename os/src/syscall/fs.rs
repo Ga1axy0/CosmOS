@@ -1064,8 +1064,11 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
 
 pub fn sys_llseek(fd: u32, offset_high: usize, offset_low: usize, result: *mut u64, whence: u32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_llseek",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_llseek, offset_high={}, offset_low={}, whence={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        offset_high,
+        offset_low,
+        whence
     );
     let token = current_user_token();
     syscall_body!({

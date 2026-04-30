@@ -7,7 +7,7 @@ use crate::{
     mm::{translated_ref, translated_refmut, translated_str},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, pid2process, ExitReason, SignalAction, SignalFlags,
+        exit_current_and_run_next, pid2process, ExitReason, SignalFlags,
         WaitReason,
     },
 };
@@ -78,133 +78,6 @@ fn parse_shebang_line(file_data: &[u8]) -> Result<Option<ShebangInfo>, ERRNO> {
 /// 解析 `execve` 目标，必要时按 shebang 规则递归展开到最终 ELF。
 fn resolve_exec_image(
     cwd: &str,
-    path: &str,
-    argv: Vec<String>,
-    depth: usize,
-) -> Result<ResolvedExecImage, ERRNO> {
-    debug!("Resolving exec image: path='{}', argv={:?}, depth={}", path, argv, depth);
-
-    if depth >= EXEC_INTERPRETER_MAX_DEPTH {
-        return Err(ERRNO::ELOOP);
-    }
-
-    let abs_path = canonicalize(cwd, path);
-    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
-    if inode.is_dir() {
-        return Err(ERRNO::EISDIR);
-    }
-
-    // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
-    let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
-    debug!(
-        "First line of exec target: {:?}, complete={}",
-        core::str::from_utf8(&first_line).unwrap_or("<invalid utf-8>"),
-        first_line_complete
-    );
-    if is_elf_image(&first_line) {
-        let file_data = inode.read_all();
-        return Ok(ResolvedExecImage {
-            elf_data: file_data,
-            argv,
-        });
-    }
-
-    // 首行超过限制时直接拒绝，避免 shebang 解析继续处理不完整输入。
-    if !first_line_complete {
-        return Err(ERRNO::ENOEXEC);
-    }
-
-    if let Some(shebang) = parse_shebang_line(&first_line)? {
-        // shebang 语义要求解释器路径必须是绝对路径。
-        if !shebang.interpreter.starts_with('/') {
-            return Err(ERRNO::ENOEXEC);
-        }
-
-        // 按 Linux 语义重写 argv：解释器、可选参数、脚本绝对路径、原 argv[1..]。
-        let mut next_argv = Vec::with_capacity(argv.len() + 2);
-        next_argv.push(shebang.interpreter.clone());
-        if let Some(optional_arg) = shebang.optional_arg {
-            next_argv.push(optional_arg);
-        }
-        next_argv.push(abs_path);
-        next_argv.extend(argv.into_iter().skip(1));
-        return resolve_exec_image(cwd, shebang.interpreter.as_str(), next_argv, depth + 1);
-    }
-
-    Err(ERRNO::ENOEXEC)
-}
-/// exit syscall
-///
-/// exit the current task and run the next task in task list
-pub fn sys_exit(exit_code: i32) -> ! {
-    trace!(
-        "kernel:pid[{}] sys_exit",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    exit_current_and_run_next(ExitReason::Exit(exit_code));
-    panic!("Unreachable in sys_exit!");
-}
-
-/// 临时实现
-pub fn sys_exit_group(exit_code: i32) -> ! {
-    sys_exit(exit_code);
-}
-
-/// getpid syscall
-pub fn sys_getpid() -> isize {
-    trace!(
-        "kernel: sys_getpid pid:{}",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    current_task().unwrap().process.upgrade().unwrap().getpid() as isize
-}
-
-/// getppid syscall
-pub fn sys_getppid() -> isize {
-    trace!(
-        "kernel: sys_getppid pid:{}",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    let process = current_process();
-    let parent = process.inner_exclusive_access().parent.clone();
-    if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
-        parent.getpid() as isize
-    } else {
-        0
-    }
-}
-
-/// getuid syscall
-pub fn sys_getuid() -> isize {
-    let process = current_process();
-    trace!("kernel: sys_getuid pid:{}", process.getpid());
-    process.getuid() as isize
-}
-
-/// geteuid syscall
-pub fn sys_geteuid() -> isize {
-    let process = current_process();
-    trace!("kernel: sys_geteuid pid:{}", process.getpid());
-    process.geteuid() as isize
-}
-
-/// getgid syscall
-pub fn sys_getgid() -> isize {
-    let process = current_process();
-    trace!("kernel: sys_getgid pid:{}", process.getpid());
-    process.getgid() as isize
-}
-
-/// getegid syscall
-pub fn sys_getegid() -> isize {
-    let process = current_process();
-    trace!("kernel: sys_getegid pid:{}", process.getpid());
-    process.getegid() as isize
-}
-
-pub fn sys_getsid() -> isize {
-    let process = current_process();
-    trace!("kernel: sys_getsid pid:{}", process.getpid());
     process.getsid() as isize
 }
 
@@ -212,11 +85,8 @@ pub fn sys_setsid() -> isize {
     trace!("kernel: sys_setsid pid:{}", current_process().getpid());
     warn!("kernel: sys_setsid is not fully implemented, just return new sid 1");
     1
-}
-
-/// fork child process syscall
 pub fn sys_fork() -> isize {
-    trace!(
+    }
         "kernel:pid[{}] sys_fork",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
@@ -419,6 +289,7 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
     })
 }
 
+<<<<<<< HEAD
 /// sigaction 系统调用
 pub fn sys_sigaction(
     signum: i32,
@@ -544,6 +415,15 @@ pub fn sys_sigreturn() -> isize {
         // Return the original a0 value (which was saved in the trap context)
         Ok(trap_cx.x[10] as isize)
     })
+=======
+/// change data segment size
+pub fn sys_brk(addr: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_brk",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    current_process().set_program_brk(addr) as isize
+>>>>>>> 5b1c7cf (feat: Support complete signal handling.)
 }
 
 /// spawn syscall
