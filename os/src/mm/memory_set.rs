@@ -1,6 +1,6 @@
 //! Address Space [`MemorySet`] management of Process
 
-use super::{frame_alloc, FrameTracker};
+use super::{frame_alloc, shootdown, FrameTracker, ShootdownKind};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -13,7 +13,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -47,6 +47,8 @@ pub struct MemorySet {
     pub page_table: PageTable,
     /// virtual memory areas
     pub vmas: Vec<Vma>,
+    /// 当前仍在用户态装载该地址空间的 hart 掩码。
+    loaded_user_harts: AtomicUsize,
 }
 
 /// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
@@ -67,11 +69,68 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             vmas: Vec::new(),
+            loaded_user_harts: AtomicUsize::new(0),
         }
     }
     /// Get he page table token
     pub fn token(&self) -> usize {
         self.page_table.token()
+    }
+    /// 标记某个 hart 即将返回用户态并装载该地址空间。
+    pub fn mark_user_loaded(&self, hart_id: usize) {
+        let bit = 1usize << hart_id;
+        let mask = self.loaded_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
+        trace!(
+            "[tlb] user mm loaded on hart {} token={:#x} mask={:#b}",
+            hart_id,
+            self.token(),
+            mask
+        );
+    }
+    /// 标记某个 hart 已经离开用户态，不再需要作为该地址空间的远端 shootdown 目标。
+    pub fn mark_user_unloaded(&self, hart_id: usize) {
+        let bit = 1usize << hart_id;
+        let mask = self.loaded_user_harts.fetch_and(!bit, Ordering::AcqRel) & !bit;
+        trace!(
+            "[tlb] user mm unloaded from hart {} token={:#x} mask={:#b}",
+            hart_id,
+            self.token(),
+            mask
+        );
+    }
+    /// 返回当前仍在用户态装载该地址空间的 hart 掩码。
+    pub fn loaded_user_harts(&self) -> usize {
+        self.loaded_user_harts.load(Ordering::Acquire)
+    }
+    /// 对当前仍在用户态装载该地址空间的 hart 发起同步 TLB shootdown。
+    ///
+    /// 调用方不能持有对应进程锁等待 ack。用户态 IPI 进入内核后会先更新进程
+    /// 运行态信息，持锁等待可能导致远端 hart 无法进入 softirq 分支。
+    ///
+    /// 这里依赖当前 trap 语义：hart 从用户态进入内核时已经切到 kernel satp
+    /// 并执行本地 `sfence.vma`，因此不在该掩码中的 hart 不应再持有这个用户
+    /// 地址空间的旧翻译。若后续去掉 trap 入口 flush 或引入 ASID，需要重新审查。
+    pub fn shootdown_loaded_user_harts(&self) {
+        let mask = self.loaded_user_harts();
+        self.shootdown_user_harts(mask);
+    }
+    /// 对指定 hart 掩码发起该地址空间的同步 TLB shootdown。
+    ///
+    /// 这个接口用于调用方已经在锁内快照出目标 mask，随后释放锁再执行同步等待
+    /// 的场景。
+    ///
+    /// snapshot 只覆盖“页表修改完成时仍在用户态运行该 mm”的 hart。修改完成后
+    /// 才从内核态返回用户态的 hart，必须已经经过 trap 入口的本地 flush 同步点。
+    pub fn shootdown_user_harts(&self, mask: usize) {
+        if mask == 0 {
+            return;
+        }
+        debug!(
+            "[tlb] shootdown user mm token={:#x} loaded_mask={:#b}",
+            self.token(),
+            mask
+        );
+        shootdown(mask, ShootdownKind::AddressSpace { satp: self.token() });
     }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
