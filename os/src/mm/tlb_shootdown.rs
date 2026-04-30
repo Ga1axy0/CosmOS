@@ -27,8 +27,9 @@ pub enum ShootdownKind {
     Global,
     /// 刷新某个地址空间的 TLB。
     ///
-    /// TODO：后续接入用户态 shootdown 时，应结合“该 hart 当前/最近装载的 mm”
-    /// 元数据，只对真正持有该地址空间的 hart 做精确刷新。
+    /// 调用方应使用目标地址空间的 loaded hart 掩码决定通知范围。远端收到 IPI
+    /// 时可能已经从用户态切入内核，但仍需要完成本地 flush 并 ack。
+    /// TODO：引入 ASID 后，应把这里改成按 ASID 或地址范围精确刷新。
     AddressSpace {
         /// 目标地址空间的 satp token。
         satp: usize,
@@ -399,11 +400,9 @@ fn perform_local_tlb_shootdown(kind: ShootdownKind) {
     match kind {
         ShootdownKind::Global => local_sfence_vma_all(),
         ShootdownKind::AddressSpace { satp: target_satp } => {
-            // 当前先做保守实现：若当前 satp 就是目标地址空间，或当前已经在共享内核
-            // 地址空间中，都执行一次本地全量 sfence.vma。
-            //
-            // TODO：接入用户态 shootdown 时，这里应结合 per-hart 已装载 mm 信息，
-            // 把“当前在内核态但刚从目标用户态切入”的情况也覆盖精确。
+            // 目标 hart 可能是在用户态收到 IPI 后刚切入内核，因此当前 satp
+            // 可能已经是 kernel_token；此时仍然要完成本地 flush 并回 ack。
+            // TODO：引入 ASID 后，应避免把 kernel_token 情况退化成全量 flush。
             let current_satp = satp::read().bits();
             if current_satp == target_satp || current_satp == kernel_token() {
                 local_sfence_vma_all();

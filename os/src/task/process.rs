@@ -9,8 +9,8 @@ use super::WaitQueue;
 use crate::config::PAGE_SIZE;
 use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
 use crate::mm::{
-    translated_refmut, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, VirtAddr, Vma,
-    KERNEL_SPACE,
+    shootdown, translated_refmut, MapPermission, MemorySet, PageFaultAccess, ShootdownKind,
+    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
@@ -783,10 +783,32 @@ impl ProcessControlBlock {
 
     /// change permissions of a mapped range. return true if success
     pub fn mprotect(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
-        self.inner
-            .lock()
-            .memory_set
-            .mprotect_range(start, end, perm)
+        let (ok, token, mask) = {
+            let mut inner = self.inner.lock();
+            let ok = inner.memory_set.mprotect_range(start, end, perm);
+            let token = inner.memory_set.token();
+            // 锁内只快照目标 hart，锁外再等待 ack。远端用户态 IPI 进入
+            // trap_handler 前会调用 enter_kernel()，持进程锁等待会造成死锁。
+            //
+            // 这个快照依赖 trap 入口本地 sfence.vma：快照后才返回用户态的 hart
+            // 已经经过本地 flush，不需要包含在本次远端 shootdown 里。
+            let mask = if ok {
+                inner.memory_set.loaded_user_harts()
+            } else {
+                0
+            };
+            (ok, token, mask)
+        };
+        if ok && mask != 0 {
+            debug!(
+                "[tlb] mprotect shootdown: pid={} token={:#x} mask={:#b}",
+                self.getpid(),
+                token,
+                mask
+            );
+            shootdown(mask, ShootdownKind::AddressSpace { satp: token });
+        }
+        ok
     }
 
     /// 返回当前进程用于 `mmap(NULL, ...)` 的默认起始基址。
@@ -856,6 +878,8 @@ impl ProcessControlBlock {
     /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
     pub fn enter_kernel(&self, now: usize) {
         let mut inner = self.inner.lock();
+        // trap 入口已经切到内核页表并做过本地 sfence.vma，此 hart 不再持有该用户 mm。
+        inner.memory_set.mark_user_unloaded(crate::hart::hartid());
         match inner.accounting_state {
             CpuAccountingState::User => {
                 inner.user_time = inner
@@ -881,6 +905,8 @@ impl ProcessControlBlock {
         }
         inner.accounting_state = CpuAccountingState::User;
         inner.accounting_timestamp = now;
+        // 即将跳回用户态，后续其他 hart 修改该 mm 时需要把当前 hart 作为 shootdown 目标。
+        inner.memory_set.mark_user_loaded(crate::hart::hartid());
     }
 
     /// Flush the current running slice into the corresponding accumulator.
