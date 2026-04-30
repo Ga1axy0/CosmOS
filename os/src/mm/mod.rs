@@ -18,8 +18,8 @@ pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use frame_allocator::{frame_alloc, frame_dealloc, FrameTracker};
 pub use memory_set::remap_test;
 pub use memory_set::{
-    kernel_token, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind,
-    KERNEL_SPACE,
+    kernel_token, DeferredUserReclaim, MapPermission, MemorySet, PageFaultAccess,
+    UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
 pub use tlb_shootdown::{
     clear_deferred, deferred_frame_count, deferred_range_count, defer_release, flush_deferred,
