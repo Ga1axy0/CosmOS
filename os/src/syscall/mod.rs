@@ -282,7 +282,7 @@ macro_rules! syscall_body {
         match result {
             Ok(v) => v,
             Err(e) => {
-                warn!("syscall error: {:?}", e);
+                // warn!("syscall error: {:?}", e);
                 -(e as isize)
             },
         }
@@ -320,7 +320,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
-        SYSCALL_LSEEK => sys_llseek(args[0] as u32, args[1], args[2], args[3] as *mut u64, args[4] as u32),
+        SYSCALL_LSEEK => sys_lseek(args[0] as u32, args[1], args[2] as u32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
