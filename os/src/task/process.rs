@@ -9,8 +9,8 @@ use super::WaitQueue;
 use crate::config::PAGE_SIZE;
 use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
 use crate::mm::{
-    shootdown, translated_refmut, MapPermission, MemorySet, PageFaultAccess, ShootdownKind,
-    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
+    shootdown, translated_refmut, DeferredUserReclaim, MapPermission, MemorySet,
+    PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
@@ -340,17 +340,20 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        let (mut old_memory_set, cloexec_entries) = {
+        let (mut old_memory_set, old_token, old_mask, cloexec_entries) = {
             let mut inner = self.inner_exclusive_access();
             let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
+            let old_token = old_memory_set.token();
+            let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
-            (old_memory_set, cloexec_entries)
+            (old_memory_set, old_token, old_mask, cloexec_entries)
         };
         debug!("[mmap] exec teardown old memory_set before installing new user context");
-        old_memory_set.recycle_data_pages();
+        let old_batch = old_memory_set.recycle_data_pages_deferred();
+        DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
         drop(cloexec_entries);
         // then we alloc user resource for main thread again
         // since memory_set has been changed
@@ -453,9 +456,19 @@ impl ProcessControlBlock {
             parent.thread_count()
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
+        let (memory_set, parent_tlb_needs_flush) =
+            MemorySet::from_existed_user(&mut parent.memory_set);
+        let parent_token = parent.memory_set.token();
+        let parent_mask = if parent_tlb_needs_flush {
+            parent.memory_set.loaded_user_harts()
+        } else {
+            0
+        };
         let vm_layout = parent.vm_layout;
         let cred = parent.cred;
+        let parent_signal_mask = parent.signal_mask;
+        let parent_signal_actions = parent.signal_actions.clone();
+        let parent_cwd = parent.cwd.clone();
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -480,8 +493,8 @@ impl ProcessControlBlock {
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
                     pending_signals: SignalFlags::empty(),
-                    signal_mask: parent.signal_mask,
-                    signal_actions: parent.signal_actions.clone(),
+                    signal_mask: parent_signal_mask,
+                    signal_actions: parent_signal_actions,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
@@ -490,7 +503,7 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
-                    cwd: parent.cwd.clone(),
+                    cwd: parent_cwd,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -511,6 +524,21 @@ impl ProcessControlBlock {
         let parent_sched_attr = parent_task_inner.sched_attr();
         let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
         drop(parent_task_inner);
+        drop(parent);
+        if parent_mask != 0 {
+            debug!(
+                "[tlb] fork shootdown parent mm: parent_pid={} token={:#x} mask={:#b}",
+                self.getpid(),
+                parent_token,
+                parent_mask
+            );
+            shootdown(parent_mask, ShootdownKind::AddressSpace { satp: parent_token });
+        }
+        debug!(
+            "[cow] fork created child process: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         // create main thread of child process
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
@@ -683,14 +711,35 @@ impl ProcessControlBlock {
     }
     /// unmap an area. return true if success
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
-        self.inner.lock().memory_set.munmap(start, end)
+        let Some(reclaim) = ({
+            let mut inner = self.inner.lock();
+            let token = inner.memory_set.token();
+            let mask = inner.memory_set.loaded_user_harts();
+            inner
+                .memory_set
+                .munmap_deferred(start, end)
+                .map(|batch| DeferredUserReclaim::new(token, mask, batch))
+        }) else {
+            return false;
+        };
+        reclaim.flush_then_release();
+        true
     }
     /// 处理当前进程的私有页写时复制缺页。
     pub fn handle_private_cow_fault(&self, fault_addr: usize) -> bool {
-        self.inner
-            .lock()
-            .memory_set
-            .handle_private_cow_fault(VirtAddr::from(fault_addr))
+        let Some(reclaim) = ({
+            let mut inner = self.inner.lock();
+            let token = inner.memory_set.token();
+            let mask = inner.memory_set.loaded_user_harts();
+            inner
+                .memory_set
+                .handle_private_cow_fault(VirtAddr::from(fault_addr))
+                .map(|batch| DeferredUserReclaim::new(token, mask, batch))
+        }) else {
+            return false;
+        };
+        reclaim.flush_then_release();
+        true
     }
     /// 处理当前进程的 file-backed 缺页。
     pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> Result<(), ERRNO> {
@@ -818,54 +867,70 @@ impl ProcessControlBlock {
 
     /// 按目标地址调整程序 break，返回调整后的当前 break。
     pub fn set_program_brk(&self, new_brk: usize) -> usize {
-        let mut inner = self.inner.lock();
-        let old_brk = inner.vm_layout.brk;
-        debug!("brk: old addr = {:#x}, new addr = {:#x}", old_brk, new_brk);
-        // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
-        if new_brk == 0 {
-            return old_brk;
-        }
-        if new_brk < inner.vm_layout.start_brk
-            || new_brk >= inner.vm_layout.mmap_base
-            || new_brk >= inner.vm_layout.start_stack
-        {
-            return old_brk;
-        }
-        if new_brk == old_brk {
-            return old_brk;
-        }
-
-        let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
-        let new_brk_va = VirtAddr::from(new_brk);
-        let old_brk_va = VirtAddr::from(old_brk);
-        let old_end_vpn = old_brk_va.ceil();
-        let new_end_vpn = new_brk_va.ceil();
-        let heap_exists = inner.memory_set.vmas.iter().any(|vma| vma.is_heap());
-
-        if new_brk > old_brk {
-            let success = if heap_exists {
-                inner.memory_set.append_to(heap_start, new_brk_va)
-            } else {
-                inner.memory_set.insert_vma(
-                    Vma::new_heap(heap_start, new_brk_va, MapPermission::R | MapPermission::W | MapPermission::U),
-                    None,
-                )
-            };
-            if !success && old_end_vpn != new_end_vpn {
+        let (result_brk, reclaim) = {
+            let mut inner = self.inner.lock();
+            let old_brk = inner.vm_layout.brk;
+            debug!("brk: old addr = {:#x}, new addr = {:#x}", old_brk, new_brk);
+            // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
+            if new_brk == 0 {
                 return old_brk;
             }
-        } else if new_brk == inner.vm_layout.start_brk {
-            inner
-                .memory_set
-                .remove_vma_with_start_vpn(heap_start.floor());
-        } else if old_end_vpn != new_end_vpn
-            && !inner.memory_set.shrink_to(heap_start, new_brk_va)
-        {
-            return old_brk;
-        }
+            if new_brk < inner.vm_layout.start_brk
+                || new_brk >= inner.vm_layout.mmap_base
+                || new_brk >= inner.vm_layout.start_stack
+            {
+                return old_brk;
+            }
+            if new_brk == old_brk {
+                return old_brk;
+            }
 
-        inner.vm_layout.brk = new_brk;
-        new_brk
+            let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
+            let new_brk_va = VirtAddr::from(new_brk);
+            let old_brk_va = VirtAddr::from(old_brk);
+            let old_end_vpn = old_brk_va.ceil();
+            let new_end_vpn = new_brk_va.ceil();
+            let heap_exists = inner.memory_set.vmas.iter().any(|vma| vma.is_heap());
+            let mut batch = None;
+
+            if new_brk > old_brk {
+                let success = if heap_exists {
+                    inner.memory_set.append_to(heap_start, new_brk_va)
+                } else {
+                    inner.memory_set.insert_vma(
+                        Vma::new_heap(heap_start, new_brk_va, MapPermission::R | MapPermission::W | MapPermission::U),
+                        None,
+                    )
+                };
+                if !success && old_end_vpn != new_end_vpn {
+                    return old_brk;
+                }
+            } else if new_brk == inner.vm_layout.start_brk {
+                batch = Some(inner
+                    .memory_set
+                    .remove_vma_with_start_vpn_user_deferred(heap_start.floor()));
+            } else if old_end_vpn != new_end_vpn {
+                let Some(shrink_batch) = inner.memory_set.shrink_to_deferred(heap_start, new_brk_va) else {
+                    return old_brk;
+                };
+                batch = Some(shrink_batch);
+            }
+
+            inner.vm_layout.brk = new_brk;
+            let reclaim = batch.map(|batch| {
+                // 锁内快照仍在用户态运行该 mm 的 hart，锁外等待 shootdown ack。
+                DeferredUserReclaim::new(
+                    inner.memory_set.token(),
+                    inner.memory_set.loaded_user_harts(),
+                    batch,
+                )
+            });
+            (new_brk, reclaim)
+        };
+        if let Some(reclaim) = reclaim {
+            reclaim.flush_then_release();
+        }
+        result_brk
     }
 
     /// Mark this process as running in kernel mode from `now`.

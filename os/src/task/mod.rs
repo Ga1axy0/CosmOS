@@ -31,7 +31,7 @@ use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::task::runqueue::add_stopping_task;
 use crate::timer::remove_timer;
 use crate::timer::get_time;
-use crate::mm::{MapPermission, VirtAddr};
+use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use process::ProcessControlBlock;
@@ -217,11 +217,14 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(process_inner);
         recycle_res.clear();
 
-        let (closed_fds, parent_weak) = {
+        let (closed_fds, parent_weak, reclaim) = {
             let mut process_inner = process.inner_exclusive_access();
             process_inner.children.clear();
             // deallocate other data in user space i.e. program code/data section
-            process_inner.memory_set.recycle_data_pages();
+            let token = process_inner.memory_set.token();
+            let mask = process_inner.memory_set.loaded_user_harts();
+            let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
+            let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
             let closed_fds = process_inner.take_all_fds();
             process_inner.fd_table.clear();
@@ -229,8 +232,9 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             process_inner.tasks.clear();
 
             let parent_weak = process_inner.parent.clone();
-            (closed_fds, parent_weak)
+            (closed_fds, parent_weak, reclaim)
         };
+        reclaim.flush_then_release();
         drop(closed_fds);
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
