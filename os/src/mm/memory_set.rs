@@ -1573,10 +1573,10 @@ impl Vma {
             return;
         }
         if self.map_type == MapType::Framed {
-            debug!(
-                "[munmap] release private frame mapping: vpn={:#x}",
-                vpn.0
-            );
+            // debug!(
+            //     "[munmap] release private frame mapping: vpn={:#x}",
+            //     vpn.0
+            // );
             self.data_frames.remove(&vpn);
         }
         let _ = page_table.clear(vpn);
