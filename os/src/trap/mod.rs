@@ -16,14 +16,15 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::hart::hartid;
-use crate::mm::{handle_ipi, PageFaultAccess, translated_refmut};
+use crate::mm::{handle_ipi, PageFaultAccess};
+use crate::signal::{SignalFlags, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
 use crate::task::{
-    ExitReason, SignalFlags, check_fatal_signals_of_current, check_itimers_of_all_processes,
-    check_signals_of_current, current_add_signal, current_process, current_process_is_zombie,
-    current_trap_cx, current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
-    on_timer_tick, schedule_if_needed,
+    ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
+    current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next, on_timer_tick,
+    schedule_if_needed,
 };
 use crate::timer::{check_timer, get_realtime_ns, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -278,72 +279,6 @@ pub fn trap_handler() -> ! {
     // Handle non-fatal signals before returning to user space
     handle_signals();
     trap_return();
-}
-
-/// Handle pending signals by setting up user-space signal handler invocation.
-/// This modifies the trap context to call the signal handler when returning to user space.
-fn handle_signals() {
-    let (signum, handler, mask) = match check_signals_of_current() {
-        Some(signal_info) => signal_info,
-        None => return,
-    };
-
-    let trap_cx = current_trap_cx();
-
-    // Save the current context on user stack.
-    let mut user_sp = trap_cx.x[2]; // sp register
-
-    // We need to save the trap context on the user stack so sigreturn can restore it.
-    // Allocate space for: saved trap context + signum + old mask.
-    user_sp -= core::mem::size_of::<TrapContext>();
-    let saved_trap_cx_ptr = user_sp;
-
-    user_sp -= core::mem::size_of::<usize>(); // signum
-    let signum_ptr = user_sp;
-
-    user_sp -= core::mem::size_of::<SignalFlags>(); // old mask
-    let old_mask_ptr = user_sp;
-
-    // Align stack to 16 bytes.
-    user_sp &= !0xf;
-
-    // Write saved context to user stack.
-    let token = current_user_token();
-    let process = current_process();
-
-    // Save the trap context.
-    let saved_cx_opt = translated_refmut(token, saved_trap_cx_ptr as *mut TrapContext);
-    let Some(saved_cx) = saved_cx_opt else {
-        // Failed to save context, skip this signal.
-        warn!("[kernel] handle_signals: failed to save trap context for signal {}", signum);
-        return;
-    };
-    *saved_cx = *trap_cx;
-
-    // Save signum.
-    let signum_opt = translated_refmut(token, signum_ptr as *mut i32);
-    let Some(signum_ref) = signum_opt else {
-        warn!("[kernel] handle_signals: failed to save signum");
-        return;
-    };
-    *signum_ref = signum;
-
-    // Save old mask and apply new mask.
-    let old_mask_opt = translated_refmut(token, old_mask_ptr as *mut SignalFlags);
-    let Some(old_mask_ref) = old_mask_opt else {
-        warn!("[kernel] handle_signals: failed to save old mask");
-        return;
-    };
-    let mut inner = process.inner_exclusive_access();
-    *old_mask_ref = inner.signal_mask;
-    // Apply the signal mask during handler execution.
-    inner.signal_mask |= mask;
-
-    // Set up the trap context to call the signal handler.
-    // When the handler returns, it should call sigreturn.
-    trap_cx.x[2] = user_sp; // Update sp
-    trap_cx.x[10] = signum as usize; // a0 = signum (first argument)
-    trap_cx.sepc = handler; // Jump to signal handler
 }
 
 /// return to user space

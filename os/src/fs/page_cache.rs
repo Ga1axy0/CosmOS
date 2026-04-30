@@ -339,12 +339,12 @@ fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> 
             current_size
         );
     } else {
-        debug!(
-            "[page_cache] mapping hit: inode_ptr={:#x} fs_id={} ino={}",
-            Arc::as_ptr(inode) as usize,
-            inode.fs_id(),
-            inode.ino()
-        );
+        // debug!(
+        //     "[page_cache] mapping hit: inode_ptr={:#x} fs_id={} ino={}",
+        //     Arc::as_ptr(inode) as usize,
+        //     inode.fs_id(),
+        //     inode.ino()
+        // );
     }
     mapping
 }

@@ -46,6 +46,7 @@ pub mod lang_items;
 pub mod klog;
 pub mod mm;
 pub mod net;
+pub mod signal;
 mod poll;
 pub mod sbi;
 pub mod sync;
