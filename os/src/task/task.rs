@@ -1,6 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 
 use super::id::TaskUserRes;
+use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
 use crate::config::MAX_HARTS;
 use crate::trap::TrapContext;
@@ -117,6 +118,9 @@ pub struct TaskControlBlockInner {
     pub need_resched: bool,
     /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
     pub cpu_affinity_mask: usize,
+    /// Handle to the WaitQueue this task is currently sleeping in (if any).
+    /// Used by signal delivery to properly remove the task from the queue.
+    pub current_wq_handle: Option<WaitQueueHandle>,
 }
 
 impl TaskControlBlockInner {
@@ -174,6 +178,14 @@ impl TaskControlBlock {
                     remaining_slice_ticks: sched_attr.time_slice_ticks,
                     need_resched: false,
                     cpu_affinity_mask: all_cpu_affinity_mask(),
+                    current_wq_handle: None,
+                    policy: sched_attr.policy,
+                    rt_priority: sched_attr.rt_priority,
+                    time_slice_ticks: sched_attr.time_slice_ticks,
+                    remaining_slice_ticks: sched_attr.time_slice_ticks,
+                    need_resched: false,
+                    cpu_affinity_mask: all_cpu_affinity_mask(),
+                    current_wq_handle: None,
                 })
             },
         }
@@ -211,6 +223,8 @@ pub enum WaitReason {
     SocketReadable,
     /// Waiting for socket buffer space / writable state.
     SocketWritable,
+    /// Waiting for signal delivery in sigsuspend.
+    SignalSuspend,
 }
 
 #[derive(Copy, Clone, PartialEq)]

@@ -112,6 +112,8 @@ pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_TKILL: usize = 130;
 /// tgkill syscall
 pub const SYSCALL_TGKILL: usize = 131;
+/// sigsuspend syscall
+pub const SYSCALL_SIGSUSPEND: usize = 133;
 /// sigaction syscall
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -476,6 +478,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3], // sigsetsize
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
+        SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u32, args[1]),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
