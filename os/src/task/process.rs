@@ -3,7 +3,7 @@
 use super::id::RecycleAllocator;
 use super::runqueue::insert_into_pid2process;
 use super::{SchedAttr, TaskControlBlock};
-use super::{add_task, SignalActions, SignalFlags};
+use super::{add_task, SignalAction, SignalActions, SignalFlags, SIG_IGN};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
+bitflags! {
     /// fd 表项级别的标志位。
     pub struct FdFlags: u32 {
         /// `exec` 成功后自动关闭该 fd。
@@ -449,6 +450,14 @@ impl ProcessControlBlock {
             let old_token = old_memory_set.token();
             let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
+            // POSIX: on exec, reset all user-defined signal handlers to SIG_DFL.
+            // SIG_IGN dispositions are preserved across exec.
+            for action in inner.signal_actions.table.iter_mut() {
+                if action.handler != SIG_IGN {
+                    *action = SignalAction::default();
+                }
+            }
+            inner.pending_signals = SignalFlags::empty();
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
@@ -1037,7 +1046,6 @@ impl ProcessControlBlock {
 
     /// 按目标地址调整程序 break，返回调整后的当前 break。
     pub fn set_program_brk(&self, new_brk: usize) -> usize {
-<<<<<<< HEAD
         let (result_brk, reclaim) = {
             let mut inner = self.inner.lock();
             let old_brk = inner.vm_layout.brk;
@@ -1055,69 +1063,22 @@ impl ProcessControlBlock {
             if new_brk == old_brk {
                 return old_brk;
             }
-=======
-        let mut inner = self.inner.lock();
-        let old_brk = inner.vm_layout.brk;
-        debug!("brk: old addr = {:#x}, new addr = {:#x}", old_brk, new_brk);
-        // TODO： 特殊情况，如果输入 new_brk 为 0，应该返回当前 brk 而不进行调整，用于兼容测试
-        if new_brk == 0 {
-            return old_brk;
-        }
-        if new_brk < inner.vm_layout.start_brk
-            || new_brk >= inner.vm_layout.mmap_base
-            || new_brk >= inner.vm_layout.start_stack
-        {
-            return old_brk;
-        }
-        if new_brk == old_brk {
-            return old_brk;
-        }
-
-        let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
-        let new_brk_va = VirtAddr::from(new_brk);
-        let old_brk_va = VirtAddr::from(old_brk);
-        let old_end_vpn = old_brk_va.ceil();
-        let new_end_vpn = new_brk_va.ceil();
-
-        if new_brk > old_brk {
-            let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
-                || inner.memory_set.register_vma_metadata(Vma::new_heap(
-                    heap_start,
-                    new_brk_va,
-                    MapPermission::R | MapPermission::W | MapPermission::U,
-                ));
-            if !success && old_end_vpn != new_end_vpn {
-                return old_brk;
-            }
-        } else if new_brk == inner.vm_layout.start_brk {
-            inner
-                .memory_set
-                .remove_vma_with_start_vpn(heap_start.floor());
-        } else if old_end_vpn != new_end_vpn
-            && !inner.memory_set.shrink_metadata_to(heap_start, new_brk_va)
-        {
-            return old_brk;
-        }
->>>>>>> 521032a (perf: Make `brk` heap allocation lazy.)
 
             let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
             let new_brk_va = VirtAddr::from(new_brk);
             let old_brk_va = VirtAddr::from(old_brk);
             let old_end_vpn = old_brk_va.ceil();
             let new_end_vpn = new_brk_va.ceil();
-            let heap_exists = inner.memory_set.vmas.iter().any(|vma| vma.is_heap());
             let mut batch = None;
 
             if new_brk > old_brk {
-                let success = if heap_exists {
-                    inner.memory_set.append_to(heap_start, new_brk_va)
-                } else {
-                    inner.memory_set.insert_vma(
-                        Vma::new_heap(heap_start, new_brk_va, MapPermission::R | MapPermission::W | MapPermission::U),
-                        None,
-                    )
-                };
-                if !success && old_end_vpn != new_end_vpn {
+                let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
+                    || inner.memory_set.register_vma_metadata(Vma::new_heap(
+                        heap_start,
+                        new_brk_va,
+                        MapPermission::R | MapPermission::W | MapPermission::U,
+                    ));
+                if !success {
                     return old_brk;
                 }
             } else if new_brk == inner.vm_layout.start_brk {

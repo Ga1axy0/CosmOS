@@ -48,7 +48,7 @@ pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use wait_queue::{WaitQueue, WaitQueueKeyed};
+pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
 pub use task::{
@@ -101,6 +101,7 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         if matches!(task_inner.task_status, TaskStatus::Runnable) {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
+            task_inner.current_wq_handle = None;
             task_inner.on_cpu = true;
             task_inner.on_rq = false;
             task_inner.need_resched = false;
@@ -238,6 +239,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(closed_fds);
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
+            add_signal_to_process(&parent, SignalFlags::SIGCHLD);
             parent.wait_exit_queue.wake_one();
         }
     } else {
@@ -344,11 +346,17 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
     };
 
     if should_notify_poll {
+        debug!(
+            "add_signal_to_process: pid={} added signal {:#x} which is unmasked, should notify poll",
+            pid,
+            signal.bits()
+        );
         crate::poll::notify_poll_signal_pid(pid);
 
-        // `ppoll` 在注册表耗尽时会走 ENOSPC 回退路径，直接以 `WaitReason::Poll`
-        // 阻塞并依赖短时 timer 唤醒重扫；该路径不在 keyed poll registry 中，
-        // 需要在信号投递时主动唤醒，确保尽快返回 EINTR。
+        // When an unmasked signal arrives, wake interruptible tasks so they
+        // return -EINTR.  Use the WaitQueueHandle (if the task is enqueued)
+        // to properly remove it from its wait queue before waking.
+        // Keyed-poll tasks are already handled by notify_poll_signal_pid above.
         let tasks: Vec<Arc<TaskControlBlock>> = {
             let process_inner = process.inner_exclusive_access();
             process_inner
@@ -361,16 +369,22 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
             if task_has_inflight_keyed_poll_wait(&task) {
                 continue;
             }
-            let should_wake = {
+            let handle = {
                 let task_inner = task.inner_exclusive_access();
-                matches!(task_inner.wait_reason, Some(WaitReason::Poll))
-                    && matches!(
-                        task_inner.task_status,
-                        TaskStatus::Interruptible | TaskStatus::Uninterruptible
-                    )
+                task_inner.current_wq_handle.clone()
             };
-            if should_wake {
-                wakeup_task(task);
+            if let Some(handle) = handle {
+                debug!("Wakeup with handle, reason = {:?}", task.inner_exclusive_access().wait_reason.unwrap_or(WaitReason::Unknown));
+                handle.wake_waiter(&task);
+            } else {
+                debug!("Wakeup task without handle, reason = {:?}", task.inner_exclusive_access().wait_reason.unwrap_or(WaitReason::Unknown));
+                let should_wake = {
+                    let task_inner = task.inner_exclusive_access();
+                    matches!(task_inner.task_status, TaskStatus::Interruptible)
+                };
+                if should_wake {
+                    wakeup_task(task);
+                }
             }
         }
     }

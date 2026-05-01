@@ -4,7 +4,7 @@ use crate::{
     mm::{translated_ref, translated_refmut},
     syscall::errno::OrErrno,
     syscall_body,
-    task::{current_process, current_task, current_user_token, SignalAction, SignalFlags},
+    task::{current_process, current_task, current_user_token, SignalAction, SignalFlags, WaitReason},
 };
 
 /// rt_sigaction 系统调用
@@ -188,5 +188,110 @@ pub fn sys_sigreturn() -> isize {
 
         // Return the original a0 value (which was saved in the trap context)
         Ok(trap_cx.x[10] as isize)
+    })
+}
+
+/// rt_sigsuspend / sigsuspend 系统调用
+///
+/// 原子地替换信号掩码并挂起进程，直到信号到达。
+/// 参数：
+///   mask: 指向新信号掩码的指针
+///   sigsetsize: 信号集大小（支持 4 或 8 字节，但只使用前 4 字节）
+///
+/// 返回值：
+///   总是返回 -EINTR（被信号中断）
+pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sigsuspend mask={:#x} sigsetsize={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        mask as usize,
+        sigsetsize
+    );
+    syscall_body!({
+        // Validate sigsetsize - accept 4 (32-bit) or 8 (64-bit) sigset_t
+        // We only use the first 32 bits for compatibility
+        if sigsetsize != 4 && sigsetsize != 8 {
+            debug!(
+                "sys_sigsuspend: invalid sigsetsize={}, expected 4 or 8",
+                sigsetsize
+            );
+            return Err(ERRNO::EINVAL);
+        }
+
+        let token = current_user_token();
+        let process = current_process();
+
+        // Read new mask from user space (only use the first 32 bits)
+        let new_mask_bits = *translated_ref(token, mask).or_errno(ERRNO::EFAULT)?;
+        let new_mask = SignalFlags::from_bits(new_mask_bits).or_errno(ERRNO::EINVAL)?;
+
+        // Save old mask and atomically set new mask
+        let old_mask = {
+            let mut inner = process.inner_exclusive_access();
+            let old = inner.signal_mask;
+            inner.signal_mask = new_mask;
+            debug!(
+                "sys_sigsuspend: changed mask from {:#x} to {:#x}",
+                old.bits(),
+                new_mask.bits()
+            );
+            old
+        };
+
+        // Block until a signal arrives.
+        // Check if any unmasked signals are already pending.
+        let has_pending = {
+            let inner = process.inner_exclusive_access();
+            let unmasked_pending = inner.pending_signals & !inner.signal_mask;
+            !unmasked_pending.is_empty()
+        };
+
+        if !has_pending {
+            // Block directly without enqueuing in any WaitQueue.
+            // This avoids polluting wait_exit_queue (shared with waitpid)
+            // because otherwise wake_one from a child exit would be
+            // consumed by sigsuspend instead of the real waitpid waiter.
+            //
+            // Set status to Interruptible first, then re-check for
+            // pending signals to close the race window where a signal
+            // arrives between has_pending and actually sleeping.
+            let task = current_task().unwrap();
+            {
+                let mut task_inner = task.inner_exclusive_access();
+                task_inner.task_status = crate::task::TaskStatus::Interruptible;
+                task_inner.wait_reason = Some(WaitReason::SignalSuspend);
+            }
+
+            // Re-check: did a signal arrive before we could block?
+            let should_block = {
+                let inner = process.inner_exclusive_access();
+                let unmasked_pending = inner.pending_signals & !inner.signal_mask;
+                unmasked_pending.is_empty()
+            };
+
+            if should_block {
+                crate::task::block_current_and_run_next(WaitReason::SignalSuspend);
+            } else {
+                // Signal arrived — cancel the sleep, keep running.
+                let mut task_inner = task.inner_exclusive_access();
+                if matches!(task_inner.task_status, crate::task::TaskStatus::Interruptible) {
+                    task_inner.task_status = crate::task::TaskStatus::Running;
+                    task_inner.wait_reason = None;
+                }
+            }
+        }
+
+        // When we wake up, restore the old signal mask
+        {
+            let mut inner = process.inner_exclusive_access();
+            inner.signal_mask = old_mask;
+            debug!(
+                "sys_sigsuspend: restored mask to {:#x}",
+                old_mask.bits()
+            );
+        }
+
+        // sigsuspend always returns -EINTR after signal delivery
+        Err(ERRNO::EINTR)
     })
 }

@@ -225,6 +225,23 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     });
                     !has_target_child || has_target_zombie
                 });
+
+            // If woken by a deliverable user-handled signal, return EINTR so the trap handler can dispatch it.
+            {
+                let inner = process.inner_exclusive_access();
+                let pending_unmasked = inner.pending_signals & !inner.signal_mask;
+                let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
+                    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else { return false; };
+                    if !pending_unmasked.contains(flag) {
+                        return false;
+                    }
+                    let handler = inner.signal_actions.table[signum].handler;
+                    handler != crate::task::SIG_DFL && handler != crate::task::SIG_IGN
+                });
+                if has_user_handler {
+                    return Err(ERRNO::EINTR);
+                }
+            }
         }
     })
 }
