@@ -1,13 +1,15 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
+use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
     mm::{translated_ref, translated_refmut, translated_str},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, pid2process, ExitReason, SignalFlags,
+        exit_current_and_run_next, pid2process, suspend_current_and_run_next, ExitReason,
+        SignalFlags,
         WaitReason,
     },
 };
@@ -78,6 +80,141 @@ fn parse_shebang_line(file_data: &[u8]) -> Result<Option<ShebangInfo>, ERRNO> {
 /// 解析 `execve` 目标，必要时按 shebang 规则递归展开到最终 ELF。
 fn resolve_exec_image(
     cwd: &str,
+    path: &str,
+    argv: Vec<String>,
+    depth: usize,
+) -> Result<ResolvedExecImage, ERRNO> {
+    debug!("Resolving exec image: path='{}', argv={:?}, depth={}", path, argv, depth);
+
+    if depth >= EXEC_INTERPRETER_MAX_DEPTH {
+        return Err(ERRNO::ELOOP);
+    }
+
+    let abs_path = canonicalize(cwd, path);
+    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
+    if inode.is_dir() {
+        return Err(ERRNO::EISDIR);
+    }
+
+    // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
+    let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    debug!(
+        "First line of exec target: {:?}, complete={}",
+        core::str::from_utf8(&first_line).unwrap_or("<invalid utf-8>"),
+        first_line_complete
+    );
+    if is_elf_image(&first_line) {
+        let file_data = inode.read_all();
+        return Ok(ResolvedExecImage {
+            elf_data: file_data,
+            argv,
+        });
+    }
+
+    // 首行超过限制时直接拒绝，避免 shebang 解析继续处理不完整输入。
+    if !first_line_complete {
+        return Err(ERRNO::ENOEXEC);
+    }
+
+    if let Some(shebang) = parse_shebang_line(&first_line)? {
+        // shebang 语义要求解释器路径必须是绝对路径。
+        if !shebang.interpreter.starts_with('/') {
+            return Err(ERRNO::ENOEXEC);
+        }
+
+        // 按 Linux 语义重写 argv：解释器、可选参数、脚本绝对路径、原 argv[1..]。
+        let mut next_argv = Vec::with_capacity(argv.len() + 2);
+        next_argv.push(shebang.interpreter.clone());
+        if let Some(optional_arg) = shebang.optional_arg {
+            next_argv.push(optional_arg);
+        }
+        next_argv.push(abs_path);
+        next_argv.extend(argv.into_iter().skip(1));
+        return resolve_exec_image(cwd, shebang.interpreter.as_str(), next_argv, depth + 1);
+    }
+
+    Err(ERRNO::ENOEXEC)
+}
+/// exit syscall
+///
+/// exit the current task and run the next task in task list
+pub fn sys_exit(exit_code: i32) -> ! {
+    trace!(
+        "kernel:pid[{}] sys_exit - time {}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        get_time_ns()
+    );
+    exit_current_and_run_next(ExitReason::Exit(exit_code));
+    panic!("Unreachable in sys_exit!");
+}
+
+/// 临时实现
+pub fn sys_exit_group(exit_code: i32) -> ! {
+    sys_exit(exit_code);
+}
+
+/// yield syscall
+pub fn sys_yield() -> isize {
+    //trace!("kernel: sys_yield");
+    suspend_current_and_run_next();
+    0
+}
+/// getpid syscall
+pub fn sys_getpid() -> isize {
+    trace!(
+        "kernel: sys_getpid pid:{}",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+}
+    );
+    current_task().unwrap().process.upgrade().unwrap().getpid() as isize
+}
+
+/// getppid syscall
+pub fn sys_getppid() -> isize {
+    trace!(
+        "kernel: sys_getppid pid:{}",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    let parent = process.inner_exclusive_access().parent.clone();
+    if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
+        parent.getpid() as isize
+    } else {
+        0
+    }
+}
+
+/// getuid syscall
+pub fn sys_getuid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getuid pid:{}", process.getpid());
+    process.getuid() as isize
+}
+
+/// geteuid syscall
+pub fn sys_geteuid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_geteuid pid:{}", process.getpid());
+    process.geteuid() as isize
+}
+
+/// getgid syscall
+pub fn sys_getgid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getgid pid:{}", process.getpid());
+    process.getgid() as isize
+}
+
+/// getegid syscall
+pub fn sys_getegid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getegid pid:{}", process.getpid());
+    process.getegid() as isize
+}
+
+pub fn sys_getsid() -> isize {
+    let process = current_process();
+    trace!("kernel: sys_getsid pid:{}", process.getpid());
     process.getsid() as isize
 }
 
@@ -85,13 +222,22 @@ pub fn sys_setsid() -> isize {
     trace!("kernel: sys_setsid pid:{}", current_process().getpid());
     warn!("kernel: sys_setsid is not fully implemented, just return new sid 1");
     1
+}
+
+/// fork child process syscall
 pub fn sys_fork() -> isize {
-    }
+    trace!(
         "kernel:pid[{}] sys_fork",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let current_process = current_process();
     let new_process = current_process.fork();
+    info!(
+        "kernel:pid[{}] forked new process with pid {} - time {}",
+        current_process.getpid(),
+        new_process.getpid(),
+        get_time_ns()
+    );
     new_process.getpid() as isize
 }
 /// sys_execve
@@ -306,133 +452,6 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
     })
 }
 
-<<<<<<< HEAD
-/// sigaction 系统调用
-pub fn sys_sigaction(
-    signum: i32,
-    action: *const SignalAction,
-    old_action: *mut SignalAction,
-) -> isize {
-    syscall_body!({
-        let signum = signum as u32;
-        if signum == 0 || signum as usize > crate::task::MAX_SIG {
-            return Err(ERRNO::EINVAL);
-        }
-        if signum == 9 || signum == 19 {
-            return Err(ERRNO::EINVAL);
-        }
-        let token = current_user_token();
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let slot = &mut inner.signal_actions.table[signum as usize];
-        if !old_action.is_null() {
-            let old = translated_refmut(token, old_action).or_errno(ERRNO::EFAULT)?;
-            *old = *slot;
-        }
-        if !action.is_null() {
-            let new_action = *translated_ref(token, action).or_errno(ERRNO::EFAULT)?;
-            *slot = new_action;
-        }
-        Ok(0)
-    })
-}
-
-/// sigprocmask / rt_sigprocmask 系统调用
-///
-/// Linux 语义：
-///   how == SIG_BLOCK   (0) -> mask |= set
-///   how == SIG_UNBLOCK (1) -> mask &= ~set
-///   how == SIG_SETMASK (2) -> mask = set
-/// 参数含义遵循 rt_sigprocmask: (int how, const sigset_t *set, sigset_t *oset, size_t sigsetsize)
-pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_sigprocmask",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    let token = current_user_token();
-    syscall_body!({
-        // We represent sigset as a u32 bitmask in this kernel; require user-provided
-        // buffer to be large enough to hold at least a u32.
-        if sigsetsize < core::mem::size_of::<u32>() {
-            return Err(ERRNO::EINVAL);
-        }
-
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-
-        // If user requested old mask, write it out first.
-        if !oset.is_null() {
-            let old_bits = inner.signal_mask.bits();
-            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
-            *slot = old_bits;
-        }
-
-        // If user provided a new mask, apply according to `how`.
-        if !set.is_null() {
-            let new_bits = *translated_ref(token, set).or_errno(ERRNO::EFAULT)?;
-            let new_mask = SignalFlags::from_bits(new_bits).or_errno(ERRNO::EINVAL)?;
-            match how {
-                0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
-                1 => inner.signal_mask.remove(new_mask), // SIG_UNBLOCK
-                2 => inner.signal_mask = new_mask,       // SIG_SETMASK
-                _ => return Err(ERRNO::EINVAL),
-            }
-        }
-
-        Ok(0)
-    })
-}
-
-/// sigreturn 系统调用
-pub fn sys_sigreturn() -> isize {
-    syscall_body!({
-        // Restore the trap context and signal mask from the user stack
-        let trap_cx = crate::task::current_trap_cx();
-        let user_sp = trap_cx.x[2]; // Current sp
-
-        // The stack layout (from handle_signals):
-        // [aligned sp] -> [old_mask] -> [signum] -> [saved_trap_cx]
-        let token = current_user_token();
-
-        // Calculate pointers (reverse order from handle_signals)
-        let mut ptr = user_sp;
-
-        // Read old mask
-        let old_mask_ptr = ptr;
-        ptr += core::mem::size_of::<crate::task::SignalFlags>();
-
-        // Read signum (we don't need it for restoration)
-        ptr += core::mem::size_of::<usize>();
-
-        // Read saved trap context
-        let saved_trap_cx_ptr = ptr;
-
-        // Restore the old signal mask
-        let old_mask_opt = unsafe {
-            crate::mm::translated_ref(token, old_mask_ptr as *const crate::task::SignalFlags)
-        };
-        if let Some(old_mask) = old_mask_opt {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            inner.signal_mask = *old_mask;
-        } else {
-            return Err(ERRNO::EFAULT);
-        }
-
-        // Restore the trap context
-        let saved_cx_opt = unsafe {
-            crate::mm::translated_ref(token, saved_trap_cx_ptr as *const crate::trap::TrapContext)
-        };
-        if let Some(saved_cx) = saved_cx_opt {
-            *trap_cx = *saved_cx;
-        } else {
-            return Err(ERRNO::EFAULT);
-        }
-
-        // Return the original a0 value (which was saved in the trap context)
-        Ok(trap_cx.x[10] as isize)
-    })
-=======
 /// change data segment size
 pub fn sys_brk(addr: usize) -> isize {
     trace!(
@@ -440,7 +459,6 @@ pub fn sys_brk(addr: usize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     current_process().set_program_brk(addr) as isize
->>>>>>> 5b1c7cf (feat: Support complete signal handling.)
 }
 
 /// spawn syscall

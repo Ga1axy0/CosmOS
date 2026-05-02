@@ -5,6 +5,11 @@ use crate::{config::MEMORY_END, sync::{SpinNoIrqLock}};
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
 use lazy_static::*;
+use crate::fs::PAGE_CACHE_MANAGER;
+
+extern "C" {
+    fn ekernel();
+}
 
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
@@ -64,6 +69,11 @@ impl FrameAllocator for StackFrameAllocator {
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
+        trace!("FrameAllocator: Used {} | PageCache {} | Free {} | Recycled {}",
+            self.current - PhysAddr::from(ekernel as usize).ceil().0 - self.recycled.len(),
+            PAGE_CACHE_MANAGER.lock().cached_pages,
+            self.end - self.current,
+            self.recycled.len());
         if let Some(ppn) = self.recycled.pop() {
             Some(ppn.into())
         } else if self.current == self.end {
