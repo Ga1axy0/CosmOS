@@ -35,8 +35,8 @@ pub use page_table::{
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
-    heap_allocator::init_heap();
     frame_allocator::init_frame_allocator();
+    heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
 }
 
