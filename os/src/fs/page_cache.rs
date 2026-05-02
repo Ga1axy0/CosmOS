@@ -8,11 +8,19 @@ use fs::Inode;
 use lazy_static::lazy_static;
 
 use crate::config::{MEMORY_END, PAGE_SIZE};
+<<<<<<< HEAD
 use crate::mm::{
-    frame_alloc, invalidate_inode_mappings_after_truncate, FrameTracker, PhysPageNum,
+    frame_alloc, invalidate_inode_mappings_after_truncate, FrameTracker, PhysAddr, PhysPageNum,
 };
+=======
+use crate::mm::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum};
+>>>>>>> 4af9d33 (fix: correct lower/upper bounds in page cache.)
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
+
+extern "C" {
+    fn ekernel();
+}
 
 bitflags! {
     /// 单个缓存页的状态位。
@@ -154,7 +162,7 @@ pub struct PageCacheManager {
     /// 简化版 CLOCK 队列，允许存在重复和失效条目。
     inactive: VecDeque<Weak<SpinNoIrqLock<CachePage>>>,
     /// 当前缓存页总数。
-    cached_pages: usize,
+    pub cached_pages: usize,
     /// 超过该阈值后开始回收。
     high_watermark: usize,
     /// 回收到该阈值后停止。
@@ -164,7 +172,9 @@ pub struct PageCacheManager {
 impl PageCacheManager {
     /// 创建新的全局 page cache 管理器。
     fn new() -> Self {
-        let total_pages = max(1, MEMORY_END / PAGE_SIZE);
+        let managed_start = PhysAddr::from(ekernel as usize).ceil();
+        let managed_end = PhysAddr::from(MEMORY_END).floor();
+        let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
         let high_watermark = max(128, total_pages / 16);
         let low_watermark = max(96, high_watermark * 3 / 4);
         Self {
@@ -178,7 +188,7 @@ impl PageCacheManager {
 
 lazy_static! {
     /// 全局 page cache 管理器。
-    static ref PAGE_CACHE_MANAGER: SpinNoIrqLock<PageCacheManager> =
+    pub static ref PAGE_CACHE_MANAGER: SpinNoIrqLock<PageCacheManager> =
         SpinNoIrqLock::new(PageCacheManager::new());
 }
 
@@ -479,13 +489,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
         mapping_guard.size = new_size;
 
         if new_size < old_size {
-            let first_removed_idx = if new_size == 0 {
-                0
-            } else if new_tail_valid == PAGE_SIZE {
-                new_tail_idx.saturating_add(1)
-            } else {
-                new_tail_idx.saturating_add(1)
-            };
+            let first_removed_idx = if new_size == 0 { 0 } else { new_tail_idx.saturating_add(1) };
             let removed_indices: alloc::vec::Vec<_> = mapping_guard
                 .pages
                 .range(first_removed_idx..)
@@ -764,7 +768,7 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
 }
 
 /// 若当前缓存压力过大，则回收到低水位。
-fn reclaim_if_needed() {
+pub fn reclaim_if_needed() {
     loop {
         let need_reclaim = {
             let manager = PAGE_CACHE_MANAGER.lock();

@@ -19,7 +19,7 @@ use core::any::Any;
 pub use fs::vfs::InodeTime;
 pub use page_cache::{
     mapping_for_inode, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
-    retain_mapped_page,
+    retain_mapped_page, PAGE_CACHE_MANAGER
 };
 
 bitflags! {
