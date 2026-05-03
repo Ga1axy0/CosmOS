@@ -106,6 +106,25 @@ impl PageTable {
         }
         result
     }
+    fn find_pte_create_untracked(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        let idxs = vpn.indexes();
+        let mut ppn = self.root_ppn;
+        let mut result: Option<&mut PageTableEntry> = None;
+        for (i, idx) in idxs.iter().enumerate() {
+            let pte = &mut ppn.get_pte_array()[*idx];
+            if i == 2 {
+                result = Some(pte);
+                break;
+            }
+            if !pte.is_valid() {
+                let frame = frame_alloc().unwrap();
+                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                core::mem::forget(frame);
+            }
+            ppn = pte.ppn();
+        }
+        result
+    }
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
@@ -127,6 +146,12 @@ impl PageTable {
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
         let pte = self.find_pte_create(vpn).unwrap();
+        debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+    }
+    /// Map a permanent kernel page without recording page-table frames in `frames`.
+    pub fn map_kernel_untracked(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        let pte = self.find_pte_create_untracked(vpn).unwrap();
         debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }

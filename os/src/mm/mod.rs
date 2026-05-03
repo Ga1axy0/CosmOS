@@ -15,7 +15,10 @@ mod tlb_shootdown;
 
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
-pub use frame_allocator::{frame_alloc, frame_dealloc, FrameTracker};
+pub use frame_allocator::{
+    frame_alloc, frame_alloc_contiguous, frame_dealloc, frame_dealloc_range, ContiguousFrames,
+    FrameTracker,
+};
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
@@ -38,6 +41,7 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
+    heap_allocator::init_heap_virtual_window();
 }
 
 /// 在当前 hart 上激活内核地址空间（写入 satp + sfence.vma）。

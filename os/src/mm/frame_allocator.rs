@@ -2,9 +2,15 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::fs::PAGE_CACHE_MANAGER;
+use crate::mm::heap_allocator::KERNEL_HEAP_BYTES;
 use crate::{config::MEMORY_END, sync::SpinNoIrqLock};
 use core::fmt::{self, Debug, Formatter};
 use lazy_static::*;
+use virtio_drivers::PAGE_SIZE;
+use core::sync::atomic::Ordering;
+
+const MAX_ORDER: usize = 32;
+const INVALID_PPN: usize = usize::MAX;
 
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
@@ -36,124 +42,221 @@ impl Drop for FrameTracker {
     }
 }
 
+/// RAII handle for a physically contiguous frame range.
+pub struct ContiguousFrames {
+    start: PhysPageNum,
+    pages: usize,
+}
+
+impl ContiguousFrames {
+    fn new(start: PhysPageNum, pages: usize) -> Self {
+        for ppn in start.0..start.0 + pages {
+            clear_frame(PhysPageNum(ppn));
+        }
+        Self { start, pages }
+    }
+
+    /// Return the first physical page number in this contiguous range.
+    pub fn start_ppn(&self) -> PhysPageNum {
+        self.start
+    }
+
+    /// Return the number of pages owned by this range.
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+}
+
+impl Drop for ContiguousFrames {
+    fn drop(&mut self) {
+        frame_dealloc_range(self.start, self.pages);
+    }
+}
+
 trait FrameAllocator {
     fn new() -> Self;
     fn alloc(&mut self) -> Option<PhysPageNum>;
     fn dealloc(&mut self, ppn: PhysPageNum);
 }
 
-pub struct StackFrameAllocator {
+pub struct BuddyFrameAllocator {
     start: usize,
-    current: usize,
     end: usize,
-    recycled_head: Option<usize>,
-    recycled_count: usize,
+    free_list: [Option<usize>; MAX_ORDER],
+    free_pages: usize,
+    allocated_pages: usize,
 }
 
-impl StackFrameAllocator {
+impl BuddyFrameAllocator {
     pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
         self.start = l.0;
-        self.current = l.0;
         self.end = r.0;
-        self.recycled_head = None;
-        self.recycled_count = 0;
-        // trace!("last {} Physical Frames.", self.end - self.current);
+        self.free_list = [None; MAX_ORDER];
+        self.free_pages = 0;
+        self.allocated_pages = 0;
+        self.add_range(l.0, r.0);
     }
 
-    fn set_recycled_next(ppn: usize, next: Option<usize>) {
-        let next = next.unwrap_or(usize::MAX);
+    fn set_next(ppn: usize, next: Option<usize>) {
+        let next = next.unwrap_or(INVALID_PPN);
         *PhysPageNum(ppn).get_mut::<usize>() = next;
     }
 
-    fn recycled_next(ppn: usize) -> Option<usize> {
+    fn next(ppn: usize) -> Option<usize> {
         let next = *PhysPageNum(ppn).get_mut::<usize>();
-        if next == usize::MAX {
+        if next == INVALID_PPN {
             None
         } else {
             Some(next)
         }
     }
 
-    fn recycled_contains(&self, ppn: usize) -> bool {
-        let mut current = self.recycled_head;
-        while let Some(recycled_ppn) = current {
-            if recycled_ppn == ppn {
+    fn push_block(&mut self, order: usize, ppn: usize) {
+        debug_assert!(order < MAX_ORDER);
+        debug_assert_eq!(ppn & ((1usize << order) - 1), 0);
+        Self::set_next(ppn, self.free_list[order]);
+        self.free_list[order] = Some(ppn);
+    }
+
+    fn pop_block(&mut self, order: usize) -> Option<usize> {
+        let ppn = self.free_list[order]?;
+        self.free_list[order] = Self::next(ppn);
+        Self::set_next(ppn, None);
+        Some(ppn)
+    }
+
+    fn remove_block(&mut self, order: usize, target: usize) -> bool {
+        let mut current = self.free_list[order];
+        let mut previous = None;
+        while let Some(ppn) = current {
+            let next = Self::next(ppn);
+            if ppn == target {
+                if let Some(previous) = previous {
+                    Self::set_next(previous, next);
+                } else {
+                    self.free_list[order] = next;
+                }
+                Self::set_next(ppn, None);
                 return true;
             }
-            current = Self::recycled_next(recycled_ppn);
+            previous = current;
+            current = next;
         }
         false
     }
 
-    fn recycle_raw(&mut self, ppn: usize) {
-        Self::set_recycled_next(ppn, self.recycled_head);
-        self.recycled_head = Some(ppn);
-        self.recycled_count += 1;
+    fn contains_free_block(&self, ppn: usize) -> bool {
+        for order in 0..MAX_ORDER {
+            let mut current = self.free_list[order];
+            while let Some(block) = current {
+                if block <= ppn && ppn < block + (1usize << order) {
+                    return true;
+                }
+                current = Self::next(block);
+            }
+        }
+        false
     }
 
-    fn alloc_contiguous_aligned(
-        &mut self,
-        pages: usize,
-        align_pages: usize,
-    ) -> Option<PhysPageNum> {
-        if pages == 0 || align_pages == 0 {
+    fn add_range(&mut self, mut start: usize, end: usize) {
+        while start < end {
+            let remaining = end - start;
+            let lowbit_order = if start == 0 {
+                MAX_ORDER - 1
+            } else {
+                (start.trailing_zeros() as usize).min(MAX_ORDER - 1)
+            };
+            let mut order = floor_log2(remaining).min(lowbit_order).min(MAX_ORDER - 1);
+            while start + (1usize << order) > end {
+                order -= 1;
+            }
+            self.push_block(order, start);
+            self.free_pages += 1usize << order;
+            start += 1usize << order;
+        }
+    }
+
+    fn alloc_order(&mut self, order: usize) -> Option<PhysPageNum> {
+        if order >= MAX_ORDER {
             return None;
         }
-        let aligned_current = align_up(self.current, align_pages)?;
-        if self.end.saturating_sub(aligned_current) < pages {
+        let mut source_order = order;
+        while source_order < MAX_ORDER && self.free_list[source_order].is_none() {
+            source_order += 1;
+        }
+        if source_order == MAX_ORDER {
             return None;
         }
-        for ppn in self.current..aligned_current {
-            self.recycle_raw(ppn);
+        let ppn = self.pop_block(source_order)?;
+        while source_order > order {
+            source_order -= 1;
+            self.push_block(source_order, ppn + (1usize << source_order));
         }
-        let start = aligned_current;
-        self.current = aligned_current + pages;
-        Some(start.into())
+        self.free_pages -= 1usize << order;
+        self.allocated_pages += 1usize << order;
+        Some(ppn.into())
+    }
+
+    fn dealloc_order(&mut self, ppn: PhysPageNum, order: usize) {
+        let mut ppn = ppn.0;
+        let pages = 1usize << order;
+        if order >= MAX_ORDER
+            || ppn < self.start
+            || ppn + pages > self.end
+            || ppn & (pages - 1) != 0
+            || self.contains_free_block(ppn)
+        {
+            panic!(
+                "Frame ppn={:#x}, pages={} has not been allocated!",
+                ppn, pages
+            );
+        }
+
+        let mut current_order = order;
+        while current_order + 1 < MAX_ORDER {
+            let buddy = ppn ^ (1usize << current_order);
+            if buddy < self.start || buddy + (1usize << current_order) > self.end {
+                break;
+            }
+            if !self.remove_block(current_order, buddy) {
+                break;
+            }
+            ppn = ppn.min(buddy);
+            current_order += 1;
+        }
+
+        self.push_block(current_order, ppn);
+        self.free_pages += pages;
+        self.allocated_pages -= pages;
     }
 }
-impl FrameAllocator for StackFrameAllocator {
+
+impl FrameAllocator for BuddyFrameAllocator {
     fn new() -> Self {
         Self {
             start: 0,
-            current: 0,
             end: 0,
-            recycled_head: None,
-            recycled_count: 0,
+            free_list: [None; MAX_ORDER],
+            free_pages: 0,
+            allocated_pages: 0,
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
         trace!(
-            "FrameAllocator: Used {} | PageCache {} | Free {} | Recycled {}",
-            self.current - self.start - self.recycled_count,
+            "FrameAllocator: Used {} | PageCache {} | Free {} | Kernel heap {}",
+            self.allocated_pages,
             PAGE_CACHE_MANAGER.lock().cached_pages,
-            self.end - self.current,
-            self.recycled_count
+            self.free_pages,
+            KERNEL_HEAP_BYTES.load(Ordering::Acquire) / PAGE_SIZE
         );
-        if let Some(ppn) = self.recycled_head {
-            self.recycled_head = Self::recycled_next(ppn);
-            self.recycled_count -= 1;
-            Some(ppn.into())
-        } else if self.current == self.end {
-            None
-        } else {
-            self.current += 1;
-            Some((self.current - 1).into())
-        }
+        self.alloc_order(0)
     }
     fn dealloc(&mut self, ppn: PhysPageNum) {
-        let ppn = ppn.0;
-        // validity check
-        if ppn < self.start || ppn >= self.current || self.recycled_contains(ppn) {
-            panic!("Frame ppn={:#x} has not been allocated!", ppn);
-        }
-        // recycle
-        Self::set_recycled_next(ppn, self.recycled_head);
-        self.recycled_head = Some(ppn);
-        self.recycled_count += 1;
+        self.dealloc_order(ppn, 0);
     }
 }
 
-type FrameAllocatorImpl = StackFrameAllocator;
+type FrameAllocatorImpl = BuddyFrameAllocator;
 
 lazy_static! {
     pub static ref FRAME_ALLOCATOR: SpinNoIrqLock<FrameAllocatorImpl> =
@@ -180,26 +283,41 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.lock().dealloc(ppn);
 }
 
-/// Allocate contiguous physical pages for the kernel heap.
-///
-/// These pages become permanently owned by the heap allocator, so they are not
-/// wrapped in `FrameTracker` and will not be returned by dropping a tracker.
-pub(super) fn frame_alloc_contiguous_for_heap(pages: usize) -> Option<usize> {
-    let start_ppn = FRAME_ALLOCATOR
-        .lock()
-        .alloc_contiguous_aligned(pages, pages)?;
-    for ppn in start_ppn.0..start_ppn.0 + pages {
-        for byte in PhysPageNum(ppn).get_bytes_array() {
-            *byte = 0;
-        }
+/// Allocate a physically contiguous frame range.
+/// Simplified implmentation: maybe fail when align_pages > pages (require over-alignment)
+pub fn frame_alloc_contiguous(pages: usize, align_pages: usize) -> Option<ContiguousFrames> {
+    info!("Allocating contiguous frames: pages={}, align_pages={}", pages, align_pages);
+    if pages == 0 || align_pages == 0 || !pages.is_power_of_two() || !align_pages.is_power_of_two()
+    {
+        return None;
     }
-    let start_pa: PhysAddr = start_ppn.into();
-    Some(start_pa.into())
+    let order = pages.trailing_zeros() as usize;
+    let start = FRAME_ALLOCATOR.lock().alloc_order(order)?;
+    if start.0 & (align_pages - 1) != 0 {
+        FRAME_ALLOCATOR.lock().dealloc_order(start, order);
+        return None;
+    }
+    Some(ContiguousFrames::new(start, pages))
 }
 
-fn align_up(value: usize, align: usize) -> Option<usize> {
-    let mask = align.checked_sub(1)?;
-    Some(value.checked_add(mask)? & !mask)
+/// Deallocate a physically contiguous frame range.
+pub fn frame_dealloc_range(start: PhysPageNum, pages: usize) {
+    if pages == 0 || !pages.is_power_of_two() {
+        panic!("invalid frame range: start={:#x}, pages={}", start.0, pages);
+    }
+    FRAME_ALLOCATOR
+        .lock()
+        .dealloc_order(start, pages.trailing_zeros() as usize);
+}
+
+fn clear_frame(ppn: PhysPageNum) {
+    for byte in ppn.get_bytes_array() {
+        *byte = 0;
+    }
+}
+
+fn floor_log2(value: usize) -> usize {
+    usize::BITS as usize - 1 - value.leading_zeros() as usize
 }
 
 #[allow(unused)]
