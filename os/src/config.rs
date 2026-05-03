@@ -7,7 +7,9 @@ pub const USER_STACK_SIZE: usize = 1024 * 16; // 16 KiB
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 4;
 /// kernel heap size
-pub const KERNEL_HEAP_SIZE: usize = 0x400_0000;
+pub const MAX_KERNEL_HEAP_SIZE: usize = 0x400_0000;
+/// base address of the dynamically mapped kernel heap window
+pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
 /// physical memory end address
