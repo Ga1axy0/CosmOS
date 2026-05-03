@@ -8,10 +8,10 @@ use crate::{
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, pid2process, remove_from_pid2process,
-        ExitReason, SignalBit, WaitReason,
+        exit_current_and_run_next, ExitReason, SignalBit, WaitReason,
     },
 };
+use crate::sched::{pid2process, remove_from_pid2process};
 
 use alloc::{string::String, vec::Vec};
 /// `execve` 在解析脚本后得到的最终执行目标。

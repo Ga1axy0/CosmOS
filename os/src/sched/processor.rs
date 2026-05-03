@@ -74,7 +74,7 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
 
 ///The main part of process execution and scheduling
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
-pub fn run_tasks() {
+pub(crate) fn run_tasks() {
     loop {
         if let Some(task) = pick_next_task(hartid()) {
             // debug!(
@@ -122,7 +122,7 @@ pub fn run_tasks() {
 }
 
 /// Get current task through take, leaving a None in its place
-pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
+pub(crate) fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     current_processor().lock().take_current()
 }
 
@@ -162,12 +162,12 @@ pub fn current_trap_cx_user_va() -> usize {
 }
 
 /// get the top addr of kernel stack
-pub fn current_kstack_top() -> usize {
+pub(crate) fn current_kstack_top() -> usize {
     current_task().unwrap().kstack.get_top()
 }
 
 /// Return to idle control flow for new scheduling
-pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+pub(crate) fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = current_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
