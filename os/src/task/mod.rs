@@ -40,9 +40,11 @@ pub use crate::signal::{
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
+pub use crate::sched::{
+    DEFAULT_TIME_SLICE_TICKS, SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+};
 pub use task::{
-    all_cpu_affinity_mask, SchedAttr, SchedPolicy, TaskControlBlock, TaskSchedState, TaskStatus,
-    WaitReason, DEFAULT_TIME_SLICE_TICKS, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+    all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason,
 };
 
 use crate::board::QEMUExit;
