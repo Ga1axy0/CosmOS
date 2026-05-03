@@ -1,6 +1,6 @@
 use crate::{
     mm::kernel_token,
-    sched::activate_task,
+    sched::add_task,
     syscall::errno::ERRNO,
     task::current_task,
     trap::{trap_handler, TrapContext},
@@ -48,7 +48,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     (*new_task_trap_cx).x[10] = arg;
     drop(new_task_inner);
     process.attach_task(Arc::clone(&new_task));
-    activate_task(new_task);
+    add_task(new_task);
     new_task_tid as isize
 }
 /// get current thread id syscall

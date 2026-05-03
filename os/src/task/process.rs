@@ -3,8 +3,8 @@
 
 use super::id::RecycleAllocator;
 use super::{SchedAttr, TaskControlBlock};
-use crate::sched::activate_task;
 use super::{SignalAction, SignalActions, SignalBit, SIG_IGN};
+use crate::sched::add_task;
 use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
@@ -524,7 +524,7 @@ impl ProcessControlBlock {
         process.attach_task(Arc::clone(&task));
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // publish main thread to scheduler only after the process/task state is fully initialized
-        activate_task(task);
+        add_task(task);
         process
     }
 
@@ -864,7 +864,7 @@ impl ProcessControlBlock {
             child.getpid()
         );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        activate_task(task);
+        add_task(task);
         child
     }
 
@@ -948,7 +948,7 @@ impl ProcessControlBlock {
 
         child.attach_task(Arc::clone(&task));
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        activate_task(task);
+        add_task(task);
         Ok(child)
     }
     /// get pid

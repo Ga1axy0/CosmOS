@@ -6,9 +6,9 @@ use crate::hart::hartid;
 use crate::sbi::send_ipi_mask;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    all_cpu_affinity_mask, mark_current_task_need_resched, ProcessControlBlock,
-    SCHED_RT_PRIO_MAX, TaskControlBlock, TaskStatus,
+    all_cpu_affinity_mask, ProcessControlBlock, SCHED_RT_PRIO_MAX, TaskControlBlock, TaskStatus,
 };
+use crate::sched::mark_current_task_need_resched;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::array;
@@ -145,18 +145,13 @@ pub fn highest_runnable_prio(hart: usize) -> Option<u8> {
     RUN_QUEUES[normalize_hart(hart)].lock().highest_prio()
 }
 
-/// Add a task to the current hart's runqueue.
-pub fn add_task(task: Arc<TaskControlBlock>) {
+/// Add a task to the scheduler on the current hart.
+pub(crate) fn add_task(task: Arc<TaskControlBlock>) {
     enqueue_task_on(task, hartid());
 }
 
-/// Publish a fully initialized task to the scheduler on the current hart.
-pub fn activate_task(task: Arc<TaskControlBlock>) {
-    add_task(task);
-}
-
-/// Publish a fully initialized task to the scheduler on a selected hart.
-pub fn activate_task_on(task: Arc<TaskControlBlock>, hart: usize) {
+/// Add a task to the scheduler on a selected hart.
+fn add_task_on(task: Arc<TaskControlBlock>, hart: usize) {
     enqueue_task_on(task, hart);
 }
 
@@ -181,7 +176,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
 }
 
 /// Pop one runnable task from the selected hart's runqueue.
-pub fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
+fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
     let task = RUN_QUEUES[normalize_hart(hart)].lock().dequeue_highest()?;
     {
         let mut task_inner = task.inner_exclusive_access();
@@ -191,7 +186,7 @@ pub fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
 }
 
 /// Pick the next task for the selected hart.
-pub fn pick_next_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
+pub(crate) fn pick_next_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
     dequeue_task(hart)
 }
 

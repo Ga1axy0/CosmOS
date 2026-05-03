@@ -6,11 +6,11 @@ use crate::{
     hart::hartid,
     mm::{translated_byte_buffer, translated_ref},
     sched::{
-        mark_current_task_need_resched, suspend_current_and_run_next,
+        enqueue_task_on, has_runnable_task_at_or_above, mark_current_task_need_resched,
+        pid2process, remove_task, resched_hart, suspend_current_and_run_next,
     },
     task::{
-        current_process, current_task, current_user_token, enqueue_task_on,
-        pid2process, remove_task, resched_hart, SchedPolicy, SCHED_RT_PRIO_MAX,
+        current_process, current_task, current_user_token, SchedPolicy, SCHED_RT_PRIO_MAX,
         SCHED_RT_PRIO_MIN,
     },
 };
@@ -89,7 +89,7 @@ fn read_cpu_affinity_mask(
 
 /// yield syscall
 pub fn sys_yield() -> isize {
-    if crate::task::has_runnable_task_at_or_above(
+    if has_runnable_task_at_or_above(
         hartid(),
         current_task().unwrap().inner_exclusive_access().sched.rt_priority,
     ) {

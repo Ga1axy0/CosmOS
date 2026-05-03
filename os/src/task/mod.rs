@@ -16,6 +16,10 @@ mod wait_queue;
 mod task;
 
 use self::id::TaskUserRes;
+use crate::sched::{
+    add_stopping_task, remove_from_pid2process, remove_task, schedule, take_current_task,
+    TaskContext,
+};
 use crate::fs::{open_file, OpenFlags};
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
@@ -25,13 +29,9 @@ use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use crate::sched::{
-    add_stopping_task, add_task, current_kstack_top, current_process, current_processor,
-    current_task, current_trap_cx, current_trap_cx_user_va, current_user_token, dequeue_task,
-    enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio, pid2process,
-    pick_next_task, remove_from_pid2process, remove_task, resched_hart, run_tasks, schedule,
-    schedule_if_needed, suspend_current_and_run_next, suspend_current_and_run_next_with_slice_reset,
-    block_current_and_run_next, mark_current_task_need_resched, on_timer_tick,
-    take_current_task, wakeup_task, TaskContext,
+    block_current_and_run_next, current_process, current_task, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, schedule_if_needed,
+    suspend_current_and_run_next, suspend_current_and_run_next_with_slice_reset, wakeup_task,
 };
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
