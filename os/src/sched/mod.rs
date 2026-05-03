@@ -5,6 +5,7 @@
 
 mod api;
 mod context;
+mod policy;
 mod processor;
 mod runqueue;
 mod switch;
@@ -15,6 +16,9 @@ pub use api::{
     suspend_current_and_run_next_with_slice_reset,
 };
 pub use context::TaskContext;
+pub use policy::{
+    DEFAULT_TIME_SLICE_TICKS, SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+};
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
