@@ -20,7 +20,7 @@ use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
-use crate::sched::{on_timer_tick, schedule_if_needed};
+use crate::sched::{mark_current_task_need_resched, on_timer_tick, schedule_if_needed};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
     current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
@@ -152,6 +152,17 @@ pub fn clear_software_interrupt_pending() {
     }
 }
 
+/// Handle a scheduler reschedule IPI.
+///
+/// On a running hart, the IPI requests deferred rescheduling of the current
+/// task. On an idle hart, clearing the pending bit is enough to wake `wfi`
+/// so the idle loop can observe newly queued work on the next iteration.
+fn handle_reschedule_ipi() {
+    handle_ipi();
+    clear_software_interrupt_pending();
+    mark_current_task_need_resched();
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -254,8 +265,7 @@ pub fn trap_handler() -> ! {
             on_timer_tick();
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
-            handle_ipi();
-            clear_software_interrupt_pending();
+            handle_reschedule_ipi();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::drivers::plic::handle_supervisor_external();
@@ -343,8 +353,7 @@ pub fn trap_from_kernel() {
             // crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
-            handle_ipi();
-            clear_software_interrupt_pending();
+            handle_reschedule_ipi();
         }
         _ => {
             panic!("Kernel trap: {:?}, stval = {:#x}", scause.cause(), stval);

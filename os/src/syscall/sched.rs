@@ -156,7 +156,6 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
         }
         if was_on_rq {
             enqueue_task_on(task, last_cpu);
-            mark_current_task_need_resched();
         } else if was_on_cpu {
             resched_task_if_running(&task, pid == 0);
         }
@@ -234,7 +233,6 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: *const u8) -> 
                 task_inner.sched.last_cpu
             };
             enqueue_task_on(task, target_hart);
-            mark_current_task_need_resched();
         } else if needs_migration && was_on_cpu {
             if pid == 0 {
                 mark_current_task_need_resched();

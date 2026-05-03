@@ -133,6 +133,19 @@ fn maybe_preempt_current_on_this_hart(incoming_prio: u8) {
     }
 }
 
+fn notify_enqueued_task(target_hart: usize, prio: u8) {
+    if target_hart == hartid() {
+        maybe_preempt_current_on_this_hart(prio);
+    } else {
+        resched_hart(target_hart);
+    }
+}
+
+fn enqueue_prepared_task(task: Arc<TaskControlBlock>, target_hart: usize, prio: u8) {
+    RUN_QUEUES[target_hart].lock().enqueue(task, prio);
+    notify_enqueued_task(target_hart, prio);
+}
+
 /// Returns whether this hart already has runnable work at or above `prio`.
 pub fn has_runnable_task_at_or_above(hart: usize, prio: u8) -> bool {
     RUN_QUEUES[normalize_hart(hart)]
@@ -172,7 +185,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         task_inner.sched.on_rq = true;
         (target_hart, task_inner.sched.rt_priority)
     };
-    RUN_QUEUES[target_hart].lock().enqueue(task, prio);
+    enqueue_prepared_task(task, target_hart, prio);
 }
 
 /// Pop one runnable task from the selected hart's runqueue.
@@ -223,12 +236,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
             let task_inner = task.inner_exclusive_access();
             task_inner.sched.rt_priority
         };
-        RUN_QUEUES[target_hart].lock().enqueue(Arc::clone(&task), prio);
-        if target_hart == hartid() {
-            maybe_preempt_current_on_this_hart(prio);
-        } else {
-            resched_hart(target_hart);
-        }
+        enqueue_prepared_task(Arc::clone(&task), target_hart, prio);
         // trace!("kernel: wakeup_task -> hart {} prio {}", target_hart, prio);
     }
     true
