@@ -335,6 +335,12 @@ pub fn trap_from_kernel() {
             let now_raw = get_time();
             check_itimers_of_all_processes(now_raw, get_realtime_ns());
             crate::net::poll();
+            // Account CPU time spent while the current task executes in kernel
+            // context as part of its RR quantum as well. This matches Linux's
+            // "running on CPU" notion more closely than charging only
+            // user-mode ticks.
+            on_timer_tick();
+            // crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
             handle_ipi();
