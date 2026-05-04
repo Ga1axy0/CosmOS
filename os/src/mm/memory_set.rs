@@ -1188,7 +1188,7 @@ impl MemorySet {
     pub fn handle_lazy_heap_fault(&mut self, fault_va: VirtAddr, access: PageFaultAccess) -> bool {
         let vpn = fault_va.floor();
         if self.page_table.translate(vpn).is_some() {
-            return true;
+            return false;
         }
         let Some(area) = self.find_vma_containing(vpn) else {
             return false;
