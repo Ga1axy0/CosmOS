@@ -8,13 +8,9 @@ use fs::Inode;
 use lazy_static::lazy_static;
 
 use crate::config::{MEMORY_END, PAGE_SIZE};
-<<<<<<< HEAD
 use crate::mm::{
     frame_alloc, invalidate_inode_mappings_after_truncate, FrameTracker, PhysAddr, PhysPageNum,
 };
-=======
-use crate::mm::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum};
->>>>>>> 4af9d33 (fix: correct lower/upper bounds in page cache.)
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
 

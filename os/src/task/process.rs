@@ -165,6 +165,8 @@ pub struct ProcessVmLayout {
     pub brk: usize,
     /// 匿名 mmap 自动选址的默认基址。
     pub mmap_base: usize,
+    /// 上一次匿名 mmap 成功后留下的提示地址。
+    pub mmap_hint: usize,
     /// 主线程的初始栈顶位置。
     pub start_stack: usize,
 }
@@ -176,6 +178,7 @@ impl ProcessVmLayout {
             start_brk: layout.start_brk,
             brk: layout.start_brk,
             mmap_base: layout.mmap_base,
+            mmap_hint: layout.mmap_base,
             start_stack: layout.start_stack,
         }
     }
@@ -872,7 +875,7 @@ impl ProcessControlBlock {
             inner
                 .memory_set
                 .vmas
-                .iter()
+                .values()
                 .filter_map(|area| area.file.as_ref())
                 .filter_map(|file| file.file.backing_inode())
                 .collect::<Vec<_>>()
