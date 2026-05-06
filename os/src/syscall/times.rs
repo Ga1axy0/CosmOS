@@ -4,6 +4,7 @@ use crate::syscall_body;
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
 use crate::timer::set_realtime_offset_from_time_ns;
+use crate::config::CLOCK_FREQ;
 use crate::{
     task::{current_process, current_task},
     timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
@@ -17,14 +18,45 @@ pub const CLOCK_REALTIME: ClockId = 0;
 /// Linux 兼容的单调时钟 ID。
 pub const CLOCK_MONOTONIC: ClockId = 1;
 
+/// Linux `getrusage(2)` 的当前进程选择器。
+pub const RUSAGE_SELF: i32 = 0;
+/// Linux `getrusage(2)` 的子进程选择器。
+pub const RUSAGE_CHILDREN: i32 = -1;
+/// Linux `getrusage(2)` 的当前线程选择器。
+pub const RUSAGE_THREAD: i32 = 1;
+
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
 }
 
 impl Pod for TimeVal {}
+
+/// Linux 风格的 `rusage` 结构。
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct RUsage {
+    pub ru_utime: TimeVal,
+    pub ru_stime: TimeVal,
+    pub ru_maxrss: isize,
+    pub ru_ixrss: isize,
+    pub ru_idrss: isize,
+    pub ru_isrss: isize,
+    pub ru_minflt: isize,
+    pub ru_majflt: isize,
+    pub ru_nswap: isize,
+    pub ru_inblock: isize,
+    pub ru_oublock: isize,
+    pub ru_msgsnd: isize,
+    pub ru_msgrcv: isize,
+    pub ru_nsignals: isize,
+    pub ru_nvcsw: isize,
+    pub ru_nivcsw: isize,
+}
+
+impl Pod for RUsage {}
 
 /// Linux 风格的 `timespec` 结构。
 #[repr(C)]
@@ -51,6 +83,16 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
     Timespec {
         tv_sec: (time_ns / 1_000_000_000) as usize,
         tv_nsec: (time_ns % 1_000_000_000) as usize,
+    }
+}
+
+/// 将内核 CPU 账户的原始时间计数转换为 `timeval`。
+fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
+    let raw_time = raw_time as u128;
+    let freq = CLOCK_FREQ as u128;
+    TimeVal {
+        sec: (raw_time / freq) as usize,
+        usec: ((raw_time % freq) * 1_000_000 / freq) as usize,
     }
 }
 
@@ -99,6 +141,7 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
             // CLOCK_REALTIME_COARSE 等其它 clock id。
             _ => return Err(ERRNO::EINVAL),
         };
+        // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
         write_pod_to_user(tp, &timespec)?;
         Ok(0)
     })
@@ -141,5 +184,36 @@ pub fn sys_times(buf: *mut Tms) -> isize {
         };
         write_pod_to_user(buf, &tms)?;
         Ok(get_time_ticks() as isize)
+    })
+}
+
+/// `getrusage(2)` 系统调用。
+pub fn sys_getrusage(who: i32, usage: *mut RUsage) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_getrusage who={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        who
+    );
+    syscall_body!({
+        let process = current_process();
+        let (utime_raw, stime_raw) = match who {
+            RUSAGE_SELF | RUSAGE_THREAD => {
+                let (utime, stime, _, _) = process.times_snapshot(get_time());
+                (utime, stime)
+            }
+            RUSAGE_CHILDREN => {
+                let (_, _, cutime, cstime) = process.times_snapshot(get_time());
+                (cutime, cstime)
+            }
+            _ => return Err(ERRNO::EINVAL),
+        };
+
+        let rusage = RUsage {
+            ru_utime: timeval_from_raw_time(utime_raw),
+            ru_stime: timeval_from_raw_time(stime_raw),
+            ..Default::default()
+        };
+        write_pod_to_user(usage, &rusage)?;
+        Ok(0)
     })
 }
