@@ -9,8 +9,9 @@ use super::WaitQueue;
 use crate::config::PAGE_SIZE;
 use crate::fs::{mapping_for_inode, new_stdio_files, FileDescription};
 use crate::mm::{
-    shootdown, translated_refmut, DeferredUserReclaim, MapPermission, MemorySet,
-    PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
+    register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
+    MapPermission, MemorySet, PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma,
+    KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
@@ -539,6 +540,7 @@ impl ProcessControlBlock {
             self.getpid(),
             child.getpid()
         );
+        child.register_existing_file_mappings();
         // create main thread of child process
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
@@ -696,7 +698,7 @@ impl ProcessControlBlock {
     }
     /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
     pub fn mmap_file(
-        &self,
+        self: &Arc<Self>,
         start: VirtAddr,
         end: VirtAddr,
         perm: MapPermission,
@@ -704,10 +706,47 @@ impl ProcessControlBlock {
         pgoff: usize,
         shared: bool,
     ) -> bool {
-        self.inner
+        let mapped = self.inner
             .lock()
             .memory_set
-            .mmap_file(start, end, perm, file, pgoff, shared)
+            .mmap_file(start, end, perm, file.clone(), pgoff, shared);
+        if mapped {
+            if let Some(inode) = file.backing_inode() {
+                register_file_mapping(&inode, self);
+            }
+        }
+        mapped
+    }
+
+    /// 失效当前进程中因 truncate 越过 EOF 的 file-backed 用户映射。
+    pub fn invalidate_file_mappings_after_truncate(&self, inode: InodeKey, new_size: usize) {
+        let reclaim = {
+            let mut inner = self.inner.lock();
+            let token = inner.memory_set.token();
+            let mask = inner.memory_set.loaded_user_harts();
+            let batch = inner
+                .memory_set
+                .invalidate_file_mappings_after_truncate_deferred(inode, new_size);
+            DeferredUserReclaim::new(token, mask, batch)
+        };
+        reclaim.flush_then_release();
+    }
+
+    /// 登记当前地址空间中已有的 file-backed VMA，供 fork 继承映射后补齐反向映射。
+    fn register_existing_file_mappings(self: &Arc<Self>) {
+        let files = {
+            let inner = self.inner.lock();
+            inner
+                .memory_set
+                .vmas
+                .iter()
+                .filter_map(|area| area.file.as_ref())
+                .filter_map(|file| file.file.backing_inode())
+                .collect::<Vec<_>>()
+        };
+        for inode in files {
+            register_file_mapping(&inode, self);
+        }
     }
     /// unmap an area. return true if success
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {

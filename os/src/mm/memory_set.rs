@@ -9,11 +9,13 @@ use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, CachePage, FileDescription,
 };
 use crate::sync::{SpinNoIrqLock};
+use crate::task::ProcessControlBlock;
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use fs::Inode;
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -34,11 +36,86 @@ lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
     pub static ref KERNEL_SPACE: Arc<SpinNoIrqLock<MemorySet>> =
         Arc::new(unsafe { SpinNoIrqLock::new(MemorySet::new_kernel()) });
+    /// file-backed mmap 的反向映射注册表，用于 truncate 时找到需要失效的用户页表。
+    static ref FILE_MAPPING_REGISTRY: SpinNoIrqLock<Vec<FileMappingEntry>> =
+        SpinNoIrqLock::new(Vec::new());
 }
 
 /// the kernel token
 pub fn kernel_token() -> usize {
     KERNEL_SPACE.lock().token()
+}
+
+/// 用于稳定标识一个底层 inode。
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct InodeKey {
+    /// 文件系统编号。
+    fs_id: u64,
+    /// inode 编号。
+    ino: u64,
+}
+
+impl InodeKey {
+    /// 从 inode 中提取稳定 key。
+    pub fn from_inode(inode: &Arc<Inode>) -> Self {
+        Self {
+            fs_id: inode.fs_id(),
+            ino: inode.ino(),
+        }
+    }
+}
+
+/// 一条 file-backed mmap 反向映射记录。
+struct FileMappingEntry {
+    /// 被映射的 inode。
+    inode: InodeKey,
+    /// 曾经映射过该 inode 的进程。
+    process: Weak<ProcessControlBlock>,
+}
+
+/// 登记当前进程曾建立过某个 inode 的 file-backed mmap。
+pub fn register_file_mapping(inode: &Arc<Inode>, process: &Arc<ProcessControlBlock>) {
+    let inode = InodeKey::from_inode(inode);
+    let mut registry = FILE_MAPPING_REGISTRY.lock();
+    let process_ptr = Arc::as_ptr(process);
+    if registry
+        .iter()
+        .any(|entry| entry.inode == inode && entry.process.as_ptr() == process_ptr)
+    {
+        return;
+    }
+    registry.push(FileMappingEntry {
+        inode,
+        process: Arc::downgrade(process),
+    });
+    debug!(
+        "[mmap] register file mapping: fs_id={} ino={} pid={}",
+        inode.fs_id,
+        inode.ino,
+        process.getpid()
+    );
+}
+
+/// 在 truncate 缩小时失效所有映射了该 inode 的用户页表项。
+pub fn invalidate_inode_mappings_after_truncate(inode: &Arc<Inode>, new_size: usize) {
+    let inode = InodeKey::from_inode(inode);
+    let processes = {
+        let mut registry = FILE_MAPPING_REGISTRY.lock();
+        let mut processes = Vec::new();
+        registry.retain(|entry| {
+            let Some(process) = entry.process.upgrade() else {
+                return false;
+            };
+            if entry.inode == inode {
+                processes.push(process);
+            }
+            true
+        });
+        processes
+    };
+    for process in processes {
+        process.invalidate_file_mappings_after_truncate(inode, new_size);
+    }
 }
 
 /// address space
@@ -702,6 +779,69 @@ impl MemorySet {
         );
         self.finish_deferred_page_table_edit();
         Some(batch)
+    }
+
+    /// 失效指定 inode 在 truncate 后越过 EOF 的 file-backed 用户映射。
+    pub(crate) fn invalidate_file_mappings_after_truncate_deferred(
+        &mut self,
+        inode: InodeKey,
+        new_size: usize,
+    ) -> UserReleaseBatch {
+        let mut batch = UserReleaseBatch::new();
+        let mut pte_changed = false;
+        for area in self.vmas.iter_mut() {
+            let Some(file) = area.file.as_ref() else {
+                continue;
+            };
+            let Some(area_inode) = file.file.backing_inode() else {
+                continue;
+            };
+            if InodeKey::from_inode(&area_inode) != inode {
+                continue;
+            }
+
+            let direct_vpns: Vec<_> = area.direct_cache_pages.keys().copied().collect();
+            for vpn in direct_vpns {
+                let Some(page_idx) = area.file_page_index(vpn) else {
+                    continue;
+                };
+                let page_start = page_idx as usize * PAGE_SIZE;
+                if page_start >= new_size {
+                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    pte_changed = true;
+                    continue;
+                }
+                if new_size < page_start + PAGE_SIZE {
+                    if let Some(page) = area.direct_cache_pages.get(&vpn) {
+                        let page = page.lock();
+                        page.ppn().get_bytes_array()[new_size - page_start..].fill(0);
+                    }
+                }
+            }
+
+            let private_vpns: Vec<_> = area.data_frames.keys().copied().collect();
+            for vpn in private_vpns {
+                let Some(page_idx) = area.file_page_index(vpn) else {
+                    continue;
+                };
+                let page_start = page_idx as usize * PAGE_SIZE;
+                if page_start >= new_size {
+                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    pte_changed = true;
+                    continue;
+                }
+                if new_size < page_start + PAGE_SIZE {
+                    if let Some(page) = area.data_frames.get(&vpn) {
+                        page.ppn().get_bytes_array()[new_size - page_start..].fill(0);
+                    }
+                }
+            }
+        }
+        if pte_changed {
+            self.finish_deferred_page_table_edit();
+        }
+        // 当前只失效已经 present 的页；未装入页依赖后续 fault 路径用新文件长度拒绝 EOF 外访问。
+        batch
     }
 
     /// append the area to new_end
