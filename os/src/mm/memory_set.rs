@@ -1089,7 +1089,10 @@ impl MemorySet {
             return None;
         };
         if pte.writable() {
-            return None;
+            // 可能是其他 hart 已经把该页从 COW 只读状态放宽为可写，
+            // 当前 hart 仍命中了陈旧的只读 TLB。刷新本地后让用户态重试。
+            self.finish_deferred_page_table_edit();
+            return Some(batch);
         }
         let file_private_cache_page = {
             let Some(area) = self.find_vma_containing(vpn) else {
