@@ -9,7 +9,8 @@ use lazy_static::lazy_static;
 
 use crate::config::{MEMORY_END, PAGE_SIZE};
 use crate::mm::{
-    frame_alloc, invalidate_inode_mappings_after_truncate, FrameTracker, PhysAddr, PhysPageNum,
+    frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
+    PhysAddr, PhysPageNum,
 };
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
@@ -168,11 +169,7 @@ pub struct PageCacheManager {
 impl PageCacheManager {
     /// 创建新的全局 page cache 管理器。
     fn new() -> Self {
-        let managed_start = PhysAddr::from(ekernel as usize).ceil();
-        let managed_end = PhysAddr::from(MEMORY_END).floor();
-        let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
-        let high_watermark = max(128, total_pages / 16);
-        let low_watermark = max(96, high_watermark * 3 / 4);
+        let (high_watermark, low_watermark) = default_watermarks();
         Self {
             inactive: VecDeque::new(),
             cached_pages: 0,
@@ -766,6 +763,7 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
 /// 若当前缓存压力过大，则回收到低水位。
 pub fn reclaim_if_needed() {
     loop {
+        refresh_page_cache_watermarks();
         let need_reclaim = {
             let manager = PAGE_CACHE_MANAGER.lock();
             manager.cached_pages > manager.high_watermark
@@ -819,10 +817,14 @@ fn reclaim_one() -> bool {
         }
         if page_guard.state.contains(CachePageState::DIRTY) {
             drop(page_guard);
-            if let Some(mapping) = page.lock().owner.upgrade() {
+            let mapping = {
+                let page_guard = page.lock();
+                page_guard.owner.upgrade()
+            };
+
+            if let Some(mapping) = mapping {
                 flush_page(&mapping, &page);
             }
-            PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
             return true;
         }
         page_guard.state.insert(CachePageState::EVICTING);
@@ -862,6 +864,37 @@ fn reclaim_one() -> bool {
     true
 }
 
+/// 按当前物理内存剩余情况刷新 page cache 水位。
+fn refresh_page_cache_watermarks() {
+    let (high_watermark, low_watermark) = dynamic_watermarks();
+    let mut manager = PAGE_CACHE_MANAGER.lock();
+    manager.high_watermark = high_watermark;
+    manager.low_watermark = low_watermark;
+}
+
+/// 使用实时物理页统计动态计算水位。
+fn dynamic_watermarks() -> (usize, usize) {
+    let stats = frame_allocator_stats();
+    if stats.total_pages == 0 {
+        return default_watermarks();
+    }
+    let base_high = max(128, stats.total_pages / 16);
+    let pressure_high = stats.free_pages / 2;
+    let high_watermark = min(base_high, pressure_high);
+    let low_watermark = high_watermark * 3 / 4;
+    (high_watermark, low_watermark)
+}
+
+/// 初始化时使用的保守水位估算。
+fn default_watermarks() -> (usize, usize) {
+    let managed_start = PhysAddr::from(ekernel as usize).ceil();
+    let managed_end = PhysAddr::from(MEMORY_END).floor();
+    let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
+    let high_watermark = max(128, total_pages / 16);
+    let low_watermark = max(96, high_watermark * 3 / 4);
+    (high_watermark, low_watermark)
+}
+
 /// 分配 page cache 使用的页框；内存紧张时先尝试回收一轮。
 fn alloc_cache_frame() -> FrameTracker {
     if let Some(frame) = frame_alloc() {
@@ -878,7 +911,12 @@ fn alloc_cache_frame() -> FrameTracker {
         }
     }
     // TODO：后续可继续接入更积极的回收/等待策略；当前在无可回收页且彻底无页时直接报错。
-    frame_alloc().expect("page cache out of memory")
+    frame_alloc().unwrap_or_else(|| {
+        error!("Page Cache: Out of memory");
+        error!("Frame allocator stats: {:?}", frame_allocator_stats());
+        error!("Watermark: high={} low={}", PAGE_CACHE_MANAGER.lock().high_watermark, PAGE_CACHE_MANAGER.lock().low_watermark);
+        panic!();
+    })
 }
 
 /// 计算文件偏移所属页号。

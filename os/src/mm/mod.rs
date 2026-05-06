@@ -16,8 +16,8 @@ mod tlb_shootdown;
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use frame_allocator::{
-    frame_alloc, frame_alloc_contiguous, frame_dealloc, frame_dealloc_range, ContiguousFrames,
-    FrameTracker,
+    frame_alloc, frame_alloc_contiguous, frame_allocator_stats, frame_dealloc,
+    frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
 };
 pub use memory_set::remap_test;
 pub use memory_set::{
