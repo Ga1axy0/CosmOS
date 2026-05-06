@@ -10,6 +10,7 @@ use crate::fs::{
 };
 use crate::sync::{SpinNoIrqLock};
 use crate::task::ProcessControlBlock;
+use crate::syscall::errno::ERRNO;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -643,12 +644,12 @@ impl MemorySet {
     }
     /// Include ELF segments and trampoline, and compute initial process VM layout.
     /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo)
-    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), ()> {
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), ERRNO> {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
         // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| ())?;
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| ERRNO::ENOEXEC)?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
@@ -661,7 +662,7 @@ impl MemorySet {
         let mut phdr_load_vaddr: Option<usize> = None; // 程序头表加载后的虚拟地址
 
         for i in 0..ph_count {
-            let ph = elf.program_header(i).map_err(|_| ())?;
+            let ph = elf.program_header(i).map_err(|_| ERRNO::ENOEXEC)?;
 
             // 检查 INTERP 段
             if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {

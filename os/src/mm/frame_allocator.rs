@@ -258,6 +258,17 @@ impl FrameAllocator for BuddyFrameAllocator {
 
 type FrameAllocatorImpl = BuddyFrameAllocator;
 
+#[derive(Clone, Copy, Debug)]
+/// Runtime statistics of the frame allocator.
+pub struct FrameAllocatorStats {
+    /// Number of free physical pages.
+    pub free_pages: usize,
+    /// Number of allocated physical pages.
+    pub allocated_pages: usize,
+    /// Total number of managed physical pages.
+    pub total_pages: usize,
+}
+
 lazy_static! {
     pub static ref FRAME_ALLOCATOR: SpinNoIrqLock<FrameAllocatorImpl> =
         SpinNoIrqLock::new(FrameAllocatorImpl::new());
@@ -271,6 +282,18 @@ pub fn init_frame_allocator() {
         PhysAddr::from(ekernel as usize).ceil(),
         PhysAddr::from(MEMORY_END).floor(),
     );
+}
+
+/// Return runtime statistics of the frame allocator.
+pub fn frame_allocator_stats() -> FrameAllocatorStats {
+    let allocator = FRAME_ALLOCATOR.lock();
+    let free_pages = allocator.free_pages;
+    let allocated_pages = allocator.allocated_pages;
+    FrameAllocatorStats {
+        free_pages,
+        allocated_pages,
+        total_pages: free_pages + allocated_pages,
+    }
 }
 
 /// Allocate a physical page frame in FrameTracker style

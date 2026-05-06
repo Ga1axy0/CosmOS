@@ -336,7 +336,7 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) -> Result<(), ()> {
+    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) -> Result<(), ERRNO> {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
 
@@ -357,19 +357,20 @@ impl ProcessControlBlock {
                 cwd.as_str(),
                 interp_path.as_str(),
                 crate::fs::OpenFlags::RDONLY
-            ).map_err(|e| {
-                warn!("Failed to open dynamic linker: {}", interp_path);
+            ).map_err(|_| {
+                error!("Failed to open interpreter {}", interp_path);
+                ERRNO::ENOENT
             })?;
 
             if interp_inode.is_dir() {
-                warn!("Dynamic linker path is a directory: {}", interp_path);
-                return Err(());
+                error!("Dynamic linker path is a directory: {}", interp_path);
+                return Err(ERRNO::EISDIR);
             }
 
             let interp_data = interp_inode.read_all();
 
             // 解析动态链接器ELF
-            let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ())?;
+            let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ERRNO::ENOEXEC)?;
             let interp_entry = interp_elf.header.pt2.entry_point() as usize;
             let ph_count = interp_elf.header.pt2.ph_count();
 
@@ -381,7 +382,7 @@ impl ProcessControlBlock {
 
             // 将动态链接器的LOAD段加载到内存，所有地址加上 interp_base
             for i in 0..ph_count {
-                let ph = interp_elf.program_header(i).map_err(|_| ())?;
+                let ph = interp_elf.program_header(i).map_err(|_| ERRNO::ELIBBAD)?;
                 if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
                     // 原始虚拟地址 + 基地址 = 实际加载地址
                     let start_va: VirtAddr = (interp_base + ph.virtual_addr() as usize).into();
@@ -416,7 +417,7 @@ impl ProcessControlBlock {
                     if !memory_set.insert_vma(vma, Some(seg_data)) {
                         warn!("Failed to insert interpreter VMA at [{:#x}, {:#x})",
                             usize::from(start_va), usize::from(end_va));
-                        return Err(());
+                        return Err(ERRNO::EACCES);
                     }
                 }
             }
@@ -707,7 +708,7 @@ impl ProcessControlBlock {
     }
 
     /// Create a child process directly from elf image.
-    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ()> {
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ERRNO> {
         let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data)?;
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
