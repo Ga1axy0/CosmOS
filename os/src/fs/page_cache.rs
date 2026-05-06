@@ -8,7 +8,9 @@ use fs::Inode;
 use lazy_static::lazy_static;
 
 use crate::config::{MEMORY_END, PAGE_SIZE};
-use crate::mm::{frame_alloc, FrameTracker, PhysPageNum};
+use crate::mm::{
+    frame_alloc, invalidate_inode_mappings_after_truncate, FrameTracker, PhysPageNum,
+};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
 
@@ -242,11 +244,13 @@ pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRN
         new_size
     );
     if let Some(mapping) = mapping_for_inode(inode) {
+        if new_size < mapping.size() {
+            invalidate_inode_mappings_after_truncate(inode, new_size);
+        }
         mapping.truncate(new_size);
         return Ok(());
     }
     inode.truncate(new_size)?;
-    // TODO：后续接入 `mmap(MAP_SHARED)` 后，这里还需要同步失效用户态映射。
     Ok(())
 }
 
@@ -535,8 +539,6 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
             }
         }
     }
-
-    // TODO：接入 `mmap(MAP_SHARED)` 后，truncate 还需要先失效用户页表，再允许共享页离开 cache。
 }
 
 /// 获取并确保装入某个文件页对应的 cache page。

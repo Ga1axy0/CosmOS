@@ -34,7 +34,6 @@ use crate::timer::get_time;
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
-use process::ProcessControlBlock;
 use switch::__switch;
 
 pub use context::TaskContext;
@@ -50,6 +49,7 @@ pub use processor::{
 };
 pub use wait_queue::{WaitQueue, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
+pub(crate) use process::ProcessControlBlock;
 pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{
     all_cpu_affinity_mask, SchedAttr, SchedPolicy, TaskControlBlock, TaskStatus, WaitReason,
