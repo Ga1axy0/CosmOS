@@ -236,6 +236,7 @@ pub fn trap_handler() -> ! {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
+            crate::net::poll();
             suspend_current_and_run_next();
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
@@ -243,7 +244,7 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::drivers::plic::handle_supervisor_external();
-            // crate::net::poll();
+            crate::net::poll();
         }
         _ => {
             panic!(
@@ -307,13 +308,13 @@ pub fn trap_from_kernel() {
         Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
             // debug!("External interrupt from kernel: scause = {:?}, stval = {:#x}", scause, stval);
             crate::drivers::plic::handle_supervisor_external();
-            // crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
+            crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
-            // crate::net::poll();
+            crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
             clear_software_interrupt_pending();

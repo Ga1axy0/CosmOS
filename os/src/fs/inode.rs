@@ -4,7 +4,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, RtcDevNode};
+use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode, UrandomDevNode};
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -14,6 +14,7 @@ use bitflags::*;
 use fs::vfs::VfsNode;
 use fs::Inode;
 use lazy_static::*;
+use core::any::Any;
 
 // Compile-time check: exactly one filesystem backend must be selected.
 #[cfg(not(any(feature = "ext4", feature = "easyfs", feature = "fat32")))]
@@ -104,9 +105,7 @@ lazy_static! {
     /// inserted into the namespace during mount operations.  Used by
     /// `ensure_virtual_dir` (to avoid recreating existing dirs) and
     /// `do_umount` (to clean up the registry).
-    static ref VIRT_DIRS: SpinNoIrqLock<BTreeMap<String, Arc<VirtualDirNode>>> =
-        // SAFETY: single-processor kernel.
-        unsafe { SpinNoIrqLock::new(BTreeMap::new()) };
+    static ref VIRT_DIRS: SpinNoIrqLock<BTreeMap<String, Arc<VirtualDirNode>>> = SpinNoIrqLock::new(BTreeMap::new());
 
     /// The kernel's global root inode, backed by the virtual rootfs.
     ///
@@ -271,6 +270,14 @@ pub fn init_rootfs() {
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
+    }
+
+    // Automatically make a /tmp directory if it doesn't exist, since many apps expect it.
+    if lookup_inode("/tmp").is_none() {
+        match mkdir_at("/", "/tmp") {
+            Ok(()) => info!("[kernel] created missing /tmp"),
+            Err(e) => warn!("[kernel] failed to create /tmp, errno={}", e as isize),
+        }
     }
 
     info!("[kernel] rootfs initialised");
@@ -583,6 +590,10 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
 }
 
 impl File for OSInode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     /// file readable?
     fn readable(&self) -> bool {
         // 目录项遍历走 `getdents64`，普通 `read` 仅对常规文件开放。
@@ -776,11 +787,14 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 /// Must be called **after** both [`probe_block_devices`](crate::drivers::block::probe_block_devices)
 /// and [`init_rootfs`].  The `/dev` virtual directory is created if absent.
 pub fn init_dev() {
-
-
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
+    // Register special character devices under /dev
+    let null_node = Arc::new(NullDevNode::new());
+    dev_dir.bind("null", null_node as Arc<dyn VfsNode>);
+    info!("[kernel] /dev/null registered");
 
+    // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
         let node = Arc::new(BlockDevNode::new(Arc::clone(dev)));
@@ -796,6 +810,12 @@ pub fn init_dev() {
     dev_dir.bind("rtc0", Arc::clone(&rtc_node));
     misc_dir.bind("rtc", rtc_node);
     info!("[kernel] /dev/rtc, /dev/rtc0 and /dev/misc/rtc registered");
+
+    // Register /dev/urandom and /dev/random (map to same CSPRNG device).
+    let urandom_node: Arc<dyn VfsNode> = Arc::new(UrandomDevNode::new());
+    dev_dir.bind("urandom", Arc::clone(&urandom_node));
+    dev_dir.bind("random", Arc::clone(&urandom_node));
+    info!("[kernel] /dev/urandom and /dev/random registered");
 
     info!("[kernel] /dev initialized");
 }

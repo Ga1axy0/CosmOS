@@ -118,6 +118,12 @@ pub enum WaitReason {
     BlockDeviceIo,
     /// Waiting for poll/ppoll readiness notification.
     Poll,
+    /// Waiting for network device TX completion.
+    NetDeviceTx,
+    /// Waiting for socket data to become readable.
+    SocketReadable,
+    /// Waiting for socket buffer space / writable state.
+    SocketWritable,
 }
 
 #[derive(Copy, Clone, PartialEq)]

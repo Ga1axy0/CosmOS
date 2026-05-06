@@ -5,6 +5,7 @@ use crate::syscall::errno::ERRNO;
 use crate::task::current_user_token;
 use crate::sync::SpinNoIrqLock;
 use alloc::sync::Arc;
+use core::any::Any;
 
 /// `ioctl(TCGETS)`：读取当前终端配置。
 const TCGETS: usize = 0x5401;
@@ -203,6 +204,10 @@ impl TtyFile {
 }
 
 impl File for TtyFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn readable(&self) -> bool {
         self.readable
     }

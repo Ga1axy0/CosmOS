@@ -5,10 +5,10 @@ use crate::fs::{
     rename_at,
     open_file_at, unlinkat,
 };
-use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
+use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
-use crate::syscall::{write_bytes_to_user, write_pod_to_user};
+use crate::syscall::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
@@ -19,7 +19,7 @@ use crate::timer::get_realtime_ns;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::{mem::size_of, slice};
 use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
 use crate::task::SignalFlags;
 
@@ -54,14 +54,33 @@ pub struct OldTimespec32 {
 }
 
 const POLLIN: u16 = 0x001;  // readable
+const POLLPRI: u16 = 0x002; // urgent data / exceptional condition
 const POLLOUT: u16 = 0x004; // writable
 const POLLERR: u16 = 0x008; // error
 const POLLHUP: u16 = 0x010; // hung up
 const POLLNVAL: u16 = 0x020;    // invalid fd
+const SELECT_READ_REVENTS: u16 = POLLIN | POLLERR | POLLHUP;
+const SELECT_WRITE_REVENTS: u16 = POLLOUT | POLLERR | POLLHUP;
+const SELECT_EXCEPT_REVENTS: u16 = POLLPRI;
 /// 事件注册表耗尽时，回退轮询的休眠步长（毫秒）。
 const PPOLL_FALLBACK_POLL_MS: usize = 10;
 /// 单次 `ppoll`/`poll` 调用允许的最大 fd 数量上限，用于防止恶意的大规模分配。
 const MAX_POLL_NFDS: usize = 4096;
+const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PselectFdMeta {
+    read: bool,
+    write: bool,
+    except: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct PselectSigmaskArg {
+    sigmask: *const u8,
+    sigsetsize: usize,
+}
 
 /// 从用户态复制 `pollfd` 数组，兼容跨页布局。
 fn copy_user_pollfds(token: usize, ufds: *mut PollFd, nfds: usize) -> Result<Vec<PollFd>, ERRNO> {
@@ -192,6 +211,359 @@ fn parse_timeout_ms(token: usize, tmo_p: *const OldTimespec32) -> Result<Option<
     Ok(Some(timeout_ms as usize))
 }
 
+fn timeout_ms_to_deadline(timeout_ms: Option<usize>) -> Result<Option<usize>, ERRNO> {
+    match timeout_ms {
+        None => Ok(None),
+        Some(ms) => get_time_ms().checked_add(ms).map(Some).ok_or(ERRNO::EINVAL),
+    }
+}
+
+fn apply_temp_signal_mask(
+    token: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
+    syscall_name: &str,
+) -> Result<Option<SignalFlags>, ERRNO> {
+    if sigmask.is_null() {
+        return Ok(None);
+    }
+    if sigsetsize < size_of::<u32>() {
+        warn!(
+            "{}: sigsetsize {} too small for u32 mask",
+            syscall_name,
+            sigsetsize
+        );
+        return Err(ERRNO::EINVAL);
+    }
+    let new_mask_bits = *translated_refmut(token, sigmask as *mut u32).or_errno(ERRNO::EFAULT)?;
+    let new_mask = SignalFlags::from_bits(new_mask_bits).or_errno(ERRNO::EINVAL)?;
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let old = inner.signal_mask;
+    inner.signal_mask = new_mask;
+    Ok(Some(old))
+}
+
+fn restore_temp_signal_mask(old_mask: Option<SignalFlags>) {
+    if let Some(old) = old_mask {
+        current_process().inner_exclusive_access().signal_mask = old;
+    }
+}
+
+fn poll_wait_loop_with_writeback<F>(
+    pid: usize,
+    pollfds: &mut [PollFd],
+    deadline: Option<usize>,
+    mut write_back: F,
+) -> Result<isize, ERRNO>
+where
+    F: FnMut(&[PollFd]) -> Result<(), ERRNO>,
+{
+    loop {
+        let ready = scan_pollfds(pollfds);
+        write_back(pollfds)?;
+        if ready > 0 {
+            return Ok(ready as isize);
+        }
+
+        if has_unmasked_pending_signal() {
+            return Err(ERRNO::EINTR);
+        }
+
+        let now_ms = get_time_ms();
+        if let Some(dl) = deadline {
+            if now_ms >= dl {
+                return Ok(0);
+            }
+        }
+
+        let task = current_task().unwrap();
+        let interests = {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            let mut rows = Vec::new();
+            for pfd in pollfds.iter() {
+                if pfd.fd < 0 {
+                    continue;
+                }
+                let fd = pfd.fd as usize;
+                if let Some(entry) = inner.fd_table.get(fd).and_then(|slot| slot.as_ref()) {
+                    rows.push((fd, entry.desc.poll_source_id(), pfd.events as u16));
+                }
+            }
+            rows
+        };
+
+        let handle = match poll::register_poll_wait(pid, &task, &interests) {
+            Ok(handle) => handle,
+            Err(ERRNO::ENOSPC) => {
+                // 回退路径：全局 poll 键/行耗尽时，短周期睡眠后重新扫描 fd 集，
+                // 避免直接失败，同时不引入忙等。
+                let sleep_until = if let Some(dl) = deadline {
+                    let remain = dl.saturating_sub(now_ms);
+                    let step = PPOLL_FALLBACK_POLL_MS.min(remain);
+                    now_ms.saturating_add(step)
+                } else {
+                    now_ms.saturating_add(PPOLL_FALLBACK_POLL_MS)
+                };
+                add_timer(sleep_until, Arc::clone(&task));
+                block_current_and_run_next(WaitReason::Poll);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(dl) = deadline {
+            add_timer_with_poll_tag(dl, Arc::clone(&task), Some(handle.timer_tag()));
+        }
+        poll::wait_poll_key(handle);
+
+        let wake_state = poll::poll_wait_state(handle);
+        poll::cleanup_poll_wait(handle);
+
+        if matches!(wake_state, PollWakeState::TimedOut) {
+            return Ok(0);
+        }
+    }
+}
+
+fn fd_set_word_count(nfds: usize) -> Result<usize, ERRNO> {
+    nfds
+        .checked_add(FD_SET_BITS_PER_WORD - 1)
+        .ok_or(ERRNO::EINVAL)
+        .map(|x| x / FD_SET_BITS_PER_WORD)
+}
+
+fn copy_user_fdset_words(
+    token: usize,
+    set: *const usize,
+    nfds: usize,
+) -> Result<Option<Vec<usize>>, ERRNO> {
+    if set.is_null() {
+        return Ok(None);
+    }
+    let words = fd_set_word_count(nfds)?;
+    if words == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let bytes_len = words
+        .checked_mul(size_of::<usize>())
+        .ok_or(ERRNO::EINVAL)?;
+    let bytes = translated_byte_buffer(token, set as *const u8, bytes_len).or_errno(ERRNO::EFAULT)?;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(bytes_len).map_err(|_| ERRNO::ENOMEM)?;
+    for chunk in bytes {
+        raw.extend_from_slice(chunk);
+    }
+    if raw.len() != bytes_len {
+        return Err(ERRNO::EFAULT);
+    }
+
+    let mut words_vec = Vec::new();
+    words_vec.try_reserve_exact(words).map_err(|_| ERRNO::ENOMEM)?;
+    for i in 0..words {
+        let off = i * size_of::<usize>();
+        let value = unsafe { core::ptr::read_unaligned(raw[off..].as_ptr() as *const usize) };
+        words_vec.push(value);
+    }
+
+    if let Some(last) = words_vec.last_mut() {
+        let valid_bits = nfds % FD_SET_BITS_PER_WORD;
+        if valid_bits != 0 {
+            *last &= (1usize << valid_bits) - 1;
+        }
+    }
+    Ok(Some(words_vec))
+}
+
+fn write_user_fdset_words(set: *mut usize, words: &[usize]) -> Result<(), ERRNO> {
+    if set.is_null() || words.is_empty() {
+        return Ok(());
+    }
+    let bytes_len = words
+        .len()
+        .checked_mul(size_of::<usize>())
+        .ok_or(ERRNO::EINVAL)?;
+    let bytes = unsafe { slice::from_raw_parts(words.as_ptr() as *const u8, bytes_len) };
+    write_bytes_to_user(set as *mut u8, bytes)
+}
+
+#[inline]
+fn fdset_test_bit(words: &[usize], fd: usize) -> bool {
+    let word = fd / FD_SET_BITS_PER_WORD;
+    let bit = fd % FD_SET_BITS_PER_WORD;
+    words
+        .get(word)
+        .map(|w| (w & (1usize << bit)) != 0)
+        .unwrap_or(false)
+}
+
+#[inline]
+fn fdset_set_bit(words: &mut [usize], fd: usize) {
+    let word = fd / FD_SET_BITS_PER_WORD;
+    let bit = fd % FD_SET_BITS_PER_WORD;
+    if let Some(dst) = words.get_mut(word) {
+        *dst |= 1usize << bit;
+    }
+}
+
+fn build_pselect_pollfds(
+    nfds: usize,
+    read_set: Option<&[usize]>,
+    write_set: Option<&[usize]>,
+    except_set: Option<&[usize]>,
+) -> Result<(Vec<PollFd>, Vec<PselectFdMeta>), ERRNO> {
+    let mut pollfds = Vec::new();
+    pollfds.try_reserve_exact(nfds).map_err(|_| ERRNO::ENOMEM)?;
+    let mut metas = Vec::new();
+    metas.try_reserve_exact(nfds).map_err(|_| ERRNO::ENOMEM)?;
+
+    for fd in 0..nfds {
+        let mut events: u16 = 0;
+        let mut meta = PselectFdMeta::default();
+
+        if let Some(read_words) = read_set {
+            if fdset_test_bit(read_words, fd) {
+                events |= POLLIN;
+                meta.read = true;
+            }
+        }
+        if let Some(write_words) = write_set {
+            if fdset_test_bit(write_words, fd) {
+                events |= POLLOUT;
+                meta.write = true;
+            }
+        }
+        if let Some(except_words) = except_set {
+            if fdset_test_bit(except_words, fd) {
+                events |= POLLPRI;
+                meta.except = true;
+            }
+        }
+
+        if events == 0 {
+            continue;
+        }
+        pollfds.push(PollFd {
+            fd: fd as i32,
+            events: events as i16,
+            revents: 0,
+        });
+        metas.push(meta);
+    }
+    Ok((pollfds, metas))
+}
+
+fn validate_pselect_fds(
+    nfds: usize,
+    read_set: Option<&[usize]>,
+    write_set: Option<&[usize]>,
+    except_set: Option<&[usize]>,
+) -> Result<(), ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    for fd in 0..nfds {
+        let monitored = read_set.map(|s| fdset_test_bit(s, fd)).unwrap_or(false)
+            || write_set.map(|s| fdset_test_bit(s, fd)).unwrap_or(false)
+            || except_set.map(|s| fdset_test_bit(s, fd)).unwrap_or(false);
+        if !monitored {
+            continue;
+        }
+        if inner
+            .fd_table
+            .get(fd)
+            .and_then(|entry| entry.as_ref())
+            .is_none()
+        {
+            return Err(ERRNO::EBADF);
+        }
+    }
+    Ok(())
+}
+
+fn write_back_pselect_fdsets(
+    readfds: *mut usize,
+    writefds: *mut usize,
+    exceptfds: *mut usize,
+    nfds: usize,
+    pollfds: &[PollFd],
+    metas: &[PselectFdMeta],
+) -> Result<(), ERRNO> {
+    let words = fd_set_word_count(nfds)?;
+    let mut read_out = if readfds.is_null() {
+        None
+    } else {
+        let mut out = Vec::new();
+        out.try_reserve_exact(words).map_err(|_| ERRNO::ENOMEM)?;
+        out.resize(words, 0);
+        Some(out)
+    };
+    let mut write_out = if writefds.is_null() {
+        None
+    } else {
+        let mut out = Vec::new();
+        out.try_reserve_exact(words).map_err(|_| ERRNO::ENOMEM)?;
+        out.resize(words, 0);
+        Some(out)
+    };
+    let mut except_out = if exceptfds.is_null() {
+        None
+    } else {
+        let mut out = Vec::new();
+        out.try_reserve_exact(words).map_err(|_| ERRNO::ENOMEM)?;
+        out.resize(words, 0);
+        Some(out)
+    };
+
+    for (pfd, meta) in pollfds.iter().zip(metas.iter()) {
+        if pfd.fd < 0 {
+            continue;
+        }
+        let fd = pfd.fd as usize;
+        if fd >= nfds {
+            continue;
+        }
+        let revents = pfd.revents as u16;
+        if meta.read && (revents & SELECT_READ_REVENTS) != 0 {
+            if let Some(out) = read_out.as_mut() {
+                fdset_set_bit(out, fd);
+            }
+        }
+        if meta.write && (revents & SELECT_WRITE_REVENTS) != 0 {
+            if let Some(out) = write_out.as_mut() {
+                fdset_set_bit(out, fd);
+            }
+        }
+        if meta.except && (revents & SELECT_EXCEPT_REVENTS) != 0 {
+            if let Some(out) = except_out.as_mut() {
+                fdset_set_bit(out, fd);
+            }
+        }
+    }
+
+    // 显式按参数顺序回写，保持与用户态入参一一对应。
+    if let Some(out) = read_out.as_ref() {
+        write_user_fdset_words(readfds, out)?;
+    }
+    if let Some(out) = write_out.as_ref() {
+        write_user_fdset_words(writefds, out)?;
+    }
+    if let Some(out) = except_out.as_ref() {
+        write_user_fdset_words(exceptfds, out)?;
+    }
+    Ok(())
+}
+
+fn parse_pselect_sigmask_arg(
+    token: usize,
+    sigmask_arg: *const u8,
+) -> Result<(*const u8, usize), ERRNO> {
+    if sigmask_arg.is_null() {
+        return Ok((core::ptr::null(), 0));
+    }
+    let arg = translated_refmut(token, sigmask_arg as *mut PselectSigmaskArg).or_errno(ERRNO::EFAULT)?;
+    Ok((arg.sigmask, arg.sigsetsize))
+}
+
 /// 打开路径后需要挂入 `FileDescription` 的打开参数。
 struct OpenFileState {
     /// 打开时确定的访问模式。
@@ -243,7 +615,7 @@ fn parse_truncate_len(len: isize) -> Result<usize, ERRNO> {
 }
 
 /// 从用户态复制 `iovec` 数组，避免数组跨页时直接解引用失败。
-fn copy_user_iovecs(token: usize, iov: *const IoVec, iovcnt: i32) -> Result<Vec<IoVec>, ERRNO> {
+pub fn copy_user_iovecs(token: usize, iov: *const IoVec, iovcnt: i32) -> Result<Vec<IoVec>, ERRNO> {
     if iovcnt < 0 {
         return Err(ERRNO::EINVAL);
     }
@@ -588,12 +960,11 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
         "kernel:pid[{}] sys_write",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
         Ok(desc.write(UserBuffer::new(
-            translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
+            translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?,
         )) as isize)
     })
 }
@@ -615,7 +986,11 @@ pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                 continue;
             }
             let user_buf = UserBuffer::new(
-                translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len).or_errno(ERRNO::EFAULT)?,
+                translated_byte_buffer_with_access(
+                    iovec.iov_base as *const u8,
+                    iovec.iov_len,
+                    PageFaultAccess::Write,
+                )?,
             );
             let read = desc.read(user_buf);
             read_total = read_total.checked_add(read).ok_or(ERRNO::EINVAL)?;
@@ -653,8 +1028,11 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                 continue;
             }
             let user_buf = UserBuffer::new(
-                translated_byte_buffer(token, iovec.iov_base as *const u8, iovec.iov_len)
-                    .or_errno(ERRNO::EFAULT)?,
+                translated_byte_buffer_with_access(
+                    iovec.iov_base as *const u8,
+                    iovec.iov_len,
+                    PageFaultAccess::Read,
+                )?,
             );
             let written = desc.write(user_buf);
             completed += written;
@@ -674,13 +1052,12 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
         "kernel:pid[{}] sys_read",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
         let desc = get_readable_file(fd)?;
         trace!("kernel: sys_read .. desc.read");
         Ok(desc.read(UserBuffer::new(
-            translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?,
+            translated_byte_buffer_with_access(buf, len, PageFaultAccess::Write)?,
         )) as isize)
     })
 }
@@ -1399,103 +1776,84 @@ pub fn sys_ppoll_time32(
     syscall_body!({
         let mut pollfds = copy_user_pollfds(token, ufds, nfds as usize)?;
         let timeout_ms = parse_timeout_ms(token, tmo_p)?;
-        let start_ms = get_time_ms();
-        let deadline = match timeout_ms {
-            None => None,
-            Some(ms) => match start_ms.checked_add(ms) {
-                Some(d) => Some(d),
-                None => return Err(ERRNO::EINVAL),
-            },
-        };
+        let deadline = timeout_ms_to_deadline(timeout_ms)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
 
-        let process = current_process();
-        let old_mask = if !sigmask.is_null() {
-            if sigsetsize < size_of::<u32>() {
-                warn!("sys_ppoll_time32: sigsetsize {} too small for u32 mask", sigsetsize);
-                return Err(ERRNO::EINVAL);
-            }
-            let new_mask_bits = *translated_refmut(token, sigmask as *mut u32).or_errno(ERRNO::EFAULT)?;
-            let new_mask = SignalFlags::from_bits(new_mask_bits).or_errno(ERRNO::EINVAL)?;
-            let mut inner = process.inner_exclusive_access();
-            let old = inner.signal_mask;
-            inner.signal_mask = new_mask;
-            Some(old)
-        } else {
-            None
-        };
+        let old_mask = apply_temp_signal_mask(token, sigmask, sigsetsize, "sys_ppoll_time32")?;
+        let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline, |polled| {
+            write_back_pollfds(token, ufds, polled)
+        });
+        restore_temp_signal_mask(old_mask);
+        ret
+    })
+}
 
-        let ret = (|| -> Result<isize, ERRNO> {
-            loop {
-                let ready = scan_pollfds(&mut pollfds);
-                write_back_pollfds(token, ufds, &pollfds)?;
-                if ready > 0 {
-                    return Ok(ready as isize);
-                }
-
-                if has_unmasked_pending_signal() {
-                    return Err(ERRNO::EINTR);
-                }
-
-                let now_ms = get_time_ms();
-                if let Some(dl) = deadline {
-                    if now_ms >= dl {
-                        return Ok(0);
-                    }
-                }
-
-                let task = current_task().unwrap();
-                let interests = {
-                    let inner = process.inner_exclusive_access();
-                    let mut rows = Vec::new();
-                    for pfd in pollfds.iter() {
-                        if pfd.fd < 0 {
-                            continue;
-                        }
-                        let fd = pfd.fd as usize;
-                        if let Some(entry) = inner.fd_table.get(fd).and_then(|slot| slot.as_ref()) {
-                            rows.push((fd, entry.desc.poll_source_id(), pfd.events as u16));
-                        }
-                    }
-                    rows
-                };
-
-                let handle = match poll::register_poll_wait(pid, &task, &interests) {
-                    Ok(handle) => handle,
-                    Err(ERRNO::ENOSPC) => {
-                        // 回退路径：全局 poll 键/行耗尽时，短周期睡眠后重新扫描 fd 集，
-                        // 避免直接失败，同时不引入忙等。
-                        let sleep_until = if let Some(dl) = deadline {
-                            let remain = dl.saturating_sub(now_ms);
-                            let step = PPOLL_FALLBACK_POLL_MS.min(remain);
-                            now_ms.saturating_add(step)
-                        } else {
-                            now_ms.saturating_add(PPOLL_FALLBACK_POLL_MS)
-                        };
-                        add_timer(sleep_until, Arc::clone(&task));
-                        block_current_and_run_next(WaitReason::Poll);
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                if let Some(dl) = deadline {
-                    debug!("sys_ppoll_time32: wait with timeout, now = {}, deadline = {}", now_ms, dl);
-                    add_timer_with_poll_tag(dl, Arc::clone(&task), Some(handle.timer_tag()));
-                }
-                poll::wait_poll_key(handle);
-
-                let wake_state = poll::poll_wait_state(handle);
-                poll::cleanup_poll_wait(handle);
-
-                if matches!(wake_state, PollWakeState::TimedOut) {
-                    return Ok(0);
-                }
-            }
-        })();
-
-        if let Some(old) = old_mask {
-            process.inner_exclusive_access().signal_mask = old;
+/// `pselect6_time32(2)`：在 `fd_set` 上等待事件，支持 32 位 timespec 与临时信号掩码。
+///
+/// 第 6 个参数遵循 Linux `pselect6` 约定：
+/// `struct { const sigset_t *ss; size_t ss_len; }`。
+pub fn sys_pselect6_time32(
+    nfds: i32,
+    readfds: *mut usize,
+    writefds: *mut usize,
+    exceptfds: *mut usize,
+    tmo_p: *const OldTimespec32,
+    sigmask: *const u8,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pselect6_time32",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        if nfds < 0 {
+            return Err(ERRNO::EINVAL);
         }
+        let nfds = nfds as usize;
+        if nfds > MAX_POLL_NFDS {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let read_set = copy_user_fdset_words(token, readfds as *const usize, nfds)?;
+        let write_set = copy_user_fdset_words(token, writefds as *const usize, nfds)?;
+        let except_set = copy_user_fdset_words(token, exceptfds as *const usize, nfds)?;
+
+        
+        validate_pselect_fds(
+            nfds,
+            read_set.as_deref(),
+            write_set.as_deref(),
+            except_set.as_deref(),
+        )?;
+        
+        let (mut pollfds, metas) = build_pselect_pollfds(
+            nfds,
+            read_set.as_deref(),
+            write_set.as_deref(),
+            except_set.as_deref(),
+        )?;
+        
+        let timeout_ms = parse_timeout_ms(token, tmo_p)?;
+        // debug!(
+        //     "sys_pselect6_time32: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
+        //     nfds, read_set, write_set, except_set, timeout_ms, sigmask
+        // );
+        let deadline = timeout_ms_to_deadline(timeout_ms)?;
+        let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
+        let (sigmask_ptr, sigsetsize) = parse_pselect_sigmask_arg(token, sigmask)?;
+        let old_mask = apply_temp_signal_mask(token, sigmask_ptr, sigsetsize, "sys_pselect6_time32")?;
+
+        let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline, |polled| {
+            write_back_pselect_fdsets(
+                readfds,
+                writefds,
+                exceptfds,
+                nfds,
+                polled,
+                &metas,
+            )
+        });
+        restore_temp_signal_mask(old_mask);
         ret
     })
 }

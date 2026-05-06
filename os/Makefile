@@ -117,6 +117,8 @@ disasm-vim: kernel
 
 run: build run-inner
 
+run-trace: build run-inner-trace
+
 fast-run: kernel $(KERNEL_BIN) run-inner
 
 run-inner:
@@ -127,8 +129,30 @@ run-inner:
 		-nographic \
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778,hostfwd=udp::7778-:7778 \
+        -device virtio-net-device,netdev=net0,id=net0 \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
         -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+        # -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
+		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
+		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+#	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
+
+run-inner-trace:
+	@$(QEMU) \
+		-M 128m \
+		-machine virt \
+		-smp $(SMP) \
+		-nographic \
+		-bios $(BOOTLOADER) \
+		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777 \
+        -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
+        -device virtio-net-device,netdev=net0,id=net0 \
+		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-d int,in_asm \
+		-D qemu.log \
 		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
 		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 #	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 

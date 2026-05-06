@@ -60,6 +60,8 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_READV: usize = 65;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
+/// pselect6_time32 syscall
+pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
 pub const SYSCALL_PPOLL_TIME32: usize = 73;
 /// newfstatat syscall
@@ -104,8 +106,14 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
+/// getsid syscall
+pub const SYSCALL_GETSID: usize = 156;
+/// setsid syscall
+pub const SYSCALL_SETSID: usize = 157;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
+/// getrusage syscall
+pub const SYSCALL_GETRUSAGE: usize = 165;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
@@ -126,6 +134,36 @@ pub const SYSCALL_GETGID: usize = 176;
 pub const SYSCALL_GETEGID: usize = 177;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
+/// socket syscall
+pub const SYSCALL_SOCKET: usize = 198;
+/// socketpair syscall
+pub const SYSCALL_SOCKETPAIR: usize = 199;
+/// bind syscall
+pub const SYSCALL_BIND: usize = 200;
+/// listen syscall
+pub const SYSCALL_LISTEN: usize = 201;
+/// accept syscall
+pub const SYSCALL_ACCEPT: usize = 202;
+/// connect syscall
+pub const SYSCALL_CONNECT: usize = 203;
+/// getsockname syscall
+pub const SYSCALL_GETSOCKNAME: usize = 204;
+/// getpeername syscall
+pub const SYSCALL_GETPEERNAME: usize = 205;
+/// sendto syscall
+pub const SYSCALL_SENDTO: usize = 206;
+/// recvfrom syscall
+pub const SYSCALL_RECVFROM: usize = 207;
+/// setsockopt syscall
+pub const SYSCALL_SETSOCKOPT: usize = 208;
+/// getsockopt syscall
+pub const SYSCALL_GETSOCKOPT: usize = 209;
+/// shutdown syscall
+pub const SYSCALL_SHUTDOWN: usize = 210;
+/// sendmsg syscall
+pub const SYSCALL_SENDMSG: usize = 211;
+/// recvmsg syscall
+pub const SYSCALL_RECVMSG: usize = 212;
 /// brk syscall
 pub const SYSCALL_BRK: usize = 214;
 /// munmap syscall
@@ -179,6 +217,7 @@ pub const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 pub const SYSCALL_CONDVAR_WAIT: usize = 473;
 
 mod fs;
+mod net;
 mod process;
 mod sync;
 mod thread;
@@ -191,16 +230,17 @@ mod utils;
 pub mod errno;
 
 use fs::*;
+use net::*;
 use process::*;
 use sync::*;
 use thread::*;
 use crate::syscall::random::*;
 use mman::*;
 use times::*;
-pub(crate) use utils::{write_bytes_to_user, write_pod_to_user, Pod};
+pub(crate) use utils::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 
 
-use crate::{fs::Stat, syscall::errno::ERRNO};
+use crate::{fs::Stat, net::SockAddrIn, syscall::errno::ERRNO};
 use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
@@ -258,8 +298,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LSEEK => sys_llseek(args[0] as u32, args[1], args[2], args[3] as *mut u64, args[4] as u32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
-        SYSCALL_READV => sys_readv(args[0], args[1] as *const IoVec, args[2] as i32),
-        SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const IoVec, args[2] as i32),
+        SYSCALL_READV => sys_readv(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
+        SYSCALL_WRITEV =>
+            sys_writev(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
         SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -271,6 +312,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as *const Timespec,
             args[3] as i32,
+        ),
+        SYSCALL_PSELECT6_TIME32 => sys_pselect6_time32(
+            args[0] as i32,
+            args[1] as *mut usize,
+            args[2] as *mut usize,
+            args[3] as *mut usize,
+            args[4] as *const OldTimespec32,
+            args[5] as *const u8,
         ),
         SYSCALL_PPOLL_TIME32 => sys_ppoll_time32(
             args[0] as *mut PollFd,
@@ -295,9 +344,54 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
+        SYSCALL_GETSID => sys_getsid(),
+        SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
+        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
+        SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
+        SYSCALL_SOCKETPAIR =>
+            sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as *mut i32),
+        SYSCALL_BIND => sys_bind(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
+        SYSCALL_LISTEN => sys_listen(args[0] as i32, args[1] as i32),
+        SYSCALL_ACCEPT => sys_accept(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
+        SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_SENDTO => sys_sendto(
+            args[0] as i32,
+            args[1] as *const u8,
+            args[2],
+            args[3] as u32,
+            args[4] as *const SockAddrIn,
+            args[5] as i32,
+        ),
+        SYSCALL_RECVFROM => sys_recvfrom(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2],
+            args[3] as u32,
+            args[4] as *mut SockAddrIn,
+            args[5] as i32,
+        ),
+        SYSCALL_SETSOCKOPT => sys_setsockopt(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *const u8,
+            args[4] as i32,
+        ),
+        SYSCALL_GETSOCKOPT => sys_getsockopt(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *mut u8,
+            args[4] as *mut i32,
+        ),
+        SYSCALL_SHUTDOWN => sys_shutdown(args[0] as i32, args[1] as i32),
+        SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
+        SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),

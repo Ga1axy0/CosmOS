@@ -10,12 +10,12 @@ pub mod devfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use fs::errno::FS_ERRNO;
+use fs::{Inode, errno::FS_ERRNO};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
-use fs::Inode;
+use core::any::Any;
 pub use fs::vfs::InodeTime;
 pub use page_cache::{
     mapping_for_inode, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
@@ -266,6 +266,11 @@ impl FileDescription {
         self.file.poll_source_id()
     }
 
+    /// Returns the underlying file object as `Any` for downcasting.
+    pub fn as_any(&self) -> &dyn Any {
+        self.file.as_any()
+    }
+
     /// `offset` 使用有符号 64 位，以兼容 SEEK_END 处的负位移。
     pub fn seek(&self, offset: i64, whence: u8) -> Result<u64, ERRNO> {
         if !self.file.is_seekable() {
@@ -287,7 +292,10 @@ impl FileDescription {
 }
 
 /// trait File for all file types
-pub trait File: Send + Sync {
+pub trait File: Send + Sync + Any {
+    /// Returns this file as `Any` for runtime downcasting.
+    fn as_any(&self) -> &dyn Any;
+
     /// the file readable?
     fn readable(&self) -> bool;
     /// the file writable?

@@ -1,182 +1,111 @@
 use super::BlockDevice;
-use crate::mm::{
-    frame_alloc, frame_dealloc, kernel_token, FrameTracker, PageTable, PhysAddr, PhysPageNum,
-    StepByOne, VirtAddr,
-};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueueKeyed, WaitReason};
-use alloc::{collections::VecDeque, vec::Vec};
-use lazy_static::*;
-use virtio_drivers::{BlkResp, Hal, RespStatus, VirtIOBlk, VirtIOHeader};
+use core::hint::spin_loop;
+use riscv::register::sstatus;
+use virtio_drivers::{
+    device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk},
+    transport::mmio::MmioTransport,
+};
 
-#[allow(unused)]
-const VIRTIO0: usize = 0x10001000;
+use crate::drivers::virtio::VirtioHal;
+
 /// VirtIOBlock device driver strcuture for virtio_blk device
 pub struct VirtIOBlock {
-    inner: SpinNoIrqLock<VirtIOBlk<'static, VirtioHal>>,
+    inner: SpinNoIrqLock<VirtIOBlk<VirtioHal, MmioTransport<'static>>>,
     wait_queue: WaitQueueKeyed<u16>,
-    completed: SpinNoIrqLock<VecDeque<u16>>,
-}
-
-lazy_static! {
-    /// The global io data queue for virtio_blk device
-    static ref QUEUE_FRAMES: SpinNoIrqLock<Vec<FrameTracker>> = unsafe { SpinNoIrqLock::new(Vec::new()) };
 }
 
 impl BlockDevice for VirtIOBlock {
     /// Read a block from the virtio_blk device
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let token = unsafe {
             self.inner
                 .lock()
-                .read_block_nb(block_id, buf, &mut resp)
+                .read_blocks_nb(block_id, &mut req, buf, &mut resp)
                 .expect("Error when submitting VirtIOBlk read")
         };
         self.wait_token(token);
+        unsafe {
+            self.inner
+                .lock()
+                .complete_read_blocks(token, &req, buf, &mut resp)
+                .expect("Error when completing VirtIOBlk read");
+        }
         assert_eq!(
             resp.status(),
-            RespStatus::Ok,
+            RespStatus::OK,
             "Error when completing VirtIOBlk read"
         );
     }
     /// Write a block to the virtio_blk device
     fn write_block(&self, block_id: usize, buf: &[u8]) {
+        let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let token = unsafe {
             self.inner
                 .lock()
-                .write_block_nb(block_id, buf, &mut resp)
+                .write_blocks_nb(block_id, &mut req, buf, &mut resp)
                 .expect("Error when submitting VirtIOBlk write")
         };
         self.wait_token(token);
+        unsafe {
+            self.inner
+                .lock()
+                .complete_write_blocks(token, &req, buf, &mut resp)
+                .expect("Error when completing VirtIOBlk write");
+        }
         assert_eq!(
             resp.status(),
-            RespStatus::Ok,
+            RespStatus::OK,
             "Error when completing VirtIOBlk write"
         );
     }
 }
 
 impl VirtIOBlock {
-    #[allow(unused)]
-    /// Create a new VirtIOBlock driver with VIRTIO0 base_addr for virtio_blk device
-    pub fn new() -> Self {
-        unsafe {
-            Self {
-                inner: SpinNoIrqLock::new(
-                    VirtIOBlk::<VirtioHal>::new(&mut *(VIRTIO0 as *mut VirtIOHeader)).unwrap(),
-                ),
-                wait_queue: WaitQueueKeyed::new(),
-                completed: SpinNoIrqLock::new(VecDeque::new()),
-            }
-        }
-    }
-
-    /// Try to initialise a VirtIO block device at `base_addr`.
-    ///
-    /// Returns `None` if there is no VirtIO block device at that address
-    /// (e.g. the MMIO slot is empty or maps a different device type).
-    pub fn try_new(base_addr: usize) -> Option<Self> {
-        unsafe {
-            VirtIOBlk::<VirtioHal>::new(&mut *(base_addr as *mut VirtIOHeader))
-                .ok()
-                .map(|blk| Self {
-                    inner: SpinNoIrqLock::new(blk),
-                    wait_queue: WaitQueueKeyed::new(),
-                    completed: SpinNoIrqLock::new(VecDeque::new()),
-                })
-        }
+    /// Build a wrapper from an initialized MMIO transport.
+    pub fn try_new(transport: MmioTransport<'static>) -> Option<Self> {
+        VirtIOBlk::<VirtioHal, _>::new(transport).ok().map(|blk| Self {
+            inner: SpinNoIrqLock::new(blk),
+            wait_queue: WaitQueueKeyed::new(),
+        })
     }
 
     fn wait_token(&self, token: u16) {
-        loop {
-            if self.take_completed_token(token) {
-                return;
+        // TODO Enable kernel interrupt in more cases.
+        let irq_disabled = !sstatus::read().sie();
+        if current_task().is_none() || irq_disabled {
+            while !self.token_ready(token) {
+                spin_loop();
             }
-            if current_task().is_some() {
-                self.wait_queue
-                    .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
-                        self.take_completed_token(token)
-                    });
-                return;
-            }
-
-            // Early boot path: no schedulable task context exists yet,
-            // so we cannot block via wait queue and must poll completions.
-            self.collect_completed_tokens(false);
+            return;
         }
+
+        // Task context path: park current task and wait for precise token wakeup.
+        self.wait_queue
+            .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
+                self.token_ready(token)
+            });
     }
 
-    fn take_completed_token(&self, token: u16) -> bool {
-        let mut completed = self.completed.lock();
-        if let Some(pos) = completed.iter().position(|&done| done == token) {
-            completed.remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn collect_completed_tokens(&self, wake_waiters: bool) {
+    fn token_ready(&self, token: u16) -> bool {
         let mut inner = self.inner.lock();
-        let mut completed = self.completed.lock();
-        while let Ok(token) = inner.pop_used() {
-            if wake_waiters && self.wait_queue.wake_selected(token) {
-                continue;
-            }
-            completed.push_back(token);
-        }
-        // debug!("Length of completed queue: {}", completed.len());
+        matches!(inner.peek_used(), Some(ready) if ready == token)
     }
 
     /// Called from external interrupt path for this block device.
     pub fn handle_irq(&self) {
         let mut inner = self.inner.lock();
-        if !inner.ack_interrupt() {
+        if inner.ack_interrupt().is_empty() {
             return;
         }
+        let ready = inner.peek_used();
         drop(inner);
-        self.collect_completed_tokens(true);
-    }
-}
-
-pub struct VirtioHal;
-
-impl Hal for VirtioHal {
-    /// allocate memory for virtio_blk device's io data queue
-    fn dma_alloc(pages: usize) -> usize {
-        let mut ppn_base = PhysPageNum(0);
-        for i in 0..pages {
-            let frame = frame_alloc().unwrap();
-            if i == 0 {
-                ppn_base = frame.ppn;
-            }
-            assert_eq!(frame.ppn.0, ppn_base.0 + i);
-            QUEUE_FRAMES.lock().push(frame);
+        if let Some(token) = ready {
+            self.wait_queue.wake_selected(token);
         }
-        let pa: PhysAddr = ppn_base.into();
-        pa.0
-    }
-    /// free memory for virtio_blk device's io data queue
-    fn dma_dealloc(pa: usize, pages: usize) -> i32 {
-        let pa = PhysAddr::from(pa);
-        let mut ppn_base: PhysPageNum = pa.into();
-        for _ in 0..pages {
-            frame_dealloc(ppn_base);
-            ppn_base.step();
-        }
-        0
-    }
-    /// translate physical address to virtual address for virtio_blk device
-    fn phys_to_virt(addr: usize) -> usize {
-        addr
-    }
-    /// translate virtual address to physical address for virtio_blk device
-    fn virt_to_phys(vaddr: usize) -> usize {
-        PageTable::from_token(kernel_token())
-            .translate_va(VirtAddr::from(vaddr))
-            .unwrap()
-            .0
     }
 }

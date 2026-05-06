@@ -13,6 +13,11 @@
     ],
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.checkOnSave": true,
+    "files.watcherExclude": {
+        "**/target": true
+    },
+    "metals.inlayHints.implicitArguments.enable": true,
+    "metals.inlayHints.implicitConversions.enable": true,
     // "rust-analyzer.cargo.features": [
     //     "board_qemu"
     // ]
