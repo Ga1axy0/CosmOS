@@ -1,4 +1,5 @@
 use crate::signal::signals::MAX_SIG;
+use crate::syscall::Pod;
 
 /// Action for a signal (Linux rt_sigaction layout)
 #[repr(C)]
@@ -13,6 +14,8 @@ pub struct SignalAction {
     /// Signal mask to apply during handler execution (32-bit)
     pub sa_mask: u32,
 }
+
+impl Pod for SignalAction {}
 
 impl Default for SignalAction {
     fn default() -> Self {
@@ -54,6 +57,8 @@ pub struct SigInfo {
     pub _pad: [u32; 29],
 }
 
+impl Pod for SigInfo {}
+
 impl SigInfo {
     /// Create a new SigInfo with the given signal number
     pub fn new(signo: i32) -> Self {
@@ -80,6 +85,8 @@ pub struct MContext {
     pub fcsr: usize,
 }
 
+impl Pod for MContext {}
+
 /// ucontext_t structure
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +105,8 @@ pub struct UContext {
     pub uc_mcontext: MContext,
 }
 
+impl Pod for UContext {}
+
 /// stack_t structure
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -109,3 +118,5 @@ pub struct StackT {
     /// Stack size
     pub ss_size: usize,
 }
+
+impl Pod for StackT {}

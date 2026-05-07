@@ -1,8 +1,6 @@
-use crate::mm::translated_ref;
-use crate::syscall::errno::{ERRNO, OrErrno};
+use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
-use crate::syscall::{write_pod_to_user, Pod};
-use crate::task::current_user_token;
+use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
 use crate::timer::set_realtime_offset_from_time_ns;
 use crate::{
     config::CLOCK_FREQ,
@@ -170,7 +168,7 @@ pub fn sys_set_time_of_day(tv: *const TimeVal, _tz: usize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let timeval = translated_ref(current_user_token(), tv).or_errno(ERRNO::EFAULT)?;
+        let timeval = read_pod_from_user(tv)?;
         let time_us = timeval.sec * 1_000_000 + timeval.usec;
         set_realtime_offset_from_time_ns((time_us * 1_000) as u64);
         Ok(0)
@@ -219,11 +217,10 @@ pub fn sys_setitimer(
             _ => return Err(ERRNO::EINVAL),
         }
 
-        let token = current_user_token();
         let new_value = if value.is_null() {
             None
         } else {
-            let new_timer = translated_ref(token, value).or_errno(ERRNO::EFAULT)?;
+            let new_timer = read_pod_from_user(value)?;
             let value_ns = timeval_to_ns(&new_timer.it_value)?;
             let interval_ns = timeval_to_ns(&new_timer.it_interval)?;
             Some((value_ns, interval_ns))
@@ -294,7 +291,7 @@ pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
         // CLOCK_REALTIME_COARSE 等其它 clock id 的设置。
         match clockid {
             CLOCK_REALTIME => {
-                let timespec = translated_ref(current_user_token(), _tp).or_errno(ERRNO::EFAULT)?;
+                let timespec = read_pod_from_user(_tp)?;
                 let time_ns = (timespec.tv_sec as u64) * 1_000_000_000 + (timespec.tv_nsec as u64);
                 set_realtime_offset_from_time_ns(time_ns);
                 Ok(0)

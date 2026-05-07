@@ -1,12 +1,11 @@
-use crate::mm::translated_refmut;
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::syscall_body;
-use crate::syscall::times::Timespec;
+use crate::syscall::{read_pod_from_user, times::Timespec};
 use crate::task::{
-    WaitReason, block_current_and_run_next, current_process, current_task, current_user_token
+    WaitReason, block_current_and_run_next, current_process, current_task
 };
 use crate::timer::{add_timer, get_time_ms};
-use crate::syscall::errno::{ERRNO, OrErrno};
+use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
 
 const DEADLOCK_DETECTED: isize = -0xDEAD;
@@ -35,11 +34,10 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
             .unwrap()
             .tid
     );
-    
-    let token = current_user_token();
+
     syscall_body!({
         let _ = rem;
-        let timespec = translated_refmut(token, req as *mut Timespec).or_errno(ERRNO::EFAULT)?;
+        let timespec = read_pod_from_user(req)?;
         let current_time = get_time_ms();
         let expire_ms = current_time + timespec.tv_sec * 1_000 + timespec.tv_nsec / 1_000_000;
         debug!(
