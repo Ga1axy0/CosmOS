@@ -97,6 +97,7 @@ fn init_local_hart(hart_id: usize) {
     trap::init_hart();
     timer::init_hart();
     drivers::plic::init_hart(hart_id);
+    mm::mark_online(hart_id);
     debug!("hart {} local init done", hart_id);
 }
 

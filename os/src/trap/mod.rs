@@ -16,7 +16,7 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::hart::hartid;
-use crate::mm::PageFaultAccess;
+use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
 use crate::task::{
@@ -242,6 +242,7 @@ pub fn trap_handler() -> ! {
             on_timer_tick();
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
+            handle_ipi();
             clear_software_interrupt_pending();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
@@ -320,6 +321,7 @@ pub fn trap_from_kernel() {
             crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
+            handle_ipi();
             clear_software_interrupt_pending();
         }
         _ => {
