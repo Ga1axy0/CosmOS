@@ -1,7 +1,8 @@
 //! Signal handling implementation.
 
 use crate::{
-    mm::translated_refmut, task::{current_process, current_trap_cx, current_user_token}
+    syscall::write_pod_to_user,
+    task::{current_process, current_trap_cx},
 };
 
 mod action;
@@ -105,7 +106,6 @@ pub fn handle_signals() {
     };
 
     let trap_cx = current_trap_cx();
-    let token = current_user_token();
     let process = current_process();
 
     // Save the current user stack pointer
@@ -165,28 +165,24 @@ pub fn handle_signals() {
     };
 
     // Write ucontext to user stack
-    let ucontext_ref = translated_refmut(token, ucontext_ptr as *mut UContext);
-    let Some(ucontext_slot) = ucontext_ref else {
+    if let Err(err) = write_pod_to_user(ucontext_ptr as *mut UContext, &ucontext) {
         warn!(
-            "[kernel] handle_signals: failed to write ucontext for signal {}",
-            signum
+            "[kernel] handle_signals: failed to write ucontext for signal {}: {:?}",
+            signum, err
         );
         return;
-    };
-    *ucontext_slot = ucontext;
+    }
 
     // Write siginfo if SA_SIGINFO is set
     if action.sa_flags & SaFlags::SA_SIGINFO.bits() != 0 {
         let siginfo = SigInfo::new(signum);
-        let siginfo_ref = translated_refmut(token, siginfo_ptr as *mut SigInfo);
-        let Some(siginfo_slot) = siginfo_ref else {
+        if let Err(err) = write_pod_to_user(siginfo_ptr as *mut SigInfo, &siginfo) {
             warn!(
-                "[kernel] handle_signals: failed to write siginfo for signal {}",
-                signum
+                "[kernel] handle_signals: failed to write siginfo for signal {}: {:?}",
+                signum, err
             );
             return;
-        };
-        *siginfo_slot = siginfo;
+        }
     }
 
     // Apply signal mask during handler execution

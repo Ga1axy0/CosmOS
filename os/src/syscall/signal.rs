@@ -1,10 +1,12 @@
-use crate::syscall::ERRNO;
+use crate::syscall::{read_pod_from_user, write_pod_to_user, ERRNO};
 use crate::task::UContext;
 use crate::{
     mm::{translated_ref, translated_refmut},
     syscall::errno::OrErrno,
     syscall_body,
-    task::{current_process, current_task, current_user_token, SignalAction, SignalFlags, WaitReason},
+    task::{
+        current_process, current_task, current_user_token, SignalAction, SignalFlags, WaitReason,
+    },
 };
 
 /// rt_sigaction 系统调用
@@ -42,25 +44,10 @@ pub fn sys_sigaction(
             return Err(ERRNO::EINVAL);
         }
 
-        let token = current_user_token();
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let slot = &mut inner.signal_actions.table[signum as usize];
-
-        // Return old action if requested
-        if !old_action.is_null() {
-            let old = translated_refmut(token, old_action).or_errno(ERRNO::EFAULT)?;
-            *old = *slot;
-            debug!(
-                "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
-                signum, slot.handler, slot.sa_flags
-            );
-        }
-
-        // Set new action if provided
-        if !action.is_null() {
-            let new_action = *translated_ref(token, action).or_errno(ERRNO::EFAULT)?;
-
+        let new_action = if action.is_null() {
+            None
+        } else {
+            let new_action = read_pod_from_user(action)?;
             // Validate handler address (SIG_DFL=0, SIG_IGN=1, or valid user address)
             if new_action.handler != crate::task::SIG_DFL
                 && new_action.handler != crate::task::SIG_IGN
@@ -72,8 +59,27 @@ pub fn sys_sigaction(
                 );
                 return Err(ERRNO::EINVAL);
             }
+            Some(new_action)
+        };
 
-            *slot = new_action;
+        let old = {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            let slot = &mut inner.signal_actions.table[signum as usize];
+            let old = *slot;
+            if let Some(new_action) = new_action {
+                *slot = new_action;
+            }
+            old
+        };
+
+        // Return old action after dropping process.inner; copyout may prefault user pages.
+        if !old_action.is_null() {
+            write_pod_to_user(old_action, &old)?;
+            debug!(
+                "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
+                signum, old.handler, old.sa_flags
+            );
         }
 
         Ok(0)
@@ -100,26 +106,33 @@ pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: us
             return Err(ERRNO::EINVAL);
         }
 
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-
-        // If user requested old mask, write it out first.
-        if !oset.is_null() {
-            let old_bits = inner.signal_mask.bits();
-            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
-            *slot = old_bits;
-        }
-
-        // If user provided a new mask, apply according to `how`.
-        if !set.is_null() {
+        let new_mask = if !set.is_null() {
             let new_bits = *translated_ref(token, set).or_errno(ERRNO::EFAULT)?;
             let new_mask = SignalFlags::from_bits(new_bits).or_errno(ERRNO::EINVAL)?;
-            match how {
-                0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
-                1 => inner.signal_mask.remove(new_mask), // SIG_UNBLOCK
-                2 => inner.signal_mask = new_mask,       // SIG_SETMASK
-                _ => return Err(ERRNO::EINVAL),
+            Some(new_mask)
+        } else {
+            None
+        };
+
+        let old_bits = {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            let old_bits = inner.signal_mask.bits();
+            if let Some(new_mask) = new_mask {
+                match how {
+                    0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
+                    1 => inner.signal_mask.remove(new_mask), // SIG_UNBLOCK
+                    2 => inner.signal_mask = new_mask,       // SIG_SETMASK
+                    _ => return Err(ERRNO::EINVAL),
+                }
             }
+            old_bits
+        };
+
+        // If user requested old mask, write it out after dropping process.inner.
+        if !oset.is_null() {
+            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
+            *slot = old_bits;
         }
 
         Ok(0)
@@ -135,23 +148,22 @@ pub fn sys_sigreturn() -> isize {
     syscall_body!({
         let trap_cx = crate::task::current_trap_cx();
         let user_sp = trap_cx.x[2]; // Current sp
-        let token = current_user_token();
 
         debug!(
             "sys_sigreturn: ENTRY sepc={:#x}, sp={:#x}, ra={:#x}, a0={:#x}, a7={:#x}",
             trap_cx.sepc, user_sp, trap_cx.x[1], trap_cx.x[10], trap_cx.x[17]
         );
 
-        // Read ucontext from user stack at sp
+        // Read ucontext from user stack at sp. The frame can cross a page boundary,
+        // so this must use the byte-wise copy helper instead of translated_ref.
         let ucontext_ptr = user_sp;
-        let ucontext_ref = crate::mm::translated_ref(token, ucontext_ptr as *const UContext);
-        let Some(ucontext) = ucontext_ref else {
+        let ucontext = read_pod_from_user(ucontext_ptr as *const UContext).map_err(|err| {
             error!(
-                "sys_sigreturn: failed to read ucontext at {:#x}",
-                ucontext_ptr
+                "sys_sigreturn: failed to read ucontext at {:#x}: {:?}",
+                ucontext_ptr, err
             );
-            return Err(ERRNO::EFAULT);
-        };
+            err
+        })?;
 
         debug!(
             "sys_sigreturn: restoring context from {:#x}, sigmask={:#x}",
@@ -274,7 +286,10 @@ pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
             } else {
                 // Signal arrived — cancel the sleep, keep running.
                 let mut task_inner = task.inner_exclusive_access();
-                if matches!(task_inner.task_status, crate::task::TaskStatus::Interruptible) {
+                if matches!(
+                    task_inner.task_status,
+                    crate::task::TaskStatus::Interruptible
+                ) {
                     task_inner.task_status = crate::task::TaskStatus::Running;
                     task_inner.wait_reason = None;
                 }
@@ -285,10 +300,7 @@ pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
         {
             let mut inner = process.inner_exclusive_access();
             inner.signal_mask = old_mask;
-            debug!(
-                "sys_sigsuspend: restored mask to {:#x}",
-                old_mask.bits()
-            );
+            debug!("sys_sigsuspend: restored mask to {:#x}", old_mask.bits());
         }
 
         // sigsuspend always returns -EINTR after signal delivery
