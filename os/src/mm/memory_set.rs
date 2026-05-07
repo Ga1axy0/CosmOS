@@ -1,6 +1,6 @@
 //! Address Space [`MemorySet`] management of Process
 
-use super::{frame_alloc, FrameTracker};
+use super::{frame_alloc, shootdown, FrameTracker, ShootdownKind};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -9,11 +9,13 @@ use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, CachePage, FileDescription,
 };
 use crate::sync::{SpinNoIrqLock};
+use crate::task::ProcessControlBlock;
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use fs::Inode;
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -34,11 +36,86 @@ lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
     pub static ref KERNEL_SPACE: Arc<SpinNoIrqLock<MemorySet>> =
         Arc::new(unsafe { SpinNoIrqLock::new(MemorySet::new_kernel()) });
+    /// file-backed mmap 的反向映射注册表，用于 truncate 时找到需要失效的用户页表。
+    static ref FILE_MAPPING_REGISTRY: SpinNoIrqLock<Vec<FileMappingEntry>> =
+        SpinNoIrqLock::new(Vec::new());
 }
 
 /// the kernel token
 pub fn kernel_token() -> usize {
     KERNEL_SPACE.lock().token()
+}
+
+/// 用于稳定标识一个底层 inode。
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct InodeKey {
+    /// 文件系统编号。
+    fs_id: u64,
+    /// inode 编号。
+    ino: u64,
+}
+
+impl InodeKey {
+    /// 从 inode 中提取稳定 key。
+    pub fn from_inode(inode: &Arc<Inode>) -> Self {
+        Self {
+            fs_id: inode.fs_id(),
+            ino: inode.ino(),
+        }
+    }
+}
+
+/// 一条 file-backed mmap 反向映射记录。
+struct FileMappingEntry {
+    /// 被映射的 inode。
+    inode: InodeKey,
+    /// 曾经映射过该 inode 的进程。
+    process: Weak<ProcessControlBlock>,
+}
+
+/// 登记当前进程曾建立过某个 inode 的 file-backed mmap。
+pub fn register_file_mapping(inode: &Arc<Inode>, process: &Arc<ProcessControlBlock>) {
+    let inode = InodeKey::from_inode(inode);
+    let mut registry = FILE_MAPPING_REGISTRY.lock();
+    let process_ptr = Arc::as_ptr(process);
+    if registry
+        .iter()
+        .any(|entry| entry.inode == inode && entry.process.as_ptr() == process_ptr)
+    {
+        return;
+    }
+    registry.push(FileMappingEntry {
+        inode,
+        process: Arc::downgrade(process),
+    });
+    debug!(
+        "[mmap] register file mapping: fs_id={} ino={} pid={}",
+        inode.fs_id,
+        inode.ino,
+        process.getpid()
+    );
+}
+
+/// 在 truncate 缩小时失效所有映射了该 inode 的用户页表项。
+pub fn invalidate_inode_mappings_after_truncate(inode: &Arc<Inode>, new_size: usize) {
+    let inode = InodeKey::from_inode(inode);
+    let processes = {
+        let mut registry = FILE_MAPPING_REGISTRY.lock();
+        let mut processes = Vec::new();
+        registry.retain(|entry| {
+            let Some(process) = entry.process.upgrade() else {
+                return false;
+            };
+            if entry.inode == inode {
+                processes.push(process);
+            }
+            true
+        });
+        processes
+    };
+    for process in processes {
+        process.invalidate_file_mappings_after_truncate(inode, new_size);
+    }
 }
 
 /// address space
@@ -47,6 +124,8 @@ pub struct MemorySet {
     pub page_table: PageTable,
     /// virtual memory areas
     pub vmas: Vec<Vma>,
+    /// 当前仍在用户态装载该地址空间的 hart 掩码。
+    loaded_user_harts: AtomicUsize,
 }
 
 /// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
@@ -61,17 +140,169 @@ pub struct UserSpaceLayout {
     pub start_stack: usize,
 }
 
+/// 用户页表 shootdown 完成后才能释放的旧页对象集合。
+pub(crate) struct UserReleaseBatch {
+    pages: Vec<DeferredUserPage>,
+}
+
+/// 用户页表中已经摘除、但仍需等 TLB shootdown 后才能释放的页对象。
+enum DeferredUserPage {
+    /// 私有匿名页或 COW 私有页。
+    Private(Arc<PrivatePage>),
+    /// 直接映射的 page cache 页。
+    DirectCache(Arc<SpinNoIrqLock<CachePage>>),
+}
+
+impl UserReleaseBatch {
+    /// 创建一个空的用户页延迟释放批次。
+    pub(crate) fn new() -> Self {
+        Self { pages: Vec::new() }
+    }
+
+    /// 判断当前批次是否为空。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// 暂存一张私有页，等待远端 TLB flush 完成后再释放引用。
+    fn push_private(&mut self, page: Arc<PrivatePage>) {
+        self.pages.push(DeferredUserPage::Private(page));
+    }
+
+    /// 暂存一张 page cache 映射页，等待远端 TLB flush 完成后再减少映射计数。
+    fn push_direct_cache(&mut self, page: Arc<SpinNoIrqLock<CachePage>>) {
+        self.pages.push(DeferredUserPage::DirectCache(page));
+    }
+
+    /// 合并另一个延迟释放批次。
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        self.pages.append(&mut other.pages);
+    }
+}
+
+impl Drop for UserReleaseBatch {
+    fn drop(&mut self) {
+        for page in self.pages.drain(..) {
+            match page {
+                DeferredUserPage::Private(_page) => {}
+                DeferredUserPage::DirectCache(page) => release_mapped_page(&page),
+            }
+        }
+    }
+}
+
+/// 用户页表修改后需要在锁外完成的 TLB shootdown 与延迟释放动作。
+pub struct DeferredUserReclaim {
+    /// 被修改的用户地址空间 token。
+    token: usize,
+    /// 需要接收 shootdown 的 hart 掩码。
+    mask: usize,
+    /// shootdown 完成后才能释放的旧页对象。
+    batch: UserReleaseBatch,
+}
+
+impl DeferredUserReclaim {
+    /// 基于锁内快照创建一次用户页表延迟回收动作。
+    pub(crate) fn new(token: usize, mask: usize, batch: UserReleaseBatch) -> Self {
+        Self { token, mask, batch }
+    }
+
+    /// 判断本次回收是否实际持有旧页对象。
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    /// 在目标 hart 完成 TLB shootdown 后释放旧页对象。
+    pub fn flush_then_release(self) {
+        if self.mask != 0 && !self.batch.is_empty() {
+            debug!(
+                "[tlb] deferred user reclaim shootdown: token={:#x} mask={:#b}",
+                self.token,
+                self.mask
+            );
+            shootdown(self.mask, ShootdownKind::AddressSpace { satp: self.token });
+        }
+        // self 在函数返回时析构，batch 的 Drop 会真正释放旧页引用。
+    }
+}
+
 impl MemorySet {
+    /// 完成一次会返回延迟回收 batch 的本地页表修改。
+    fn finish_deferred_page_table_edit(&self) {
+        // 本地 hart 可能刚刚使用过被拆除的翻译，必须先清掉本地 TLB；
+        // 远端 hart 的同步由调用方构造 `DeferredUserReclaim` 后在锁外完成。
+        unsafe {
+            asm!("sfence.vma");
+        }
+    }
+
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTable::new(),
             vmas: Vec::new(),
+            loaded_user_harts: AtomicUsize::new(0),
         }
     }
     /// Get he page table token
     pub fn token(&self) -> usize {
         self.page_table.token()
+    }
+    /// 标记某个 hart 即将返回用户态并装载该地址空间。
+    pub fn mark_user_loaded(&self, hart_id: usize) {
+        let bit = 1usize << hart_id;
+        let mask = self.loaded_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
+        trace!(
+            "[tlb] user mm loaded on hart {} token={:#x} mask={:#b}",
+            hart_id,
+            self.token(),
+            mask
+        );
+    }
+    /// 标记某个 hart 已经离开用户态，不再需要作为该地址空间的远端 shootdown 目标。
+    pub fn mark_user_unloaded(&self, hart_id: usize) {
+        let bit = 1usize << hart_id;
+        let mask = self.loaded_user_harts.fetch_and(!bit, Ordering::AcqRel) & !bit;
+        trace!(
+            "[tlb] user mm unloaded from hart {} token={:#x} mask={:#b}",
+            hart_id,
+            self.token(),
+            mask
+        );
+    }
+    /// 返回当前仍在用户态装载该地址空间的 hart 掩码。
+    pub fn loaded_user_harts(&self) -> usize {
+        self.loaded_user_harts.load(Ordering::Acquire)
+    }
+    /// 对当前仍在用户态装载该地址空间的 hart 发起同步 TLB shootdown。
+    ///
+    /// 调用方不能持有对应进程锁等待 ack。用户态 IPI 进入内核后会先更新进程
+    /// 运行态信息，持锁等待可能导致远端 hart 无法进入 softirq 分支。
+    ///
+    /// 这里依赖当前 trap 语义：hart 从用户态进入内核时已经切到 kernel satp
+    /// 并执行本地 `sfence.vma`，因此不在该掩码中的 hart 不应再持有这个用户
+    /// 地址空间的旧翻译。若后续去掉 trap 入口 flush 或引入 ASID，需要重新审查。
+    pub fn shootdown_loaded_user_harts(&self) {
+        let mask = self.loaded_user_harts();
+        self.shootdown_user_harts(mask);
+    }
+    /// 对指定 hart 掩码发起该地址空间的同步 TLB shootdown。
+    ///
+    /// 这个接口用于调用方已经在锁内快照出目标 mask，随后释放锁再执行同步等待
+    /// 的场景。
+    ///
+    /// snapshot 只覆盖“页表修改完成时仍在用户态运行该 mm”的 hart。修改完成后
+    /// 才从内核态返回用户态的 hart，必须已经经过 trap 入口的本地 flush 同步点。
+    pub fn shootdown_user_harts(&self, mask: usize) {
+        if mask == 0 {
+            return;
+        }
+        debug!(
+            "[tlb] shootdown user mm token={:#x} loaded_mask={:#b}",
+            self.token(),
+            mask
+        );
+        shootdown(mask, ShootdownKind::AddressSpace { satp: self.token() });
     }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
@@ -85,20 +316,44 @@ impl MemorySet {
             None,
         );
     }
-    /// 根据起始虚拟页号删除一段已经登记的区域。
-    pub fn remove_vma_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
-        if let Some((idx, area)) = self
+    /// 根据起始虚拟页号删除一段用户区域，并延迟释放拆下的旧页对象。
+    pub(crate) fn remove_vma_with_start_vpn_user_deferred(
+        &mut self,
+        start_vpn: VirtPageNum,
+    ) -> UserReleaseBatch {
+        let Some(idx) = self
             .vmas
-            .iter_mut()
-            .enumerate()
-            .find(|(_, area)| area.start_vpn() == start_vpn)
-        {
-            area.teardown(&mut self.page_table);
-            self.vmas.remove(idx);
-            unsafe {
-                asm!("sfence.vma");
-            }
-        }
+            .iter()
+            .position(|area| area.start_vpn() == start_vpn)
+        else {
+            return UserReleaseBatch::new();
+        };
+        let mut area = self.vmas.remove(idx);
+        let mut batch = UserReleaseBatch::new();
+        area.teardown_user_deferred(&mut self.page_table, &mut batch);
+        self.finish_deferred_page_table_edit();
+        batch
+    }
+    /// 根据起始虚拟页号删除一段 framed 区域，并返回其中拆下的页框。
+    ///
+    /// 当前只为 kernel stack 与线程用户资源这类独占 framed VMA 的 deferred 回收准备。
+    /// TODO：若后续要让更多内核态映射复用这条路径，需要补齐 direct cache page
+    /// 与共享私有页的语义约束。
+    pub fn remove_vma_with_start_vpn_deferred(
+        &mut self,
+        start_vpn: VirtPageNum,
+    ) -> Vec<FrameTracker> {
+        let Some(idx) = self
+            .vmas
+            .iter()
+            .position(|area| area.start_vpn() == start_vpn)
+        else {
+            return Vec::new();
+        };
+        let mut area = self.vmas.remove(idx);
+        let frames = area.teardown_deferred(&mut self.page_table);
+        self.finish_deferred_page_table_edit();
+        frames
     }
     /// 判断给定区间是否与当前地址空间中的任意区域重叠。
     pub fn overlaps_vma_range(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
@@ -364,7 +619,7 @@ impl MemorySet {
         ))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
-    pub fn from_existed_user(user_space: &mut Self) -> Self {
+    pub fn from_existed_user(user_space: &mut Self) -> (Self, bool) {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -475,13 +730,12 @@ impl MemorySet {
             }
         }
         if parent_tlb_needs_flush {
-            // TODO: SMP 下需要对同一地址空间正在其他 hart 上运行的线程做远端 TLB shootdown。
             unsafe {
                 asm!("sfence.vma");
             }
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
-        memory_set
+        (memory_set, parent_tlb_needs_flush)
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
@@ -496,23 +750,98 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
-    ///Remove all VMAs
-    pub fn recycle_data_pages(&mut self) {
+    /// 拆除全部用户 VMA，并把旧页对象放入延迟释放批次。
+    pub(crate) fn recycle_data_pages_deferred(&mut self) -> UserReleaseBatch {
+        let mut batch = UserReleaseBatch::new();
         for area in self.vmas.iter_mut() {
-            area.teardown(&mut self.page_table);
+            area.teardown_user_deferred(&mut self.page_table, &mut batch);
         }
         self.vmas.clear();
+        self.finish_deferred_page_table_edit();
+        batch
     }
 
-    /// shrink the area to new_end
-    #[allow(unused)]
-    pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
-        if let Some(idx) = self.vmas.iter().position(|vma| vma.start_vpn() == start.floor()) {
-            self.vmas[idx].shrink_to(&mut self.page_table, new_end.ceil());
-            true
-        } else {
-            false
+    /// 将用户区域收缩到新的上界，并延迟释放被拆下的旧页对象。
+    pub(crate) fn shrink_to_deferred(
+        &mut self,
+        start: VirtAddr,
+        new_end: VirtAddr,
+    ) -> Option<UserReleaseBatch> {
+        let idx = self
+            .vmas
+            .iter()
+            .position(|vma| vma.start_vpn() == start.floor())?;
+        let mut batch = UserReleaseBatch::new();
+        self.vmas[idx].shrink_to_deferred(
+            &mut self.page_table,
+            new_end.ceil(),
+            &mut batch,
+        );
+        self.finish_deferred_page_table_edit();
+        Some(batch)
+    }
+
+    /// 失效指定 inode 在 truncate 后越过 EOF 的 file-backed 用户映射。
+    pub(crate) fn invalidate_file_mappings_after_truncate_deferred(
+        &mut self,
+        inode: InodeKey,
+        new_size: usize,
+    ) -> UserReleaseBatch {
+        let mut batch = UserReleaseBatch::new();
+        let mut pte_changed = false;
+        for area in self.vmas.iter_mut() {
+            let Some(file) = area.file.as_ref() else {
+                continue;
+            };
+            let Some(area_inode) = file.file.backing_inode() else {
+                continue;
+            };
+            if InodeKey::from_inode(&area_inode) != inode {
+                continue;
+            }
+
+            let direct_vpns: Vec<_> = area.direct_cache_pages.keys().copied().collect();
+            for vpn in direct_vpns {
+                let Some(page_idx) = area.file_page_index(vpn) else {
+                    continue;
+                };
+                let page_start = page_idx as usize * PAGE_SIZE;
+                if page_start >= new_size {
+                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    pte_changed = true;
+                    continue;
+                }
+                if new_size < page_start + PAGE_SIZE {
+                    if let Some(page) = area.direct_cache_pages.get(&vpn) {
+                        let page = page.lock();
+                        page.ppn().get_bytes_array()[new_size - page_start..].fill(0);
+                    }
+                }
+            }
+
+            let private_vpns: Vec<_> = area.data_frames.keys().copied().collect();
+            for vpn in private_vpns {
+                let Some(page_idx) = area.file_page_index(vpn) else {
+                    continue;
+                };
+                let page_start = page_idx as usize * PAGE_SIZE;
+                if page_start >= new_size {
+                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    pte_changed = true;
+                    continue;
+                }
+                if new_size < page_start + PAGE_SIZE {
+                    if let Some(page) = area.data_frames.get(&vpn) {
+                        page.ppn().get_bytes_array()[new_size - page_start..].fill(0);
+                    }
+                }
+            }
         }
+        if pte_changed {
+            self.finish_deferred_page_table_edit();
+        }
+        // 当前只失效已经 present 的页；未装入页依赖后续 fault 路径用新文件长度拒绝 EOF 外访问。
+        batch
     }
 
     /// append the area to new_end
@@ -584,8 +913,15 @@ impl MemorySet {
         true
     }
 
-    /// 按给定用户区间拆除映射，支持匿名区域与文件映射区域。
-    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    /// 按给定用户区间拆除映射，并返回需要在 shootdown 后释放的旧页对象。
+    ///
+    /// 调用方必须在锁内快照目标 hart，并在锁外完成 shootdown 后再释放返回的
+    /// `UserReleaseBatch`。
+    pub(crate) fn munmap_deferred(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> Option<UserReleaseBatch> {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         debug!(
@@ -597,13 +933,14 @@ impl MemorySet {
         );
         for vpn in VPNRange::new(start_vpn, end_vpn) {
             let Some(area) = self.find_vma_containing(vpn) else {
-                return false;
+                return None;
             };
             if !area.is_user_accessible() {
-                return false;
+                return None;
             }
         }
 
+        let mut batch = UserReleaseBatch::new();
         let mut new_areas: Vec<Vma> = Vec::with_capacity(self.vmas.len() + 1);
         for mut area in self.vmas.drain(..) {
             let area_start = area.start_vpn();
@@ -636,7 +973,7 @@ impl MemorySet {
             );
 
             for vpn in VPNRange::new(overlap_start, overlap_end) {
-                area.unmap_present_one(&mut self.page_table, vpn);
+                area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
             }
 
             if area_start < overlap_start {
@@ -655,15 +992,13 @@ impl MemorySet {
         }
         self.vmas = new_areas;
         self.merge_adjacent_vmas();
-        unsafe {
-            asm!("sfence.vma");
-        }
+        self.finish_deferred_page_table_edit();
         debug!(
             "[munmap] complete teardown: start_vpn={:#x} end_vpn={:#x}",
             start_vpn.0,
             end_vpn.0
         );
-        true
+        Some(batch)
     }
 
     /// 为 file-backed 缺页生成锁外慢路径所需的最小计划。
@@ -887,20 +1222,24 @@ impl MemorySet {
     }
 
     /// 处理私有页的写时复制缺页。
-    pub fn handle_private_cow_fault(&mut self, fault_va: VirtAddr) -> bool {
+    pub(crate) fn handle_private_cow_fault(&mut self, fault_va: VirtAddr) -> Option<UserReleaseBatch> {
+        let mut batch = UserReleaseBatch::new();
         let vpn = fault_va.floor();
         let Some(pte) = self.page_table.translate(vpn) else {
-            return false;
+            return None;
         };
         if pte.writable() {
-            return false;
+            // 可能是其他 hart 已经把该页从 COW 只读状态放宽为可写，
+            // 当前 hart 仍命中了陈旧的只读 TLB。刷新本地后让用户态重试。
+            self.finish_deferred_page_table_edit();
+            return Some(batch);
         }
         let file_private_cache_page = {
             let Some(area) = self.find_vma_containing(vpn) else {
-                return false;
+                return None;
             };
             if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
-                return false;
+                return None;
             }
             match area.file.as_ref() {
                 Some(file) if !file.shared => area.direct_cache_pages.get(&vpn).cloned(),
@@ -920,18 +1259,16 @@ impl MemorySet {
             writable_flags.insert(PTEFlags::W);
             writable_flags.remove(PTEFlags::D);
             let Some(area) = self.find_vma_containing_mut(vpn) else {
-                return false;
+                return None;
             };
-            area.direct_cache_pages.remove(&vpn);
+            if let Some(old_page) = area.direct_cache_pages.remove(&vpn) {
+                batch.push_direct_cache(old_page);
+            }
             area.data_frames.insert(vpn, Arc::clone(&new_page));
             if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
-                return false;
+                return None;
             }
-            release_mapped_page(&cache_page);
-            // TODO: SMP 下这里还需要远端 hart 的 TLB shootdown，保证其他核能看到新的物理页映射。
-            unsafe {
-                asm!("sfence.vma");
-            }
+            self.finish_deferred_page_table_edit();
             debug!(
                 "[cow] materialize MAP_PRIVATE page on write fault: vpn={:#x} cache_ppn={:#x} new_ppn={:#x} path={:?}",
                 vpn.0,
@@ -939,20 +1276,20 @@ impl MemorySet {
                 new_page.ppn().0,
                 path
             );
-            return true;
+            return Some(batch);
         }
         let (page, path) = {
             let Some(area) = self.find_vma_containing(vpn) else {
-                return false;
+                return None;
             };
             if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
-                return false;
+                return None;
             }
             let Some(page) = area.data_frames.get(&vpn).cloned() else {
-                return false;
+                return None;
             };
             if !page.is_cow() {
-                return false;
+                return None;
             }
             (page, area.file.as_ref().and_then(|file| file.file.path()))
         };
@@ -974,19 +1311,16 @@ impl MemorySet {
         if Arc::strong_count(&page) <= 2 {
             page.set_cow(false);
             if !self.page_table.update_flags(vpn, writable_flags) {
-                return false;
+                return None;
             }
-            // TODO: SMP 下这里还需要远端 hart 的 TLB shootdown，保证其他核不会继续使用旧的只读缓存。
-            unsafe {
-                asm!("sfence.vma");
-            }
+            self.finish_deferred_page_table_edit();
             debug!(
                 "[cow] reuse exclusive private page: vpn={:#x} ppn={:#x} path={:?}",
                 vpn.0,
                 page.ppn().0,
                 path
             );
-            return true;
+            return Some(batch);
         }
 
         let new_page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
@@ -995,16 +1329,15 @@ impl MemorySet {
             .get_bytes_array()
             .copy_from_slice(page.ppn().get_bytes_array());
         let Some(area) = self.find_vma_containing_mut(vpn) else {
-            return false;
+            return None;
         };
-        area.data_frames.insert(vpn, Arc::clone(&new_page));
+        if let Some(old_page) = area.data_frames.insert(vpn, Arc::clone(&new_page)) {
+            batch.push_private(old_page);
+        }
         if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
-            return false;
+            return None;
         }
-        // TODO: SMP 下这里还需要远端 hart 的 TLB shootdown，保证其他核能看到新的物理页映射。
-        unsafe {
-            asm!("sfence.vma");
-        }
+        self.finish_deferred_page_table_edit();
         debug!(
             "[cow] copy private page on write fault: vpn={:#x} old_ppn={:#x} new_ppn={:#x} path={:?}",
             vpn.0,
@@ -1012,7 +1345,7 @@ impl MemorySet {
             new_page.ppn().0,
             path
         );
-        true
+        Some(batch)
     }
 
     /// 为 `MAP_PRIVATE` 缺页分配私有页框，并以 page cache 作为填充源。
@@ -1312,6 +1645,11 @@ impl PrivatePage {
     pub fn is_cow(&self) -> bool {
         self.cow.load(Ordering::Acquire)
     }
+
+    /// 消费当前私有页并返回底层页框。
+    pub fn into_frame(self) -> FrameTracker {
+        self.frame
+    }
 }
 
 /// 一段带有权限、来源和页框信息的虚拟内存区域描述。
@@ -1527,12 +1865,17 @@ impl Vma {
             direct_cache_pages: right_direct_cache_pages,
         })
     }
-    /// 按当前实际已经建立的映射状态拆除单页映射。
-    pub fn unmap_present_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+    /// 按当前实际映射状态拆除单页映射，并延迟释放旧页对象。
+    pub(crate) fn unmap_present_one_deferred(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        batch: &mut UserReleaseBatch,
+    ) {
         if let Some(page) = self.direct_cache_pages.remove(&vpn) {
             let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
             debug!(
-                "[munmap] release file cache mapping: vpn={:#x} shared={}",
+                "[munmap] defer file cache mapping release: vpn={:#x} shared={}",
                 vpn.0,
                 shared_file_mapping
             );
@@ -1541,33 +1884,73 @@ impl Vma {
                     mark_cached_page_dirty(&page);
                 }
             }
-            release_mapped_page(&page);
+            batch.push_direct_cache(page);
             return;
         }
         if self.map_type == MapType::Framed {
-            debug!(
-                "[munmap] release private frame mapping: vpn={:#x}",
-                vpn.0
-            );
-            self.data_frames.remove(&vpn);
+            if let Some(page) = self.data_frames.remove(&vpn) {
+                batch.push_private(page);
+            }
         }
         let _ = page_table.clear(vpn);
     }
-    /// 依据当前区域实际映射状态拆除全部页表项。
-    pub fn teardown(&mut self, page_table: &mut PageTable) {
+    /// 依据当前区域实际映射状态拆除全部页表项，并延迟释放旧页对象。
+    pub(crate) fn teardown_user_deferred(
+        &mut self,
+        page_table: &mut PageTable,
+        batch: &mut UserReleaseBatch,
+    ) {
         let shared_vpns: alloc::vec::Vec<_> = self.direct_cache_pages.keys().copied().collect();
         for vpn in shared_vpns {
-            self.unmap_present_one(page_table, vpn);
+            self.unmap_present_one_deferred(page_table, vpn, batch);
         }
         let framed_vpns: alloc::vec::Vec<_> = self.data_frames.keys().copied().collect();
         for vpn in framed_vpns {
-            self.unmap_present_one(page_table, vpn);
+            self.unmap_present_one_deferred(page_table, vpn, batch);
         }
         if self.map_type == MapType::Identical {
             for vpn in self.vpn_range {
                 let _ = page_table.clear(vpn);
             }
         }
+    }
+    /// 依据当前区域实际映射状态拆除全部页表项，并返回 framed 私有页对应的页框。
+    ///
+    /// 当前调用方只覆盖 kernel stack，因此这里要求每张私有页都具有独占所有权。
+    /// TODO：若未来需要推广到更一般的 deferred reclaim，应补齐共享私有页与
+    /// direct cache page 的处理分支。
+    pub fn teardown_deferred(&mut self, page_table: &mut PageTable) -> Vec<FrameTracker> {
+        let shared_vpns: alloc::vec::Vec<_> = self.direct_cache_pages.keys().copied().collect();
+        for vpn in shared_vpns {
+            if let Some(page) = self.direct_cache_pages.remove(&vpn) {
+                let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
+                if let Some(old_pte) = page_table.clear(vpn) {
+                    if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
+                        mark_cached_page_dirty(&page);
+                    }
+                }
+                release_mapped_page(&page);
+            }
+        }
+        let framed_vpns: alloc::vec::Vec<_> = self.data_frames.keys().copied().collect();
+        let mut frames = Vec::with_capacity(framed_vpns.len());
+        for vpn in framed_vpns {
+            let Some(page) = self.data_frames.remove(&vpn) else {
+                continue;
+            };
+            let _ = page_table.clear(vpn);
+            let page = match Arc::try_unwrap(page) {
+                Ok(page) => page,
+                Err(_) => panic!("deferred framed reclaim requires exclusive page ownership"),
+            };
+            frames.push(page.into_frame());
+        }
+        if self.map_type == MapType::Identical {
+            for vpn in self.vpn_range {
+                let _ = page_table.clear(vpn);
+            }
+        }
+        frames
     }
     /// 为指定虚拟页建立单页映射，并在需要时分配新的物理页框。
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -1585,30 +1968,21 @@ impl Vma {
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
-    /// 撤销指定虚拟页的映射，并释放对应的页框记录。
-    pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        if self.map_type == MapType::Framed {
-            self.data_frames.remove(&vpn);
-        }
-        page_table.unmap(vpn);
-    }
     /// 为当前区域覆盖的全部虚拟页建立映射。
     pub fn map(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
-    /// 撤销当前区域覆盖的全部虚拟页映射。
-    pub fn unmap(&mut self, page_table: &mut PageTable) {
-        for vpn in self.vpn_range {
-            self.unmap_one(page_table, vpn);
-        }
-    }
-    #[allow(unused)]
-    /// 将当前区域收缩到新的上界，并同步拆除尾部页映射。
-    pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+    /// 将当前区域收缩到新的上界，并把尾部页对象加入延迟释放批次。
+    pub(crate) fn shrink_to_deferred(
+        &mut self,
+        page_table: &mut PageTable,
+        new_end: VirtPageNum,
+        batch: &mut UserReleaseBatch,
+    ) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
-            self.unmap_one(page_table, vpn)
+            self.unmap_present_one_deferred(page_table, vpn, batch)
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }

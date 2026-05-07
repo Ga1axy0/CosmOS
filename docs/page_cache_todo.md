@@ -58,18 +58,56 @@
   - 直接返回 `SIGBUS`
 - 尾页仍保留 EOF 后补零语义
 
-### 7. exec() 旧地址空间 teardown
+### 7. 用户态 TLB shootdown 与延迟回收
 
-- `exec()` 现在会先把旧 `memory_set` 摘出来，再显式 `recycle_data_pages()`
-- 避免旧的 shared/file-backed 映射绕过 teardown
+- 已维护每个用户地址空间当前装载的 hart 掩码。
+- 以下用户页表修改路径已经接入地址空间 shootdown：
+  - `munmap`
+  - `exec`
+  - 进程退出
+  - `brk` 收缩/归零
+  - 线程用户资源释放
+  - private COW 物理页替换
+  - `mprotect`
+  - `fork()` 后父页表降权
+- 拆映射/替换物理页时会先把旧页对象放入 `UserReleaseBatch`，再通过 `DeferredUserReclaim::flush_then_release()` 在锁外完成远端 TLB shootdown 后释放。
+- deferred 路径的本地 `sfence.vma` 已统一到 `MemorySet::finish_deferred_page_table_edit()`。
 
-### 8. 调试日志
+### 8. kernel stack deferred recycle
+
+- kernel stack 释放时不立即把页框归还 allocator。
+- 释放的 kernel stack VA 区间与页框会进入 deferred 状态。
+- 后续复用命中 deferred VA 时，通过 global shootdown 刷新所有 online hart，再统一回收 deferred frame。
+
+### 9. truncate / ftruncate 与 mmap 失效
+
+- `truncate/ftruncate` 缩小时，会先失效相关 file-backed 用户映射，再释放 page cache 页。
+- file-backed `mmap` 成功后会登记 inode 到进程的弱引用反向映射。
+- `fork()` 继承 file-backed VMA 后会补登记子进程。
+- truncate 缩小时会：
+  - 查找曾映射该 inode 的进程
+  - 扫描进程当前 file-backed VMA
+  - 清除新 EOF 之后已经 present 的 PTE
+  - 清零已 present 尾页中 EOF 之后的字节
+  - 锁外执行 TLB shootdown
+  - shootdown 完成后释放旧 page cache/private page 引用
+- 未 present 的 EOF 外页不需要 truncate 当场拆 PTE，后续 fault 会按新的文件长度拒绝装页。
+
+### 10. exec() 旧地址空间 teardown
+
+- `exec()` 现在会先把旧 `memory_set` 摘出来，再显式 `recycle_data_pages_deferred()`
+- 避免旧的 shared/file-backed 映射绕过 teardown，并保证旧页释放发生在 shootdown 之后。
+
+### 11. 调试日志
 
 - 已在以下关键路径加入 DEBUG 日志：
   - file-backed `mmap/munmap`
   - shared write-notify
   - `MAP_PRIVATE` 首次只读接入与首次写物化
   - `fork()` 的私有页共享/COW
+  - TLB shootdown 发起/ack
+  - kernel stack deferred recycle
+  - truncate 触发的 file-backed 映射失效
 
 ## 当前设计中的关键数据结构
 
@@ -109,28 +147,31 @@ TODO:
 - 写回前扫描并清理相关 PTE dirty
 - 写回后按需重新 write-protect
 
-### 2. SMP 下没有远端 TLB shootdown
+### 2. TLB shootdown 仍是第一阶段实现
 
-- 当前只有本 hart `sfence.vma`
-- 以下路径在 SMP 下还不完整：
-  - `fork()` 后父页表降权
-  - private COW fault 切换到新物理页
-  - `munmap/exec/truncate` 之类的映射撤销
-
-TODO:
-- 维护 per-mm 活跃 hart 集合
-- 为权限收紧、unmap、replace 建立 IPI + `sfence.vma` 的远端 shootdown
-
-### 3. truncate / ftruncate 语义未补齐
-
-- 现在只有 `truncate_zero()`
-- 还没有实现任意长度 `truncate`
-- 也没有把 truncate 与 mmap 失效/SIGBUS 完整接起来
+- 当前 address-space shootdown 以 `loaded_user_harts` 为目标集合。
+- 该设计依赖当前 trap 语义：用户态进入内核会切到 kernel satp 并执行本地 `sfence.vma`。
+- 还没有 ASID，也没有按 VA range 精确 flush。
+- `ShootdownKind::AddressSpace` 当前仍退化为本地全量 `sfence.vma`。
 
 TODO:
-- 支持任意长度 truncate
-- 失效超过新 EOF 的缓存页
-- 处理已存在 mmap 页在 truncate 后的行为
+- 引入 ASID 后重新审查 `loaded_user_harts` 语义。
+- 支持按 ASID 或按 VA range 的精确 `sfence.vma`。
+- 评估是否需要 Linux 风格的 `mm_cpumask(mm)`，记录曾经装载过该 mm 的 hart。
+- 为 shootdown 等待路径增加超时/诊断，避免远端 hart 长时间不 ack 时难以定位。
+
+### 3. truncate / ftruncate 仍是保守实现
+
+- 现在已经支持任意长度 truncate，并接入 page cache 与已 present 用户映射失效。
+- 当前 inode 反向映射是 lazy cleanup：
+  - `munmap/exec/exit` 不主动注销 registry entry
+  - truncate 扫描时通过 `Weak<ProcessControlBlock>` 和当前 VMA 二次确认清理失效项
+- registry 粒度是 inode -> process，不是 inode -> VMA/page。
+
+TODO:
+- 如有性能需求，把 registry 改成更精确的 inode -> VMA/page 反向映射。
+- 更精确地区分 partial tail page 的 MAP_SHARED/MAP_PRIVATE 行为和 SIGBUS 行为。
+- 增加 truncate + mmap 并发测试。
 
 ### 4. msync / fsync / sync syscall 入口未补齐
 
@@ -153,12 +194,13 @@ TODO:
 
 ### 6. page cache 仍缺完整文件侧反向映射
 
-- 现在 `direct_cache_pages` 只存在于 VMA 侧
-- page cache 自己还没有 Linux 风格的 `i_mmap` 反查结构
+- 当前已有一个 inode -> process 的弱引用注册表，足够支持 truncate 的保守失效。
+- 还没有 Linux 风格的 `i_mmap`/per-page rmap。
 
 TODO:
-- 为 page cache / inode 增加 file mapping 反向映射
-- 支持 truncate / writeback / invalidate 时从文件页反查用户映射
+- 为 page cache / inode 增加更完整的 file mapping 反向映射。
+- 支持 writeback / invalidate 时从文件页精确反查用户映射。
+- 为 shared dirty 精确闭环提供 per-page 映射扫描能力。
 
 ### 7. reclaim 机制仍是简化版本
 
@@ -182,7 +224,7 @@ TODO:
 ## 建议的后续顺序
 
 1. 先补 `fsync/msync`，把“能标脏”接到“能显式刷回”
-2. 再补 truncate / ftruncate
-3. 然后做 shared dirty 的精确闭环
-4. 再补 SMP TLB shootdown
+2. 做 shared dirty 的精确闭环
+3. 为 truncate + mmap + fork 增加覆盖 SMP 的测试
+4. 引入 ASID/range flush，降低 shootdown 成本
 5. 最后评估是否继续往 Linux 的完整 file rmap / anon_vma 方向推进

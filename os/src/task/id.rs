@@ -2,7 +2,10 @@
 
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE};
+use crate::mm::{
+    defer_release, flush_deferred, needs_flush, online_mask, DeferredUserReclaim,
+    MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
+};
 use crate::sync::{SpinNoIrqLock};
 use alloc::{
     sync::{Arc, Weak},
@@ -84,6 +87,15 @@ pub struct KernelStack(pub usize);
 pub fn kstack_alloc() -> KernelStack {
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
+    if needs_flush(kstack_bottom, kstack_top) {
+        // 复用已 deferred 的 kernel stack VA 前，先做一次全局 shootdown，
+        // 再统一提交此前暂缓归还的页框。
+        debug!(
+            "[tlb] kstack alloc hits deferred range: id={}, bottom={:#x}, top={:#x}",
+            kstack_id, kstack_bottom, kstack_top
+        );
+        flush_deferred(online_mask());
+    }
     KERNEL_SPACE.lock().insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
@@ -96,9 +108,22 @@ impl Drop for KernelStack {
     fn drop(&mut self) {
         let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
-        KERNEL_SPACE
+        let deferred_frames = KERNEL_SPACE
             .lock()
-            .remove_vma_with_start_vpn(kernel_stack_bottom_va.into());
+            .remove_vma_with_start_vpn_deferred(kernel_stack_bottom_va.into());
+        debug!(
+            "[tlb] kstack drop enters deferred state: id={}, bottom={:#x}, frames={}",
+            self.0,
+            kernel_stack_bottom,
+            deferred_frames.len()
+        );
+        // 这里先把拆下来的页框挂到 deferred 容器里；真正的 global TLB flush
+        // 与批量并回 frame allocator 的同步点在下一步接入。
+        defer_release(
+            kernel_stack_bottom,
+            kernel_stack_bottom + KERNEL_STACK_SIZE,
+            deferred_frames,
+        );
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
     }
 }
@@ -183,17 +208,31 @@ impl TaskUserRes {
     fn dealloc_user_res(&self) {
         // dealloc tid
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        // dealloc ustack manually
-        let ustack_bottom_va: VirtAddr = ustack_bottom_from_tid(self.ustack_base, self.tid).into();
-        process_inner
-            .memory_set
-            .remove_vma_with_start_vpn(ustack_bottom_va.into());
-        // dealloc trap_cx manually
-        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
-        process_inner
-            .memory_set
-            .remove_vma_with_start_vpn(trap_cx_bottom_va.into());
+        let reclaim = {
+            let mut process_inner = process.inner_exclusive_access();
+            let token = process_inner.memory_set.token();
+            let mask = process_inner.memory_set.loaded_user_harts();
+            // 用户栈可能在 fork 后与子进程共享 COW 页，不能使用 kernel stack
+            // 专用的独占 frame deferred helper。
+            let ustack_bottom_va: VirtAddr =
+                ustack_bottom_from_tid(self.ustack_base, self.tid).into();
+            let mut release_batch = process_inner
+                .memory_set
+                .remove_vma_with_start_vpn_user_deferred(ustack_bottom_va.into());
+            let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
+            let mut trap_cx_batch = process_inner
+                .memory_set
+                .remove_vma_with_start_vpn_user_deferred(trap_cx_bottom_va.into());
+            release_batch.append(&mut trap_cx_batch);
+            DeferredUserReclaim::new(token, mask, release_batch)
+        };
+        if !reclaim.is_empty() {
+            debug!(
+                "[tlb] task user resource reclaim: tid={}",
+                self.tid
+            );
+        }
+        reclaim.flush_then_release();
     }
 
     #[allow(unused)]
