@@ -1,9 +1,10 @@
 use crate::{
     syscall::errno::ERRNO,
+    syscall::write_bytes_to_user,
     syscall_body,
     config::{PAGE_SIZE, PAGE_SIZE_BITS, TRAP_CONTEXT_BASE},
     mm::{
-        MapPermission,
+        translated_refmut, MapPermission,
         VirtAddr,
     },
     task::{
@@ -11,6 +12,29 @@ use crate::{
         mmap_current_process, munmap_current_process, mprotect_current_process,
     },
 };
+
+use alloc::vec::Vec;
+use core::mem::size_of;
+
+const MPOL_DEFAULT: i32 = 0;
+const MPOL_F_NODE: u32 = 1 << 0;
+const MPOL_F_ADDR: u32 = 1 << 1;
+const MPOL_F_MEMS_ALLOWED: u32 = 1 << 2;
+const GET_MEMPOLICY_SUPPORTED_FLAGS: u32 = MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED;
+
+fn write_ulong_mask_to_user(mask_ptr: *mut u8, maxnode: usize, mask: usize) -> Result<(), ERRNO> {
+    if mask_ptr.is_null() || maxnode == 0 {
+        return Ok(());
+    }
+    let byte_len = maxnode.div_ceil(8);
+    let mut mask_bytes = Vec::new();
+    mask_bytes.resize(byte_len, 0);
+    let usable_bytes = byte_len.min(size_of::<usize>());
+    for (idx, slot) in mask_bytes.iter_mut().take(usable_bytes).enumerate() {
+        *slot = ((mask >> (idx * 8)) & 0xff) as u8;
+    }
+    write_bytes_to_user(mask_ptr, mask_bytes.as_slice())
+}
 
 bitflags! {
     /// mmap syscall flags (the `flags` argument of `sys_mmap`).
@@ -27,9 +51,6 @@ bitflags! {
         const PROT_GROWSUP = 0x02000000;
     }
 }
-
-
-
 /// mmap syscall
 pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
     trace!(
@@ -208,6 +229,15 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
     })
 }
 
+/// change data segment size
+pub fn sys_brk(addr: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_brk",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    current_process().set_program_brk(addr) as isize
+}
+
 /// munmap syscall
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
@@ -244,6 +274,60 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     })
 }
 
+pub fn sys_get_mempolicy(
+    mode: *mut i32,
+    nodemask: *mut u8,
+    maxnode: usize,
+    addr: usize,
+    flags: u32,
+) -> isize {
+    syscall_body!({
+        if flags & !GET_MEMPOLICY_SUPPORTED_FLAGS != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if flags & MPOL_F_MEMS_ALLOWED != 0 {
+            if flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0 {
+                return Err(ERRNO::EINVAL);
+            }
+            if !mode.is_null() {
+                return Err(ERRNO::EINVAL);
+            }
+        } else if flags & MPOL_F_ADDR == 0 && addr != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let token = current_user_token();
+
+        if flags & MPOL_F_MEMS_ALLOWED != 0 {
+            write_ulong_mask_to_user(nodemask, maxnode, 1)?;
+            return Ok(0);
+        }
+
+        if flags & MPOL_F_NODE != 0 {
+            if mode.is_null() {
+                return Err(ERRNO::EINVAL);
+            }
+            translated_refmut(token, mode)
+                .map(|slot| *slot = 0)
+                .ok_or(ERRNO::EFAULT)?;
+            if !nodemask.is_null() {
+                write_ulong_mask_to_user(nodemask, maxnode, 1)?;
+            }
+            return Ok(0);
+        }
+
+        if !mode.is_null() {
+            translated_refmut(token, mode)
+                .map(|slot| *slot = MPOL_DEFAULT)
+                .ok_or(ERRNO::EFAULT)?;
+        }
+        if !nodemask.is_null() {
+            write_ulong_mask_to_user(nodemask, maxnode, 1)?;
+        }
+        Ok(0)
+    })
+}
+
 /// mprotect syscall
 pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
     trace!(
@@ -267,7 +351,7 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
         // If no R/W/X bits are set (e.g., PROT_NONE), treat it as a valid
         // "no access" mapping by using an empty MapPermission, matching
         // Linux semantics used for guard pages.
-        let mut perm = if prot & (MMapProt::PROT_READ.bits()
+        let perm = if prot & (MMapProt::PROT_READ.bits()
             | MMapProt::PROT_WRITE.bits()
             | MMapProt::PROT_EXEC.bits())
             == 0

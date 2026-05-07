@@ -2,10 +2,66 @@
 
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
+use crate::config::MAX_HARTS;
 use crate::trap::TrapContext;
 use crate::{mm::PhysPageNum};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use alloc::sync::{Arc, Weak};
+
+/// Linux-like RT priority range supported by this kernel.
+pub const SCHED_RT_PRIO_MIN: u8 = 1;
+/// Linux-like RT priority range supported by this kernel.
+pub const SCHED_RT_PRIO_MAX: u8 = 99;
+/// Default time slice for SCHED_RR tasks, in timer ticks.
+pub const DEFAULT_TIME_SLICE_TICKS: u32 = 10;
+
+/// Return a mask containing all online harts supported by the kernel.
+pub const fn all_cpu_affinity_mask() -> usize {
+    if MAX_HARTS == 0 {
+        0
+    } else if MAX_HARTS >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1usize << MAX_HARTS) - 1
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+/// Supported scheduling policies for phase 1.
+pub enum SchedPolicy {
+    /// Internal idle context, not exposed as a normal runnable task policy.
+    Idle = 0,
+    /// Linux-like real-time round-robin scheduling.
+    Rr = 2,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+/// In-kernel scheduling attributes inherited by newly created tasks.
+pub struct SchedAttr {
+    /// Scheduling policy.
+    pub policy: SchedPolicy,
+    /// Real-time priority in the range `1..=99`.
+    pub rt_priority: u8,
+    /// Round-robin time slice length in timer ticks.
+    pub time_slice_ticks: u32,
+}
+
+impl SchedAttr {
+    /// Create a round-robin scheduling attribute set with the given RT priority.
+    pub const fn rr(rt_priority: u8) -> Self {
+        Self {
+            policy: SchedPolicy::Rr,
+            rt_priority,
+            time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
+        }
+    }
+}
+
+impl Default for SchedAttr {
+    fn default() -> Self {
+        Self::rr(SCHED_RT_PRIO_MIN)
+    }
+}
 
 /// Task control block structure
 pub struct TaskControlBlock {
@@ -49,6 +105,18 @@ pub struct TaskControlBlockInner {
     pub on_rq: bool,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
+    /// Current scheduling policy.
+    pub policy: SchedPolicy,
+    /// Real-time priority. Larger value means higher priority.
+    pub rt_priority: u8,
+    /// Configured round-robin time slice, in timer ticks.
+    pub time_slice_ticks: u32,
+    /// Remaining time slice budget, in timer ticks.
+    pub remaining_slice_ticks: u32,
+    /// Deferred reschedule request handled at safe scheduling points.
+    pub need_resched: bool,
+    /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
+    pub cpu_affinity_mask: usize,
 }
 
 impl TaskControlBlockInner {
@@ -60,6 +128,18 @@ impl TaskControlBlockInner {
     fn get_status(&self) -> TaskStatus {
         self.task_status
     }
+
+    pub fn sched_attr(&self) -> SchedAttr {
+        SchedAttr {
+            policy: self.policy,
+            rt_priority: self.rt_priority,
+            time_slice_ticks: self.time_slice_ticks,
+        }
+    }
+
+    pub fn reset_time_slice(&mut self) {
+        self.remaining_slice_ticks = self.time_slice_ticks;
+    }
 }
 
 impl TaskControlBlock {
@@ -68,6 +148,7 @@ impl TaskControlBlock {
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
         alloc_user_res: bool,
+        sched_attr: SchedAttr,
     ) -> Self {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
         let trap_cx_ppn = res.trap_cx_ppn();
@@ -87,6 +168,12 @@ impl TaskControlBlock {
                     on_cpu: false,
                     on_rq: false,
                     exit_code: None,
+                    policy: sched_attr.policy,
+                    rt_priority: sched_attr.rt_priority,
+                    time_slice_ticks: sched_attr.time_slice_ticks,
+                    remaining_slice_ticks: sched_attr.time_slice_ticks,
+                    need_resched: false,
+                    cpu_affinity_mask: all_cpu_affinity_mask(),
                 })
             },
         }
