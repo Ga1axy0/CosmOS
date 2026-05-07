@@ -20,16 +20,24 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     );
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
+    let (ustack_base, sched_attr) = {
+        let task_inner = task.inner_exclusive_access();
+        (
+            task_inner.res.as_ref().unwrap().ustack_base,
+            task_inner.sched_attr(),
+        )
+    };
     // create a new thread
     let new_task = Arc::new(TaskControlBlock::new(
         Arc::clone(&process),
-        task.inner_exclusive_access()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base,
+        ustack_base,
         true,
+        sched_attr,
     ));
+    {
+        let affinity_mask = task.inner_exclusive_access().cpu_affinity_mask;
+        new_task.inner_exclusive_access().cpu_affinity_mask = affinity_mask;
+    }
     // add new task to scheduler
     add_task(Arc::clone(&new_task));
     let new_task_inner = new_task.inner_exclusive_access();
