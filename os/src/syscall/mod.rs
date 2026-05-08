@@ -132,6 +132,10 @@ pub const SYSCALL_GETSID: usize = 156;
 pub const SYSCALL_SETSID: usize = 157;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
+/// getrlimit syscall
+pub const SYSCALL_GETRLIMIT: usize = 163;
+/// setrlimit syscall
+pub const SYSCALL_SETRLIMIT: usize = 164;
 /// getrusage syscall
 pub const SYSCALL_GETRUSAGE: usize = 165;
 /// getcpu
@@ -200,6 +204,8 @@ pub const SYSCALL_MPROTECT: usize = 226;
 pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 /// waitpid syscall
 pub const SYSCALL_WAIT4: usize = 260;
+/// prlimit64 syscall
+pub const SYSCALL_PRLIMIT64: usize = 261;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -249,6 +255,7 @@ mod mman;
 mod signal;
 mod times;
 mod utils;
+mod resource;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
@@ -263,6 +270,8 @@ use crate::syscall::random::*;
 use mman::*;
 use signal::*;
 use times::*;
+use resource::*;
+pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use utils::{
     read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_user, Pod,
@@ -387,6 +396,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
+        SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut rlimit),
+        SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const rlimit),
+        SYSCALL_PRLIMIT64 => sys_prlimit64(args[0] as i32, args[1], args[2] as *const rlimit, args[3] as *mut rlimit),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),

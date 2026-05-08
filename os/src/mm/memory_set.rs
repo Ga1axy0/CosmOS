@@ -549,6 +549,14 @@ impl MemorySet {
             }
         }
     }
+    /// 当前进程用户态 VMA 占用的总字节数。
+    pub fn user_vma_bytes(&self) -> usize {
+        self.vmas
+            .values()
+            .filter(|vma| vma.is_user_accessible())
+            .map(|vma| vma.byte_len())
+            .sum()
+    }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -1986,6 +1994,10 @@ impl Vma {
     /// 判断当前区域是否表示某个线程的 Trap 上下文页。
     pub fn is_trap_context(&self) -> bool {
         matches!(self.kind, VmaKind::TrapContext { .. })
+    }
+    /// 返回区域覆盖的字节长度。
+    pub fn byte_len(&self) -> usize {
+        self.end_vpn().0.saturating_sub(self.start_vpn().0) * PAGE_SIZE
     }
     /// 依据权限位判断该区域是否允许用户态直接访问。
     pub fn is_user_accessible(&self) -> bool {

@@ -856,18 +856,6 @@ fn parse_setfl_status(arg: usize) -> Result<FileStatusFlags, ERRNO> {
     Ok(FileStatusFlags::from_bits_truncate(arg))
 }
 
-/// 在 `fd_table` 中分配大于等于 `min_fd` 的最小空闲 fd。
-fn alloc_fd_from(fd_table: &mut Vec<Option<FdEntry>>, min_fd: usize) -> usize {
-    if let Some(fd) = (min_fd..fd_table.len()).find(|fd| fd_table[*fd].is_none()) {
-        return fd;
-    }
-    if min_fd > fd_table.len() {
-        fd_table.resize(min_fd, None);
-    }
-    fd_table.push(None);
-    fd_table.len() - 1
-}
-
 /// `fcntl` 系统调用：处理 fd 标志、文件状态位与描述复制。
 pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
     trace!(
@@ -914,7 +902,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                     return Err(ERRNO::EINVAL);
                 }
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
-                let new_fd = alloc_fd_from(&mut inner.fd_table, min_fd as usize);
+                let new_fd = inner.alloc_fd_from(min_fd as usize)?;
                 inner.fd_table[new_fd] = Some(FdEntry {
                     desc,
                     flags: FdFlags::empty(),
@@ -937,7 +925,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                     return Err(ERRNO::EINVAL);
                 }
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
-                let new_fd = alloc_fd_from(&mut inner.fd_table, min_fd as usize);
+                let new_fd = inner.alloc_fd_from(min_fd as usize)?;
                 inner.fd_table[new_fd] = Some(FdEntry {
                     desc,
                     flags: FdFlags::CLOEXEC,
@@ -1123,7 +1111,7 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             return Err(ERRNO::ENOTDIR);
         }
         let mut inner = process.inner_exclusive_access();
-        let fd = inner.alloc_fd();
+        let fd = inner.alloc_fd()?;
         let desc = Arc::new(FileDescription::new(
             inode,
             open_state.access_mode,
@@ -1231,15 +1219,16 @@ pub fn sys_pipe2(pipefd: *mut i32, _flags: i32) -> isize {
     let token = current_user_token();
     syscall_body!({
         let mut inner = process.inner_exclusive_access();
+        inner.ensure_fd_capacity(2)?;
         let (pipe_read, pipe_write) = make_pipe();
-        let read_fd = inner.alloc_fd();
+        let read_fd = inner.alloc_fd()?;
         inner.fd_table[read_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
             pipe_read,
             AccessMode::ReadOnly,
             FileStatusFlags::empty(),
             0,
         ))));
-        let write_fd = inner.alloc_fd();
+        let write_fd = inner.alloc_fd()?;
         inner.fd_table[write_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
             pipe_write,
             AccessMode::WriteOnly,
@@ -1270,7 +1259,7 @@ pub fn sys_dup(fd: u32) -> isize {
         if inner.fd_table[fd].is_none() {
             return Err(ERRNO::EBADF);
         }
-        let new_fd = inner.alloc_fd();
+        let new_fd = inner.alloc_fd()?;
         let desc = Arc::clone(&inner.fd_table[fd].as_ref().unwrap().desc);
         inner.fd_table[new_fd] = Some(FdEntry {
             desc,
@@ -1302,8 +1291,10 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
             if oldfd == newfd {
                 return Ok(newfd as isize);
             }
-            if newfd >= inner.fd_table.len() {
-                inner.fd_table.resize(newfd + 1, None);
+            let newfd_is_occupied = inner.fd_table.get(newfd).and_then(|slot| slot.as_ref()).is_some();
+            if !newfd_is_occupied {
+                let allocated = inner.alloc_fd_from(newfd)?;
+                debug_assert_eq!(allocated, newfd);
             }
             // 先把旧 `newfd` 表项拿出来，等离开进程自旋锁后再 drop。
             replaced_entry = inner.take_fd(newfd);
