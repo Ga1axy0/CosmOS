@@ -118,6 +118,8 @@ pub const SYSCALL_SIGSUSPEND: usize = 133;
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
 pub const SYSCALL_SIGPROCMASK: usize = 135;
+/// rt_sigtimedwait_time32 syscall
+pub const SYSCALL_RT_SIGTIMEDWAIT_TIME32: usize = 137;
 /// sigreturn syscall
 pub const SYSCALL_SIGRETURN: usize = 139;
 /// set priority syscall
@@ -380,7 +382,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
-        SYSCALL_YIELD => sched::sys_yield(),
+        SYSCALL_YIELD => sys_yield(),
         SYSCALL_GETSID => sys_getsid(),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
@@ -445,7 +447,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
         SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
-        SYSCALL_BRK => mman::sys_brk(args[0]),
+        SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
@@ -482,6 +484,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
         SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u32, args[1]),
+        SYSCALL_RT_SIGTIMEDWAIT_TIME32 => sys_rt_sigtimedwait_time32(
+            args[0] as *const u32,
+            args[1] as *mut crate::task::SigInfo,
+            args[2] as *const OldTimespec32,
+            args[3],
+        ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),

@@ -216,6 +216,8 @@ pub enum WaitReason {
     SocketWritable,
     /// Waiting for signal delivery in sigsuspend.
     SignalSuspend,
+    /// Waiting for one of a selected signal set in sigtimedwait.
+    SignalTimedWait,
 }
 
 #[derive(Copy, Clone, PartialEq)]
