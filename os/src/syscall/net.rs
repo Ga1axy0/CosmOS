@@ -311,13 +311,14 @@ fn parse_send_ancillary(control_bytes: &[u8]) -> Result<UnixSocketAncillaryData,
     Ok(ancillary)
 }
 
-fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> Vec<i32> {
+fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> Result<Vec<i32>, ERRNO> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let mut out = Vec::with_capacity(rights.len());
+    inner.ensure_fd_capacity(rights.len())?;
 
     for desc in rights {
-        let fd = inner.alloc_fd();
+        let fd = inner.alloc_fd()?;
         let mut entry = FdEntry::new(desc);
         if cloexec {
             entry.flags |= FdFlags::CLOEXEC;
@@ -325,7 +326,7 @@ fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> 
         inner.fd_table[fd] = Some(entry);
         out.push(fd as i32);
     }
-    out
+    Ok(out)
 }
 
 fn with_udp_socket<R>(fd: usize, f: impl FnOnce(&UdpSocketFile) -> Result<R, ERRNO>) -> Result<R, ERRNO> {
@@ -450,7 +451,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let fd = inner.alloc_fd();
+        let fd = inner.alloc_fd()?;
         inner.fd_table[fd] = Some(FdEntry::new(desc));
         Ok(fd as isize)
     })
@@ -506,15 +507,15 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-
-        let fd0 = inner.alloc_fd();
+        inner.ensure_fd_capacity(2)?;
+        let fd0 = inner.alloc_fd()?;
         let mut entry0 = FdEntry::new(desc0);
         if cloexec {
             entry0.flags |= FdFlags::CLOEXEC;
         }
         inner.fd_table[fd0] = Some(entry0);
 
-        let fd1 = inner.alloc_fd();
+        let fd1 = inner.alloc_fd()?;
         let mut entry1 = FdEntry::new(desc1);
         if cloexec {
             entry1.flags |= FdFlags::CLOEXEC;
@@ -590,7 +591,7 @@ pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let new_fd = inner.alloc_fd();
+        let new_fd = inner.alloc_fd()?;
         inner.fd_table[new_fd] = Some(FdEntry::new(accepted_desc));
         drop(inner);
 
@@ -1080,7 +1081,7 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
             let rights_payload_len = ancillary.rights.len() * size_of::<i32>();
             let need = cmsg_align(size_of::<CmsgHdr>() + rights_payload_len);
             if used + need <= control_cap {
-                let received_fds = install_received_rights(ancillary.rights, cloexec);
+                let received_fds = install_received_rights(ancillary.rights, cloexec)?;
                 let mut payload = Vec::with_capacity(received_fds.len() * size_of::<i32>());
                 for fd in received_fds {
                     payload.extend_from_slice(&fd.to_ne_bytes());

@@ -150,6 +150,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             // Linux-style mmap(NULL, ...): choose a free user VA automatically.
             let (chosen, chosen_end, hint) = {
                 let mut inner = process.inner_exclusive_access();
+                inner.ensure_address_space_capacity(len_aligned)?;
                 let hint = inner.vm_layout.mmap_hint;
                 let base = inner.vm_layout.mmap_base;
                 let chosen = inner
