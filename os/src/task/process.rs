@@ -1,4 +1,5 @@
 //! Implementation of  [`ProcessControlBlock`]
+#![allow(deprecated)]
 
 use super::id::RecycleAllocator;
 use super::runqueue::insert_into_pid2process;
@@ -42,51 +43,102 @@ pub struct FdEntry {
 }
 
 impl FdEntry {
-
-            let heap_start = VirtAddr::from(inner.vm_layout.start_brk);
-            let new_brk_va = VirtAddr::from(new_brk);
-            let old_brk_va = VirtAddr::from(old_brk);
-            let old_end_vpn = old_brk_va.ceil();
-            let new_end_vpn = new_brk_va.ceil();
-            let mut batch = None;
-
-            if new_brk > old_brk {
-                let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
-                    || inner.memory_set.register_vma_metadata(Vma::new_heap(
-                        heap_start,
-                        new_brk_va,
-                        MapPermission::R | MapPermission::W | MapPermission::U,
-                    ));
-                if !success {
-                    return old_brk;
-                }
-            } else if new_brk == inner.vm_layout.start_brk {
-                batch = Some(inner
-                    .memory_set
-                    .remove_vma_with_start_vpn_user_deferred(heap_start.floor()));
-            } else if old_end_vpn != new_end_vpn {
-                let Some(shrink_batch) = inner.memory_set.shrink_to_deferred(heap_start, new_brk_va) else {
-                    return old_brk;
-                };
-                batch = Some(shrink_batch);
-            }
-
-            inner.vm_layout.brk = new_brk;
-            let reclaim = batch.map(|batch| {
-                // 锁内快照仍在用户态运行该 mm 的 hart，锁外等待 shootdown ack。
-                DeferredUserReclaim::new(
-                    inner.memory_set.token(),
-                    inner.memory_set.loaded_user_harts(),
-                    batch,
-                )
-            });
-            (new_brk, reclaim)
-        };
-        if let Some(reclaim) = reclaim {
-            reclaim.flush_then_release();
+    /// 基于文件对象创建默认 fd 表项。
+    pub fn new(desc: Arc<FileDescription>) -> Self {
+        Self {
+            desc,
+            // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
+            flags: FdFlags::empty(),
         }
-        result_brk
     }
+}
+
+/// Process termination reason preserved for wait4/waitpid encoding.
+#[derive(Debug, Clone, Copy)]
+pub enum ExitReason {
+    /// Process terminated via `exit(code)`.
+    Exit(i32),
+    /// Process terminated by a signal number.
+    Signal(u32),
+}
+
+/// Process Control Block
+pub struct ProcessControlBlock {
+    /// immutable
+    pub pid: PidHandle,
+    /// mutable
+    inner: SpinNoIrqLock<ProcessControlBlockInner>,
+    pub wait_exit_queue: Arc<WaitQueue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Credentials {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sid: u32,
+}
+
+impl Credentials {
+    pub const fn root() -> Self {
+        Self {
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            sid: 0,
+        }
+    }
+}
+
+/// Inner of Process Control Block
+pub struct ProcessControlBlockInner {
+    /// is zombie?
+    pub is_zombie: bool,
+    /// memory set(address space)
+    pub memory_set: MemorySet,
+    /// process virtual memory layout metadata
+    pub vm_layout: ProcessVmLayout,
+    /// parent process
+    pub parent: Option<Weak<ProcessControlBlock>>,
+    /// children process
+    pub children: Vec<Arc<ProcessControlBlock>>,
+    /// exit reason observed by wait4/waitpid
+    pub exit_reason: ExitReason,
+    /// file descriptor table
+    pub fd_table: Vec<Option<FdEntry>>,
+    /// pending process signals
+    pub pending_signals: SignalFlags,
+    /// blocked process signals
+    pub signal_mask: SignalFlags,
+    /// installed signal actions
+    pub signal_actions: SignalActions,
+    /// tasks(also known as threads)
+    pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
+    /// task resource allocator
+    pub task_res_allocator: RecycleAllocator,
+    /// mutex list
+    pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
+    /// semaphore list
+    pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
+    /// condvar list
+    pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock_enabled
+    pub deadlock_enabled: bool,
+    /// deadlock detector for mutex resources
+    pub mutex_detector: DeadlockDetector,
+    /// deadlock detector for semaphore resources
+    pub semaphore_detector: DeadlockDetector,
+    /// current working directory (absolute path)
+    pub cwd: String,
+    /// process credentials
+    pub cred: Credentials,
+    /// CPU time spent in user mode for this process (raw timer counter units)
+    pub user_time: usize,
+    /// CPU time spent in kernel mode for this process (raw timer counter units)
+    pub kernel_time: usize,
+    /// waited-for children's aggregated user time (raw timer counter units)
     pub child_user_time: usize,
     /// waited-for children's aggregated kernel time (raw timer counter units)
     pub child_kernel_time: usize,
@@ -104,10 +156,10 @@ impl FdEntry {
     pub robust_list: RobustList,
 }
 
-    pub struct RobustList {
-        pub head: usize,
-        pub len: usize,
-    }
+pub struct RobustList {
+    pub head: usize,
+    pub len: usize,
+}
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum CpuAccountingState {
@@ -269,8 +321,7 @@ impl ProcessControlBlock {
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
-            inner: unsafe {
-                SpinNoIrqLock::new(ProcessControlBlockInner {
+            inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
@@ -301,8 +352,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
-                })
-            },
+                }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
@@ -614,8 +664,7 @@ impl ProcessControlBlock {
         // create child process pcb
         let child = Arc::new(Self {
             pid,
-            inner: unsafe {
-                SpinNoIrqLock::new(ProcessControlBlockInner {
+            inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
@@ -646,8 +695,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
-                })
-            },
+                }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
         // add child
@@ -726,8 +774,7 @@ impl ProcessControlBlock {
         }
         let child = Arc::new(Self {
             pid,
-            inner: unsafe {
-                SpinNoIrqLock::new(ProcessControlBlockInner {
+            inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
@@ -758,8 +805,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
-                })
-            },
+                }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
         parent.children.push(Arc::clone(&child));

@@ -164,7 +164,6 @@ pub fn sys_getpid() -> isize {
     trace!(
         "kernel: sys_getpid pid:{}",
         current_task().unwrap().process.upgrade().unwrap().getpid()
-}
     );
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
 }

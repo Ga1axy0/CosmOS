@@ -51,7 +51,7 @@ pub struct ElfLoadInfo {
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
     pub static ref KERNEL_SPACE: Arc<SpinNoIrqLock<MemorySet>> =
-        Arc::new(unsafe { SpinNoIrqLock::new(MemorySet::new_kernel()) });
+        Arc::new(SpinNoIrqLock::new(MemorySet::new_kernel()));
     /// file-backed mmap 的反向映射注册表，用于 truncate 时找到需要失效的用户页表。
     static ref FILE_MAPPING_REGISTRY: SpinNoIrqLock<Vec<FileMappingEntry>> =
         SpinNoIrqLock::new(Vec::new());
@@ -368,10 +368,8 @@ impl MemorySet {
     /// 根据起始虚拟页号删除一段已经登记的区域。
     pub fn remove_vma_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some(mut area) = self.vmas.remove(&start_vpn) {
-            area.teardown(&mut self.page_table);
-            unsafe {
-                asm!("sfence.vma");
-            }
+            let _ = area.teardown_deferred(&mut self.page_table);
+            self.finish_deferred_page_table_edit();
         }
     }
     /// 判断给定区间是否与当前地址空间中的任意区域重叠。
@@ -891,7 +889,7 @@ impl MemorySet {
     /// Remove all VMAs
     pub fn recycle_data_pages(&mut self) {
         for area in self.vmas.values_mut() {
-            area.teardown(&mut self.page_table);
+            let _ = area.teardown_deferred(&mut self.page_table);
         }
         self.vmas.clear();
         unsafe {
@@ -982,7 +980,7 @@ impl MemorySet {
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self.vmas.get_mut(&start.floor()) {
-            area.shrink_to(&mut self.page_table, new_end.ceil());
+            area.shrink_present_to(&mut self.page_table, new_end.ceil());
             true
         } else {
             false
@@ -1619,7 +1617,7 @@ impl MemorySet {
             if overlap_start >= overlap_end {
                 continue;
             }
-            if let Some((last_start, last_end)) = user_ranges.last_mut() {
+            if let Some((_, last_end)) = user_ranges.last_mut() {
                 // Merge adjacent overlaps to keep the list compact.
                 if *last_end == overlap_start {
                     *last_end = overlap_end;
@@ -2091,6 +2089,23 @@ impl Vma {
             if let Some(page) = self.data_frames.remove(&vpn) {
                 batch.push_private(page);
             }
+        }
+        let _ = page_table.clear(vpn);
+    }
+    /// 按当前实际映射状态拆除单页映射，不保留旧页对象。
+    pub(crate) fn unmap_present_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+        if let Some(page) = self.direct_cache_pages.remove(&vpn) {
+            let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
+            if let Some(old_pte) = page_table.clear(vpn) {
+                if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
+                    mark_cached_page_dirty(&page);
+                }
+            }
+            release_mapped_page(&page);
+            return;
+        }
+        if self.map_type == MapType::Framed {
+            let _ = self.data_frames.remove(&vpn);
         }
         let _ = page_table.clear(vpn);
     }

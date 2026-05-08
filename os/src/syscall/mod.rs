@@ -380,7 +380,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
-        SYSCALL_YIELD => sys_yield(),
+        SYSCALL_YIELD => sched::sys_yield(),
         SYSCALL_GETSID => sys_getsid(),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
@@ -445,7 +445,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
         SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
-        SYSCALL_BRK => sys_brk(args[0]),
+        SYSCALL_BRK => mman::sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
