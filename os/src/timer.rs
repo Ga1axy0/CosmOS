@@ -8,6 +8,7 @@ use crate::config::MAX_HARTS;
 use crate::drivers::rtc;
 use crate::hart::hartid;
 use crate::poll::{self, PollTimerTag};
+use crate::signal::{handle_signal_wait_timeout, SignalTimerTag};
 use crate::sbi::set_timer;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
@@ -112,8 +113,15 @@ pub struct TimerCondVar {
     pub expire_ms: usize,
     /// The task to be woken up when the timer expires
     pub task: Arc<TaskControlBlock>,
-    /// Optional poll timeout identity used to validate stale timer entries.
-    pub(crate) poll_tag: Option<PollTimerTag>,
+    /// Optional timeout identity for specialized timer wakeup paths.
+    pub(crate) timer_tag: Option<TimerTagKind>,
+}
+
+/// Specialized timeout identity stored in timer heap entries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TimerTagKind {
+    Poll(PollTimerTag),
+    Signal(SignalTimerTag),
 }
 
 impl PartialEq for TimerCondVar {
@@ -153,7 +161,7 @@ fn timer_hart_for_task(task: &Arc<TaskControlBlock>) -> usize {
 
 /// Add a timer
 pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
-    add_timer_with_poll_tag(expire_ms, task, None);
+    add_timer_with_tag(expire_ms, task, None);
 }
 
 /// Add a timer with an optional poll timeout identity.
@@ -161,6 +169,23 @@ pub(crate) fn add_timer_with_poll_tag(
     expire_ms: usize,
     task: Arc<TaskControlBlock>,
     poll_tag: Option<PollTimerTag>,
+) {
+    add_timer_with_tag(expire_ms, task, poll_tag.map(TimerTagKind::Poll));
+}
+
+/// Add a timer with an optional sigtimedwait timeout identity.
+pub(crate) fn add_timer_with_signal_tag(
+    expire_ms: usize,
+    task: Arc<TaskControlBlock>,
+    signal_tag: Option<SignalTimerTag>,
+) {
+    add_timer_with_tag(expire_ms, task, signal_tag.map(TimerTagKind::Signal));
+}
+
+fn add_timer_with_tag(
+    expire_ms: usize,
+    task: Arc<TaskControlBlock>,
+    timer_tag: Option<TimerTagKind>,
 ) {
     trace!(
         "kernel:pid[{}] add_timer",
@@ -171,7 +196,7 @@ pub(crate) fn add_timer_with_poll_tag(
     timers.push(TimerCondVar {
         expire_ms,
         task,
-        poll_tag,
+        timer_tag,
     });
 }
 
@@ -200,9 +225,18 @@ pub fn check_timer() {
     let mut timers = PER_CPU_TIMERS[normalize_hart(hartid())].lock();
     while let Some(timer) = timers.peek() {
         if timer.expire_ms <= current_ms {
-            if let Some(tag) = timer.poll_tag {
-                if poll::handle_poll_timeout(tag, &timer.task) {
-                    timers.pop();
+            if let Some(tag) = timer.timer_tag {
+                match tag {
+                    TimerTagKind::Poll(poll_tag) => {
+                        if poll::handle_poll_timeout(poll_tag, &timer.task) {
+                            timers.pop();
+                        }
+                    }
+                    TimerTagKind::Signal(signal_tag) => {
+                        if handle_signal_wait_timeout(signal_tag, &timer.task) {
+                            timers.pop();
+                        }
+                    }
                 }
                 continue;
             }

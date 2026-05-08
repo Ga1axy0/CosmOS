@@ -153,12 +153,6 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
     sys_exit(exit_code);
 }
 
-/// yield syscall
-pub fn sys_yield() -> isize {
-    //trace!("kernel: sys_yield");
-    suspend_current_and_run_next();
-    0
-}
 /// getpid syscall
 pub fn sys_getpid() -> isize {
     trace!(
@@ -449,15 +443,6 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
         add_signal_to_process(&process, flag);
         Ok(0)
     })
-}
-
-/// change data segment size
-pub fn sys_brk(addr: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_brk",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    current_process().set_program_brk(addr) as isize
 }
 
 /// spawn syscall

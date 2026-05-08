@@ -7,9 +7,16 @@ use crate::{
 
 mod action;
 mod signals;
+mod wait;
 
 pub use action::{MContext, SigInfo, StackT, UContext, SignalAction, SignalActions};
 pub use signals::{SignalFlags, MAX_SIG};
+pub(crate) use wait::{
+    cleanup_signal_wait, cleanup_signal_wait_for_task, handle_signal_wait_timeout,
+    has_pending_signal_in_set, has_unmasked_pending_signal, notify_signal_wait_pid,
+    register_signal_wait, signal_wait_should_skip, signal_wait_state, take_pending_signal_in_set,
+    SignalTimerTag, SignalWaitHandle, SignalWakeState,
+};
 
 bitflags! {
     /// Signal action flags (`sa_flags`) used by `rt_sigaction`.

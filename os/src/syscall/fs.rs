@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use core::{mem::size_of, slice};
 use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
 use crate::task::SignalFlags;
+use crate::syscall::OldTimespec32;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
 #[derive(Clone, Copy, Debug)]
@@ -45,13 +46,7 @@ pub struct PollFd {
     revents: i16,
 }
 
-/// Linux 旧 ABI 中 `ppoll_time32` 使用的 32 位 `timespec`。
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct OldTimespec32 {
-    tv_sec: i32,    // seconds
-    tv_nsec: i32,   // nanoseconds
-}
+
 
 const POLLIN: u16 = 0x001;  // readable
 const POLLPRI: u16 = 0x002; // urgent data / exceptional condition

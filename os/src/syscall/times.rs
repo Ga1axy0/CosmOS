@@ -83,6 +83,16 @@ pub struct Timespec {
 
 impl Pod for Timespec {}
 
+/// 32-bit timespec used by legacy *_time32 syscalls (tv_sec/tv_nsec are signed 32-bit)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct OldTimespec32 {
+    pub tv_sec: i32,
+    pub tv_nsec: i32,
+}
+
+impl Pod for OldTimespec32 {}
+
 #[repr(C)]
 pub struct Tms {
     pub tms_utime: usize,
