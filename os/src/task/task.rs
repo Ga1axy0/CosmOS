@@ -158,37 +158,28 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();
         let kstack_top = kstack.get_top();
-        Self {
-            process: Arc::downgrade(&process),
-            kstack,
-            inner: unsafe {
-                SpinNoIrqLock::new(TaskControlBlockInner {
-                    res: Some(res),
-                    trap_cx_ppn,
-                    task_cx: TaskContext::goto_trap_return(kstack_top),
-                    task_status: TaskStatus::Runnable,
-                    wait_reason: None,
-                    last_cpu: 0,
-                    on_cpu: false,
-                    on_rq: false,
-                    exit_code: None,
-                    policy: sched_attr.policy,
-                    rt_priority: sched_attr.rt_priority,
-                    time_slice_ticks: sched_attr.time_slice_ticks,
-                    remaining_slice_ticks: sched_attr.time_slice_ticks,
-                    need_resched: false,
-                    cpu_affinity_mask: all_cpu_affinity_mask(),
-                    current_wq_handle: None,
-                    policy: sched_attr.policy,
-                    rt_priority: sched_attr.rt_priority,
-                    time_slice_ticks: sched_attr.time_slice_ticks,
-                    remaining_slice_ticks: sched_attr.time_slice_ticks,
-                    need_resched: false,
-                    cpu_affinity_mask: all_cpu_affinity_mask(),
-                    current_wq_handle: None,
-                })
-            },
-        }
+            Self {
+                process: Arc::downgrade(&process),
+                kstack,
+                inner: SpinNoIrqLock::new(TaskControlBlockInner {
+                        res: Some(res),
+                        trap_cx_ppn,
+                        task_cx: TaskContext::goto_trap_return(kstack_top),
+                        task_status: TaskStatus::Runnable,
+                        wait_reason: None,
+                        last_cpu: 0,
+                        on_cpu: false,
+                        on_rq: false,
+                        exit_code: None,
+                        policy: sched_attr.policy,
+                        rt_priority: sched_attr.rt_priority,
+                        time_slice_ticks: sched_attr.time_slice_ticks,
+                        remaining_slice_ticks: sched_attr.time_slice_ticks,
+                        need_resched: false,
+                        cpu_affinity_mask: all_cpu_affinity_mask(),
+                        current_wq_handle: None,
+                    }),
+            }
     }
 }
 
