@@ -242,13 +242,13 @@ impl FrameAllocator for BuddyFrameAllocator {
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
-        trace!(
-            "FrameAllocator: Used {} | PageCache {} | Free {} | Kernel heap {}",
-            self.allocated_pages,
-            PAGE_CACHE_MANAGER.lock().cached_pages,
-            self.free_pages,
-            KERNEL_HEAP_BYTES.load(Ordering::Acquire) / PAGE_SIZE
-        );
+        // trace!(
+        //     "FrameAllocator: Used {} | PageCache {} | Free {} | Kernel heap {}",
+        //     self.allocated_pages,
+        //     PAGE_CACHE_MANAGER.lock().cached_pages,
+        //     self.free_pages,
+        //     KERNEL_HEAP_BYTES.load(Ordering::Acquire) / PAGE_SIZE
+        // );
         self.alloc_order(0)
     }
     fn dealloc(&mut self, ppn: PhysPageNum) {
