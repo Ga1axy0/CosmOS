@@ -6,6 +6,7 @@ use core::cmp::min;
 use core::sync::atomic::Ordering;
 
 use smoltcp::socket::udp as udp_socket;
+use smoltcp::socket::udp::SendError;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
@@ -177,8 +178,11 @@ impl UdpSocketFile {
                         return Ok(data.len());
                     }
                     Err(e) => {
-                        warn!("udp send_slice failed for socket {:?}: {:?}", self.st.handle, e);
-                        return Err(ERRNO::ENOBUFS);
+                        error!("udp send_slice failed for socket {:?}: {:?}, ep = {}", self.st.handle, e, ep);
+                        return match e {
+                            SendError::Unaddressable => Err(ERRNO::EHOSTUNREACH),
+                            SendError::BufferFull => Err(ERRNO::ENOBUFS),
+                        };
                     }
                 }
             }
