@@ -200,6 +200,8 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// madvise syscall
+pub const SYSCALL_MADVISE: usize = 233;
 /// get_mempolicy syscall
 pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 /// waitpid syscall
@@ -441,6 +443,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *mut i32,
         ),
         SYSCALL_SHUTDOWN => sys_shutdown(args[0] as i32, args[1] as i32),
+        SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2] as i32),
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
