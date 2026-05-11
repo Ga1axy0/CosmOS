@@ -13,7 +13,7 @@ use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
     block_current_and_run_next, current_process, current_task, current_user_token, FdEntry,
-    FdFlags, WaitReason,
+    FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
@@ -183,8 +183,30 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
 
 fn has_unmasked_pending_signal() -> bool {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    !(inner.pending_signals & !inner.signal_mask).is_empty()
+    let mut inner = process.inner_exclusive_access();
+    let pending = inner.pending_signals & !inner.signal_mask;
+
+    for signum in 1..=crate::task::MAX_SIG {
+        let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
+            continue;
+        };
+        if !pending.contains(flag) {
+            continue;
+        }
+
+        let action = inner.signal_actions.table[signum];
+        if action.handler == SIG_IGN {
+            inner.pending_signals &= !flag;
+            continue;
+        }
+        if action.handler == SIG_DFL && flag.check_error().is_none() {
+            inner.pending_signals &= !flag;
+            continue;
+        }
+        return true;
+    }
+
+    false
 }
 
 fn parse_timeout_ms(token: usize, tmo_p: *const OldTimespec32) -> Result<Option<usize>, ERRNO> {
