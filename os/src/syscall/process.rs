@@ -272,7 +272,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage { elf_data, argv } = resolved;
         let argc = argv.len();
-        process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
+        process.exec(elf_data.as_slice(), argv)?;
         // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
         Ok(argc as isize)
     })
