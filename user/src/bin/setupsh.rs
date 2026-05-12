@@ -3,16 +3,18 @@
 
 #[macro_use]
 extern crate user_lib;
+extern crate alloc;
 
+use alloc::string::String;
 use core::ptr;
 
-use user_lib::{exec, exit, fork, link, mkdir, unlink, waitpid};
+use user_lib::{OpenFlags, close, exec, exit, fork, getdents64, link, mkdir, open, unlink, waitpid};
 
 const EEXIST: isize = -17;
-const ENOENT: isize = -2;
 
 const BIN_DIR: &str = "/bin";
 const BIN_DIR_CSTR: &str = "/bin\0";
+const LIB_DIR: &str = "/lib";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const ROOT_BUSYBOX: &str = "/busybox";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
@@ -23,6 +25,8 @@ const INSTALL_ARG_CSTR: &str = "--install\0";
 const PROC_DIR: &str = "/proc";
 const PROC_SELF_DIR: &str = "/proc/self";
 const PROC_SELF_EXE: &str = "/proc/self/exe";
+const DENTS_BUF_SIZE: usize = 4096;
+const DT_DIR: u8 = 4;
 
 /// BusyBox 所属的 libc 版本。
 #[derive(Copy, Clone)]
@@ -74,6 +78,14 @@ impl BusyBoxLibc {
             Self::Glibc => "glibc",
         }
     }
+
+    /// 返回运行库所在目录。
+    fn lib_dir(self) -> &'static str {
+        match self {
+            Self::Musl => "/musl/lib",
+            Self::Glibc => "/glibc/lib",
+        }
+    }
 }
 
 /// 运行一个外部程序并等待其退出。
@@ -118,17 +130,112 @@ fn ensure_dir(path: &str) -> bool {
 
 /// 用硬链接创建一个稳定入口；若目标已存在则先删除再重建。
 fn ensure_hard_link(src: &str, dst: &str) -> bool {
-    let unlink_ret = unlink(dst);
-    if unlink_ret != 0 && unlink_ret != ENOENT {
-        println!("[setupsh] unlink {} failed: {}", dst, unlink_ret);
-        return false;
-    }
-
     let link_ret = link(src, dst);
-    if link_ret != 0 {
+    if link_ret == 0 {
+        return true;
+    }
+    if link_ret != EEXIST {
         println!("[setupsh] link {} -> {} failed: {}", dst, src, link_ret);
         return false;
     }
+
+    let unlink_ret = unlink(dst);
+    if unlink_ret != 0 {
+        println!("[setupsh] unlink {} failed: {}", dst, unlink_ret);
+        return false;
+    }
+    let relink_ret = link(src, dst);
+    if relink_ret != 0 {
+        println!("[setupsh] link {} -> {} failed: {}", dst, src, relink_ret);
+        return false;
+    }
+    true
+}
+
+/// 拼接目录与文件名，返回完整路径。
+fn join_path(dir: &str, name: &str) -> String {
+    let mut path = String::from(dir);
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(name);
+    path
+}
+
+/// 安装一条同名运行库硬链接。
+fn install_lib_link(src: &str, dst: &str) -> bool {
+    let link_ret = link(src, dst);
+    if link_ret == 0 {
+        return true;
+    }
+    if link_ret != EEXIST {
+        println!("[setupsh] link {} -> {} failed: {}", dst, src, link_ret);
+        return false;
+    }
+
+    let unlink_ret = unlink(dst);
+    if unlink_ret != 0 {
+        println!("[setupsh] unlink {} failed: {}", dst, unlink_ret);
+        return false;
+    }
+    let relink_ret = link(src, dst);
+    if relink_ret != 0 {
+        println!("[setupsh] link {} -> {} failed: {}", dst, src, relink_ret);
+        return false;
+    }
+    true
+}
+
+/// 按所选 libc 扫描运行库目录，并在 `/lib` 下创建同名硬链接。
+fn install_runtime_libs(libc: BusyBoxLibc) -> bool {
+    if !ensure_dir(LIB_DIR) {
+        return false;
+    }
+    let src_dir = libc.lib_dir();
+    let fd = open(src_dir, OpenFlags::RDONLY | OpenFlags::DIRECTORY);
+    if fd < 0 {
+        println!("[setupsh] open {} failed: {}", src_dir, fd);
+        return false;
+    }
+
+    let mut buf = [0u8; DENTS_BUF_SIZE];
+    loop {
+        let nread = getdents64(fd as usize, &mut buf);
+        if nread < 0 {
+            println!("[setupsh] getdents64 {} failed: {}", src_dir, nread);
+            close(fd as usize);
+            return false;
+        }
+        if nread == 0 {
+            break;
+        }
+
+        let mut pos = 0usize;
+        let nread = nread as usize;
+        while pos + 19 <= nread {
+            let reclen = u16::from_le_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            if reclen == 0 || pos + reclen > nread {
+                break;
+            }
+            let dtype = buf[pos + 18];
+            let name_field = &buf[pos + 19..pos + reclen];
+            let name_len = name_field.iter().position(|&b| b == 0).unwrap_or(name_field.len());
+            if name_len > 0 {
+                if let Ok(name) = core::str::from_utf8(&name_field[..name_len]) {
+                    if name != "." && name != ".." && dtype != DT_DIR {
+                        let src = join_path(src_dir, name);
+                        let dst = join_path(LIB_DIR, name);
+                        if !install_lib_link(src.as_str(), dst.as_str()) {
+                            close(fd as usize);
+                            return false;
+                        }
+                    }
+                }
+            }
+            pos += reclen;
+        }
+    }
+    close(fd as usize);
     true
 }
 
@@ -144,7 +251,7 @@ fn ensure_proc_self_exe() -> bool {
 
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 5;
+    const TOTAL_STEPS: usize = 6;
 
     let busybox_libc = match BusyBoxLibc::from_args(argv) {
         Some(libc) => libc,
@@ -159,7 +266,12 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(2, TOTAL_STEPS, "install busybox applets into /bin");
+    print_step(2, TOTAL_STEPS, "install runtime libraries into /lib");
+    if !install_runtime_libs(busybox_libc) {
+        return 1;
+    }
+
+    print_step(3, TOTAL_STEPS, "install busybox applets into /bin");
     let install_argv = [
         busybox_path_cstr.as_ptr(),
         INSTALL_ARG_CSTR.as_ptr(),
@@ -173,17 +285,17 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return install_exit;
     }
 
-    print_step(3, TOTAL_STEPS, "create /busybox hard link");
+    print_step(4, TOTAL_STEPS, "create /busybox hard link");
     if !ensure_hard_link(busybox_path, ROOT_BUSYBOX) {
         return 1;
     }
 
-    print_step(4, TOTAL_STEPS, "prepare temporary /proc/self/exe");
+    print_step(5, TOTAL_STEPS, "prepare temporary /proc/self/exe");
     if !ensure_proc_self_exe() {
         return 1;
     }
 
-    print_step(5, TOTAL_STEPS, "launch /bin/sh");
+    print_step(6, TOTAL_STEPS, "launch /bin/sh");
     let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
     let shell_exit = spawn_and_wait(BIN_SH_CSTR, &shell_argv);
     println!("[setupsh] /bin/sh exited with {}", shell_exit);

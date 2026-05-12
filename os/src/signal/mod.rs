@@ -84,6 +84,17 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
 
                 // User-defined handler
                 if action.handler > 1 {
+                     if flag.contains(SignalFlags::SIGCHLD)
+                        && action.sa_flags & SaFlags::SA_RESTORER.bits() == 0
+                    {
+                        // TODO: 补充用户态 signal trampoline 后再完整执行无 restorer 的 SIGCHLD handler。
+                        process_inner.pending_signals &= !flag;
+                        warn!(
+                            "check_signals: signum={} has handler={:#x} but no restorer, ignored",
+                            signum, action.handler
+                        );
+                        continue;
+                    }
                     process_inner.pending_signals &= !flag;
                     debug!(
                         "check_signals: signum={} dispatching to handler={:#x}, flags={:#x}",
