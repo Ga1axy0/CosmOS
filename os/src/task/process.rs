@@ -492,7 +492,7 @@ impl ProcessControlBlock {
         drop(task_inner);
         let user_sp = init_user_stack(process.inner_exclusive_access().get_user_token(), ustack_top, &["initproc"]);
         *trap_cx = TrapContext::app_init_context(
-            final_entry,
+            entry_point,
             user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
@@ -687,7 +687,7 @@ impl ProcessControlBlock {
         trap_cx.x[11] = 0;
         debug!(
             "kernel: exec trap init entry={:#x} sp={:#x} a0={:#x} a1={:#x}",
-            entry_point,
+            final_entry,
             user_sp,
             trap_cx.x[10],
             trap_cx.x[11]
