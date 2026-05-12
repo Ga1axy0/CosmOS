@@ -16,6 +16,7 @@ extern crate bitflags;
 
 use alloc::{string::String, vec::Vec};
 use buddy_system_allocator::LockedHeap;
+use core::arch::global_asm;
 pub use console::{flush, STDIN, STDOUT};
 pub use syscall::*;
 
@@ -46,14 +47,26 @@ fn clear_bss() {
     }
 }
 
+global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+_start:
+    mv a0, sp
+    call __user_start
+"#
+);
+
+/// 用户程序入口：从 Linux ABI 初始栈解析 argc/argv 后调用 main。
 #[no_mangle]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+pub extern "C" fn __user_start(user_sp: usize) -> ! {
     clear_bss();
     unsafe {
         HEAP.lock()
             .init(HEAP_SPACE.as_ptr() as usize, USER_HEAP_SIZE);
     }
+    let argc = unsafe { (user_sp as *const usize).read_volatile() };
+    let argv = user_sp + core::mem::size_of::<usize>();
     let mut v: Vec<&'static str> = Vec::new();
     for i in 0..argc {
         let str_start =

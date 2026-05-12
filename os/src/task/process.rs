@@ -239,6 +239,75 @@ impl ProcessVmLayout {
     }
 }
 
+/// 按 Linux ELF ABI 在用户栈上构造 argc/argv/envp/auxv 初始布局。
+fn init_user_stack_from_strings(
+    token: usize,
+    stack_top: usize,
+    args: &[String],
+    auxv_extra: &[(usize, usize)],
+) -> usize {
+    let mut user_sp = stack_top;
+    let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
+    // 参数字符串放在高地址区域，argv 表只保存用户态指针。
+    for arg in args.iter().rev() {
+        user_sp -= arg.len() + 1;
+        let mut p = user_sp;
+        for c in arg.as_bytes() {
+            *translated_refmut(token, p as *mut u8).unwrap() = *c;
+            p += 1;
+        }
+        *translated_refmut(token, p as *mut u8).unwrap() = 0;
+        arg_ptrs.push(user_sp);
+    }
+    arg_ptrs.reverse();
+
+    user_sp &= !0xf_usize;
+
+    // glibc 会读取 AT_RANDOM，这里先提供固定的 16 字节随机区。
+    // TODO: 后续接入真正的随机源，避免固定 canary。
+    user_sp -= 8;
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
+    user_sp -= 8;
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
+    let at_random_ptr = user_sp;
+
+    // 先放入 AT_NULL，再倒序放入额外 auxv 与基础 auxv，保证内存中按正序排列。
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    for &(tag, val) in auxv_extra.iter().rev() {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = val;
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = tag;
+    }
+    for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = word;
+    }
+
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    for &ptr in arg_ptrs.iter().rev() {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = ptr;
+    }
+
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = args.len();
+    user_sp
+}
+
+/// 便捷封装：从静态字符串参数构造用户初始栈。
+fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
+    let args: Vec<String> = args.iter().map(|arg| String::from(*arg)).collect();
+    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[])
+}
+
 impl ProcessControlBlockInner {
     #[allow(unused)]
     /// get the address of app's page table
@@ -421,9 +490,10 @@ impl ProcessControlBlock {
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
+        let user_sp = init_user_stack(process.inner_exclusive_access().get_user_token(), ustack_top, &["initproc"]);
         *trap_cx = TrapContext::app_init_context(
-            entry_point,
-            ustack_top,
+            final_entry,
+            user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
@@ -596,70 +666,12 @@ impl ProcessControlBlock {
         //   [sp+(argc+?)*8]   0              /
         //   [above + 16 bytes random data, 16-byte aligned]  argument strings
         trace!("kernel: exec .. push arguments on user stack");
-        let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
-
-        // 1. Push argument strings (from stack top downward)
-        let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
-        for arg in args.iter().rev() {
-            user_sp -= arg.len() + 1;
-            let mut p = user_sp;
-            for c in arg.as_bytes() {
-                *translated_refmut(new_token, p as *mut u8).unwrap() = *c;
-                p += 1;
-            }
-            *translated_refmut(new_token, p as *mut u8).unwrap() = 0;
-            arg_ptrs.push(user_sp);
-        }
-        arg_ptrs.reverse(); // arg_ptrs[i] now points to args[i]
-
-        // 2. 16-byte align sp (RISC-V calling convention)
-        user_sp &= !0xf_usize;
-
-        // 3. Push 16 bytes of pseudo-random data for AT_RANDOM.
-        //    glibc's __libc_start_main reads _dl_random (set from AT_RANDOM) for stack
-        //    canary / arc4random seeding; if AT_RANDOM is absent the pointer stays null
-        //    and the very first dereference crashes.
-        user_sp -= 8;
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
-        user_sp -= 8;
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
-        let at_random_ptr = user_sp; // pointer to the 16 pseudo-random bytes above
-
-        // 4. Push auxv in reverse order
-        // First push AT_NULL terminator
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
-
-        // Push dynamic linking auxv if present (in reverse order)
-        for &(tag, val) in auxv_extra.iter().rev() {
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = val;
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = tag;
-        }
-
-        // Push standard auxv entries
-        for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = word;
-        }
-
-        // 5. Push envp NULL terminator (empty environment)
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
-
-        // 6. Push argv NULL terminator, then argv pointers (reversed to fill low→high)
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0; // argv[argc] = NULL
-        for &ptr in arg_ptrs.iter().rev() {
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = ptr;
-        }
-        // 7. Push argc  —  sp now points here; glibc/musl _start reads argc from *sp
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
+        let user_sp = init_user_stack_from_strings(
+            new_token,
+            task_inner.res.as_mut().unwrap().ustack_top(),
+            args.as_slice(),
+            auxv_extra.as_slice(),
+        );
 
         // initialize trap_cx
         trace!("kernel: exec .. initialize trap_cx with entry={:#x}", final_entry);
@@ -915,9 +927,10 @@ impl ProcessControlBlock {
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
+        let user_sp = init_user_stack(child.inner_exclusive_access().get_user_token(), ustack_top, &["spawn"]);
         *trap_cx = TrapContext::app_init_context(
             entry_point,
-            ustack_top,
+            user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
