@@ -251,6 +251,8 @@ bitflags! {
 /// Linux `clone` syscall。
 ///
 /// 当前支持 fork-like 进程创建、`stack`、`CLONE_SETTLS` 与 set_tid 写入。
+///
+/// `CLONE_CHILD_CLEARTID` 暂时仅告警并忽略，避免 glibc fork 包装因可延后语义失败。
 pub fn sys_clone(
     flags: usize,
     stack: usize,
@@ -314,8 +316,11 @@ pub fn sys_clone(
         return -(ERRNO::EINVAL as isize);
     }
     if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-        warn!("kernel: sys_clone unsupported flag CLONE_CHILD_CLEARTID");
-        return -(ERRNO::EINVAL as isize);
+        // TODO: 在线程退出路径清零 child_tid 并执行 futex wake。
+        warn!(
+            "kernel: sys_clone ignored flag CLONE_CHILD_CLEARTID: child_tid={:#x}",
+            child_tid
+        );
     }
     let mut parent_set_tid = None;
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
