@@ -15,12 +15,66 @@ const BIN_DIR: &str = "/bin";
 const BIN_DIR_CSTR: &str = "/bin\0";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const ROOT_BUSYBOX: &str = "/busybox";
-const BUSYBOX_PATH_CSTR: &str = "/musl/busybox\0";
-const BUSYBOX_ARGV0_CSTR: &str = "/musl/busybox\0";
+const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
+const MUSL_BUSYBOX_PATH_CSTR: &str = "/musl/busybox\0";
+const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
+const GLIBC_BUSYBOX_PATH_CSTR: &str = "/glibc/busybox\0";
 const INSTALL_ARG_CSTR: &str = "--install\0";
 const PROC_DIR: &str = "/proc";
 const PROC_SELF_DIR: &str = "/proc/self";
 const PROC_SELF_EXE: &str = "/proc/self/exe";
+
+/// BusyBox 所属的 libc 版本。
+#[derive(Copy, Clone)]
+enum BusyBoxLibc {
+    Musl,
+    Glibc,
+}
+
+impl BusyBoxLibc {
+    /// 从 `setupsh` 参数中选择 BusyBox 版本。
+    fn from_args(argv: &[&str]) -> Option<Self> {
+        match argv.get(1) {
+            None => {
+                println!("[setupsh] missing busybox libc, usage: setupsh [musl|glibc]");
+                None
+            }
+            Some(&"musl") => Some(Self::Musl),
+            Some(&"glibc") => Some(Self::Glibc),
+            Some(arg) => {
+                println!(
+                    "[setupsh] unknown busybox libc '{}', usage: setupsh [musl|glibc]",
+                    arg
+                );
+                None
+            }
+        }
+    }
+
+    /// 返回 BusyBox 的普通路径，供硬链接创建使用。
+    fn busybox_path(self) -> &'static str {
+        match self {
+            Self::Musl => MUSL_BUSYBOX_PATH,
+            Self::Glibc => GLIBC_BUSYBOX_PATH,
+        }
+    }
+
+    /// 返回 BusyBox 的 C 字符串路径，供 exec 参数使用。
+    fn busybox_path_cstr(self) -> &'static str {
+        match self {
+            Self::Musl => MUSL_BUSYBOX_PATH_CSTR,
+            Self::Glibc => GLIBC_BUSYBOX_PATH_CSTR,
+        }
+    }
+
+    /// 返回用于日志输出的 libc 名称。
+    fn name(self) -> &'static str {
+        match self {
+            Self::Musl => "musl",
+            Self::Glibc => "glibc",
+        }
+    }
+}
 
 /// 运行一个外部程序并等待其退出。
 fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
@@ -89,10 +143,17 @@ fn ensure_proc_self_exe() -> bool {
 }
 
 #[no_mangle]
-fn main() -> i32 {
+fn main(_argc: usize, argv: &[&str]) -> i32 {
     const TOTAL_STEPS: usize = 5;
 
-    println!("[setupsh] start");
+    let busybox_libc = match BusyBoxLibc::from_args(argv) {
+        Some(libc) => libc,
+        None => return 1,
+    };
+    let busybox_path = busybox_libc.busybox_path();
+    let busybox_path_cstr = busybox_libc.busybox_path_cstr();
+
+    println!("[setupsh] start with {} busybox", busybox_libc.name());
     print_step(1, TOTAL_STEPS, "prepare /bin");
     if !ensure_dir(BIN_DIR) {
         return 1;
@@ -100,12 +161,12 @@ fn main() -> i32 {
 
     print_step(2, TOTAL_STEPS, "install busybox applets into /bin");
     let install_argv = [
-        BUSYBOX_ARGV0_CSTR.as_ptr(),
+        busybox_path_cstr.as_ptr(),
         INSTALL_ARG_CSTR.as_ptr(),
         BIN_DIR_CSTR.as_ptr(),
         ptr::null(),
     ];
-    let install_exit = spawn_and_wait(BUSYBOX_PATH_CSTR, &install_argv);
+    let install_exit = spawn_and_wait(busybox_path_cstr, &install_argv);
     if install_exit != 0 {
         // TODO: 若后续需要兼容 `--install` 的部分成功场景，可在这里补充更细的降级策略。
         println!("[setupsh] busybox --install failed: {}", install_exit);
@@ -113,7 +174,7 @@ fn main() -> i32 {
     }
 
     print_step(3, TOTAL_STEPS, "create /busybox hard link");
-    if !ensure_hard_link(BUSYBOX_PATH_CSTR.trim_end_matches('\0'), ROOT_BUSYBOX) {
+    if !ensure_hard_link(busybox_path, ROOT_BUSYBOX) {
         return 1;
     }
 
