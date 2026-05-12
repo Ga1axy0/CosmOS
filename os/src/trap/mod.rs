@@ -55,6 +55,28 @@ fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
         cx.x[17],
         signal,
     );
+    error!(
+        "[kernel] user fault regs: t0={:#x}, t1={:#x}, t2={:#x}, s0={:#x}, s1={:#x}, s2={:#x}, s3={:#x}, s4={:#x}, s5={:#x}, s6={:#x}, s7={:#x}, s8={:#x}, s9={:#x}, s10={:#x}, s11={:#x}, t3={:#x}, t4={:#x}, t5={:#x}, t6={:#x}",
+        cx.x[5],
+        cx.x[6],
+        cx.x[7],
+        cx.x[8],
+        cx.x[9],
+        cx.x[18],
+        cx.x[19],
+        cx.x[20],
+        cx.x[21],
+        cx.x[22],
+        cx.x[23],
+        cx.x[24],
+        cx.x[25],
+        cx.x[26],
+        cx.x[27],
+        cx.x[28],
+        cx.x[29],
+        cx.x[30],
+        cx.x[31],
+    );
 }
 
 /// 初始化当前 hart 的 trap 相关状态。
