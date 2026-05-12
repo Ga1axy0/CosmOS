@@ -657,8 +657,6 @@ impl ProcessControlBlock {
             user_sp -= core::mem::size_of::<usize>();
             *translated_refmut(new_token, user_sp as *mut usize).unwrap() = ptr;
         }
-        let argv_base = user_sp; // argv_base == sp+8 once argc is pushed below
-
         // 7. Push argc  —  sp now points here; glibc/musl _start reads argc from *sp
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
@@ -672,10 +670,16 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        // a0/a1 are set for compatibility with non-glibc entry points;
-        // glibc _start ignores these and reads argc/argv directly from the stack.
-        trap_cx.x[10] = args.len();
-        trap_cx.x[11] = argv_base;
+        // RISC-V glibc _start treats a0 as rtld_fini and reads argc/argv from the stack.
+        trap_cx.x[10] = 0;
+        trap_cx.x[11] = 0;
+        debug!(
+            "kernel: exec trap init entry={:#x} sp={:#x} a0={:#x} a1={:#x}",
+            entry_point,
+            user_sp,
+            trap_cx.x[10],
+            trap_cx.x[11]
+        );
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
