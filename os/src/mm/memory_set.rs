@@ -4,7 +4,10 @@ use super::{frame_alloc, shootdown, FrameTracker, ShootdownKind};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE};
+use crate::config::{
+    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_MMAP_BASE, USER_STACK_BASE,
+    USER_STACK_SIZE, USER_VDSO_BASE,
+};
 use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, CachePage, FileDescription,
 };
@@ -33,6 +36,15 @@ extern "C" {
     fn ekernel();
     fn strampoline();
 }
+
+/// 用户态 rt_sigreturn trampoline 机器码。
+///
+/// RISC-V Linux 不依赖用户提供 `SA_RESTORER`，handler 返回后跳到这里执行
+/// `rt_sigreturn` 系统调用。
+const USER_VDSO_CODE: [u8; 8] = [
+    0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 139
+    0x73, 0x00, 0x00, 0x00, // ecall
+];
 
 /// ELF 加载结果，包含动态链接所需的额外信息
 pub struct ElfLoadInfo {
@@ -335,6 +347,18 @@ impl MemorySet {
             Vma::new(start_va, end_va, MapType::Framed, permission, VmaKind::Anonymous),
             None,
         );
+    }
+    /// 映射最小用户态 vDSO 页，用于 signal handler 返回时进入 rt_sigreturn。
+    pub fn map_user_vdso(&mut self) {
+        let start_va = VirtAddr::from(USER_VDSO_BASE);
+        let end_va = VirtAddr::from(USER_VDSO_BASE + PAGE_SIZE);
+        let vma = Vma::new_vdso(start_va, end_va);
+        if !self.insert_vma(vma, Some(&USER_VDSO_CODE)) {
+            warn!(
+                "[vdso] failed to map user signal trampoline at {:#x}",
+                USER_VDSO_BASE
+            );
+        }
     }
     /// 根据起始虚拟页号删除一段用户区域，并延迟释放拆下的旧页对象。
     pub(crate) fn remove_vma_with_start_vpn_user_deferred(
@@ -654,6 +678,7 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
+        memory_set.map_user_vdso();
         // map program headers of elf, with U flag
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| ERRNO::ENOEXEC)?;
         let elf_header = elf.header;
@@ -1773,6 +1798,8 @@ pub enum VmaKind {
     Anonymous,
     /// 文件映射区域。
     File,
+    /// 用户态 vDSO/trampoline 区域。
+    Vdso,
 }
 
 /// 文件映射区域附带的底层对象信息。
@@ -1924,6 +1951,16 @@ impl Vma {
             MapType::Framed,
             MapPermission::R | MapPermission::W,
             VmaKind::TrapContext { tid },
+        )
+    }
+    /// 创建用户态 vDSO/trampoline 区域描述。
+    pub fn new_vdso(start_va: VirtAddr, end_va: VirtAddr) -> Self {
+        Self::new(
+            start_va,
+            end_va,
+            MapType::Framed,
+            MapPermission::R | MapPermission::X | MapPermission::U,
+            VmaKind::Vdso,
         )
     }
     /// 为匿名映射场景生成一段普通用户区域。

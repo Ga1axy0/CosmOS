@@ -408,7 +408,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage { elf_data, argv } = resolved;
-        process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
+        process.exec(elf_data.as_slice(), argv)?;
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
         Ok(0)

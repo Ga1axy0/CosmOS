@@ -493,8 +493,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
-            args[1] as *const crate::task::SignalAction,
-            args[2] as *mut crate::task::SignalAction,
+            args[1] as *const UserSigAction,
+            args[2] as *mut UserSigAction,
             args[3], // sigsetsize
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
