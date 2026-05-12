@@ -445,17 +445,12 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     .child_kernel_time
                     .saturating_add(child_inner.kernel_time)
                     .saturating_add(child_inner.child_kernel_time);
-                let token = inner.memory_set.token();
                 drop(child_inner);
                 drop(inner);
                 remove_from_pid2process(found_pid);
 
                 if !exit_status_ptr.is_null() {
-                    if let Some(slot) = translated_refmut(token, exit_status_ptr) {
-                        *slot = exit_status;
-                    } else {
-                        return Err(ERRNO::EFAULT);
-                    }
+                    write_pod_to_user(exit_status_ptr, &exit_status)?;
                 }
 
                 return Ok(found_pid as isize);
