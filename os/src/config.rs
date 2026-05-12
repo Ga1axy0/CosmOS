@@ -5,7 +5,7 @@
 /// user app's stack size (increased to avoid user-space stack overflow for glibc/busybox)
 pub const USER_STACK_SIZE: usize = 1024 * 512; // 512 KiB
 /// kernel stack size
-pub const KERNEL_STACK_SIZE: usize = 4096 * 4;
+pub const KERNEL_STACK_SIZE: usize = 4096 * 8;
 /// kernel heap size
 pub const MAX_KERNEL_HEAP_SIZE: usize = 0x400_0000;
 /// base address of the dynamically mapped kernel heap window
