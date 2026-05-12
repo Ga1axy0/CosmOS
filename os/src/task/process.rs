@@ -682,7 +682,12 @@ impl ProcessControlBlock {
     /// 按 Linux `clone` 的进程分支创建子进程。
     ///
     /// 当前只支持 fork-like 语义；`child_stack` 非 0 时作为子进程返回用户态的 `sp`。
-    pub fn clone_process(self: &Arc<Self>, child_stack: usize, child_tls: Option<usize>) -> Arc<Self> {
+    pub fn clone_process(
+        self: &Arc<Self>,
+        child_stack: usize,
+        child_tls: Option<usize>,
+        child_set_tid: Option<usize>,
+    ) -> Arc<Self> {
         trace!("kernel: clone_process");
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
@@ -806,6 +811,21 @@ impl ProcessControlBlock {
             trap_cx.x[4] = tls;
         }
         drop(task_inner);
+        if let Some(child_tid_ptr) = child_set_tid {
+            let child_tid_value = child.getpid() as i32;
+            let child_token = child.inner_exclusive_access().memory_set.token();
+            // 写入 child_tid 前先触发子地址空间的 COW，避免直接改到父子共享页。
+            let _ = child.handle_private_cow_fault(child_tid_ptr);
+            if let Some(slot) = translated_refmut(child_token, child_tid_ptr as *mut i32) {
+                *slot = child_tid_value;
+            } else {
+                // TODO：当前 clone_process 尚未实现失败回滚，只能保守记录异常。
+                warn!(
+                    "kernel: clone_process failed to write child_tid at {:#x}",
+                    child_tid_ptr
+                );
+            }
+        }
         debug!(
             "[cow] clone_process complete: parent_pid={} child_pid={}",
             self.getpid(),

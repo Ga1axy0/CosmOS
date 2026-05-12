@@ -221,42 +221,36 @@ pub fn sys_setsid() -> isize {
 const CLONE_EXIT_SIGNAL_SIGCHLD: usize = 17;
 /// Linux clone flags 中低 8 位保存退出信号。
 const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
-/// 共享地址空间标志，当前暂不支持。
-const CLONE_VM: usize = 0x0000_0100;
-/// 共享文件系统上下文标志，当前暂不支持。
-const CLONE_FS: usize = 0x0000_0200;
-/// 共享文件描述符表标志，当前暂不支持。
-const CLONE_FILES: usize = 0x0000_0400;
-/// 共享信号处理表标志，当前暂不支持。
-const CLONE_SIGHAND: usize = 0x0000_0800;
-/// vfork 语义标志，当前暂不支持。
-const CLONE_VFORK: usize = 0x0000_4000;
-/// 线程组标志，当前暂不支持。
-const CLONE_THREAD: usize = 0x0001_0000;
-/// 设置子任务 TLS 指针，RISC-V 上对应 tp(x4)。
-const CLONE_SETTLS: usize = 0x0008_0000;
-/// 在父地址空间写入子 tid，当前暂不支持。
-const CLONE_PARENT_SETTID: usize = 0x0010_0000;
-/// 子任务退出时清理 child_tid，当前暂不支持。
-const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
-/// 在子地址空间写入子 tid，当前暂不支持。
-const CLONE_CHILD_SETTID: usize = 0x0100_0000;
-/// 当前已经实现的 clone 功能位。
-const CLONE_SUPPORTED_FLAGS: usize = CLONE_SETTLS;
-/// 已知但暂未实现的 clone 功能位，用于给出更明确的 TODO 日志。
-const CLONE_TODO_FLAGS: usize = CLONE_VM
-    | CLONE_FS
-    | CLONE_FILES
-    | CLONE_SIGHAND
-    | CLONE_VFORK
-    | CLONE_THREAD
-    | CLONE_PARENT_SETTID
-    | CLONE_CHILD_CLEARTID
-    | CLONE_CHILD_SETTID;
+
+bitflags! {
+    /// Linux `clone` 的功能标志位，不包含低 8 位退出信号。
+    struct CloneFlags: usize {
+        /// 共享地址空间标志，当前暂不支持。
+        const CLONE_VM = 0x0000_0100;
+        /// 共享文件系统上下文标志，当前暂不支持。
+        const CLONE_FS = 0x0000_0200;
+        /// 共享文件描述符表标志，当前暂不支持。
+        const CLONE_FILES = 0x0000_0400;
+        /// 共享信号处理表标志，当前暂不支持。
+        const CLONE_SIGHAND = 0x0000_0800;
+        /// vfork 语义标志，当前暂不支持。
+        const CLONE_VFORK = 0x0000_4000;
+        /// 线程组标志，当前暂不支持。
+        const CLONE_THREAD = 0x0001_0000;
+        /// 设置子任务 TLS 指针，RISC-V 上对应 tp(x4)。
+        const CLONE_SETTLS = 0x0008_0000;
+        /// 在父地址空间写入子 tid。
+        const CLONE_PARENT_SETTID = 0x0010_0000;
+        /// 子任务退出时清理 child_tid，当前暂不支持。
+        const CLONE_CHILD_CLEARTID = 0x0020_0000;
+        /// 在子地址空间写入子 tid。
+        const CLONE_CHILD_SETTID = 0x0100_0000;
+    }
+}
 
 /// Linux `clone` syscall。
 ///
-/// 当前支持 fork-like 进程创建、`stack` 参数与 `CLONE_SETTLS`。
+/// 当前支持 fork-like 进程创建、`stack`、`CLONE_SETTLS` 与 set_tid 写入。
 pub fn sys_clone(
     flags: usize,
     stack: usize,
@@ -271,23 +265,14 @@ pub fn sys_clone(
         stack,
     );
     let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
-    let clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
-    let todo_flags = clone_flags & CLONE_TODO_FLAGS;
-    if todo_flags != 0 {
-        warn!(
-            "kernel: sys_clone TODO unsupported clone flags {:#x}",
-            todo_flags
-        );
-    }
-    let unsupported_flags = clone_flags & !(CLONE_SUPPORTED_FLAGS | CLONE_TODO_FLAGS);
+    let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
+    let flags = CloneFlags::from_bits_truncate(raw_clone_flags);
+    let unsupported_flags = raw_clone_flags & !CloneFlags::all().bits();
     if unsupported_flags != 0 {
         warn!(
             "kernel: sys_clone unknown clone flags {:#x}",
             unsupported_flags
         );
-        return -(ERRNO::EINVAL as isize);
-    }
-    if todo_flags != 0 {
         return -(ERRNO::EINVAL as isize);
     }
     if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
@@ -297,31 +282,74 @@ pub fn sys_clone(
         );
         return -(ERRNO::EINVAL as isize);
     }
-    if parent_tid != 0 {
-        // TODO：实现 CLONE_PARENT_SETTID 后再写入 parent_tid。
-        warn!("kernel: sys_clone ignored parent_tid without CLONE_PARENT_SETTID: {:#x}", parent_tid);
+    if flags.contains(CloneFlags::CLONE_VM) {
+        warn!("kernel: sys_clone unsupported flag CLONE_VM");
+        return -(ERRNO::EINVAL as isize);
     }
-    if child_tid != 0 {
-        // TODO：实现 CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID 后再使用 child_tid。
-        warn!("kernel: sys_clone ignored child_tid without child tid flags: {:#x}", child_tid);
+    if flags.contains(CloneFlags::CLONE_FS) {
+        warn!("kernel: sys_clone unsupported flag CLONE_FS");
+        return -(ERRNO::EINVAL as isize);
     }
-    let child_tls = if clone_flags & CLONE_SETTLS != 0 {
-        Some(tls)
-    } else {
-        if tls != 0 {
-            warn!("kernel: sys_clone ignored tls without CLONE_SETTLS: {:#x}", tls);
+    if flags.contains(CloneFlags::CLONE_FILES) {
+        warn!("kernel: sys_clone unsupported flag CLONE_FILES");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_SIGHAND) {
+        warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_VFORK) {
+        warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_THREAD) {
+        warn!("kernel: sys_clone unsupported flag CLONE_THREAD");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+        warn!("kernel: sys_clone unsupported flag CLONE_CHILD_CLEARTID");
+        return -(ERRNO::EINVAL as isize);
+    }
+    let mut parent_set_tid = None;
+    if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+        if parent_tid == 0 {
+            warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
+            return -(ERRNO::EFAULT as isize);
         }
-        None
-    };
-    if clone_flags & CLONE_SETTLS != 0 {
+        if translated_refmut::<i32>(current_user_token(), parent_tid as *mut i32).is_none() {
+            return -(ERRNO::EFAULT as isize);
+        }
+        parent_set_tid = Some(parent_tid);
+    }
+    let mut child_set_tid = None;
+    if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+        if child_tid == 0 {
+            warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
+            return -(ERRNO::EFAULT as isize);
+        }
+        // 子地址空间由父地址空间复制而来，创建前先确认该地址在父进程中可翻译。
+        if translated_refmut::<i32>(current_user_token(), child_tid as *mut i32).is_none() {
+            return -(ERRNO::EFAULT as isize);
+        }
+        child_set_tid = Some(child_tid);
+    }
+    let mut child_tls = None;
+    if flags.contains(CloneFlags::CLONE_SETTLS) {
         debug!(
             "kernel: sys_clone set child TLS to {:#x}",
             tls
         );
+        child_tls = Some(tls);
     }
     let current_process = current_process();
-    let new_process = current_process.clone_process(stack, child_tls);
-    new_process.getpid() as isize
+    syscall_body!({
+        let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
+        let child_pid = new_process.getpid() as i32;
+        if let Some(ptr) = parent_set_tid {
+            write_pod_to_user(ptr as *mut i32, &child_pid)?;
+        }
+        Ok(child_pid as isize)
+    })
 }
 /// sys_execve
 pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
