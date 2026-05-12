@@ -1,10 +1,11 @@
 # Building
 TARGET := riscv64gc-unknown-none-elf
-MODE := release
-KERNEL_ELF := target/$(TARGET)/$(MODE)/os
-KERNEL_BIN := $(KERNEL_ELF).bin
-DISASM_TMP := target/$(TARGET)/$(MODE)/asm
-FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
+MODE ?= release
+KERNEL_ELF = target/$(TARGET)/$(MODE)/os
+KERNEL_BIN = $(KERNEL_ELF).bin
+DISASM_TMP = target/$(TARGET)/$(MODE)/asm
+USER_MODE := release
+FS_IMG = ../user/target/$(TARGET)/$(USER_MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
 LOG ?= INFO
@@ -35,9 +36,7 @@ BOOTLOADER := ../bootloader/$(SBI)-$(BOARD)-$(BOOTLOADER_TAG).bin
 QEMU7_CFG := $(shell echo "$(QEMU_MAJOR)" | awk '/^[0-9]+$$/ { if ($$1 <= 7) print "--cfg qemu7" }')
 
 # Building mode argument
-ifeq ($(MODE), release)
-	MODE_ARG := --release
-endif
+MODE_ARG = $(if $(filter release,$(MODE)),--release)
 
 # KERNEL ENTRY
 KERNEL_ENTRY_PA := 0x80200000
@@ -57,7 +56,8 @@ DISASM ?= -x
 # Run usertests or usershell
 TEST ?=
 
-build: env $(KERNEL_BIN) fs-img 
+build: env kernel fs-img
+	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 env:
 ifeq ($(OFFLINE),)
@@ -66,9 +66,6 @@ ifeq ($(OFFLINE),)
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
 endif
-
-$(KERNEL_BIN): kernel
-	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
 
 fs-img:
 	@if [ -f "$(FS_IMG)" ]; then \
@@ -87,11 +84,11 @@ fs-img:
 				exit 2; \
 			fi; \
 			echo "Injecting user apps into base ext4 image: $(BASE_IMG)"; \
-			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS) --ext4-base $(BASE_IMG); \
+			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/$(USER_MODE)/ -t $(FS_IMG) -f $(MAIN_FS) --ext4-base $(BASE_IMG); \
 		else \
 			rm -f $(FS_IMG); \
 			echo "Packing fresh $(MAIN_FS) image from user apps."; \
-			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/release/ -t $(FS_IMG) -f $(MAIN_FS); \
+			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/$(USER_MODE)/ -t $(FS_IMG) -f $(MAIN_FS); \
 		fi; \
 	fi
 
@@ -119,7 +116,9 @@ run: build run-inner
 
 run-trace: build run-inner-trace
 
-fast-run: kernel $(KERNEL_BIN) run-inner
+fast-run: kernel
+	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
+	@$(MAKE) run-inner
 
 run-inner:
 	@$(QEMU) \
@@ -157,6 +156,7 @@ run-inner-trace:
 		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 #	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
 
+debug: MODE=debug
 debug: build
 	@tmux new-session -d \
 		"$(QEMU) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
@@ -164,13 +164,15 @@ debug: build
 		tmux -2 attach-session -d
 
 
+gdbserver: MODE=debug
 gdbserver: build
 	@$(QEMU) -M 128m -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 	        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
 		-s -S
 
+gdbclient: MODE=debug
 gdbclient:
 	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: build env kernel clean disasm disasm-vim run-inner fs-img gdbserver gdbclient
+.PHONY: build env kernel clean disasm disasm-vim run run-trace fast-run run-inner fs-img debug gdbserver gdbclient
