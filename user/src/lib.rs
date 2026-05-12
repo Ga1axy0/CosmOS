@@ -20,6 +20,7 @@ pub use console::{flush, STDIN, STDOUT};
 pub use syscall::*;
 
 const USER_HEAP_SIZE: usize = 128 * 1024;
+const EAGAIN: isize = -11;
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
 
@@ -437,7 +438,8 @@ pub fn getpeername(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
 }
 
 pub fn fork() -> isize {
-    sys_fork()
+    // fork 在 Linux/RISC-V 上由 clone(SIGCHLD, NULL, ...) 表达。
+    sys_clone(SIGCHLD as usize, 0, 0, 0, 0)
 }
 
 /// 兼容接口：执行程序（不传环境变量），内部等价于 `execve(path, args, [NULL])`。
@@ -457,7 +459,7 @@ pub fn set_priority(prio: isize) -> isize {
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(-1, exit_code as *mut _) {
-            -2 => {
+            EAGAIN => {
                 sys_yield();
             }
             n => {
@@ -470,7 +472,7 @@ pub fn wait(exit_code: &mut i32) -> isize {
 pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(pid as isize, exit_code as *mut _) {
-            -11 => {
+            EAGAIN => {
                 sys_yield();
             }
             n => {
