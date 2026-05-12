@@ -429,9 +429,16 @@ pub fn sys_sigaction(
     action: *const SignalAction,
     old_action: *mut SignalAction,
 ) -> isize {
-    syscall(
+    syscall6(
         SYSCALL_SIGACTION,
-        [signum as usize, action as usize, old_action as usize],
+        [
+            signum as usize,
+            action as usize,
+            old_action as usize,
+            core::mem::size_of::<u64>(),
+            0,
+            0,
+        ],
     )
 }
 

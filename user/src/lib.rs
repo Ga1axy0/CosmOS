@@ -628,19 +628,24 @@ pub fn condvar_wait(condvar_id: usize, mutex_id: usize) {
     sys_condvar_wait(condvar_id, mutex_id);
 }
 
-/// Action for a signal
-#[repr(C, align(16))]
+/// RISC-V Linux `rt_sigaction` 用户态布局。
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalAction {
+    /// handler 地址，或 SIG_DFL/SIG_IGN。
     pub handler: usize,
-    pub mask: SignalFlags,
+    /// Linux `SA_*` 标志位。
+    pub sa_flags: usize,
+    /// 信号掩码，当前用户库只包装低 32 位。
+    pub sa_mask: u64,
 }
 
 impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
-            mask: SignalFlags::empty(),
+            sa_flags: 0,
+            sa_mask: SignalFlags::empty().bits() as u64,
         }
     }
 }
