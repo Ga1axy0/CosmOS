@@ -17,14 +17,16 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::hart::hartid;
 use crate::mm::{handle_ipi, PageFaultAccess};
+use crate::signal::{SignalFlags, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
 use crate::task::{
-    ExitReason, SignalFlags, check_fatal_signals_of_current, current_add_signal, current_process,
-    current_process_is_zombie, current_trap_cx, current_trap_cx_user_va, current_user_token,
-    exit_current_and_run_next, on_timer_tick, schedule_if_needed,
+    ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
+    current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next, on_timer_tick,
+    schedule_if_needed,
 };
-use crate::timer::{check_timer, get_time, set_next_trigger};
+use crate::timer::{check_timer, get_realtime_ns, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
@@ -135,7 +137,9 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            if !current_process().handle_private_cow_fault(stval) {
+            if !current_process().handle_private_cow_fault(stval)
+                && !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Write)
+            {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
@@ -165,25 +169,27 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
-                Ok(()) => {}
-                Err(ERRNO::ENXIO) => {
-                    error!(
-                        "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
-                        scause.cause(),
-                        stval,
-                        current_trap_cx().sepc,
-                    );
-                    current_add_signal(SignalFlags::SIGBUS);
-                }
-                Err(_) => {
-                    error!(
-                        "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                        scause.cause(),
-                        stval,
-                        current_trap_cx().sepc,
-                    );
-                    current_add_signal(SignalFlags::SIGSEGV);
+            if !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Read) {
+                match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
+                    Ok(()) => {}
+                    Err(ERRNO::ENXIO) => {
+                        error!(
+                            "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
+                            scause.cause(),
+                            stval,
+                            current_trap_cx().sepc,
+                        );
+                        current_add_signal(SignalFlags::SIGBUS);
+                    }
+                    Err(_) => {
+                        error!(
+                            "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                            scause.cause(),
+                            stval,
+                            current_trap_cx().sepc,
+                        );
+                        current_add_signal(SignalFlags::SIGSEGV);
+                    }
                 }
             }
         }
@@ -238,6 +244,8 @@ pub fn trap_handler() -> ! {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
+            let now_raw = get_time();
+            check_itimers_of_all_processes(now_raw, get_realtime_ns());
             crate::net::poll();
             on_timer_tick();
         }
@@ -268,6 +276,8 @@ pub fn trap_handler() -> ! {
         exit_current_and_run_next(ExitReason::Exit(0));
     }
     schedule_if_needed();
+    // Handle non-fatal signals before returning to user space
+    handle_signals();
     trap_return();
 }
 
@@ -318,6 +328,8 @@ pub fn trap_from_kernel() {
             // trace!("hart {} timer tick", hartid());
             set_next_trigger();
             check_timer();
+            let now_raw = get_time();
+            check_itimers_of_all_processes(now_raw, get_realtime_ns());
             crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {

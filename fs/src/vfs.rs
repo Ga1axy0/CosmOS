@@ -2,6 +2,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 use spin::Mutex;
 
+use crate::dentry_cache::{insert_dentry, lookup_dentry, remove_dentry};
 use crate::errno::FS_ERRNO;
 use crate::inode_cache::get_or_create_inode;
 
@@ -21,13 +22,27 @@ impl InodeTime {
     }
 }
 
+/// Batched inode attribute snapshot — read in one call to avoid repeated
+/// lock acquisitions in the backend.
+#[derive(Clone, Debug)]
+pub struct VfsAttrs {
+    pub mode: Option<u32>,
+    pub ino: u64,
+    pub nlink: u32,
+    pub size: usize,
+    pub atime: Option<InodeTime>,
+    pub mtime: Option<InodeTime>,
+    pub ctime: Option<InodeTime>,
+}
+
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
 pub trait VfsNode: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
-    fn ls(&self) -> Vec<String>;
+    /// List directory entries as `(name, is_dir)` pairs.
+    fn ls(&self) -> Vec<(String, bool)>;
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Create a sub-directory named `name` inside this directory.
@@ -126,6 +141,22 @@ pub trait VfsNode: Send + Sync + Any {
         self.set_times(Some(now), Some(now), Some(now))
     }
 
+    /// Read all stat-relevant attributes in one shot.
+    ///
+    /// The default implementation calls individual getters; backends should
+    /// override this to batch the reads under a single lock acquisition.
+    fn stat_attrs(&self) -> VfsAttrs {
+        VfsAttrs {
+            mode: self.mode(),
+            ino: self.ino(),
+            nlink: self.nlink(),
+            size: self.size(),
+            atime: self.atime(),
+            mtime: self.mtime(),
+            ctime: self.ctime(),
+        }
+    }
+
     /// Rename or move a child entry from this directory to `new_parent/new_name`.
     fn rename_child(
         &self,
@@ -172,34 +203,54 @@ impl Inode {
         Self::from_vfs_node(node)
     }
 
-    pub fn ls(&self) -> Vec<String> {
+    pub fn ls(&self) -> Vec<(String, bool)> {
         self.inner.ls()
     }
 
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.find(name).map(Self::wrap)
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            if let Some(child) = lookup_dentry(fs_id, self.ino(), name) {
+                return Some(child);
+            }
+        }
+        let child = self.inner.find(name).map(Self::wrap)?;
+        if fs_id != 0 {
+            insert_dentry(fs_id, self.ino(), name, &child);
+        }
+        Some(child)
     }
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.create(name).map(|i| {
+        let child = self.inner.create(name).map(|i| {
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o644u32 & perms_mask);
                 let _ = i.set_mode(new_mode);
             }
             Self::wrap(i)
-        })
+        })?;
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            insert_dentry(fs_id, self.ino(), name, &child);
+        }
+        Some(child)
     }
 
     pub fn mkdir(&self, name: &str) -> Option<Arc<Inode>> {
-        self.inner.mkdir(name).map(|i|{
+        let child = self.inner.mkdir(name).map(|i|{
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
                 let _ = i.set_mode(new_mode);
             }
             Self::wrap(i)
-        })
+        })?;
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            insert_dentry(fs_id, self.ino(), name, &child);
+        }
+        Some(child)
     }
 
     pub fn is_dir(&self) -> bool {
@@ -232,6 +283,11 @@ impl Inode {
         self.inner.fs_id()
     }
 
+    /// Read all stat-relevant attributes in one call.
+    pub fn stat_attrs(&self) -> VfsAttrs {
+        self.inner.stat_attrs()
+    }
+
     pub fn nlink(&self) -> u32 {
         self.inner.nlink()
     }
@@ -257,16 +313,31 @@ impl Inode {
         self.inner.link(old_name, new_name)
     }
 
-    pub fn link_inode(&self, child: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
-        self.inner.link_inode(&child.inner, new_name)
+    pub fn link_inode(&self, child: &Arc<Inode>, new_name: &str) -> Result<(), FS_ERRNO> {
+        self.inner.link_inode(&child.inner, new_name)?;
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            insert_dentry(fs_id, self.ino(), new_name, child);
+        }
+        Ok(())
     }
 
     pub fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
-        self.inner.unlink(name)
+        self.inner.unlink(name)?;
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            remove_dentry(fs_id, self.ino(), name);
+        }
+        Ok(())
     }
 
     pub fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
-        self.inner.rmdir(name)
+        self.inner.rmdir(name)?;
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            remove_dentry(fs_id, self.ino(), name);
+        }
+        Ok(())
     }
 
     pub fn atime(&self) -> Option<InodeTime> {
@@ -296,7 +367,16 @@ impl Inode {
     }
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
-        self.inner.rename_child(old_name, &new_parent.inner, new_name)
+        self.inner.rename_child(old_name, &new_parent.inner, new_name)?;
+        let old_fs = self.fs_id();
+        if old_fs != 0 {
+            remove_dentry(old_fs, self.ino(), old_name);
+        }
+        let new_fs = new_parent.fs_id();
+        if new_fs != 0 {
+            remove_dentry(new_fs, new_parent.ino(), new_name);
+        }
+        Ok(())
     }
 
     /// 获取当前 inode 挂载的 page cache 宿主对象。

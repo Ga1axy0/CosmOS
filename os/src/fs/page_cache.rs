@@ -9,10 +9,15 @@ use lazy_static::lazy_static;
 
 use crate::config::{MEMORY_END, PAGE_SIZE};
 use crate::mm::{
-    frame_alloc, invalidate_inode_mappings_after_truncate, FrameTracker, PhysPageNum,
+    frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
+    PhysAddr, PhysPageNum,
 };
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
+
+extern "C" {
+    fn ekernel();
+}
 
 bitflags! {
     /// 单个缓存页的状态位。
@@ -154,7 +159,7 @@ pub struct PageCacheManager {
     /// 简化版 CLOCK 队列，允许存在重复和失效条目。
     inactive: VecDeque<Weak<SpinNoIrqLock<CachePage>>>,
     /// 当前缓存页总数。
-    cached_pages: usize,
+    pub cached_pages: usize,
     /// 超过该阈值后开始回收。
     high_watermark: usize,
     /// 回收到该阈值后停止。
@@ -164,9 +169,7 @@ pub struct PageCacheManager {
 impl PageCacheManager {
     /// 创建新的全局 page cache 管理器。
     fn new() -> Self {
-        let total_pages = max(1, MEMORY_END / PAGE_SIZE);
-        let high_watermark = max(128, total_pages / 16);
-        let low_watermark = max(96, high_watermark * 3 / 4);
+        let (high_watermark, low_watermark) = default_watermarks();
         Self {
             inactive: VecDeque::new(),
             cached_pages: 0,
@@ -178,7 +181,7 @@ impl PageCacheManager {
 
 lazy_static! {
     /// 全局 page cache 管理器。
-    static ref PAGE_CACHE_MANAGER: SpinNoIrqLock<PageCacheManager> =
+    pub static ref PAGE_CACHE_MANAGER: SpinNoIrqLock<PageCacheManager> =
         SpinNoIrqLock::new(PageCacheManager::new());
 }
 
@@ -196,6 +199,19 @@ pub fn cached_inode_size(inode: &Arc<Inode>) -> usize {
         return mapping.size();
     }
     inode.size()
+}
+
+/// Like [`cached_inode_size`], but uses `fs_size` as the fallback instead of
+/// calling `inode.size()` again.  Useful when the caller already has a
+/// batched-read size and wants to avoid a redundant lock acquisition.
+pub fn cached_inode_size_fast(inode: &Arc<Inode>, fs_size: usize) -> usize {
+    if !is_inode_page_cacheable(inode) {
+        return fs_size;
+    }
+    if let Some(mapping) = try_get_mapping(inode) {
+        return mapping.size();
+    }
+    fs_size
 }
 
 /// 获取当前 inode 对应的稳定 page mapping 句柄。
@@ -326,12 +342,12 @@ fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> 
             current_size
         );
     } else {
-        debug!(
-            "[page_cache] mapping hit: inode_ptr={:#x} fs_id={} ino={}",
-            Arc::as_ptr(inode) as usize,
-            inode.fs_id(),
-            inode.ino()
-        );
+        // debug!(
+        //     "[page_cache] mapping hit: inode_ptr={:#x} fs_id={} ino={}",
+        //     Arc::as_ptr(inode) as usize,
+        //     inode.fs_id(),
+        //     inode.ino()
+        // );
     }
     mapping
 }
@@ -466,13 +482,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
         mapping_guard.size = new_size;
 
         if new_size < old_size {
-            let first_removed_idx = if new_size == 0 {
-                0
-            } else if new_tail_valid == PAGE_SIZE {
-                new_tail_idx.saturating_add(1)
-            } else {
-                new_tail_idx.saturating_add(1)
-            };
+            let first_removed_idx = if new_size == 0 { 0 } else { new_tail_idx.saturating_add(1) };
             let removed_indices: alloc::vec::Vec<_> = mapping_guard
                 .pages
                 .range(first_removed_idx..)
@@ -557,7 +567,7 @@ fn get_or_create_page(
     page_idx: u64,
 ) -> Arc<SpinNoIrqLock<CachePage>> {
     if let Some(page) = mapping.lock().pages.get(&page_idx).cloned() {
-        debug!("[page_cache] page hit: page_idx={}", page_idx);
+        // debug!("[page_cache] page hit: page_idx={}", page_idx);
         return page;
     }
 
@@ -580,11 +590,11 @@ fn get_or_create_page(
     let mut manager = PAGE_CACHE_MANAGER.lock();
     manager.cached_pages += 1;
     manager.inactive.push_back(Arc::downgrade(&page));
-    debug!(
-        "[page_cache] page miss: page_idx={} cached_pages={}",
-        page_idx,
-        manager.cached_pages
-    );
+    // debug!(
+    //     "[page_cache] page miss: page_idx={} cached_pages={}",
+    //     page_idx,
+    //     manager.cached_pages
+    // );
     drop(manager);
     page
 }
@@ -638,13 +648,13 @@ fn ensure_page_uptodate(
         } else {
             let bytes = ppn.get_bytes_array();
             bytes.fill(0);
-            debug!(
-                "[page_cache] load page: fs_id={} ino={} page_idx={} valid_bytes={}",
-                inode.fs_id(),
-                inode.ino(),
-                page_idx,
-                valid_bytes
-            );
+            // debug!(
+            //     "[page_cache] load page: fs_id={} ino={} page_idx={} valid_bytes={}",
+            //     inode.fs_id(),
+            //     inode.ino(),
+            //     page_idx,
+            //     valid_bytes
+            // );
             // TODO：后续接入通用 truncate 后，需要避免装页与截断并发时把旧数据重新提交回 cache。
             inode.read_at(page_start_off, &mut bytes[..valid_bytes])
         };
@@ -751,8 +761,9 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
 }
 
 /// 若当前缓存压力过大，则回收到低水位。
-fn reclaim_if_needed() {
+pub fn reclaim_if_needed() {
     loop {
+        refresh_page_cache_watermarks();
         let need_reclaim = {
             let manager = PAGE_CACHE_MANAGER.lock();
             manager.cached_pages > manager.high_watermark
@@ -806,10 +817,14 @@ fn reclaim_one() -> bool {
         }
         if page_guard.state.contains(CachePageState::DIRTY) {
             drop(page_guard);
-            if let Some(mapping) = page.lock().owner.upgrade() {
+            let mapping = {
+                let page_guard = page.lock();
+                page_guard.owner.upgrade()
+            };
+
+            if let Some(mapping) = mapping {
                 flush_page(&mapping, &page);
             }
-            PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
             return true;
         }
         page_guard.state.insert(CachePageState::EVICTING);
@@ -849,6 +864,37 @@ fn reclaim_one() -> bool {
     true
 }
 
+/// 按当前物理内存剩余情况刷新 page cache 水位。
+fn refresh_page_cache_watermarks() {
+    let (high_watermark, low_watermark) = dynamic_watermarks();
+    let mut manager = PAGE_CACHE_MANAGER.lock();
+    manager.high_watermark = high_watermark;
+    manager.low_watermark = low_watermark;
+}
+
+/// 使用实时物理页统计动态计算水位。
+fn dynamic_watermarks() -> (usize, usize) {
+    let stats = frame_allocator_stats();
+    if stats.total_pages == 0 {
+        return default_watermarks();
+    }
+    let base_high = max(128, stats.total_pages / 16);
+    let pressure_high = stats.free_pages / 2;
+    let high_watermark = min(base_high, pressure_high);
+    let low_watermark = high_watermark * 3 / 4;
+    (high_watermark, low_watermark)
+}
+
+/// 初始化时使用的保守水位估算。
+fn default_watermarks() -> (usize, usize) {
+    let managed_start = PhysAddr::from(ekernel as usize).ceil();
+    let managed_end = PhysAddr::from(MEMORY_END).floor();
+    let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
+    let high_watermark = max(128, total_pages / 16);
+    let low_watermark = max(96, high_watermark * 3 / 4);
+    (high_watermark, low_watermark)
+}
+
 /// 分配 page cache 使用的页框；内存紧张时先尝试回收一轮。
 fn alloc_cache_frame() -> FrameTracker {
     if let Some(frame) = frame_alloc() {
@@ -865,7 +911,12 @@ fn alloc_cache_frame() -> FrameTracker {
         }
     }
     // TODO：后续可继续接入更积极的回收/等待策略；当前在无可回收页且彻底无页时直接报错。
-    frame_alloc().expect("page cache out of memory")
+    frame_alloc().unwrap_or_else(|| {
+        error!("Page Cache: Out of memory");
+        error!("Frame allocator stats: {:?}", frame_allocator_stats());
+        error!("Watermark: high={} low={}", PAGE_CACHE_MANAGER.lock().high_watermark, PAGE_CACHE_MANAGER.lock().low_watermark);
+        panic!();
+    })
 }
 
 /// 计算文件偏移所属页号。

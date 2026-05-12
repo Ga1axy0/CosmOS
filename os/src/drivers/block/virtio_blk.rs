@@ -21,24 +21,51 @@ impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
+        // debug!("Submitting VirtIOBlk read for block_id {}", block_id);
         let token = unsafe {
             self.inner
                 .lock()
                 .read_blocks_nb(block_id, &mut req, buf, &mut resp)
-                .expect("Error when submitting VirtIOBlk read")
+                .unwrap_or_else(|err| {
+                    let capacity = self.inner.lock().capacity();
+                    panic!(
+                        "Error when submitting VirtIOBlk read: block_id={} buf_len={} capacity={} err={:?}",
+                        block_id,
+                        buf.len(),
+                        capacity,
+                        err
+                    )
+                })
         };
         self.wait_token(token);
-        unsafe {
+        let result = unsafe {
             self.inner
                 .lock()
                 .complete_read_blocks(token, &req, buf, &mut resp)
-                .expect("Error when completing VirtIOBlk read");
+        };
+        if let Err(err) = result {
+            let capacity = self.inner.lock().capacity();
+            panic!(
+                "Error when completing VirtIOBlk read: block_id={} token={} buf_len={} capacity={} resp_status={:?} err={:?}",
+                block_id,
+                token,
+                buf.len(),
+                capacity,
+                resp.status(),
+                err
+            );
         }
-        assert_eq!(
-            resp.status(),
-            RespStatus::OK,
-            "Error when completing VirtIOBlk read"
-        );
+        if resp.status() != RespStatus::OK {
+            let capacity = self.inner.lock().capacity();
+            panic!(
+                "VirtIOBlk read response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
+                block_id,
+                token,
+                buf.len(),
+                capacity,
+                resp.status()
+            );
+        }
     }
     /// Write a block to the virtio_blk device
     fn write_block(&self, block_id: usize, buf: &[u8]) {
@@ -48,20 +75,46 @@ impl BlockDevice for VirtIOBlock {
             self.inner
                 .lock()
                 .write_blocks_nb(block_id, &mut req, buf, &mut resp)
-                .expect("Error when submitting VirtIOBlk write")
+                .unwrap_or_else(|err| {
+                    let capacity = self.inner.lock().capacity();
+                    panic!(
+                        "Error when submitting VirtIOBlk write: block_id={} buf_len={} capacity={} err={:?}",
+                        block_id,
+                        buf.len(),
+                        capacity,
+                        err
+                    )
+                })
         };
         self.wait_token(token);
-        unsafe {
+        let result = unsafe {
             self.inner
                 .lock()
                 .complete_write_blocks(token, &req, buf, &mut resp)
-                .expect("Error when completing VirtIOBlk write");
+        };
+        if let Err(err) = result {
+            let capacity = self.inner.lock().capacity();
+            panic!(
+                "Error when completing VirtIOBlk write: block_id={} token={} buf_len={} capacity={} resp_status={:?} err={:?}",
+                block_id,
+                token,
+                buf.len(),
+                capacity,
+                resp.status(),
+                err
+            );
         }
-        assert_eq!(
-            resp.status(),
-            RespStatus::OK,
-            "Error when completing VirtIOBlk write"
-        );
+        if resp.status() != RespStatus::OK {
+            let capacity = self.inner.lock().capacity();
+            panic!(
+                "VirtIOBlk write response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
+                block_id,
+                token,
+                buf.len(),
+                capacity,
+                resp.status()
+            );
+        }
     }
 }
 

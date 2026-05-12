@@ -7,7 +7,9 @@ pub const USER_STACK_SIZE: usize = 1024 * 16; // 16 KiB
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 4;
 /// kernel heap size
-pub const KERNEL_HEAP_SIZE: usize = 0x400_0000;
+pub const MAX_KERNEL_HEAP_SIZE: usize = 0x400_0000;
+/// base address of the dynamically mapped kernel heap window
+pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
 /// physical memory end address
@@ -20,6 +22,9 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 pub const USER_MMAP_BASE: usize = 0x1000_0000;
 /// default base address for the main thread's user stack region
 pub const USER_STACK_BASE: usize = 0x0800_0000;
+/// base address for loading dynamic linker (interpreter)
+/// placed between stack and mmap region to avoid conflicts
+pub const INTERP_BASE: usize = 0x4000_0000;
 /// the virtual addr of trapoline
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context

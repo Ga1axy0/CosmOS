@@ -1,15 +1,12 @@
 use crate::{
+    config::{PAGE_SIZE, PAGE_SIZE_BITS},
+    mm::{translated_refmut, MapPermission, VirtAddr},
     syscall::errno::ERRNO,
     syscall::write_bytes_to_user,
     syscall_body,
-    config::{PAGE_SIZE, PAGE_SIZE_BITS, TRAP_CONTEXT_BASE},
-    mm::{
-        translated_refmut, MapPermission,
-        VirtAddr,
-    },
     task::{
-        current_process, current_task, current_user_token,
-        mmap_current_process, munmap_current_process, mprotect_current_process,
+        current_process, current_task, current_user_token, mprotect_current_process,
+        munmap_current_process,
     },
 };
 
@@ -151,40 +148,49 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         }
         let map_addr = if addr == 0 {
             // Linux-style mmap(NULL, ...): choose a free user VA automatically.
-            let step = len_aligned.max(PAGE_SIZE);
-            let mut probe = process.mmap_base();
-            let limit = TRAP_CONTEXT_BASE.saturating_sub(step);
-            let mut chosen: Option<usize> = None;
-            while probe <= limit {
-                let probe_end = probe.checked_add(step).ok_or(ERRNO::EOVERFLOW)?;
+            let (chosen, chosen_end, hint) = {
+                let mut inner = process.inner_exclusive_access();
+                let hint = inner.vm_layout.mmap_hint;
+                let base = inner.vm_layout.mmap_base;
+                let chosen = inner
+                    .memory_set
+                    .find_free_mmap_area(hint, base, len_aligned)
+                    .ok_or(ERRNO::ENOMEM)?;
+                let chosen_end = chosen.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
                 let mapped = if let Some(file) = file_desc.as_ref() {
-                    process.mmap_file(
-                        VirtAddr::from(probe),
-                        VirtAddr::from(probe_end),
+                    inner.memory_set.mmap_file(
+                        VirtAddr::from(chosen),
+                        VirtAddr::from(chosen_end),
                         perm,
                         file.clone(),
                         offset / PAGE_SIZE,
                         is_shared,
                     )
                 } else {
-                    process.mmap(VirtAddr::from(probe), VirtAddr::from(probe_end), perm)
+                    inner.memory_set.mmap_anonymous(
+                        VirtAddr::from(chosen),
+                        VirtAddr::from(chosen_end),
+                        perm,
+                    )
                 };
-                if mapped {
-                    debug!(
-                        "[mmap] auto-selected range: pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
-                        pid,
-                        probe,
-                        probe_end,
-                        file_desc.is_some(),
-                        is_shared,
-                        file_desc.is_some()
-                    );
-                    chosen = Some(probe);
-                    break;
+                if !mapped {
+                    return Err(ERRNO::ENOMEM);
                 }
-                probe = probe.saturating_add(step);
-            }
-            chosen.ok_or(ERRNO::ENOMEM)?
+                inner.vm_layout.mmap_hint = chosen_end;
+                (chosen, chosen_end, hint)
+            };
+            debug!(
+                "[mmap] auto-selected range: pid={} start={:#x} end={:#x} hint_in={:#x} hint_out={:#x} file_backed={} shared={} lazy={}",
+                pid,
+                chosen,
+                chosen_end,
+                hint,
+                chosen_end,
+                file_desc.is_some(),
+                is_shared,
+                file_desc.is_some()
+            );
+            chosen
         } else {
             let mapped = if let Some(file) = file_desc.as_ref() {
                 process.mmap_file(

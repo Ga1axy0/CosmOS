@@ -10,6 +10,30 @@ use alloc::{
 };
 use hashbrown::HashMap;
 
+/// Type-erased handle used by signal delivery to properly wake a task
+/// from whichever WaitQueue (or WaitQueueKeyed<T>) it's sleeping in.
+///
+/// The handle stores a raw pointer to the wait queue and a function
+/// pointer that knows how to remove-and-wake a specific task from it.
+/// This avoids needing trait objects or generics in the task struct.
+#[derive(Clone)]
+pub struct WaitQueueHandle {
+    ptr: *const (),
+    wake_fn: fn(ptr: *const (), task: &Arc<TaskControlBlock>),
+}
+
+// Safety: ptr always points to a Sync+Send object with static effective lifetime.
+unsafe impl Send for WaitQueueHandle {}
+unsafe impl Sync for WaitQueueHandle {}
+
+impl WaitQueueHandle {
+    /// Wake a specific task by properly removing it from the wait queue
+    /// and then calling `wakeup_task`.
+    pub fn wake_waiter(&self, task: &Arc<TaskControlBlock>) {
+        (self.wake_fn)(self.ptr, task);
+    }
+}
+
 pub trait NextKey: Default + Eq + core::hash::Hash + Copy {
     fn next(&self) -> Self;
 }
@@ -54,6 +78,7 @@ impl WaitQueue {
             debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
+            task_inner.current_wq_handle = Some(self.to_handle());
         }
         queue.push_back(task.clone());
         drop(queue);
@@ -69,6 +94,7 @@ impl WaitQueue {
                 if matches!(task_inner.task_status, TaskStatus::Interruptible) {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
+                    task_inner.current_wq_handle = None;
                     task_inner.on_cpu = true;
                     task_inner.on_rq = false;
                 }
@@ -92,6 +118,25 @@ impl WaitQueue {
         let mut queue = self.queue.lock();
         while let Some(task) = queue.pop_front() {
             wakeup_task(task);
+        }
+    }
+
+    /// Remove this specific task from the queue and wake it.
+    pub fn wake_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
+        let task_ptr = Arc::as_ptr(task);
+        self.queue.lock().retain(|t| Arc::as_ptr(t) != task_ptr);
+        wakeup_task(task.clone());
+    }
+
+    /// Build a type-erased handle for signal delivery.
+    pub fn to_handle(&self) -> WaitQueueHandle {
+        fn wake_fn(ptr: *const (), task: &Arc<TaskControlBlock>) {
+            let wq = unsafe { &*(ptr as *const WaitQueue) };
+            wq.wake_waiter_by_ptr(task);
+        }
+        WaitQueueHandle {
+            ptr: self as *const Self as *const (),
+            wake_fn,
         }
     }
 }
@@ -132,6 +177,7 @@ where
             debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
+            task_inner.current_wq_handle = Some(self.to_handle());
         }
         let key = {
             let mut next = self.next_key.lock();
@@ -142,6 +188,21 @@ where
         self.waiters.lock().insert(key, task);
         self.queue.lock().push_back(key);
         block_current_and_run_next(reason);
+
+        // Self-cleanup: remove ourselves from waiters and clear the handle.
+        let task = current_task().unwrap();
+        let task_ptr = Arc::as_ptr(&task);
+        let k = {
+            let waiters = self.waiters.lock();
+            waiters
+                .iter()
+                .find(|(_, t)| Arc::as_ptr(t) == task_ptr)
+                .map(|(k, _)| *k)
+        };
+        if let Some(k) = k {
+            self.waiters.lock().remove(&k);
+        }
+        task.inner_exclusive_access().current_wq_handle = None;
     }
 
     /// Enqueue current task with a selected key and block with a specific reason.
@@ -167,6 +228,7 @@ where
             debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
+            task_inner.current_wq_handle = Some(self.to_handle());
         }
         let replaced = self.waiters.lock().insert(key, task);
         assert!(replaced.is_none(), "duplicate wait key");
@@ -181,6 +243,7 @@ where
                 if matches!(task_inner.task_status, TaskStatus::Interruptible) {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
+                    task_inner.current_wq_handle = None;
                     task_inner.on_cpu = true;
                     task_inner.on_rq = false;
                 }
@@ -214,6 +277,7 @@ where
     /// Returns whether a waiter is found and woken.
     pub fn wake_selected(&self, key: T) -> bool {
         if let Some(task) = self.waiters.lock().remove(&key) {
+            // debug!("Poll: waking with key {}", key);
             wakeup_task(task);
             true
         } else {
@@ -225,6 +289,42 @@ where
     pub fn wake_all(&self) {
         while let Some(task) = Self::pop_next_task_keyed(&self.queue, &self.waiters) {
             wakeup_task(task);
+        }
+    }
+
+    /// Remove this specific task from the waiters and wake it.
+    pub fn wake_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
+        let task_ptr = Arc::as_ptr(task);
+        let key = {
+            let waiters = self.waiters.lock();
+            waiters
+                .iter()
+                .find(|(_, t)| Arc::as_ptr(t) == task_ptr)
+                .map(|(k, _)| *k)
+        };
+        if let Some(key) = key {
+            self.waiters.lock().remove(&key);
+        }
+        wakeup_task(task.clone());
+    }
+
+    /// Build a type-erased handle for signal delivery.
+    pub fn to_handle(&self) -> WaitQueueHandle {
+        fn wake_fn<T>(ptr: *const (), task: &Arc<TaskControlBlock>)
+        where
+            T: Default
+                + Eq
+                + core::hash::Hash
+                + core::fmt::Display
+                + Copy
+                + NextKey,
+        {
+            let wq = unsafe { &*(ptr as *const WaitQueueKeyed<T>) };
+            wq.wake_waiter_by_ptr(task);
+        }
+        WaitQueueHandle {
+            ptr: self as *const Self as *const (),
+            wake_fn: wake_fn::<T>,
         }
     }
 }

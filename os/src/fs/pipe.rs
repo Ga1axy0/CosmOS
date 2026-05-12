@@ -38,7 +38,7 @@ impl Pipe {
     }
 }
 
-const RING_BUFFER_SIZE: usize = 32;
+const RING_BUFFER_SIZE: usize = 1024;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -140,7 +140,7 @@ impl File for Pipe {
         loop {
             let mut ring_buffer = self.buffer.lock();
             let loop_read = ring_buffer.available_read();
-            debug!("Pipe::read: want_to_read {}, already_read {}, loop_read {}", want_to_read, already_read, loop_read);
+            // debug!("Pipe::read: want_to_read {}, already_read {}, loop_read {}", want_to_read, already_read, loop_read);
             if loop_read == 0 {
                 // 只要本次调用已经读到数据，就立即短读返回，避免阻塞等待凑满用户缓冲区。
                 if already_read > 0 {
@@ -187,7 +187,7 @@ impl File for Pipe {
         loop {
             let mut ring_buffer = self.buffer.lock();
             let loop_write = ring_buffer.available_write();
-            debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
+            // debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
             if loop_write == 0 {
                 let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);

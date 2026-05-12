@@ -4,6 +4,7 @@ use crate::mm::{translated_ref, translated_refmut, UserBuffer};
 use crate::syscall::errno::ERRNO;
 use crate::task::current_user_token;
 use crate::sync::SpinNoIrqLock;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::Any;
 
@@ -19,6 +20,15 @@ const TCSETSF: usize = 0x5404;
 const TIOCGWINSZ: usize = 0x5413;
 /// `ioctl(TIOCSWINSZ)`：设置窗口大小。
 const TIOCSWINSZ: usize = 0x5414;
+
+/// termios input flag: CR -> NL conversion.
+const IFLAG_ICRNL: u32 = 0x0000_0100;
+/// termios local flag: canonical mode (line buffering).
+const LFLAG_ICANON: u32 = 0x0000_0002;
+/// termios local flag: echo input characters.
+const LFLAG_ECHO: u32 = 0x0000_0008;
+/// termios local flag: echo erase (backspace).
+const LFLAG_ECHOE: u32 = 0x0000_0010;
 
 /// tty 终端配置的最小占位结构。
 #[repr(C)]
@@ -42,10 +52,10 @@ impl Default for Termios {
     /// 返回一份最小可用的终端配置占位值。
     fn default() -> Self {
         Self {
-            iflag: 0,
+            iflag: IFLAG_ICRNL,
             oflag: 0,
             cflag: 0,
-            lflag: 0,
+            lflag: LFLAG_ICANON | LFLAG_ECHO | LFLAG_ECHOE,
             line: 0,
             cc: [0; 19],
         }
@@ -82,6 +92,8 @@ impl Default for WinSize {
 struct TtyState {
     termios: Termios,
     winsize: WinSize,
+    input_buf: VecDeque<u8>,
+    line_buf: VecDeque<u8>,
 }
 
 /// 共享 tty 核心，统一管理一个控制台终端的底层设备与状态。
@@ -105,6 +117,8 @@ impl TtyCore {
                 SpinNoIrqLock::new(TtyState {
                     termios: Termios::default(),
                     winsize: WinSize::default(),
+                    input_buf: VecDeque::new(),
+                    line_buf: VecDeque::new(),
                 })
             },
             tx_lock: SpinNoIrqLock::new(()),
@@ -119,8 +133,114 @@ impl TtyCore {
 
     /// 从底层终端读取一个字节。
     pub fn read_byte(&self) -> u8 {
-        // TODO: 后续在这里接入行规程、回显和信号语义。
+        // 原始读取：直接从底层驱动取字节（阻塞）。
         self.driver.read()
+    }
+
+    /// 是否已有可直接返回给用户的输入字节。
+    pub fn has_ready_input(&self) -> bool {
+        !self.state.lock().input_buf.is_empty()
+    }
+
+    /// 轮询是否具备可读输入：canonical 下必须已有完整行。
+    pub fn poll_read_ready(&self) -> bool {
+        let (has_ready, canonical) = {
+            let state = self.state.lock();
+            (
+                !state.input_buf.is_empty(),
+                (state.termios.lflag & LFLAG_ICANON) != 0,
+            )
+        };
+        if has_ready {
+            return true;
+        }
+        if canonical {
+            return false;
+        }
+        self.driver.has_data()
+    }
+
+    /// 读取一个经过 tty 行规程处理后的字节。
+    pub fn read_processed_byte(&self) -> u8 {
+        loop {
+            if let Some(ch) = self.state.lock().input_buf.pop_front() {
+                return ch;
+            }
+            let raw = self.driver.read();
+            self.ingest_input_byte(raw);
+        }
+    }
+
+    fn ingest_input_byte(&self, raw: u8) {
+        let mut echo_buf = [0u8; 3];
+        let mut echo_len = 0usize;
+
+        let mut state = self.state.lock();
+        let termios = state.termios;
+        let mut ch = raw;
+
+        if (termios.iflag & IFLAG_ICRNL) != 0 && ch == b'\r' {
+            ch = b'\n';
+        }
+
+        let canonical = (termios.lflag & LFLAG_ICANON) != 0;
+        let echo_enabled = (termios.lflag & LFLAG_ECHO) != 0;
+        let echo_erase = (termios.lflag & LFLAG_ECHOE) != 0;
+
+        if canonical {
+            match ch {
+                b'\n' => {
+                    state.line_buf.push_back(b'\n');
+                    while let Some(b) = state.line_buf.pop_front() {
+                        state.input_buf.push_back(b);
+                    }
+                    if echo_enabled {
+                        echo_buf[0] = b'\r';
+                        echo_buf[1] = b'\n';
+                        echo_len = 2;
+                    }
+                }
+                0x08 | 0x7f => {
+                    if state.line_buf.pop_back().is_some() && echo_enabled && echo_erase {
+                        echo_buf[0] = 0x08;
+                        echo_buf[1] = b' ';
+                        echo_buf[2] = 0x08;
+                        echo_len = 3;
+                    }
+                }
+                _ => {
+                    state.line_buf.push_back(ch);
+                    if echo_enabled {
+                        echo_buf[0] = ch;
+                        echo_len = 1;
+                    }
+                }
+            }
+        } else {
+            state.input_buf.push_back(ch);
+            if echo_enabled {
+                if ch == b'\n' {
+                    echo_buf[0] = b'\r';
+                    echo_buf[1] = b'\n';
+                    echo_len = 2;
+                } else {
+                    echo_buf[0] = ch;
+                    echo_len = 1;
+                }
+            }
+        }
+
+        drop(state);
+        if echo_enabled && echo_len > 0 {
+            self.echo_bytes(&echo_buf[..echo_len]);
+        }
+    }
+
+    fn echo_bytes(&self, bytes: &[u8]) {
+        let _guard = self.tx_lock.lock();
+        for &b in bytes {
+            self.driver.write(b);
+        }
     }
 
     /// 向底层终端写入一个字节。
@@ -217,15 +337,18 @@ impl File for TtyFile {
     }
 
     fn read_at(&self, _offset: usize, user_buf: UserBuffer) -> usize {
-        // 支持将用户缓冲区中的每个字节填充为独立读取的字符。
-        // TODO: 后续接入行规程、非阻塞、canonical/raw 模式语义以及信号中断。
+        // TODO: 后续接入非阻塞语义以及信号中断。
         let mut n = 0usize;
         for user_ptr in user_buf.into_iter() {
-            let ch = self.core.read_byte();
+            let ch = self.core.read_processed_byte();
             unsafe {
                 core::ptr::write_volatile(user_ptr, ch);
             }
             n += 1;
+
+            if !self.core.has_ready_input() {
+                break;
+            }
         }
         n
     }
@@ -249,7 +372,7 @@ impl File for TtyFile {
         const POLLOUT: u16 = 0x004;
 
         let mut ready = 0u16;
-        if self.readable && (events & POLLIN) != 0 && self.core.driver.has_data() {
+        if self.readable && (events & POLLIN) != 0 && self.core.poll_read_ready() {
             ready |= POLLIN;
         }
         if self.writable && (events & POLLOUT) != 0 {

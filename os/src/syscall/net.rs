@@ -922,10 +922,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                         level,
                         optname
                     );
-                    unsafe {
-                        *optval = 0;
-                        *optlen = core::mem::size_of::<i32>() as i32;
-                    }
+                    write_getsockopt_i32(token, optval, optlen, 0)?;
                     Ok(0)
                 }
             },
