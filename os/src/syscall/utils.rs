@@ -14,6 +14,9 @@ use core::slice;
 /// 以显式确认该类型可以安全地通过 `write_pod_to_user` 按字节写回用户空间。
 pub trait Pod {}
 
+// i32 是 Linux ABI 中常见的简单写回类型，如 tid/status。
+impl Pod for i32 {}
+
 /// 尝试为一段用户虚拟地址触发并完成缺页装入，使后续字节翻译可成功。
 ///
 /// 仅处理与当前进程地址空间相关的 lazy file-backed / COW 场景；若地址本身
