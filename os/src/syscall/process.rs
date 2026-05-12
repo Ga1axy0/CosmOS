@@ -1,13 +1,15 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::syscall_body;
+use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
     mm::{translated_ref, translated_refmut, translated_str},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, pid2process, ExitReason, SignalAction, SignalFlags,
+        exit_current_and_run_next, pid2process, suspend_current_and_run_next, ExitReason,
+        SignalFlags,
         WaitReason,
     },
 };
@@ -82,6 +84,8 @@ fn resolve_exec_image(
     argv: Vec<String>,
     depth: usize,
 ) -> Result<ResolvedExecImage, ERRNO> {
+    debug!("Resolving exec image: path='{}', argv={:?}, depth={}", path, argv, depth);
+
     if depth >= EXEC_INTERPRETER_MAX_DEPTH {
         return Err(ERRNO::ELOOP);
     }
@@ -94,6 +98,11 @@ fn resolve_exec_image(
 
     // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
     let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    debug!(
+        "First line of exec target: {:?}, complete={}",
+        core::str::from_utf8(&first_line).unwrap_or("<invalid utf-8>"),
+        first_line_complete
+    );
     if is_elf_image(&first_line) {
         let file_data = inode.read_all();
         return Ok(ResolvedExecImage {
@@ -131,8 +140,9 @@ fn resolve_exec_image(
 /// exit the current task and run the next task in task list
 pub fn sys_exit(exit_code: i32) -> ! {
     trace!(
-        "kernel:pid[{}] sys_exit",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_exit - time {}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        get_time_ns()
     );
     exit_current_and_run_next(ExitReason::Exit(exit_code));
     panic!("Unreachable in sys_exit!");
@@ -143,6 +153,12 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
     sys_exit(exit_code);
 }
 
+/// yield syscall
+pub fn sys_yield() -> isize {
+    //trace!("kernel: sys_yield");
+    suspend_current_and_run_next();
+    0
+}
 /// getpid syscall
 pub fn sys_getpid() -> isize {
     trace!(
@@ -215,6 +231,12 @@ pub fn sys_fork() -> isize {
     );
     let current_process = current_process();
     let new_process = current_process.fork();
+    info!(
+        "kernel:pid[{}] forked new process with pid {} - time {}",
+        current_process.getpid(),
+        new_process.getpid(),
+        get_time_ns()
+    );
     new_process.getpid() as isize
 }
 /// sys_execve
@@ -251,7 +273,9 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
 
         let process = current_process();
         let cwd = process.inner_exclusive_access().cwd.clone();
+        debug!(" ------------------- Resolve -----------------------");
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
+        debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage { elf_data, argv } = resolved;
         let argc = argv.len();
         process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
@@ -346,6 +370,23 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     });
                     !has_target_child || has_target_zombie
                 });
+
+            // If woken by a deliverable user-handled signal, return EINTR so the trap handler can dispatch it.
+            {
+                let inner = process.inner_exclusive_access();
+                let pending_unmasked = inner.pending_signals & !inner.signal_mask;
+                let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
+                    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else { return false; };
+                    if !pending_unmasked.contains(flag) {
+                        return false;
+                    }
+                    let handler = inner.signal_actions.table[signum].handler;
+                    handler != crate::task::SIG_DFL && handler != crate::task::SIG_IGN
+                });
+                if has_user_handler {
+                    return Err(ERRNO::EINTR);
+                }
+            }
         }
     })
 }
@@ -410,98 +451,13 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
     })
 }
 
-/// sigaction 系统调用
-///
-/// 为当前进程的指定信号安装/读取用户态处理动作。
-/// 当前仅完成动作表的存取与基础参数校验，还没有把用户态 handler
-/// 真正接入 trap 返回路径。
-pub fn sys_sigaction(
-    signum: i32,
-    action: *const SignalAction,
-    old_action: *mut SignalAction,
-) -> isize {
-    syscall_body!({
-        let signum = signum as u32;
-        if signum == 0 || signum as usize > crate::task::MAX_SIG {
-            return Err(ERRNO::EINVAL);
-        }
-        if signum == 9 || signum == 19 {
-            return Err(ERRNO::EINVAL);
-        }
-        let token = current_user_token();
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let slot = &mut inner.signal_actions.table[signum as usize];
-        if !old_action.is_null() {
-            let old = translated_refmut(token, old_action).or_errno(ERRNO::EFAULT)?;
-            *old = *slot;
-        }
-        if !action.is_null() {
-            // TODO: 接入用户态 signal handler 分发后，需要在这里补充
-            // 对 handler/mask 组合语义的进一步约束校验。
-            let new_action = *translated_ref(token, action).or_errno(ERRNO::EFAULT)?;
-            *slot = new_action;
-        }
-        Ok(0)
-    })
-}
-
-/// sigprocmask / rt_sigprocmask 系统调用
-///
-/// Linux 语义：
-///   how == SIG_BLOCK   (0) -> mask |= set
-///   how == SIG_UNBLOCK (1) -> mask &= ~set
-///   how == SIG_SETMASK (2) -> mask = set
-/// 参数含义遵循 rt_sigprocmask: (int how, const sigset_t *set, sigset_t *oset, size_t sigsetsize)
-pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: usize) -> isize {
+/// change data segment size
+pub fn sys_brk(addr: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_sigprocmask",
+        "kernel:pid[{}] sys_brk",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
-    syscall_body!({
-        // We represent sigset as a u32 bitmask in this kernel; require user-provided
-        // buffer to be large enough to hold at least a u32.
-        if sigsetsize < core::mem::size_of::<u32>() {
-            return Err(ERRNO::EINVAL);
-        }
-
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-
-        // If user requested old mask, write it out first.
-        if !oset.is_null() {
-            let old_bits = inner.signal_mask.bits();
-            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
-            *slot = old_bits;
-        }
-
-        // If user provided a new mask, apply according to `how`.
-        if !set.is_null() {
-            let new_bits = *translated_ref(token, set).or_errno(ERRNO::EFAULT)?;
-            let new_mask = SignalFlags::from_bits(new_bits).or_errno(ERRNO::EINVAL)?;
-            match how {
-                0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
-                1 => inner.signal_mask.remove(new_mask), // SIG_UNBLOCK
-                2 => inner.signal_mask = new_mask,       // SIG_SETMASK
-                _ => return Err(ERRNO::EINVAL),
-            }
-        }
-
-        Ok(0)
-    })
-}
-
-/// sigreturn 系统调用
-///
-/// 供用户态 signal handler 返回内核并恢复被中断现场。
-/// 当前仅保留 syscall 框架，尚未实现 signal frame / trap context 恢复。
-pub fn sys_sigreturn() -> isize {
-    syscall_body!({
-        // TODO: 实现用户态 signal frame 恢复，包括 trap context、
-        // 屏蔽字与正在处理信号状态的回滚。
-        Err(ERRNO::ENOSYS)?
-    })
+    current_process().set_program_brk(addr) as isize
 }
 
 /// spawn syscall

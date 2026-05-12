@@ -35,6 +35,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
+use fs::remove_dentry;
 use fs::vfs::{InodeTime, VfsNode};
 use lazy_static::*;
 
@@ -112,13 +113,20 @@ impl VirtualDirNode {
             .lock()
             .mounts
             .insert(String::from(name), node);
+        // Invalidate cached overlay dentry at this name.
+        remove_dentry(u64::MAX, self.ino, name);
     }
 
     /// Remove the explicit binding for `name`.
     ///
     /// Returns `true` if the binding existed and was removed.
     pub fn unbind(&self, name: &str) -> bool {
-        self.inner.lock().mounts.remove(name).is_some()
+        let existed = self.inner.lock().mounts.remove(name).is_some();
+        if existed {
+            // Invalidate cached mount dentry at this name.
+            remove_dentry(u64::MAX, self.ino, name);
+        }
+        existed
     }
 
     /// If the overlay contains a *directory* child named `name`, return it.
@@ -156,6 +164,11 @@ impl VfsNode for VirtualDirNode {
         true
     }
 
+    fn fs_id(&self) -> u64 {
+        // Use a sentinel so the dentry cache covers virtual-directory lookups.
+        u64::MAX
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -168,9 +181,9 @@ impl VfsNode for VirtualDirNode {
     // Directory enumeration
     // -----------------------------------------------------------------------
 
-    fn ls(&self) -> Vec<String> {
-        // Phase 1: collect names from overlay (drop borrow before phase 2).
-        let overlay_names: Vec<String> = {
+    fn ls(&self) -> Vec<(String, bool)> {
+        // Phase 1: collect (name, is_dir) from overlay.
+        let mut entries: Vec<(String, bool)> = {
             let inner = self.inner.lock();
             match inner.overlay.as_ref() {
                 Some(ov) => ov.ls(),
@@ -179,18 +192,21 @@ impl VfsNode for VirtualDirNode {
         };
 
         // Phase 2: add explicit mount names that the overlay doesn't list.
-        let mount_keys: Vec<String> = {
+        let mount_entries: Vec<(String, bool)> = {
             let inner = self.inner.lock();
-            inner.mounts.keys().cloned().collect()
+            inner
+                .mounts
+                .iter()
+                .map(|(name, node)| (name.clone(), node.is_dir()))
+                .collect()
         };
 
-        let mut names = overlay_names;
-        for key in mount_keys {
-            if !names.contains(&key) {
-                names.push(key);
+        for (key, is_dir) in mount_entries {
+            if !entries.iter().any(|(name, _)| name == &key) {
+                entries.push((key, is_dir));
             }
         }
-        names
+        entries
     }
 
     // -----------------------------------------------------------------------

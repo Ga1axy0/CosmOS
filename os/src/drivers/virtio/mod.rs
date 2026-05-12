@@ -6,32 +6,19 @@
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
-use virtio_drivers::{
-    BufferDirection,
-    Hal,
-    PhysAddr as VirtioPhysAddr,
-};
+use virtio_drivers::{BufferDirection, Hal, PhysAddr as VirtioPhysAddr};
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    frame_alloc,
-    frame_dealloc,
-    kernel_token,
-    FrameTracker,
-    PageTable,
-    PhysAddr as KernelPhysAddr,
-    PhysPageNum,
-    StepByOne,
-    VirtAddr,
+    frame_alloc_contiguous, frame_dealloc_range, kernel_token, ContiguousFrames, PageTable,
+    PhysAddr as KernelPhysAddr, PhysPageNum, VirtAddr,
 };
 use crate::sync::SpinNoIrqLock;
 
 lazy_static! {
     /// Tracks DMA frames allocated for VirtIO queues so their lifetime extends
     /// across device usage.
-    static ref QUEUE_FRAMES: SpinNoIrqLock<Vec<FrameTracker>> = unsafe {
-        SpinNoIrqLock::new(Vec::new())
-    };
+    static ref QUEUE_FRAMES: SpinNoIrqLock<Vec<ContiguousFrames>> = SpinNoIrqLock::new(Vec::new());
 
     /// Bounce mappings for shared buffers that are not physically contiguous.
     static ref BOUNCE_MAPPINGS: SpinNoIrqLock<Vec<BounceMapping>> = SpinNoIrqLock::new(Vec::new());
@@ -43,7 +30,7 @@ struct BounceMapping {
     /// Kernel virtual address of the bounced buffer start (same offset as original).
     bounced_vaddr: usize,
     /// Contiguous frames backing this bounced region.
-    frames: Vec<FrameTracker>,
+    frames: ContiguousFrames,
 }
 
 #[inline]
@@ -81,33 +68,17 @@ fn is_physically_contiguous(ptr: usize, len: usize) -> bool {
     true
 }
 
-fn alloc_contiguous_frames(pages: usize) -> Vec<FrameTracker> {
+fn alloc_contiguous_frames(pages: usize) -> ContiguousFrames {
     assert!(pages > 0);
-
-    const MAX_RETRY: usize = 64;
-    for _ in 0..MAX_RETRY {
-        let mut frames: Vec<FrameTracker> = Vec::with_capacity(pages);
-        let mut ok = true;
-
-        for i in 0..pages {
-            let Some(frame) = frame_alloc() else {
-                panic!("virtio bounce alloc: out of memory");
-            };
-            if i > 0 && frame.ppn.0 != frames[0].ppn.0 + i {
-                ok = false;
-            }
-            frames.push(frame);
-        }
-
-        if ok {
-            return frames;
-        }
-
-        // Drop and retry; dropping FrameTracker returns pages to allocator.
-        drop(frames);
-    }
-
-    panic!("virtio bounce alloc: failed to get {} contiguous pages", pages);
+    let pages = pages
+        .checked_next_power_of_two()
+        .expect("virtio contiguous allocation size overflow");
+    frame_alloc_contiguous(pages, pages).unwrap_or_else(|| {
+        panic!(
+            "virtio bounce alloc: failed to get {} contiguous pages",
+            pages
+        )
+    })
 }
 
 #[inline]
@@ -139,19 +110,13 @@ unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (VirtioPhysAddr, NonNull<u8>) {
         assert!(pages > 0);
 
-        let mut ppn_base = PhysPageNum(0);
-        for i in 0..pages {
-            let frame = frame_alloc().expect("virtio dma_alloc: frame_alloc failed");
-            if i == 0 {
-                ppn_base = frame.ppn;
-            }
-            assert_eq!(frame.ppn.0, ppn_base.0 + i, "virtio dma_alloc: pages not contiguous");
-            QUEUE_FRAMES.lock().push(frame);
-        }
+        let frames = alloc_contiguous_frames(pages);
+        let ppn_base = frames.start_ppn();
 
         let pa: KernelPhysAddr = ppn_base.into();
         let paddr = pa.0 as VirtioPhysAddr;
         let vaddr = NonNull::new(pa.0 as *mut u8).expect("virtio dma_alloc: null vaddr");
+        QUEUE_FRAMES.lock().push(frames);
         (paddr, vaddr)
     }
 
@@ -160,15 +125,18 @@ unsafe impl Hal for VirtioHal {
             return 0;
         }
 
-        let mut ppn: PhysPageNum = KernelPhysAddr::from(paddr as usize).into();
+        let ppn: PhysPageNum = KernelPhysAddr::from(paddr as usize).into();
         let mut frames = QUEUE_FRAMES.lock();
-        for _ in 0..pages {
-            if let Some(idx) = frames.iter().position(|f| f.ppn == ppn) {
-                frames.swap_remove(idx);
-            } else {
-                frame_dealloc(ppn);
-            }
-            ppn.step();
+        if let Some(idx) = frames
+            .iter()
+            .position(|f| f.start_ppn() == ppn && f.pages() >= pages)
+        {
+            frames.swap_remove(idx);
+        } else {
+            let pages = pages
+                .checked_next_power_of_two()
+                .expect("virtio dma_dealloc size overflow");
+            frame_dealloc_range(ppn, pages);
         }
         0
     }
@@ -188,16 +156,19 @@ unsafe impl Hal for VirtioHal {
         // Fall back to contiguous physical bounce buffer.
         let page_offset = ptr & (PAGE_SIZE - 1);
         let total = page_offset + len;
-        let pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages = total.div_ceil(PAGE_SIZE);
         let frames = alloc_contiguous_frames(pages);
 
-        let base_ppn = frames[0].ppn;
+        let base_ppn = frames.start_ppn();
         let base_pa: KernelPhysAddr = base_ppn.into();
         let base_pa_usize = base_pa.0;
         let bounced_vaddr = base_pa_usize + page_offset;
         let shared_paddr = (base_pa_usize + page_offset) as VirtioPhysAddr;
 
-        if matches!(direction, BufferDirection::DriverToDevice | BufferDirection::Both) {
+        if matches!(
+            direction,
+            BufferDirection::DriverToDevice | BufferDirection::Both
+        ) {
             // SAFETY: `ptr..ptr+len` and bounce range are valid and non-overlapping.
             unsafe {
                 copy_to_bounce(ptr, bounced_vaddr, len);
@@ -230,7 +201,10 @@ unsafe impl Hal for VirtioHal {
         let ptr = buffer.as_ptr() as *mut u8 as usize;
         let len = buffer.len();
 
-        if matches!(direction, BufferDirection::DeviceToDriver | BufferDirection::Both) {
+        if matches!(
+            direction,
+            BufferDirection::DeviceToDriver | BufferDirection::Both
+        ) {
             // SAFETY: `ptr..ptr+len` and bounce range are valid and non-overlapping.
             unsafe {
                 copy_from_bounce(mapping.bounced_vaddr, ptr, len);

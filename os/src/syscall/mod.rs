@@ -82,6 +82,10 @@ pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 pub const SYSCALL_GET_ROBUST_LIST: usize = 100;
 /// sleep syscall
 pub const SYSCALL_NANOSLEEP: usize = 101;
+/// getitimer syscall
+pub const SYSCALL_GETITIMER: usize = 102;
+/// setitimer syscall
+pub const SYSCALL_SETITIMER: usize = 103;
 /// clock_settime syscall
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 /// clock_gettime syscall
@@ -108,6 +112,8 @@ pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_TKILL: usize = 130;
 /// tgkill syscall
 pub const SYSCALL_TGKILL: usize = 131;
+/// sigsuspend syscall
+pub const SYSCALL_SIGSUSPEND: usize = 133;
 /// sigaction syscall
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
@@ -238,6 +244,7 @@ mod sync;
 mod thread;
 mod random;
 mod mman;
+mod signal;
 mod times;
 mod utils;
 
@@ -252,8 +259,12 @@ use sync::*;
 use thread::*;
 use crate::syscall::random::*;
 use mman::*;
+use signal::*;
 use times::*;
-pub(crate) use utils::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
+pub(crate) use utils::{
+    read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
+    write_pod_to_user, Pod,
+};
 
 
 use crate::{fs::Stat, net::SockAddrIn, syscall::errno::ERRNO};
@@ -275,7 +286,10 @@ macro_rules! syscall_body {
         let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
         match result {
             Ok(v) => v,
-            Err(e) => -(e as isize),
+            Err(e) => {
+                // warn!("syscall error: {:?}", e);
+                -(e as isize)
+            },
         }
     }};
 }
@@ -311,7 +325,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
-        SYSCALL_LSEEK => sys_llseek(args[0] as u32, args[1], args[2], args[3] as *mut u64, args[4] as u32),
+        SYSCALL_LSEEK => sys_lseek(args[0] as u32, args[1], args[2] as u32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0] as u32, args[1] as *const u8, args[2]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
@@ -356,11 +370,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
+        SYSCALL_GETITIMER => sys_getitimer(args[0] as i32, args[1] as *mut OldItimerval),
+        SYSCALL_SETITIMER => sys_setitimer(
+            args[0] as i32,
+            args[1] as *const OldItimerval,
+            args[2] as *mut OldItimerval,
+        ),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
-        SYSCALL_YIELD => sys_yield(),
+        SYSCALL_YIELD => sched::sys_yield(),
         SYSCALL_GETSID => sys_getsid(),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
@@ -425,7 +445,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
         SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
-        SYSCALL_BRK => sys_brk(args[0]),
+        SYSCALL_BRK => mman::sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
@@ -454,8 +474,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
-        SYSCALL_SIGACTION => sys_sigaction(args[0] as i32, args[1] as *const crate::task::SignalAction, args[2] as *mut crate::task::SignalAction),
+        SYSCALL_SIGACTION => sys_sigaction(
+            args[0] as i32,
+            args[1] as *const crate::task::SignalAction,
+            args[2] as *mut crate::task::SignalAction,
+            args[3], // sigsetsize
+        ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
+        SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u32, args[1]),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),

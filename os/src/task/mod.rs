@@ -14,11 +14,9 @@ mod context;
 mod id;
 #[path = "../sched/runqueue.rs"]
 mod runqueue;
-mod action;
 mod process;
 #[path ="../sched/processor.rs"]
 mod processor;
-mod signal;
 #[path ="../sched/switch.rs"]
 mod switch;
 mod wait_queue;
@@ -42,15 +40,17 @@ pub use runqueue::{
     add_task, dequeue_task, enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio,
     pid2process, pick_next_task, remove_from_pid2process, remove_task, resched_hart, wakeup_task,
 };
-pub use action::{SignalAction, SignalActions};
+pub use crate::signal::{
+    check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
+    SignalActions, SignalFlags, StackT, UContext, SIG_DFL, SIG_IGN,
+};
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
 };
-pub use wait_queue::{WaitQueue, WaitQueueKeyed};
+pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
-pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{
     all_cpu_affinity_mask, SchedAttr, SchedPolicy, TaskControlBlock, TaskStatus, WaitReason,
     DEFAULT_TIME_SLICE_TICKS, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
@@ -101,6 +101,7 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         if matches!(task_inner.task_status, TaskStatus::Runnable) {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
+            task_inner.current_wq_handle = None;
             task_inner.on_cpu = true;
             task_inner.on_rq = false;
             task_inner.need_resched = false;
@@ -238,6 +239,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(closed_fds);
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
+            add_signal_to_process(&parent, SignalFlags::SIGCHLD);
             parent.wait_exit_queue.wake_one();
         }
     } else {
@@ -321,6 +323,8 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     pending.check_error()
 }
 
+
+
 /// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
 pub fn current_process_is_zombie() -> bool {
     let process = current_process();
@@ -342,11 +346,17 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
     };
 
     if should_notify_poll {
+        debug!(
+            "add_signal_to_process: pid={} added signal {:#x} which is unmasked, should notify poll",
+            pid,
+            signal.bits()
+        );
         crate::poll::notify_poll_signal_pid(pid);
 
-        // `ppoll` 在注册表耗尽时会走 ENOSPC 回退路径，直接以 `WaitReason::Poll`
-        // 阻塞并依赖短时 timer 唤醒重扫；该路径不在 keyed poll registry 中，
-        // 需要在信号投递时主动唤醒，确保尽快返回 EINTR。
+        // When an unmasked signal arrives, wake interruptible tasks so they
+        // return -EINTR.  Use the WaitQueueHandle (if the task is enqueued)
+        // to properly remove it from its wait queue before waking.
+        // Keyed-poll tasks are already handled by notify_poll_signal_pid above.
         let tasks: Vec<Arc<TaskControlBlock>> = {
             let process_inner = process.inner_exclusive_access();
             process_inner
@@ -359,16 +369,22 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
             if task_has_inflight_keyed_poll_wait(&task) {
                 continue;
             }
-            let should_wake = {
+            let handle = {
                 let task_inner = task.inner_exclusive_access();
-                matches!(task_inner.wait_reason, Some(WaitReason::Poll))
-                    && matches!(
-                        task_inner.task_status,
-                        TaskStatus::Interruptible | TaskStatus::Uninterruptible
-                    )
+                task_inner.current_wq_handle.clone()
             };
-            if should_wake {
-                wakeup_task(task);
+            if let Some(handle) = handle {
+                debug!("Wakeup with handle, reason = {:?}", task.inner_exclusive_access().wait_reason.unwrap_or(WaitReason::Unknown));
+                handle.wake_waiter(&task);
+            } else {
+                debug!("Wakeup task without handle, reason = {:?}", task.inner_exclusive_access().wait_reason.unwrap_or(WaitReason::Unknown));
+                let should_wake = {
+                    let task_inner = task.inner_exclusive_access();
+                    matches!(task_inner.task_status, TaskStatus::Interruptible)
+                };
+                if should_wake {
+                    wakeup_task(task);
+                }
             }
         }
     }
@@ -378,6 +394,21 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
 pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
     add_signal_to_process(&process, signal);
+}
+
+/// 扫描所有进程的 interval timer，到期则投递对应信号。
+pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
+    let processes: Vec<Arc<ProcessControlBlock>> = {
+        let map = self::runqueue::PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+
+    for process in processes {
+        let pending = process.consume_expired_itimers(now_raw, now_realtime_ns);
+        if !pending.is_empty() {
+            add_signal_to_process(&process, pending);
+        }
+    }
 }
 
 /// the inactive(blocked) tasks are removed when the PCB is deallocated.(called by exit_current_and_run_next)

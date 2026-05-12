@@ -5,7 +5,7 @@ use spin::Mutex;
 use crate::{BLOCK_SZ, fat32::dir::DirAttr};
 use crate::block_cache::get_block_cache;
 use crate::errno::FS_ERRNO;
-use crate::vfs::VfsNode;
+use crate::vfs::{VfsAttrs, VfsNode};
 
 use super::{Fat32FileSystem, dir, fat};
 
@@ -479,7 +479,7 @@ impl VfsNode for FatInode {
         self
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         let inner = self.inner.lock();
         if !inner.is_dir {
             return Vec::new();
@@ -489,8 +489,11 @@ impl VfsNode for FatInode {
 
         self.iter_dir(dir_cluster)
             .into_iter()
-            .map(|e| e.name_string())
-            .filter(|name| name != "." && name != "..")
+            .filter(|e| {
+                let name = e.name_string();
+                name != "." && name != ".."
+            })
+            .map(|e| (e.name_string(), e.sfn.is_dir()))
             .collect()
     }
 
@@ -712,6 +715,28 @@ impl VfsNode for FatInode {
 
     fn is_dir(&self) -> bool {
         self.inner.lock().is_dir
+    }
+
+    fn stat_attrs(&self) -> VfsAttrs {
+        let inner = self.inner.lock();
+        let ino = if inner.is_dir && inner.pos.is_none() {
+            inner.start_cluster as u64
+        } else if let Some(pos) = &inner.pos {
+            ((pos.dir_start_cluster as u64) << 32) | pos.entry_offset as u64
+        } else if inner.start_cluster >= 2 {
+            (1u64 << 63) | inner.start_cluster as u64
+        } else {
+            0
+        };
+        VfsAttrs {
+            mode: None,
+            ino,
+            nlink: 1,
+            size: inner.size as usize,
+            atime: None,
+            mtime: None,
+            ctime: None,
+        }
     }
 
     fn clear(&self) {

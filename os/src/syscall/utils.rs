@@ -5,7 +5,7 @@ use crate::task::{current_process, current_user_token};
 
 use alloc::vec::Vec;
 
-use core::mem::size_of;
+use core::mem::{size_of, MaybeUninit};
 use core::slice;
 
 /// 标记“可按原始字节整体复制”的 ABI 数据结构。
@@ -53,6 +53,10 @@ fn prefault_user_pages(
             None => {
                 if access == PageFaultAccess::Write && process.handle_private_cow_fault(page_start)
                 {
+                    page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
+                    continue;
+                }
+                if process.handle_lazy_heap_fault(page_start, access) {
                     page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
                     continue;
                 }
@@ -107,4 +111,26 @@ pub fn write_pod_to_user<T: Pod>(ptr: *mut T, value: &T) -> Result<(), ERRNO> {
     let value_bytes =
         unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
     write_bytes_to_user(ptr as *mut u8, value_bytes)
+}
+
+/// 从用户地址空间读取一段字节，允许跨越多个用户页。
+pub fn read_bytes_from_user(ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO> {
+    let buffers = translated_byte_buffer_with_access(ptr, len, PageFaultAccess::Read)?;
+    let mut bytes = Vec::with_capacity(len);
+    for buffer in buffers.iter() {
+        bytes.extend_from_slice(buffer);
+    }
+    Ok(bytes)
+}
+
+/// 从用户地址空间读取一个 POD 结构，允许结构体跨越多个用户页。
+pub fn read_pod_from_user<T: Pod>(ptr: *const T) -> Result<T, ERRNO> {
+    debug!("Read pod from user");
+    let bytes = read_bytes_from_user(ptr as *const u8, size_of::<T>())?;
+    let mut value = MaybeUninit::<T>::uninit();
+    let value_bytes =
+    unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
+    value_bytes.copy_from_slice(&bytes);
+    debug!("End read pod from user");
+    Ok(unsafe { value.assume_init() })
 }

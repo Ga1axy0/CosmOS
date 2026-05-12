@@ -1,8 +1,6 @@
-use crate::mm::translated_ref;
-use crate::syscall::errno::{ERRNO, OrErrno};
+use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
-use crate::syscall::{write_pod_to_user, Pod};
-use crate::task::current_user_token;
+use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
 use crate::timer::set_realtime_offset_from_time_ns;
 use crate::{
     config::CLOCK_FREQ,
@@ -25,14 +23,31 @@ pub const RUSAGE_CHILDREN: i32 = -1;
 /// Linux `getrusage(2)` 的当前线程选择器。
 pub const RUSAGE_THREAD: i32 = 1;
 
+/// Linux `getitimer(2)/setitimer(2)` 的 `which`：实时时钟。
+pub const ITIMER_REAL: i32 = 0;
+/// Linux `getitimer(2)/setitimer(2)` 的 `which`：用户态 CPU 时间。
+pub const ITIMER_VIRTUAL: i32 = 1;
+/// Linux `getitimer(2)/setitimer(2)` 的 `which`：用户态 + 内核态 CPU 时间。
+pub const ITIMER_PROF: i32 = 2;
+
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct TimeVal {
     pub sec: usize,
     pub usec: usize,
 }
 
 impl Pod for TimeVal {}
+
+/// Linux 兼容的旧版 `itimerval` 结构。
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OldItimerval {
+    pub it_interval: TimeVal,
+    pub it_value: TimeVal,
+}
+
+impl Pod for OldItimerval {}
 
 /// Linux 风格的 `rusage` 结构。
 #[repr(C)]
@@ -108,6 +123,28 @@ fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     }
 }
 
+/// 将纳秒时间长度转换为 `timeval`。
+fn timeval_from_ns(ns: u64) -> TimeVal {
+    TimeVal {
+        sec: (ns / 1_000_000_000) as usize,
+        usec: ((ns % 1_000_000_000) / 1_000) as usize,
+    }
+}
+
+/// 将 `timeval` 转为纳秒时间长度。
+fn timeval_to_ns(tv: &TimeVal) -> Result<u64, ERRNO> {
+    if tv.usec >= 1_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let sec_ns = (tv.sec as u128) * 1_000_000_000u128;
+    let usec_ns = (tv.usec as u128) * 1_000u128;
+    let total = sec_ns.saturating_add(usec_ns);
+    if total > u64::MAX as u128 {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(total as u64)
+}
+
 /// get_time syscall
 pub fn sys_get_time_of_day(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
@@ -131,9 +168,77 @@ pub fn sys_set_time_of_day(tv: *const TimeVal, _tz: usize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let timeval = translated_ref(current_user_token(), tv).or_errno(ERRNO::EFAULT)?;
+        let timeval = read_pod_from_user(tv)?;
         let time_us = timeval.sec * 1_000_000 + timeval.usec;
         set_realtime_offset_from_time_ns((time_us * 1_000) as u64);
+        Ok(0)
+    })
+}
+
+/// `getitimer(2)` 系统调用。
+pub fn sys_getitimer(which: i32, value: *mut OldItimerval) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_getitimer which={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        which
+    );
+    syscall_body!({
+        match which {
+            ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF => {}
+            _ => return Err(ERRNO::EINVAL),
+        }
+        let process = current_process();
+        let now_raw = get_time();
+        let now_realtime_ns = get_realtime_ns();
+        let (value_ns, interval_ns) = process.get_itimer_state(which, now_raw, now_realtime_ns)?;
+        let out = OldItimerval {
+            it_interval: timeval_from_ns(interval_ns),
+            it_value: timeval_from_ns(value_ns),
+        };
+        write_pod_to_user(value, &out)?;
+        Ok(0)
+    })
+}
+
+/// `setitimer(2)` 系统调用。
+pub fn sys_setitimer(
+    which: i32,
+    value: *const OldItimerval,
+    ovalue: *mut OldItimerval,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_setitimer which={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        which
+    );
+    syscall_body!({
+        match which {
+            ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF => {}
+            _ => return Err(ERRNO::EINVAL),
+        }
+
+        let new_value = if value.is_null() {
+            None
+        } else {
+            let new_timer = read_pod_from_user(value)?;
+            let value_ns = timeval_to_ns(&new_timer.it_value)?;
+            let interval_ns = timeval_to_ns(&new_timer.it_interval)?;
+            Some((value_ns, interval_ns))
+        };
+
+        let process = current_process();
+        let now_raw = get_time();
+        let now_realtime_ns = get_realtime_ns();
+        let (old_value_ns, old_interval_ns) =
+            process.set_itimer_state(which, now_raw, now_realtime_ns, new_value)?;
+
+        if !ovalue.is_null() {
+            let old = OldItimerval {
+                it_interval: timeval_from_ns(old_interval_ns),
+                it_value: timeval_from_ns(old_value_ns),
+            };
+            write_pod_to_user(ovalue, &old)?;
+        }
         Ok(0)
     })
 }
@@ -186,7 +291,7 @@ pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
         // CLOCK_REALTIME_COARSE 等其它 clock id 的设置。
         match clockid {
             CLOCK_REALTIME => {
-                let timespec = translated_ref(current_user_token(), _tp).or_errno(ERRNO::EFAULT)?;
+                let timespec = read_pod_from_user(_tp)?;
                 let time_ns = (timespec.tv_sec as u64) * 1_000_000_000 + (timespec.tv_nsec as u64);
                 set_realtime_offset_from_time_ns(time_ns);
                 Ok(0)

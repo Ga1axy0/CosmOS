@@ -20,6 +20,7 @@ extern crate alloc;
 
 pub mod block_cache;
 pub mod block_dev;
+mod dentry_cache;
 mod inode_cache;
 pub mod vfs;
 pub mod easyfs;
@@ -34,6 +35,7 @@ pub use block_dev::BlockDevice;
 pub use easyfs::efs::EasyFileSystem;
 pub use fat32::Fat32FileSystem;
 pub use ext4::Ext4FileSystem;
+pub use dentry_cache::remove_dentry;
 pub use vfs::Inode;
 
 

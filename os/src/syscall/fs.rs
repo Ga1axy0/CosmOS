@@ -15,7 +15,7 @@ use crate::task::{
     block_current_and_run_next, current_process, current_task, current_user_token, FdEntry,
     FdFlags, WaitReason,
 };
-use crate::timer::get_realtime_ns;
+use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1049,8 +1049,8 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
 /// read syscall
 pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_read",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_read, fd = {}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(), fd
     );
     syscall_body!({
         let fd = fd as usize;
@@ -1062,22 +1062,18 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
-pub fn sys_llseek(fd: u32, offset_high: usize, offset_low: usize, result: *mut u64, whence: u32) -> isize {
+pub fn sys_lseek(fd: u32, offset: usize, whence: u32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_llseek",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_lseek, offset={}, whence={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        offset,
+        whence
     );
-    let token = current_user_token();
     syscall_body!({
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
         // Combine high/low into a 64-bit pattern and interpret as signed offset.
-        let offset_u = ((offset_high as u64) << 32) | (offset_low as u64);
-        let offset_i = offset_u as i64;
-        let new_pos = desc.seek(offset_i, whence as u8)?;
-        // write back as unsigned 64-bit position
-        *translated_refmut(token, result).or_errno(ERRNO::EFAULT)? = new_pos;
-        Ok(0)
+        Ok(desc.seek(offset as i64, whence as u8)? as isize)
     })
 }
 
@@ -1383,11 +1379,18 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
                 }
             }
         }
+let time1 = get_time_us();
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
         let abs_path = canonicalize(cwd.as_str(), path.as_str());
+let time2 = get_time_us();
         let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+let time3 = get_time_us();
         let stat = inode_stat(&inode);
+let time4 = get_time_us();
         write_pod_to_user(st, &stat)?;
+let time5 = get_time_us();
+        debug!("sys_newfstatat: resolve_dirfd_base & canonicalize = {}us, lookup_inode = {}us, inode_stat = {}us, write_pod_to_user = {}us",
+            time2 - time1, time3 - time2, time4 - time3, time5 - time4);
         Ok(0)
     })
 }

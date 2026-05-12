@@ -1,12 +1,13 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
 use log::debug;
 use spin::Mutex;
 
+use crate::block_cache::get_block_cache;
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::errno::FS_ERRNO;
-use crate::vfs::{Inode, InodeTime, VfsNode};
+use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsNode};
 use crate::BLOCK_SZ;
 
 use ext4_rs::{
@@ -17,10 +18,6 @@ use ext4_rs::{
 struct Ext4BlockDeviceAdapter {
     inner: Arc<dyn OsBlockDevice>,
 }
-
-/// 4KiB 对齐的扇区缓冲区，避免 virtio 直接访问跨物理页的 512-byte 缓冲。
-#[repr(align(4096))]
-struct AlignedSector([u8; BLOCK_SZ]);
 
 const EXT4_ROOT_INODE: u32 = 2;
 
@@ -54,11 +51,6 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         let end_block = (offset + len + BLOCK_SZ - 1) / BLOCK_SZ;
 
         for block_id in start_block..end_block {
-            let mut sector = Box::new(AlignedSector([0u8; BLOCK_SZ]));
-
-            // debug!("Ext4BlockDeviceAdapter read: block_id={}, offset={}, len={}", block_id, offset, len);
-            self.inner.read_block(block_id, &mut sector.0);
-
             let block_start = block_id * BLOCK_SZ;
             let src_start = offset.saturating_sub(block_start);
             let src_end = BLOCK_SZ.min(offset + len - block_start);
@@ -68,7 +60,9 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
 
             let dst_start = block_start + src_start - offset;
             let copy_len = src_end - src_start;
-            out[dst_start..dst_start + copy_len].copy_from_slice(&sector.0[src_start..src_end]);
+            get_block_cache(block_id, Arc::clone(&self.inner))
+                .lock()
+                .read_bytes(src_start, &mut out[dst_start..dst_start + copy_len]);
         }
 
         out
@@ -96,20 +90,13 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
             let dst_end = seg_end - block_start;
 
             if dst_start == 0 && dst_end == BLOCK_SZ {
-                // 这里使用固定大小的跳板缓冲区，避免直接把可能跨物理页的 heap slice 交给 virtio 块设备。
-                let mut sector = Box::new(AlignedSector([0u8; BLOCK_SZ]));
-                sector.0.copy_from_slice(&data[src_start..src_end]);
-                self.inner.write_block(block_id, &sector.0);
+                get_block_cache(block_id, Arc::clone(&self.inner))
+                    .lock()
+                    .write_bytes(0, &data[src_start..src_end]);
             } else {
-                let mut sector = Box::new(AlignedSector([0u8; BLOCK_SZ]));
-
-                // debug!("Ext4BlockDeviceAdapter partial block read: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
-                self.inner.read_block(block_id, &mut sector.0);
-                
-                sector.0[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
-
-                // debug!("Ext4BlockDeviceAdapter partial block write: block_id={}, dst_start={}, dst_end={}, src_start={}, src_end={}", block_id, dst_start, dst_end, src_start, src_end);
-                self.inner.write_block(block_id, &sector.0);
+                get_block_cache(block_id, Arc::clone(&self.inner))
+                    .lock()
+                    .write_bytes(dst_start, &data[src_start..src_end]);
             }
         }
     }
@@ -285,7 +272,7 @@ impl VfsNode for Ext4Inode {
         self
     }
 
-    fn ls(&self) -> Vec<String> {
+    fn ls(&self) -> Vec<(String, bool)> {
         if !self.is_dir {
             return Vec::new();
         }
@@ -293,8 +280,11 @@ impl VfsNode for Ext4Inode {
         ext4
             .ext4_dir_get_entries(self.inode_num)
             .into_iter()
-            .map(|de| de.get_name())
-            .filter(|name| name != "." && name != "..")
+            .filter(|de| {
+                let name = de.get_name();
+                name != "." && name != ".."
+            })
+            .map(|de| (de.get_name(), de.get_de_type() == 2))
             .collect()
     }
 
@@ -327,6 +317,22 @@ impl VfsNode for Ext4Inode {
 
     fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    fn stat_attrs(&self) -> VfsAttrs {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        let i = &inode_ref.inode;
+        let ret = VfsAttrs {
+            mode: Some(i.mode() as u32),
+            ino: self.inode_num as u64,
+            nlink: i.links_count() as u32,
+            size: i.size() as usize,
+            atime: Some(decode_ext4_time(i.atime(), i.i_atime_extra())),
+            mtime: Some(decode_ext4_time(i.mtime(), i.i_mtime_extra())),
+            ctime: Some(decode_ext4_time(i.ctime(), i.i_ctime_extra())),
+        };
+        ret
     }
 
     fn clear(&self) {

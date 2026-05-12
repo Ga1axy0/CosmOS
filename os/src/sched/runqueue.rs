@@ -190,6 +190,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                 }
                 task_inner.task_status = TaskStatus::Runnable;
                 task_inner.wait_reason = None;
+                task_inner.current_wq_handle = None;
                 task_inner.reset_time_slice();
                 if task_inner.on_cpu {
                     None
