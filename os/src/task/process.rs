@@ -679,16 +679,18 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
-    /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Arc<Self> {
-        trace!("kernel: fork");
+    /// 按 Linux `clone` 的进程分支创建子进程。
+    ///
+    /// 当前只支持 fork-like 语义；`child_stack` 非 0 时作为子进程返回用户态的 `sp`。
+    pub fn clone_process(self: &Arc<Self>, child_stack: usize, child_tls: Option<usize>) -> Arc<Self> {
+        trace!("kernel: clone_process");
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        // debug!(
-        //     "[cow] fork begin: parent_pid={} parent_threads={}",
-        //     self.getpid(),
-        //     parent.thread_count()
-        // );
+        debug!(
+            "[cow] clone_process begin: parent_pid={} parent_threads={}",
+            self.getpid(),
+            parent.thread_count()
+        );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let (memory_set, parent_tlb_needs_flush) =
             MemorySet::from_existed_user(&mut parent.memory_set);
@@ -771,7 +773,7 @@ impl ProcessControlBlock {
             shootdown(parent_mask, ShootdownKind::AddressSpace { satp: parent_token });
         }
         debug!(
-            "[cow] fork created child process: parent_pid={} child_pid={}",
+            "[cow] clone_process created child process: parent_pid={} child_pid={}",
             self.getpid(),
             child.getpid()
         );
@@ -790,19 +792,25 @@ impl ProcessControlBlock {
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
-        // Finalize the child's trap context before publishing it to the scheduler.
-        // Otherwise, on SMP the child may run on another hart before `sys_fork`
-        // patches the inherited return register, breaking fork semantics.
+        // 在发布到调度器前修正子进程 trap context，避免 SMP 下子进程过早运行。
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
         trap_cx.x[10] = 0;
+        if child_stack != 0 {
+            // Linux clone ABI 要求子进程从指定用户栈继续执行。
+            trap_cx.x[2] = child_stack;
+        }
+        if let Some(tls) = child_tls {
+            // RISC-V 用户态 TLS 指针使用 tp，也就是 x4。
+            trap_cx.x[4] = tls;
+        }
         drop(task_inner);
-        // debug!(
-        //     "[cow] fork complete: parent_pid={} child_pid={}",
-        //     self.getpid(),
-        //     child.getpid()
-        // );
+        debug!(
+            "[cow] clone_process complete: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);

@@ -217,20 +217,110 @@ pub fn sys_setsid() -> isize {
     1
 }
 
-/// fork child process syscall
-pub fn sys_fork() -> isize {
+/// `clone` 支持的退出信号：当前仅实现 basic 测试需要的 SIGCHLD。
+const CLONE_EXIT_SIGNAL_SIGCHLD: usize = 17;
+/// Linux clone flags 中低 8 位保存退出信号。
+const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
+/// 共享地址空间标志，当前暂不支持。
+const CLONE_VM: usize = 0x0000_0100;
+/// 共享文件系统上下文标志，当前暂不支持。
+const CLONE_FS: usize = 0x0000_0200;
+/// 共享文件描述符表标志，当前暂不支持。
+const CLONE_FILES: usize = 0x0000_0400;
+/// 共享信号处理表标志，当前暂不支持。
+const CLONE_SIGHAND: usize = 0x0000_0800;
+/// vfork 语义标志，当前暂不支持。
+const CLONE_VFORK: usize = 0x0000_4000;
+/// 线程组标志，当前暂不支持。
+const CLONE_THREAD: usize = 0x0001_0000;
+/// 设置子任务 TLS 指针，RISC-V 上对应 tp(x4)。
+const CLONE_SETTLS: usize = 0x0008_0000;
+/// 在父地址空间写入子 tid，当前暂不支持。
+const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+/// 子任务退出时清理 child_tid，当前暂不支持。
+const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+/// 在子地址空间写入子 tid，当前暂不支持。
+const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+/// 当前已经实现的 clone 功能位。
+const CLONE_SUPPORTED_FLAGS: usize = CLONE_SETTLS;
+/// 已知但暂未实现的 clone 功能位，用于给出更明确的 TODO 日志。
+const CLONE_TODO_FLAGS: usize = CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_VFORK
+    | CLONE_THREAD
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_CHILD_SETTID;
+
+/// Linux `clone` syscall。
+///
+/// 当前支持 fork-like 进程创建、`stack` 参数与 `CLONE_SETTLS`。
+pub fn sys_clone(
+    flags: usize,
+    stack: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
+) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fork",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        flags,
+        stack,
     );
+    let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
+    let clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
+    let todo_flags = clone_flags & CLONE_TODO_FLAGS;
+    if todo_flags != 0 {
+        warn!(
+            "kernel: sys_clone TODO unsupported clone flags {:#x}",
+            todo_flags
+        );
+    }
+    let unsupported_flags = clone_flags & !(CLONE_SUPPORTED_FLAGS | CLONE_TODO_FLAGS);
+    if unsupported_flags != 0 {
+        warn!(
+            "kernel: sys_clone unknown clone flags {:#x}",
+            unsupported_flags
+        );
+        return -(ERRNO::EINVAL as isize);
+    }
+    if todo_flags != 0 {
+        return -(ERRNO::EINVAL as isize);
+    }
+    if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
+        warn!(
+            "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
+            exit_signal
+        );
+        return -(ERRNO::EINVAL as isize);
+    }
+    if parent_tid != 0 {
+        // TODO：实现 CLONE_PARENT_SETTID 后再写入 parent_tid。
+        warn!("kernel: sys_clone ignored parent_tid without CLONE_PARENT_SETTID: {:#x}", parent_tid);
+    }
+    if child_tid != 0 {
+        // TODO：实现 CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID 后再使用 child_tid。
+        warn!("kernel: sys_clone ignored child_tid without child tid flags: {:#x}", child_tid);
+    }
+    let child_tls = if clone_flags & CLONE_SETTLS != 0 {
+        Some(tls)
+    } else {
+        if tls != 0 {
+            warn!("kernel: sys_clone ignored tls without CLONE_SETTLS: {:#x}", tls);
+        }
+        None
+    };
+    if clone_flags & CLONE_SETTLS != 0 {
+        debug!(
+            "kernel: sys_clone set child TLS to {:#x}",
+            tls
+        );
+    }
     let current_process = current_process();
-    let new_process = current_process.fork();
-    info!(
-        "kernel:pid[{}] forked new process with pid {} - time {}",
-        current_process.getpid(),
-        new_process.getpid(),
-        get_time_ns()
-    );
+    let new_process = current_process.clone_process(stack, child_tls);
     new_process.getpid() as isize
 }
 /// sys_execve
