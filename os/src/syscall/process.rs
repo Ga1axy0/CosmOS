@@ -258,11 +258,18 @@ pub fn sys_clone(
     tls: usize,
     child_tid: usize,
 ) -> isize {
+    let clone_flags_arg = flags;
     trace!(
         "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
         flags,
         stack,
+    );
+    debug!(
+        "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
+        clone_flags_arg,
+        parent_tid,
+        child_tid
     );
     let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
     let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
@@ -345,6 +352,13 @@ pub fn sys_clone(
     syscall_body!({
         let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
         let child_pid = new_process.getpid() as i32;
+        debug!(
+            "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
+            clone_flags_arg,
+            parent_tid,
+            child_tid,
+            child_pid
+        );
         if let Some(ptr) = parent_set_tid {
             write_pod_to_user(ptr as *mut i32, &child_pid)?;
         }
@@ -389,10 +403,10 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage { elf_data, argv } = resolved;
-        let argc = argv.len();
         process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
-        // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
-        Ok(argc as isize)
+        // Linux execve succeeds by returning 0 through the trap return path.
+        // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
+        Ok(0)
     })
 }
 
