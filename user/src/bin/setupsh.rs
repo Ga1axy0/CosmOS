@@ -14,11 +14,14 @@ const EEXIST: isize = -17;
 
 const BIN_DIR: &str = "/bin";
 const BIN_DIR_CSTR: &str = "/bin\0";
+const BIN_BUSYBOX: &str = "/bin/busybox";
 const LIB_DIR: &str = "/lib";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const ROOT_BUSYBOX: &str = "/busybox";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_BUSYBOX_PATH_CSTR: &str = "/musl/busybox\0";
+const MUSL_LIBC_PATH: &str = "/musl/lib/libc.so";
+const MUSL_LD_PATH: &str = "/lib/ld-musl-riscv64-sf.so.1";
 const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
 const GLIBC_BUSYBOX_PATH_CSTR: &str = "/glibc/busybox\0";
 const INSTALL_ARG_CSTR: &str = "--install\0";
@@ -236,6 +239,12 @@ fn install_runtime_libs(libc: BusyBoxLibc) -> bool {
         }
     }
     close(fd as usize);
+    if let BusyBoxLibc::Musl = libc {
+        // musl 动态程序的 PT_INTERP 可能直接指向该 loader 名称。
+        if !install_lib_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
+            return false;
+        }
+    }
     true
 }
 
@@ -287,6 +296,9 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
 
     print_step(4, TOTAL_STEPS, "create /busybox hard link");
     if !ensure_hard_link(busybox_path, ROOT_BUSYBOX) {
+        return 1;
+    }
+    if !ensure_hard_link(busybox_path, BIN_BUSYBOX) {
         return 1;
     }
 
