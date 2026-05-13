@@ -98,6 +98,7 @@ bitflags! {
         const CREATE = 0x40;
         const TRUNC = 0x200;
         const DIRECTORY = 0x10000;
+        const NOFOLLOW = 0x20000;
     }
 }
 
@@ -246,6 +247,8 @@ bitflags! {
         const DIR   = 0o040000;
         /// ordinary regular file
         const FILE  = 0o100000;
+        /// symbolic link
+        const LINK  = 0o120000;
         /// socket file
         const SOCK  = 0o140000;
     }
@@ -254,6 +257,7 @@ bitflags! {
 pub const AT_FDCWD: isize = -100;
 pub const AT_REMOVEDIR: usize = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+pub const AT_SYMLINK_FOLLOW: usize = 0x400;
 pub const AT_EMPTY_PATH: usize = 0x1000;
 pub const F_DUPFD: i32 = 0;
 pub const F_GETFD: i32 = 1;
@@ -307,6 +311,17 @@ pub fn link(old_path: &str, new_path: &str) -> isize {
         new_path.as_str(),
         0,
     )
+}
+
+pub fn symlink(target: &str, linkpath: &str) -> isize {
+    let target = to_cstring(target);
+    let linkpath = to_cstring(linkpath);
+    sys_symlinkat(target.as_str(), AT_FDCWD as usize, linkpath.as_str())
+}
+
+pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
+    let path = to_cstring(path);
+    sys_readlinkat(AT_FDCWD as usize, path.as_str(), buf)
 }
 
 pub fn unlink(path: &str) -> isize {

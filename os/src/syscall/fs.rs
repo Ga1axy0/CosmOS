@@ -1,9 +1,9 @@
 use crate::fs::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
-    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Pipe, Stat, StatMode, canonicalize, do_umount,
-    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device, truncate_inode,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
+    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, canonicalize, do_umount,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at, mount_device, truncate_inode,
     rename_at,
-    open_file_at, unlinkat,
+    open_file_at, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::net::UnixSocketPairEnd;
@@ -759,7 +759,7 @@ fn resolve_at_target(dirfd: isize, path: &str, flags: i32) -> Result<ResolvedAtT
         }
         if dirfd == AT_FDCWD {
             let cwd = current_process().inner_exclusive_access().cwd.clone();
-            return lookup_inode(cwd.as_str()).ok_or(ERRNO::ENOENT).map(ResolvedAtTarget::Inode);
+            return lookup_inode_follow("/", cwd.as_str(), true).map(ResolvedAtTarget::Inode);
         }
         if dirfd < 0 {
             return Err(ERRNO::EBADF);
@@ -771,15 +771,15 @@ fn resolve_at_target(dirfd: isize, path: &str, flags: i32) -> Result<ResolvedAtT
         }
         // Fall back to path-based lookup if the description recorded an open path.
         if let Some(target_path) = desc.path() {
-            return lookup_inode(target_path.as_str()).ok_or(ERRNO::ENOENT).map(ResolvedAtTarget::Inode);
+            return lookup_inode_follow("/", target_path.as_str(), true).map(ResolvedAtTarget::Inode);
         }
         // Otherwise return the open description itself (e.g. pipe/tty).
         return Ok(ResolvedAtTarget::FileDesc(desc));
     }
 
     let cwd = resolve_dirfd_base(dirfd, path)?;
-    let abs_path = canonicalize(cwd.as_str(), path);
-    lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT).map(ResolvedAtTarget::Inode)
+    let follow_final = flags & AT_SYMLINK_NOFOLLOW as i32 == 0;
+    lookup_inode_follow(cwd.as_str(), path, follow_final).map(ResolvedAtTarget::Inode)
 }
 
 fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
@@ -886,7 +886,7 @@ fn parse_setfl_status(arg: usize) -> Result<FileStatusFlags, ERRNO> {
     let arg = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
     let mutable_mask = FileStatusFlags::APPEND.bits() | FileStatusFlags::NONBLOCK.bits();
     let ignored_mask =
-        0x3 | OpenFlags::CREATE.bits() | OpenFlags::TRUNC.bits() | OpenFlags::DIRECTORY.bits() | 0x100 | 0x8000;
+        0x3 | OpenFlags::CREATE.bits() | OpenFlags::TRUNC.bits() | OpenFlags::DIRECTORY.bits() | OpenFlags::NOFOLLOW.bits() | 0x100 | 0x8000;
     if arg & !(mutable_mask | ignored_mask) != 0 {
         // TODO: 后续若补齐 `O_ASYNC/O_DIRECT/O_NOATIME` 等位，应在这里扩展掩码。
         warn!(
@@ -1388,12 +1388,6 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         if flags & !supported_flags != 0 {
             return Err(ERRNO::EINVAL);
         }
-        if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            // TODO: 当前 VFS 尚未实现 symlink，暂时按普通路径 stat 处理。
-            // warn!(
-            //     "sys_newfstatat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to stat target path"
-            // );
-        }
         if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(ERRNO::ENOENT);
@@ -1415,9 +1409,8 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         }
 let time1 = get_time_us();
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
 let time2 = get_time_us();
-        let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), flags & AT_SYMLINK_NOFOLLOW == 0)?;
 let time3 = get_time_us();
         let stat = inode_stat(&inode);
 let time4 = get_time_us();
@@ -1447,8 +1440,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         }
 
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
-        let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
         if mode == F_OK {
             return Ok(0);
         }
@@ -1478,7 +1470,7 @@ pub fn sys_linkat(
     );
     let token = current_user_token();
     syscall_body!({
-        if flags != 0 {
+        if flags & !AT_SYMLINK_FOLLOW != 0 {
             return Err(ERRNO::EINVAL);
         }
         let old_path = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
@@ -1491,8 +1483,55 @@ pub fn sys_linkat(
         }
         let old_cwd = resolve_dirfd_base(old_dirfd, old_path.as_str())?;
         let new_cwd = resolve_dirfd_base(new_dirfd, new_path.as_str())?;
-        linkat(old_cwd.as_str(), &old_path, new_cwd.as_str(), &new_path)?;
+        linkat_with_flags(old_cwd.as_str(), &old_path, new_cwd.as_str(), &new_path, flags)?;
         Ok(0)
+    })
+}
+
+/// symlinkat syscall
+pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_symlinkat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let target = translated_str(token, target).or_errno(ERRNO::EFAULT)?;
+        let linkpath = translated_str(token, linkpath).or_errno(ERRNO::EFAULT)?;
+        if target.is_empty() || linkpath.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let cwd = resolve_dirfd_base(new_dirfd, linkpath.as_str())?;
+        symlinkat(target.as_str(), cwd.as_str(), linkpath.as_str())?;
+        Ok(0)
+    })
+}
+
+/// readlinkat syscall
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_readlinkat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        if bufsiz == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), false)?;
+        if !inode.is_symlink() {
+            return Err(ERRNO::EINVAL);
+        }
+        let target = inode.read_link()?;
+        let bytes = target.as_bytes();
+        let n = bytes.len().min(bufsiz);
+        write_bytes_to_user(buf, &bytes[..n])?;
+        Ok(n as isize)
     })
 }
 
@@ -1584,7 +1623,7 @@ pub fn sys_chdir(path: *const u8) -> isize {
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
         let cwd = process.inner_exclusive_access().cwd.clone();
         let new_abs = canonicalize(cwd.as_str(), path.as_str());
-        let inode = lookup_inode(new_abs.as_str()).or_errno(ERRNO::ENOENT)?;
+        let inode = lookup_inode_follow("/", new_abs.as_str(), true)?;
         if !inode.is_dir() {
             return Err(ERRNO::ENOTDIR);
         }
@@ -1641,13 +1680,6 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         if flags & !supported_flags != 0 {
             return Err(ERRNO::EINVAL);
         }
-        if flags & AT_SYMLINK_NOFOLLOW as i32 != 0 {
-            // TODO: 当前 VFS 尚未实现 symlink，先按普通路径处理。
-            // warn!(
-            //     "sys_utimensat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to normal path"
-            // );
-        }
-
         let path = if path.is_null() && (flags & AT_EMPTY_PATH as i32 != 0) { 
             String::new()
         } else {
@@ -1703,7 +1735,7 @@ pub fn sys_fchmod(fd: u32, mode: u32) -> isize {
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
         };
 
-        let old_mode = inode.mode().unwrap_or(if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() });
+        let old_mode = inode_stat(&inode).mode.bits();
         let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
         inode.set_mode(new_mode)?;
         Ok(0)
@@ -1735,7 +1767,7 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) ->
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
         };
 
-        let old_mode = inode.mode().unwrap_or(if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() });
+        let old_mode = inode_stat(&inode).mode.bits();
         let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
         inode.set_mode(new_mode)?;
         Ok(0)
