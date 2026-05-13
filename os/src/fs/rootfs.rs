@@ -36,7 +36,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
 use fs::remove_dentry;
-use fs::vfs::{InodeTime, VfsNode};
+use fs::vfs::{InodeTime, VfsFileType, VfsNode};
 use lazy_static::*;
 
 use crate::sync::{SpinNoIrqLock};
@@ -160,8 +160,8 @@ impl VfsNode for VirtualDirNode {
         self
     }
 
-    fn is_dir(&self) -> bool {
-        true
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
     }
 
     fn fs_id(&self) -> u64 {
@@ -181,9 +181,9 @@ impl VfsNode for VirtualDirNode {
     // Directory enumeration
     // -----------------------------------------------------------------------
 
-    fn ls(&self) -> Vec<(String, bool)> {
-        // Phase 1: collect (name, is_dir) from overlay.
-        let mut entries: Vec<(String, bool)> = {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        // Phase 1: collect (name, file_type) from overlay.
+        let mut entries: Vec<(String, VfsFileType)> = {
             let inner = self.inner.lock();
             match inner.overlay.as_ref() {
                 Some(ov) => ov.ls(),
@@ -192,18 +192,18 @@ impl VfsNode for VirtualDirNode {
         };
 
         // Phase 2: add explicit mount names that the overlay doesn't list.
-        let mount_entries: Vec<(String, bool)> = {
+        let mount_entries: Vec<(String, VfsFileType)> = {
             let inner = self.inner.lock();
             inner
                 .mounts
                 .iter()
-                .map(|(name, node)| (name.clone(), node.is_dir()))
+                .map(|(name, node)| (name.clone(), node.file_type()))
                 .collect()
         };
 
-        for (key, is_dir) in mount_entries {
+        for (key, file_type) in mount_entries {
             if !entries.iter().any(|(name, _)| name == &key) {
-                entries.push((key, is_dir));
+                entries.push((key, file_type));
             }
         }
         entries
@@ -255,6 +255,14 @@ impl VfsNode for VirtualDirNode {
         let new_dir = VirtualDirNode::new();
         self.bind(name, Arc::clone(&new_dir) as Arc<dyn VfsNode>);
         Some(new_dir as Arc<dyn VfsNode>)
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        overlay.ok_or(FS_ERRNO::EPERM)?.symlink(name, target)
     }
 
     // -----------------------------------------------------------------------

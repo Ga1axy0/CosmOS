@@ -24,6 +24,8 @@ pub const SYSCALL_IOCTL: usize = 29;
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
 pub const SYSCALL_UNLINKAT: usize = 35;
+/// symlinkat syscall
+pub const SYSCALL_SYMLINKAT: usize = 36;
 /// linkat syscall
 pub const SYSCALL_LINKAT: usize = 37;
 /// umount syscall
@@ -64,6 +66,8 @@ pub const SYSCALL_WRITEV: usize = 66;
 pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
 pub const SYSCALL_PPOLL_TIME32: usize = 73;
+/// readlinkat syscall
+pub const SYSCALL_READLINKAT: usize = 78;
 /// newfstatat syscall
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 /// utimensat syscall
@@ -315,6 +319,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_SYMLINKAT => sys_symlinkat(
+            args[0] as *const u8,
+            args[1] as isize,
+            args[2] as *const u8,
+        ),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -344,6 +353,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READV => sys_readv(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
         SYSCALL_WRITEV =>
             sys_writev(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
+        SYSCALL_READLINKAT => sys_readlinkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,

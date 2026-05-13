@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use fs::vfs::VfsNode;
+use fs::vfs::{VfsFileType, VfsNode};
 use fs::BlockDevice;
 
 use crate::drivers::rtc;
@@ -199,11 +199,11 @@ impl VfsNode for NullDevNode {
         self
     }
 
-    fn is_dir(&self) -> bool {
-        false
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
 
@@ -246,11 +246,11 @@ impl VfsNode for BlockDevNode {
         self
     }
 
-    fn is_dir(&self) -> bool {
-        false
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Block
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
 
@@ -390,11 +390,11 @@ impl VfsNode for RtcDevNode {
         self
     }
 
-    fn is_dir(&self) -> bool {
-        false
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
 
@@ -445,11 +445,11 @@ impl VfsNode for UrandomDevNode {
         self
     }
 
-    fn is_dir(&self) -> bool {
-        false
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
 

@@ -7,6 +7,8 @@ pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
+pub const SYSCALL_SYMLINKAT: usize = 36;
+pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_TRUNCATE: usize = 45;
 pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_CHDIR: usize = 49;
@@ -16,8 +18,8 @@ pub const SYSCALL_PIPE: usize = 59;
 pub const SYSCALL_GETDENTS64: usize = 61;
 pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
+pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
-pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_SLEEP: usize = 101;
@@ -142,6 +144,27 @@ pub fn sys_linkat(
             new_dirfd,
             new_path.as_ptr() as usize,
             flags,
+            0,
+        ],
+    )
+}
+
+pub fn sys_symlinkat(target: &str, new_dirfd: usize, linkpath: &str) -> isize {
+    syscall(
+        SYSCALL_SYMLINKAT,
+        [target.as_ptr() as usize, new_dirfd, linkpath.as_ptr() as usize],
+    )
+}
+
+pub fn sys_readlinkat(dirfd: usize, path: &str, buffer: &mut [u8]) -> isize {
+    syscall6(
+        SYSCALL_READLINKAT,
+        [
+            dirfd,
+            path.as_ptr() as usize,
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+            0,
             0,
         ],
     )

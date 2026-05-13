@@ -5,7 +5,7 @@ use spin::Mutex;
 use crate::{BLOCK_SZ, fat32::dir::DirAttr};
 use crate::block_cache::get_block_cache;
 use crate::errno::FS_ERRNO;
-use crate::vfs::{VfsAttrs, VfsNode};
+use crate::vfs::{VfsAttrs, VfsFileType, VfsNode};
 
 use super::{Fat32FileSystem, dir, fat};
 
@@ -479,7 +479,7 @@ impl VfsNode for FatInode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         let inner = self.inner.lock();
         if !inner.is_dir {
             return Vec::new();
@@ -489,11 +489,14 @@ impl VfsNode for FatInode {
 
         self.iter_dir(dir_cluster)
             .into_iter()
-            .filter(|e| {
-                let name = e.name_string();
-                name != "." && name != ".."
+            .map(|e| {
+                let file_type = if e.sfn.is_dir() {
+                    VfsFileType::Directory
+                } else {
+                    VfsFileType::Regular
+                };
+                (e.name_string(), file_type)
             })
-            .map(|e| (e.name_string(), e.sfn.is_dir()))
             .collect()
     }
 
@@ -713,8 +716,12 @@ impl VfsNode for FatInode {
         Some(Arc::new(inode) as Arc<dyn VfsNode>)
     }
 
-    fn is_dir(&self) -> bool {
-        self.inner.lock().is_dir
+    fn file_type(&self) -> VfsFileType {
+        if self.inner.lock().is_dir {
+            VfsFileType::Directory
+        } else {
+            VfsFileType::Regular
+        }
     }
 
     fn stat_attrs(&self) -> VfsAttrs {

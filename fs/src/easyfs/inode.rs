@@ -7,7 +7,7 @@ use crate::{
     block_cache::get_block_cache,
     easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType},
     errno::FS_ERRNO,
-    vfs::{Inode, VfsAttrs, VfsNode},
+    vfs::{Inode, VfsAttrs, VfsFileType, VfsNode},
 };
 
 /// EasyFS-backed inode implementation.
@@ -87,7 +87,7 @@ impl VfsNode for EasyInode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         // Phase 1: collect (name, block_id, block_offset) while holding the fs lock.
         let entries: Vec<(String, u32, usize)> = {
             let fs = self.fs.lock();
@@ -107,13 +107,17 @@ impl VfsNode for EasyInode {
                 v
             })
         };
-        // Phase 2: resolve is_dir for each child without holding any locks.
+        // Phase 2: resolve file type for each child without holding any locks.
         entries
             .into_iter()
             .map(|(name, block_id, block_offset)| {
                 let child = Self::new(block_id, block_offset, self.fs.clone(), self.block_device.clone());
-                let is_dir = child.read_disk_inode(|di| di.is_dir());
-                (name, is_dir)
+                let file_type = if child.read_disk_inode(|di| di.is_dir()) {
+                    VfsFileType::Directory
+                } else {
+                    VfsFileType::Regular
+                };
+                (name, file_type)
             })
             .collect()
     }
@@ -186,8 +190,12 @@ impl VfsNode for EasyInode {
         None
     }
 
-    fn is_dir(&self) -> bool {
-        self.read_disk_inode(|d| d.is_dir())
+    fn file_type(&self) -> VfsFileType {
+        if self.read_disk_inode(|d| d.is_dir()) {
+            VfsFileType::Directory
+        } else {
+            VfsFileType::Regular
+        }
     }
 
     fn stat_attrs(&self) -> VfsAttrs {
