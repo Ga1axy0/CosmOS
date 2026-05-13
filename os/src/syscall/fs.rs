@@ -807,6 +807,22 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     desc.path().ok_or(ERRNO::ENOTDIR)
 }
 
+fn resolve_chown_ids(inode: &Arc<fs::Inode>, uid: u32, gid: u32) -> Result<(u32, u32), ERRNO> {
+    if uid == UID_GID_NO_CHANGE && gid == UID_GID_NO_CHANGE {
+        return Ok((uid, gid));
+    }
+    let attrs = inode.stat_attrs();
+    let mut new_uid = uid;
+    let mut new_gid = gid;
+    if uid == UID_GID_NO_CHANGE {
+        new_uid = attrs.uid.or_else(|| inode.uid()).ok_or(ERRNO::EOPNOTSUPP)?;
+    }
+    if gid == UID_GID_NO_CHANGE {
+        new_gid = attrs.gid.or_else(|| inode.gid()).ok_or(ERRNO::EOPNOTSUPP)?;
+    }
+    Ok((new_uid, new_gid))
+}
+
 const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
@@ -821,6 +837,7 @@ const R_OK: i32 = 4;
 
 const UTIME_NOW: usize = 0x3fff_ffff;
 const UTIME_OMIT: usize = 0x3fff_fffe;
+const UID_GID_NO_CHANGE: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 enum UtimeArg {
@@ -1718,6 +1735,64 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         }
 
         inode.set_times(atime, mtime, Some(now))?;
+        Ok(0)
+    })
+}
+
+/// fchown(fd, user, group) — change ownership of the file referred to by `fd`.
+pub fn sys_fchown(fd: u32, user: u32, group: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fchown",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let target = resolve_at_target(fd as isize, "", AT_EMPTY_PATH as i32)?;
+        let inode = match target {
+            ResolvedAtTarget::Inode(i) => i,
+            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
+        };
+
+        if user == UID_GID_NO_CHANGE && group == UID_GID_NO_CHANGE {
+            return Ok(0);
+        }
+
+        let (uid, gid) = resolve_chown_ids(&inode, user, group)?;
+        inode.set_owner(uid, gid)?;
+        Ok(0)
+    })
+}
+
+/// fchownat(dirfd, pathname, user, group, flags) — change ownership of a path-relative target.
+pub fn sys_fchownat(dirfd: isize, pathname: *const u8, user: u32, group: u32, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fchownat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let supported_flags = (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as i32;
+        if flags & !supported_flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let path = if pathname.is_null() && (flags & AT_EMPTY_PATH as i32 != 0) {
+            String::new()
+        } else {
+            translated_str(token, pathname).or_errno(ERRNO::EFAULT)?
+        };
+
+        let target = resolve_at_target(dirfd, path.as_str(), flags)?;
+        let inode = match target {
+            ResolvedAtTarget::Inode(i) => i,
+            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
+        };
+
+        if user == UID_GID_NO_CHANGE && group == UID_GID_NO_CHANGE {
+            return Ok(0);
+        }
+
+        let (uid, gid) = resolve_chown_ids(&inode, user, group)?;
+        inode.set_owner(uid, gid)?;
         Ok(0)
     })
 }
