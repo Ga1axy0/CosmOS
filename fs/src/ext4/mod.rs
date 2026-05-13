@@ -374,6 +374,8 @@ impl VfsNode for Ext4Inode {
             ino: self.inode_num as u64,
             nlink: i.links_count() as u32,
             size: i.size() as usize,
+            uid: Some(i.uid() as u32),
+            gid: Some(i.gid() as u32),
             atime: Some(decode_ext4_time(i.atime(), i.i_atime_extra())),
             mtime: Some(decode_ext4_time(i.mtime(), i.i_mtime_extra())),
             ctime: Some(decode_ext4_time(i.ctime(), i.i_ctime_extra())),
@@ -425,10 +427,34 @@ impl VfsNode for Ext4Inode {
         Some(inode_ref.inode.mode() as u32)
     }
 
+    fn uid(&self) -> Option<u32> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(inode_ref.inode.uid() as u32)
+    }
+
+    fn gid(&self) -> Option<u32> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(inode_ref.inode.gid() as u32)
+    }
+
     fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
         let ext4 = self.fs.ext4.lock();
         let mut inode_ref = ext4.get_inode_ref(self.inode_num);
         inode_ref.inode.set_mode(mode as u16);
+        ext4.write_back_inode(&mut inode_ref);
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
+            return Err(FS_ERRNO::EOVERFLOW);
+        }
+        let ext4 = self.fs.ext4.lock();
+        let mut inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref.inode.set_uid(uid as u16);
+        inode_ref.inode.set_gid(gid as u16);
         ext4.write_back_inode(&mut inode_ref);
         Ok(())
     }

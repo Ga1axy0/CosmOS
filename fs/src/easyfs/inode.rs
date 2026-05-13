@@ -207,6 +207,8 @@ impl VfsNode for EasyInode {
             ino,
             nlink: 1,
             size,
+            uid: None,
+            gid: None,
             atime: None,
             mtime: None,
             ctime: None,
