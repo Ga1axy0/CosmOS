@@ -35,21 +35,46 @@ pub struct VfsAttrs {
     pub ctime: Option<InodeTime>,
 }
 
+/// VFS-visible inode file type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfsFileType {
+    Regular,
+    Directory,
+    Symlink,
+    Char,
+    Block,
+    Fifo,
+    Socket,
+    Unknown,
+}
+
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
 pub trait VfsNode: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
-    /// List directory entries as `(name, is_dir)` pairs.
-    fn ls(&self) -> Vec<(String, bool)>;
+    /// List directory entries as `(name, file_type)` pairs.
+    fn ls(&self) -> Vec<(String, VfsFileType)>;
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Create a sub-directory named `name` inside this directory.
     /// Returns the new directory inode, or `None` on failure.
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Returns true if this node is a directory.
-    fn is_dir(&self) -> bool;
+    fn file_type(&self) -> VfsFileType;
+    fn is_dir(&self) -> bool {
+        self.file_type() == VfsFileType::Directory
+    }
+    fn is_symlink(&self) -> bool {
+        self.file_type() == VfsFileType::Symlink
+    }
+    fn read_link(&self) -> Result<String, FS_ERRNO> {
+        Err(FS_ERRNO::EINVAL)
+    }
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
     fn clear(&self);
     /// 调整常规文件逻辑长度。
     fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
@@ -203,7 +228,7 @@ impl Inode {
         Self::from_vfs_node(node)
     }
 
-    pub fn ls(&self) -> Vec<(String, bool)> {
+    pub fn ls(&self) -> Vec<(String, VfsFileType)> {
         self.inner.ls()
     }
 
@@ -255,6 +280,27 @@ impl Inode {
 
     pub fn is_dir(&self) -> bool {
         self.inner.is_dir()
+    }
+
+    pub fn file_type(&self) -> VfsFileType {
+        self.inner.file_type()
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.inner.is_symlink()
+    }
+
+    pub fn read_link(&self) -> Result<String, FS_ERRNO> {
+        self.inner.read_link()
+    }
+
+    pub fn symlink(&self, name: &str, target: &str) -> Result<Arc<Inode>, FS_ERRNO> {
+        let child = Self::wrap(self.inner.symlink(name, target)?);
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            insert_dentry(fs_id, self.ino(), name, &child);
+        }
+        Ok(child)
     }
 
     pub fn clear(&self) {

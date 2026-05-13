@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
-use fs::vfs::VfsNode;
+use fs::vfs::{VfsFileType, VfsNode};
 use fs::Inode;
 use lazy_static::*;
 use core::any::Any;
@@ -91,6 +91,10 @@ pub const AT_REMOVEDIR: u32 = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 /// `newfstatat` 标志：允许空路径并直接作用于 `dirfd`。
 pub const AT_EMPTY_PATH: u32 = 0x1000;
+/// `linkat` flag: follow the old path if it is a symbolic link.
+pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
+
+const MAX_SYMLINK_DEPTH: usize = 40;
 
 #[inline]
 fn inode_now() -> fs::vfs::InodeTime {
@@ -273,7 +277,7 @@ pub fn init_rootfs() {
     }
 
     // Automatically make a /tmp directory if it doesn't exist, since many apps expect it.
-    if lookup_inode("/tmp").is_none() {
+    if lookup_inode_follow("/", "/tmp", true).is_err() {
         match mkdir_at("/", "/tmp") {
             Ok(()) => info!("[kernel] created missing /tmp"),
             Err(e) => warn!("[kernel] failed to create /tmp, errno={}", e as isize),
@@ -346,21 +350,100 @@ pub fn lookup_inode(abs_path: &str) -> Option<Arc<Inode>> {
     Some(cur)
 }
 
+fn join_remaining(target: &str, rest: &[String]) -> String {
+    if rest.is_empty() {
+        return String::from(target);
+    }
+    let mut out = String::from(target);
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    for (idx, component) in rest.iter().enumerate() {
+        if idx != 0 {
+            out.push('/');
+        }
+        out.push_str(component);
+    }
+    out
+}
+
+/// Resolve a path and optionally leave the final symlink unresolved.
+pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<Arc<Inode>, ERRNO> {
+    let mut abs = canonicalize(cwd, path);
+    let mut depth = 0usize;
+
+    loop {
+        let components: Vec<String> = abs
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if components.is_empty() {
+            return Ok(Arc::clone(&ROOT_INODE));
+        }
+
+        let mut cur = Arc::clone(&ROOT_INODE);
+        let mut cur_path = String::from("/");
+        let mut restart: Option<String> = None;
+
+        for (idx, component) in components.iter().enumerate() {
+            let child = cur.find(component).ok_or(ERRNO::ENOENT)?;
+            let is_final = idx + 1 == components.len();
+            if child.is_symlink() && (!is_final || follow_final) {
+                depth += 1;
+                if depth > MAX_SYMLINK_DEPTH {
+                    return Err(ERRNO::ELOOP);
+                }
+                let target = child.read_link().map_err(ERRNO::from)?;
+                let base = if target.starts_with('/') {
+                    String::from("/")
+                } else {
+                    cur_path.clone()
+                };
+                let combined = join_remaining(target.as_str(), &components[idx + 1..]);
+                restart = Some(canonicalize(base.as_str(), combined.as_str()));
+                break;
+            }
+
+            cur = child;
+            if cur_path != "/" {
+                cur_path.push('/');
+            }
+            cur_path.push_str(component);
+        }
+
+        if let Some(next_abs) = restart {
+            abs = next_abs;
+        } else {
+            return Ok(cur);
+        }
+    }
+}
+
+/// Resolve parent directory with symlinks followed in all parent components.
+fn resolve_parent_follow(cwd: &str, path: &str) -> Result<(Arc<Inode>, String, String), ERRNO> {
+    let abs = canonicalize(cwd, path);
+    if abs == "/" {
+        return Err(ERRNO::ENOENT);
+    }
+    let (parent_path, filename) = match abs.rfind('/') {
+        Some(0) => (String::from("/"), String::from(&abs[1..])),
+        Some(idx) => (String::from(&abs[..idx]), String::from(&abs[idx + 1..])),
+        None => (String::from("/"), abs.clone()),
+    };
+    if filename.is_empty() {
+        return Err(ERRNO::ENOENT);
+    }
+    let parent = lookup_inode_follow("/", parent_path.as_str(), true)?;
+    Ok((parent, filename, parent_path))
+}
+
 /// Resolve `path` into (parent_directory_inode, filename).
 /// Returns `None` if the parent directory does not exist.
 fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
-    let abs = canonicalize(cwd, path);
-    if abs == "/" {
-        return None; // cannot resolve parent of root
-    }
-    // Split into directory part and filename.
-    let (parent_path, filename) = match abs.rfind('/') {
-        Some(0) => ("/", &abs[1..]),
-        Some(idx) => (&abs[..idx], &abs[idx + 1..]),
-        None => ("/", abs.as_str()),
-    };
-    let parent = lookup_inode(parent_path)?;
-    Some((parent, String::from(filename)))
+    resolve_parent_follow(cwd, path)
+        .ok()
+        .map(|(parent, filename, _)| (parent, filename))
 }
 
 /// Open (or optionally create) a file/directory at `path` relative to `cwd`.
@@ -371,17 +454,26 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
 
     if flags.contains(OpenFlags::CREATE) {
         // Navigate to the parent directory and create the file there.
-        let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
+        let (parent, name, parent_path) = resolve_parent_follow(cwd, path)?;
         if let Some(existing) = parent.find(&name) {
             // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
             debug!("EXCL flag valid: {}", flags.contains(OpenFlags::EXCL));
             if flags.contains(OpenFlags::EXCL) {
                 return Err(ERRNO::EEXIST);
             }
-            if flags.contains(OpenFlags::TRUNC) {
-                page_cache::truncate_inode(&existing, 0).map_err(ERRNO::from)?;
+            if existing.is_symlink() && flags.contains(OpenFlags::NOFOLLOW) {
+                return Err(ERRNO::ELOOP);
             }
-            Ok(Arc::new(OSInode::new(existing, abs.clone())))
+            let inode = if existing.is_symlink() {
+                let existing_path = canonicalize(parent_path.as_str(), name.as_str());
+                lookup_inode_follow("/", existing_path.as_str(), true)?
+            } else {
+                existing
+            };
+            if flags.contains(OpenFlags::TRUNC) {
+                page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
+            }
+            Ok(Arc::new(OSInode::new(inode, abs.clone())))
         } else {
             parent.create(&name).map(|inode| {
                 let _ = inode.set_times_now(inode_now());
@@ -389,20 +481,24 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
             }).ok_or(ERRNO::EIO)
         }
     } else {
-        lookup_inode(&abs).map(|inode| {
+        let inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
+        if inode.is_symlink() {
+            return Err(ERRNO::ELOOP);
+        }
+        {
             if flags.contains(OpenFlags::TRUNC) {
                 debug!("open_file_at: truncating existing file at {}", abs);
                 page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
             Ok(Arc::new(OSInode::new(inode, abs.clone())))
-        }).ok_or(ERRNO::ENOENT)?
+        }
     }
 }
 
 /// Create a directory at `path` relative to `cwd`.
 /// Returns `true` on success.
 pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
-    if let Some((parent, name)) = resolve_parent(cwd, path) {
+    if let Ok((parent, name, _)) = resolve_parent_follow(cwd, path) {
         // 已存在同名目录或文件
         if parent.find(&name).is_some() {
             return Err(ERRNO::EEXIST);
@@ -425,7 +521,7 @@ pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
 
 bitflags! {
     ///  The flags argument to the open() system call is constructed by ORing together zero or more of the following values:
-    pub struct OpenFlags: i32 {
+pub struct OpenFlags: i32 {
         /// readyonly
         /// TODO: fix the bug of bitflag.
         const RDONLY = 0x000;
@@ -441,6 +537,8 @@ bitflags! {
         const TRUNC = 0x200;
         /// open directory
         const DIRECTORY = 0x10000;
+        /// fail if the final component is a symbolic link
+        const NOFOLLOW = 0x20000;
     }
 }
 
@@ -477,25 +575,43 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             })
         }
     } else {
-        ROOT_INODE.find(name).map(|inode| {
+        ROOT_INODE.find(name).and_then(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 page_cache::truncate_inode(&inode, 0).ok()?;
             }
             Some(Arc::new(OSInode::new(inode, abs)))
         })
-        .flatten()
     }
 }
 
 /// Create a hard link from `old_path` to `new_path`.
 pub fn linkat(old_cwd: &str, old_path: &str, new_cwd: &str, new_path: &str) -> Result<(), ERRNO> {
-    let (_, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
-    let (new_parent, new_name) = resolve_parent(new_cwd, new_path).ok_or(ERRNO::ENOENT)?;
+    linkat_with_flags(old_cwd, old_path, new_cwd, new_path, 0)
+}
+
+/// Create a hard link from `old_path` to `new_path` with Linux `linkat` flags.
+pub fn linkat_with_flags(
+    old_cwd: &str,
+    old_path: &str,
+    new_cwd: &str,
+    new_path: &str,
+    flags: u32,
+) -> Result<(), ERRNO> {
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let (_, old_name, _) = resolve_parent_follow(old_cwd, old_path)?;
+    let (new_parent, new_name, _) = resolve_parent_follow(new_cwd, new_path)?;
     if old_name.is_empty() || new_name.is_empty() {
         return Err(ERRNO::ENOENT);
     }
-    let (old_parent, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
-    let old_inode = old_parent.find(old_name.as_str()).ok_or(ERRNO::ENOENT)?;
+    let (old_parent, old_name, old_parent_path) = resolve_parent_follow(old_cwd, old_path)?;
+    let old_inode = if flags & AT_SYMLINK_FOLLOW != 0 {
+        let old_abs = canonicalize(old_parent_path.as_str(), old_name.as_str());
+        lookup_inode_follow("/", old_abs.as_str(), true)?
+    } else {
+        old_parent.find(old_name.as_str()).ok_or(ERRNO::ENOENT)?
+    };
     if old_inode.is_dir() {
         return Err(ERRNO::EPERM);
     }
@@ -504,6 +620,17 @@ pub fn linkat(old_cwd: &str, old_path: &str, new_cwd: &str, new_path: &str) -> R
     }
     new_parent
         .link_inode(&old_inode, new_name.as_str())?;
+    Ok(())
+}
+
+/// Create a symbolic link named `link_path` containing `target`.
+pub fn symlinkat(target: &str, cwd: &str, link_path: &str) -> Result<(), ERRNO> {
+    let (parent, name, _) = resolve_parent_follow(cwd, link_path)?;
+    if parent.find(name.as_str()).is_some() {
+        return Err(ERRNO::EEXIST);
+    }
+    let inode = parent.symlink(name.as_str(), target).map_err(ERRNO::from)?;
+    let _ = inode.set_times_now(inode_now());
     Ok(())
 }
 
@@ -677,7 +804,7 @@ impl File for OSInode {
         let start_idx = offset; // entry index, not byte offset
         let mut written = 0usize;
 
-        for (i, (name, is_dir)) in entries.iter().enumerate().skip(start_idx) {
+        for (i, (name, file_type)) in entries.iter().enumerate().skip(start_idx) {
             let name_bytes = name.as_bytes();
             // reclen must be a multiple of 8
             let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
@@ -691,8 +818,17 @@ impl File for OSInode {
             buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
             // d_reclen (u16)
             buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            // d_type (u8): DT_DIR=4, DT_REG=8
-            let dtype: u8 = if *is_dir { 4 } else { 8 };
+            // d_type (u8): DT_DIR=4, DT_LNK=10, DT_REG=8
+            let dtype: u8 = match file_type {
+                VfsFileType::Directory => 4,
+                VfsFileType::Symlink => 10,
+                VfsFileType::Char => 2,
+                VfsFileType::Block => 6,
+                VfsFileType::Fifo => 1,
+                VfsFileType::Socket => 12,
+                VfsFileType::Regular => 8,
+                VfsFileType::Unknown => 0,
+            };
             buf[written + 18] = dtype;
             // d_name: null-terminated, zero-padded to reclen
             buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
@@ -747,13 +883,21 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
     // Read all attributes in one batched call (single lock acquisition for
     // backends like ext4, instead of one per field).
     let attrs = inode.stat_attrs();
-    let is_dir = inode.is_dir();
+    let file_type = inode.file_type();
     let mode = StatMode::from_bits_truncate(attrs.mode.unwrap_or(
-        if is_dir { StatMode::DIR.bits() } else { StatMode::FILE.bits() }
+        match file_type {
+            VfsFileType::Directory => StatMode::DIR.bits() | 0o755,
+            VfsFileType::Symlink => StatMode::LINK.bits() | 0o777,
+            VfsFileType::Char => StatMode::CHAR.bits() | 0o666,
+            VfsFileType::Block => StatMode::BLOCK.bits() | 0o660,
+            VfsFileType::Fifo => StatMode::FIFO.bits() | 0o666,
+            VfsFileType::Socket => StatMode::SOCK.bits() | 0o777,
+            VfsFileType::Regular | VfsFileType::Unknown => StatMode::FILE.bits() | 0o644,
+        }
     ));
     // Prefer the page-cache size for regular files that have dirty mappings;
     // fall back to the batched attribute read otherwise.
-    let size = if !is_dir {
+    let size = if file_type == VfsFileType::Regular {
         page_cache::cached_inode_size_fast(inode, attrs.size)
     } else {
         attrs.size
@@ -770,7 +914,7 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         size: size as i64,
         blksize: 512,
         pad1: 0,
-        blocks: (size as u64 + 511) / 512,
+        blocks: (size as u64).div_ceil(512),
         atime_sec: attrs.atime.map(|t| t.sec as isize).unwrap_or(0),
         atime_nsec: attrs.atime.map(|t| t.nsec as isize).unwrap_or(0),
         mtime_sec: attrs.mtime.map(|t| t.sec as isize).unwrap_or(0),
@@ -836,7 +980,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
         abs_mnt,
         fs_type,
     );
-    let dev_inode = lookup_inode(dev_path).ok_or(ERRNO::ENODEV)?;
+    let dev_inode = lookup_inode_follow("/", dev_path, true).or(Err(ERRNO::ENODEV))?;
     let vfs_node = dev_inode.vfs_node();
     let block_dev_node = vfs_node
         .as_any()
