@@ -30,6 +30,8 @@ pub struct VfsAttrs {
     pub ino: u64,
     pub nlink: u32,
     pub size: usize,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
     pub atime: Option<InodeTime>,
     pub mtime: Option<InodeTime>,
     pub ctime: Option<InodeTime>,
@@ -104,8 +106,23 @@ pub trait VfsNode: Send + Sync + Any {
         None
     }
 
+    /// File owner uid for stat-like metadata.
+    fn uid(&self) -> Option<u32> {
+        None
+    }
+
+    /// File owner gid for stat-like metadata.
+    fn gid(&self) -> Option<u32> {
+        None
+    }
+
     /// Set file mode bits. This is used by `chmod` and `mkdir` syscalls to set permissions and type bits.
     fn set_mode(&self, _mode: u32) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
+    /// Set file owner uid/gid.
+    fn set_owner(&self, _uid: u32, _gid: u32) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
 
@@ -176,6 +193,8 @@ pub trait VfsNode: Send + Sync + Any {
             ino: self.ino(),
             nlink: self.nlink(),
             size: self.size(),
+            uid: self.uid(),
+            gid: self.gid(),
             atime: self.atime(),
             mtime: self.mtime(),
             ctime: self.ctime(),
@@ -346,9 +365,22 @@ impl Inode {
         self.inner.mode()
     }
 
+    pub fn uid(&self) -> Option<u32> {
+        self.inner.uid()
+    }
+
+    pub fn gid(&self) -> Option<u32> {
+        self.inner.gid()
+    }
+
     /// Set file mode bits on the underlying node.
     pub fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
         self.inner.set_mode(mode)
+    }
+
+    /// Set file owner uid/gid on the underlying node.
+    pub fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        self.inner.set_owner(uid, gid)
     }
 
     pub fn check_access(&self, uid: u32, gid: u32, mode: u32) -> bool {
