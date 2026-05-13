@@ -30,7 +30,7 @@ use crate::task::runqueue::add_stopping_task;
 use crate::timer::remove_timer;
 use crate::timer::get_time;
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use lazy_static::*;
 use switch::__switch;
 
@@ -38,7 +38,8 @@ pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use runqueue::{
     add_task, dequeue_task, enqueue_task_on, has_runnable_task_at_or_above, highest_runnable_prio,
-    pid2process, pick_next_task, remove_from_pid2process, remove_task, resched_hart, wakeup_task,
+    list_pids, pid2process, pick_next_task, remove_from_pid2process, remove_task, resched_hart,
+    wakeup_task,
 };
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
@@ -304,7 +305,7 @@ lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         let inode = open_file("initproc", OpenFlags::RDONLY).expect("Initproc not found! Rebuild image to include initproc.");
         let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice())
+        ProcessControlBlock::new(v.as_slice(), String::from("/initproc"))
     };
 }
 

@@ -135,6 +135,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_detector: DeadlockDetector,
     /// current working directory (absolute path)
     pub cwd: String,
+    /// absolute path of the last executed image (for /proc/<pid>/exe)
+    pub exec_path: String,
     /// process credentials
     pub cred: Credentials,
     /// CPU time spent in user mode for this process (raw timer counter units)
@@ -361,7 +363,7 @@ impl ProcessControlBlock {
         self.inner.lock()
     }
     /// new process from elf file
-    pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    pub fn new(elf_data: &[u8], exec_path: String) -> Arc<Self> {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
         // assert that initproc is always valid elf
@@ -394,6 +396,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
+                    exec_path,
                     cred: Credentials::root(),
                     user_time: 0,
                     kernel_time: 0,
@@ -439,7 +442,12 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) -> Result<(), ERRNO> {
+    pub fn exec(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        args: Vec<String>,
+        exec_path: String,
+    ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
 
@@ -557,6 +565,7 @@ impl ProcessControlBlock {
             let old_token = old_memory_set.token();
             let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
+            inner.exec_path = exec_path;
             // POSIX: on exec, reset all user-defined signal handlers to SIG_DFL.
             // SIG_IGN dispositions are preserved across exec.
             for action in inner.signal_actions.table.iter_mut() {
@@ -703,6 +712,7 @@ impl ProcessControlBlock {
         let parent_signal_mask = parent.signal_mask;
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
+        let parent_exec_path = parent.exec_path.clone();
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -738,6 +748,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent_cwd,
+                    exec_path: parent_exec_path,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -810,7 +821,7 @@ impl ProcessControlBlock {
     }
 
     /// Create a child process directly from elf image.
-    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ERRNO> {
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8], exec_path: String) -> Result<Arc<Self>, ERRNO> {
         let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data)?;
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
@@ -849,6 +860,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                    exec_path,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -901,6 +913,11 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Get absolute path of the last executed image.
+    pub fn exec_path(&self) -> String {
+        self.inner.lock().exec_path.clone()
     }
 
     pub fn getuid(&self) -> u32 {

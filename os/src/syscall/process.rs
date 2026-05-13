@@ -9,7 +9,7 @@ use crate::{
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
         exit_current_and_run_next, pid2process, remove_from_pid2process,
-        suspend_current_and_run_next, ExitReason, SignalFlags,
+        ExitReason, SignalFlags,
         WaitReason,
     },
 };
@@ -21,6 +21,8 @@ struct ResolvedExecImage {
     elf_data: Vec<u8>,
     /// 按 shebang 规则重写后的参数列表。
     argv: Vec<String>,
+    /// 最终执行映像的绝对路径。
+    exec_path: String,
 }
 
 /// shebang 首行解析结果。
@@ -108,6 +110,7 @@ fn resolve_exec_image(
         return Ok(ResolvedExecImage {
             elf_data: file_data,
             argv,
+            exec_path: abs_path,
         });
     }
 
@@ -270,9 +273,13 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         debug!(" ------------------- Resolve -----------------------");
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
         debug!(" ------------------- End Resolve -----------------------");
-        let ResolvedExecImage { elf_data, argv } = resolved;
+        let ResolvedExecImage {
+            elf_data,
+            argv,
+            exec_path,
+        } = resolved;
         let argc = argv.len();
-        process.exec(elf_data.as_slice(), argv)?;
+        process.exec(elf_data.as_slice(), argv, exec_path)?;
         // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
         Ok(argc as isize)
     })
@@ -460,7 +467,10 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
         let parent = current_process();
         let all_data = app_inode.read_all();
-        let child = parent.spawn(all_data.as_slice()).or_errno(ERRNO::ENOEXEC)?;
+        let exec_path = canonicalize("/", path.as_str());
+        let child = parent
+            .spawn(all_data.as_slice(), exec_path)
+            .or_errno(ERRNO::ENOEXEC)?;
         Ok(child.getpid() as isize)
     })
 }

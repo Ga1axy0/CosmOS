@@ -202,11 +202,10 @@ fn first_hart_main(hart_id: usize) -> ! {
     info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
     net::init();
+    fs::init();
     timer::init_realtime_offset_from_rtc();
     probe_and_start_other_harts(hart_id);
     init_local_hart(hart_id);
-    fs::init_rootfs();
-    fs::init_dev();
     task::add_initproc();
     BOOT_DONE.store(true, Ordering::Release);
     println!("[kernel] Hello, world!");

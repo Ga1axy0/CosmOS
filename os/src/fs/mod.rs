@@ -7,6 +7,7 @@ mod stdio;
 mod tty;
 pub mod rootfs;
 pub mod devfs;
+pub mod procfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -472,7 +473,7 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_mount, do_umount, init_dev, init_rootfs, inode_stat, linkat,
+    canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
     linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at, mount_device,
     open_file, open_file_at, rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD,
     AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
@@ -486,4 +487,5 @@ pub use tty::{Termios, TtyCore, TtyFile, WinSize};
 pub fn init() {
     init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
     init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+    init_procfs();  // Initialize procfs for /proc entries.
 }
