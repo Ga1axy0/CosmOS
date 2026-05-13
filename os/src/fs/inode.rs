@@ -5,6 +5,7 @@ use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
 use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode, UrandomDevNode};
+use crate::fs::procfs::ProcRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -703,7 +704,9 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
         if flags & AT_REMOVEDIR == 0 {
             return Err(ERRNO::EISDIR);
         }
-        if !inode.ls().is_empty() {
+        // if !inode.ls().is_empty() {
+        if inode.ls().len() > 2 {
+            // Contains at least one entry other than `.` and `..`
             return Err(ERRNO::ENOTEMPTY);
         }
         parent.rmdir(name.as_str())?
@@ -966,6 +969,17 @@ pub fn init_dev() {
     info!("[kernel] /dev/urandom and /dev/random registered");
 
     info!("[kernel] /dev initialized");
+}
+
+/// Mount procfs at `/proc`.
+///
+/// Must be called after `init_rootfs` so the virtual root is ready.
+pub fn init_procfs() {
+    let proc_root: Arc<dyn VfsNode> = Arc::new(ProcRootNode::new());
+    let proc_inode = Inode::from_vfs_node(proc_root);
+    do_mount("/proc", proc_inode)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount procfs at /proc"));
+    info!("[kernel] /proc initialized");
 }
 
 /// Mount the filesystem on `dev_path` at the absolute path `abs_mnt`.

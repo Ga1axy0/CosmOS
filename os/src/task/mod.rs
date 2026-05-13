@@ -193,7 +193,7 @@ lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         let inode = open_file("initproc", OpenFlags::RDONLY).expect("Initproc not found! Rebuild image to include initproc.");
         let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice())
+        ProcessControlBlock::new(v.as_slice(), String::from("/initproc"))
     };
 }
 
