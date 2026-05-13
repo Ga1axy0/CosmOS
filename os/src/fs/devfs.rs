@@ -230,6 +230,11 @@ impl VfsNode for NullDevNode {
         // Discard and report full length written
         buf.len()
     }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), fs::errno::FS_ERRNO> {
+        Ok(())   
+    }
+
 }
 
 // SAFETY: single-processor kernel; `BlockDevice` is already `Send + Sync`.

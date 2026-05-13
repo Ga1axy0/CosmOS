@@ -118,6 +118,8 @@ pub const SYSCALL_SIGSUSPEND: usize = 133;
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
 pub const SYSCALL_SIGPROCMASK: usize = 135;
+/// rt_sigtimedwait_time32 syscall
+pub const SYSCALL_RT_SIGTIMEDWAIT_TIME32: usize = 137;
 /// sigreturn syscall
 pub const SYSCALL_SIGRETURN: usize = 139;
 /// set priority syscall
@@ -130,6 +132,10 @@ pub const SYSCALL_GETSID: usize = 156;
 pub const SYSCALL_SETSID: usize = 157;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
+/// getrlimit syscall
+pub const SYSCALL_GETRLIMIT: usize = 163;
+/// setrlimit syscall
+pub const SYSCALL_SETRLIMIT: usize = 164;
 /// getrusage syscall
 pub const SYSCALL_GETRUSAGE: usize = 165;
 /// getcpu
@@ -194,10 +200,14 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// madvise syscall
+pub const SYSCALL_MADVISE: usize = 233;
 /// get_mempolicy syscall
 pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 /// waitpid syscall
 pub const SYSCALL_WAIT4: usize = 260;
+/// prlimit64 syscall
+pub const SYSCALL_PRLIMIT64: usize = 261;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -247,6 +257,7 @@ mod mman;
 mod signal;
 mod times;
 mod utils;
+mod resource;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
@@ -261,6 +272,8 @@ use crate::syscall::random::*;
 use mman::*;
 use signal::*;
 use times::*;
+use resource::*;
+pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use utils::{
     read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_user, Pod,
@@ -380,11 +393,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
-        SYSCALL_YIELD => sched::sys_yield(),
+        SYSCALL_YIELD => sys_yield(),
         SYSCALL_GETSID => sys_getsid(),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
+        SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut rlimit),
+        SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const rlimit),
+        SYSCALL_PRLIMIT64 => sys_prlimit64(args[0] as i32, args[1], args[2] as *const rlimit, args[3] as *mut rlimit),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
@@ -427,6 +443,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *mut i32,
         ),
         SYSCALL_SHUTDOWN => sys_shutdown(args[0] as i32, args[1] as i32),
+        SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2] as i32),
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
@@ -445,7 +462,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
         SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
-        SYSCALL_BRK => mman::sys_brk(args[0]),
+        SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
@@ -482,6 +499,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
         SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u32, args[1]),
+        SYSCALL_RT_SIGTIMEDWAIT_TIME32 => sys_rt_sigtimedwait_time32(
+            args[0] as *const u32,
+            args[1] as *mut crate::task::SigInfo,
+            args[2] as *const OldTimespec32,
+            args[3],
+        ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),

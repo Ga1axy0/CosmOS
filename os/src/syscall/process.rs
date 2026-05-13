@@ -8,8 +8,8 @@ use crate::{
     mm::{translated_ref, translated_refmut, translated_str},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, pid2process, suspend_current_and_run_next, ExitReason,
-        SignalFlags,
+        exit_current_and_run_next, pid2process, remove_from_pid2process,
+        suspend_current_and_run_next, ExitReason, SignalFlags,
         WaitReason,
     },
 };
@@ -153,12 +153,6 @@ pub fn sys_exit_group(exit_code: i32) -> ! {
     sys_exit(exit_code);
 }
 
-/// yield syscall
-pub fn sys_yield() -> isize {
-    //trace!("kernel: sys_yield");
-    suspend_current_and_run_next();
-    0
-}
 /// getpid syscall
 pub fn sys_getpid() -> isize {
     trace!(
@@ -336,6 +330,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 let token = inner.memory_set.token();
                 drop(child_inner);
                 drop(inner);
+                remove_from_pid2process(found_pid);
 
                 if !exit_status_ptr.is_null() {
                     if let Some(slot) = translated_refmut(token, exit_status_ptr) {
@@ -394,8 +389,10 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 /// kill syscall
 pub fn sys_kill(pid: usize, signal: u32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_kill",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_kill pid:{} signal:{}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        pid,
+        signal
     );
     syscall_body!({
         let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
@@ -449,15 +446,6 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
         add_signal_to_process(&process, flag);
         Ok(0)
     })
-}
-
-/// change data segment size
-pub fn sys_brk(addr: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_brk",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    current_process().set_program_brk(addr) as isize
 }
 
 /// spawn syscall

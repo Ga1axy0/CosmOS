@@ -6,6 +6,7 @@ use core::cmp::min;
 use core::sync::atomic::Ordering;
 
 use smoltcp::socket::udp as udp_socket;
+use smoltcp::socket::udp::SendError;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
@@ -95,13 +96,15 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn bind(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
-        if ep.port == 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let bind_ep = listen_endpoint_from_bind(ep);
-        debug!("UDP socket {:?} binding to {:?}", self.st.handle, bind_ep);
         let mut guard = NET_STACK.lock();
         let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+        let port = if ep.port == 0 {
+            stack.alloc_ephemeral_port()
+        } else {
+            ep.port
+        };
+        let bind_ep = listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port));
+        debug!("UDP socket {:?} binding to {:?}", self.st.handle, bind_ep);
         let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
         match socket.bind(bind_ep) {
             Ok(()) => {
@@ -155,6 +158,9 @@ impl UdpSocketFile {
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
         trace!("udp send_to: data_len={} ep={} handle={:?}", data.len(), ep, self.st.handle);
         loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             self.ensure_bound_for_send_locked(stack, ep)?;
@@ -177,8 +183,11 @@ impl UdpSocketFile {
                         return Ok(data.len());
                     }
                     Err(e) => {
-                        warn!("udp send_slice failed for socket {:?}: {:?}", self.st.handle, e);
-                        return Err(ERRNO::ENOBUFS);
+                        error!("udp send_slice failed for socket {:?}: {:?}, ep = {}", self.st.handle, e, ep);
+                        return match e {
+                            SendError::Unaddressable => Err(ERRNO::EHOSTUNREACH),
+                            SendError::BufferFull => Err(ERRNO::ENOBUFS),
+                        };
                     }
                 }
             }
@@ -214,6 +223,9 @@ impl UdpSocketFile {
 
     pub(crate) fn recv_from_user_buffer(&self, out: &mut UserBuffer) -> Result<(usize, IpEndpoint), ERRNO> {
         loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);

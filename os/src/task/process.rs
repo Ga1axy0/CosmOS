@@ -15,6 +15,7 @@ use crate::mm::{
     KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::syscall::ResourceLimits;
 use crate::syscall::errno::ERRNO;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -108,6 +109,8 @@ pub struct ProcessControlBlockInner {
     pub exit_reason: ExitReason,
     /// file descriptor table
     pub fd_table: Vec<Option<FdEntry>>,
+    /// per-process resource limits
+    pub resource_limits: ResourceLimits,
     /// pending process signals
     pub pending_signals: SignalFlags,
     /// blocked process signals
@@ -242,13 +245,62 @@ impl ProcessControlBlockInner {
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
-    /// allocate a new file descriptor
-    pub fn alloc_fd(&mut self) -> usize {
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            fd
+    fn nofile_limit(&self) -> usize {
+        self.resource_limits.nofile.rlim_cur.min(usize::MAX as u64) as usize
+    }
+    pub fn available_fd_slots(&self) -> usize {
+        let limit = self.nofile_limit();
+        let occupied = self
+            .fd_table
+            .iter()
+            .take(limit)
+            .filter(|entry| entry.is_some())
+            .count();
+        limit.saturating_sub(occupied)
+    }
+    pub fn ensure_fd_capacity(&self, needed: usize) -> Result<(), ERRNO> {
+        if self.available_fd_slots() < needed {
+            Err(ERRNO::EMFILE)
         } else {
+            Ok(())
+        }
+    }
+    /// allocate a new file descriptor
+    pub fn alloc_fd(&mut self) -> Result<usize, ERRNO> {
+        self.alloc_fd_from(0)
+    }
+    /// allocate a new file descriptor no smaller than `min_fd`
+    pub fn alloc_fd_from(&mut self, min_fd: usize) -> Result<usize, ERRNO> {
+        let limit = self.nofile_limit();
+        if min_fd >= limit {
+            return Err(ERRNO::EMFILE);
+        }
+        if let Some(fd) = (min_fd..self.fd_table.len().min(limit)).find(|fd| self.fd_table[*fd].is_none()) {
+            return Ok(fd);
+        }
+        if self.fd_table.len() < limit {
+            if min_fd > self.fd_table.len() {
+                self.fd_table.resize(min_fd, None);
+            }
             self.fd_table.push(None);
-            self.fd_table.len() - 1
+            return Ok(self.fd_table.len() - 1);
+        }
+        Err(ERRNO::EMFILE)
+    }
+    pub fn address_space_bytes(&self) -> usize {
+        self.memory_set.user_vma_bytes()
+    }
+    pub fn ensure_address_space_capacity(&self, additional: usize) -> Result<(), ERRNO> {
+        let limit = self.resource_limits.address_space.rlim_cur;
+        if limit == u64::MAX {
+            return Ok(());
+        }
+        let current = self.address_space_bytes() as u128;
+        let required = current.checked_add(additional as u128).ok_or(ERRNO::ENOMEM)?;
+        if required > limit as u128 {
+            Err(ERRNO::ENOMEM)
+        } else {
+            Ok(())
         }
     }
     /// 取走指定 fd 表项，供调用方在释放进程锁后再销毁底层文件对象。
@@ -329,6 +381,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_stdio_files(),
+                    resource_limits: ResourceLimits::default(),
                     pending_signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
                     signal_actions: SignalActions::default(),
@@ -672,6 +725,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
+                    resource_limits: parent.resource_limits,
                     pending_signals: SignalFlags::empty(),
                     signal_mask: parent_signal_mask,
                     signal_actions: parent_signal_actions,
@@ -782,6 +836,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
+                    resource_limits: parent.resource_limits,
                     pending_signals: SignalFlags::empty(),
                     signal_mask: parent.signal_mask,
                     signal_actions: parent.signal_actions.clone(),
@@ -874,10 +929,12 @@ impl ProcessControlBlock {
 
     /// map an anonymous area with given permission, return true if success
     pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
-        self.inner
-            .lock()
-            .memory_set
-            .mmap_anonymous(start, end, perm)
+        let len = usize::from(end).saturating_sub(usize::from(start));
+        let mut inner = self.inner.lock();
+        if inner.ensure_address_space_capacity(len).is_err() {
+            return false;
+        }
+        inner.memory_set.mmap_anonymous(start, end, perm)
     }
     /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
     pub fn mmap_file(
@@ -889,10 +946,15 @@ impl ProcessControlBlock {
         pgoff: usize,
         shared: bool,
     ) -> bool {
-        let mapped = self.inner
-            .lock()
-            .memory_set
-            .mmap_file(start, end, perm, file.clone(), pgoff, shared);
+        let len = usize::from(end).saturating_sub(usize::from(start));
+        let mapped = {
+            let mut inner = self.inner.lock();
+            if inner.ensure_address_space_capacity(len).is_err() {
+                false
+            } else {
+                inner.memory_set.mmap_file(start, end, perm, file.clone(), pgoff, shared)
+            }
+        };
         if mapped {
             if let Some(inode) = file.backing_inode() {
                 register_file_mapping(&inode, self);
@@ -1120,6 +1182,12 @@ impl ProcessControlBlock {
             let old_end_vpn = old_brk_va.ceil();
             let new_end_vpn = new_brk_va.ceil();
             let mut batch = None;
+            if new_end_vpn > old_end_vpn {
+                let additional = (new_end_vpn.0 - old_end_vpn.0) * PAGE_SIZE;
+                if inner.ensure_address_space_capacity(additional).is_err() {
+                    return old_brk;
+                }
+            }
 
             if new_brk > old_brk {
                 let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)

@@ -1,13 +1,83 @@
-use crate::syscall::{read_pod_from_user, write_pod_to_user, ERRNO};
+use crate::signal::{SigInfo, SignalWaitHandle, SignalWakeState, register_signal_wait};
+use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::task::UContext;
 use crate::{
     mm::{translated_ref, translated_refmut},
     syscall::errno::OrErrno,
     syscall_body,
     task::{
-        current_process, current_task, current_user_token, SignalAction, SignalFlags, WaitReason,
+        block_current_and_run_next, current_process, current_task, current_user_token,
+        SignalAction, SignalFlags, TaskStatus, WaitReason,
     },
 };
+use crate::timer::{add_timer_with_signal_tag, get_time_ms};
+
+use crate::syscall::OldTimespec32;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+struct SigSet32(u32);
+
+impl Pod for SigSet32 {}
+
+fn parse_sigtimedwait_timeout_ms(
+    uts: *const OldTimespec32,
+) -> Result<Option<usize>, ERRNO> {
+    if uts.is_null() {
+        return Ok(None);
+    }
+    let timeout = read_pod_from_user(uts)?;
+    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let sec_ms = (timeout.tv_sec as u64)
+        .checked_mul(1_000)
+        .ok_or(ERRNO::EINVAL)?;
+    let nsec_ms = (timeout.tv_nsec as u64).div_ceil(1_000_000);
+    let timeout_ms = sec_ms.checked_add(nsec_ms).ok_or(ERRNO::EINVAL)?;
+    Ok(Some(timeout_ms as usize))
+}
+
+fn timeout_ms_to_deadline(timeout_ms: Option<usize>) -> Result<Option<usize>, ERRNO> {
+    match timeout_ms {
+        None => Ok(None),
+        Some(ms) => get_time_ms().checked_add(ms).map(Some).ok_or(ERRNO::EINVAL),
+    }
+}
+
+fn read_signal_wait_set(uthese: *const u32, sigsetsize: usize) -> Result<SignalFlags, ERRNO> {
+    if uthese.is_null() || sigsetsize < core::mem::size_of::<u32>() {
+        return Err(ERRNO::EINVAL);
+    }
+    let bits = read_pod_from_user(uthese as *const SigSet32)?.0;
+    SignalFlags::from_bits(bits).or_errno(ERRNO::EINVAL)
+}
+
+fn signal_wait_sleep(handle: SignalWaitHandle, signal_set: SignalFlags) {
+    let task = current_task().unwrap();
+    {
+        debug!("signal_wait_sleep: blocking task of pid {} for signals {:#x}", task.process.upgrade().unwrap().getpid(), signal_set.bits());
+        let mut task_inner = task.inner_exclusive_access();
+        debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
+        task_inner.task_status = TaskStatus::Interruptible;
+        task_inner.wait_reason = Some(WaitReason::SignalTimedWait);
+    }
+
+    if crate::signal::has_pending_signal_in_set(signal_set)
+        || crate::signal::has_unmasked_pending_signal()
+        || crate::signal::signal_wait_should_skip(handle)
+    {
+        crate::signal::cleanup_signal_wait(handle);
+        let mut task_inner = task.inner_exclusive_access();
+        if matches!(task_inner.task_status, TaskStatus::Interruptible) {
+            task_inner.task_status = TaskStatus::Running;
+            task_inner.wait_reason = None;
+        }
+        return;
+    }
+
+    block_current_and_run_next(WaitReason::SignalTimedWait);
+}
 
 /// rt_sigaction 系统调用
 pub fn sys_sigaction(
@@ -305,5 +375,68 @@ pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
 
         // sigsuspend always returns -EINTR after signal delivery
         Err(ERRNO::EINTR)
+    })
+}
+
+/// `rt_sigtimedwait_time32(2)`：等待并同步消费指定信号集合中的 pending signal。
+///
+/// 当前内核使用 32 位 `sigset_t`，因此 64 位兼容入口只消费用户信号集的低 32 位。
+pub fn sys_rt_sigtimedwait_time32(
+    uthese: *const u32,
+    uinfo: *mut SigInfo,
+    uts: *const OldTimespec32,
+    sigsetsize: usize,
+) -> isize {
+    debug!(
+        "kernel:pid[{}] sys_rt_sigtimedwait_time32 uthese={:#x} uinfo={:#x} uts={:#x} sigsetsize={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        uthese as usize,
+        uinfo as usize,
+        uts as usize,
+        sigsetsize
+    );
+    syscall_body!({
+        let signal_set = read_signal_wait_set(uthese, sigsetsize)?;
+        if signal_set.is_empty() {
+            return Err(ERRNO::EINVAL);
+        }
+        let timeout_ms = parse_sigtimedwait_timeout_ms(uts)?;
+        let deadline = timeout_ms_to_deadline(timeout_ms)?;
+
+        loop {
+            if let Some(signum) = crate::signal::take_pending_signal_in_set(signal_set) {
+                if !uinfo.is_null() {
+                    write_pod_to_user(uinfo, &SigInfo::new(signum))?;
+                }
+                return Ok(signum as isize);
+            }
+
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+
+            let now_ms = get_time_ms();
+            if let Some(dl) = deadline {
+                if now_ms >= dl {
+                    return Err(ERRNO::EAGAIN);
+                }
+            }
+
+            let task = current_task().unwrap();
+            let pid = task.process.upgrade().unwrap().getpid();
+            let handle = register_signal_wait(pid, signal_set, &task).ok_or(ERRNO::ENOSPC)?;
+            if let Some(dl) = deadline {
+                add_timer_with_signal_tag(dl, task.clone(), Some(handle.timer_tag()));
+            }
+            signal_wait_sleep(handle, signal_set);
+
+            let wake_state = crate::signal::signal_wait_state(handle);
+            crate::signal::cleanup_signal_wait(handle);
+
+            match wake_state {
+                SignalWakeState::TimedOut => return Err(ERRNO::EAGAIN),
+                SignalWakeState::Ready | SignalWakeState::Canceled => {}
+            }
+        }
     })
 }
