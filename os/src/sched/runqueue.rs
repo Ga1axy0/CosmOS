@@ -13,6 +13,7 @@ use crate::task::{
 };
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::array;
 use lazy_static::*;
 
@@ -579,6 +580,12 @@ pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     let map = (*PID2PCB).lock();
     map.get(&pid).map(Arc::clone)
+}
+
+/// List all current process IDs.
+pub fn list_pids() -> Vec<usize> {
+    let map = PID2PCB.lock();
+    map.keys().copied().collect()
 }
 
 /// Insert item(pid, pcb) into PID2PCB map.

@@ -25,9 +25,6 @@ const MUSL_LD_PATH: &str = "/lib/ld-musl-riscv64-sf.so.1";
 const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
 const GLIBC_BUSYBOX_PATH_CSTR: &str = "/glibc/busybox\0";
 const INSTALL_ARG_CSTR: &str = "--install\0";
-const PROC_DIR: &str = "/proc";
-const PROC_SELF_DIR: &str = "/proc/self";
-const PROC_SELF_EXE: &str = "/proc/self/exe";
 const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
 
@@ -248,20 +245,8 @@ fn install_runtime_libs(libc: BusyBoxLibc) -> bool {
     true
 }
 
-/// 建立临时 `/proc/self/exe` 入口，供 BusyBox/ash 重执行自身时复用。
-fn ensure_proc_self_exe() -> bool {
-    if !ensure_dir(PROC_DIR) || !ensure_dir(PROC_SELF_DIR) {
-        return false;
-    }
-
-    // TODO: 这里只是临时用硬链接伪装 `/proc/self/exe`，并不具备真正 procfs 的动态语义。
-    ensure_hard_link(ROOT_BUSYBOX, PROC_SELF_EXE)
-}
-
-#[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 6;
-
+    const TOTAL_STEPS: usize = 5;
     let busybox_libc = match BusyBoxLibc::from_args(argv) {
         Some(libc) => libc,
         None => return 1,
@@ -302,12 +287,7 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(5, TOTAL_STEPS, "prepare temporary /proc/self/exe");
-    if !ensure_proc_self_exe() {
-        return 1;
-    }
-
-    print_step(6, TOTAL_STEPS, "launch /bin/sh");
+    print_step(5, TOTAL_STEPS, "launch /bin/sh");
     let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
     let shell_exit = spawn_and_wait(BIN_SH_CSTR, &shell_argv);
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
