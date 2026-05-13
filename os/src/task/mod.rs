@@ -177,7 +177,6 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
                 crate::board::QEMU_EXIT_HANDLE.exit_success();
             }
         }
-        remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
         // mark this process as a zombie process
         process_inner.is_zombie = true;
@@ -345,6 +344,8 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
         (process.getpid(), !newly_unmasked.is_empty())
     };
 
+    crate::signal::notify_signal_wait_pid(pid, signal.bits());
+
     if should_notify_poll {
         debug!(
             "add_signal_to_process: pid={} added signal {:#x} which is unmasked, should notify poll",
@@ -414,6 +415,7 @@ pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
 /// the inactive(blocked) tasks are removed when the PCB is deallocated.(called by exit_current_and_run_next)
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_task(Arc::clone(&task));
+    crate::signal::cleanup_signal_wait_for_task(&task);
     trace!("kernel: remove_inactive_task .. remove_timer");
     remove_timer(Arc::clone(&task));
 }

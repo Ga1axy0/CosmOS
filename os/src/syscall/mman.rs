@@ -150,6 +150,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             // Linux-style mmap(NULL, ...): choose a free user VA automatically.
             let (chosen, chosen_end, hint) = {
                 let mut inner = process.inner_exclusive_access();
+                inner.ensure_address_space_capacity(len_aligned)?;
                 let hint = inner.vm_layout.mmap_hint;
                 let base = inner.vm_layout.mmap_base;
                 let chosen = inner
@@ -383,4 +384,29 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
             Err(ERRNO::ENOMEM)
         }
     })
+}
+
+pub fn sys_madvise(start: usize, len: usize, advice: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_madvise",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    // TODO take madvice
+    syscall_body!({
+        if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+            return Err(ERRNO::EINVAL); // start not page-aligned
+        }
+        if len == 0 {
+            return Ok(0); // POSIX/Linux: zero-length madvise is a successful no-op
+        }
+        warn!(
+            "madvise(pid={} addr={:#x} len={} advice={}) is not implemented",
+            current_task().unwrap().process.upgrade().unwrap().getpid(),
+            start,
+            len,
+            advice
+        );
+        Ok(0)
+    }
+)
 }

@@ -27,17 +27,17 @@ fn normalize_backlog(backlog: usize) -> usize {
 }
 
 #[inline]
-fn loopback_connect_local_endpoint(remote: IpEndpoint, port: u16) -> IpListenEndpoint {
-    let addr = match remote.addr {
-        IpAddress::Ipv4(v4) if v4.is_loopback() => {
-            Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)))
-        }
-        _ => None,
+fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
+    let addr = if ep.addr.is_unspecified() {
+        None
+    } else {
+        Some(ep.addr)
     };
-    IpListenEndpoint { addr, port }
+    IpListenEndpoint { addr, port: ep.port }
 }
 
 pub(crate) struct TcpListenerShared {
+    addr: SpinNoIrqLock<Option<IpAddress>>,
     port: AtomicUsize,
     backlog: AtomicUsize,
     pending: SpinNoIrqLock<VecDeque<Arc<TcpSocketState>>>,
@@ -46,9 +46,10 @@ pub(crate) struct TcpListenerShared {
 }
 
 impl TcpListenerShared {
-    fn new(port: u16, backlog: usize) -> Self {
+    fn new(endpoint: IpListenEndpoint, backlog: usize) -> Self {
         Self {
-            port: AtomicUsize::new(port as usize),
+            addr: SpinNoIrqLock::new(endpoint.addr),
+            port: AtomicUsize::new(endpoint.port as usize),
             backlog: AtomicUsize::new(backlog),
             pending: SpinNoIrqLock::new(VecDeque::new()),
             passive: SpinNoIrqLock::new(Vec::new()),
@@ -64,8 +65,20 @@ impl TcpListenerShared {
         self.port.load(Ordering::Acquire) as u16
     }
 
-    fn set_port(&self, port: u16) {
-        self.port.store(port as usize, Ordering::Release);
+    fn addr(&self) -> Option<IpAddress> {
+        *self.addr.lock()
+    }
+
+    fn set_endpoint(&self, endpoint: IpListenEndpoint) {
+        *self.addr.lock() = endpoint.addr;
+        self.port.store(endpoint.port as usize, Ordering::Release);
+    }
+
+    fn endpoint(&self) -> IpListenEndpoint {
+        IpListenEndpoint {
+            addr: self.addr(),
+            port: self.port(),
+        }
     }
 
     fn backlog(&self) -> usize {
@@ -220,7 +233,7 @@ pub(crate) fn queue_listener_connection_if_ready(
 
 pub(crate) struct TcpSocketFile {
     st: SpinNoIrqLock<Arc<TcpSocketState>>,
-    bound_port: SpinNoIrqLock<Option<u16>>,
+    bound_endpoint: SpinNoIrqLock<Option<IpListenEndpoint>>,
     listening: AtomicBool,
     listener: SpinNoIrqLock<Option<Arc<TcpListenerShared>>>,
 }
@@ -229,7 +242,7 @@ impl TcpSocketFile {
     fn new(st: Arc<TcpSocketState>) -> Self {
         Self {
             st: SpinNoIrqLock::new(st),
-            bound_port: SpinNoIrqLock::new(None),
+            bound_endpoint: SpinNoIrqLock::new(None),
             listening: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
         }
@@ -253,7 +266,16 @@ impl TcpSocketFile {
         let mut guard = crate::net::NET_STACK.lock();
         let stack = guard.as_mut()?;
         let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-        socket.local_endpoint()
+        if let Some(ep) = socket.local_endpoint() {
+            return Some(ep);
+        }
+        let bound = *self.bound_endpoint.lock();
+        bound.map(|bound| {
+            let addr = bound
+                .addr
+                .unwrap_or(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)));
+            IpEndpoint::new(addr, bound.port)
+        })
     }
 
     /// Return the remote endpoint of this TCP socket, or None if not connected.
@@ -314,7 +336,7 @@ impl TcpSocketFile {
             let (_h, st) = stack.create_tcp_socket();
             {
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                socket.listen(listener.port()).map_err(|_| ERRNO::EIO)?;
+                socket.listen(listener.endpoint()).map_err(|_| ERRNO::EIO)?;
             }
             st.set_listener(Some(Arc::downgrade(listener)));
             listener.push_passive(Arc::clone(&st));
@@ -325,19 +347,26 @@ impl TcpSocketFile {
         Ok(())
     }
 
-    pub(crate) fn bind(&self, port: u16) -> Result<(), ERRNO> {
-        if port == 0 {
-            return Err(ERRNO::EINVAL);
-        }
+    pub(crate) fn bind(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
         }
-        *self.bound_port.lock() = Some(port);
+        let port = if ep.port == 0 {
+            let mut guard = NET_STACK.lock();
+            let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            stack.alloc_ephemeral_port()
+        } else {
+            ep.port
+        };
+        *self.bound_endpoint.lock() = Some(listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port)));
         Ok(())
     }
 
     pub(crate) fn listen(&self, backlog: usize) -> Result<(), ERRNO> {
-        let port = (*self.bound_port.lock()).ok_or(ERRNO::EINVAL)?;
+        let endpoint = (*self.bound_endpoint.lock()).ok_or(ERRNO::EINVAL)?;
+
+        info!("Tcp listen: endpoint={:?} backlog={}", endpoint, backlog);
+        
         let backlog = normalize_backlog(backlog);
         let was_listening = self.listening.load(Ordering::Acquire);
 
@@ -346,14 +375,14 @@ impl TcpSocketFile {
             match guard.as_ref() {
                 Some(ls) => Arc::clone(ls),
                 None => {
-                    let ls = Arc::new(TcpListenerShared::new(port, backlog));
+                    let ls = Arc::new(TcpListenerShared::new(endpoint, backlog));
                     *guard = Some(Arc::clone(&ls));
                     ls
                 }
             }
         };
 
-        listener.set_port(port);
+        listener.set_endpoint(endpoint);
         listener.set_backlog(backlog);
 
         let st = self.state();
@@ -362,7 +391,7 @@ impl TcpSocketFile {
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             if !listener.contains_passive(st.handle) && !st.is_listener_owned() {
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                if socket.listen(port).is_ok() {
+                if socket.listen(endpoint).is_ok() {
                     st.set_listener(Some(Arc::downgrade(&listener)));
                     listener.push_passive(Arc::clone(&st));
                 } else if !was_listening {
@@ -385,9 +414,11 @@ impl TcpSocketFile {
         }
 
         let listener = self.listener_shared().ok_or(ERRNO::EINVAL)?;
-        let port = listener.port();
 
         loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
             if let Some(st) = listener.pop_pending() {
                 st.clear_queued_for_accept();
 
@@ -413,7 +444,7 @@ impl TcpSocketFile {
 
                 let accepted = Arc::new(TcpSocketFile {
                     st: SpinNoIrqLock::new(Arc::clone(&st)),
-                    bound_port: SpinNoIrqLock::new(Some(port)),
+                    bound_endpoint: SpinNoIrqLock::new(Some(listener.endpoint())),
                     listening: AtomicBool::new(false),
                     listener: SpinNoIrqLock::new(None),
                 });
@@ -425,35 +456,47 @@ impl TcpSocketFile {
             listener
                 .accept_wait
                 .wait_with_reason_or_skip(WaitReason::SocketReadable, || listener.has_pending());
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
         }
     }
 
     pub(crate) fn connect(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
-        debug!("Tcp connect: {}", ep);
         if self.listening.load(Ordering::Acquire) {
+            info!("Tcp connect failed: socket is listening");
             return Err(ERRNO::EINVAL);
         }
-
+        
+        info!("Tcp connect: {}", ep);
+        
         {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
-            let local_port = {
-                let mut bp = self.bound_port.lock();
+            let local_endpoint = {
+                let mut bp = self.bound_endpoint.lock();
                 match *bp {
-                    Some(p) => p,
+                    Some(ep) if ep.port != 0 => ep,
+                    Some(mut ep) => {
+                        ep.port = stack.alloc_ephemeral_port();
+                        *bp = Some(ep);
+                        ep
+                    }
                     None => {
-                        let p = stack.alloc_ephemeral_port();
-                        *bp = Some(p);
-                        p
+                        let ep = IpListenEndpoint {
+                            addr: None,
+                            port: stack.alloc_ephemeral_port(),
+                        };
+                        *bp = Some(ep);
+                        ep
                     }
                 }
             };
 
             let st = self.state();
             let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-            let local_ep = loopback_connect_local_endpoint(ep, local_port);
             socket
-                .connect(stack.iface.context(), ep, local_ep)
+                .connect(stack.iface.context(), ep, local_endpoint)
                 .map_err(|_| ERRNO::EADDRINUSE)?;
 
             stack.poll();
@@ -462,6 +505,9 @@ impl TcpSocketFile {
         NEED_POLL.store(true, Ordering::Release);
 
         loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
             let st = self.state();
             {
                 let mut guard = NET_STACK.lock();
@@ -477,10 +523,40 @@ impl TcpSocketFile {
             }
             st.write_wait
                 .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.connect_done());
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
         }
     }
 
-    fn recv_into_user_buffer(&self, buf: &mut UserBuffer) -> Result<usize, ERRNO> {
+    pub(crate) fn shutdown(&self, how: i32) -> Result<(), ERRNO> {
+        if self.listening.load(Ordering::Acquire) {
+            return Err(ERRNO::ENOTCONN);
+        }
+
+        let st = self.state();
+        {
+            let mut guard = NET_STACK.lock();
+            let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+            if socket.remote_endpoint().is_none() {
+                return Err(ERRNO::ENOTCONN);
+            }
+            match how {
+                0 => {}
+                1 | 2 => socket.close(),
+                _ => return Err(ERRNO::EINVAL),
+            }
+            stack.poll();
+        }
+
+        st.read_wait.wake_all();
+        st.write_wait.wake_all();
+        NEED_POLL.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn recv_into_user_buffer(&self, buf: &mut UserBuffer) -> Result<usize, ERRNO> {
         // debug!("tcp recv_into_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
@@ -489,6 +565,9 @@ impl TcpSocketFile {
             return Ok(0);
         }
         loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
             let st = self.state();
             {
                 let mut guard = NET_STACK.lock();
@@ -525,10 +604,13 @@ impl TcpSocketFile {
             }
             st.read_wait
                 .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
         }
     }
 
-    fn send_from_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
+    pub(crate) fn send_from_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
         // debug!("tcp send_from_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
 
         if self.listening.load(Ordering::Acquire) {
@@ -538,6 +620,9 @@ impl TcpSocketFile {
             return Ok(0);
         }
         loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
             let st = self.state();
             {
                 let mut guard = NET_STACK.lock();
@@ -574,6 +659,9 @@ impl TcpSocketFile {
             }
             st.write_wait
                 .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
         }
     }
 

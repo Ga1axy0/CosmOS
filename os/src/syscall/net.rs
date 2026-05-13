@@ -311,13 +311,14 @@ fn parse_send_ancillary(control_bytes: &[u8]) -> Result<UnixSocketAncillaryData,
     Ok(ancillary)
 }
 
-fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> Vec<i32> {
+fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> Result<Vec<i32>, ERRNO> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let mut out = Vec::with_capacity(rights.len());
+    inner.ensure_fd_capacity(rights.len())?;
 
     for desc in rights {
-        let fd = inner.alloc_fd();
+        let fd = inner.alloc_fd()?;
         let mut entry = FdEntry::new(desc);
         if cloexec {
             entry.flags |= FdFlags::CLOEXEC;
@@ -325,7 +326,7 @@ fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> 
         inner.fd_table[fd] = Some(entry);
         out.push(fd as i32);
     }
-    out
+    Ok(out)
 }
 
 fn with_udp_socket<R>(fd: usize, f: impl FnOnce(&UdpSocketFile) -> Result<R, ERRNO>) -> Result<R, ERRNO> {
@@ -378,15 +379,25 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
     }
 }
 
-fn socket_kind(fd: usize) -> Result<(bool, bool, bool), ERRNO> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketKind {
+    Udp,
+    Tcp,
+    Unix,
+}
+
+fn socket_kind(fd: usize) -> Result<SocketKind, ERRNO> {
     let desc = get_file_description(fd)?;
-    let is_udp = desc.as_any().downcast_ref::<UdpSocketFile>().is_some();
-    let is_tcp = desc.as_any().downcast_ref::<TcpSocketFile>().is_some();
-    let is_unix = desc.as_any().downcast_ref::<UnixSocketPairEnd>().is_some();
-    if !(is_udp || is_tcp || is_unix) {
-        return Err(ERRNO::ENOTSOCK);
+    if desc.as_any().downcast_ref::<UdpSocketFile>().is_some() {
+        return Ok(SocketKind::Udp);
     }
-    Ok((is_udp, is_tcp, is_unix))
+    if desc.as_any().downcast_ref::<TcpSocketFile>().is_some() {
+        return Ok(SocketKind::Tcp);
+    }
+    if desc.as_any().downcast_ref::<UnixSocketPairEnd>().is_some() {
+        return Ok(SocketKind::Unix);
+    }
+    Err(ERRNO::ENOTSOCK)
 }
 
 fn read_sockopt_i32(token: usize, optval: *const u8, optlen: i32) -> Result<i32, ERRNO> {
@@ -450,7 +461,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let fd = inner.alloc_fd();
+        let fd = inner.alloc_fd()?;
         inner.fd_table[fd] = Some(FdEntry::new(desc));
         Ok(fd as isize)
     })
@@ -506,15 +517,15 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-
-        let fd0 = inner.alloc_fd();
+        inner.ensure_fd_capacity(2)?;
+        let fd0 = inner.alloc_fd()?;
         let mut entry0 = FdEntry::new(desc0);
         if cloexec {
             entry0.flags |= FdFlags::CLOEXEC;
         }
         inner.fd_table[fd0] = Some(entry0);
 
-        let fd1 = inner.alloc_fd();
+        let fd1 = inner.alloc_fd()?;
         let mut entry1 = FdEntry::new(desc1);
         if cloexec {
             entry1.flags |= FdFlags::CLOEXEC;
@@ -539,12 +550,11 @@ pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         let ep = sockaddr_to_endpoint(uaddr)?;
 
         let fd = fd as usize;
-        match with_udp_socket(fd, |udp| udp.bind(ep)) {
-            Ok(()) => return Ok(0),
-            Err(ERRNO::ENOTSOCK) => {}
-            Err(e) => return Err(e),
+        match socket_kind(fd)? {
+            SocketKind::Udp => with_udp_socket(fd, |udp| udp.bind(ep))?,
+            SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.bind(ep))?,
+            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
         }
-        with_tcp_socket(fd, |tcp| tcp.bind(ep.port))?;
         Ok(0)
     })
 }
@@ -559,26 +569,35 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         let ep = sockaddr_to_endpoint(uaddr)?;
 
         let fd = fd as usize;
-        match with_udp_socket(fd, |udp| udp.connect(ep)) {
-            Ok(()) => return Ok(0),
-            Err(ERRNO::ENOTSOCK) => {}
-            Err(e) => return Err(e),
+        match socket_kind(fd)? {
+            SocketKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
+            SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
+            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
         }
-        with_tcp_socket(fd, |tcp| tcp.connect(ep))?;
         Ok(0)
     })
 }
 
 pub fn sys_listen(fd: i32, backlog: i32) -> isize {
     syscall_body!({
-        with_tcp_socket(fd as usize, |tcp| tcp.listen(backlog as usize))?;
-        Ok(0)
+        let fd = fd as usize;
+        match socket_kind(fd)? {
+            SocketKind::Tcp => {
+                with_tcp_socket(fd, |tcp| tcp.listen(backlog as usize))?;
+                Ok(0)
+            }
+            SocketKind::Udp | SocketKind::Unix => Err(ERRNO::ENOTSOCK),
+        }
     })
 }
 
 pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
     syscall_body!({
-        let (accepted, peer) = with_tcp_socket(fd as usize, |tcp| tcp.accept())?;
+        let fd = fd as usize;
+        let (accepted, peer) = match socket_kind(fd)? {
+            SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.accept())?,
+            SocketKind::Udp | SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+        };
 
         let accepted_file: Arc<dyn File + Send + Sync> = accepted;
         let accepted_desc = Arc::new(FileDescription::new(
@@ -590,7 +609,7 @@ pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
-        let new_fd = inner.alloc_fd();
+        let new_fd = inner.alloc_fd()?;
         inner.fd_table[new_fd] = Some(FdEntry::new(accepted_desc));
         drop(inner);
 
@@ -614,33 +633,31 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
 
         let fd = fd as usize;
 
-        // Try UDP first; if fd is UDP, return local endpoint or error from UDP path.
-        match with_udp_socket(fd, |udp| {
-            let ep = udp
-                .local_endpoint()
-                .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
-            let token = current_user_token();
-            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-            *out = endpoint_to_sockaddr(ep);
-            Ok(())
-        }) {
-            Ok(_) => return Ok(0),
-            Err(ERRNO::ENOTSOCK) => {
-                // fallthrough to TCP
+        match socket_kind(fd)? {
+            SocketKind::Udp => {
+                with_udp_socket(fd, |udp| {
+                    let ep = udp
+                        .local_endpoint()
+                        .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+                    let token = current_user_token();
+                    let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+                    *out = endpoint_to_sockaddr(ep);
+                    Ok(())
+                })?;
             }
-            Err(e) => return Err(e),
+            SocketKind::Tcp => {
+                with_tcp_socket(fd, |tcp| {
+                    let ep = tcp
+                        .local_endpoint()
+                        .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+                    let token = current_user_token();
+                    let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+                    *out = endpoint_to_sockaddr(ep);
+                    Ok(())
+                })?;
+            }
+            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
         }
-
-        // Try TCP
-        with_tcp_socket(fd, |tcp| {
-            let ep = tcp
-                .local_endpoint()
-                .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
-            let token = current_user_token();
-            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-            *out = endpoint_to_sockaddr(ep);
-            Ok(())
-        })?;
 
         Ok(0)
     })
@@ -654,32 +671,30 @@ pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
 
         let fd = fd as usize;
 
-        // UDP: use connected field
-        match with_udp_socket(fd, |udp| {
-            let ep = udp.peer_endpoint().ok_or(ERRNO::ENOTCONN)?;
-            let token = current_user_token();
-            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-            *out = endpoint_to_sockaddr(ep);
-            Ok(())
-        }) {
-            Ok(_) => return Ok(0),
-            Err(ERRNO::ENOTSOCK) => {
-                // fallthrough to TCP
+        match socket_kind(fd)? {
+            SocketKind::Udp => {
+                with_udp_socket(fd, |udp| {
+                    let ep = udp.peer_endpoint().ok_or(ERRNO::ENOTCONN)?;
+                    let token = current_user_token();
+                    let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+                    *out = endpoint_to_sockaddr(ep);
+                    Ok(())
+                })?;
             }
-            Err(e) => return Err(e),
+            SocketKind::Tcp => {
+                with_tcp_socket(fd, |tcp| {
+                    if let Some(ep) = tcp.remote_endpoint() {
+                        let token = current_user_token();
+                        let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+                        *out = endpoint_to_sockaddr(ep);
+                        Ok(())
+                    } else {
+                        Err(ERRNO::ENOTCONN)
+                    }
+                })?;
+            }
+            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
         }
-
-        // TCP: remote_endpoint
-        with_tcp_socket(fd, |tcp| {
-            if let Some(ep) = tcp.remote_endpoint() {
-                let token = current_user_token();
-                let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-                *out = endpoint_to_sockaddr(ep);
-                Ok(())
-            } else {
-                Err(ERRNO::ENOTCONN)
-            }
-        })?;
 
         Ok(0)
     })
@@ -708,15 +723,27 @@ pub fn sys_sendto(
         let ubuf = UserBuffer::new(translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?);
 
         let fd = fd as usize;
-        let n = if addr.is_null() {
-            with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
-        } else {
-            if (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
-                return Err(ERRNO::EINVAL);
+        let n = match socket_kind(fd)? {
+            SocketKind::Udp => {
+                if addr.is_null() {
+                    with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
+                } else {
+                    if (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
+                        return Err(ERRNO::EINVAL);
+                    }
+                    let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
+                    let ep = sockaddr_to_endpoint(uaddr)?;
+                    with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
+                }
             }
-            let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
-            let ep = sockaddr_to_endpoint(uaddr)?;
-            with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
+            SocketKind::Tcp => {
+                if addr.is_null() {
+                    with_tcp_socket(fd, |tcp| tcp.send_from_user_buffer(&ubuf))?
+                } else {
+                    return Err(ERRNO::ENOTSOCK);
+                }
+            }
+            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
         };
 
         Ok(n as isize)
@@ -751,7 +778,20 @@ pub fn sys_recvfrom(
         );
 
         let fd = fd as usize;
-        let (n, ep) = with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?;
+        let (n, ep) = match socket_kind(fd)? {
+            SocketKind::Udp => with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?,
+            SocketKind::Tcp => {
+                let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
+                let ep = if addr.is_null() {
+                    IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0)
+                } else {
+                    with_tcp_socket(fd, |tcp| Ok(tcp.remote_endpoint()))?
+                        .ok_or(ERRNO::ENOTCONN)?
+                };
+                (n, ep)
+            }
+            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+        };
 
         if !addr.is_null() {
             let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
@@ -767,22 +807,33 @@ pub fn sys_shutdown(fd: i32, how: i32) -> isize {
         if !matches!(how, SHUT_RD | SHUT_WR | SHUT_RDWR) {
             return Err(ERRNO::EINVAL);
         }
-        with_unix_socket(fd as usize, |unix| {
-            unix.shutdown(how)?;
-            Ok(0)
-        })
+        let fd = fd as usize;
+        match socket_kind(fd)? {
+            SocketKind::Unix => {
+                with_unix_socket(fd, |unix| {
+                    unix.shutdown(how)?;
+                    Ok(())
+                })?;
+                Ok(0)
+            }
+            SocketKind::Tcp => {
+                with_tcp_socket(fd, |tcp| tcp.shutdown(how))?;
+                Ok(0)
+            }
+            SocketKind::Udp => Err(ERRNO::ENOTSOCK),
+        }
     })
 }
 
 pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optlen: i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
-        let (_is_udp, _is_tcp, is_unix) = socket_kind(fd)?;
+        let kind = socket_kind(fd)?;
 
         match SocketLevel::from_repr(level) {
             Some(SocketLevel::SolSocket) => match PosixSocketOption::from_repr(optname) {
                 Some(PosixSocketOption::SoPassCred) => {
-                    if !is_unix {
+                    if kind != SocketKind::Unix {
                         warn!(
                             "setsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
                             fd, level, optname
@@ -813,25 +864,22 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
-        let (is_udp, is_tcp, is_unix) = socket_kind(fd)?;
+        let kind = socket_kind(fd)?;
         let token = current_user_token();
 
         match SocketLevel::from_repr(level) {
             Some(SocketLevel::SolSocket) => match PosixSocketOption::from_repr(optname) {
                 Some(PosixSocketOption::SoType) => {
-                    let socket_type = if is_udp {
-                        SOCK_DGRAM
-                    } else if is_tcp || is_unix {
-                        SOCK_STREAM
-                    } else {
-                        return Err(ERRNO::ENOTSOCK);
+                    let socket_type = match kind {
+                        SocketKind::Udp => SOCK_DGRAM,
+                        SocketKind::Tcp | SocketKind::Unix => SOCK_STREAM,
                     };
                     write_getsockopt_i32(token, optval, optlen, socket_type)?;
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoAcceptConn) => {
                     let mut acceptconn = 0i32;
-                    if is_tcp {
+                    if kind == SocketKind::Tcp {
                         with_tcp_socket(fd, |tcp| {
                             acceptconn = if tcp.is_listening() { 1 } else { 0 };
                             Ok(())
@@ -842,17 +890,17 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 }
                 Some(PosixSocketOption::SoRcvBuf) => {
                     let mut size = 0i32;
-                    if is_udp {
+                    if kind == SocketKind::Udp {
                         with_udp_socket(fd, |udp| {
                             size = udp.recv_buffer_size() as i32;
                             Ok(())
                         })?;
-                    } else if is_tcp {
+                    } else if kind == SocketKind::Tcp {
                         with_tcp_socket(fd, |tcp| {
                             size = tcp.recv_buffer_size() as i32;
                             Ok(())
                         })?;
-                    } else if is_unix {
+                    } else {
                         warn!(
                             "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
                             fd,
@@ -869,17 +917,17 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 }
                 Some(PosixSocketOption::SoSndBuf) => {
                     let mut size = 0i32;
-                    if is_udp {
+                    if kind == SocketKind::Udp {
                         with_udp_socket(fd, |udp| {
                             size = udp.send_buffer_size() as i32;
                             Ok(())
                         })?;
-                    } else if is_tcp {
+                    } else if kind == SocketKind::Tcp {
                         with_tcp_socket(fd, |tcp| {
                             size = tcp.send_buffer_size() as i32;
                             Ok(())
                         })?;
-                    } else if is_unix {
+                    } else {
                         warn!(
                             "getsockopt(fd={}, level={}, optname={}) not implemented on UNIX socket, using default=0",
                             fd,
@@ -898,7 +946,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoPassCred) => {
-                    if !is_unix {
+                    if kind != SocketKind::Unix {
                         warn!(
                             "getsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
                             fd,
@@ -1013,7 +1061,11 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
             return Err(ERRNO::EINVAL);
         }
 
-        let n = with_unix_socket(fd as usize, |unix| unix.sendmsg(ubuf, ancillary))?;
+        let fd = fd as usize;
+        let n = match socket_kind(fd)? {
+            SocketKind::Unix => with_unix_socket(fd, |unix| unix.sendmsg(ubuf, ancillary))?,
+            SocketKind::Udp | SocketKind::Tcp => return Err(ERRNO::EOPNOTSUPP),
+        };
         Ok(n as isize)
     })
 }
@@ -1046,13 +1098,17 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         let _total_len = iovecs_total_len(&iovecs)?;
         let ubuf = iovecs_to_user_buffer(token, &iovecs)?;
 
-        let (n, ancillary) = with_unix_socket(fd as usize, |unix| {
-            let (n, mut ancillary) = unix.recvmsg(ubuf)?;
-            if !unix.passcred_enabled() {
-                ancillary.credentials = None;
-            }
-            Ok((n, ancillary))
-        })?;
+        let fd = fd as usize;
+        let (n, ancillary) = match socket_kind(fd)? {
+            SocketKind::Unix => with_unix_socket(fd, |unix| {
+                let (n, mut ancillary) = unix.recvmsg(ubuf)?;
+                if !unix.passcred_enabled() {
+                    ancillary.credentials = None;
+                }
+                Ok((n, ancillary))
+            })?,
+            SocketKind::Udp | SocketKind::Tcp => return Err(ERRNO::EOPNOTSUPP),
+        };
 
         let cloexec = (flags & MSG_CMSG_CLOEXEC) != 0;
         let control_cap = msghdr.msg_controllen;
@@ -1080,7 +1136,7 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
             let rights_payload_len = ancillary.rights.len() * size_of::<i32>();
             let need = cmsg_align(size_of::<CmsgHdr>() + rights_payload_len);
             if used + need <= control_cap {
-                let received_fds = install_received_rights(ancillary.rights, cloexec);
+                let received_fds = install_received_rights(ancillary.rights, cloexec)?;
                 let mut payload = Vec::with_capacity(received_fds.len() * size_of::<i32>());
                 for fd in received_fds {
                     payload.extend_from_slice(&fd.to_ne_bytes());
