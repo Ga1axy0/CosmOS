@@ -2,7 +2,7 @@ use crate::signal::{SigInfo, SignalWaitHandle, SignalWakeState, register_signal_
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::task::UContext;
 use crate::{
-    mm::{translated_ref, translated_refmut},
+    mm::translated_ref,
     syscall::errno::OrErrno,
     syscall_body,
     task::{
@@ -268,8 +268,7 @@ pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: us
 
         // If user requested old mask, write it out after dropping process.inner.
         if !oset.is_null() {
-            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
-            *slot = old_bits;
+            write_pod_to_user(oset, &old_bits)?;
         }
 
         Ok(0)

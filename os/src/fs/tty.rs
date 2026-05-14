@@ -1,7 +1,8 @@
 use super::{File, Stat, StatMode};
 use crate::drivers::chardev::{CharDevice, UART};
-use crate::mm::{translated_ref, translated_refmut, UserBuffer};
+use crate::mm::{translated_ref, UserBuffer};
 use crate::syscall::errno::ERRNO;
+use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
 use crate::sync::SpinNoIrqLock;
 use alloc::collections::VecDeque;
@@ -62,6 +63,9 @@ impl Default for Termios {
     }
 }
 
+// 允许 tty ioctl 将该 C ABI 结构整体写回用户空间。
+impl Pod for Termios {}
+
 /// tty 窗口大小的最小占位结构。
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -75,6 +79,9 @@ pub struct WinSize {
     /// Terminal height in pixels.
     pub ypixel: u16,
 }
+
+// 允许 tty ioctl 将该 C ABI 结构整体写回用户空间。
+impl Pod for WinSize {}
 
 impl Default for WinSize {
     /// 返回默认终端窗口大小占位值。
@@ -389,8 +396,7 @@ impl File for TtyFile {
         let token = current_user_token();
         match req {
             TCGETS => {
-                let slot = translated_refmut(token, arg as *mut Termios).ok_or(ERRNO::EFAULT)?;
-                *slot = self.core.termios();
+                write_pod_to_user(arg as *mut Termios, &self.core.termios())?;
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
@@ -400,8 +406,7 @@ impl File for TtyFile {
                 Ok(0)
             }
             TIOCGWINSZ => {
-                let slot = translated_refmut(token, arg as *mut WinSize).ok_or(ERRNO::EFAULT)?;
-                *slot = self.core.winsize();
+                write_pod_to_user(arg as *mut WinSize, &self.core.winsize())?;
                 Ok(0)
             }
             TIOCSWINSZ => {

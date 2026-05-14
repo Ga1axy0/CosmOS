@@ -30,7 +30,6 @@ pub use tlb_shootdown::{
     handle_ipi, has_deferred, mark_online, needs_flush, online_mask, shootdown,
     shootdown_global, take_deferred, DeferredBatch, ShootdownKind,
 };
-use page_table::PTEFlags;
 pub use page_table::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
     PageTableEntry, UserBuffer, UserBufferIterator,

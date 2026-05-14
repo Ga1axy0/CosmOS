@@ -276,7 +276,7 @@ use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use utils::{
     read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
-    write_pod_to_user, Pod,
+    write_pod_to_process_user, write_pod_to_user, Pod,
 };
 
 
