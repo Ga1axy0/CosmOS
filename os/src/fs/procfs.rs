@@ -2,6 +2,7 @@
 //!
 //! Provides:
 //! - `/proc/meminfo` — basic memory statistics.
+//! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.
 
@@ -15,6 +16,7 @@ use fs::errno::FS_ERRNO;
 use fs::vfs::{VfsFileType, VfsNode};
 
 use crate::config::PAGE_SIZE;
+use crate::fs::inode::snapshot_mount_table;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::mm::frame_allocator_stats;
 use crate::task::{current_process, list_pids, pid2process};
@@ -43,6 +45,35 @@ fn build_meminfo() -> String {
     out
 }
 
+fn escape_mount_field(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        match ch {
+            ' ' => out.push_str("\\040"),
+            '\t' => out.push_str("\\011"),
+            '\n' => out.push_str("\\012"),
+            '\\' => out.push_str("\\134"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn build_mounts() -> String {
+    let mut out = String::new();
+    for mount in snapshot_mount_table() {
+        let _ = writeln!(
+            &mut out,
+            "{} {} {} {} 0 0",
+            escape_mount_field(&mount.source),
+            escape_mount_field(&mount.target),
+            escape_mount_field(&mount.fs_type),
+            escape_mount_field(&mount.options),
+        );
+    }
+    out
+}
+
 /// `/proc` root directory node.
 #[derive(Default)]
 pub struct ProcRootNode;
@@ -67,6 +98,7 @@ impl VfsNode for ProcRootNode {
         let mut entries = Vec::new();
         entries.push((String::from("self"), VfsFileType::Symlink));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
+        entries.push((String::from("mounts"), VfsFileType::Regular));
         for pid in list_pids() {
             entries.push((alloc::format!("{}", pid), VfsFileType::Directory));
         }
@@ -77,6 +109,7 @@ impl VfsNode for ProcRootNode {
         match name {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
+            "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             _ => {
                 let pid = parse_pid(name)?;
                 if pid2process(pid).is_some() {
@@ -154,6 +187,68 @@ impl VfsNode for ProcMeminfoNode {
             return 0;
         }
         let data = build_meminfo();
+        let bytes = data.as_bytes();
+        if offset >= bytes.len() {
+            return 0;
+        }
+        let end = (offset + buf.len()).min(bytes.len());
+        let len = end - offset;
+        buf[..len].copy_from_slice(&bytes[offset..end]);
+        len
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+}
+
+/// `/proc/mounts` node.
+#[derive(Default)]
+pub struct ProcMountsNode;
+
+impl ProcMountsNode {
+    /// Create a new mounts node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcMountsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_mounts().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let data = build_mounts();
         let bytes = data.as_bytes();
         if offset >= bytes.len() {
             return 0;

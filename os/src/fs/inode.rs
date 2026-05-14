@@ -4,9 +4,8 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode, UrandomDevNode};
+use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode};
 use crate::fs::procfs::ProcRootNode;
-use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -118,6 +117,41 @@ lazy_static! {
     /// filesystem and make the full directory tree accessible.
     pub static ref ROOT_INODE: Arc<Inode> =
         Inode::from_vfs_node(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>);
+}
+
+/// A single mount-table entry exposed via `/proc/mounts`.
+#[derive(Clone, Debug)]
+pub(crate) struct MountRecord {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) fs_type: String,
+    pub(crate) options: String,
+}
+
+lazy_static! {
+    /// Current mount table used by procfs.
+    static ref MOUNT_TABLE: SpinNoIrqLock<BTreeMap<String, MountRecord>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+}
+
+pub(crate) fn snapshot_mount_table() -> Vec<MountRecord> {
+    MOUNT_TABLE.lock().values().cloned().collect()
+}
+
+fn record_mount(target: &str, source: &str, fs_type: &str, options: &str) {
+    MOUNT_TABLE.lock().insert(
+        String::from(target),
+        MountRecord {
+            source: String::from(source),
+            target: String::from(target),
+            fs_type: String::from(fs_type),
+            options: String::from(options),
+        },
+    );
+}
+
+fn remove_mount_record(target: &str) {
+    MOUNT_TABLE.lock().remove(target);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +272,8 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
         return Err(ERRNO::EINVAL);
     }
 
+    remove_mount_record(&abs);
+
     // Clean up the registry entry (no-op if `abs` was a real-FS mount, not
     // a VirtualDirNode we created).
     VIRT_DIRS.lock().remove(&abs);
@@ -260,6 +296,7 @@ pub fn init_rootfs() {
         let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
         let root = Fat32FileSystem::root_inode(&vfs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
+        record_mount("/", "rootfs", "fat32", "rw");
     }
     #[cfg(feature = "easyfs")]
     {
@@ -267,6 +304,7 @@ pub fn init_rootfs() {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
+        record_mount("/", "rootfs", "easyfs", "rw");
     }
     #[cfg(feature = "ext4")]
     {
@@ -274,6 +312,7 @@ pub fn init_rootfs() {
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
+        record_mount("/", "rootfs", "ext4", "rw");
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
@@ -936,7 +975,8 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 /// Populate `/dev` with one [`BlockDevNode`] per discovered block device.
 ///
 /// Must be called **after** both [`probe_block_devices`](crate::drivers::block::probe_block_devices)
-/// and [`init_rootfs`].  The `/dev` virtual directory is created if absent.
+/// and [`init_rootfs`].  The `/dev` directory is provided by a dedicated
+/// devfs mount.
 pub fn init_dev() {
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
@@ -980,6 +1020,7 @@ pub fn init_procfs() {
     let proc_inode = Inode::from_vfs_node(proc_root);
     do_mount("/proc", proc_inode)
         .unwrap_or_else(|_| panic!("[kernel] failed to mount procfs at /proc"));
+    record_mount("/proc", "proc", "proc", "rw");
     info!("[kernel] /proc initialized");
 }
 
@@ -1019,5 +1060,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
         _ => return Err(ERRNO::EINVAL),
     };
 
-    do_mount(abs_mnt, fs_root)
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, &canonicalize("/", dev_path), fs_type, "rw");
+    Ok(())
 }
