@@ -1137,7 +1137,7 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
         let desc = get_file_description(fd)?;
         // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。
         // TODO: tty 实现 `TCGETS/TIOCGWINSZ` 后，这里会开始承载真实终端控制语义。
-        debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
+        // debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
         desc.ioctl(req, arg)
     })
 }
@@ -1642,6 +1642,8 @@ pub fn sys_chdir(path: *const u8) -> isize {
         let new_abs = canonicalize(cwd.as_str(), path.as_str());
         let inode = lookup_inode_follow("/", new_abs.as_str(), true)?;
         if !inode.is_dir() {
+            warn!("sys_chdir: target '{}' resolved to '{}', which is not a directory",
+                path, new_abs);
             return Err(ERRNO::ENOTDIR);
         }
         process.inner_exclusive_access().cwd = new_abs;
@@ -1818,25 +1820,20 @@ pub fn sys_fchmod(fd: u32, mode: u32) -> isize {
 }
 
 /// fchmodat(dirfd, pathname, mode, flags) — change permissions of a path-relative target.
-pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -> isize {
+pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_fchmodat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
+    debug!("sys_fchmodat: dirfd = {}, pathname = {:?}, mode = {:#o}", dirfd, pathname, mode);
     let token = current_user_token();
     syscall_body!({
-        let supported_flags = (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as i32;
-        if flags & !supported_flags != 0 {
-            return Err(ERRNO::EINVAL);
+        let path = translated_str(token, pathname).or_errno(ERRNO::EFAULT)?;
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
         }
 
-        let path = if pathname.is_null() && (flags & AT_EMPTY_PATH as i32 != 0) {
-            String::new()
-        } else {
-            translated_str(token, pathname).or_errno(ERRNO::EFAULT)?
-        };
-
-        let target = resolve_at_target(dirfd, path.as_str(), flags)?;
+        let target = resolve_at_target(dirfd, path.as_str(), 0)?;
         let inode = match target {
             ResolvedAtTarget::Inode(i) => i,
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
@@ -1845,6 +1842,7 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) ->
         let old_mode = inode_stat(&inode).mode.bits();
         let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
         inode.set_mode(new_mode)?;
+        debug!("sys_fchmodat: ok");
         Ok(0)
     })
 }

@@ -1,7 +1,7 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
-use log::debug;
+use log::{debug, info};
 use spin::Mutex;
 
 use crate::block_cache::get_block_cache;
@@ -440,6 +440,7 @@ impl VfsNode for Ext4Inode {
     }
 
     fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
+        info!("Ext4Inode set_mode: ino={} mode={:#o}", self.inode_num, mode);
         let ext4 = self.fs.ext4.lock();
         let mut inode_ref = ext4.get_inode_ref(self.inode_num);
         inode_ref.inode.set_mode(mode as u16);
