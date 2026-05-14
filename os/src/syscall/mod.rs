@@ -134,6 +134,10 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
+/// getpgid syscall
+pub const SYSCALL_GETPGID: usize = 154;
+/// setpgid syscall
+pub const SYSCALL_SETPGID: usize = 155;
 /// getsid syscall
 pub const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
@@ -421,6 +425,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
+        SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
+        SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
         SYSCALL_GETSID => sys_getsid(),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
