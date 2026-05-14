@@ -347,7 +347,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0] as u32, args[1] as isize),
         SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
         SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
-        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as i32),
+        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_FCHOWNAT => sys_fchownat(
             args[0] as isize,
             args[1] as *const u8,
