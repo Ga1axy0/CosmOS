@@ -15,6 +15,7 @@ use core::any::Any;
 use fs::vfs::{VfsFileType, VfsNode};
 use fs::BlockDevice;
 
+use crate::drivers::block::BLOCK_DEVICES;
 use crate::drivers::rtc;
 use crate::fs::{Stat, StatMode};
 use crate::mm::{translated_ref, translated_refmut};
@@ -181,6 +182,7 @@ impl BlockDevNode {
 ///
 /// Reads always return EOF (0 bytes). Writes discard data and report the
 /// full write length as written.
+#[derive(Default)]
 pub struct NullDevNode;
 
 impl NullDevNode {
@@ -308,6 +310,125 @@ impl VfsNode for BlockDevNode {
             pos += copy;
         }
         total
+    }
+}
+
+/// Root directory node for the `/dev` filesystem.
+#[derive(Default)]
+pub struct DevRootNode;
+
+impl DevRootNode {
+    /// Create a new devfs root node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for DevRootNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        let mut entries = alloc::vec![
+            (String::from("null"), VfsFileType::Char),
+            (String::from("rtc"), VfsFileType::Char),
+            (String::from("rtc0"), VfsFileType::Char),
+            (String::from("urandom"), VfsFileType::Char),
+            (String::from("random"), VfsFileType::Char),
+            (String::from("misc"), VfsFileType::Directory),
+        ];
+        let map = BLOCK_DEVICES.lock();
+        for dev_name in map.keys() {
+            entries.push((dev_name.clone(), VfsFileType::Block));
+        }
+        entries
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        match name {
+            "null" => Some(Arc::new(NullDevNode::new()) as Arc<dyn VfsNode>),
+            "rtc" | "rtc0" => Some(Arc::new(RtcDevNode::new()) as Arc<dyn VfsNode>),
+            "urandom" | "random" => Some(Arc::new(UrandomDevNode::new()) as Arc<dyn VfsNode>),
+            "misc" => Some(Arc::new(DevMiscNode::new()) as Arc<dyn VfsNode>),
+            _ => {
+                let map = BLOCK_DEVICES.lock();
+                let dev = map.get(name)?;
+                Some(Arc::new(BlockDevNode::new(Arc::clone(dev))) as Arc<dyn VfsNode>)
+            }
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+}
+
+/// `/dev/misc` directory node.
+#[derive(Default)]
+pub struct DevMiscNode;
+
+impl DevMiscNode {
+    /// Create a new `/dev/misc` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for DevMiscNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        alloc::vec![(String::from("rtc"), VfsFileType::Char)]
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        match name {
+            "rtc" => Some(Arc::new(RtcDevNode::new()) as Arc<dyn VfsNode>),
+            _ => None,
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
     }
 }
 
