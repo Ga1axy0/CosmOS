@@ -32,6 +32,7 @@ pub use crate::sched::{
     block_current_and_run_next, current_process, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, schedule_if_needed,
     suspend_current_and_run_next, suspend_current_and_run_next_with_slice_reset, wakeup_task,
+    yield_current_and_run_next,
 };
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
@@ -41,11 +42,13 @@ pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
-    DEFAULT_TIME_SLICE_TICKS, SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+    clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
+    SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
 };
 pub use task::{
     all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason,
 };
+pub(crate) use task::TaskControlBlockInner;
 
 use crate::board::QEMUExit;
 
