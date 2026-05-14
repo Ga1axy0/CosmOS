@@ -17,8 +17,9 @@ use fs::BlockDevice;
 
 use crate::drivers::rtc;
 use crate::fs::{Stat, StatMode};
-use crate::mm::{translated_ref, translated_refmut};
+use crate::mm::translated_ref;
 use crate::syscall::errno::ERRNO;
+use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
 
 use crate::random as kernel_random;
@@ -49,6 +50,9 @@ pub struct LinuxRtcTime {
     /// daylight saving time flag
     pub tm_isdst: i32,
 }
+
+// 允许 RTC ioctl 将该 C ABI 结构整体写回用户空间。
+impl Pod for LinuxRtcTime {}
 
 fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
@@ -333,11 +337,9 @@ impl RtcDevNode {
                 if !rtc::rtc_ready() {
                     return Err(ERRNO::ENODEV);
                 }
-                let token = current_user_token();
-                let out = translated_refmut(token, arg as *mut LinuxRtcTime).ok_or(ERRNO::EFAULT)?;
                 let now_ns = rtc::read_time_ns();
                 let now_secs = (now_ns / 1_000_000_000) as i64;
-                *out = rtc_time_from_unix_secs(now_secs);
+                write_pod_to_user(arg as *mut LinuxRtcTime, &rtc_time_from_unix_secs(now_secs))?;
                 Ok(0)
             }
             RTC_SET_TIME => {

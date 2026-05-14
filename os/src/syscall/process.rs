@@ -1,16 +1,15 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{write_pod_to_user, Pod};
+use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
         exit_current_and_run_next, pid2process, remove_from_pid2process,
-        suspend_current_and_run_next, ExitReason, SignalFlags,
-        WaitReason,
+        ExitReason, SignalFlags, WaitReason,
     },
 };
 
@@ -328,7 +327,11 @@ pub fn sys_clone(
             warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
             return -(ERRNO::EFAULT as isize);
         }
-        if translated_refmut::<i32>(current_user_token(), parent_tid as *mut i32).is_none() {
+        if translated_byte_buffer_with_access(
+            parent_tid as *const u8,
+            core::mem::size_of::<i32>(),
+            PageFaultAccess::Write,
+        ).is_err() {
             return -(ERRNO::EFAULT as isize);
         }
         parent_set_tid = Some(parent_tid);
@@ -339,8 +342,12 @@ pub fn sys_clone(
             warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
             return -(ERRNO::EFAULT as isize);
         }
-        // 子地址空间由父地址空间复制而来，创建前先确认该地址在父进程中可翻译。
-        if translated_refmut::<i32>(current_user_token(), child_tid as *mut i32).is_none() {
+        // 子地址空间由父地址空间复制而来，创建前先确认该地址在父进程中可写。
+        if translated_byte_buffer_with_access(
+            child_tid as *const u8,
+            core::mem::size_of::<i32>(),
+            PageFaultAccess::Write,
+        ).is_err() {
             return -(ERRNO::EFAULT as isize);
         }
         child_set_tid = Some(child_tid);
@@ -662,12 +669,11 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut usize, len_ptr: *mut usize) 
     syscall_body!({
         let process = pid2process(pid as usize).or_errno(ERRNO::ESRCH)?;
         let robust_list = &process.inner_exclusive_access().robust_list;
-        let token = current_user_token();
         if !head_ptr.is_null() {
-            translated_refmut(token, head_ptr).map(|slot| *slot = robust_list.head).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(head_ptr, &robust_list.head)?;
         }
         if !len_ptr.is_null() {
-            translated_refmut(token, len_ptr).map(|slot| *slot = robust_list.len).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(len_ptr, &robust_list.len)?;
         }
         Ok(0)
     })
@@ -694,13 +700,12 @@ pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let token = current_user_token();
         let cpu = hartid() as u32;
         if !cpu_ptr.is_null() {
-            translated_refmut(token, cpu_ptr).map(|slot| *slot = cpu).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(cpu_ptr, &cpu)?;
         }
         if !node_ptr.is_null() {
-            translated_refmut(token, node_ptr).map(|slot| *slot = 0).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(node_ptr, &0u32)?;
         }
         Ok(0)
     })

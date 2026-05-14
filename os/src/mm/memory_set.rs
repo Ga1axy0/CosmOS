@@ -1,7 +1,8 @@
 //! Address Space [`MemorySet`] management of Process
 
 use super::{frame_alloc, shootdown, FrameTracker, ShootdownKind};
-use super::{PTEFlags, PageTable, PageTableEntry};
+use super::page_table::PTEFlags;
+use super::{PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{

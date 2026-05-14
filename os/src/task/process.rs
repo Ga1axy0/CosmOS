@@ -15,8 +15,8 @@ use crate::mm::{
     KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
-use crate::syscall::ResourceLimits;
 use crate::syscall::errno::ERRNO;
+use crate::syscall::{write_pod_to_process_user, ResourceLimits};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -829,12 +829,9 @@ impl ProcessControlBlock {
         drop(task_inner);
         if let Some(child_tid_ptr) = child_set_tid {
             let child_tid_value = child.getpid() as i32;
-            let child_token = child.inner_exclusive_access().memory_set.token();
-            // 写入 child_tid 前先触发子地址空间的 COW，避免直接改到父子共享页。
-            let _ = child.handle_private_cow_fault(child_tid_ptr);
-            if let Some(slot) = translated_refmut(child_token, child_tid_ptr as *mut i32) {
-                *slot = child_tid_value;
-            } else {
+            if write_pod_to_process_user(&child, child_tid_ptr as *mut i32, &child_tid_value)
+                .is_err()
+            {
                 // TODO：当前 clone_process 尚未实现失败回滚，只能保守记录异常。
                 warn!(
                     "kernel: clone_process failed to write child_tid at {:#x}",
