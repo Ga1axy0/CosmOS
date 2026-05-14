@@ -88,6 +88,28 @@ pub(crate) fn get_or_create_inode(node: Arc<dyn VfsNode>) -> Arc<Inode> {
     inode
 }
 
+/// Drop a cached inode by its stable key.
+pub(crate) fn remove_cached_inode(fs_id: u64, ino: u64) {
+    if fs_id == 0 || ino == 0 {
+        return;
+    }
+    INODE_CACHE
+        .lock()
+        .table
+        .remove(&InodeCacheKey { fs_id, ino });
+}
+
+/// Drop a cached inode corresponding to a backend node.
+///
+/// This is needed when a filesystem can reuse inode numbers after unlink/rmdir:
+/// a newly allocated backend node must not resolve to an old in-memory inode
+/// with stale file type state.
+pub(crate) fn remove_cached_node(node: &dyn VfsNode) {
+    if let Some(key) = cache_key_of(node) {
+        remove_cached_inode(key.fs_id, key.ino);
+    }
+}
+
 /// 当 inode cache 过大时，回收到低水位。
 fn reclaim_inode_cache_if_needed() {
     loop {

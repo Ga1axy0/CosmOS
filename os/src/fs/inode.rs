@@ -692,6 +692,7 @@ pub fn rename_at(
 
 /// Remove a link at `path` relative to `cwd`.
 pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
+    debug!("unlinkat: cwd={}, path={}, flags={:#x}", cwd, path, flags);
     if flags & !AT_REMOVEDIR != 0 {
         return Err(ERRNO::EINVAL);
     }
