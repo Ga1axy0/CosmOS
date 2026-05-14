@@ -214,10 +214,95 @@ pub fn sys_getsid() -> isize {
     process.getsid() as isize
 }
 
+pub fn sys_getpgid(pid: isize) -> isize {
+    trace!("kernel: sys_getpgid pid:{}", current_process().getpid());
+    syscall_body!({
+        if pid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let process = if pid == 0 { current_process() } else {
+            pid2process(pid as usize).or_errno(ERRNO::ESRCH)?
+        };
+        Ok(process.getpgid() as isize)
+    })
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    trace!("kernel: sys_setpgid pid:{}", current_process().getpid());
+    syscall_body!({
+        if pid < 0 || pgid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let current = current_process();
+        let current_pid = current.getpid();
+        let target = if pid == 0 { current.clone() } else {
+            pid2process(pid as usize).or_errno(ERRNO::ESRCH)?
+        };
+        let target_pid = target.getpid();
+
+        if target_pid != current_pid {
+            let parent_pid = target
+                .inner_exclusive_access()
+                .parent
+                .clone()
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid());
+            if parent_pid != Some(current_pid) {
+                return Err(ERRNO::EPERM);
+            }
+        }
+
+        let target_sid = target.getsid();
+        if target_sid != current.getsid() {
+            return Err(ERRNO::EPERM);
+        }
+
+        if target_pid as u32 == target_sid {
+            return Err(ERRNO::EPERM);
+        }
+
+        let new_pgid = if pgid == 0 {
+            target_pid
+        } else {
+            pgid as usize
+        };
+        if new_pgid > u32::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+
+        if new_pgid != target_pid {
+            let mut found = false;
+            for pid in crate::task::list_pids() {
+                if let Some(process) = pid2process(pid) {
+                    if process.getsid() == target_sid && process.getpgid() as usize == new_pgid {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                return Err(ERRNO::EINVAL);
+            }
+        }
+
+        target.setpgid(new_pgid as u32);
+        Ok(0)
+    })
+}
+
 pub fn sys_setsid() -> isize {
     trace!("kernel: sys_setsid pid:{}", current_process().getpid());
-    warn!("kernel: sys_setsid is not fully implemented, just return new sid 1");
-    1
+    syscall_body!({
+        let process = current_process();
+        let pid = process.getpid() as u32;
+        if process.getpgid() == pid {
+            return Err(ERRNO::EPERM);
+        }
+        process.setsid(pid);
+        process.setpgid(pid);
+        Ok(pid as isize)
+    })
 }
 
 /// `clone` 支持的退出信号：当前仅实现 basic 测试需要的 SIGCHLD。
