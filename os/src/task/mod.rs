@@ -42,7 +42,7 @@ pub use runqueue::{
 };
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
-    SignalActions, SignalFlags, StackT, UContext, SIG_DFL, SIG_IGN,
+    SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
 };
 pub use processor::{
     current_kstack_top, current_process, current_processor, current_task, current_trap_cx,
@@ -238,7 +238,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(closed_fds);
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
-            add_signal_to_process(&parent, SignalFlags::SIGCHLD);
+            add_signal_to_process(&parent, SignalBit::SIGCHLD);
             parent.wait_exit_queue.wake_one();
         }
     } else {
@@ -335,7 +335,7 @@ pub fn current_process_is_zombie() -> bool {
 ///
 /// When the delivered signal introduces a **newly pending and unmasked** bit,
 /// proactively wake poll waiters of this process so `ppoll` can return `EINTR`.
-pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalFlags) {
+pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalBit) {
     let (pid, should_notify_poll) = {
         let mut process_inner = process.inner_exclusive_access();
         let newly_pending = signal & !process_inner.pending_signals;
@@ -392,7 +392,7 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalF
 }
 
 /// Add signal to the current task
-pub fn current_add_signal(signal: SignalFlags) {
+pub fn current_add_signal(signal: SignalBit) {
     let process = current_process();
     add_signal_to_process(&process, signal);
 }

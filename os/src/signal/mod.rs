@@ -11,7 +11,7 @@ mod signals;
 mod wait;
 
 pub use action::{MContext, SigInfo, StackT, UContext, SignalAction, SignalActions};
-pub use signals::{SignalFlags, MAX_SIG};
+pub use signals::{SignalBit, SignalNum, MAX_SIG};
 pub(crate) use wait::{
     cleanup_signal_wait, cleanup_signal_wait_for_task, handle_signal_wait_timeout,
     has_pending_signal_in_set, has_unmasked_pending_signal, notify_signal_wait_pid,
@@ -56,7 +56,7 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
 
     // Find the first pending signal
     for signum in 1..=MAX_SIG {
-        let flag = SignalFlags::from_bits(1 << signum);
+        let flag = SignalBit::from_signum(signum as u32);
         if let Some(flag) = flag {
             if pending.contains(flag) {
                 let action = process_inner.signal_actions.table[signum];
@@ -168,7 +168,6 @@ pub fn handle_signals() {
             ss_size: 0,
         },
         uc_sigmask: old_mask,
-        _pad: 0,
         uc_mcontext: mcontext,
     };
 
@@ -196,12 +195,12 @@ pub fn handle_signals() {
     // Apply signal mask during handler execution
     {
         let mut inner = process.inner_exclusive_access();
-        // Convert sa_mask to SignalFlags
-        if let Some(new_mask) = SignalFlags::from_bits(action.sa_mask) {
+        // sa_mask 使用 Linux sigset_t bit 布局，可直接转为内核 SignalBit。
+        if let Some(new_mask) = SignalBit::from_bits(action.sa_mask) {
             // SA_NODEFER: don't automatically block the signal being handled
             if action.sa_flags & SaFlags::SA_NODEFER.bits() == 0 {
                 // Block the signal being handled
-                if let Some(sig_flag) = SignalFlags::from_signum(signum as u32) {
+                if let Some(sig_flag) = SignalBit::from_signum(signum as u32) {
                     inner.signal_mask.insert(sig_flag);
                 }
             }

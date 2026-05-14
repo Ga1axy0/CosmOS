@@ -497,10 +497,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut UserSigAction,
             args[3], // sigsetsize
         ),
-        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),
-        SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u32, args[1]),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u64, args[2] as *mut u64, args[3]),
+        SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u64, args[1]),
         SYSCALL_RT_SIGTIMEDWAIT_TIME32 => sys_rt_sigtimedwait_time32(
-            args[0] as *const u32,
+            args[0] as *const u64,
             args[1] as *mut crate::task::SigInfo,
             args[2] as *const OldTimespec32,
             args[3],

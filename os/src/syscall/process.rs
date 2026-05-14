@@ -9,7 +9,7 @@ use crate::{
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
         exit_current_and_run_next, pid2process, remove_from_pid2process,
-        ExitReason, SignalFlags, WaitReason,
+        ExitReason, SignalBit, WaitReason,
     },
 };
 
@@ -510,7 +510,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 let inner = process.inner_exclusive_access();
                 let pending_unmasked = inner.pending_signals & !inner.signal_mask;
                 let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
-                    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else { return false; };
+                    let Some(flag) = SignalBit::from_signum(signum as u32) else { return false; };
                     if !pending_unmasked.contains(flag) {
                         return false;
                     }
@@ -535,7 +535,7 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     );
     syscall_body!({
         let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
-        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
         add_signal_to_process(&process, flag);
         Ok(0)
     })
@@ -558,7 +558,7 @@ pub fn sys_tkill(tid: usize, signal: u32) -> isize {
         if !target_exists {
             return Err(ERRNO::ESRCH);
         }
-        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
         add_signal_to_process(&process, flag);
         Ok(0)
     })
@@ -581,7 +581,7 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
         if !target_exists {
             return Err(ERRNO::ESRCH);
         }
-        let flag = SignalFlags::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
         add_signal_to_process(&process, flag);
         Ok(0)
     })

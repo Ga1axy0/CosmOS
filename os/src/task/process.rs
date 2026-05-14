@@ -4,7 +4,7 @@
 use super::id::RecycleAllocator;
 use super::runqueue::insert_into_pid2process;
 use super::{SchedAttr, TaskControlBlock};
-use super::{add_task, SignalAction, SignalActions, SignalFlags, SIG_IGN};
+use super::{add_task, SignalAction, SignalActions, SignalBit, SIG_IGN};
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
@@ -112,9 +112,9 @@ pub struct ProcessControlBlockInner {
     /// per-process resource limits
     pub resource_limits: ResourceLimits,
     /// pending process signals
-    pub pending_signals: SignalFlags,
+    pub pending_signals: SignalBit,
     /// blocked process signals
-    pub signal_mask: SignalFlags,
+    pub signal_mask: SignalBit,
     /// installed signal actions
     pub signal_actions: SignalActions,
     /// tasks(also known as threads)
@@ -451,8 +451,8 @@ impl ProcessControlBlock {
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_stdio_files(),
                     resource_limits: ResourceLimits::default(),
-                    pending_signals: SignalFlags::empty(),
-                    signal_mask: SignalFlags::empty(),
+                    pending_signals: SignalBit::empty(),
+                    signal_mask: SignalBit::empty(),
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -634,7 +634,7 @@ impl ProcessControlBlock {
                     *action = SignalAction::default();
                 }
             }
-            inner.pending_signals = SignalFlags::empty();
+            inner.pending_signals = SignalBit::empty();
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
@@ -749,7 +749,7 @@ impl ProcessControlBlock {
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
-                    pending_signals: SignalFlags::empty(),
+                    pending_signals: SignalBit::empty(),
                     signal_mask: parent_signal_mask,
                     signal_actions: parent_signal_actions,
                     tasks: Vec::new(),
@@ -878,7 +878,7 @@ impl ProcessControlBlock {
                     exit_reason: ExitReason::Exit(0),
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
-                    pending_signals: SignalFlags::empty(),
+                    pending_signals: SignalBit::empty(),
                     signal_mask: parent.signal_mask,
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
@@ -1442,7 +1442,7 @@ impl ProcessControlBlock {
     }
 
     /// 在一个时钟 tick 上推进进程级 interval timers，并返回本次应投递的信号集合。
-    pub fn consume_expired_itimers(&self, now_raw: usize, now_realtime_ns: u64) -> SignalFlags {
+    pub fn consume_expired_itimers(&self, now_raw: usize, now_realtime_ns: u64) -> SignalBit {
         let mut inner = self.inner.lock();
         let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
         let (user_raw, kernel_raw) = match inner.accounting_state {
@@ -1459,18 +1459,18 @@ impl ProcessControlBlock {
         let user_ns = raw_counter_to_ns(user_raw);
         let prof_ns = user_ns.saturating_add(raw_counter_to_ns(kernel_raw));
 
-        let mut pending = SignalFlags::empty();
+        let mut pending = SignalBit::empty();
 
         if inner.itimer_real.deadline_ns != 0 && inner.itimer_real.deadline_ns <= now_realtime_ns {
-            pending |= SignalFlags::SIGALRM;
+            pending |= SignalBit::SIGALRM;
             rearm_itimer_after_expire(&mut inner.itimer_real, now_realtime_ns);
         }
         if inner.itimer_virtual.deadline_ns != 0 && inner.itimer_virtual.deadline_ns <= user_ns {
-            pending |= SignalFlags::SIGVTALRM;
+            pending |= SignalBit::SIGVTALRM;
             rearm_itimer_after_expire(&mut inner.itimer_virtual, user_ns);
         }
         if inner.itimer_prof.deadline_ns != 0 && inner.itimer_prof.deadline_ns <= prof_ns {
-            pending |= SignalFlags::SIGPROF;
+            pending |= SignalBit::SIGPROF;
             rearm_itimer_after_expire(&mut inner.itimer_prof, prof_ns);
         }
 
