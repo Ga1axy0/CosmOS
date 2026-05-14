@@ -3,11 +3,11 @@
 use super::id::TaskUserRes;
 use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock};
-use crate::sched::{SchedAttr, SchedPolicy, TaskContext};
 use crate::config::MAX_HARTS;
-use crate::trap::TrapContext;
-use crate::{mm::PhysPageNum};
+use crate::mm::PhysPageNum;
+use crate::sched::{SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
 
 /// Return a mask containing all online harts supported by the kernel.
@@ -37,6 +37,22 @@ pub struct TaskSchedState {
     pub time_slice_ticks: u32,
     /// Remaining time slice budget, in timer ticks.
     pub remaining_slice_ticks: u32,
+    /// Linux nice value used by CFS.
+    pub nice: i32,
+    /// CFS load weight derived from nice.
+    pub weight: u64,
+    /// Virtual runtime used as the CFS ordering key, in nanoseconds.
+    pub vruntime_ns: u64,
+    /// Last timestamp at which execution accounting was started, in nanoseconds.
+    pub exec_start_ns: u64,
+    /// Total runtime accounted by CFS, in nanoseconds.
+    pub sum_exec_runtime_ns: u64,
+    /// Runtime accounting baseline for the current CFS CPU slice, in nanoseconds.
+    pub cfs_slice_start_ns: u64,
+    /// Current key while this task is linked into a CFS runqueue.
+    pub cfs_rq_key: Option<(u64, usize)>,
+    /// Whether the task has been placed on a CFS runqueue before.
+    pub cfs_initialized: bool,
     /// Deferred reschedule request handled at safe scheduling points.
     pub need_resched: bool,
     /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
@@ -54,6 +70,14 @@ impl TaskSchedState {
             rt_priority: sched_attr.rt_priority,
             time_slice_ticks: sched_attr.time_slice_ticks,
             remaining_slice_ticks: sched_attr.time_slice_ticks,
+            nice: sched_attr.nice,
+            weight: sched_attr.weight,
+            vruntime_ns: 0,
+            exec_start_ns: 0,
+            sum_exec_runtime_ns: 0,
+            cfs_slice_start_ns: 0,
+            cfs_rq_key: None,
+            cfs_initialized: false,
             need_resched: false,
             cpu_affinity_mask: all_cpu_affinity_mask(),
         }
@@ -65,6 +89,8 @@ impl TaskSchedState {
             policy: self.policy,
             rt_priority: self.rt_priority,
             time_slice_ticks: self.time_slice_ticks,
+            nice: self.nice,
+            weight: self.weight,
         }
     }
 
@@ -133,6 +159,33 @@ impl TaskControlBlockInner {
 
     pub fn reset_time_slice(&mut self) {
         self.sched.reset_time_slice();
+    }
+
+    /// Account CFS runtime up to `now_ns` for a currently running regular task.
+    pub fn account_cfs_runtime(&mut self, now_ns: u64) {
+        if !matches!(self.sched.policy, SchedPolicy::Other) {
+            return;
+        }
+        if self.sched.exec_start_ns == 0 {
+            self.sched.exec_start_ns = now_ns;
+            self.sched.cfs_slice_start_ns = now_ns;
+            return;
+        }
+        let delta_exec = now_ns.saturating_sub(self.sched.exec_start_ns);
+        if delta_exec == 0 {
+            return;
+        }
+        self.sched.exec_start_ns = now_ns;
+        self.sched.sum_exec_runtime_ns = self.sched.sum_exec_runtime_ns.saturating_add(delta_exec);
+        let delta_fair = if self.sched.weight == NICE_0_LOAD {
+            delta_exec
+        } else {
+            (delta_exec as u128)
+                .saturating_mul(NICE_0_LOAD as u128)
+                .checked_div(self.sched.weight.max(1) as u128)
+                .unwrap_or(0) as u64
+        };
+        self.sched.vruntime_ns = self.sched.vruntime_ns.saturating_add(delta_fair);
     }
 }
 

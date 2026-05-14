@@ -124,6 +124,8 @@ pub const SYSCALL_RT_SIGTIMEDWAIT_TIME32: usize = 137;
 pub const SYSCALL_SIGRETURN: usize = 139;
 /// set priority syscall
 pub const SYSCALL_SET_PRIORITY: usize = 140;
+/// get priority syscall
+pub const SYSCALL_GET_PRIORITY: usize = 141;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// getsid syscall
@@ -484,6 +486,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_GETAFFINITY => {
             sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
         }
+        SYSCALL_SET_PRIORITY => sys_setpriority(args[0] as i32, args[1], args[2] as i32),
+        SYSCALL_GET_PRIORITY => sys_getpriority(args[0] as i32, args[1]),
         SYSCALL_RENAMEAT2 => sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,

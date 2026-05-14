@@ -1,26 +1,39 @@
-//! Per-hart RT runqueue management for phase 1 SCHED_RR.
+//! Per-hart runqueue management for RT and CFS scheduling classes.
 
 use super::current_task;
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
 use crate::sbi::send_ipi_mask;
+use crate::sched::{mark_current_task_need_resched, CFS_WAKEUP_GRANULARITY_NS};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    all_cpu_affinity_mask, ProcessControlBlock, SCHED_RT_PRIO_MAX, TaskControlBlock, TaskStatus,
+    all_cpu_affinity_mask, ProcessControlBlock, SchedPolicy, TaskControlBlock,
+    TaskControlBlockInner, TaskStatus, SCHED_RT_PRIO_MAX,
 };
-use crate::sched::mark_current_task_need_resched;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::array;
 use lazy_static::*;
 
 const RT_QUEUE_LEVELS: usize = SCHED_RT_PRIO_MAX as usize + 1;
+type CfsKey = (u64, usize);
+
+#[derive(Copy, Clone)]
+struct EnqueuedTaskInfo {
+    policy: SchedPolicy,
+    rt_priority: u8,
+    vruntime_ns: u64,
+}
 
 /// Local runnable queues owned by one hart.
 struct RunQueue {
-    queues: [VecDeque<Arc<TaskControlBlock>>; RT_QUEUE_LEVELS],
-    highest_prio: Option<u8>,
-    nr_running: usize,
+    rt_queues: [VecDeque<Arc<TaskControlBlock>>; RT_QUEUE_LEVELS],
+    highest_rt_prio: Option<u8>,
+    rt_nr_running: usize,
+    cfs_tasks: BTreeMap<CfsKey, Arc<TaskControlBlock>>,
+    cfs_nr_running: usize,
+    cfs_load: u64,
+    min_vruntime_ns: u64,
     /// Keep a reference to the last exiting task so its kernel stack
     /// is not freed while this hart is still running on it.
     stop_task: Option<Arc<TaskControlBlock>>,
@@ -29,56 +42,170 @@ struct RunQueue {
 impl RunQueue {
     fn new() -> Self {
         Self {
-            queues: array::from_fn(|_| VecDeque::new()),
-            highest_prio: None,
-            //保留字段，负责计数当前queue上runable的task，用于负载均衡。
-            nr_running: 0,
+            rt_queues: array::from_fn(|_| VecDeque::new()),
+            highest_rt_prio: None,
+            rt_nr_running: 0,
+            cfs_tasks: BTreeMap::new(),
+            cfs_nr_running: 0,
+            cfs_load: 0,
+            min_vruntime_ns: 0,
             stop_task: None,
         }
     }
 
-    fn enqueue(&mut self, task: Arc<TaskControlBlock>, prio: u8) {
-        self.queues[prio as usize].push_back(task);
-        self.nr_running += 1;
-        self.highest_prio = Some(self.highest_prio.map_or(prio, |curr| curr.max(prio)));
-    }
-
-    fn dequeue_highest(&mut self) -> Option<Arc<TaskControlBlock>> {
-        let prio = self.highest_prio?;
-        let task = self.queues[prio as usize].pop_front()?;
-        self.nr_running = self.nr_running.saturating_sub(1);
-        self.refresh_highest_prio();
-        Some(task)
-    }
-
-    fn remove_task(&mut self, task: &Arc<TaskControlBlock>, prio: u8) -> bool {
-        if let Some((idx, _)) = self.queues[prio as usize]
-            .iter()
-            .enumerate()
-            .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(task))
-        {
-            self.queues[prio as usize].remove(idx);
-            self.nr_running = self.nr_running.saturating_sub(1);
-            self.refresh_highest_prio();
-            true
-        } else {
-            false
+    fn enqueue_locked(
+        &mut self,
+        task: Arc<TaskControlBlock>,
+        task_inner: &mut TaskControlBlockInner,
+    ) -> EnqueuedTaskInfo {
+        match task_inner.sched.policy {
+            SchedPolicy::Rr => {
+                let prio = task_inner.sched.rt_priority;
+                self.rt_queues[prio as usize].push_back(task);
+                self.rt_nr_running += 1;
+                self.highest_rt_prio =
+                    Some(self.highest_rt_prio.map_or(prio, |curr| curr.max(prio)));
+                EnqueuedTaskInfo {
+                    policy: SchedPolicy::Rr,
+                    rt_priority: prio,
+                    vruntime_ns: 0,
+                }
+            }
+            SchedPolicy::Other => {
+                let (placed_vruntime, initialized) = self.place_cfs_entity(
+                    task_inner.sched.vruntime_ns,
+                    task_inner.sched.cfs_initialized,
+                );
+                task_inner.sched.vruntime_ns = placed_vruntime;
+                task_inner.sched.cfs_initialized = initialized;
+                let vruntime = task_inner.sched.vruntime_ns;
+                let weight = task_inner.sched.weight;
+                let key = (vruntime, Arc::as_ptr(&task) as usize);
+                task_inner.sched.cfs_rq_key = Some(key);
+                self.cfs_tasks.insert(key, task);
+                self.cfs_nr_running += 1;
+                self.cfs_load = self.cfs_load.saturating_add(weight);
+                self.refresh_min_vruntime(None);
+                EnqueuedTaskInfo {
+                    policy: SchedPolicy::Other,
+                    rt_priority: 0,
+                    vruntime_ns: vruntime,
+                }
+            }
+            SchedPolicy::Idle => unreachable!("idle tasks are not enqueued"),
         }
     }
 
-    fn highest_prio(&self) -> Option<u8> {
-        self.highest_prio
+    fn place_cfs_entity(&self, vruntime_ns: u64, initialized: bool) -> (u64, bool) {
+        if !initialized {
+            return (self.min_vruntime_ns, true);
+        }
+        let sleeper_floor = self
+            .min_vruntime_ns
+            .saturating_sub(CFS_WAKEUP_GRANULARITY_NS);
+        let placed_vruntime = vruntime_ns.max(sleeper_floor);
+        (placed_vruntime, true)
     }
 
-    fn has_same_or_higher(&self, prio: u8) -> bool {
-        self.highest_prio.is_some_and(|highest| highest >= prio)
+    fn dequeue_highest_rt(&mut self) -> Option<Arc<TaskControlBlock>> {
+        let prio = self.highest_rt_prio?;
+        let task = self.rt_queues[prio as usize].pop_front()?;
+        self.rt_nr_running = self.rt_nr_running.saturating_sub(1);
+        self.refresh_highest_rt_prio();
+        Some(task)
     }
 
-    fn refresh_highest_prio(&mut self) {
-        self.highest_prio = (1..RT_QUEUE_LEVELS)
+    fn dequeue_leftmost_cfs(&mut self) -> Option<Arc<TaskControlBlock>> {
+        let key = *self.cfs_tasks.keys().next()?;
+        self.remove_cfs_by_key(key)
+    }
+
+    fn remove_cfs_by_key(&mut self, key: CfsKey) -> Option<Arc<TaskControlBlock>> {
+        let task = self.cfs_tasks.remove(&key)?;
+        let accounted_vruntime = {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.cfs_rq_key = None;
+            self.cfs_load = self.cfs_load.saturating_sub(task_inner.sched.weight);
+            task_inner.sched.vruntime_ns
+        };
+        self.cfs_nr_running = self.cfs_nr_running.saturating_sub(1);
+        self.refresh_min_vruntime(Some(accounted_vruntime));
+        Some(task)
+    }
+
+    fn remove_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        let (policy, prio, cfs_key) = {
+            let task_inner = task.inner_exclusive_access();
+            (
+                task_inner.sched.policy,
+                task_inner.sched.rt_priority,
+                task_inner.sched.cfs_rq_key,
+            )
+        };
+        match policy {
+            SchedPolicy::Rr => {
+                if let Some((idx, _)) = self.rt_queues[prio as usize]
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(task))
+                {
+                    self.rt_queues[prio as usize].remove(idx);
+                    self.rt_nr_running = self.rt_nr_running.saturating_sub(1);
+                    self.refresh_highest_rt_prio();
+                    true
+                } else {
+                    false
+                }
+            }
+            SchedPolicy::Other => {
+                if let Some(key) = cfs_key {
+                    return self.remove_cfs_by_key(key).is_some();
+                }
+                let key = self
+                    .cfs_tasks
+                    .iter()
+                    .find(|(_, queued)| Arc::as_ptr(*queued) == Arc::as_ptr(task))
+                    .map(|(key, _)| *key);
+                key.and_then(|key| self.remove_cfs_by_key(key)).is_some()
+            }
+            SchedPolicy::Idle => false,
+        }
+    }
+
+    fn highest_rt_prio(&self) -> Option<u8> {
+        self.highest_rt_prio
+    }
+
+    fn has_same_or_higher_rt(&self, prio: u8) -> bool {
+        self.highest_rt_prio.is_some_and(|highest| highest >= prio)
+    }
+
+    fn total_nr_running(&self) -> usize {
+        self.rt_nr_running + self.cfs_nr_running
+    }
+
+    fn cfs_load_score(&self) -> (u64, usize) {
+        (self.cfs_load, self.cfs_nr_running)
+    }
+
+    fn leftmost_cfs_vruntime(&self) -> Option<u64> {
+        self.cfs_tasks.keys().next().map(|key| key.0)
+    }
+
+    fn refresh_highest_rt_prio(&mut self) {
+        self.highest_rt_prio = (1..RT_QUEUE_LEVELS)
             .rev()
-            .find(|prio| !self.queues[*prio].is_empty())
+            .find(|prio| !self.rt_queues[*prio].is_empty())
             .map(|prio| prio as u8);
+    }
+
+    fn refresh_min_vruntime(&mut self, accounted_vruntime: Option<u64>) {
+        if let Some(vruntime) = accounted_vruntime {
+            self.min_vruntime_ns = self.min_vruntime_ns.max(vruntime);
+        }
+        if let Some(leftmost) = self.leftmost_cfs_vruntime() {
+            self.min_vruntime_ns = self.min_vruntime_ns.max(leftmost);
+        }
     }
 }
 
@@ -96,18 +223,49 @@ fn normalize_hart(hart: usize) -> usize {
     hart.min(MAX_HARTS.saturating_sub(1))
 }
 
-fn select_target_hart(preferred_hart: usize, affinity_mask: usize) -> usize {
-    let affinity_mask = if affinity_mask == 0 {
-        all_cpu_affinity_mask()
+fn effective_affinity_mask(affinity_mask: usize) -> usize {
+    let online = all_cpu_affinity_mask();
+    let effective = if affinity_mask == 0 {
+        online
     } else {
-        affinity_mask & all_cpu_affinity_mask()
+        affinity_mask & online
     };
-    let preferred_hart = normalize_hart(preferred_hart);
-    if affinity_mask & (1usize << preferred_hart) != 0 {
-        preferred_hart
+    if effective == 0 {
+        online
     } else {
-        affinity_mask.trailing_zeros() as usize
+        effective
     }
+}
+
+fn select_target_hart(preferred_hart: usize, affinity_mask: usize, policy: SchedPolicy) -> usize {
+    let affinity_mask = effective_affinity_mask(affinity_mask);
+    let preferred_hart = normalize_hart(preferred_hart);
+    if matches!(policy, SchedPolicy::Rr) {
+        if affinity_mask & (1usize << preferred_hart) != 0 {
+            return preferred_hart;
+        }
+        return affinity_mask.trailing_zeros() as usize;
+    }
+
+    if affinity_mask & (1usize << preferred_hart) != 0
+        && RUN_QUEUES[preferred_hart].lock().total_nr_running() == 0
+    {
+        return preferred_hart;
+    }
+
+    let mut best_hart = affinity_mask.trailing_zeros() as usize;
+    let mut best_score = RUN_QUEUES[best_hart].lock().cfs_load_score();
+    for hart in 0..MAX_HARTS {
+        if affinity_mask & (1usize << hart) == 0 {
+            continue;
+        }
+        let score = RUN_QUEUES[hart].lock().cfs_load_score();
+        if score < best_score || (score == best_score && hart == preferred_hart) {
+            best_hart = hart;
+            best_score = score;
+        }
+    }
+    best_hart
 }
 
 /// Request a reschedule on the selected hart, using an IPI when needed.
@@ -120,42 +278,83 @@ pub fn resched_hart(hart: usize) {
     send_ipi_mask(1usize << target_hart);
 }
 
-fn maybe_preempt_current_on_this_hart(incoming_prio: u8) {
+fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
     if let Some(task) = current_task() {
         let task_inner = task.inner_exclusive_access();
-        if task_inner.sched.on_cpu
-            && matches!(task_inner.task_status, TaskStatus::Running)
-            && incoming_prio > task_inner.sched.rt_priority
-        {
-            drop(task_inner);
+        if !task_inner.sched.on_cpu || !matches!(task_inner.task_status, TaskStatus::Running) {
+            return;
+        }
+        let should_preempt = match (task_inner.sched.policy, incoming.policy) {
+            (SchedPolicy::Rr, SchedPolicy::Rr) => {
+                incoming.rt_priority > task_inner.sched.rt_priority
+            }
+            (SchedPolicy::Other, SchedPolicy::Rr) => true,
+            (SchedPolicy::Other, SchedPolicy::Other) => {
+                incoming
+                    .vruntime_ns
+                    .saturating_add(CFS_WAKEUP_GRANULARITY_NS)
+                    < task_inner.sched.vruntime_ns
+            }
+            _ => false,
+        };
+        drop(task_inner);
+        if should_preempt {
             mark_current_task_need_resched();
         }
     }
 }
 
-fn notify_enqueued_task(target_hart: usize, prio: u8) {
+fn notify_enqueued_task(target_hart: usize, incoming: EnqueuedTaskInfo) {
     if target_hart == hartid() {
-        maybe_preempt_current_on_this_hart(prio);
+        maybe_preempt_current_on_this_hart(incoming);
     } else {
         resched_hart(target_hart);
     }
 }
 
-fn enqueue_prepared_task(task: Arc<TaskControlBlock>, target_hart: usize, prio: u8) {
-    RUN_QUEUES[target_hart].lock().enqueue(task, prio);
-    notify_enqueued_task(target_hart, prio);
-}
-
-/// Returns whether this hart already has runnable work at or above `prio`.
+/// Returns whether this hart already has runnable RT work at or above `prio`.
 pub fn has_runnable_task_at_or_above(hart: usize, prio: u8) -> bool {
     RUN_QUEUES[normalize_hart(hart)]
         .lock()
-        .has_same_or_higher(prio)
+        .has_same_or_higher_rt(prio)
 }
 
 /// Returns the highest runnable RT priority on the selected hart.
 pub fn highest_runnable_prio(hart: usize) -> Option<u8> {
-    RUN_QUEUES[normalize_hart(hart)].lock().highest_prio()
+    RUN_QUEUES[normalize_hart(hart)].lock().highest_rt_prio()
+}
+
+/// Return whether CFS should preempt the current task on `hart`.
+pub fn cfs_should_preempt(
+    hart: usize,
+    current_vruntime_ns: u64,
+    current_weight: u64,
+    current_slice_exec_ns: u64,
+) -> bool {
+    let rq = RUN_QUEUES[normalize_hart(hart)].lock();
+    if rq.highest_rt_prio().is_some() {
+        return true;
+    }
+    let Some(leftmost_vruntime) = rq.leftmost_cfs_vruntime() else {
+        return false;
+    };
+    if current_vruntime_ns <= leftmost_vruntime.saturating_add(CFS_WAKEUP_GRANULARITY_NS) {
+        return false;
+    }
+    let runnable = rq.cfs_nr_running.saturating_add(1);
+    let period = if (runnable as u64) * crate::sched::CFS_MIN_GRANULARITY_NS
+        > crate::sched::CFS_TARGET_LATENCY_NS
+    {
+        (runnable as u64) * crate::sched::CFS_MIN_GRANULARITY_NS
+    } else {
+        crate::sched::CFS_TARGET_LATENCY_NS
+    };
+    let total_load = rq.cfs_load.saturating_add(current_weight).max(1);
+    let ideal_runtime = (period as u128)
+        .saturating_mul(current_weight as u128)
+        .checked_div(total_load as u128)
+        .unwrap_or(0) as u64;
+    current_slice_exec_ns >= ideal_runtime.max(crate::sched::CFS_MIN_GRANULARITY_NS)
 }
 
 /// Add a task to the scheduler on the current hart.
@@ -163,14 +362,21 @@ pub(crate) fn add_task(task: Arc<TaskControlBlock>) {
     enqueue_task_on(task, hartid());
 }
 
-/// Add a task to the scheduler on a selected hart.
-fn add_task_on(task: Arc<TaskControlBlock>, hart: usize) {
-    enqueue_task_on(task, hart);
-}
-
 /// Add a task to a specific hart's runqueue.
 pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
-    let (target_hart, prio) = {
+    let (affinity_mask, policy) = {
+        let task_inner = task.inner_exclusive_access();
+        if task_inner.sched.on_rq
+            || task_inner.sched.on_cpu
+            || matches!(task_inner.task_status, TaskStatus::Zombie)
+        {
+            return;
+        }
+        (task_inner.sched.cpu_affinity_mask, task_inner.sched.policy)
+    };
+    let target_hart = select_target_hart(hart, affinity_mask, policy);
+    let incoming = {
+        let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
         if task_inner.sched.on_rq
             || task_inner.sched.on_cpu
@@ -178,29 +384,115 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         {
             return;
         }
-        let target_hart = select_target_hart(hart, task_inner.sched.cpu_affinity_mask);
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
         task_inner.sched.last_cpu = target_hart;
         task_inner.sched.on_rq = true;
-        (target_hart, task_inner.sched.rt_priority)
+        rq.enqueue_locked(Arc::clone(&task), &mut task_inner)
     };
-    enqueue_prepared_task(task, target_hart, prio);
+    notify_enqueued_task(target_hart, incoming);
+}
+
+fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool {
+    let incoming = {
+        let mut rq = RUN_QUEUES[target_hart].lock();
+        let mut task_inner = task.inner_exclusive_access();
+        match task_inner.task_status {
+            TaskStatus::Interruptible | TaskStatus::Uninterruptible => {}
+            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return true,
+        }
+        if task_inner.sched.on_rq || task_inner.sched.on_cpu {
+            task_inner.task_status = TaskStatus::Runnable;
+            task_inner.wait_reason = None;
+            task_inner.current_wq_handle = None;
+            return true;
+        }
+        task_inner.task_status = TaskStatus::Runnable;
+        task_inner.wait_reason = None;
+        task_inner.current_wq_handle = None;
+        if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
+            task_inner.reset_time_slice();
+        }
+        task_inner.sched.on_rq = true;
+        task_inner.sched.last_cpu = target_hart;
+        rq.enqueue_locked(Arc::clone(&task), &mut task_inner)
+    };
+    notify_enqueued_task(target_hart, incoming);
+    true
+}
+
+fn wake_running_or_queued_task(task: &Arc<TaskControlBlock>) -> bool {
+    {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.task_status = TaskStatus::Runnable;
+        task_inner.wait_reason = None;
+        task_inner.current_wq_handle = None;
+        if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
+            task_inner.reset_time_slice();
+        }
+    }
+    true
 }
 
 /// Pop one runnable task from the selected hart's runqueue.
 fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
-    let task = RUN_QUEUES[normalize_hart(hart)].lock().dequeue_highest()?;
-    {
+    let hart = normalize_hart(hart);
+    loop {
+        let task = {
+            let mut rq = RUN_QUEUES[hart].lock();
+            rq.dequeue_highest_rt()
+                .or_else(|| rq.dequeue_leftmost_cfs())
+        }?;
         let mut task_inner = task.inner_exclusive_access();
         task_inner.sched.on_rq = false;
+        if matches!(task_inner.task_status, TaskStatus::Runnable) {
+            task_inner.sched.on_cpu = true;
+            task_inner.sched.last_cpu = hart;
+            drop(task_inner);
+            return Some(task);
+        }
     }
-    Some(task)
+}
+
+fn steal_cfs_task(target_hart: usize) -> Option<Arc<TaskControlBlock>> {
+    let target_bit = 1usize << normalize_hart(target_hart);
+    for source_hart in 0..MAX_HARTS {
+        if source_hart == target_hart {
+            continue;
+        }
+        let maybe_task = {
+            let mut source_rq = RUN_QUEUES[source_hart].lock();
+            let key = source_rq
+                .cfs_tasks
+                .iter()
+                .find(|(_, task)| {
+                    task.inner_exclusive_access().sched.cpu_affinity_mask & target_bit != 0
+                })
+                .map(|(key, _)| *key);
+            key.and_then(|key| source_rq.remove_cfs_by_key(key))
+        };
+        if let Some(task) = maybe_task {
+            let target_min = RUN_QUEUES[normalize_hart(target_hart)]
+                .lock()
+                .min_vruntime_ns;
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.on_rq = false;
+            if !matches!(task_inner.task_status, TaskStatus::Runnable) {
+                continue;
+            }
+            task_inner.sched.on_cpu = true;
+            task_inner.sched.last_cpu = target_hart;
+            task_inner.sched.vruntime_ns = task_inner.sched.vruntime_ns.max(target_min);
+            drop(task_inner);
+            return Some(task);
+        }
+    }
+    None
 }
 
 /// Pick the next task for the selected hart.
 pub(crate) fn pick_next_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
-    dequeue_task(hart)
+    dequeue_task(hart).or_else(|| steal_cfs_task(normalize_hart(hart)))
 }
 
 /// Wake up a sleeping task and place it on its target hart runqueue.
@@ -210,51 +502,45 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
         match task_inner.task_status {
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {
                 if task_inner.sched.on_rq {
-                    return false;
+                    task_inner.task_status = TaskStatus::Runnable;
+                    task_inner.wait_reason = None;
+                    task_inner.current_wq_handle = None;
+                    if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
+                        task_inner.reset_time_slice();
+                    }
+                    return true;
                 }
-                task_inner.task_status = TaskStatus::Runnable;
-                task_inner.wait_reason = None;
-                task_inner.current_wq_handle = None;
-                task_inner.reset_time_slice();
                 if task_inner.sched.on_cpu {
-                    None
+                    drop(task_inner);
+                    return wake_running_or_queued_task(&task);
                 } else {
-                    let target_hart = select_target_hart(
+                    Some((
                         task_inner.sched.last_cpu,
                         task_inner.sched.cpu_affinity_mask,
-                    );
-                    task_inner.sched.on_rq = true;
-                    task_inner.sched.last_cpu = target_hart;
-                    Some(target_hart)
+                        task_inner.sched.policy,
+                    ))
                 }
             }
-            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return false,
+            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return true,
         }
     };
-    if let Some(target_hart) = wake_target {
-        let prio = {
-            let task_inner = task.inner_exclusive_access();
-            task_inner.sched.rt_priority
-        };
-        enqueue_prepared_task(Arc::clone(&task), target_hart, prio);
-        // trace!("kernel: wakeup_task -> hart {} prio {}", target_hart, prio);
+    if let Some((preferred_hart, affinity_mask, policy)) = wake_target {
+        let target_hart = select_target_hart(preferred_hart, affinity_mask, policy);
+        return enqueue_wakeup_task(task, target_hart);
     }
     true
 }
 
 /// Remove a task from all local runqueues.
 pub fn remove_task(task: Arc<TaskControlBlock>) {
-    let prio = {
-        let task_inner = task.inner_exclusive_access();
-        task_inner.sched.rt_priority
-    };
     for rq in RUN_QUEUES.iter() {
-        if rq.lock().remove_task(&task, prio) {
+        if rq.lock().remove_task(&task) {
             break;
         }
     }
     let mut task_inner = task.inner_exclusive_access();
     task_inner.sched.on_rq = false;
+    task_inner.sched.cfs_rq_key = None;
 }
 
 /// Set a task to stop-wait status on the current hart, keeping its kernel
