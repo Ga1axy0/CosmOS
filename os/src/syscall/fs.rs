@@ -1,6 +1,6 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
-    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, canonicalize, do_umount,
+    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
     inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at, mount_device, truncate_inode,
     rename_at,
     open_file_at, symlinkat, unlinkat,
@@ -2025,6 +2025,46 @@ pub fn sys_renameat2(
         let old_cwd = resolve_dirfd_base(old_dirfd, old_name.as_str())?;
         let new_cwd = resolve_dirfd_base(new_dirfd, new_name.as_str())?;
         rename_at(old_cwd.as_str(), &old_name, new_cwd.as_str(), &new_name)?;
+        Ok(0)
+    })
+}
+
+/// `statfs64(2)` syscall: get filesystem statistics by path.
+pub fn sys_statfs64(path: *const u8, buf: *mut u8) -> isize {
+    trace!("kernel:pid[{}] sys_statfs64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let path_str = translated_str(token, path).ok_or(ERRNO::EFAULT)?;
+        let cwd = resolve_dirfd_base(AT_FDCWD, path_str.as_str())?;
+        debug!("sys_statfs64: cwd = '{}', path = '{}'", cwd, path_str);
+        let inode = lookup_inode_follow(cwd.as_str(), path_str.as_str(), true)?;
+        let stat = inode.statfs()?;
+        let buf_ptr = buf as *mut StatFs64;
+        write_pod_to_user(buf_ptr, &stat)?;
+        Ok(0)
+    })
+}
+
+/// `fstatfs64(2)` syscall: get filesystem statistics by file descriptor.
+pub fn sys_fstatfs64(fd: u32, buf: *mut u8) -> isize {
+    trace!("kernel:pid[{}] sys_fstatfs64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let fd = fd as usize;
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let file = inner
+            .fd_table
+            .get(fd)
+            .and_then(|f| f.as_ref())
+            .ok_or(ERRNO::EBADF)?;
+        let stat = file.desc.statfs()?;
+        drop(inner);
+        let buf_ptr = buf as *mut StatFs64;
+        write_pod_to_user(buf_ptr, &stat)?;
         Ok(0)
     })
 }

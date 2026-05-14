@@ -9,6 +9,8 @@ pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_SYMLINKAT: usize = 36;
 pub const SYSCALL_LINKAT: usize = 37;
+pub const SYSCALL_STATFS64: usize = 43;
+pub const SYSCALL_FSTATFS64: usize = 44;
 pub const SYSCALL_TRUNCATE: usize = 45;
 pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_CHDIR: usize = 49;
@@ -568,5 +570,33 @@ pub fn sys_getdents64(fd: usize, buffer: &mut [u8]) -> isize {
     syscall(
         SYSCALL_GETDENTS64,
         [fd, buffer.as_mut_ptr() as usize, buffer.len()],
+    )
+}
+
+pub fn sys_statfs64(path: &str, buf: &mut super::StatFs64) -> isize {
+    syscall6(
+        SYSCALL_STATFS64,
+        [
+            path.as_ptr() as usize,
+            buf as *mut _ as usize,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_fstatfs64(fd: usize, buf: &mut super::StatFs64) -> isize {
+    syscall6(
+        SYSCALL_FSTATFS64,
+        [
+            fd,
+            buf as *mut _ as usize,
+            0,
+            0,
+            0,
+            0,
+        ],
     )
 }

@@ -240,6 +240,36 @@ impl Default for Stat {
     }
 }
 
+/// Filesystem statistics structure, matching `struct statfs64` ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatFs64 {
+    /// Filesystem type magic number.
+    pub f_type: u64,
+    /// Optimal transfer block size.
+    pub f_bsize: u64,
+    /// Total data blocks.
+    pub f_blocks: u64,
+    /// Free blocks.
+    pub f_bfree: u64,
+    /// Free blocks for unprivileged users.
+    pub f_bavail: u64,
+    /// Total inodes.
+    pub f_files: u64,
+    /// Free inodes.
+    pub f_ffree: u64,
+    /// Filesystem ID.
+    pub f_fsid: [i32; 2],
+    /// Maximum filename length.
+    pub f_namelen: u64,
+    /// Fragment size.
+    pub f_frsize: u64,
+    /// Mount flags.
+    pub f_flags: u64,
+    /// Spare fields.
+    pub f_spare: [u64; 4],
+}
+
 bitflags! {
     pub struct StatMode: u32 {
         const NULL  = 0;

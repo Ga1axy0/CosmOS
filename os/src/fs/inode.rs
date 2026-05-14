@@ -1,5 +1,5 @@
-use super::{page_cache, File, Stat, StatMode};
-use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
+use super::{page_cache, File, Stat, StatFs64, StatMode};
+use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -312,7 +312,7 @@ pub fn init_rootfs() {
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
-        record_mount("/", "rootfs", "ext4", "rw");
+        record_mount("/", "/dev/vda", "ext4", "rw");
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
@@ -898,6 +898,10 @@ impl File for OSInode {
             return rtc.stat();
         }
         inode_stat(&self.inode)
+    }
+
+    fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        self.inode.statfs().map_err(ERRNO::from)
     }
 
     fn sync(&self) -> Result<(), ERRNO> {
