@@ -7,6 +7,7 @@ use spin::Mutex;
 use crate::block_cache::get_block_cache;
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::errno::FS_ERRNO;
+use crate::{STATFS_MAGIC_EXT4, STATFS_NAMELEN_DEFAULT, VfsStatFs};
 use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsFileType, VfsNode};
 use crate::BLOCK_SZ;
 
@@ -381,6 +382,28 @@ impl VfsNode for Ext4Inode {
             ctime: Some(decode_ext4_time(i.ctime(), i.i_ctime_extra())),
         };
         ret
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        let ext4 = self.fs.ext4.lock();
+        let sb = ext4.super_block;
+        Ok(VfsStatFs {
+            f_type: STATFS_MAGIC_EXT4,
+            f_bsize: sb.block_size() as u64,
+            f_blocks: sb.blocks_count() as u64,
+            f_bfree: sb.free_blocks_count(),
+            f_bavail: sb.free_blocks_count(),
+            f_files: sb.total_inodes() as u64,
+            f_ffree: sb.free_inodes_count() as u64,
+            f_fsid: [
+                (Arc::as_ptr(&self.fs) as usize as u32) as i32,
+                ((Arc::as_ptr(&self.fs) as usize as u64 >> 32) as u32) as i32,
+            ],
+            f_namelen: STATFS_NAMELEN_DEFAULT,
+            f_frsize: sb.block_size() as u64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        })
     }
 
     fn clear(&self) {

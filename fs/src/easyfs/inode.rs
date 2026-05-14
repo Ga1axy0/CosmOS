@@ -3,9 +3,9 @@ use core::any::Any;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
-    BlockDevice, EasyFileSystem,
+    BlockDevice, EasyFileSystem, STATFS_MAGIC_EASYFS, STATFS_NAMELEN_EASYFS, VfsStatFs,
     block_cache::get_block_cache,
-    easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType},
+    easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType, SuperBlock},
     errno::FS_ERRNO,
     vfs::{Inode, VfsAttrs, VfsFileType, VfsNode},
 };
@@ -213,6 +213,41 @@ impl VfsNode for EasyInode {
             mtime: None,
             ctime: None,
         }
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        let fs = self.fs.lock();
+        let block_device = Arc::clone(&fs.block_device);
+
+        let (total_blocks, data_area_blocks) = get_block_cache(0, Arc::clone(&block_device))
+            .lock()
+            .read(0, |super_block: &SuperBlock| {
+                (super_block.total_blocks as u64, super_block.data_area_blocks as u64)
+            });
+
+        let total_inodes = fs.inode_bitmap.maximum() as u64;
+        let used_inodes = fs.inode_bitmap.count_allocated(&block_device) as u64;
+        let used_data_blocks = fs.data_bitmap.count_allocated(&block_device) as u64;
+
+        let mut stat = VfsStatFs {
+            f_type: STATFS_MAGIC_EASYFS,
+            f_bsize: crate::BLOCK_SZ as u64,
+            f_blocks: total_blocks,
+            f_bfree: data_area_blocks.saturating_sub(used_data_blocks),
+            f_bavail: data_area_blocks.saturating_sub(used_data_blocks),
+            f_files: total_inodes,
+            f_ffree: total_inodes.saturating_sub(used_inodes),
+            f_fsid: [(Arc::as_ptr(&self.fs) as usize as u32) as i32, ((Arc::as_ptr(&self.fs) as usize as u64 >> 32) as u32) as i32],
+            f_namelen: STATFS_NAMELEN_EASYFS,
+            f_frsize: crate::BLOCK_SZ as u64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        };
+        if stat.f_bfree > stat.f_blocks {
+            stat.f_bfree = stat.f_blocks;
+            stat.f_bavail = stat.f_blocks;
+        }
+        Ok(stat)
     }
 
     fn clear(&self) {

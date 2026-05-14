@@ -2,7 +2,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 use spin::Mutex;
 
-use crate::{BLOCK_SZ, fat32::dir::DirAttr};
+use crate::{
+    BLOCK_SZ, STATFS_MAGIC_MSDOS, STATFS_NAMELEN_DEFAULT, VfsStatFs,
+    fat32::dir::DirAttr,
+};
 use crate::block_cache::get_block_cache;
 use crate::errno::FS_ERRNO;
 use crate::vfs::{VfsAttrs, VfsFileType, VfsNode};
@@ -746,6 +749,29 @@ impl VfsNode for FatInode {
             mtime: None,
             ctime: None,
         }
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        let bpb = self.fs.bpb();
+        let total_clusters = bpb.max_cluster.saturating_sub(1) as u64;
+        let free_clusters = fat::count_free_clusters(bpb, self.fs.device());
+        Ok(VfsStatFs {
+            f_type: STATFS_MAGIC_MSDOS,
+            f_bsize: bpb.cluster_size_bytes() as u64,
+            f_blocks: total_clusters,
+            f_bfree: free_clusters,
+            f_bavail: free_clusters,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [
+                (Arc::as_ptr(&self.fs) as usize as u32) as i32,
+                ((Arc::as_ptr(&self.fs) as usize as u64 >> 32) as u32) as i32,
+            ],
+            f_namelen: STATFS_NAMELEN_DEFAULT,
+            f_frsize: bpb.cluster_size_bytes() as u64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        })
     }
 
     fn clear(&self) {

@@ -137,3 +137,17 @@ pub fn last_cluster(bpb: &Fat32Bpb, block_device: &Arc<dyn BlockDevice>, start: 
         cur = next;
     }
 }
+
+/// Count free clusters in the FAT allocation table.
+pub fn count_free_clusters(bpb: &Fat32Bpb, block_device: &Arc<dyn BlockDevice>) -> u64 {
+    let mut free = 0u64;
+    if bpb.max_cluster < 2 {
+        return 0;
+    }
+    for cluster in 2..=bpb.max_cluster {
+        if read_fat_entry(bpb, block_device, cluster) == 0 {
+            free += 1;
+        }
+    }
+    free
+}
