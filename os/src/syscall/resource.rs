@@ -70,7 +70,10 @@ impl Default for ResourceLimits {
                 rlim_cur: USER_STACK_SIZE as u64,
                 rlim_max: USER_STACK_SIZE as u64,
             },
-            nofile: rlimit::unlimited(),
+            nofile: rlimit {
+                rlim_cur: 1024,
+                rlim_max: 1024,
+            },
             address_space: rlimit::unlimited(),
         }
     }

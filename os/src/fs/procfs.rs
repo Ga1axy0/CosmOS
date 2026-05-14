@@ -138,6 +138,15 @@ impl VfsNode for ProcRootNode {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
 }
 
 /// `/proc/meminfo` node.
@@ -199,6 +208,15 @@ impl VfsNode for ProcMeminfoNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
     }
 }
 
@@ -262,6 +280,15 @@ impl VfsNode for ProcMountsNode {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
 }
 
 /// `/proc/self` symlink node.
@@ -322,6 +349,15 @@ impl VfsNode for ProcSelfLinkNode {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
 }
 
 /// `/proc/<pid>` directory node.
@@ -379,6 +415,15 @@ impl VfsNode for ProcPidDirNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
     }
 }
 
@@ -444,5 +489,14 @@ impl VfsNode for ProcPidExeLinkNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
     }
 }

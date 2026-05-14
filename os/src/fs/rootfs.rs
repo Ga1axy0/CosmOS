@@ -36,7 +36,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
 use fs::remove_dentry;
-use fs::vfs::{InodeTime, VfsFileType, VfsNode};
+use fs::vfs::{InodeTime, VfsFileType, VfsNode, VfsStatFs};
 use lazy_static::*;
 
 use crate::sync::{SpinNoIrqLock};
@@ -389,6 +389,15 @@ impl VfsNode for VirtualDirNode {
         } else {
             overlay.rename_child(old_name, new_parent, new_name)
         }
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        // The virtual root overlays a real filesystem; report stats from the overlay.
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        overlay.ok_or(FS_ERRNO::ENOSYS)?.statfs()
     }
 }
 

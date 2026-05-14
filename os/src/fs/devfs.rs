@@ -13,11 +13,12 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use fs::vfs::{VfsFileType, VfsNode};
-use fs::BlockDevice;
+use fs::{BlockDevice, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT};
 
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::drivers::rtc;
 use crate::fs::{Stat, StatMode};
+use super::{empty_statfs, StatFs64};
 use crate::mm::{translated_ref, translated_refmut};
 use crate::syscall::errno::ERRNO;
 use crate::task::current_user_token;
@@ -26,6 +27,15 @@ use crate::random as kernel_random;
 
 const RTC_RD_TIME: usize = 0xFFFF_FFFF_8024_7009;
 const RTC_SET_TIME: usize = 0x4024_700A;
+
+fn devfs_statfs() -> StatFs64 {
+    empty_statfs(
+        STATFS_MAGIC_TMPFS,
+        crate::config::PAGE_SIZE as u64,
+        STATFS_MAGIC_TMPFS,
+        STATFS_NAMELEN_DEFAULT,
+    )
+}
 
 /// Linux `struct rtc_time` ABI.
 #[repr(C)]
@@ -237,6 +247,10 @@ impl VfsNode for NullDevNode {
         Ok(())   
     }
 
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
+
 }
 
 // SAFETY: single-processor kernel; `BlockDevice` is already `Send + Sync`.
@@ -311,6 +325,10 @@ impl VfsNode for BlockDevNode {
         }
         total
     }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
 }
 
 /// Root directory node for the `/dev` filesystem.
@@ -380,6 +398,10 @@ impl VfsNode for DevRootNode {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
 }
 
 /// `/dev/misc` directory node.
@@ -429,6 +451,10 @@ impl VfsNode for DevMiscNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
     }
 }
 
@@ -540,6 +566,10 @@ impl VfsNode for RtcDevNode {
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
     }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
 }
 
 /// VFS node representing `/dev/urandom` (CSPRNG character device).
@@ -608,5 +638,9 @@ impl VfsNode for UrandomDevNode {
 
     fn mode(&self) -> Option<u32> {
         Some(StatMode::CHAR.bits())
+    }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
     }
 }

@@ -230,9 +230,7 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Optio
                 v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
             }
             start = end_va.into();
-            info!("translated_byte_buffer: start_va = {:?}, end_va = {:?}, ppn = {:?}", start_va, end_va, ppn);
         } else {
-            info!("translated_byte_buffer: invalid page for va = {:?}", start_va);
             return None;
         }
     }

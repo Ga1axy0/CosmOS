@@ -37,6 +37,36 @@ pub struct VfsAttrs {
     pub ctime: Option<InodeTime>,
 }
 
+/// Filesystem statistics snapshot shared by VFS backends.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VfsStatFs {
+    pub f_type: u64,
+    pub f_bsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: u64,
+    pub f_frsize: u64,
+    pub f_flags: u64,
+    pub f_spare: [u64; 4],
+}
+
+/// Linux magic numbers used by the in-tree filesystem backends.
+pub const STATFS_MAGIC_EASYFS: u64 = 0x0041_4A53;
+pub const STATFS_MAGIC_EXT4: u64 = 0x0000_EF53;
+pub const STATFS_MAGIC_MSDOS: u64 = 0x0000_4D44;
+pub const STATFS_MAGIC_PROC: u64 = 0x0000_9FA0;
+pub const STATFS_MAGIC_TMPFS: u64 = 0x0102_1994;
+pub const STATFS_MAGIC_PIPEFS: u64 = 0x5049_5045;
+
+/// Generic filename-length defaults used by the in-tree filesystems.
+pub const STATFS_NAMELEN_DEFAULT: u64 = 255;
+pub const STATFS_NAMELEN_EASYFS: u64 = 27;
+
 /// VFS-visible inode file type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VfsFileType {
@@ -201,6 +231,11 @@ pub trait VfsNode: Send + Sync + Any {
         }
     }
 
+    /// Read filesystem-wide statistics.
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        Err(FS_ERRNO::ENOSYS)
+    }
+
     /// Rename or move a child entry from this directory to `new_parent/new_name`.
     fn rename_child(
         &self,
@@ -355,6 +390,11 @@ impl Inode {
     /// Read all stat-relevant attributes in one call.
     pub fn stat_attrs(&self) -> VfsAttrs {
         self.inner.stat_attrs()
+    }
+
+    /// Read filesystem-wide statistics.
+    pub fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        self.inner.statfs()
     }
 
     pub fn nlink(&self) -> u32 {

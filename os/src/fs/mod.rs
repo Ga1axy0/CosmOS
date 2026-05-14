@@ -23,6 +23,32 @@ pub use page_cache::{
     retain_mapped_page, PAGE_CACHE_MANAGER
 };
 
+/// Kernel-side alias for the shared filesystem statistics snapshot.
+pub type StatFs64 = fs::VfsStatFs;
+
+/// Convert a 64-bit seed into a stable `fsid_t`-style pair.
+pub(crate) fn fsid_from_u64(seed: u64) -> [i32; 2] {
+    [(seed as u32) as i32, (seed >> 32) as u32 as i32]
+}
+
+/// Build a zero-initialised filesystem stat snapshot.
+pub(crate) fn empty_statfs(f_type: u64, bsize: u64, fsid_seed: u64, namelen: u64) -> StatFs64 {
+    StatFs64 {
+        f_type,
+        f_bsize: bsize,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+        f_files: 0,
+        f_ffree: 0,
+        f_fsid: fsid_from_u64(fsid_seed),
+        f_namelen: namelen,
+        f_frsize: bsize,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
     pub struct FileStatusFlags: i32 {
@@ -193,6 +219,11 @@ impl FileDescription {
         self.file.stat()
     }
 
+    /// 转发 `statfs` 到底层文件对象。
+    pub fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        self.file.statfs()
+    }
+
     /// 返回底层文件对象是否为目录。
     pub fn is_dir(&self) -> bool {
         self.file.is_dir()
@@ -352,6 +383,10 @@ pub trait File: Send + Sync + Any {
     }
     /// get file metadata
     fn stat(&self) -> Stat;
+    /// get filesystem metadata
+    fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        Err(ERRNO::ENOSYS)
+    }
     /// 将该文件对象的脏数据同步到底层存储。
     fn sync(&self) -> Result<(), ERRNO> {
         Ok(())
@@ -420,6 +455,8 @@ pub struct Stat {
 }
 
 impl Pod for Stat {}
+
+impl Pod for StatFs64 {}
 
 bitflags! {
     /// The mode of a inode
