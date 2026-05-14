@@ -234,11 +234,8 @@ fn syslog_action_read(bufp: *mut u8, size: usize) -> isize {
         if size == 0 {
             return Ok(0);
         }
-        let user_bufs = translated_byte_buffer_with_access(
-            bufp as *const u8,
-            size,
-            PageFaultAccess::Write,
-        ).map_err(|_| ERRNO::EINVAL)?;
+        let user_bufs =
+            translated_byte_buffer_with_access(bufp as *const u8, size, PageFaultAccess::Write)?;
         let mut klog = KLOG_BUFFER.lock();
         let mut copied = 0usize;
         for slice in user_bufs {
@@ -257,11 +254,8 @@ fn syslog_action_read_all(bufp: *mut u8, size: usize) -> isize {
         if size == 0 {
             return Ok(0);
         }
-        let user_bufs = translated_byte_buffer_with_access(
-            bufp as *const u8,
-            size,
-            PageFaultAccess::Write,
-        ).map_err(|_| ERRNO::EINVAL)?;
+        let user_bufs =
+            translated_byte_buffer_with_access(bufp as *const u8, size, PageFaultAccess::Write)?;
         let klog = KLOG_BUFFER.lock();
         let available = klog.since_clear_len();
         let target_len = size.min(available);
@@ -284,11 +278,8 @@ fn syslog_action_read_clear(bufp: *mut u8, size: usize) -> isize {
             KLOG_BUFFER.lock().clear_since_marker();
             return Ok(0);
         }
-        let user_bufs = translated_byte_buffer_with_access(
-            bufp as *const u8,
-            size,
-            PageFaultAccess::Write,
-        ).map_err(|_| ERRNO::EINVAL)?;
+        let user_bufs =
+            translated_byte_buffer_with_access(bufp as *const u8, size, PageFaultAccess::Write)?;
         let mut klog = KLOG_BUFFER.lock();
         let available = klog.since_clear_len();
         let target_len = size.min(available);
