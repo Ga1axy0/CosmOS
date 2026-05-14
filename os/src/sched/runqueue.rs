@@ -4,10 +4,10 @@ use super::current_task;
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
 use crate::sbi::send_ipi_mask;
-use crate::sched::{mark_current_task_need_resched, CFS_WAKEUP_GRANULARITY_NS};
+use crate::sched::{request_current_task_resched, CFS_WAKEUP_GRANULARITY_NS};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    all_cpu_affinity_mask, ProcessControlBlock, SchedPolicy, TaskControlBlock,
+    all_cpu_affinity_mask, ProcessControlBlock, ReschedReason, SchedPolicy, TaskControlBlock,
     TaskControlBlockInner, TaskStatus, SCHED_RT_PRIO_MAX,
 };
 use alloc::collections::{BTreeMap, VecDeque};
@@ -59,14 +59,19 @@ impl RunQueue {
         task_inner: &mut TaskControlBlockInner,
     ) -> EnqueuedTaskInfo {
         match task_inner.sched.policy {
-            SchedPolicy::Rr => {
+            SchedPolicy::Fifo | SchedPolicy::Rr => {
                 let prio = task_inner.sched.rt_priority;
-                self.rt_queues[prio as usize].push_back(task);
+                if task_inner.sched.rt_enqueue_head {
+                    self.rt_queues[prio as usize].push_front(task);
+                } else {
+                    self.rt_queues[prio as usize].push_back(task);
+                }
+                task_inner.sched.rt_enqueue_head = false;
                 self.rt_nr_running += 1;
                 self.highest_rt_prio =
                     Some(self.highest_rt_prio.map_or(prio, |curr| curr.max(prio)));
                 EnqueuedTaskInfo {
-                    policy: SchedPolicy::Rr,
+                    policy: task_inner.sched.policy,
                     rt_priority: prio,
                     vruntime_ns: 0,
                 }
@@ -143,7 +148,7 @@ impl RunQueue {
             )
         };
         match policy {
-            SchedPolicy::Rr => {
+            SchedPolicy::Fifo | SchedPolicy::Rr => {
                 if let Some((idx, _)) = self.rt_queues[prio as usize]
                     .iter()
                     .enumerate()
@@ -240,7 +245,7 @@ fn effective_affinity_mask(affinity_mask: usize) -> usize {
 fn select_target_hart(preferred_hart: usize, affinity_mask: usize, policy: SchedPolicy) -> usize {
     let affinity_mask = effective_affinity_mask(affinity_mask);
     let preferred_hart = normalize_hart(preferred_hart);
-    if matches!(policy, SchedPolicy::Rr) {
+    if policy.is_rt() {
         if affinity_mask & (1usize << preferred_hart) != 0 {
             return preferred_hart;
         }
@@ -272,35 +277,49 @@ fn select_target_hart(preferred_hart: usize, affinity_mask: usize, policy: Sched
 pub fn resched_hart(hart: usize) {
     let target_hart = normalize_hart(hart);
     if target_hart == hartid() {
-        mark_current_task_need_resched();
+        request_current_task_resched(ReschedReason::Migration);
         return;
     }
     send_ipi_mask(1usize << target_hart);
 }
 
+fn preempt_reason_for_current(
+    current_policy: SchedPolicy,
+    current_rt_priority: u8,
+    current_vruntime_ns: u64,
+    incoming: EnqueuedTaskInfo,
+) -> Option<ReschedReason> {
+    match (current_policy, incoming.policy) {
+        (current, incoming_policy) if current.is_rt() && incoming_policy.is_rt() => {
+            (incoming.rt_priority > current_rt_priority).then_some(ReschedReason::HigherRtPriority)
+        }
+        (SchedPolicy::Other, incoming) if incoming.is_rt() => Some(ReschedReason::HigherRtPriority),
+        (SchedPolicy::Other, SchedPolicy::Other) => (incoming
+            .vruntime_ns
+            .saturating_add(CFS_WAKEUP_GRANULARITY_NS)
+            < current_vruntime_ns)
+            .then_some(ReschedReason::CfsPreempt),
+        _ => None,
+    }
+}
+
 fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
-    if let Some(task) = current_task() {
-        let task_inner = task.inner_exclusive_access();
-        if !task_inner.sched.on_cpu || !matches!(task_inner.task_status, TaskStatus::Running) {
-            return;
-        }
-        let should_preempt = match (task_inner.sched.policy, incoming.policy) {
-            (SchedPolicy::Rr, SchedPolicy::Rr) => {
-                incoming.rt_priority > task_inner.sched.rt_priority
-            }
-            (SchedPolicy::Other, SchedPolicy::Rr) => true,
-            (SchedPolicy::Other, SchedPolicy::Other) => {
-                incoming
-                    .vruntime_ns
-                    .saturating_add(CFS_WAKEUP_GRANULARITY_NS)
-                    < task_inner.sched.vruntime_ns
-            }
-            _ => false,
-        };
-        drop(task_inner);
-        if should_preempt {
-            mark_current_task_need_resched();
-        }
+    let Some(task) = current_task() else {
+        return;
+    };
+    let task_inner = task.inner_exclusive_access();
+    if !task_inner.sched.on_cpu || !matches!(task_inner.task_status, TaskStatus::Running) {
+        return;
+    }
+    let reason = preempt_reason_for_current(
+        task_inner.sched.policy,
+        task_inner.sched.rt_priority,
+        task_inner.sched.vruntime_ns,
+        incoming,
+    );
+    drop(task_inner);
+    if let Some(reason) = reason {
+        request_current_task_resched(reason);
     }
 }
 

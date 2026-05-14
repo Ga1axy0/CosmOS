@@ -52,8 +52,32 @@ pub enum SchedPolicy {
     Idle = -1,
     /// Linux-like regular fair scheduling (SCHED_OTHER/SCHED_NORMAL).
     Other = 0,
+    /// Linux-like real-time first-in, first-out scheduling.
+    Fifo = 1,
     /// Linux-like real-time round-robin scheduling.
     Rr = 2,
+}
+
+impl SchedPolicy {
+    /// Return whether this policy belongs to the Linux real-time scheduling class.
+    pub const fn is_rt(self) -> bool {
+        matches!(self, Self::Fifo | Self::Rr)
+    }
+}
+
+/// Why the current task should leave the CPU at the next safe point.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ReschedReason {
+    /// A runnable RT task with higher static priority should preempt the current task.
+    HigherRtPriority,
+    /// The current RR task exhausted its round-robin quantum.
+    RrTimesliceExpired,
+    /// The current task voluntarily called `sched_yield`.
+    Yield,
+    /// A fair task should be preempted by CFS placement/runtime rules.
+    CfsPreempt,
+    /// The current task must reschedule because its CPU placement changed.
+    Migration,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -87,6 +111,17 @@ impl SchedAttr {
     pub const fn rr(rt_priority: u8) -> Self {
         Self {
             policy: SchedPolicy::Rr,
+            rt_priority,
+            time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
+            nice: 0,
+            weight: NICE_0_LOAD,
+        }
+    }
+
+    /// Create a FIFO real-time scheduling attribute set with the given RT priority.
+    pub const fn fifo(rt_priority: u8) -> Self {
+        Self {
+            policy: SchedPolicy::Fifo,
             rt_priority,
             time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
             nice: 0,

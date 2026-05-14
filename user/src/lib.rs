@@ -353,6 +353,7 @@ pub fn yield_() -> isize {
 }
 
 pub const SCHED_OTHER: i32 = 0;
+pub const SCHED_FIFO: i32 = 1;
 pub const SCHED_RR: i32 = 2;
 pub const PRIO_PROCESS: i32 = 0;
 

@@ -12,12 +12,12 @@ mod switch;
 
 pub use api::{
     block_current_and_run_next, current_task_need_resched, mark_current_task_need_resched,
-    on_timer_tick, schedule_if_needed, suspend_current_and_run_next,
+    on_timer_tick, request_current_task_resched, schedule_if_needed, suspend_current_and_run_next,
     suspend_current_and_run_next_with_slice_reset, yield_current_and_run_next,
 };
 pub use context::TaskContext;
 pub use policy::{
-    clamp_nice, nice_to_weight, SchedAttr, SchedPolicy, CFS_MIN_GRANULARITY_NS,
+    clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, CFS_MIN_GRANULARITY_NS,
     CFS_TARGET_LATENCY_NS, CFS_WAKEUP_GRANULARITY_NS, CFS_YIELD_PENALTY_NS,
     DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD, SCHED_RT_PRIO_MAX,
     SCHED_RT_PRIO_MIN,
