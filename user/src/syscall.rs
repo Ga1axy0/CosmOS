@@ -443,7 +443,7 @@ pub fn sys_sigaction(
 }
 
 /// New rt_sigprocmask ABI wrapper: (how, set, oset, sigsetsize)
-pub fn sys_rt_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: usize) -> isize {
+pub fn sys_rt_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: usize) -> isize {
     syscall6(
         SYSCALL_SIGPROCMASK,
         [how as usize, set as usize, oset as usize, sigsetsize, 0, 0],
@@ -451,10 +451,10 @@ pub fn sys_rt_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize:
 }
 
 /// Compatibility helper that sets the mask to `mask` (SIG_SETMASK semantics).
-pub fn sys_sigprocmask(mask: u32) -> isize {
+pub fn sys_sigprocmask(mask: u64) -> isize {
     // SIG_SETMASK == 2
-    let size = core::mem::size_of::<u32>();
-    sys_rt_sigprocmask(2, &mask as *const u32, core::ptr::null_mut(), size)
+    let size = core::mem::size_of::<u64>();
+    sys_rt_sigprocmask(2, &mask as *const u64, core::ptr::null_mut(), size)
 }
 
 pub fn sys_sigreturn() -> isize {

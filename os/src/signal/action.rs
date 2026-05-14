@@ -11,8 +11,8 @@ pub struct SignalAction {
     pub sa_flags: u32,
     /// Restorer function address (used when SA_RESTORER is set)
     pub sa_restorer: usize,
-    /// Signal mask to apply during handler execution (32-bit)
-    pub sa_mask: u32,
+    /// Signal mask to apply during handler execution (64-bit Linux sigset layout)
+    pub sa_mask: u64,
 }
 
 impl Pod for SignalAction {}
@@ -98,9 +98,7 @@ pub struct UContext {
     /// Signal stack
     pub uc_stack: StackT,
     /// Signal mask
-    pub uc_sigmask: u32,
-    /// Padding for alignment
-    pub _pad: u32,
+    pub uc_sigmask: u64,
     /// Machine context (registers)
     pub uc_mcontext: MContext,
 }

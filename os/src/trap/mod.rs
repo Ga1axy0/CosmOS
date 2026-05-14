@@ -17,7 +17,7 @@ mod context;
 use crate::config::TRAMPOLINE;
 use crate::hart::hartid;
 use crate::mm::{handle_ipi, PageFaultAccess};
-use crate::signal::{SignalFlags, handle_signals};
+use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
 use crate::task::{
@@ -187,11 +187,11 @@ pub fn trap_handler() -> ! {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
                         log_user_fault("store page fault beyond file EOF", "write", stval, "SIGBUS");
-                        current_add_signal(SignalFlags::SIGBUS);
+                        current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(_) => {
                         log_user_fault("store page fault", "write", stval, "SIGSEGV");
-                        current_add_signal(SignalFlags::SIGSEGV);
+                        current_add_signal(SignalBit::SIGSEGV);
                     }
                 }
             }
@@ -207,11 +207,11 @@ pub fn trap_handler() -> ! {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
                         log_user_fault("load page fault beyond file EOF", "read", stval, "SIGBUS");
-                        current_add_signal(SignalFlags::SIGBUS);
+                        current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(_) => {
                         log_user_fault("load page fault", "read", stval, "SIGSEGV");
-                        current_add_signal(SignalFlags::SIGSEGV);
+                        current_add_signal(SignalBit::SIGSEGV);
                     }
                 }
             }
@@ -226,11 +226,11 @@ pub fn trap_handler() -> ! {
                 Ok(()) => {}
                 Err(ERRNO::ENXIO) => {
                     log_user_fault("instruction page fault beyond file EOF", "exec", stval, "SIGBUS");
-                    current_add_signal(SignalFlags::SIGBUS);
+                    current_add_signal(SignalBit::SIGBUS);
                 }
                 Err(_) => {
                     log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
-                    current_add_signal(SignalFlags::SIGSEGV);
+                    current_add_signal(SignalBit::SIGSEGV);
                 }
             }
         }
@@ -238,11 +238,11 @@ pub fn trap_handler() -> ! {
         | Trap::Exception(Exception::InstructionFault)
         | Trap::Exception(Exception::LoadFault) => {
             log_user_fault("access fault", "unknown", stval, "SIGSEGV");
-            current_add_signal(SignalFlags::SIGSEGV);
+            current_add_signal(SignalBit::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
             log_user_fault("illegal instruction", "exec", stval, "SIGILL");
-            current_add_signal(SignalFlags::SIGILL);
+            current_add_signal(SignalBit::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             // trace!("hart {} timer tick", hartid());

@@ -3,11 +3,10 @@ use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::task::UContext;
 use crate::{
     mm::translated_ref,
-    syscall::errno::OrErrno,
     syscall_body,
     task::{
         block_current_and_run_next, current_process, current_task, current_user_token,
-        SignalAction, SignalFlags, TaskStatus, WaitReason,
+        SignalAction, SignalBit, TaskStatus, WaitReason,
     },
 };
 use crate::timer::{add_timer_with_signal_tag, get_time_ms};
@@ -19,6 +18,41 @@ use crate::syscall::OldTimespec32;
 struct SigSet32(u32);
 
 impl Pod for SigSet32 {}
+
+/// Linux `sigset_t` 的低 64 位表示。
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+struct SigSet64(u64);
+
+impl Pod for SigSet64 {}
+
+fn read_user_sigset(mask: *const u64, sigsetsize: usize) -> Result<SignalBit, ERRNO> {
+    if mask.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    if sigsetsize >= core::mem::size_of::<u64>() {
+        let bits = read_pod_from_user(mask as *const SigSet64)?.0;
+        Ok(SignalBit::from_user_bits(bits))
+    } else if sigsetsize >= core::mem::size_of::<u32>() {
+        let bits = read_pod_from_user(mask as *const SigSet32)?.0;
+        Ok(SignalBit::from_user_bits(bits as u64))
+    } else {
+        Err(ERRNO::EINVAL)
+    }
+}
+
+fn write_user_sigset(mask: *mut u64, sigsetsize: usize, signal_set: SignalBit) -> Result<(), ERRNO> {
+    if mask.is_null() {
+        return Ok(());
+    }
+    if sigsetsize >= core::mem::size_of::<u64>() {
+        write_pod_to_user(mask as *mut SigSet64, &SigSet64(signal_set.user_bits()))
+    } else if sigsetsize >= core::mem::size_of::<u32>() {
+        write_pod_to_user(mask as *mut SigSet32, &SigSet32(signal_set.bits() as u32))
+    } else {
+        Err(ERRNO::EINVAL)
+    }
+}
 
 fn parse_sigtimedwait_timeout_ms(
     uts: *const OldTimespec32,
@@ -45,15 +79,14 @@ fn timeout_ms_to_deadline(timeout_ms: Option<usize>) -> Result<Option<usize>, ER
     }
 }
 
-fn read_signal_wait_set(uthese: *const u32, sigsetsize: usize) -> Result<SignalFlags, ERRNO> {
-    if uthese.is_null() || sigsetsize < core::mem::size_of::<u32>() {
+fn read_signal_wait_set(uthese: *const u64, sigsetsize: usize) -> Result<SignalBit, ERRNO> {
+    if uthese.is_null() {
         return Err(ERRNO::EINVAL);
     }
-    let bits = read_pod_from_user(uthese as *const SigSet32)?.0;
-    SignalFlags::from_bits(bits).or_errno(ERRNO::EINVAL)
+    read_user_sigset(uthese, sigsetsize)
 }
 
-fn signal_wait_sleep(handle: SignalWaitHandle, signal_set: SignalFlags) {
+fn signal_wait_sleep(handle: SignalWaitHandle, signal_set: SignalBit) {
     let task = current_task().unwrap();
     {
         debug!("signal_wait_sleep: blocking task of pid {} for signals {:#x}", task.process.upgrade().unwrap().getpid(), signal_set.bits());
@@ -89,7 +122,7 @@ pub struct UserSigAction {
     pub handler: usize,
     /// Linux `SA_*` 标志位。
     pub sa_flags: usize,
-    /// 用户态信号掩码，当前内核只消费低 32 位。
+    /// 用户态信号掩码，当前内核按低 64 位读取并裁剪未支持的信号位。
     pub sa_mask: u64,
 }
 
@@ -101,7 +134,7 @@ impl From<UserSigAction> for SignalAction {
             handler: action.handler,
             sa_flags: action.sa_flags as u32,
             sa_restorer: 0,
-            sa_mask: action.sa_mask as u32,
+            sa_mask: SignalBit::from_user_bits(action.sa_mask).bits(),
         }
     }
 }
@@ -111,7 +144,9 @@ impl From<SignalAction> for UserSigAction {
         Self {
             handler: action.handler,
             sa_flags: action.sa_flags as usize,
-            sa_mask: action.sa_mask as u64,
+            sa_mask: SignalBit::from_bits(action.sa_mask)
+                .unwrap_or(SignalBit::empty())
+                .user_bits(),
         }
     }
 }
@@ -230,23 +265,19 @@ pub fn sys_sigaction(
 ///   how == SIG_UNBLOCK (1) -> mask &= ~set
 ///   how == SIG_SETMASK (2) -> mask = set
 /// 参数含义遵循 rt_sigprocmask: (int how, const sigset_t *set, sigset_t *oset, size_t sigsetsize)
-pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: usize) -> isize {
+pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_sigprocmask",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        // We represent sigset as a u32 bitmask in this kernel; require user-provided
-        // buffer to be large enough to hold at least a u32.
+        // Linux sigset_t 使用 `1 << (signum - 1)` 布局；内核内部也保持同一布局。
         if sigsetsize < core::mem::size_of::<u32>() {
             return Err(ERRNO::EINVAL);
         }
 
         let new_mask = if !set.is_null() {
-            let new_bits = *translated_ref(token, set).or_errno(ERRNO::EFAULT)?;
-            let new_mask = SignalFlags::from_bits(new_bits).or_errno(ERRNO::EINVAL)?;
-            Some(new_mask)
+            Some(read_user_sigset(set, sigsetsize)?)
         } else {
             None
         };
@@ -254,7 +285,7 @@ pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: us
         let old_bits = {
             let process = current_process();
             let mut inner = process.inner_exclusive_access();
-            let old_bits = inner.signal_mask.bits();
+            let old_mask = inner.signal_mask;
             if let Some(new_mask) = new_mask {
                 match how {
                     0 => inner.signal_mask.insert(new_mask), // SIG_BLOCK
@@ -263,13 +294,11 @@ pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: us
                     _ => return Err(ERRNO::EINVAL),
                 }
             }
-            old_bits
+            old_mask
         };
 
         // If user requested old mask, write it out after dropping process.inner.
-        if !oset.is_null() {
-            write_pod_to_user(oset, &old_bits)?;
-        }
+        write_user_sigset(oset, sigsetsize, old_bits)?;
 
         Ok(0)
     })
@@ -310,15 +339,9 @@ pub fn sys_sigreturn() -> isize {
         {
             let process = current_process();
             let mut inner = process.inner_exclusive_access();
-            if let Some(mask) = SignalFlags::from_bits(ucontext.uc_sigmask) {
-                inner.signal_mask = mask;
-                debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
-            } else {
-                warn!(
-                    "sys_sigreturn: invalid signal mask {:#x}",
-                    ucontext.uc_sigmask
-                );
-            }
+            let mask = SignalBit::from_user_bits(ucontext.uc_sigmask);
+            inner.signal_mask = mask;
+            debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
         }
 
         // Restore registers from mcontext
@@ -344,11 +367,11 @@ pub fn sys_sigreturn() -> isize {
 /// 原子地替换信号掩码并挂起进程，直到信号到达。
 /// 参数：
 ///   mask: 指向新信号掩码的指针
-///   sigsetsize: 信号集大小（支持 4 或 8 字节，但只使用前 4 字节）
+///   sigsetsize: 信号集大小（支持 4 或 8 字节）
 ///
 /// 返回值：
 ///   总是返回 -EINTR（被信号中断）
-pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
+pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_sigsuspend mask={:#x} sigsetsize={}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -356,8 +379,7 @@ pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
         sigsetsize
     );
     syscall_body!({
-        // Validate sigsetsize - accept 4 (32-bit) or 8 (64-bit) sigset_t
-        // We only use the first 32 bits for compatibility
+        // Validate sigsetsize - accept 4 (compat) or 8 (native) sigset_t.
         if sigsetsize != 4 && sigsetsize != 8 {
             debug!(
                 "sys_sigsuspend: invalid sigsetsize={}, expected 4 or 8",
@@ -366,12 +388,10 @@ pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
             return Err(ERRNO::EINVAL);
         }
 
-        let token = current_user_token();
         let process = current_process();
 
-        // Read new mask from user space (only use the first 32 bits)
-        let new_mask_bits = *translated_ref(token, mask).or_errno(ERRNO::EFAULT)?;
-        let new_mask = SignalFlags::from_bits(new_mask_bits).or_errno(ERRNO::EINVAL)?;
+        // Read new mask from user space.
+        let new_mask = read_user_sigset(mask, sigsetsize)?;
 
         // Save old mask and atomically set new mask
         let old_mask = {
@@ -446,9 +466,9 @@ pub fn sys_sigsuspend(mask: *const u32, sigsetsize: usize) -> isize {
 
 /// `rt_sigtimedwait_time32(2)`：等待并同步消费指定信号集合中的 pending signal。
 ///
-/// 当前内核使用 32 位 `sigset_t`，因此 64 位兼容入口只消费用户信号集的低 32 位。
+/// 当前内核使用 64 位 `SignalBit`，并保留 4 字节 sigsetsize 的兼容读取。
 pub fn sys_rt_sigtimedwait_time32(
-    uthese: *const u32,
+    uthese: *const u64,
     uinfo: *mut SigInfo,
     uts: *const OldTimespec32,
     sigsetsize: usize,

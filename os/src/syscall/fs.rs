@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{mem::{offset_of, size_of}, slice};
 use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
-use crate::task::SignalFlags;
+use crate::task::SignalBit;
 use crate::syscall::OldTimespec32;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
@@ -189,7 +189,7 @@ fn has_unmasked_pending_signal() -> bool {
     let pending = inner.pending_signals & !inner.signal_mask;
 
     for signum in 1..=crate::task::MAX_SIG {
-        let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
+        let Some(flag) = SignalBit::from_signum(signum as u32) else {
             continue;
         };
         if !pending.contains(flag) {
@@ -241,20 +241,25 @@ fn apply_temp_signal_mask(
     sigmask: *const u8,
     sigsetsize: usize,
     syscall_name: &str,
-) -> Result<Option<SignalFlags>, ERRNO> {
+) -> Result<Option<SignalBit>, ERRNO> {
     if sigmask.is_null() {
         return Ok(None);
     }
     if sigsetsize < size_of::<u32>() {
         warn!(
-            "{}: sigsetsize {} too small for u32 mask",
+            "{}: sigsetsize {} too small for sigset_t",
             syscall_name,
             sigsetsize
         );
         return Err(ERRNO::EINVAL);
     }
-    let new_mask_bits = read_pod_from_user(sigmask as *const u32)?;
-    let new_mask = SignalFlags::from_bits(new_mask_bits).or_errno(ERRNO::EINVAL)?;
+    let new_mask = if sigsetsize >= size_of::<u64>() {
+        let new_mask_bits = read_pod_from_user(sigmask as *const u64)?;
+        SignalBit::from_user_bits(new_mask_bits)
+    } else {
+        let new_mask_bits = read_pod_from_user(sigmask as *const u32)?;
+        SignalBit::from_user_bits(new_mask_bits as u64)
+    };
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let old = inner.signal_mask;
@@ -262,7 +267,7 @@ fn apply_temp_signal_mask(
     Ok(Some(old))
 }
 
-fn restore_temp_signal_mask(old_mask: Option<SignalFlags>) {
+fn restore_temp_signal_mask(old_mask: Option<SignalBit>) {
     if let Some(old) = old_mask {
         current_process().inner_exclusive_access().signal_mask = old;
     }
@@ -1770,7 +1775,7 @@ pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
 }
 
 /// `ppoll_time32(2)`：在 fd 集上等待事件，支持 32 位 timespec 与临时信号掩码。
-/// sigmask 目前转为*mut u32，因为当前的信号实现中掩码就是一个 u32 位域；未来若扩展为更复杂结构体再调整类型。
+/// sigmask 按 Linux sigset_t 处理，内核内部统一保存为 64 位 SignalBit。
 pub fn sys_ppoll_time32(
     ufds: *mut PollFd,
     nfds: u32,  // length of ufds
