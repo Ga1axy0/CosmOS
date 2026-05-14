@@ -20,7 +20,7 @@ use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
-use crate::sched::{mark_current_task_need_resched, on_timer_tick, schedule_if_needed};
+use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
     current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
@@ -160,7 +160,7 @@ pub fn clear_software_interrupt_pending() {
 fn handle_reschedule_ipi() {
     handle_ipi();
     clear_software_interrupt_pending();
-    mark_current_task_need_resched();
+    request_current_task_resched(ReschedReason::HigherRtPriority);
 }
 
 /// trap handler

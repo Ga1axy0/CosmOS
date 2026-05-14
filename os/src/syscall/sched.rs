@@ -6,13 +6,13 @@ use crate::{
     hart::hartid,
     mm::{translated_byte_buffer, translated_ref},
     sched::{
-        enqueue_task_on, has_runnable_task_at_or_above, mark_current_task_need_resched,
-        nice_to_weight, pid2process, remove_task, resched_hart, suspend_current_and_run_next,
+        enqueue_task_on, has_runnable_task_at_or_above, nice_to_weight, pid2process, remove_task,
+        request_current_task_resched, resched_hart, suspend_current_and_run_next,
         yield_current_and_run_next, MAX_NICE, MIN_NICE,
     },
     task::{
-        current_process, current_task, current_user_token, SchedPolicy, SCHED_RT_PRIO_MAX,
-        SCHED_RT_PRIO_MIN,
+        current_process, current_task, current_user_token, ReschedReason, SchedPolicy,
+        SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
     },
 };
 
@@ -20,6 +20,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
 
 const SCHED_RR: i32 = SchedPolicy::Rr as i32;
+const SCHED_FIFO: i32 = SchedPolicy::Fifo as i32;
 const SCHED_OTHER: i32 = SchedPolicy::Other as i32;
 const PRIO_PROCESS: i32 = 0;
 
@@ -101,8 +102,9 @@ pub fn sys_yield() -> isize {
         (task_inner.sched.policy, task_inner.sched.rt_priority)
     };
     match policy {
-        SchedPolicy::Rr => {
+        SchedPolicy::Fifo | SchedPolicy::Rr => {
             if has_runnable_task_at_or_above(hartid(), rt_priority) {
+                request_current_task_resched(ReschedReason::Yield);
                 suspend_current_and_run_next();
             }
         }
@@ -129,7 +131,7 @@ fn resched_task_if_running(task: &Arc<crate::task::TaskControlBlock>, is_current
     if let Some(hart) = running_hart {
         resched_hart(hart);
     } else {
-        mark_current_task_need_resched();
+        request_current_task_resched(ReschedReason::Migration);
     }
 }
 
@@ -138,14 +140,14 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
         if pid < 0 || param.is_null() {
             return Err(ERRNO::EINVAL);
         }
-        if policy != SCHED_RR && policy != SCHED_OTHER {
+        if policy != SCHED_RR && policy != SCHED_FIFO && policy != SCHED_OTHER {
             return Err(ERRNO::EINVAL);
         }
         let token = current_user_token();
         let param = translated_ref(token, param).or_errno(ERRNO::EFAULT)?;
         let priority = param.sched_priority;
         match policy {
-            SCHED_RR => {
+            SCHED_RR | SCHED_FIFO => {
                 if priority < SCHED_RT_PRIO_MIN as i32 || priority > SCHED_RT_PRIO_MAX as i32 {
                     return Err(ERRNO::EINVAL);
                 }
@@ -157,43 +159,73 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
             }
             _ => unreachable!(),
         }
+        let new_policy = match policy {
+            SCHED_RR => SchedPolicy::Rr,
+            SCHED_FIFO => SchedPolicy::Fifo,
+            SCHED_OTHER => SchedPolicy::Other,
+            _ => unreachable!(),
+        };
+        let new_priority = if new_policy.is_rt() {
+            priority as u8
+        } else {
+            0
+        };
         let task = if pid == 0 {
             current_task().unwrap()
         } else {
             task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
         };
-        let (was_on_rq, was_on_cpu, last_cpu) = {
+        let (was_on_rq, was_on_cpu, last_cpu, old_policy, old_priority) = {
             let task_inner = task.inner_exclusive_access();
             (
                 task_inner.sched.on_rq,
                 task_inner.sched.on_cpu,
                 task_inner.sched.last_cpu,
+                task_inner.sched.policy,
+                task_inner.sched.rt_priority,
             )
         };
+        if was_on_rq && old_policy == new_policy && old_priority == new_priority {
+            return Ok(0);
+        }
+        let enqueue_at_head =
+            old_policy.is_rt() && new_policy.is_rt() && new_priority < old_priority;
         if was_on_rq {
             remove_task(task.clone());
         }
         {
             let mut task_inner = task.inner_exclusive_access();
-            match policy {
-                SCHED_RR => {
+            match new_policy {
+                SchedPolicy::Rr => {
                     task_inner.sched.policy = SchedPolicy::Rr;
-                    task_inner.sched.rt_priority = priority as u8;
+                    task_inner.sched.rt_priority = new_priority;
                     task_inner.reset_time_slice();
+                    task_inner.sched.cfs_rq_key = None;
+                    task_inner.sched.rt_enqueue_head = enqueue_at_head;
                 }
-                SCHED_OTHER => {
+                SchedPolicy::Fifo => {
+                    task_inner.sched.policy = SchedPolicy::Fifo;
+                    task_inner.sched.rt_priority = new_priority;
+                    task_inner.sched.cfs_rq_key = None;
+                    task_inner.sched.rt_enqueue_head = enqueue_at_head;
+                }
+                SchedPolicy::Other => {
                     task_inner.sched.policy = SchedPolicy::Other;
                     task_inner.sched.rt_priority = 0;
                     task_inner.sched.cfs_initialized = false;
                     task_inner.sched.exec_start_ns = 0;
                     task_inner.sched.cfs_slice_start_ns = 0;
+                    task_inner.sched.rt_enqueue_head = false;
                 }
-                _ => unreachable!(),
+                SchedPolicy::Idle => unreachable!(),
             }
         }
         if was_on_rq {
             enqueue_task_on(task, last_cpu);
         } else if was_on_cpu {
+            if enqueue_at_head {
+                task.inner_exclusive_access().sched.rt_enqueue_head = true;
+            }
             resched_task_if_running(&task, pid == 0);
         }
         Ok(0)
@@ -227,7 +259,7 @@ pub fn sys_sched_getparam(pid: isize, param: *mut SchedParam) -> isize {
         };
         let sched_priority = {
             let task_inner = task.inner_exclusive_access();
-            if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
+            if task_inner.sched.policy.is_rt() {
                 task_inner.sched.rt_priority as i32
             } else {
                 0
@@ -354,7 +386,7 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: *const u8) -> 
             enqueue_task_on(task, target_hart);
         } else if needs_migration && was_on_cpu {
             if pid == 0 {
-                mark_current_task_need_resched();
+                request_current_task_resched(ReschedReason::Migration);
             } else {
                 resched_hart(current_hart);
             }

@@ -43,7 +43,7 @@ pub use process::{ExitReason, FdEntry, FdFlags};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
     clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
-    SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+    ReschedReason, SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
 };
 pub use task::{
     all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason,
@@ -74,7 +74,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     task_inner.task_status = TaskStatus::Zombie;
     task_inner.sched.on_cpu = false;
     task_inner.sched.on_rq = false;
-    task_inner.sched.need_resched = false;
+    task_inner.sched.resched_reason = None;
     task_inner.res = None;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called

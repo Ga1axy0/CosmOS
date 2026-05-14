@@ -104,7 +104,7 @@ pub(crate) fn run_tasks() {
             task_inner.sched.last_cpu = hartid();
             task_inner.sched.on_cpu = true;
             task_inner.sched.on_rq = false;
-            task_inner.sched.need_resched = false;
+            task_inner.sched.resched_reason = None;
             if matches!(task_inner.sched.policy, SchedPolicy::Other) {
                 let now_ns = get_time_ns();
                 task_inner.sched.exec_start_ns = now_ns;

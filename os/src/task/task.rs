@@ -5,7 +5,7 @@ use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock};
 use crate::config::MAX_HARTS;
 use crate::mm::PhysPageNum;
-use crate::sched::{SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
+use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
@@ -54,7 +54,9 @@ pub struct TaskSchedState {
     /// Whether the task has been placed on a CFS runqueue before.
     pub cfs_initialized: bool,
     /// Deferred reschedule request handled at safe scheduling points.
-    pub need_resched: bool,
+    pub resched_reason: Option<ReschedReason>,
+    /// Insert the task at the head of its RT priority queue on the next enqueue.
+    pub rt_enqueue_head: bool,
     /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
     pub cpu_affinity_mask: usize,
 }
@@ -78,7 +80,8 @@ impl TaskSchedState {
             cfs_slice_start_ns: 0,
             cfs_rq_key: None,
             cfs_initialized: false,
-            need_resched: false,
+            resched_reason: None,
+            rt_enqueue_head: false,
             cpu_affinity_mask: all_cpu_affinity_mask(),
         }
     }
