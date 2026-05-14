@@ -86,6 +86,7 @@ pub struct Credentials {
     pub gid: u32,
     pub egid: u32,
     pub sid: u32,
+    pub pgid: u32,
 }
 
 impl Credentials {
@@ -96,6 +97,7 @@ impl Credentials {
             gid: 0,
             egid: 0,
             sid: 0,
+            pgid: 0,
         }
     }
 }
@@ -474,6 +476,8 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // allocate a pid
         let pid_handle = pid_alloc();
+        let mut cred = Credentials::root();
+        cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
@@ -498,7 +502,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
                     exec_path,
-                    cred: Credentials::root(),
+                    cred,
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -1017,6 +1021,18 @@ impl ProcessControlBlock {
 
     pub fn getsid(&self) -> u32 {
         self.inner.lock().cred.sid
+    }
+
+    pub fn setsid(&self, sid: u32) {
+        self.inner.lock().cred.sid = sid;
+    }
+
+    pub fn getpgid(&self) -> u32 {
+        self.inner.lock().cred.pgid
+    }
+
+    pub fn setpgid(&self, pgid: u32) {
+        self.inner.lock().cred.pgid = pgid;
     }
 
     /// map an anonymous area with given permission, return true if success

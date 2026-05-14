@@ -412,6 +412,22 @@ pub fn getpid() -> isize {
     sys_getpid()
 }
 
+pub fn getpgid(pid: isize) -> isize {
+    sys_getpgid(pid)
+}
+
+pub fn setpgid(pid: isize, pgid: isize) -> isize {
+    sys_setpgid(pid, pgid)
+}
+
+pub fn getsid() -> isize {
+    sys_getsid()
+}
+
+pub fn setsid() -> isize {
+    sys_setsid()
+}
+
 pub fn socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
     sys_socket(domain, socket_type, protocol)
 }

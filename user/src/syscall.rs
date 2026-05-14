@@ -37,6 +37,10 @@ pub const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
 pub const SYSCALL_SCHED_GETPARAM: usize = 121;
 pub const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 pub const SYSCALL_SCHED_GETAFFINITY: usize = 123;
+pub const SYSCALL_GETPGID: usize = 154;
+pub const SYSCALL_SETPGID: usize = 155;
+pub const SYSCALL_GETSID: usize = 156;
+pub const SYSCALL_SETSID: usize = 157;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_SOCKET: usize = 198;
@@ -270,6 +274,22 @@ pub fn sys_get_time(time: &mut TimeVal, tz: usize) -> isize {
 
 pub fn sys_getpid() -> isize {
     syscall(SYSCALL_GETPID, [0, 0, 0])
+}
+
+pub fn sys_getpgid(pid: isize) -> isize {
+    syscall(SYSCALL_GETPGID, [pid as usize, 0, 0])
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    syscall(SYSCALL_SETPGID, [pid as usize, pgid as usize, 0])
+}
+
+pub fn sys_getsid() -> isize {
+    syscall(SYSCALL_GETSID, [0, 0, 0])
+}
+
+pub fn sys_setsid() -> isize {
+    syscall(SYSCALL_SETSID, [0, 0, 0])
 }
 
 pub fn sys_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
