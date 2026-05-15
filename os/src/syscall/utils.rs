@@ -1,8 +1,9 @@
 use crate::config::PAGE_SIZE;
 use crate::mm::{translated_byte_buffer, PageFaultAccess, PageTable, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::task::{current_process, current_user_token};
+use crate::task::{current_process, current_user_token, ProcessControlBlock};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::mem::{size_of, MaybeUninit};
@@ -14,11 +15,31 @@ use core::slice;
 /// 以显式确认该类型可以安全地通过 `write_pod_to_user` 按字节写回用户空间。
 pub trait Pod {}
 
+// i32 是 Linux ABI 中常见的简单写回类型，如 tid/status。
+impl Pod for i16 {}
+impl Pod for i32 {}
+// u32/usize 是若干 syscall 写回标量结果时使用的基础 ABI 类型。
+impl Pod for u32 {}
+impl Pod for usize {}
+
+/// 判断页表项是否允许指定用户态访问。
+fn pte_allows_user_access(pte: crate::mm::PageTableEntry, access: PageFaultAccess) -> bool {
+    if !pte.is_user() {
+        return false;
+    }
+    match access {
+        PageFaultAccess::Read => pte.readable(),
+        PageFaultAccess::Write => pte.writable(),
+        PageFaultAccess::Exec => pte.executable(),
+    }
+}
+
 /// 尝试为一段用户虚拟地址触发并完成缺页装入，使后续字节翻译可成功。
 ///
-/// 仅处理与当前进程地址空间相关的 lazy file-backed / COW 场景；若地址本身
-/// 不合法或权限不允许，会返回对应错误。
+/// 同时检查最终 PTE 是否具备用户态访问权限，避免内核 copyin/copyout 绕过
+/// 用户页保护语义。
 fn prefault_user_pages(
+    process: &Arc<ProcessControlBlock>,
     token: usize,
     ptr: *const u8,
     len: usize,
@@ -30,12 +51,11 @@ fn prefault_user_pages(
 
     let start = ptr as usize;
     let end = start.checked_add(len).ok_or(ERRNO::EFAULT)?;
-    let page_table = PageTable::from_token(token);
-    let process = current_process();
     let mut page_start = start & !(PAGE_SIZE - 1);
 
     while page_start < end {
         let vpn = VirtAddr::from(page_start).floor();
+        let page_table = PageTable::from_token(token);
         match page_table.translate(vpn) {
             Some(pte) => {
                 // 映射已存在但不可写：可能是 COW 或 MAP_SHARED 写通知页。
@@ -68,6 +88,11 @@ fn prefault_user_pages(
                 }
             }
         }
+        let page_table = PageTable::from_token(token);
+        let pte = page_table.translate(vpn).ok_or(ERRNO::EFAULT)?;
+        if !pte_allows_user_access(pte, access) {
+            return Err(ERRNO::EFAULT);
+        }
 
         page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
     }
@@ -82,11 +107,20 @@ pub fn translated_byte_buffer_with_access(
     access: PageFaultAccess,
 ) -> Result<Vec<&'static mut [u8]>, ERRNO> {
     let token = current_user_token();
-    if let Some(buffers) = translated_byte_buffer(token, ptr, len) {
-        return Ok(buffers);
-    }
+    let process = current_process();
+    prefault_user_pages(&process, token, ptr, len, access)?;
+    translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)
+}
 
-    prefault_user_pages(token, ptr, len, access)?;
+/// 将指定进程的用户地址翻译为内核可写切片，并按访问类型检查权限。
+pub fn translated_process_byte_buffer_with_access(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *const u8,
+    len: usize,
+    access: PageFaultAccess,
+) -> Result<Vec<&'static mut [u8]>, ERRNO> {
+    let token = process.inner_exclusive_access().memory_set.token();
+    prefault_user_pages(process, token, ptr, len, access)?;
     translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)
 }
 
@@ -106,11 +140,43 @@ pub fn write_bytes_to_user(ptr: *mut u8, src: &[u8]) -> Result<(), ERRNO> {
     Ok(())
 }
 
+/// 将一段字节序列写回到指定进程的用户地址空间。
+pub fn write_bytes_to_process_user(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *mut u8,
+    src: &[u8],
+) -> Result<(), ERRNO> {
+    let mut buffers = translated_process_byte_buffer_with_access(
+        process,
+        ptr as *const u8,
+        src.len(),
+        PageFaultAccess::Write,
+    )?;
+    let mut copied = 0usize;
+    for buffer in buffers.iter_mut() {
+        let len = buffer.len();
+        buffer.copy_from_slice(&src[copied..copied + len]);
+        copied += len;
+    }
+    Ok(())
+}
+
 /// 将一个 POD 结构写回到用户地址空间。
 pub fn write_pod_to_user<T: Pod>(ptr: *mut T, value: &T) -> Result<(), ERRNO> {
     let value_bytes =
         unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
     write_bytes_to_user(ptr as *mut u8, value_bytes)
+}
+
+/// 将一个 POD 结构写回到指定进程的用户地址空间。
+pub fn write_pod_to_process_user<T: Pod>(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *mut T,
+    value: &T,
+) -> Result<(), ERRNO> {
+    let value_bytes =
+        unsafe { slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
+    write_bytes_to_process_user(process, ptr as *mut u8, value_bytes)
 }
 
 /// 从用户地址空间读取一段字节，允许跨越多个用户页。

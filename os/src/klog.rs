@@ -42,12 +42,12 @@ use core::fmt;
 use lazy_static::lazy_static;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
-use crate::mm::translated_byte_buffer;
+use crate::mm::PageFaultAccess;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
+use crate::syscall::translated_byte_buffer_with_access;
 use crate::syscall_body;
 use crate::task::current_task;
-use crate::task::current_user_token;
 
 const KLOG_BUFFER_CAPACITY: usize = 16 * 1024;
 
@@ -230,13 +230,15 @@ fn syslog_action_open() -> isize {
 }
 
 fn syslog_action_read(bufp: *mut u8, size: usize) -> isize {
-    let token = current_user_token();
     syscall_body!({
         if size == 0 {
             return Ok(0);
         }
-        let user_bufs = translated_byte_buffer(token, bufp as *const u8, size)
-            .ok_or(ERRNO::EINVAL)?;
+        let user_bufs = translated_byte_buffer_with_access(
+            bufp as *const u8,
+            size,
+            PageFaultAccess::Write,
+        ).map_err(|_| ERRNO::EINVAL)?;
         let mut klog = KLOG_BUFFER.lock();
         let mut copied = 0usize;
         for slice in user_bufs {
@@ -251,13 +253,15 @@ fn syslog_action_read(bufp: *mut u8, size: usize) -> isize {
 }
 
 fn syslog_action_read_all(bufp: *mut u8, size: usize) -> isize {
-    let token = current_user_token();
     syscall_body!({
         if size == 0 {
             return Ok(0);
         }
-        let user_bufs = translated_byte_buffer(token, bufp as *const u8, size)
-            .ok_or(ERRNO::EINVAL)?;
+        let user_bufs = translated_byte_buffer_with_access(
+            bufp as *const u8,
+            size,
+            PageFaultAccess::Write,
+        ).map_err(|_| ERRNO::EINVAL)?;
         let klog = KLOG_BUFFER.lock();
         let available = klog.since_clear_len();
         let target_len = size.min(available);
@@ -275,14 +279,16 @@ fn syslog_action_read_all(bufp: *mut u8, size: usize) -> isize {
 }
 
 fn syslog_action_read_clear(bufp: *mut u8, size: usize) -> isize {
-    let token = current_user_token();
     syscall_body!({
         if size == 0 {
             KLOG_BUFFER.lock().clear_since_marker();
             return Ok(0);
         }
-        let user_bufs = translated_byte_buffer(token, bufp as *const u8, size)
-            .ok_or(ERRNO::EINVAL)?;
+        let user_bufs = translated_byte_buffer_with_access(
+            bufp as *const u8,
+            size,
+            PageFaultAccess::Write,
+        ).map_err(|_| ERRNO::EINVAL)?;
         let mut klog = KLOG_BUFFER.lock();
         let available = klog.since_clear_len();
         let target_len = size.min(available);

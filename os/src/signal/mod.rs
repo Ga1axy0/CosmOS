@@ -1,6 +1,7 @@
 //! Signal handling implementation.
 
 use crate::{
+    config::USER_VDSO_RT_SIGRETURN,
     syscall::write_pod_to_user,
     task::{current_process, current_trap_cx},
 };
@@ -232,11 +233,12 @@ pub fn handle_signals() {
             action.sa_restorer
         );
     } else {
-        // Kernel fallback: write a trampoline that calls rt_sigreturn
-        // For now, we expect user to provide restorer
-        // TODO: implement kernel trampoline page
-        warn!("handle_signals: no restorer provided, signal may not return properly");
-        trap_cx.x[1] = 0; // This will likely crash, but it's user's fault
+        // RISC-V Linux 不要求用户态提供 SA_RESTORER，统一回到内核提供的 trampoline。
+        trap_cx.x[1] = USER_VDSO_RT_SIGRETURN;
+        debug!(
+            "handle_signals: using kernel vdso rt_sigreturn at {:#x}",
+            USER_VDSO_RT_SIGRETURN
+        );
     }
 
     // Jump to signal handler

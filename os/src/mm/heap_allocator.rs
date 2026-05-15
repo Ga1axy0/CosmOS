@@ -199,7 +199,7 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         kernel_space.page_table.map_kernel_untracked(
             vpn,
             ppn,
-            super::PTEFlags::R | super::PTEFlags::W,
+            super::page_table::PTEFlags::R | super::page_table::PTEFlags::W,
         );
         core::mem::forget(frame);
     }

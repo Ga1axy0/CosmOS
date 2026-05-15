@@ -15,8 +15,8 @@ use crate::mm::{
     KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
-use crate::syscall::ResourceLimits;
 use crate::syscall::errno::ERRNO;
+use crate::syscall::{write_pod_to_process_user, ResourceLimits};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -239,6 +239,75 @@ impl ProcessVmLayout {
     }
 }
 
+/// 按 Linux ELF ABI 在用户栈上构造 argc/argv/envp/auxv 初始布局。
+fn init_user_stack_from_strings(
+    token: usize,
+    stack_top: usize,
+    args: &[String],
+    auxv_extra: &[(usize, usize)],
+) -> usize {
+    let mut user_sp = stack_top;
+    let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
+    // 参数字符串放在高地址区域，argv 表只保存用户态指针。
+    for arg in args.iter().rev() {
+        user_sp -= arg.len() + 1;
+        let mut p = user_sp;
+        for c in arg.as_bytes() {
+            *translated_refmut(token, p as *mut u8).unwrap() = *c;
+            p += 1;
+        }
+        *translated_refmut(token, p as *mut u8).unwrap() = 0;
+        arg_ptrs.push(user_sp);
+    }
+    arg_ptrs.reverse();
+
+    user_sp &= !0xf_usize;
+
+    // glibc 会读取 AT_RANDOM，这里先提供固定的 16 字节随机区。
+    // TODO: 后续接入真正的随机源，避免固定 canary。
+    user_sp -= 8;
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
+    user_sp -= 8;
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
+    let at_random_ptr = user_sp;
+
+    // 先放入 AT_NULL，再倒序放入额外 auxv 与基础 auxv，保证内存中按正序排列。
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    for &(tag, val) in auxv_extra.iter().rev() {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = val;
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = tag;
+    }
+    for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = word;
+    }
+
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    for &ptr in arg_ptrs.iter().rev() {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = ptr;
+    }
+
+    user_sp -= core::mem::size_of::<usize>();
+    *translated_refmut(token, user_sp as *mut usize).unwrap() = args.len();
+    user_sp
+}
+
+/// 便捷封装：从静态字符串参数构造用户初始栈。
+fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
+    let args: Vec<String> = args.iter().map(|arg| String::from(*arg)).collect();
+    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[])
+}
+
 impl ProcessControlBlockInner {
     #[allow(unused)]
     /// get the address of app's page table
@@ -421,9 +490,10 @@ impl ProcessControlBlock {
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
+        let user_sp = init_user_stack(process.inner_exclusive_access().get_user_token(), ustack_top, &["initproc"]);
         *trap_cx = TrapContext::app_init_context(
             entry_point,
-            ustack_top,
+            user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,
@@ -596,72 +666,12 @@ impl ProcessControlBlock {
         //   [sp+(argc+?)*8]   0              /
         //   [above + 16 bytes random data, 16-byte aligned]  argument strings
         trace!("kernel: exec .. push arguments on user stack");
-        let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
-
-        // 1. Push argument strings (from stack top downward)
-        let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
-        for arg in args.iter().rev() {
-            user_sp -= arg.len() + 1;
-            let mut p = user_sp;
-            for c in arg.as_bytes() {
-                *translated_refmut(new_token, p as *mut u8).unwrap() = *c;
-                p += 1;
-            }
-            *translated_refmut(new_token, p as *mut u8).unwrap() = 0;
-            arg_ptrs.push(user_sp);
-        }
-        arg_ptrs.reverse(); // arg_ptrs[i] now points to args[i]
-
-        // 2. 16-byte align sp (RISC-V calling convention)
-        user_sp &= !0xf_usize;
-
-        // 3. Push 16 bytes of pseudo-random data for AT_RANDOM.
-        //    glibc's __libc_start_main reads _dl_random (set from AT_RANDOM) for stack
-        //    canary / arc4random seeding; if AT_RANDOM is absent the pointer stays null
-        //    and the very first dereference crashes.
-        user_sp -= 8;
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
-        user_sp -= 8;
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
-        let at_random_ptr = user_sp; // pointer to the 16 pseudo-random bytes above
-
-        // 4. Push auxv in reverse order
-        // First push AT_NULL terminator
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
-
-        // Push dynamic linking auxv if present (in reverse order)
-        for &(tag, val) in auxv_extra.iter().rev() {
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = val;
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = tag;
-        }
-
-        // Push standard auxv entries
-        for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = word;
-        }
-
-        // 5. Push envp NULL terminator (empty environment)
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0;
-
-        // 6. Push argv NULL terminator, then argv pointers (reversed to fill low→high)
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = 0; // argv[argc] = NULL
-        for &ptr in arg_ptrs.iter().rev() {
-            user_sp -= core::mem::size_of::<usize>();
-            *translated_refmut(new_token, user_sp as *mut usize).unwrap() = ptr;
-        }
-        let argv_base = user_sp; // argv_base == sp+8 once argc is pushed below
-
-        // 7. Push argc  —  sp now points here; glibc/musl _start reads argc from *sp
-        user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(new_token, user_sp as *mut usize).unwrap() = args.len();
+        let user_sp = init_user_stack_from_strings(
+            new_token,
+            task_inner.res.as_mut().unwrap().ustack_top(),
+            args.as_slice(),
+            auxv_extra.as_slice(),
+        );
 
         // initialize trap_cx
         trace!("kernel: exec .. initialize trap_cx with entry={:#x}", final_entry);
@@ -672,23 +682,36 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        // a0/a1 are set for compatibility with non-glibc entry points;
-        // glibc _start ignores these and reads argc/argv directly from the stack.
-        trap_cx.x[10] = args.len();
-        trap_cx.x[11] = argv_base;
+        // RISC-V glibc _start treats a0 as rtld_fini and reads argc/argv from the stack.
+        trap_cx.x[10] = 0;
+        trap_cx.x[11] = 0;
+        debug!(
+            "kernel: exec trap init entry={:#x} sp={:#x} a0={:#x} a1={:#x}",
+            final_entry,
+            user_sp,
+            trap_cx.x[10],
+            trap_cx.x[11]
+        );
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
-    /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Arc<Self> {
-        trace!("kernel: fork");
+    /// 按 Linux `clone` 的进程分支创建子进程。
+    ///
+    /// 当前只支持 fork-like 语义；`child_stack` 非 0 时作为子进程返回用户态的 `sp`。
+    pub fn clone_process(
+        self: &Arc<Self>,
+        child_stack: usize,
+        child_tls: Option<usize>,
+        child_set_tid: Option<usize>,
+    ) -> Arc<Self> {
+        trace!("kernel: clone_process");
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        // debug!(
-        //     "[cow] fork begin: parent_pid={} parent_threads={}",
-        //     self.getpid(),
-        //     parent.thread_count()
-        // );
+        debug!(
+            "[cow] clone_process begin: parent_pid={} parent_threads={}",
+            self.getpid(),
+            parent.thread_count()
+        );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let (memory_set, parent_tlb_needs_flush) =
             MemorySet::from_existed_user(&mut parent.memory_set);
@@ -771,7 +794,7 @@ impl ProcessControlBlock {
             shootdown(parent_mask, ShootdownKind::AddressSpace { satp: parent_token });
         }
         debug!(
-            "[cow] fork created child process: parent_pid={} child_pid={}",
+            "[cow] clone_process created child process: parent_pid={} child_pid={}",
             self.getpid(),
             child.getpid()
         );
@@ -790,19 +813,37 @@ impl ProcessControlBlock {
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
-        // Finalize the child's trap context before publishing it to the scheduler.
-        // Otherwise, on SMP the child may run on another hart before `sys_fork`
-        // patches the inherited return register, breaking fork semantics.
+        // 在发布到调度器前修正子进程 trap context，避免 SMP 下子进程过早运行。
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
         trap_cx.x[10] = 0;
+        if child_stack != 0 {
+            // Linux clone ABI 要求子进程从指定用户栈继续执行。
+            trap_cx.x[2] = child_stack;
+        }
+        if let Some(tls) = child_tls {
+            // RISC-V 用户态 TLS 指针使用 tp，也就是 x4。
+            trap_cx.x[4] = tls;
+        }
         drop(task_inner);
-        // debug!(
-        //     "[cow] fork complete: parent_pid={} child_pid={}",
-        //     self.getpid(),
-        //     child.getpid()
-        // );
+        if let Some(child_tid_ptr) = child_set_tid {
+            let child_tid_value = child.getpid() as i32;
+            if write_pod_to_process_user(&child, child_tid_ptr as *mut i32, &child_tid_value)
+                .is_err()
+            {
+                // TODO：当前 clone_process 尚未实现失败回滚，只能保守记录异常。
+                warn!(
+                    "kernel: clone_process failed to write child_tid at {:#x}",
+                    child_tid_ptr
+                );
+            }
+        }
+        debug!(
+            "[cow] clone_process complete: parent_pid={} child_pid={}",
+            self.getpid(),
+            child.getpid()
+        );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
@@ -883,9 +924,10 @@ impl ProcessControlBlock {
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
+        let user_sp = init_user_stack(child.inner_exclusive_access().get_user_token(), ustack_top, &["spawn"]);
         *trap_cx = TrapContext::app_init_context(
             entry_point,
-            ustack_top,
+            user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
             trap_handler as usize,

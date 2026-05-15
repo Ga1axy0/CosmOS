@@ -1,16 +1,15 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{write_pod_to_user, Pod};
+use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
         exit_current_and_run_next, pid2process, remove_from_pid2process,
-        suspend_current_and_run_next, ExitReason, SignalFlags,
-        WaitReason,
+        ExitReason, SignalFlags, WaitReason,
     },
 };
 
@@ -217,21 +216,166 @@ pub fn sys_setsid() -> isize {
     1
 }
 
-/// fork child process syscall
-pub fn sys_fork() -> isize {
+/// `clone` 支持的退出信号：当前仅实现 basic 测试需要的 SIGCHLD。
+const CLONE_EXIT_SIGNAL_SIGCHLD: usize = 17;
+/// Linux clone flags 中低 8 位保存退出信号。
+const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
+
+bitflags! {
+    /// Linux `clone` 的功能标志位，不包含低 8 位退出信号。
+    struct CloneFlags: usize {
+        /// 共享地址空间标志，当前暂不支持。
+        const CLONE_VM = 0x0000_0100;
+        /// 共享文件系统上下文标志，当前暂不支持。
+        const CLONE_FS = 0x0000_0200;
+        /// 共享文件描述符表标志，当前暂不支持。
+        const CLONE_FILES = 0x0000_0400;
+        /// 共享信号处理表标志，当前暂不支持。
+        const CLONE_SIGHAND = 0x0000_0800;
+        /// vfork 语义标志，当前暂不支持。
+        const CLONE_VFORK = 0x0000_4000;
+        /// 线程组标志，当前暂不支持。
+        const CLONE_THREAD = 0x0001_0000;
+        /// 设置子任务 TLS 指针，RISC-V 上对应 tp(x4)。
+        const CLONE_SETTLS = 0x0008_0000;
+        /// 在父地址空间写入子 tid。
+        const CLONE_PARENT_SETTID = 0x0010_0000;
+        /// 子任务退出时清理 child_tid，当前暂不支持。
+        const CLONE_CHILD_CLEARTID = 0x0020_0000;
+        /// 在子地址空间写入子 tid。
+        const CLONE_CHILD_SETTID = 0x0100_0000;
+    }
+}
+
+/// Linux `clone` syscall。
+///
+/// 当前支持 fork-like 进程创建、`stack`、`CLONE_SETTLS` 与 set_tid 写入。
+///
+/// `CLONE_CHILD_CLEARTID` 暂时仅告警并忽略，避免 glibc fork 包装因可延后语义失败。
+pub fn sys_clone(
+    flags: usize,
+    stack: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
+) -> isize {
+    let clone_flags_arg = flags;
     trace!(
-        "kernel:pid[{}] sys_fork",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        flags,
+        stack,
     );
+    debug!(
+        "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
+        clone_flags_arg,
+        parent_tid,
+        child_tid
+    );
+    let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
+    let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
+    let flags = CloneFlags::from_bits_truncate(raw_clone_flags);
+    let unsupported_flags = raw_clone_flags & !CloneFlags::all().bits();
+    if unsupported_flags != 0 {
+        warn!(
+            "kernel: sys_clone unknown clone flags {:#x}",
+            unsupported_flags
+        );
+        return -(ERRNO::EINVAL as isize);
+    }
+    if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
+        warn!(
+            "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
+            exit_signal
+        );
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_VM) {
+        warn!("kernel: sys_clone unsupported flag CLONE_VM");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_FS) {
+        warn!("kernel: sys_clone unsupported flag CLONE_FS");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_FILES) {
+        warn!("kernel: sys_clone unsupported flag CLONE_FILES");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_SIGHAND) {
+        warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_VFORK) {
+        warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_THREAD) {
+        warn!("kernel: sys_clone unsupported flag CLONE_THREAD");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+        // TODO: 在线程退出路径清零 child_tid 并执行 futex wake。
+        warn!(
+            "kernel: sys_clone ignored flag CLONE_CHILD_CLEARTID: child_tid={:#x}",
+            child_tid
+        );
+    }
+    let mut parent_set_tid = None;
+    if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+        if parent_tid == 0 {
+            warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
+            return -(ERRNO::EFAULT as isize);
+        }
+        if translated_byte_buffer_with_access(
+            parent_tid as *const u8,
+            core::mem::size_of::<i32>(),
+            PageFaultAccess::Write,
+        ).is_err() {
+            return -(ERRNO::EFAULT as isize);
+        }
+        parent_set_tid = Some(parent_tid);
+    }
+    let mut child_set_tid = None;
+    if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+        if child_tid == 0 {
+            warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
+            return -(ERRNO::EFAULT as isize);
+        }
+        // 子地址空间由父地址空间复制而来，创建前先确认该地址在父进程中可写。
+        if translated_byte_buffer_with_access(
+            child_tid as *const u8,
+            core::mem::size_of::<i32>(),
+            PageFaultAccess::Write,
+        ).is_err() {
+            return -(ERRNO::EFAULT as isize);
+        }
+        child_set_tid = Some(child_tid);
+    }
+    let mut child_tls = None;
+    if flags.contains(CloneFlags::CLONE_SETTLS) {
+        debug!(
+            "kernel: sys_clone set child TLS to {:#x}",
+            tls
+        );
+        child_tls = Some(tls);
+    }
     let current_process = current_process();
-    let new_process = current_process.fork();
-    info!(
-        "kernel:pid[{}] forked new process with pid {} - time {}",
-        current_process.getpid(),
-        new_process.getpid(),
-        get_time_ns()
-    );
-    new_process.getpid() as isize
+    syscall_body!({
+        let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
+        let child_pid = new_process.getpid() as i32;
+        debug!(
+            "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
+            clone_flags_arg,
+            parent_tid,
+            child_tid,
+            child_pid
+        );
+        if let Some(ptr) = parent_set_tid {
+            write_pod_to_user(ptr as *mut i32, &child_pid)?;
+        }
+        Ok(child_pid as isize)
+    })
 }
 /// sys_execve
 pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
@@ -271,10 +415,10 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage { elf_data, argv } = resolved;
-        let argc = argv.len();
-        process.exec(elf_data.as_slice(), argv).or_errno(ERRNO::ENOEXEC)?;
-        // trap 返回路径会覆盖 a0，这里返回 argc 以保持新程序入口参数正确。
-        Ok(argc as isize)
+        process.exec(elf_data.as_slice(), argv)?;
+        // Linux execve succeeds by returning 0 through the trap return path.
+        // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
+        Ok(0)
     })
 }
 
@@ -327,17 +471,12 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     .child_kernel_time
                     .saturating_add(child_inner.kernel_time)
                     .saturating_add(child_inner.child_kernel_time);
-                let token = inner.memory_set.token();
                 drop(child_inner);
                 drop(inner);
                 remove_from_pid2process(found_pid);
 
                 if !exit_status_ptr.is_null() {
-                    if let Some(slot) = translated_refmut(token, exit_status_ptr) {
-                        *slot = exit_status;
-                    } else {
-                        return Err(ERRNO::EFAULT);
-                    }
+                    write_pod_to_user(exit_status_ptr, &exit_status)?;
                 }
 
                 return Ok(found_pid as isize);
@@ -530,12 +669,11 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut usize, len_ptr: *mut usize) 
     syscall_body!({
         let process = pid2process(pid as usize).or_errno(ERRNO::ESRCH)?;
         let robust_list = &process.inner_exclusive_access().robust_list;
-        let token = current_user_token();
         if !head_ptr.is_null() {
-            translated_refmut(token, head_ptr).map(|slot| *slot = robust_list.head).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(head_ptr, &robust_list.head)?;
         }
         if !len_ptr.is_null() {
-            translated_refmut(token, len_ptr).map(|slot| *slot = robust_list.len).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(len_ptr, &robust_list.len)?;
         }
         Ok(0)
     })
@@ -562,13 +700,12 @@ pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let token = current_user_token();
         let cpu = hartid() as u32;
         if !cpu_ptr.is_null() {
-            translated_refmut(token, cpu_ptr).map(|slot| *slot = cpu).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(cpu_ptr, &cpu)?;
         }
         if !node_ptr.is_null() {
-            translated_refmut(token, node_ptr).map(|slot| *slot = 0).ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(node_ptr, &0u32)?;
         }
         Ok(0)
     })

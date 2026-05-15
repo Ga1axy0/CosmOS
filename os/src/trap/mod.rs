@@ -36,6 +36,49 @@ use riscv::register::{
 
 global_asm!(include_str!("trap.S"));
 
+/// 输出用户态致命异常现场，区分 fault 地址、用户 PC 与关键寄存器。
+fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
+    let cx = current_trap_cx();
+    error!(
+        "[kernel] user fault: reason={}, access={}, pid={}, fault_addr={:#x}, user_pc={:#x}, ra={:#x}, sp={:#x}, gp={:#x}, tp={:#x}, a0={:#x}, a1={:#x}, a7={:#x}, signal={}",
+        reason,
+        access,
+        current_process().getpid(),
+        fault_addr,
+        cx.sepc,
+        cx.x[1],
+        cx.x[2],
+        cx.x[3],
+        cx.x[4],
+        cx.x[10],
+        cx.x[11],
+        cx.x[17],
+        signal,
+    );
+    error!(
+        "[kernel] user fault regs: t0={:#x}, t1={:#x}, t2={:#x}, s0={:#x}, s1={:#x}, s2={:#x}, s3={:#x}, s4={:#x}, s5={:#x}, s6={:#x}, s7={:#x}, s8={:#x}, s9={:#x}, s10={:#x}, s11={:#x}, t3={:#x}, t4={:#x}, t5={:#x}, t6={:#x}",
+        cx.x[5],
+        cx.x[6],
+        cx.x[7],
+        cx.x[8],
+        cx.x[9],
+        cx.x[18],
+        cx.x[19],
+        cx.x[20],
+        cx.x[21],
+        cx.x[22],
+        cx.x[23],
+        cx.x[24],
+        cx.x[25],
+        cx.x[26],
+        cx.x[27],
+        cx.x[28],
+        cx.x[29],
+        cx.x[30],
+        cx.x[31],
+    );
+}
+
 /// 初始化当前 hart 的 trap 相关状态。
 ///
 /// 该函数需要每个 hart 各自执行一次，用于安装本 hart 的内核 trap 入口，
@@ -143,21 +186,11 @@ pub fn trap_handler() -> ! {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
-                        error!(
-                            "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
-                            scause.cause(),
-                            stval,
-                            current_trap_cx().sepc,
-                        );
+                        log_user_fault("store page fault beyond file EOF", "write", stval, "SIGBUS");
                         current_add_signal(SignalFlags::SIGBUS);
                     }
                     Err(_) => {
-                        error!(
-                            "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                            scause.cause(),
-                            stval,
-                            current_trap_cx().sepc,
-                        );
+                        log_user_fault("store page fault", "write", stval, "SIGSEGV");
                         current_add_signal(SignalFlags::SIGSEGV);
                     }
                 }
@@ -173,21 +206,11 @@ pub fn trap_handler() -> ! {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
-                        error!(
-                            "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
-                            scause.cause(),
-                            stval,
-                            current_trap_cx().sepc,
-                        );
+                        log_user_fault("load page fault beyond file EOF", "read", stval, "SIGBUS");
                         current_add_signal(SignalFlags::SIGBUS);
                     }
                     Err(_) => {
-                        error!(
-                            "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                            scause.cause(),
-                            stval,
-                            current_trap_cx().sepc,
-                        );
+                        log_user_fault("load page fault", "read", stval, "SIGSEGV");
                         current_add_signal(SignalFlags::SIGSEGV);
                     }
                 }
@@ -202,21 +225,11 @@ pub fn trap_handler() -> ! {
             match current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
                 Ok(()) => {}
                 Err(ERRNO::ENXIO) => {
-                    error!(
-                        "[kernel] trap_handler: {:?} beyond file EOF, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it with SIGBUS.",
-                        scause.cause(),
-                        stval,
-                        current_trap_cx().sepc,
-                    );
+                    log_user_fault("instruction page fault beyond file EOF", "exec", stval, "SIGBUS");
                     current_add_signal(SignalFlags::SIGBUS);
                 }
                 Err(_) => {
-                    error!(
-                        "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                        scause.cause(),
-                        stval,
-                        current_trap_cx().sepc,
-                    );
+                    log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
                     current_add_signal(SignalFlags::SIGSEGV);
                 }
             }
@@ -224,20 +237,11 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::InstructionFault)
         | Trap::Exception(Exception::LoadFault) => {
-            error!(
-                "[kernel] trap_handler: {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                scause.cause(),
-                stval,
-                current_trap_cx().sepc,
-            );
+            log_user_fault("access fault", "unknown", stval, "SIGSEGV");
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
-            error!(
-                "[kernel] trap_handler: Illegal instruction in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                current_trap_cx().sepc,
-                stval,
-            );
+            log_user_fault("illegal instruction", "exec", stval, "SIGILL");
             current_add_signal(SignalFlags::SIGILL);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {

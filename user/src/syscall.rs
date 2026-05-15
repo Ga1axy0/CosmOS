@@ -45,7 +45,7 @@ pub const SYSCALL_SHUTDOWN: usize = 210;
 pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
 pub const SYSCALL_GETTID: usize = 178;
-pub const SYSCALL_FORK: usize = 220;
+pub const SYSCALL_CLONE: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
 pub const SYSCALL_BRK: usize = 214;
@@ -299,8 +299,18 @@ pub fn sys_recvmsg(fd: usize, msg: *mut crate::net::MsgHdr, flags: usize) -> isi
     syscall(SYSCALL_RECVMSG, [fd, msg as usize, flags])
 }
 
-pub fn sys_fork() -> isize {
-    syscall(SYSCALL_FORK, [0, 0, 0])
+/// Linux `clone` 系统调用封装。
+pub fn sys_clone(
+    flags: usize,
+    stack: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
+) -> isize {
+    syscall6(
+        SYSCALL_CLONE,
+        [flags, stack, parent_tid, tls, child_tid, 0],
+    )
 }
 
 pub fn sys_execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
@@ -419,9 +429,16 @@ pub fn sys_sigaction(
     action: *const SignalAction,
     old_action: *mut SignalAction,
 ) -> isize {
-    syscall(
+    syscall6(
         SYSCALL_SIGACTION,
-        [signum as usize, action as usize, old_action as usize],
+        [
+            signum as usize,
+            action as usize,
+            old_action as usize,
+            core::mem::size_of::<u64>(),
+            0,
+            0,
+        ],
     )
 }
 
