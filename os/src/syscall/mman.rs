@@ -1,12 +1,11 @@
 use crate::{
     config::{PAGE_SIZE, PAGE_SIZE_BITS},
-    mm::{translated_refmut, MapPermission, VirtAddr},
+    mm::{MapPermission, VirtAddr},
     syscall::errno::ERRNO,
-    syscall::write_bytes_to_user,
+    syscall::{write_bytes_to_user, write_pod_to_user},
     syscall_body,
     task::{
-        current_process, current_task, current_user_token, mprotect_current_process,
-        munmap_current_process,
+        current_process, current_task, mprotect_current_process, munmap_current_process,
     },
 };
 
@@ -303,8 +302,6 @@ pub fn sys_get_mempolicy(
             return Err(ERRNO::EINVAL);
         }
 
-        let token = current_user_token();
-
         if flags & MPOL_F_MEMS_ALLOWED != 0 {
             write_ulong_mask_to_user(nodemask, maxnode, 1)?;
             return Ok(0);
@@ -314,9 +311,7 @@ pub fn sys_get_mempolicy(
             if mode.is_null() {
                 return Err(ERRNO::EINVAL);
             }
-            translated_refmut(token, mode)
-                .map(|slot| *slot = 0)
-                .ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(mode, &0i32)?;
             if !nodemask.is_null() {
                 write_ulong_mask_to_user(nodemask, maxnode, 1)?;
             }
@@ -324,9 +319,7 @@ pub fn sys_get_mempolicy(
         }
 
         if !mode.is_null() {
-            translated_refmut(token, mode)
-                .map(|slot| *slot = MPOL_DEFAULT)
-                .ok_or(ERRNO::EFAULT)?;
+            write_pod_to_user(mode, &MPOL_DEFAULT)?;
         }
         if !nodemask.is_null() {
             write_ulong_mask_to_user(nodemask, maxnode, 1)?;

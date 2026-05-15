@@ -2,7 +2,7 @@ use crate::signal::{SigInfo, SignalWaitHandle, SignalWakeState, register_signal_
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::task::UContext;
 use crate::{
-    mm::{translated_ref, translated_refmut},
+    mm::translated_ref,
     syscall::errno::OrErrno,
     syscall_body,
     task::{
@@ -79,11 +79,48 @@ fn signal_wait_sleep(handle: SignalWaitHandle, signal_set: SignalFlags) {
     block_current_and_run_next(WaitReason::SignalTimedWait);
 }
 
+/// RISC-V Linux `rt_sigaction` 用户态 ABI 布局。
+///
+/// RISC-V 不使用 `SA_RESTORER` 字段，第三个 word 是 `sigset_t` 的低 64 位。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UserSigAction {
+    /// handler 地址，或 SIG_DFL/SIG_IGN。
+    pub handler: usize,
+    /// Linux `SA_*` 标志位。
+    pub sa_flags: usize,
+    /// 用户态信号掩码，当前内核只消费低 32 位。
+    pub sa_mask: u64,
+}
+
+impl Pod for UserSigAction {}
+
+impl From<UserSigAction> for SignalAction {
+    fn from(action: UserSigAction) -> Self {
+        Self {
+            handler: action.handler,
+            sa_flags: action.sa_flags as u32,
+            sa_restorer: 0,
+            sa_mask: action.sa_mask as u32,
+        }
+    }
+}
+
+impl From<SignalAction> for UserSigAction {
+    fn from(action: SignalAction) -> Self {
+        Self {
+            handler: action.handler,
+            sa_flags: action.sa_flags as usize,
+            sa_mask: action.sa_mask as u64,
+        }
+    }
+}
+
 /// rt_sigaction 系统调用
 pub fn sys_sigaction(
     signum: i32,
-    action: *const SignalAction,
-    old_action: *mut SignalAction,
+    action: *const UserSigAction,
+    old_action: *mut UserSigAction,
     sigsetsize: usize,
 ) -> isize {
     trace!(
@@ -95,12 +132,16 @@ pub fn sys_sigaction(
         sigsetsize
     );
     syscall_body!({
-        // Validate sigsetsize - we use 32-bit sigset_t
-        if sigsetsize != core::mem::size_of::<u32>() {
-            debug!(
-                "sys_sigaction: invalid sigsetsize={}, expected 4",
+        if sigsetsize != 0 && sigsetsize != core::mem::size_of::<u64>() {
+            // TODO: 当前用户库旧封装会传 0，后续完全切到 Linux ABI 后应严格要求 8。
+            warn!(
+                "sys_sigaction: invalid sigsetsize={}, expected 8",
                 sigsetsize
             );
+            return Err(ERRNO::EINVAL);
+        }
+        if sigsetsize == 0 {
+            warn!("sys_sigaction: legacy sigsetsize=0 accepted");
         }
 
         let signum = signum as u32;
@@ -114,10 +155,35 @@ pub fn sys_sigaction(
             return Err(ERRNO::EINVAL);
         }
 
+        let token = current_user_token();
         let new_action = if action.is_null() {
             None
         } else {
-            let new_action = read_pod_from_user(action)?;
+            let user_action = read_pod_from_user(action)?;
+            for i in 0..3 {
+                let word_ptr = (action as usize + i * core::mem::size_of::<usize>()) as *const usize;
+                match translated_ref(token, word_ptr) {
+                    Some(word) => debug!(
+                        "sys_sigaction signum={} raw action[{}] addr={:#x} value={:#x}",
+                        signum,
+                        i,
+                        word_ptr as usize,
+                        *word
+                    ),
+                    None => warn!(
+                        "sys_sigaction raw action[{}] addr={:#x} unreadable",
+                        i,
+                        word_ptr as usize
+                    ),
+                }
+            }
+            let new_action = SignalAction::from(user_action);
+            debug!(
+                "sys_sigaction parsed action: handler={:#x}, flags={:#x}, mask={:#x}",
+                new_action.handler,
+                new_action.sa_flags,
+                new_action.sa_mask
+            );
             // Validate handler address (SIG_DFL=0, SIG_IGN=1, or valid user address)
             if new_action.handler != crate::task::SIG_DFL
                 && new_action.handler != crate::task::SIG_IGN
@@ -145,7 +211,8 @@ pub fn sys_sigaction(
 
         // Return old action after dropping process.inner; copyout may prefault user pages.
         if !old_action.is_null() {
-            write_pod_to_user(old_action, &old)?;
+            let user_old = UserSigAction::from(old);
+            write_pod_to_user(old_action, &user_old)?;
             debug!(
                 "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
                 signum, old.handler, old.sa_flags
@@ -201,8 +268,7 @@ pub fn sys_sigprocmask(how: i32, set: *const u32, oset: *mut u32, sigsetsize: us
 
         // If user requested old mask, write it out after dropping process.inner.
         if !oset.is_null() {
-            let slot = translated_refmut(token, oset).ok_or(ERRNO::EFAULT)?;
-            *slot = old_bits;
+            write_pod_to_user(oset, &old_bits)?;
         }
 
         Ok(0)

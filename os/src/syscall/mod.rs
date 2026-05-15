@@ -192,8 +192,8 @@ pub const SYSCALL_RECVMSG: usize = 212;
 pub const SYSCALL_BRK: usize = 214;
 /// munmap syscall
 pub const SYSCALL_MUNMAP: usize = 215;
-/// fork syscall
-pub const SYSCALL_FORK: usize = 220;
+/// clone syscall
+pub const SYSCALL_CLONE: usize = 220;
 /// execve syscall
 pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
@@ -276,7 +276,7 @@ use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use utils::{
     read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
-    write_pod_to_user, Pod,
+    write_pod_to_process_user, write_pod_to_user, Pod,
 };
 
 
@@ -452,7 +452,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_GETTID => sys_gettid(),
-        SYSCALL_FORK => sys_fork(),
+        SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
             args[1] as *const usize,
@@ -493,8 +493,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
-            args[1] as *const crate::task::SignalAction,
-            args[2] as *mut crate::task::SignalAction,
+            args[1] as *const UserSigAction,
+            args[2] as *mut UserSigAction,
             args[3], // sigsetsize
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as i32, args[1] as *const u32, args[2] as *mut u32, args[3]),

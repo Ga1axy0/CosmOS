@@ -29,5 +29,9 @@ pub const INTERP_BASE: usize = 0x4000_0000;
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
+/// 用户态 signal trampoline 页起始地址。
+pub const USER_VDSO_BASE: usize = USER_MMAP_BASE - PAGE_SIZE;
+/// 用户态 rt_sigreturn trampoline 入口地址。
+pub const USER_VDSO_RT_SIGRETURN: usize = USER_VDSO_BASE;
 /// qemu board info
 pub use crate::board::{CLOCK_FREQ, MMIO};

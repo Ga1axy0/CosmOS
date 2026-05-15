@@ -6,10 +6,11 @@ use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::fs::{
     make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
 };
-use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, UserBuffer};
+use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
 use crate::net::{
     SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file, create_udp_socket_file
 };
+use crate::syscall::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
 use crate::task::{current_process, current_user_token, FdEntry, FdFlags};
@@ -64,6 +65,12 @@ pub struct MsgHdr {
     pub msg_flags: i32,
 }
 
+// 允许 socket syscall 将该 C ABI 消息头整体写回用户空间。
+impl Pod for MsgHdr {}
+
+// 允许 socket syscall 将 IPv4 地址结构整体写回用户空间。
+impl Pod for SockAddrIn {}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoVec {
@@ -105,11 +112,11 @@ fn with_unix_socket<R>(
     Err(ERRNO::ENOTSOCK)
 }
 
-fn copy_user_bytes(token: usize, ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO> {
+fn copy_user_bytes(_token: usize, ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    let chunks = translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)?;
+    let chunks = translated_byte_buffer_with_access(ptr, len, PageFaultAccess::Read)?;
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(|_| ERRNO::ENOMEM)?;
     for chunk in chunks {
@@ -121,24 +128,7 @@ fn copy_user_bytes(token: usize, ptr: *const u8, len: usize) -> Result<Vec<u8>, 
     Ok(out)
 }
 
-fn write_user_bytes(token: usize, ptr: *mut u8, src: &[u8]) -> Result<(), ERRNO> {
-    if src.is_empty() {
-        return Ok(());
-    }
-    let mut chunks = translated_byte_buffer(token, ptr as *const u8, src.len()).or_errno(ERRNO::EFAULT)?;
-    let mut copied = 0usize;
-    for chunk in chunks.iter_mut() {
-        let n = chunk.len();
-        chunk.copy_from_slice(&src[copied..copied + n]);
-        copied += n;
-    }
-    if copied != src.len() {
-        return Err(ERRNO::EFAULT);
-    }
-    Ok(())
-}
-
-fn copy_user_iovecs(token: usize, iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, ERRNO> {
+fn copy_user_iovecs(_token: usize, iov_ptr: *const IoVec, iovcnt: usize) -> Result<Vec<IoVec>, ERRNO> {
     if iovcnt == 0 {
         return Ok(Vec::new());
     }
@@ -151,8 +141,11 @@ fn copy_user_iovecs(token: usize, iov_ptr: *const IoVec, iovcnt: usize) -> Resul
     let bytes_len = size_of::<IoVec>()
         .checked_mul(iovcnt)
         .ok_or(ERRNO::EINVAL)?;
-    let chunks = translated_byte_buffer(token, iov_ptr as *const u8, bytes_len)
-        .or_errno(ERRNO::EFAULT)?;
+    let chunks = translated_byte_buffer_with_access(
+        iov_ptr as *const u8,
+        bytes_len,
+        PageFaultAccess::Read,
+    )?;
 
     let mut iovecs = Vec::new();
     iovecs.try_reserve_exact(iovcnt).map_err(|_| ERRNO::ENOMEM)?;
@@ -198,14 +191,21 @@ fn iovecs_total_len(iovecs: &[IoVec]) -> Result<usize, ERRNO> {
     Ok(total)
 }
 
-fn iovecs_to_user_buffer(token: usize, iovecs: &[IoVec]) -> Result<UserBuffer, ERRNO> {
+fn iovecs_to_user_buffer(
+    _token: usize,
+    iovecs: &[IoVec],
+    access: PageFaultAccess,
+) -> Result<UserBuffer, ERRNO> {
     let mut buffers = Vec::new();
     for iov in iovecs {
         if iov.iov_len == 0 {
             continue;
         }
-        let mut parts = translated_byte_buffer(token, iov.iov_base as *const u8, iov.iov_len)
-            .or_errno(ERRNO::EFAULT)?;
+        let mut parts = translated_byte_buffer_with_access(
+            iov.iov_base as *const u8,
+            iov.iov_len,
+            access,
+        )?;
         buffers.append(&mut parts);
     }
     Ok(UserBuffer::new(buffers))
@@ -425,9 +425,9 @@ fn write_getsockopt_value(token: usize, optval: *mut u8, optlen: *mut i32, val: 
         if optval.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        write_user_bytes(token, optval, &val[..copy_len])?;
+        write_bytes_to_user(optval, &val[..copy_len])?;
     }
-    *translated_refmut(token, optlen).or_errno(ERRNO::EFAULT)? = val.len() as i32;
+    write_pod_to_user(optlen, &(val.len() as i32))?;
     Ok(())
 }
 
@@ -533,9 +533,8 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         inner.fd_table[fd1] = Some(entry1);
         drop(inner);
 
-        let token = current_user_token();
-        *translated_refmut(token, sv).or_errno(ERRNO::EFAULT)? = fd0 as i32;
-        *translated_refmut(token, unsafe { sv.add(1) }).or_errno(ERRNO::EFAULT)? = fd1 as i32;
+        write_pod_to_user(sv, &(fd0 as i32))?;
+        write_pod_to_user(unsafe { sv.add(1) }, &(fd1 as i32))?;
         Ok(0)
     })
 }
@@ -615,9 +614,7 @@ pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
 
         if !addr.is_null() && (addrlen as usize) >= core::mem::size_of::<SockAddrIn>() {
             if let Some(ep) = peer {
-                let token = current_user_token();
-                let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-                *out = endpoint_to_sockaddr(ep);
+                write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
             }
         }
 
@@ -639,9 +636,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
                     let ep = udp
                         .local_endpoint()
                         .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
-                    let token = current_user_token();
-                    let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-                    *out = endpoint_to_sockaddr(ep);
+                    write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
@@ -650,9 +645,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
                     let ep = tcp
                         .local_endpoint()
                         .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
-                    let token = current_user_token();
-                    let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-                    *out = endpoint_to_sockaddr(ep);
+                    write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
@@ -675,18 +668,14 @@ pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
             SocketKind::Udp => {
                 with_udp_socket(fd, |udp| {
                     let ep = udp.peer_endpoint().ok_or(ERRNO::ENOTCONN)?;
-                    let token = current_user_token();
-                    let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-                    *out = endpoint_to_sockaddr(ep);
+                    write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
             SocketKind::Tcp => {
                 with_tcp_socket(fd, |tcp| {
                     if let Some(ep) = tcp.remote_endpoint() {
-                        let token = current_user_token();
-                        let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-                        *out = endpoint_to_sockaddr(ep);
+                        write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
                         Ok(())
                     } else {
                         Err(ERRNO::ENOTCONN)
@@ -720,7 +709,9 @@ pub fn sys_sendto(
         }
 
         let token = current_user_token();
-        let ubuf = UserBuffer::new(translated_byte_buffer(token, buf, len).or_errno(ERRNO::EFAULT)?);
+        let ubuf = UserBuffer::new(
+            translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?,
+        );
 
         let fd = fd as usize;
         let n = match socket_kind(fd)? {
@@ -772,9 +763,8 @@ pub fn sys_recvfrom(
             return Err(ERRNO::EINVAL);
         }
 
-        let token = current_user_token();
         let mut ubuf = UserBuffer::new(
-            translated_byte_buffer(token, buf as *const u8, len).or_errno(ERRNO::EFAULT)?,
+            translated_byte_buffer_with_access(buf as *const u8, len, PageFaultAccess::Write)?,
         );
 
         let fd = fd as usize;
@@ -794,8 +784,7 @@ pub fn sys_recvfrom(
         };
 
         if !addr.is_null() {
-            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-            *out = endpoint_to_sockaddr(ep);
+            write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
         }
 
         Ok(n as isize)
@@ -1041,7 +1030,7 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
 
         let iovecs = copy_user_iovecs(token, msghdr.msg_iov as *const IoVec, msghdr.msg_iovlen)?;
         let total_len = iovecs_total_len(&iovecs)?;
-        let ubuf = iovecs_to_user_buffer(token, &iovecs)?;
+        let ubuf = iovecs_to_user_buffer(token, &iovecs, PageFaultAccess::Read)?;
 
         let ancillary = if msghdr.msg_controllen == 0 {
             UnixSocketAncillaryData::default()
@@ -1096,7 +1085,7 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
 
         let iovecs = copy_user_iovecs(token, msghdr.msg_iov as *const IoVec, msghdr.msg_iovlen)?;
         let _total_len = iovecs_total_len(&iovecs)?;
-        let ubuf = iovecs_to_user_buffer(token, &iovecs)?;
+        let ubuf = iovecs_to_user_buffer(token, &iovecs, PageFaultAccess::Write)?;
 
         let fd = fd as usize;
         let (n, ancillary) = match socket_kind(fd)? {
@@ -1148,12 +1137,12 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         }
 
         if !control_out.is_empty() {
-            write_user_bytes(token, msghdr.msg_control as *mut u8, control_out.as_slice())?;
+            write_bytes_to_user(msghdr.msg_control as *mut u8, control_out.as_slice())?;
         }
 
         msghdr.msg_controllen = control_out.len();
         msghdr.msg_namelen = 0;
-        *translated_refmut(token, msg).or_errno(ERRNO::EFAULT)? = msghdr;
+        write_pod_to_user(msg, &msghdr)?;
 
         Ok(n as isize)
     })

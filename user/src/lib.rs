@@ -16,10 +16,12 @@ extern crate bitflags;
 
 use alloc::{string::String, vec::Vec};
 use buddy_system_allocator::LockedHeap;
+use core::arch::global_asm;
 pub use console::{flush, STDIN, STDOUT};
 pub use syscall::*;
 
 const USER_HEAP_SIZE: usize = 128 * 1024;
+const EAGAIN: isize = -11;
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
 
@@ -45,14 +47,26 @@ fn clear_bss() {
     }
 }
 
+global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+_start:
+    mv a0, sp
+    call __user_start
+"#
+);
+
+/// 用户程序入口：从 Linux ABI 初始栈解析 argc/argv 后调用 main。
 #[no_mangle]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+pub extern "C" fn __user_start(user_sp: usize) -> ! {
     clear_bss();
     unsafe {
         HEAP.lock()
             .init(HEAP_SPACE.as_ptr() as usize, USER_HEAP_SIZE);
     }
+    let argc = unsafe { (user_sp as *const usize).read_volatile() };
+    let argv = user_sp + core::mem::size_of::<usize>();
     let mut v: Vec<&'static str> = Vec::new();
     for i in 0..argc {
         let str_start =
@@ -437,7 +451,8 @@ pub fn getpeername(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
 }
 
 pub fn fork() -> isize {
-    sys_fork()
+    // fork 在 Linux/RISC-V 上由 clone(SIGCHLD, NULL, ...) 表达。
+    sys_clone(SIGCHLD as usize, 0, 0, 0, 0)
 }
 
 /// 兼容接口：执行程序（不传环境变量），内部等价于 `execve(path, args, [NULL])`。
@@ -457,7 +472,7 @@ pub fn set_priority(prio: isize) -> isize {
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(-1, exit_code as *mut _) {
-            -2 => {
+            EAGAIN => {
                 sys_yield();
             }
             n => {
@@ -470,7 +485,7 @@ pub fn wait(exit_code: &mut i32) -> isize {
 pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(pid as isize, exit_code as *mut _) {
-            -11 => {
+            EAGAIN => {
                 sys_yield();
             }
             n => {
@@ -613,19 +628,24 @@ pub fn condvar_wait(condvar_id: usize, mutex_id: usize) {
     sys_condvar_wait(condvar_id, mutex_id);
 }
 
-/// Action for a signal
-#[repr(C, align(16))]
+/// RISC-V Linux `rt_sigaction` 用户态布局。
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalAction {
+    /// handler 地址，或 SIG_DFL/SIG_IGN。
     pub handler: usize,
-    pub mask: SignalFlags,
+    /// Linux `SA_*` 标志位。
+    pub sa_flags: usize,
+    /// 信号掩码，当前用户库只包装低 32 位。
+    pub sa_mask: u64,
 }
 
 impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
-            mask: SignalFlags::empty(),
+            sa_flags: 0,
+            sa_mask: SignalFlags::empty().bits() as u64,
         }
     }
 }
