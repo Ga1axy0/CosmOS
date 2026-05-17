@@ -2,10 +2,26 @@ use crate::{
     mm::kernel_token,
     sched::add_task,
     syscall::errno::ERRNO,
-    task::current_task,
+    task::{current_process, current_task},
     trap::{trap_handler, TrapContext},
 };
 use alloc::sync::Arc;
+
+fn linux_visible_tid() -> isize {
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let tid = task
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid;
+    if tid == 0 {
+        process.getpid() as isize
+    } else {
+        tid as isize
+    }
+}
 /// thread create syscall
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     trace!(
@@ -64,13 +80,7 @@ pub fn sys_gettid() -> isize {
             .unwrap()
             .tid
     );
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .tid as isize
+    linux_visible_tid()
 }
 
 /// wait for a thread to exit syscall
@@ -120,13 +130,10 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
         "kernel:pid[{}] sys_set_tid_address",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    current_task()
-    .unwrap()
-    .inner_exclusive_access()
-    .res
-    .as_ref()
-    .unwrap()
-    .tid
-    .try_into()
-    .unwrap()
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.clear_child_tid = tidptr as usize;
+    drop(inner);
+    let _process = current_process();
+    linux_visible_tid()
 }

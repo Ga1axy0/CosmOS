@@ -2,14 +2,22 @@ use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
-use crate::task::{
-    WaitReason, current_process, current_task, current_user_token
-};
+use crate::task::{current_process, current_task, WaitQueue, WaitReason};
 use crate::timer::{add_timer, get_time_ms};
 use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
+use hashbrown::HashMap;
+use lazy_static::lazy_static;
 
 const DEADLOCK_DETECTED: isize = -0xDEAD;
+const FUTEX_WAIT: i32 = 0;
+const FUTEX_WAKE: i32 = 1;
+const FUTEX_CMD_MASK: i32 = 0x7f;
+
+lazy_static! {
+    static ref FUTEX_QUEUES: crate::sync::SpinNoIrqLock<HashMap<usize, Arc<WaitQueue>>> =
+        crate::sync::SpinNoIrqLock::new(HashMap::new());
+}
 
 fn current_tid() -> usize {
     current_task()
@@ -19,6 +27,61 @@ fn current_tid() -> usize {
         .as_ref()
         .unwrap()
         .tid
+}
+
+fn futex_queue(uaddr: usize) -> Arc<WaitQueue> {
+    let mut queues = FUTEX_QUEUES.lock();
+    queues
+        .entry(uaddr)
+        .or_insert_with(|| Arc::new(WaitQueue::new()))
+        .clone()
+}
+
+pub(crate) fn futex_wake_addr(uaddr: usize, max_count: usize) -> isize {
+    let queue = {
+        let queues = FUTEX_QUEUES.lock();
+        queues.get(&uaddr).cloned()
+    };
+    queue.map(|q| q.wake_up_to(max_count) as isize).unwrap_or(0)
+}
+
+/// Minimal Linux futex syscall implementation for pthread wait/wake paths.
+pub fn sys_futex(
+    uaddr: *const i32,
+    op: i32,
+    val: i32,
+    _timeout: usize,
+    _uaddr2: usize,
+    _val3: i32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] tid[{}] sys_futex",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        current_tid()
+    );
+    syscall_body!({
+        if uaddr.is_null() || (uaddr as usize) & (core::mem::align_of::<i32>() - 1) != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        match op & FUTEX_CMD_MASK {
+            FUTEX_WAIT => {
+                let expected = val;
+                let current = read_pod_from_user(uaddr)?;
+                if current != expected {
+                    return Err(ERRNO::EAGAIN);
+                }
+                let queue = futex_queue(uaddr as usize);
+                queue.wait_with_reason_or_skip(WaitReason::Futex, || {
+                    read_pod_from_user(uaddr)
+                        .map(|current| current != expected)
+                        .unwrap_or(true)
+                });
+                Ok(0)
+            }
+            FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
+            _ => Err(ERRNO::ENOSYS),
+        }
+    })
 }
 
 /// sleep syscall
