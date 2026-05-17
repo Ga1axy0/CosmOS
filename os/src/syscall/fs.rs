@@ -1699,13 +1699,24 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         if flags & !supported_flags != 0 {
             return Err(ERRNO::EINVAL);
         }
-        let path = if path.is_null() && (flags & AT_EMPTY_PATH as i32 != 0) { 
+        // `futimens(2)` is commonly implemented via `utimensat(fd, NULL, ...)`.
+        // Treat that specific shape as an empty-path operation on `dirfd`.
+        let futimens_null_path = path.is_null() && dirfd != AT_FDCWD && (flags & AT_EMPTY_PATH as i32 == 0);
+        let effective_flags = if futimens_null_path {
+            flags | AT_EMPTY_PATH as i32
+        } else {
+            flags
+        };
+        let path = if path.is_null() && (effective_flags & AT_EMPTY_PATH as i32 != 0) {
             String::new()
         } else {
             translated_str(token, path).or_errno(ERRNO::EFAULT)?
         };
-        debug!("sys_utimensat: dirfd = {}, path = {}, flags = {}", dirfd, path, flags);
-        let target = resolve_at_target(dirfd, path.as_str(), flags)?;
+        debug!(
+            "sys_utimensat: dirfd = {}, path = {}, flags = {}, effective_flags = {}",
+            dirfd, path, flags, effective_flags
+        );
+        let target = resolve_at_target(dirfd, path.as_str(), effective_flags)?;
         let inode = match target {
             ResolvedAtTarget::Inode(i) => i,
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),

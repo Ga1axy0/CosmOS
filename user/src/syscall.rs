@@ -51,6 +51,7 @@ pub const SYSCALL_BIND: usize = 200;
 pub const SYSCALL_LISTEN: usize = 201;
 pub const SYSCALL_ACCEPT: usize = 202;
 pub const SYSCALL_CONNECT: usize = 203;
+pub const SYSCALL_ACCEPT4: usize = 242;
 pub const SYSCALL_GETSOCKNAME: usize = 204;
 pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
@@ -318,8 +319,17 @@ pub fn sys_listen(fd: usize, backlog: usize) -> isize {
     syscall(SYSCALL_LISTEN, [fd, backlog, 0])
 }
 
-pub fn sys_accept(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
-    syscall(SYSCALL_ACCEPT, [fd, addr as usize, addrlen])
+pub fn sys_accept(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: *mut i32) -> isize {
+    syscall(SYSCALL_ACCEPT, [fd, addr as usize, addrlen as usize])
+}
+
+pub fn sys_accept4(
+    fd: usize,
+    addr: *mut crate::net::SockAddrIn,
+    addrlen: *mut i32,
+    flags: usize,
+) -> isize {
+    syscall6(SYSCALL_ACCEPT4, [fd, addr as usize, addrlen as usize, flags, 0, 0])
 }
 
 pub fn sys_connect(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usize) -> isize {

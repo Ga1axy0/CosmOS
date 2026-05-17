@@ -475,8 +475,20 @@ pub fn listen(fd: usize, backlog: usize) -> isize {
 }
 
 pub fn accept(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
-    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
-    sys_accept(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
+    accept4(fd, addr_out, 0)
+}
+
+pub fn accept4(fd: usize, addr_out: Option<&mut net::SockAddrIn>, flags: usize) -> isize {
+    let addr_ptr = addr_out
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |a| (*a) as *const _ as *mut _);
+    let mut addrlen = core::mem::size_of::<net::SockAddrIn>() as i32;
+    let addrlen_ptr = if addr_out.is_some() {
+        &mut addrlen as *mut i32
+    } else {
+        core::ptr::null_mut()
+    };
+    sys_accept4(fd, addr_ptr, addrlen_ptr, flags)
 }
 
 pub fn connect(fd: usize, addr: &net::SockAddrIn) -> isize {
