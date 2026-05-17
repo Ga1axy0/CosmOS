@@ -76,6 +76,8 @@ pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
 /// set tid address syscall
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// futex syscall
+pub const SYSCALL_FUTEX: usize = 98;
 /// set robust list syscall
 pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 /// get robust list syscall
@@ -276,6 +278,7 @@ use signal::*;
 use times::*;
 use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
+pub(crate) use sync::futex_wake_addr;
 pub(crate) use utils::{
     read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
@@ -382,6 +385,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_FUTEX => sys_futex(
+            args[0] as *const i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3],
+            args[4],
+            args[5] as i32,
+        ),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),

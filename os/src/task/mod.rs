@@ -22,6 +22,7 @@ use crate::sched::{
 };
 use crate::fs::{open_file, OpenFlags};
 use crate::poll::task_has_inflight_keyed_poll_wait;
+use crate::syscall::{futex_wake_addr, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::remove_timer;
@@ -69,6 +70,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     process.pause_cpu_accounting(get_time());
     let mut task_inner = task.inner_exclusive_access();
     let tid = task_inner.res.as_ref().unwrap().tid;
+    let clear_child_tid = task_inner.clear_child_tid;
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
     task_inner.task_status = TaskStatus::Zombie;
@@ -76,9 +78,14 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     task_inner.sched.on_rq = false;
     task_inner.sched.resched_reason = None;
     task_inner.res = None;
+    task_inner.clear_child_tid = 0;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
+    if clear_child_tid != 0 {
+        let _ = write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32);
+        let _ = futex_wake_addr(clear_child_tid, 1);
+    }
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
     if tid == 0 {

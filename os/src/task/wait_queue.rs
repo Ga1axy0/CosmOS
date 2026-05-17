@@ -114,6 +114,20 @@ impl WaitQueue {
         }
     }
 
+    /// Wake up to `limit` waiters and return the number actually woken.
+    pub fn wake_up_to(&self, limit: usize) -> usize {
+        let mut queue = self.queue.lock();
+        let mut count = 0;
+        while count < limit {
+            let Some(task) = queue.pop_front() else {
+                break;
+            };
+            wakeup_task(task);
+            count += 1;
+        }
+        count
+    }
+
     /// Wake all waiters.
     pub fn wake_all(&self) {
         let mut queue = self.queue.lock();

@@ -144,6 +144,8 @@ pub struct TaskControlBlockInner {
     /// Handle to the WaitQueue this task is currently sleeping in (if any).
     /// Used by signal delivery to properly remove the task from the queue.
     pub current_wq_handle: Option<WaitQueueHandle>,
+    /// Userspace TID address to clear on thread exit for Linux clone compatibility.
+    pub clear_child_tid: usize,
 }
 
 impl TaskControlBlockInner {
@@ -216,6 +218,7 @@ impl TaskControlBlock {
                 exit_code: None,
                 sched: TaskSchedState::new(sched_attr),
                 current_wq_handle: None,
+                clear_child_tid: 0,
             }),
         }
     }
@@ -232,6 +235,8 @@ pub enum WaitReason {
     Semaphore,
     /// Waiting for a mutex to become available.
     Mutex,
+    /// Waiting on a Linux futex word.
+    Futex,
     /// Parent is waiting for child process exit.
     ProcessWaitExit,
     /// Waiting for UART RX data.
