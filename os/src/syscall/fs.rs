@@ -836,9 +836,10 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     const O_NONBLOCK: i32 = FileStatusFlags::NONBLOCK.bits();
     const O_LARGEFILE: i32 = 0x8000;
     const O_DIRECTORY: i32 = OpenFlags::DIRECTORY.bits();
+    const O_NOFOLLOW: i32 = 0x20000;
 
     let access_mode = AccessMode::from_open_bits(flags)?;
-    let ignored_flags = flags & O_LARGEFILE;
+    let ignored_flags = flags & (O_LARGEFILE | O_NOFOLLOW);
     let unsupported_flags = flags & O_NOCTTY;
     let status_flags = FileStatusFlags::from_bits_truncate(flags & (O_APPEND | O_NONBLOCK));
     let effective_flags = flags & !(ignored_flags | O_APPEND | O_NONBLOCK);

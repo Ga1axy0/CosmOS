@@ -26,6 +26,11 @@ use alloc::vec::Vec;
 
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const MUSL_LIBC_FALLBACK: &str = "/musl/lib/libc.so";
+const MUSL_INTERP_PATHS: [&str; 2] = [
+    "/lib/ld-musl-riscv64-sf.so.1",
+    "/lib/ld-musl-riscv64.so.1",
+];
 
 bitflags! {
     /// fd 表项级别的标志位。
@@ -546,14 +551,33 @@ impl ProcessControlBlock {
 
             // 加载动态链接器到同一地址空间
             // 使用 open_file_at 以支持相对路径（虽然INTERP通常是绝对路径）
-            let interp_inode = crate::fs::open_file_at(
+            let interp_inode = match crate::fs::open_file_at(
                 cwd.as_str(),
                 interp_path.as_str(),
-                crate::fs::OpenFlags::RDONLY
-            ).map_err(|_| {
-                error!("Failed to open interpreter {}", interp_path);
-                ERRNO::ENOENT
-            })?;
+                crate::fs::OpenFlags::RDONLY,
+            ) {
+                Ok(inode) => inode,
+                Err(_) if MUSL_INTERP_PATHS.iter().any(|path| interp_path == path) => {
+                    let fallback = crate::fs::open_file_at(
+                        cwd.as_str(),
+                        MUSL_LIBC_FALLBACK,
+                        crate::fs::OpenFlags::RDONLY,
+                    ).map_err(|_| {
+                        error!("Failed to open interpreter {}", interp_path);
+                        ERRNO::ENOENT
+                    })?;
+                    warn!(
+                        "Interpreter {} missing, falling back to {}",
+                        interp_path,
+                        MUSL_LIBC_FALLBACK
+                    );
+                    fallback
+                }
+                Err(_) => {
+                    error!("Failed to open interpreter {}", interp_path);
+                    return Err(ERRNO::ENOENT);
+                }
+            };
 
             if interp_inode.is_dir() {
                 error!("Dynamic linker path is a directory: {}", interp_path);
