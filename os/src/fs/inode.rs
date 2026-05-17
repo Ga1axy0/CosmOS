@@ -427,6 +427,9 @@ pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<
         let mut restart: Option<String> = None;
 
         for (idx, component) in components.iter().enumerate() {
+            if !cur.is_dir() {
+                return Err(ERRNO::ENOTDIR);
+            }
             let child = cur.find(component).ok_or(ERRNO::ENOENT)?;
             let is_final = idx + 1 == components.len();
             if child.is_symlink() && (!is_final || follow_final) {

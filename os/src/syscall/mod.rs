@@ -192,6 +192,8 @@ pub const SYSCALL_LISTEN: usize = 201;
 pub const SYSCALL_ACCEPT: usize = 202;
 /// connect syscall
 pub const SYSCALL_CONNECT: usize = 203;
+/// accept4 syscall
+pub const SYSCALL_ACCEPT4: usize = 242;
 /// getsockname syscall
 pub const SYSCALL_GETSOCKNAME: usize = 204;
 /// getpeername syscall
@@ -476,7 +478,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as *mut i32),
         SYSCALL_BIND => sys_bind(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
         SYSCALL_LISTEN => sys_listen(args[0] as i32, args[1] as i32),
-        SYSCALL_ACCEPT => sys_accept(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_ACCEPT => sys_accept(
+            args[0] as i32,
+            args[1] as *mut SockAddrIn,
+            args[2] as *mut i32,
+        ),
+        SYSCALL_ACCEPT4 => sys_accept4(
+            args[0] as i32,
+            args[1] as *mut SockAddrIn,
+            args[2] as *mut i32,
+            args[3] as i32,
+        ),
         SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
         SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
         SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
