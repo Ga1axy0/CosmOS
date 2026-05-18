@@ -70,6 +70,14 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_READV: usize = 65;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
+/// pread64 syscall
+pub const SYSCALL_PREAD64: usize = 67;
+/// pwrite64 syscall
+pub const SYSCALL_PWRITE64: usize = 68;
+/// preadv syscall
+pub const SYSCALL_PREADV: usize = 69;
+/// pwritev syscall
+pub const SYSCALL_PWRITEV: usize = 70;
 /// pselect6_time32 syscall
 pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
@@ -410,6 +418,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READV => sys_readv(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
         SYSCALL_WRITEV =>
             sys_writev(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
+        SYSCALL_PREAD64 =>
+            sys_pread64(args[0] as u32, args[1] as *const u8, args[2], args[3] as i64),
+        SYSCALL_PWRITE64 =>
+            sys_pwrite64(args[0] as u32, args[1] as *const u8, args[2], args[3] as i64),
+        SYSCALL_PREADV => sys_preadv(
+            args[0],
+            args[1] as *const crate::syscall::fs::IoVec,
+            args[2] as i32,
+            args[3],
+            args[4],
+        ),
+        SYSCALL_PWRITEV => sys_pwritev(
+            args[0],
+            args[1] as *const crate::syscall::fs::IoVec,
+            args[2] as i32,
+            args[3],
+            args[4],
+        ),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
             args[1] as *const u8,

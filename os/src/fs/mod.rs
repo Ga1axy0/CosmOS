@@ -189,6 +189,11 @@ impl FileDescription {
         self.file.write_at(offset, buf)
     }
 
+    /// 返回该打开文件描述是否支持位置相关 I/O（`lseek/pread/pwrite`）。
+    pub fn is_seekable(&self) -> bool {
+        self.file.is_seekable()
+    }
+
     /// 调整底层文件对象的逻辑长度。
     pub fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
         self.file.truncate(new_size)
