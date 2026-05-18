@@ -653,6 +653,87 @@ fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     Ok(desc)
 }
 
+fn parse_pos64(pos: i64) -> Result<usize, ERRNO> {
+    if pos < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    usize::try_from(pos).map_err(|_| ERRNO::EINVAL)
+}
+
+fn parse_pos64_halves(pos_l: usize, pos_h: usize) -> Result<usize, ERRNO> {
+    let pos = ((pos_h as u64) << 32) | ((pos_l as u64) & 0xffff_ffff);
+    usize::try_from(pos).map_err(|_| ERRNO::EINVAL)
+}
+
+fn preadv_like(
+    desc: &Arc<FileDescription>,
+    iovecs: &[IoVec],
+    mut offset: usize,
+    access: PageFaultAccess,
+) -> Result<isize, ERRNO> {
+    if !desc.is_seekable() {
+        return Err(ERRNO::ESPIPE);
+    }
+
+    let mut total = 0usize;
+    for &iovec in iovecs {
+        if iovec.iov_len == 0 {
+            continue;
+        }
+        let user_buf = UserBuffer::new(translated_byte_buffer_with_access(
+            iovec.iov_base as *const u8,
+            iovec.iov_len,
+            access,
+        )?);
+        let read = desc.read_at(offset, user_buf);
+        total = total.checked_add(read).ok_or(ERRNO::EINVAL)?;
+        offset = offset.checked_add(read).ok_or(ERRNO::EINVAL)?;
+        if read < iovec.iov_len {
+            break;
+        }
+    }
+    Ok(total as isize)
+}
+
+fn pwritev_like(
+    desc: &Arc<FileDescription>,
+    iovecs: &[IoVec],
+    mut offset: usize,
+) -> Result<isize, ERRNO> {
+    if !desc.is_seekable() {
+        return Err(ERRNO::ESPIPE);
+    }
+
+    let mut total_limit = 0usize;
+    for &iovec in iovecs {
+        total_limit = total_limit
+            .checked_add(iovec.iov_len)
+            .ok_or(ERRNO::EINVAL)?;
+        if total_limit > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+    }
+
+    let mut completed = 0usize;
+    for &iovec in iovecs {
+        if iovec.iov_len == 0 {
+            continue;
+        }
+        let user_buf = UserBuffer::new(translated_byte_buffer_with_access(
+            iovec.iov_base as *const u8,
+            iovec.iov_len,
+            PageFaultAccess::Read,
+        )?);
+        let written = desc.write_at(offset, user_buf);
+        completed = completed.checked_add(written).ok_or(ERRNO::EINVAL)?;
+        offset = offset.checked_add(written).ok_or(ERRNO::EINVAL)?;
+        if written < iovec.iov_len {
+            return Ok(completed as isize);
+        }
+    }
+    Ok(completed as isize)
+}
+
 /// 解析 truncate 系统调用传入的目标长度。
 fn parse_truncate_len(len: isize) -> Result<usize, ERRNO> {
     if len < 0 {
@@ -1026,6 +1107,54 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
+/// pread64 syscall：从固定偏移读取，不推进共享文件偏移。
+pub fn sys_pread64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pread64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let fd = fd as usize;
+        let desc = get_readable_file(fd)?;
+        let offset = parse_pos64(pos)?;
+        if !desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        Ok(desc.read_at(
+            offset,
+            UserBuffer::new(translated_byte_buffer_with_access(
+                buf,
+                len,
+                PageFaultAccess::Write,
+            )?),
+        ) as isize)
+    })
+}
+
+/// pwrite64 syscall：向固定偏移写入，不推进共享文件偏移。
+pub fn sys_pwrite64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pwrite64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let fd = fd as usize;
+        let desc = get_writable_file(fd)?;
+        let offset = parse_pos64(pos)?;
+        if !desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        Ok(desc.write_at(
+            offset,
+            UserBuffer::new(translated_byte_buffer_with_access(
+                buf,
+                len,
+                PageFaultAccess::Read,
+            )?),
+        ) as isize)
+    })
+}
+
 /// readv syscall：按 `iovec` 顺序将多个用户缓冲区从同一个 fd 读出。
 pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
     trace!(
@@ -1103,6 +1232,36 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
         }
         // TODO: 当前未限制 `iovcnt` 上限；若后续补齐 `IOV_MAX`，应在复制前返回 `EINVAL`。
         Ok(completed as isize)
+    })
+}
+
+/// preadv syscall：从固定偏移按 `iovec` 顺序读取，不推进共享文件偏移。
+pub fn sys_preadv(fd: usize, iov: *const IoVec, iovcnt: i32, pos_l: usize, pos_h: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_preadv",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let desc = get_readable_file(fd)?;
+        let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
+        let offset = parse_pos64_halves(pos_l, pos_h)?;
+        preadv_like(&desc, &iovecs, offset, PageFaultAccess::Write)
+    })
+}
+
+/// pwritev syscall：向固定偏移按 `iovec` 顺序写入，不推进共享文件偏移。
+pub fn sys_pwritev(fd: usize, iov: *const IoVec, iovcnt: i32, pos_l: usize, pos_h: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pwritev",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let desc = get_writable_file(fd)?;
+        let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
+        let offset = parse_pos64_halves(pos_l, pos_h)?;
+        pwritev_like(&desc, &iovecs, offset)
     })
 }
 
