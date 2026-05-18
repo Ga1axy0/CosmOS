@@ -10,9 +10,10 @@ use crate::config::{
     USER_STACK_SIZE, USER_VDSO_BASE,
 };
 use crate::fs::{
-    mark_cached_page_dirty, release_mapped_page, retain_mapped_page, CachePage, FileDescription,
+    mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
+    FileDescription,
 };
-use crate::sync::{SpinNoIrqLock};
+use crate::sync::SpinNoIrqLock;
 use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
 use alloc::collections::BTreeMap;
@@ -75,7 +76,7 @@ pub fn kernel_token() -> usize {
     KERNEL_SPACE.lock().token()
 }
 /// 用于稳定标识一个底层 inode。
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct InodeKey {
     /// 文件系统编号。
     fs_id: u64,
@@ -90,6 +91,11 @@ impl InodeKey {
             fs_id: inode.fs_id(),
             ino: inode.ino(),
         }
+    }
+
+    /// 返回文件系统编号。
+    pub fn fs_id(&self) -> u64 {
+        self.fs_id
     }
 }
 
@@ -1365,6 +1371,45 @@ impl MemorySet {
             plan.file.path()
         );
         true
+    }
+
+    /// 对当前地址空间内指定范围的 MAP_SHARED 文件映射执行同步。
+    pub fn msync_range(&self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), ERRNO> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn {
+            return Ok(());
+        }
+
+        let mut synced_any = false;
+        for area in self.vmas.values() {
+            let Some(file) = area.file.as_ref() else {
+                continue;
+            };
+            if !file.shared {
+                continue;
+            }
+            let overlap_start = area.start_vpn().max(start_vpn);
+            let overlap_end = area.end_vpn().min(end_vpn);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let Some(inode) = file.file.backing_inode() else {
+                continue;
+            };
+            synced_any = true;
+            let start_idx = overlap_start.0 - area.start_vpn().0;
+            let page_count = overlap_end.0 - overlap_start.0;
+            let file_offset = (file.pgoff + start_idx) * PAGE_SIZE;
+            let byte_len = page_count * PAGE_SIZE;
+            sync_inode_range(&inode, file_offset, byte_len)?;
+        }
+
+        if synced_any {
+            Ok(0).map(|_| ())
+        } else {
+            Ok(())
+        }
     }
 
     /// 将 file-backed `MAP_PRIVATE` 的缓存页以只读方式直接接入页表。

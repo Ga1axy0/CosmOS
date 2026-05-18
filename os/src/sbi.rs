@@ -133,6 +133,7 @@ pub fn console_getchar() -> usize {
 /// use sbi call to shutdown the kernel
 #[cfg(qemu7)]
 pub fn shutdown() -> ! {
+    let _ = sync_page_cache_all();
     sbi_call_legacy(SBI_SHUTDOWN, 0, 0, 0);
     panic!("It should shutdown!");
 }
@@ -140,6 +141,7 @@ pub fn shutdown() -> ! {
 /// use sbi call to shutdown the kernel
 #[cfg(not(qemu7))]
 pub fn shutdown() -> ! {
+    let _ = sync_page_cache_all();
     let _ = sbi_call(SBI_SHUTDOWN, 0, 0, 0, 0);
     panic!("It should shutdown!");
 }
@@ -180,3 +182,4 @@ pub fn hart_state(raw: usize) -> HartState {
         other => HartState::Unknown(other),
     }
 }
+use crate::fs::sync_page_cache_all;

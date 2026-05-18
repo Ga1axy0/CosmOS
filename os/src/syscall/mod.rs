@@ -82,6 +82,12 @@ pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_UTIMENSAT: usize = 88;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
+/// sync syscall
+pub const SYSCALL_SYNC: usize = 81;
+/// fsync syscall
+pub const SYSCALL_FSYNC: usize = 82;
+/// fdatasync syscall
+pub const SYSCALL_FDATASYNC: usize = 83;
 /// exit syscall
 pub const SYSCALL_EXIT: usize = 93;
 /// exit group syscall
@@ -224,6 +230,8 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// msync syscall
+pub const SYSCALL_MSYNC: usize = 227;
 /// mlock syscall
 pub const SYSCALL_MLOCK: usize = 228;
 /// munlock syscall
@@ -240,6 +248,8 @@ pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 pub const SYSCALL_WAIT4: usize = 260;
 /// prlimit64 syscall
 pub const SYSCALL_PRLIMIT64: usize = 261;
+/// syncfs syscall
+pub const SYSCALL_SYNCFS: usize = 267;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -431,6 +441,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
+        SYSCALL_SYNC => sys_sync(),
+        SYSCALL_FSYNC => sys_fsync(args[0] as u32),
+        SYSCALL_FDATASYNC => sys_fdatasync(args[0] as u32),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
@@ -471,6 +484,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut rlimit),
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const rlimit),
         SYSCALL_PRLIMIT64 => sys_prlimit64(args[0] as i32, args[1], args[2] as *const rlimit, args[3] as *mut rlimit),
+        SYSCALL_SYNCFS => sys_syncfs(args[0] as u32),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
@@ -545,6 +559,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
         SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
         SYSCALL_MLOCKALL => sys_mlockall(args[0] as i32),

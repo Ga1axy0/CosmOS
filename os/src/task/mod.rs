@@ -319,6 +319,11 @@ pub fn munmap_current_process(start: VirtAddr, end: VirtAddr) -> bool {
     current_process().munmap(start, end)
 }
 
+/// Sync a mapped range in current process.
+pub fn msync_current_process(start: VirtAddr, end: VirtAddr) -> Result<(), crate::syscall::errno::ERRNO> {
+    current_process().msync(start, end)
+}
+
 /// Change permissions on a range in current process.
 pub fn mprotect_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
     current_process().mprotect(start, end, perm)
