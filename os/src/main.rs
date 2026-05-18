@@ -42,6 +42,7 @@ pub mod config;
 pub mod drivers;
 pub mod fs;
 pub mod hart;
+pub mod ipc;
 pub mod lang_items;
 pub mod klog;
 pub mod mm;

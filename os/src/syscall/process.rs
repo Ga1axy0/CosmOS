@@ -1,3 +1,4 @@
+use crate::mm::{MapPermission, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
@@ -5,11 +6,14 @@ use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
+    ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
         exit_current_and_run_next, ExitReason, SignalBit, WaitReason,
         current_trap_cx,
+        exit_current_and_run_next, pid2process, remove_from_pid2process,
+        ExitReason, ShmAttachment, SignalFlags, WaitReason,
     },
 };
 use crate::sched::{add_task, pid2process, remove_from_pid2process};
@@ -206,6 +210,136 @@ pub fn sys_getegid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getegid pid:{}", process.getpid());
     process.getegid() as isize
+}
+
+/// SysV `shmget`.
+pub fn sys_shmget(key: i32, size: usize, flag: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmget",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let shmid = ipc::shmget(key, size, flag)?;
+        Ok(shmid as isize)
+    })
+}
+
+/// SysV `shmat`.
+pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if shmflg != 0 {
+            return Err(ERRNO::ENOSYS);
+        }
+        let segment = ipc::attach_segment(shmid)?;
+        let (size, desc) = {
+            let seg = segment.lock();
+            (seg.size, Arc::clone(&seg.desc))
+        };
+        let process = current_process();
+        let map_addr = if shmaddr == 0 {
+            let len_aligned = size
+                .checked_add(crate::config::PAGE_SIZE - 1)
+                .ok_or(ERRNO::EOVERFLOW)?
+                & !(crate::config::PAGE_SIZE - 1);
+            let (chosen, chosen_end) = {
+                let mut inner = process.inner_exclusive_access();
+                inner.ensure_address_space_capacity(len_aligned)?;
+                let hint = inner.vm_layout.mmap_hint;
+                let base = inner.vm_layout.mmap_base;
+                let chosen = inner
+                    .memory_set
+                    .find_free_mmap_area(hint, base, len_aligned)
+                    .ok_or(ERRNO::ENOMEM)?;
+                let chosen_end = chosen.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
+                let mapped = inner.memory_set.mmap_file(
+                    crate::mm::VirtAddr::from(chosen),
+                    crate::mm::VirtAddr::from(chosen_end),
+                    crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+                    Arc::clone(&desc),
+                    0,
+                    true,
+                );
+                if !mapped {
+                    return Err(ERRNO::ENOMEM);
+                }
+                inner.vm_layout.mmap_hint = chosen_end;
+                (chosen, chosen_end)
+            };
+            if let Some(inode) = desc.backing_inode() {
+                crate::mm::register_file_mapping(&inode, &process);
+            }
+            let _ = chosen_end;
+            chosen
+        } else {
+            if !shmaddr.is_multiple_of(crate::config::PAGE_SIZE) {
+                ipc::detach_segment(shmid);
+                return Err(ERRNO::EINVAL);
+            }
+            let ok = process.mmap_file(
+                VirtAddr::from(shmaddr),
+                VirtAddr::from(shmaddr.checked_add(size).ok_or(ERRNO::EOVERFLOW)?),
+                MapPermission::R | MapPermission::W | MapPermission::U,
+                desc,
+                0,
+                true,
+            );
+            if !ok {
+                ipc::detach_segment(shmid);
+                return Err(ERRNO::ENOMEM);
+            }
+            shmaddr
+        };
+        process.add_shm_attachment(ShmAttachment {
+            shmid,
+            addr: map_addr,
+            size,
+        });
+        Ok(map_addr as isize)
+    })
+}
+
+/// SysV `shmdt`.
+pub fn sys_shmdt(shmaddr: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmdt",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let attachment = process
+            .remove_shm_attachment_by_addr(shmaddr)
+            .ok_or(ERRNO::EINVAL)?;
+        if !process.munmap(
+            crate::mm::VirtAddr::from(attachment.addr),
+            crate::mm::VirtAddr::from(attachment.addr.checked_add(attachment.size).ok_or(ERRNO::EOVERFLOW)?),
+        ) {
+            process.add_shm_attachment(attachment);
+            return Err(ERRNO::EINVAL);
+        }
+        ipc::detach_segment(attachment.shmid);
+        Ok(0)
+    })
+}
+
+/// SysV `shmctl`.
+pub fn sys_shmctl(shmid: usize, cmd: i32, _buf: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmctl",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        match cmd {
+            IPC_RMID => {
+                ipc::mark_segment_for_removal(shmid)?;
+                Ok(0)
+            }
+            _ => Err(ERRNO::ENOSYS),
+        }
+    })
 }
 
 pub fn sys_getsid() -> isize {
@@ -420,28 +554,20 @@ pub fn sys_clone(
             warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
             return -(ERRNO::EFAULT as isize);
         }
-        if translated_byte_buffer_with_access(
-            parent_tid as *const u8,
-            core::mem::size_of::<i32>(),
-            PageFaultAccess::Write,
-        ).is_err() {
-            return -(ERRNO::EFAULT as isize);
+        if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
+            warn!(
+                "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
+                exit_signal
+            );
+            return Err(ERRNO::EINVAL);
         }
-        parent_set_tid = Some(parent_tid);
-    }
-    let mut child_set_tid = None;
-    if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        if child_tid == 0 {
-            warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
-            return -(ERRNO::EFAULT as isize);
+        if flags.contains(CloneFlags::CLONE_VM) {
+            warn!("kernel: sys_clone unsupported flag CLONE_VM");
+            return Err(ERRNO::EINVAL);
         }
-        // 子地址空间由父地址空间复制而来，创建前先确认该地址在父进程中可写。
-        if translated_byte_buffer_with_access(
-            child_tid as *const u8,
-            core::mem::size_of::<i32>(),
-            PageFaultAccess::Write,
-        ).is_err() {
-            return -(ERRNO::EFAULT as isize);
+        if flags.contains(CloneFlags::CLONE_FS) {
+            warn!("kernel: sys_clone unsupported flag CLONE_FS");
+            return Err(ERRNO::EINVAL);
         }
         child_set_tid = Some(child_tid);
     }
