@@ -1117,6 +1117,13 @@ impl ProcessControlBlock {
         reclaim.flush_then_release();
         true
     }
+
+    /// 对当前进程地址空间中的指定范围执行 `msync`。
+    pub fn msync(&self, start: VirtAddr, end: VirtAddr) -> Result<(), ERRNO> {
+        let inner = self.inner.lock();
+        inner.memory_set.msync_range(start, end)
+    }
+
     /// 处理当前进程的私有页写时复制缺页。
     pub fn handle_private_cow_fault(&self, fault_addr: usize) -> bool {
         let Some(reclaim) = ({

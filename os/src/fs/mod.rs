@@ -19,7 +19,8 @@ use crate::syscall::Pod;
 use core::any::Any;
 pub use fs::vfs::InodeTime;
 pub use page_cache::{
-    mapping_for_inode, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
+    mapping_for_inode, sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
+    sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
     retain_mapped_page, PAGE_CACHE_MANAGER
 };
 
@@ -217,6 +218,11 @@ impl FileDescription {
     /// 转发 `stat` 到底层文件对象。
     pub fn stat(&self) -> Stat {
         self.file.stat()
+    }
+
+    /// 将底层文件对象的脏数据同步到底层存储。
+    pub fn sync(&self) -> Result<(), ERRNO> {
+        self.file.sync()
     }
 
     /// 转发 `statfs` 到底层文件对象。

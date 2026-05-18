@@ -1,8 +1,8 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at, mount_device, truncate_inode,
-    rename_at,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at, mount_device, rename_at,
+    sync_page_cache_all, sync_page_cache_fs, truncate_inode,
     open_file_at, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
@@ -631,6 +631,17 @@ fn get_writable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
         return Err(ERRNO::EACCES);
     }
     Ok(desc)
+}
+
+fn get_any_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    inner
+        .fd_table
+        .get(fd)
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| entry.desc.clone())
+        .ok_or(ERRNO::EBADF)
 }
 
 /// 校验 fd 并返回可读打开文件描述。
@@ -1273,6 +1284,41 @@ pub fn sys_close(fd: u32) -> isize {
     };
     drop(closed_entry);
     0
+}
+
+/// sync syscall
+pub fn sys_sync() -> isize {
+    syscall_body!({
+        sync_page_cache_all()?;
+        Ok(0)
+    })
+}
+
+/// fsync syscall
+pub fn sys_fsync(fd: u32) -> isize {
+    syscall_body!({
+        let file = get_any_file(fd as usize)?;
+        file.sync()?;
+        Ok(0)
+    })
+}
+
+/// fdatasync syscall
+pub fn sys_fdatasync(fd: u32) -> isize {
+    syscall_body!({
+        sync_page_cache_all()?;
+        Ok(0)
+    })
+}
+
+/// syncfs syscall
+pub fn sys_syncfs(fd: u32) -> isize {
+    syscall_body!({
+        let file = get_any_file(fd as usize)?;
+        let inode = file.backing_inode().ok_or(ERRNO::EINVAL)?;
+        sync_page_cache_fs(inode.fs_id())?;
+        Ok(0)
+    })
 }
 
 /// pipe syscall
