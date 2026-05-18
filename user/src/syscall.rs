@@ -45,6 +45,10 @@ pub const SYSCALL_GETSID: usize = 156;
 pub const SYSCALL_SETSID: usize = 157;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
+pub const SYSCALL_SHMGET: usize = 194;
+pub const SYSCALL_SHMCTL: usize = 195;
+pub const SYSCALL_SHMAT: usize = 196;
+pub const SYSCALL_SHMDT: usize = 197;
 pub const SYSCALL_SOCKET: usize = 198;
 pub const SYSCALL_SOCKETPAIR: usize = 199;
 pub const SYSCALL_BIND: usize = 200;
@@ -382,6 +386,22 @@ pub fn sys_sendmsg(fd: usize, msg: *const crate::net::MsgHdr, flags: usize) -> i
 
 pub fn sys_recvmsg(fd: usize, msg: *mut crate::net::MsgHdr, flags: usize) -> isize {
     syscall(SYSCALL_RECVMSG, [fd, msg as usize, flags])
+}
+
+pub fn sys_shmget(key: i32, size: usize, flags: i32) -> isize {
+    syscall(SYSCALL_SHMGET, [key as usize, size, flags as usize])
+}
+
+pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> isize {
+    syscall(SYSCALL_SHMCTL, [shmid, cmd as usize, buf])
+}
+
+pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
+    syscall(SYSCALL_SHMAT, [shmid, shmaddr, shmflg as usize])
+}
+
+pub fn sys_shmdt(shmaddr: usize) -> isize {
+    syscall(SYSCALL_SHMDT, [shmaddr, 0, 0])
 }
 
 /// Linux `clone` 系统调用封装。

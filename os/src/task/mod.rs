@@ -21,6 +21,7 @@ use crate::sched::{
     TaskContext,
 };
 use crate::fs::{open_file, OpenFlags};
+use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::syscall::{futex_wake_addr, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
@@ -40,7 +41,7 @@ pub use crate::signal::{
     SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
-pub use process::{ExitReason, FdEntry, FdFlags};
+pub use process::{ExitReason, FdEntry, FdFlags, ShmAttachment};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
     clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
@@ -150,7 +151,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(process_inner);
         recycle_res.clear();
 
-        let (closed_fds, parent_weak, reclaim) = {
+        let (closed_fds, parent_weak, reclaim, shm_attachments) = {
             let mut process_inner = process.inner_exclusive_access();
             process_inner.children.clear();
             // deallocate other data in user space i.e. program code/data section
@@ -165,10 +166,14 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             process_inner.tasks.clear();
 
             let parent_weak = process_inner.parent.clone();
-            (closed_fds, parent_weak, reclaim)
+            let shm_attachments = core::mem::take(&mut process_inner.shm_attachments);
+            (closed_fds, parent_weak, reclaim, shm_attachments)
         };
         reclaim.flush_then_release();
         drop(closed_fds);
+        for attachment in shm_attachments {
+            ipc::detach_segment(attachment.shmid);
+        }
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
             add_signal_to_process(&parent, SignalBit::SIGCHLD);

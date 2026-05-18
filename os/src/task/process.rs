@@ -10,6 +10,7 @@ use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::fs::{mapping_for_inode, new_stdio_files, File, FileDescription};
+use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
     MapPermission, MemorySet, PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma,
@@ -168,6 +169,19 @@ pub struct ProcessControlBlockInner {
     pub itimer_prof: ItimerState,
     /// Robust list
     pub robust_list: RobustList,
+    /// Active SysV shared-memory attachments in this process.
+    pub shm_attachments: Vec<ShmAttachment>,
+}
+
+/// One SysV shared-memory attachment in a process address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShmAttachment {
+    /// Shared memory identifier.
+    pub shmid: usize,
+    /// User virtual address returned by `shmat`.
+    pub addr: usize,
+    /// Mapped byte length.
+    pub size: usize,
 }
 
 pub struct RobustList {
@@ -513,6 +527,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
+                    shm_attachments: Vec::new(),
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
@@ -677,7 +692,7 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        let (mut old_memory_set, old_token, old_mask, cloexec_entries) = {
+        let (mut old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments) = {
             let mut inner = self.inner_exclusive_access();
             let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             let old_token = old_memory_set.token();
@@ -695,12 +710,16 @@ impl ProcessControlBlock {
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
-            (old_memory_set, old_token, old_mask, cloexec_entries)
+            let old_shm_attachments = core::mem::take(&mut inner.shm_attachments);
+            (old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments)
         };
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
         DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
         drop(cloexec_entries);
+        for attachment in old_shm_attachments {
+            ipc::detach_segment(attachment.shmid);
+        }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
@@ -784,6 +803,7 @@ impl ProcessControlBlock {
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
         let parent_exec_path = parent.exec_path.clone();
+        let parent_shm_attachments = parent.shm_attachments.clone();
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -831,6 +851,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
+                    shm_attachments: parent_shm_attachments.clone(),
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
@@ -857,6 +878,9 @@ impl ProcessControlBlock {
             self.getpid(),
             child.getpid()
         );
+        for attachment in parent_shm_attachments {
+            ipc::retain_attached_segment(attachment.shmid);
+        }
         child.register_existing_file_mappings();
         // create main thread of child process
         let task = child.create_task(
@@ -959,6 +983,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
+                    shm_attachments: Vec::new(),
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
@@ -1116,6 +1141,24 @@ impl ProcessControlBlock {
         };
         reclaim.flush_then_release();
         true
+    }
+
+    /// Record a successful SysV shared-memory attachment.
+    pub fn add_shm_attachment(&self, attachment: ShmAttachment) {
+        self.inner.lock().shm_attachments.push(attachment);
+    }
+
+    /// Remove the attachment whose mapping starts at `addr`.
+    pub fn remove_shm_attachment_by_addr(&self, addr: usize) -> Option<ShmAttachment> {
+        let mut inner = self.inner.lock();
+        let idx = inner.shm_attachments.iter().position(|entry| entry.addr == addr)?;
+        Some(inner.shm_attachments.remove(idx))
+    }
+
+    /// Drain all SysV shared-memory attachments during exec/exit teardown.
+    pub fn take_all_shm_attachments(&self) -> Vec<ShmAttachment> {
+        let mut inner = self.inner.lock();
+        core::mem::take(&mut inner.shm_attachments)
     }
 
     /// 对当前进程地址空间中的指定范围执行 `msync`。

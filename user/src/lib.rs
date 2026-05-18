@@ -116,7 +116,7 @@ bitflags! {
 
 bitflags! {
     /// `mmap` 保护位。
-    pub struct MMapProt: usize {
+pub struct MMapProt: usize {
         /// 可读。
         const PROT_READ = 0x1;
         /// 可写。
@@ -125,6 +125,10 @@ bitflags! {
         const PROT_EXEC = 0x4;
     }
 }
+
+pub const IPC_CREAT: i32 = 0o1000;
+pub const IPC_EXCL: i32 = 0o2000;
+pub const IPC_RMID: i32 = 0;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -626,6 +630,22 @@ pub fn mmap_full(
 
 pub fn munmap(start: usize, len: usize) -> isize {
     sys_munmap(start, len)
+}
+
+pub fn shmget(key: i32, size: usize, flags: i32) -> isize {
+    sys_shmget(key, size, flags)
+}
+
+pub fn shmat(shmid: usize, addr: usize, flags: i32) -> isize {
+    sys_shmat(shmid, addr, flags)
+}
+
+pub fn shmdt(addr: usize) -> isize {
+    sys_shmdt(addr)
+}
+
+pub fn shmctl(shmid: usize, cmd: i32, buf: usize) -> isize {
+    sys_shmctl(shmid, cmd, buf)
 }
 
 pub fn brk(addr: usize) -> isize {
