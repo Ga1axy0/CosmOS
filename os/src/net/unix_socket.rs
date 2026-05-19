@@ -1,12 +1,17 @@
 use core::any::Any;
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use strum_macros::FromRepr;
 
 use crate::{
     fs::{File, FileDescription, Pipe, Stat, StatMode},
     mm::UserBuffer,
-    sync::SpinNoIrqLock,
+    poll::notify_poll_source,
+    sync::{Mutex, MutexBlocking, SpinNoIrqLock},
     syscall::errno::ERRNO,
 };
 
@@ -65,6 +70,7 @@ struct UnixStreamFrameMeta {
 
 struct UnixSocketPairLocalState {
     tx: Option<Arc<Pipe>>,
+    peer: Option<Weak<UnixSocketPairEnd>>,
     read_shutdown: bool,
     write_shutdown: bool,
     passcred: bool,
@@ -79,9 +85,9 @@ pub struct UnixSocketPairEnd {
     /// 出方向（self->peer）消息边界与控制消息元数据。
     tx_meta: Arc<SpinNoIrqLock<VecDeque<UnixStreamFrameMeta>>>,
     /// 串行化 read/recvmsg，保证与 rx_meta 的消费顺序一致。
-    rx_seq_lock: SpinNoIrqLock<()>,
+    rx_seq_lock: MutexBlocking,
     /// 串行化 write/sendmsg，保证与 tx_meta 的入队顺序一致。
-    tx_seq_lock: SpinNoIrqLock<()>,
+    tx_seq_lock: MutexBlocking,
 }
 
 impl UnixSocketPairEnd {
@@ -95,14 +101,15 @@ impl UnixSocketPairEnd {
             rx,
             state: SpinNoIrqLock::new(UnixSocketPairLocalState {
                 tx: Some(tx),
+                peer: None,
                 read_shutdown: false,
                 write_shutdown: false,
                 passcred: false,
             }),
             rx_meta,
             tx_meta,
-            rx_seq_lock: SpinNoIrqLock::new(()),
-            tx_seq_lock: SpinNoIrqLock::new(()),
+            rx_seq_lock: MutexBlocking::new(),
+            tx_seq_lock: MutexBlocking::new(),
         }
     }
 
@@ -112,13 +119,39 @@ impl UnixSocketPairEnd {
         end0_tx: Arc<Pipe>,
         end1_rx: Arc<Pipe>,
         end1_tx: Arc<Pipe>,
-    ) -> (Self, Self) {
+    ) -> (Arc<Self>, Arc<Self>) {
         let ab_meta = Arc::new(SpinNoIrqLock::new(VecDeque::new()));
         let ba_meta = Arc::new(SpinNoIrqLock::new(VecDeque::new()));
 
-        let end0 = Self::new_internal(end0_rx, end0_tx, ba_meta.clone(), ab_meta.clone());
-        let end1 = Self::new_internal(end1_rx, end1_tx, ab_meta, ba_meta);
+        let end0 = Arc::new(Self::new_internal(
+            end0_rx,
+            end0_tx,
+            ba_meta.clone(),
+            ab_meta.clone(),
+        ));
+        let end1 = Arc::new(Self::new_internal(end1_rx, end1_tx, ab_meta, ba_meta));
+        end0.set_peer(&end1);
+        end1.set_peer(&end0);
         (end0, end1)
+    }
+
+    fn set_peer(&self, peer: &Arc<Self>) {
+        self.state.lock().peer = Some(Arc::downgrade(peer));
+    }
+
+    fn source_id(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    fn notify_self(&self, ready_mask: u16) {
+        notify_poll_source(self.source_id(), ready_mask);
+    }
+
+    fn notify_peer(&self, ready_mask: u16) {
+        let peer = self.state.lock().peer.clone();
+        if let Some(peer) = peer.and_then(|peer| peer.upgrade()) {
+            peer.notify_self(ready_mask);
+        }
     }
 
     fn consume_rx_meta(
@@ -182,28 +215,36 @@ impl UnixSocketPairEnd {
             return Ok(0);
         }
 
-        let _seq = self.tx_seq_lock.lock();
+        self.tx_seq_lock.lock();
 
         let tx = {
             let state = self.state.lock();
             if state.write_shutdown || state.tx.is_none() {
                 if strict_shutdown {
+                    self.tx_seq_lock.unlock();
                     return Err(ERRNO::ESHUTDOWN);
                 }
+                self.tx_seq_lock.unlock();
                 return Ok(0);
             }
             state.tx.as_ref().cloned().unwrap()
         };
 
         let written = tx.write_at(0, buf);
+        if written == 0 && tx.write_peer_closed() {
+            self.tx_seq_lock.unlock();
+            return Err(ERRNO::EPIPE);
+        }
         if written > 0 {
             self.tx_meta.lock().push_back(UnixStreamFrameMeta {
                 remaining: written,
                 rights: ancillary.rights,
                 credentials: ancillary.credentials,
             });
+            self.notify_peer(POLLIN);
         }
 
+        self.tx_seq_lock.unlock();
         Ok(written)
     }
 
@@ -229,17 +270,22 @@ impl UnixSocketPairEnd {
             }
         }
 
-        let _seq = self.rx_seq_lock.lock();
+        self.rx_seq_lock.lock();
 
         {
             let state = self.state.lock();
             if state.read_shutdown {
+                self.rx_seq_lock.unlock();
                 return Ok((0, UnixSocketAncillaryData::default()));
             }
         }
 
         let read_len = self.rx.read_at(0, buf);
         let ancillary = self.consume_rx_meta(read_len, true);
+        if read_len > 0 {
+            self.notify_peer(POLLOUT);
+        }
+        self.rx_seq_lock.unlock();
         Ok((read_len, ancillary))
     }
 
@@ -247,17 +293,27 @@ impl UnixSocketPairEnd {
     pub fn shutdown(&self, how: i32) -> Result<(), ERRNO> {
         let mut state = self.state.lock();
         match how {
-            0 => {  // SHUT_RD
+            0 => {
+                // SHUT_RD
                 state.read_shutdown = true;
+                drop(state);
+                self.notify_self(POLLHUP);
             }
-            1 => {  // SHUT_WR
+            1 => {
+                // SHUT_WR
                 state.write_shutdown = true;
                 state.tx.take();
+                drop(state);
+                self.notify_peer(POLLHUP);
             }
-            2 => {  // SHUT_RDWR
+            2 => {
+                // SHUT_RDWR
                 state.read_shutdown = true;
                 state.write_shutdown = true;
                 state.tx.take();
+                drop(state);
+                self.notify_self(POLLHUP);
+                self.notify_peer(POLLHUP);
             }
             _ => return Err(ERRNO::EINVAL),
         }
@@ -272,6 +328,20 @@ impl UnixSocketPairEnd {
     /// Whether receiving `SCM_CREDENTIALS` is enabled on this endpoint.
     pub fn passcred_enabled(&self) -> bool {
         self.state.lock().passcred
+    }
+
+    /// Whether writing would fail because the peer read side is gone or this
+    /// endpoint has been shut down for writing.
+    pub fn write_peer_closed(&self) -> bool {
+        let state = self.state.lock();
+        if state.write_shutdown {
+            return true;
+        }
+        state
+            .tx
+            .as_ref()
+            .map(|tx| tx.write_peer_closed())
+            .unwrap_or(true)
     }
 }
 
@@ -296,17 +366,22 @@ impl File for UnixSocketPairEnd {
             }
         }
 
-        let _seq = self.rx_seq_lock.lock();
+        self.rx_seq_lock.lock();
 
         {
             let state = self.state.lock();
             if state.read_shutdown {
+                self.rx_seq_lock.unlock();
                 return 0;
             }
         }
 
         let read_len = self.rx.read_at(offset, buf);
         self.consume_rx_meta(read_len, false);
+        if read_len > 0 {
+            self.notify_peer(POLLOUT);
+        }
+        self.rx_seq_lock.unlock();
         read_len
     }
 
@@ -328,11 +403,15 @@ impl File for UnixSocketPairEnd {
             }
         }
         if (events & POLLOUT) != 0 && !state.write_shutdown {
-                if let Some(tx) = state.tx.as_ref() {
-                    ready |= tx.poll(events & POLLOUT);
-                }
+            if let Some(tx) = state.tx.as_ref() {
+                ready |= tx.poll(events & POLLOUT);
             }
+        }
         ready
+    }
+
+    fn poll_source_id(&self) -> usize {
+        self.source_id()
     }
 
     fn stat(&self) -> Stat {
@@ -357,5 +436,12 @@ impl File for UnixSocketPairEnd {
             ctime_nsec: 0,
             unused: [0; 2],
         }
+    }
+}
+
+impl Drop for UnixSocketPairEnd {
+    fn drop(&mut self) {
+        self.notify_self(POLLHUP | POLLIN | POLLOUT);
+        self.notify_peer(POLLHUP | POLLIN | POLLOUT);
     }
 }
