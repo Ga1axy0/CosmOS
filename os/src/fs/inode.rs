@@ -490,7 +490,11 @@ fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
 }
 
 /// Open (or optionally create) a file/directory at `path` relative to `cwd`.
-pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSInode>, ERRNO> {
+pub fn open_file_at_with_status(
+    cwd: &str,
+    path: &str,
+    flags: OpenFlags,
+) -> Result<(Arc<OSInode>, bool), ERRNO> {
     trace!("kernel: open_file_at: cwd={}, path={}, flags={:?}", cwd, path, flags);
     let abs = canonicalize(cwd, path);
     debug!("open_file_at: path = {} -> abs path = {}", path, abs);
@@ -516,12 +520,15 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
             if flags.contains(OpenFlags::TRUNC) {
                 page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
-            Ok(Arc::new(OSInode::new(inode, abs.clone())))
+            Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
         } else {
-            parent.create(&name).map(|inode| {
-                let _ = inode.set_times_now(inode_now());
-                Arc::new(OSInode::new(inode, abs.clone()))
-            }).ok_or(ERRNO::EIO)
+            parent
+                .create(&name)
+                .map(|inode| {
+                    let _ = inode.set_times_now(inode_now());
+                    (Arc::new(OSInode::new(inode, abs.clone())), true)
+                })
+                .ok_or(ERRNO::EIO)
         }
     } else {
         let inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
@@ -533,14 +540,24 @@ pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSIno
                 debug!("open_file_at: truncating existing file at {}", abs);
                 page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
-            Ok(Arc::new(OSInode::new(inode, abs.clone())))
+            Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
         }
     }
+}
+
+/// Open (or optionally create) a file/directory at `path` relative to `cwd`.
+pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSInode>, ERRNO> {
+    open_file_at_with_status(cwd, path, flags).map(|(inode, _created)| inode)
 }
 
 /// Create a directory at `path` relative to `cwd`.
 /// Returns `true` on success.
 pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
+    mkdir_at_with_inode(cwd, path).map(|_| ())
+}
+
+/// Create a directory at `path` relative to `cwd` and return the new inode.
+pub fn mkdir_at_with_inode(cwd: &str, path: &str) -> Result<Arc<Inode>, ERRNO> {
     if let Ok((parent, name, _)) = resolve_parent_follow(cwd, path) {
         // 已存在同名目录或文件
         if parent.find(&name).is_some() {
@@ -551,12 +568,12 @@ pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
             return Err(ERRNO::ENOTDIR);
         }
         // 创建失败
-        if let Some(inode) =  parent.mkdir(&name) {
+        if let Some(inode) = parent.mkdir(&name) {
             let _ = inode.set_times_now(inode_now());
+            Ok(inode)
         } else {
-            return Err(ERRNO::EIO);
+            Err(ERRNO::EIO)
         }
-        Ok(())
     } else {
         Err(ERRNO::ENOENT)
     }
@@ -801,6 +818,14 @@ impl File for OSInode {
         }
         total_read_size
     }
+    fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        let mapping = self.page_mapping();
+        Ok(if let Some(mapping) = mapping.as_ref() {
+            mapping.read(offset, buf)
+        } else {
+            self.inode.read_at(offset, buf)
+        })
+    }
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let mapping = self.page_mapping();
         let mut total_write_size = 0usize;
@@ -816,6 +841,13 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        Ok(if let Some(mapping) = self.page_mapping().as_ref() {
+            mapping.write(offset, buf)
+        } else {
+            self.inode.write_at(offset, buf)
+        })
     }
 
     fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {

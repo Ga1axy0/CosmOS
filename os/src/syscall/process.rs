@@ -212,6 +212,20 @@ pub fn sys_getegid() -> isize {
     process.getegid() as isize
 }
 
+/// umask syscall
+pub fn sys_umask(mask: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_umask",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let old = process.umask();
+        process.set_umask(mask as u32);
+        Ok(old as isize)
+    })
+}
+
 /// SysV `shmget`.
 pub fn sys_shmget(key: i32, size: usize, flag: i32) -> isize {
     trace!(

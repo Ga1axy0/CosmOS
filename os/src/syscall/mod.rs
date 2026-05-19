@@ -78,6 +78,8 @@ pub const SYSCALL_PWRITE64: usize = 68;
 pub const SYSCALL_PREADV: usize = 69;
 /// pwritev syscall
 pub const SYSCALL_PWRITEV: usize = 70;
+/// sendfile64 syscall
+pub const SYSCALL_SENDFILE64: usize = 71;
 /// pselect6_time32 syscall
 pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
@@ -174,6 +176,8 @@ pub const SYSCALL_GETRLIMIT: usize = 163;
 pub const SYSCALL_SETRLIMIT: usize = 164;
 /// getrusage syscall
 pub const SYSCALL_GETRUSAGE: usize = 165;
+/// umask syscall
+pub const SYSCALL_UMASK: usize = 166;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
@@ -436,6 +440,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4],
         ),
+        SYSCALL_SENDFILE64 =>
+            sys_sendfile64(args[0] as i32, args[1] as i32, args[2] as *mut i64, args[3]),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -517,6 +523,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut rlimit),
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const rlimit),
+        SYSCALL_UMASK => sys_umask(args[0] as i32),
         SYSCALL_PRLIMIT64 => sys_prlimit64(args[0] as i32, args[1], args[2] as *const rlimit, args[3] as *mut rlimit),
         SYSCALL_SYNCFS => sys_syncfs(args[0] as u32),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),

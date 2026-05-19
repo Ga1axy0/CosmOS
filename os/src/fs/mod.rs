@@ -184,9 +184,33 @@ impl FileDescription {
         self.file.read_at(offset, buf)
     }
 
+    /// 从固定偏移读取到内核缓冲区，不影响共享文件偏移。
+    pub fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        self.file.read_bytes_at(offset, buf)
+    }
+
     /// 向固定偏移写入，不影响共享文件偏移。
     pub fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         self.file.write_at(offset, buf)
+    }
+
+    /// 将内核缓冲区顺序写入并推进共享文件偏移。
+    pub fn write_bytes(&self, buf: &[u8]) -> Result<usize, ERRNO> {
+        if self.file.is_seekable() {
+            let mut inner = self.inner.lock();
+            if inner.status_flags.contains(FileStatusFlags::APPEND) {
+                inner.offset = self.file.stat().size.max(0) as usize;
+            }
+            let write_size = self.file.write_bytes_at(inner.offset, buf)?;
+            inner.offset += write_size;
+            return Ok(write_size);
+        }
+        self.file.write_bytes_at(0, buf)
+    }
+
+    /// 将内核缓冲区写入固定偏移，不影响共享文件偏移。
+    pub fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        self.file.write_bytes_at(offset, buf)
     }
 
     /// 返回该打开文件描述是否支持位置相关 I/O（`lseek/pread/pwrite`）。
@@ -347,9 +371,17 @@ pub trait File: Send + Sync + Any {
     fn read_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
     }
+    /// 从固定偏移读取到内核缓冲区。
+    fn read_bytes_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
+    }
     /// 向固定偏移写入数据。
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
+    }
+    /// 从内核缓冲区向固定偏移写入。
+    fn write_bytes_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
     }
     /// 调整文件逻辑长度。
     fn truncate(&self, _new_size: usize) -> Result<(), ERRNO> {
@@ -522,9 +554,10 @@ bitflags! {
 
 pub use inode::{
     canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
-    linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at, mount_device,
-    open_file, open_file_at, rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD,
-    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at,
+    mkdir_at_with_inode, mount_device, open_file, open_file_at, open_file_at_with_status,
+    rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
+    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};

@@ -955,7 +955,7 @@ fn refresh_page_cache_watermarks() {
     let mut manager = PAGE_CACHE_MANAGER.lock();
     manager.high_watermark = high_watermark;
     manager.low_watermark = low_watermark;
-    warn!(
+    debug!(
         "[page_cache] refresh watermarks: high={} low={} cached_pages={}",
         manager.high_watermark,
         manager.low_watermark,

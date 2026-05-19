@@ -385,10 +385,55 @@ impl File for UnixSocketPairEnd {
         read_len
     }
 
+    fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        {
+            let state = self.state.lock();
+            if state.read_shutdown {
+                return Ok(0);
+            }
+        }
+
+        let _seq = self.rx_seq_lock.lock();
+
+        {
+            let state = self.state.lock();
+            if state.read_shutdown {
+                return Ok(0);
+            }
+        }
+
+        let read_len = self.rx.read_bytes_at(offset, buf)?;
+        self.consume_rx_meta(read_len, false);
+        Ok(read_len)
+    }
+
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let _ = offset;
         self.write_with_ancillary(buf, UnixSocketAncillaryData::default(), false)
             .unwrap_or(0)
+    }
+
+    fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        let _ = offset;
+        let _seq = self.tx_seq_lock.lock();
+
+        let tx = {
+            let state = self.state.lock();
+            if state.write_shutdown || state.tx.is_none() {
+                return Ok(0);
+            }
+            state.tx.as_ref().cloned().unwrap()
+        };
+
+        let written = tx.write_bytes_at(0, buf)?;
+        if written > 0 {
+            self.tx_meta.lock().push_back(UnixStreamFrameMeta {
+                remaining: written,
+                rights: Vec::new(),
+                credentials: None,
+            });
+        }
+        Ok(written)
     }
 
     fn poll(&self, events: u16) -> u16 {
@@ -438,7 +483,6 @@ impl File for UnixSocketPairEnd {
         }
     }
 }
-
 impl Drop for UnixSocketPairEnd {
     fn drop(&mut self) {
         self.notify_self(POLLHUP | POLLIN | POLLOUT);
