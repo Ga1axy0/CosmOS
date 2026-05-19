@@ -204,6 +204,14 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// mlock syscall
+pub const SYSCALL_MLOCK: usize = 228;
+/// munlock syscall
+pub const SYSCALL_MUNLOCK: usize = 229;
+/// mlockall syscall
+pub const SYSCALL_MLOCKALL: usize = 230;
+/// munlockall syscall
+pub const SYSCALL_MUNLOCKALL: usize = 231;
 /// madvise syscall
 pub const SYSCALL_MADVISE: usize = 233;
 /// get_mempolicy syscall
@@ -478,6 +486,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
+        SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
+        SYSCALL_MLOCKALL => sys_mlockall(args[0] as i32),
+        SYSCALL_MUNLOCKALL => sys_munlockall(),
         SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
             args[0] as *mut i32,
             args[1] as *mut u8,
