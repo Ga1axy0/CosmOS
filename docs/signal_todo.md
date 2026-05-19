@@ -12,38 +12,10 @@
 - signal handler 返回时会跳到固定 trampoline，执行 `rt_sigreturn` 系统调用。
 - `sys_sigreturn` 当前能按内核自定义 `UContext` 恢复寄存器、`sepc` 和 signal mask。
 - 这套机制预计能覆盖 BusyBox ash 的普通 `SIGCHLD handler(signum)` 返回路径。
+- `SignalNum` 现在是唯一维护 Linux 信号编号的 enum，`SignalBit` 使用 Linux `sigset_t`
+  布局：信号 `n` 对应 bit `1 << (n - 1)`。
 
 ## 已知问题
-
-### sigset_t 位布局不一致
-
-Linux `sigset_t` 中信号 `n` 对应 bit `n - 1`。
-
-当前内核内部 `SignalFlags` 使用信号 `n` 对应 bit `n`，例如：
-
-```text
-SIGCHLD = 1 << 17
-```
-
-Linux ABI 中 `SIGCHLD=17` 应为：
-
-```text
-1 << 16
-```
-
-TODO：在 syscall 边界增加转换函数：
-
-```text
-linux_sigset -> internal SignalFlags
-internal SignalFlags -> linux_sigset
-```
-
-需要覆盖：
-
-- `rt_sigaction.sa_mask`
-- `rt_sigprocmask`
-- `rt_sigsuspend`
-- `rt_sigreturn` 中保存/恢复的 mask
 
 ### sigsuspend 恢复 mask 时机错误
 
@@ -95,13 +67,12 @@ TODO：在进程退出和 wait 逻辑中补齐这些语义。
 
 ## 建议处理顺序
 
-1. 修复 Linux `sigset_t` 与内部 `SignalFlags` 的位转换。
-2. 修复 `sigsuspend`，让旧 mask 由 `rt_sigreturn` 恢复。
-3. 调整 fatal signal 判断，避免覆盖用户 handler。
-4. 实现 `SA_RESETHAND`。
-5. 完善 Linux RISC-V `rt_sigframe/ucontext_t/mcontext_t` 布局。
-6. 实现 `sigaltstack` 和 `SA_ONSTACK`。
-7. 补齐 `SIGCHLD` 相关的 `SA_NOCLDWAIT/SA_NOCLDSTOP` 语义。
+1. 修复 `sigsuspend`，让旧 mask 由 `rt_sigreturn` 恢复。
+2. 调整 fatal signal 判断，避免覆盖用户 handler。
+3. 实现 `SA_RESETHAND`。
+4. 完善 Linux RISC-V `rt_sigframe/ucontext_t/mcontext_t` 布局。
+5. 实现 `sigaltstack` 和 `SA_ONSTACK`。
+6. 补齐 `SIGCHLD` 相关的 `SA_NOCLDWAIT/SA_NOCLDSTOP` 语义。
 
 ## 当前可接受的临时前提
 
