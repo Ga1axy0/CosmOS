@@ -636,7 +636,7 @@ pub struct SignalAction {
     pub handler: usize,
     /// Linux `SA_*` 标志位。
     pub sa_flags: usize,
-    /// 信号掩码，当前用户库只包装低 32 位。
+    /// 信号掩码，使用 Linux sigset_t 低 64 位布局。
     pub sa_mask: u64,
 }
 
@@ -645,7 +645,7 @@ impl Default for SignalAction {
         Self {
             handler: 0,
             sa_flags: 0,
-            sa_mask: SignalFlags::empty().bits() as u64,
+            sa_mask: SignalBit::empty().bits(),
         }
     }
 }
@@ -684,39 +684,39 @@ pub const SIGPWR: i32 = 30;
 pub const SIGSYS: i32 = 31;
 
 bitflags! {
-    pub struct SignalFlags: i32 {
-        const SIGDEF = 1; // Default signal handling
-        const SIGHUP = 1 << 1;
-        const SIGINT = 1 << 2;
-        const SIGQUIT = 1 << 3;
-        const SIGILL = 1 << 4;
-        const SIGTRAP = 1 << 5;
-        const SIGABRT = 1 << 6;
-        const SIGBUS = 1 << 7;
-        const SIGFPE = 1 << 8;
-        const SIGKILL = 1 << 9;
-        const SIGUSR1 = 1 << 10;
-        const SIGSEGV = 1 << 11;
-        const SIGUSR2 = 1 << 12;
-        const SIGPIPE = 1 << 13;
-        const SIGALRM = 1 << 14;
-        const SIGTERM = 1 << 15;
-        const SIGSTKFLT = 1 << 16;
-        const SIGCHLD = 1 << 17;
-        const SIGCONT = 1 << 18;
-        const SIGSTOP = 1 << 19;
-        const SIGTSTP = 1 << 20;
-        const SIGTTIN = 1 << 21;
-        const SIGTTOU = 1 << 22;
-        const SIGURG = 1 << 23;
-        const SIGXCPU = 1 << 24;
-        const SIGXFSZ = 1 << 25;
-        const SIGVTALRM = 1 << 26;
-        const SIGPROF = 1 << 27;
-        const SIGWINCH = 1 << 28;
-        const SIGIO = 1 << 29;
-        const SIGPWR = 1 << 30;
-        const SIGSYS = 1 << 31;
+    pub struct SignalBit: u64 {
+        const SIGDEF = 0; // Default signal handling
+        const SIGHUP = 1 << 0;
+        const SIGINT = 1 << 1;
+        const SIGQUIT = 1 << 2;
+        const SIGILL = 1 << 3;
+        const SIGTRAP = 1 << 4;
+        const SIGABRT = 1 << 5;
+        const SIGBUS = 1 << 6;
+        const SIGFPE = 1 << 7;
+        const SIGKILL = 1 << 8;
+        const SIGUSR1 = 1 << 9;
+        const SIGSEGV = 1 << 10;
+        const SIGUSR2 = 1 << 11;
+        const SIGPIPE = 1 << 12;
+        const SIGALRM = 1 << 13;
+        const SIGTERM = 1 << 14;
+        const SIGSTKFLT = 1 << 15;
+        const SIGCHLD = 1 << 16;
+        const SIGCONT = 1 << 17;
+        const SIGSTOP = 1 << 18;
+        const SIGTSTP = 1 << 19;
+        const SIGTTIN = 1 << 20;
+        const SIGTTOU = 1 << 21;
+        const SIGURG = 1 << 22;
+        const SIGXCPU = 1 << 23;
+        const SIGXFSZ = 1 << 24;
+        const SIGVTALRM = 1 << 25;
+        const SIGPROF = 1 << 26;
+        const SIGWINCH = 1 << 27;
+        const SIGIO = 1 << 28;
+        const SIGPWR = 1 << 29;
+        const SIGSYS = 1 << 30;
     }
 }
 
@@ -736,7 +736,7 @@ pub fn sigaction(
     )
 }
 
-pub fn sigprocmask(mask: u32) -> isize {
+pub fn sigprocmask(mask: u64) -> isize {
     sys_sigprocmask(mask)
 }
 

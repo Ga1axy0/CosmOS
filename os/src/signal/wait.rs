@@ -2,7 +2,7 @@
 
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    current_process, pid2process, wakeup_task, SignalFlags, TaskControlBlock,
+    current_process, pid2process, wakeup_task, SignalBit, TaskControlBlock,
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -23,7 +23,7 @@ struct SignalWaitSlot {
     generation: u8,
     state: SignalWaitState,
     pid: usize,
-    signal_bits: u32,
+    signal_bits: u64,
     task_ptr: usize,
 }
 
@@ -60,7 +60,7 @@ impl SignalWaitRegistry {
     fn alloc(
         &mut self,
         pid: usize,
-        signal_bits: u32,
+        signal_bits: u64,
         task: &Arc<TaskControlBlock>,
     ) -> Option<SignalWaitHandle> {
         for off in 0..MAX_SIGNAL_WAITERS {
@@ -151,7 +151,7 @@ pub(crate) enum SignalWakeState {
 
 pub(crate) fn register_signal_wait(
     pid: usize,
-    signal_set: SignalFlags,
+    signal_set: SignalBit,
     task: &Arc<TaskControlBlock>,
 ) -> Option<SignalWaitHandle> {
     SIGNAL_WAIT_REGISTRY
@@ -191,7 +191,7 @@ pub(crate) fn cleanup_signal_wait_for_task(task: &Arc<TaskControlBlock>) {
     }
 }
 
-pub(crate) fn notify_signal_wait_pid(pid: usize, pending_bits: u32) {
+pub(crate) fn notify_signal_wait_pid(pid: usize, pending_bits: u64) {
     if pending_bits == 0 {
         return;
     }
@@ -245,7 +245,7 @@ pub(crate) fn handle_signal_wait_timeout(
     true
 }
 
-pub(crate) fn has_pending_signal_in_set(signal_set: SignalFlags) -> bool {
+pub(crate) fn has_pending_signal_in_set(signal_set: SignalBit) -> bool {
     let process = current_process();
     let inner = process.inner_exclusive_access();
     !(inner.pending_signals & signal_set).is_empty()
@@ -257,12 +257,12 @@ pub(crate) fn has_unmasked_pending_signal() -> bool {
     !(inner.pending_signals & !inner.signal_mask).is_empty()
 }
 
-pub(crate) fn take_pending_signal_in_set(signal_set: SignalFlags) -> Option<i32> {
+pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<i32> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let pending = inner.pending_signals & signal_set;
     for signum in 1..=crate::signal::MAX_SIG {
-        let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
+        let Some(flag) = SignalBit::from_signum(signum as u32) else {
             continue;
         };
         if pending.contains(flag) {
