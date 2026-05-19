@@ -94,6 +94,8 @@ pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// clock_getres syscall
 pub const SYSCALL_CLOCK_GETRES: usize = 114;
+/// clock_nanosleep syscall
+pub const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// syslog syscall
 pub const SYSCALL_SYSLOG: usize = 116;
 /// sched_setscheduler syscall
@@ -413,6 +415,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
+            args[0] as ClockId,
+            args[1] as i32,
+            args[2] as *const Timespec,
+            args[3] as *mut Timespec,
+        ),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_GETSID => sys_getsid(),
