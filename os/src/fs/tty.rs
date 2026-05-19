@@ -360,6 +360,18 @@ impl File for TtyFile {
         n
     }
 
+    fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        let mut n = 0usize;
+        for byte in buf.iter_mut() {
+            *byte = self.core.read_processed_byte();
+            n += 1;
+            if !self.core.has_ready_input() {
+                break;
+            }
+        }
+        Ok(n)
+    }
+
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         // 以单次 `write` 为粒度串行化终端输出，尽量贴近 Linux tty 的整块写语义。
         let _tx_guard = self.core.tx_lock.lock();
@@ -372,6 +384,14 @@ impl File for TtyFile {
             }
         }
         n
+    }
+
+    fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        let _tx_guard = self.core.tx_lock.lock();
+        for &ch in buf {
+            self.core.write_byte(ch);
+        }
+        Ok(buf.len())
     }
 
     fn poll(&self, events: u16) -> u16 {

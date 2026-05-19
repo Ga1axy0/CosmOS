@@ -32,6 +32,8 @@ const MUSL_INTERP_PATHS: [&str; 2] = [
     "/lib/ld-musl-riscv64-sf.so.1",
     "/lib/ld-musl-riscv64.so.1",
 ];
+/// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
+const DEFAULT_UMASK: u32 = 0o022;
 
 bitflags! {
     /// fd 表项级别的标志位。
@@ -147,6 +149,8 @@ pub struct ProcessControlBlockInner {
     pub cwd: String,
     /// absolute path of the last executed image (for /proc/<pid>/exe)
     pub exec_path: String,
+    /// process file creation mask (`umask`)
+    pub umask: u32,
     /// process credentials
     pub cred: Credentials,
     /// CPU time spent in user mode for this process (raw timer counter units)
@@ -516,6 +520,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
                     exec_path,
+                    umask: DEFAULT_UMASK,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -803,6 +808,7 @@ impl ProcessControlBlock {
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
         let parent_exec_path = parent.exec_path.clone();
+        let parent_umask = parent.umask;
         let parent_shm_attachments = parent.shm_attachments.clone();
         // alloc a pid
         let pid = pid_alloc();
@@ -840,6 +846,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent_cwd,
                     exec_path: parent_exec_path,
+                    umask: parent_umask,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -972,6 +979,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
                     exec_path,
+                    umask: parent.umask,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -1058,6 +1066,14 @@ impl ProcessControlBlock {
 
     pub fn setpgid(&self, pgid: u32) {
         self.inner.lock().cred.pgid = pgid;
+    }
+
+    pub fn umask(&self) -> u32 {
+        self.inner.lock().umask
+    }
+
+    pub fn set_umask(&self, umask: u32) {
+        self.inner.lock().umask = umask & 0o777;
     }
 
     /// map an anonymous area with given permission, return true if success

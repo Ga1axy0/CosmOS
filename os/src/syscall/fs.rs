@@ -1,9 +1,9 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at, mount_device, rename_at,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode,
-    open_file_at, symlinkat, unlinkat,
+    open_file_at_with_status, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::net::UnixSocketPairEnd;
@@ -76,6 +76,7 @@ const PPOLL_FALLBACK_POLL_MS: usize = 10;
 /// 单次 `ppoll`/`poll` 调用允许的最大 fd 数量上限，用于防止恶意的大规模分配。
 const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
+const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -665,6 +666,11 @@ fn parse_pos64_halves(pos_l: usize, pos_h: usize) -> Result<usize, ERRNO> {
     usize::try_from(pos).map_err(|_| ERRNO::EINVAL)
 }
 
+fn is_regular_file(desc: &Arc<FileDescription>) -> bool {
+    let mode = desc.stat().mode;
+    mode.bits() & StatMode::TYPE_MASK.bits() == StatMode::FILE.bits()
+}
+
 fn preadv_like(
     desc: &Arc<FileDescription>,
     iovecs: &[IoVec],
@@ -1155,6 +1161,82 @@ pub fn sys_pwrite64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
     })
 }
 
+/// sendfile64 syscall：从普通文件搬运数据到另一个 fd，避免用户态中转。
+pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sendfile64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if out_fd < 0 || in_fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        if count > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let out_desc = get_writable_file(out_fd as usize)?;
+        let in_desc = get_readable_file(in_fd as usize)?;
+
+        if out_desc.status_flags().contains(FileStatusFlags::APPEND) {
+            return Err(ERRNO::EINVAL);
+        }
+        if !in_desc.is_seekable() || !is_regular_file(&in_desc) {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let mut in_pos = if offset.is_null() {
+            usize::try_from(in_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?
+        } else {
+            parse_pos64(read_pod_from_user(offset as *const i64)?)?
+        };
+
+        let chunk_len = count.min(SENDFILE_CHUNK_SIZE);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(chunk_len).map_err(|_| ERRNO::ENOMEM)?;
+        buf.resize(chunk_len, 0);
+
+        let mut copied = 0usize;
+        let result: Result<isize, ERRNO> = (|| {
+            while copied < count {
+                let want = (count - copied).min(buf.len());
+                let read = match in_desc.read_bytes_at(in_pos, &mut buf[..want]) {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if read == 0 {
+                    break;
+                }
+
+                let written = match out_desc.write_bytes(&buf[..read]) {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if written == 0 {
+                    break;
+                }
+
+                in_pos = in_pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                copied = copied.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if written < read {
+                    break;
+                }
+            }
+            Ok(copied as isize)
+        })();
+
+        if offset.is_null() {
+            in_desc.seek(in_pos as i64, 0)?;
+        } else {
+            write_pod_to_user(offset, &(in_pos as i64))?;
+        }
+
+        result
+    })
+}
+
 /// readv syscall：按 `iovec` 顺序将多个用户缓冲区从同一个 fd 读出。
 pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
     trace!(
@@ -1313,7 +1395,7 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
 }
 
 /// open sysall
-pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize {
+pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_open",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -1338,11 +1420,22 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             FdFlags::empty()
         };
         let open_state = filter_open_flags(flags & !O_CLOEXEC)?;
-        let inode = open_file_at(
+        let (inode, created) = open_file_at_with_status(
             cwd.as_str(),
             path.as_str(),
             open_state.open_flags,
         )?;
+        if created {
+            // POSIX: mode 仅在“新建”时生效，并受进程 umask 过滤。
+            let requested = mode & StatMode::PERM_MASK.bits();
+            let umask = process.umask();
+            let effective = requested & !umask;
+            let old_mode = inode.stat().mode.bits();
+            let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (effective & StatMode::PERM_MASK.bits());
+            if let Some(backing_inode) = inode.as_inode() {
+                backing_inode.set_mode(new_mode)?;
+            }
+        }
         if open_state.open_flags.contains(OpenFlags::DIRECTORY) && !inode.is_dir() {
             return Err(ERRNO::ENOTDIR);
         }
@@ -1810,9 +1903,9 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
 
 /// mkdirat – create a directory at `path` relative to the provided directory fd.
 ///
-/// `mode` is accepted but not enforced.
+/// `mode` 仅在创建时使用，并受进程 `umask` 过滤。
 /// Returns 0 on success, −errno on failure.
-pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_mkdirat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -1824,7 +1917,13 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
             return Err(ERRNO::ENOENT);
         }
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        mkdir_at(cwd.as_str(), path.as_str())?;
+        let dir_inode = mkdir_at_with_inode(cwd.as_str(), path.as_str())?;
+        let requested = mode & StatMode::PERM_MASK.bits();
+        let umask = current_process().umask();
+        let effective = requested & !umask;
+        let old_mode = inode_stat(&dir_inode).mode.bits();
+        let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (effective & StatMode::PERM_MASK.bits());
+        dir_inode.set_mode(new_mode)?;
         Ok(0)
     })
 }
