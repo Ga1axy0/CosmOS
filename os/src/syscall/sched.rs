@@ -4,7 +4,7 @@ use crate::syscall_body;
 use crate::{
     config::MAX_HARTS,
     hart::hartid,
-    mm::{translated_byte_buffer, translated_ref},
+    mm::{online_mask as online_hart_mask, translated_byte_buffer, translated_ref},
     sched::{
         enqueue_task_on, has_runnable_task_at_or_above, nice_to_weight, pid2process, remove_task,
         request_current_task_resched, resched_hart, suspend_current_and_run_next,
@@ -54,12 +54,11 @@ fn affinity_mask_bytes_len() -> usize {
 }
 
 fn online_cpu_mask() -> usize {
-    if MAX_HARTS >= usize::BITS as usize {
-        usize::MAX
-    } else if MAX_HARTS == 0 {
-        0
+    let online = online_hart_mask();
+    if online != 0 {
+        online
     } else {
-        (1usize << MAX_HARTS) - 1
+        1usize << hartid().min(usize::BITS.saturating_sub(1) as usize)
     }
 }
 

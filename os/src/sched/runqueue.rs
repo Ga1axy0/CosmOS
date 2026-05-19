@@ -3,12 +3,13 @@
 use super::current_task;
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
+use crate::mm::online_mask as online_hart_mask;
 use crate::sbi::send_ipi_mask;
 use crate::sched::{request_current_task_resched, CFS_WAKEUP_GRANULARITY_NS};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    all_cpu_affinity_mask, ProcessControlBlock, ReschedReason, SchedPolicy, TaskControlBlock,
-    TaskControlBlockInner, TaskStatus, SCHED_RT_PRIO_MAX,
+    ProcessControlBlock, ReschedReason, SchedPolicy, TaskControlBlock, TaskControlBlockInner,
+    TaskStatus, SCHED_RT_PRIO_MAX,
 };
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -229,7 +230,12 @@ fn normalize_hart(hart: usize) -> usize {
 }
 
 fn effective_affinity_mask(affinity_mask: usize) -> usize {
-    let online = all_cpu_affinity_mask();
+    let online = online_hart_mask();
+    let online = if online != 0 {
+        online
+    } else {
+        1usize << normalize_hart(hartid())
+    };
     let effective = if affinity_mask == 0 {
         online
     } else {
