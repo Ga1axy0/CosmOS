@@ -36,6 +36,11 @@ impl Pipe {
     fn source_id(&self) -> usize {
         Arc::as_ptr(&self.buffer) as usize
     }
+
+    /// Whether this write end no longer has any peer read end.
+    pub fn write_peer_closed(&self) -> bool {
+        self.writable && self.buffer.lock().all_read_ends_closed()
+    }
 }
 
 const RING_BUFFER_SIZE: usize = 1024;
@@ -52,6 +57,7 @@ pub struct PipeRingBuffer {
     head: usize,
     tail: usize,
     status: RingBufferStatus,
+    read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
     read_wait_queue: Arc<WaitQueue>,
     write_wait_queue: Arc<WaitQueue>,
@@ -64,10 +70,14 @@ impl PipeRingBuffer {
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
+            read_end: None,
             write_end: None,
             read_wait_queue: Arc::new(WaitQueue::new()),
             write_wait_queue: Arc::new(WaitQueue::new()),
         }
+    }
+    pub fn set_read_end(&mut self, read_end: &Arc<Pipe>) {
+        self.read_end = Some(Arc::downgrade(read_end));
     }
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
         self.write_end = Some(Arc::downgrade(write_end));
@@ -108,15 +118,22 @@ impl PipeRingBuffer {
     pub fn all_write_ends_closed(&self) -> bool {
         self.write_end.as_ref().unwrap().upgrade().is_none()
     }
+    pub fn all_read_ends_closed(&self) -> bool {
+        self.read_end.as_ref().unwrap().upgrade().is_none()
+    }
 }
 
 /// Return (read_end, write_end)
 pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     trace!("kernel: make_pipe");
-    let buffer = Arc::new(unsafe { SpinNoIrqLock::new(PipeRingBuffer::new()) });
+    let buffer = Arc::new(SpinNoIrqLock::new(PipeRingBuffer::new()));
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
-    buffer.lock().set_write_end(&write_end);
+    {
+        let mut ring_buffer = buffer.lock();
+        ring_buffer.set_read_end(&read_end);
+        ring_buffer.set_write_end(&write_end);
+    }
     (read_end, write_end)
 }
 
@@ -186,13 +203,17 @@ impl File for Pipe {
         let mut already_write = 0usize;
         loop {
             let mut ring_buffer = self.buffer.lock();
+            if ring_buffer.all_read_ends_closed() {
+                return already_write;
+            }
             let loop_write = ring_buffer.available_write();
             // debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
             if loop_write == 0 {
                 let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);
                 write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
-                    self.buffer.lock().available_write() > 0
+                    let ring_buffer = self.buffer.lock();
+                    ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
                 });
                 continue;
             }

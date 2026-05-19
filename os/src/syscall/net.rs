@@ -492,8 +492,8 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         let (ba_read, ba_write) = make_pipe();
 
         let (end0_raw, end1_raw) = UnixSocketPairEnd::new_pair(ba_read, ab_write, ab_read, ba_write);
-        let end0: Arc<dyn File + Send + Sync> = Arc::new(end0_raw);
-        let end1: Arc<dyn File + Send + Sync> = Arc::new(end1_raw);
+        let end0: Arc<dyn File + Send + Sync> = end0_raw;
+        let end1: Arc<dyn File + Send + Sync> = end1_raw;
 
         let status_flags = if (socket_type & SOCK_NONBLOCK) != 0 {
             FileStatusFlags::NONBLOCK
