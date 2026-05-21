@@ -352,6 +352,23 @@ pub fn yield_() -> isize {
     sys_yield()
 }
 
+pub const SCHED_OTHER: i32 = 0;
+pub const SCHED_FIFO: i32 = 1;
+pub const SCHED_RR: i32 = 2;
+pub const PRIO_PROCESS: i32 = 0;
+
+pub fn sched_setscheduler(pid: isize, policy: i32, param: &SchedParam) -> isize {
+    sys_sched_setscheduler(pid, policy, param)
+}
+
+pub fn sched_getscheduler(pid: isize) -> isize {
+    sys_sched_getscheduler(pid)
+}
+
+pub fn sched_getparam(pid: isize, param: &mut SchedParam) -> isize {
+    sys_sched_getparam(pid, param)
+}
+
 pub fn get_time() -> isize {
     let mut time = TimeVal::new();
     match sys_get_time(&mut time, 0) {
@@ -467,6 +484,19 @@ pub fn execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
 
 pub fn set_priority(prio: isize) -> isize {
     sys_set_priority(prio)
+}
+
+pub fn setpriority(which: i32, who: usize, prio: i32) -> isize {
+    sys_setpriority(which, who, prio)
+}
+
+pub fn getpriority(which: i32, who: usize) -> isize {
+    let raw = sys_getpriority(which, who);
+    if raw < 0 {
+        raw
+    } else {
+        20 - raw
+    }
 }
 
 pub fn wait(exit_code: &mut i32) -> isize {

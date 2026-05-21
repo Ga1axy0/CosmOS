@@ -2,19 +2,13 @@
 
 use super::id::TaskUserRes;
 use super::wait_queue::WaitQueueHandle;
-use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
+use super::{kstack_alloc, KernelStack, ProcessControlBlock};
 use crate::config::MAX_HARTS;
-use crate::trap::TrapContext;
-use crate::{mm::PhysPageNum};
+use crate::mm::PhysPageNum;
+use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
-
-/// Linux-like RT priority range supported by this kernel.
-pub const SCHED_RT_PRIO_MIN: u8 = 1;
-/// Linux-like RT priority range supported by this kernel.
-pub const SCHED_RT_PRIO_MAX: u8 = 99;
-/// Default time slice for SCHED_RR tasks, in timer ticks.
-pub const DEFAULT_TIME_SLICE_TICKS: u32 = 10;
 
 /// Return a mask containing all online harts supported by the kernel.
 pub const fn all_cpu_affinity_mask() -> usize {
@@ -27,40 +21,85 @@ pub const fn all_cpu_affinity_mask() -> usize {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-/// Supported scheduling policies for phase 1.
-pub enum SchedPolicy {
-    /// Internal idle context, not exposed as a normal runnable task policy.
-    Idle = 0,
-    /// Linux-like real-time round-robin scheduling.
-    Rr = 2,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-/// In-kernel scheduling attributes inherited by newly created tasks.
-pub struct SchedAttr {
-    /// Scheduling policy.
+/// Scheduler-owned mutable runtime state associated with one task.
+pub struct TaskSchedState {
+    /// Last hart that ran this task.
+    pub last_cpu: usize,
+    /// Whether the task is currently running on a CPU.
+    pub on_cpu: bool,
+    /// Whether the task is currently queued on a runqueue.
+    pub on_rq: bool,
+    /// Current scheduling policy.
     pub policy: SchedPolicy,
-    /// Real-time priority in the range `1..=99`.
+    /// Real-time priority. Larger value means higher priority.
     pub rt_priority: u8,
-    /// Round-robin time slice length in timer ticks.
+    /// Configured round-robin time slice, in timer ticks.
     pub time_slice_ticks: u32,
+    /// Remaining time slice budget, in timer ticks.
+    pub remaining_slice_ticks: u32,
+    /// Linux nice value used by CFS.
+    pub nice: i32,
+    /// CFS load weight derived from nice.
+    pub weight: u64,
+    /// Virtual runtime used as the CFS ordering key, in nanoseconds.
+    pub vruntime_ns: u64,
+    /// Last timestamp at which execution accounting was started, in nanoseconds.
+    pub exec_start_ns: u64,
+    /// Total runtime accounted by CFS, in nanoseconds.
+    pub sum_exec_runtime_ns: u64,
+    /// Runtime accounting baseline for the current CFS CPU slice, in nanoseconds.
+    pub cfs_slice_start_ns: u64,
+    /// Current key while this task is linked into a CFS runqueue.
+    pub cfs_rq_key: Option<(u64, usize)>,
+    /// Whether the task has been placed on a CFS runqueue before.
+    pub cfs_initialized: bool,
+    /// Deferred reschedule request handled at safe scheduling points.
+    pub resched_reason: Option<ReschedReason>,
+    /// Insert the task at the head of its RT priority queue on the next enqueue.
+    pub rt_enqueue_head: bool,
+    /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
+    pub cpu_affinity_mask: usize,
 }
 
-impl SchedAttr {
-    /// Create a round-robin scheduling attribute set with the given RT priority.
-    pub const fn rr(rt_priority: u8) -> Self {
+impl TaskSchedState {
+    /// Create a new `TaskSchedState` with the given scheduling attributes and default values.
+    pub fn new(sched_attr: SchedAttr) -> Self {
         Self {
-            policy: SchedPolicy::Rr,
-            rt_priority,
-            time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
+            last_cpu: 0,
+            on_cpu: false,
+            on_rq: false,
+            policy: sched_attr.policy,
+            rt_priority: sched_attr.rt_priority,
+            time_slice_ticks: sched_attr.time_slice_ticks,
+            remaining_slice_ticks: sched_attr.time_slice_ticks,
+            nice: sched_attr.nice,
+            weight: sched_attr.weight,
+            vruntime_ns: 0,
+            exec_start_ns: 0,
+            sum_exec_runtime_ns: 0,
+            cfs_slice_start_ns: 0,
+            cfs_rq_key: None,
+            cfs_initialized: false,
+            resched_reason: None,
+            rt_enqueue_head: false,
+            cpu_affinity_mask: all_cpu_affinity_mask(),
         }
     }
-}
 
-impl Default for SchedAttr {
-    fn default() -> Self {
-        Self::rr(SCHED_RT_PRIO_MIN)
+    /// Get the scheduling attributes corresponding to the current state.
+    pub fn sched_attr(&self) -> SchedAttr {
+        SchedAttr {
+            policy: self.policy,
+            rt_priority: self.rt_priority,
+            time_slice_ticks: self.time_slice_ticks,
+            nice: self.nice,
+            weight: self.weight,
+        }
+    }
+
+    /// Reset the remaining time slice to the full length according to the current scheduling attributes.
+    pub fn reset_time_slice(&mut self) {
+        self.remaining_slice_ticks = self.time_slice_ticks;
     }
 }
 
@@ -98,29 +137,15 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// Why this task is blocked (if blocked by a sleep queue/event).
     pub wait_reason: Option<WaitReason>,
-    /// Last hart that ran this task.
-    pub last_cpu: usize,
-    /// whether the task is running on cpu
-    pub on_cpu: bool,
-    /// whether the task is in runqueue
-    pub on_rq: bool,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
-    /// Current scheduling policy.
-    pub policy: SchedPolicy,
-    /// Real-time priority. Larger value means higher priority.
-    pub rt_priority: u8,
-    /// Configured round-robin time slice, in timer ticks.
-    pub time_slice_ticks: u32,
-    /// Remaining time slice budget, in timer ticks.
-    pub remaining_slice_ticks: u32,
-    /// Deferred reschedule request handled at safe scheduling points.
-    pub need_resched: bool,
-    /// Allowed target harts for this task. Bit `n` corresponds to hart `n`.
-    pub cpu_affinity_mask: usize,
+    /// Scheduler-private mutable runtime state.
+    pub sched: TaskSchedState,
     /// Handle to the WaitQueue this task is currently sleeping in (if any).
     /// Used by signal delivery to properly remove the task from the queue.
     pub current_wq_handle: Option<WaitQueueHandle>,
+    /// Userspace TID address to clear on thread exit for Linux clone compatibility.
+    pub clear_child_tid: usize,
 }
 
 impl TaskControlBlockInner {
@@ -134,15 +159,38 @@ impl TaskControlBlockInner {
     }
 
     pub fn sched_attr(&self) -> SchedAttr {
-        SchedAttr {
-            policy: self.policy,
-            rt_priority: self.rt_priority,
-            time_slice_ticks: self.time_slice_ticks,
-        }
+        self.sched.sched_attr()
     }
 
     pub fn reset_time_slice(&mut self) {
-        self.remaining_slice_ticks = self.time_slice_ticks;
+        self.sched.reset_time_slice();
+    }
+
+    /// Account CFS runtime up to `now_ns` for a currently running regular task.
+    pub fn account_cfs_runtime(&mut self, now_ns: u64) {
+        if !matches!(self.sched.policy, SchedPolicy::Other) {
+            return;
+        }
+        if self.sched.exec_start_ns == 0 {
+            self.sched.exec_start_ns = now_ns;
+            self.sched.cfs_slice_start_ns = now_ns;
+            return;
+        }
+        let delta_exec = now_ns.saturating_sub(self.sched.exec_start_ns);
+        if delta_exec == 0 {
+            return;
+        }
+        self.sched.exec_start_ns = now_ns;
+        self.sched.sum_exec_runtime_ns = self.sched.sum_exec_runtime_ns.saturating_add(delta_exec);
+        let delta_fair = if self.sched.weight == NICE_0_LOAD {
+            delta_exec
+        } else {
+            (delta_exec as u128)
+                .saturating_mul(NICE_0_LOAD as u128)
+                .checked_div(self.sched.weight.max(1) as u128)
+                .unwrap_or(0) as u64
+        };
+        self.sched.vruntime_ns = self.sched.vruntime_ns.saturating_add(delta_fair);
     }
 }
 
@@ -158,28 +206,21 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc();
         let kstack_top = kstack.get_top();
-            Self {
-                process: Arc::downgrade(&process),
-                kstack,
-                inner: SpinNoIrqLock::new(TaskControlBlockInner {
-                        res: Some(res),
-                        trap_cx_ppn,
-                        task_cx: TaskContext::goto_trap_return(kstack_top),
-                        task_status: TaskStatus::Runnable,
-                        wait_reason: None,
-                        last_cpu: 0,
-                        on_cpu: false,
-                        on_rq: false,
-                        exit_code: None,
-                        policy: sched_attr.policy,
-                        rt_priority: sched_attr.rt_priority,
-                        time_slice_ticks: sched_attr.time_slice_ticks,
-                        remaining_slice_ticks: sched_attr.time_slice_ticks,
-                        need_resched: false,
-                        cpu_affinity_mask: all_cpu_affinity_mask(),
-                        current_wq_handle: None,
-                    }),
-            }
+        Self {
+            process: Arc::downgrade(&process),
+            kstack,
+            inner: SpinNoIrqLock::new(TaskControlBlockInner {
+                res: Some(res),
+                trap_cx_ppn,
+                task_cx: TaskContext::goto_trap_return(kstack_top),
+                task_status: TaskStatus::Runnable,
+                wait_reason: None,
+                exit_code: None,
+                sched: TaskSchedState::new(sched_attr),
+                current_wq_handle: None,
+                clear_child_tid: 0,
+            }),
+        }
     }
 }
 
@@ -194,6 +235,8 @@ pub enum WaitReason {
     Semaphore,
     /// Waiting for a mutex to become available.
     Mutex,
+    /// Waiting on a Linux futex word.
+    Futex,
     /// Parent is waiting for child process exit.
     ProcessWaitExit,
     /// Waiting for UART RX data.

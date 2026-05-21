@@ -1,10 +1,27 @@
 use crate::{
     mm::kernel_token,
+    sched::add_task,
     syscall::errno::ERRNO,
-    task::{add_task, current_task, TaskControlBlock},
+    task::{current_process, current_task},
     trap::{trap_handler, TrapContext},
 };
 use alloc::sync::Arc;
+
+fn linux_visible_tid() -> isize {
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let tid = task
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid;
+    if tid == 0 {
+        process.getpid() as isize
+    } else {
+        tid as isize
+    }
+}
 /// thread create syscall
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     trace!(
@@ -28,28 +45,14 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         )
     };
     // create a new thread
-    let new_task = Arc::new(TaskControlBlock::new(
-        Arc::clone(&process),
-        ustack_base,
-        true,
-        sched_attr,
-    ));
+    let new_task = process.create_task(ustack_base, true, sched_attr);
     {
-        let affinity_mask = task.inner_exclusive_access().cpu_affinity_mask;
-        new_task.inner_exclusive_access().cpu_affinity_mask = affinity_mask;
+        let affinity_mask = task.inner_exclusive_access().sched.cpu_affinity_mask;
+        new_task.inner_exclusive_access().sched.cpu_affinity_mask = affinity_mask;
     }
-    // add new task to scheduler
-    add_task(Arc::clone(&new_task));
     let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
     let new_task_tid = new_task_res.tid;
-    let mut process_inner = process.inner_exclusive_access();
-    // add new thread to current process
-    let tasks = &mut process_inner.tasks;
-    while tasks.len() < new_task_tid + 1 {
-        tasks.push(None);
-    }
-    tasks[new_task_tid] = Some(Arc::clone(&new_task));
     let new_task_trap_cx = new_task_inner.get_trap_cx();
     *new_task_trap_cx = TrapContext::app_init_context(
         entry,
@@ -59,6 +62,9 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         trap_handler as usize,
     );
     (*new_task_trap_cx).x[10] = arg;
+    drop(new_task_inner);
+    process.attach_task(Arc::clone(&new_task));
+    add_task(new_task);
     new_task_tid as isize
 }
 /// get current thread id syscall
@@ -74,13 +80,7 @@ pub fn sys_gettid() -> isize {
             .unwrap()
             .tid
     );
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .tid as isize
+    linux_visible_tid()
 }
 
 /// wait for a thread to exit syscall
@@ -130,13 +130,10 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
         "kernel:pid[{}] sys_set_tid_address",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    current_task()
-    .unwrap()
-    .inner_exclusive_access()
-    .res
-    .as_ref()
-    .unwrap()
-    .tid
-    .try_into()
-    .unwrap()
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.clear_child_tid = tidptr as usize;
+    drop(inner);
+    let _process = current_process();
+    linux_visible_tid()
 }

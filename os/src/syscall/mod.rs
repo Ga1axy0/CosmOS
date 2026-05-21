@@ -76,6 +76,8 @@ pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
 /// set tid address syscall
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// futex syscall
+pub const SYSCALL_FUTEX: usize = 98;
 /// set robust list syscall
 pub const SYSCALL_SET_ROBUST_LIST: usize = 99;
 /// get robust list syscall
@@ -92,6 +94,8 @@ pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 /// clock_getres syscall
 pub const SYSCALL_CLOCK_GETRES: usize = 114;
+/// clock_nanosleep syscall
+pub const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 /// syslog syscall
 pub const SYSCALL_SYSLOG: usize = 116;
 /// sched_setscheduler syscall
@@ -124,6 +128,8 @@ pub const SYSCALL_RT_SIGTIMEDWAIT_TIME32: usize = 137;
 pub const SYSCALL_SIGRETURN: usize = 139;
 /// set priority syscall
 pub const SYSCALL_SET_PRIORITY: usize = 140;
+/// get priority syscall
+pub const SYSCALL_GET_PRIORITY: usize = 141;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// getsid syscall
@@ -200,6 +206,14 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// mlock syscall
+pub const SYSCALL_MLOCK: usize = 228;
+/// munlock syscall
+pub const SYSCALL_MUNLOCK: usize = 229;
+/// mlockall syscall
+pub const SYSCALL_MLOCKALL: usize = 230;
+/// munlockall syscall
+pub const SYSCALL_MUNLOCKALL: usize = 231;
 /// madvise syscall
 pub const SYSCALL_MADVISE: usize = 233;
 /// get_mempolicy syscall
@@ -274,6 +288,7 @@ use signal::*;
 use times::*;
 use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
+pub(crate) use sync::futex_wake_addr;
 pub(crate) use utils::{
     read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
@@ -380,6 +395,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
+        SYSCALL_FUTEX => sys_futex(
+            args[0] as *const i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3],
+            args[4],
+            args[5] as i32,
+        ),
         SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => sys_get_robust_list(args[0] as i32, args[1] as *mut usize, args[2] as *mut usize),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0] as *const Timespec, args[1] as *mut Timespec),
@@ -392,6 +415,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as ClockId, args[1] as *mut Timespec),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(
+            args[0] as ClockId,
+            args[1] as i32,
+            args[2] as *const Timespec,
+            args[3] as *mut Timespec,
+        ),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_GETSID => sys_getsid(),
@@ -465,6 +494,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
+        SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
+        SYSCALL_MLOCKALL => sys_mlockall(args[0] as i32),
+        SYSCALL_MUNLOCKALL => sys_munlockall(),
         SYSCALL_GET_MEMPOLICY => sys_get_mempolicy(
             args[0] as *mut i32,
             args[1] as *mut u8,
@@ -484,6 +517,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_GETAFFINITY => {
             sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8)
         }
+        SYSCALL_SET_PRIORITY => sys_setpriority(args[0] as i32, args[1], args[2] as i32),
+        SYSCALL_GET_PRIORITY => sys_getpriority(args[0] as i32, args[1]),
         SYSCALL_RENAMEAT2 => sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,

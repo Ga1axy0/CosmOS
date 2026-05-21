@@ -2,9 +2,10 @@
 #![allow(deprecated)]
 
 use super::id::RecycleAllocator;
-use super::runqueue::insert_into_pid2process;
 use super::{SchedAttr, TaskControlBlock};
-use super::{add_task, SignalAction, SignalActions, SignalBit, SIG_IGN};
+use super::{SignalAction, SignalActions, SignalBit, SIG_IGN};
+use crate::sched::add_task;
+use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
@@ -25,6 +26,11 @@ use alloc::vec::Vec;
 
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const MUSL_LIBC_FALLBACK: &str = "/musl/lib/libc.so";
+const MUSL_INTERP_PATHS: [&str; 2] = [
+    "/lib/ld-musl-riscv64-sf.so.1",
+    "/lib/ld-musl-riscv64.so.1",
+];
 
 bitflags! {
     /// fd 表项级别的标志位。
@@ -69,6 +75,7 @@ pub struct ProcessControlBlock {
     pub pid: PidHandle,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
+    /// wait queue for wait4/waitpid
     pub wait_exit_queue: Arc<WaitQueue>,
 }
 
@@ -429,6 +436,31 @@ impl ProcessControlBlock {
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
     }
+    /// Construct a task owned by this process without publishing it to the scheduler.
+    pub fn create_task(
+        self: &Arc<Self>,
+        ustack_base: usize,
+        alloc_user_res: bool,
+        sched_attr: SchedAttr,
+    ) -> Arc<TaskControlBlock> {
+        Arc::new(TaskControlBlock::new(
+            Arc::clone(self),
+            ustack_base,
+            alloc_user_res,
+            sched_attr,
+        ))
+    }
+
+    /// Attach a created task to this process's task table without scheduling it.
+    pub fn attach_task(self: &Arc<Self>, task: Arc<TaskControlBlock>) {
+        let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+        let mut inner = self.inner_exclusive_access();
+        while inner.tasks.len() <= tid {
+            inner.tasks.push(None);
+        }
+        inner.tasks[tid] = Some(task);
+    }
+
     /// new process from elf file
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         trace!("kernel: ProcessControlBlock::new");
@@ -478,12 +510,7 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&process),
-            ustack_base,
-            true,
-            SchedAttr::default(),
-        ));
+        let task = process.create_task(ustack_base, true, SchedAttr::default());
         // prepare trap_cx of main thread
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
@@ -499,11 +526,9 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
         // add main thread to the process
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(process_inner);
+        process.attach_task(Arc::clone(&task));
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
-        // add main thread to scheduler
+        // publish main thread to scheduler only after the process/task state is fully initialized
         add_task(task);
         process
     }
@@ -526,14 +551,33 @@ impl ProcessControlBlock {
 
             // 加载动态链接器到同一地址空间
             // 使用 open_file_at 以支持相对路径（虽然INTERP通常是绝对路径）
-            let interp_inode = crate::fs::open_file_at(
+            let interp_inode = match crate::fs::open_file_at(
                 cwd.as_str(),
                 interp_path.as_str(),
-                crate::fs::OpenFlags::RDONLY
-            ).map_err(|_| {
-                error!("Failed to open interpreter {}", interp_path);
-                ERRNO::ENOENT
-            })?;
+                crate::fs::OpenFlags::RDONLY,
+            ) {
+                Ok(inode) => inode,
+                Err(_) if MUSL_INTERP_PATHS.iter().any(|path| interp_path == path) => {
+                    let fallback = crate::fs::open_file_at(
+                        cwd.as_str(),
+                        MUSL_LIBC_FALLBACK,
+                        crate::fs::OpenFlags::RDONLY,
+                    ).map_err(|_| {
+                        error!("Failed to open interpreter {}", interp_path);
+                        ERRNO::ENOENT
+                    })?;
+                    warn!(
+                        "Interpreter {} missing, falling back to {}",
+                        interp_path,
+                        MUSL_LIBC_FALLBACK
+                    );
+                    fallback
+                }
+                Err(_) => {
+                    error!("Failed to open interpreter {}", interp_path);
+                    return Err(ERRNO::ENOENT);
+                }
+            };
 
             if interp_inode.is_dir() {
                 error!("Dynamic linker path is a directory: {}", interp_path);
@@ -781,7 +825,7 @@ impl ProcessControlBlock {
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
+        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         drop(parent_task_inner);
         drop(parent);
         if parent_mask != 0 {
@@ -800,20 +844,19 @@ impl ProcessControlBlock {
         );
         child.register_existing_file_mappings();
         // create main thread of child process
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&child),
+        let task = child.create_task(
             parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
             parent_sched_attr,
-        ));
-        task.inner_exclusive_access().cpu_affinity_mask = parent_affinity_mask;
-        // attach task to child process
-        let mut child_inner = child.inner_exclusive_access();
-        child_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(child_inner);
-        // 在发布到调度器前修正子进程 trap context，避免 SMP 下子进程过早运行。
+        );
+        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
+        // attach task to child process before publishing it
+        child.attach_task(Arc::clone(&task));
+        // Finalize the child's trap context before publishing it to the scheduler.
+        // Otherwise, on SMP the child may run on another hart before `sys_fork`
+        // patches the inherited return register, breaking fork semantics.
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
@@ -845,7 +888,6 @@ impl ProcessControlBlock {
             child.getpid()
         );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        // add this thread to scheduler
         add_task(task);
         child
     }
@@ -908,17 +950,12 @@ impl ProcessControlBlock {
         let parent_task = parent.get_task(0);
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_affinity_mask = parent_task_inner.cpu_affinity_mask;
+        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         drop(parent_task_inner);
         drop(parent);
 
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&child),
-            ustack_base,
-            true,
-            parent_sched_attr,
-        ));
-        task.inner_exclusive_access().cpu_affinity_mask = parent_affinity_mask;
+        let task = child.create_task(ustack_base, true, parent_sched_attr);
+        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
@@ -933,9 +970,7 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
 
-        let mut child_inner = child.inner.lock();
-        child_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(child_inner);
+        child.attach_task(Arc::clone(&task));
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
         Ok(child)
@@ -944,19 +979,19 @@ impl ProcessControlBlock {
     pub fn getpid(&self) -> usize {
         self.pid.0
     }
-
+    /// get uid
     pub fn getuid(&self) -> u32 {
         self.inner.lock().cred.uid
     }
-
+    /// get euid
     pub fn geteuid(&self) -> u32 {
         self.inner.lock().cred.euid
     }
-
+    /// get gid
     pub fn getgid(&self) -> u32 {
         self.inner.lock().cred.gid
     }
-
+    /// get egid
     pub fn getegid(&self) -> u32 {
         self.inner.lock().cred.egid
     }

@@ -5,12 +5,12 @@
 //! and the replacement and transfer of control flow of different applications are executed.
 
 use super::__switch;
-use super::{pick_next_task, TaskStatus};
-use super::{ProcessControlBlock, TaskContext, TaskControlBlock};
+use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
 use crate::sync::SpinNoIrqLock;
-use crate::timer::get_time;
+use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
+use crate::timer::{get_time, get_time_ns};
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use core::array;
@@ -19,6 +19,7 @@ use lazy_static::*;
 /// Processor management structure
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
+    pending_task_release: Option<Arc<TaskControlBlock>>,
 
     ///The basic control flow of each core, helping to select and switch process
     idle_task_cx: TaskContext,
@@ -28,6 +29,7 @@ impl Processor {
     pub fn new() -> Self {
         Self {
             current: None,
+            pending_task_release: None,
             idle_task_cx: TaskContext::zero_init(),
         }
     }
@@ -49,6 +51,15 @@ impl Processor {
 
     pub fn set_current(&mut self, task: Arc<TaskControlBlock>) {
         self.current = Some(task);
+    }
+
+    fn set_pending_task_release(&mut self, task: Arc<TaskControlBlock>) {
+        assert!(self.pending_task_release.is_none());
+        self.pending_task_release = Some(task);
+    }
+
+    fn take_pending_task_release(&mut self) -> Option<Arc<TaskControlBlock>> {
+        self.pending_task_release.take()
     }
 }
 
@@ -74,7 +85,7 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
 
 ///The main part of process execution and scheduling
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
-pub fn run_tasks() {
+pub(crate) fn run_tasks() {
     loop {
         if let Some(task) = pick_next_task(hartid()) {
             // debug!(
@@ -90,10 +101,15 @@ pub fn run_tasks() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
-            task_inner.last_cpu = hartid();
-            task_inner.on_cpu = true;
-            task_inner.on_rq = false;
-            task_inner.need_resched = false;
+            task_inner.sched.last_cpu = hartid();
+            task_inner.sched.on_cpu = true;
+            task_inner.sched.on_rq = false;
+            task_inner.sched.resched_reason = None;
+            if matches!(task_inner.sched.policy, SchedPolicy::Other) {
+                let now_ns = get_time_ns();
+                task_inner.sched.exec_start_ns = now_ns;
+                task_inner.sched.cfs_slice_start_ns = now_ns;
+            }
             drop(task_inner);
 
             processor.current = Some(task);
@@ -103,9 +119,10 @@ pub fn run_tasks() {
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
+            finish_pending_task_release();
         } else {
             // idle: enable interrupts and wait for next interrupt (timer/UART/etc.)
-            if super::INITPROC.inner_exclusive_access().is_zombie() {
+            if INITPROC.inner_exclusive_access().is_zombie() {
                 info!("Goodbye!");
                 crate::sbi::shutdown();
             }
@@ -113,7 +130,7 @@ pub fn run_tasks() {
             // debug!("No task to run, idle...");
 
             crate::trap::set_kernel_trap_entry();
-            
+
             unsafe { riscv::register::sstatus::set_sie() };
             unsafe { riscv::asm::wfi() };
             unsafe { riscv::register::sstatus::clear_sie() };
@@ -121,8 +138,29 @@ pub fn run_tasks() {
     }
 }
 
+pub(crate) fn defer_task_release_after_switch(task: Arc<TaskControlBlock>) {
+    current_processor()
+        .lock()
+        .set_pending_task_release(task);
+}
+
+fn finish_pending_task_release() {
+    let Some(task) = current_processor().lock().take_pending_task_release() else {
+        return;
+    };
+    let should_requeue = {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.sched.on_cpu = false;
+        task_inner.sched.on_rq = false;
+        matches!(task_inner.task_status, TaskStatus::Runnable)
+    };
+    if should_requeue {
+        add_task(task);
+    }
+}
+
 /// Get current task through take, leaving a None in its place
-pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
+pub(crate) fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     current_processor().lock().take_current()
 }
 
@@ -162,12 +200,12 @@ pub fn current_trap_cx_user_va() -> usize {
 }
 
 /// get the top addr of kernel stack
-pub fn current_kstack_top() -> usize {
+pub(crate) fn current_kstack_top() -> usize {
     current_task().unwrap().kstack.get_top()
 }
 
 /// Return to idle control flow for new scheduling
-pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+pub(crate) fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = current_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);

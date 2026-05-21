@@ -29,6 +29,12 @@ pub const SYSCALL_SIGACTION: usize = 134;
 pub const SYSCALL_SIGPROCMASK: usize = 135;
 pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
+pub const SYSCALL_GET_PRIORITY: usize = 141;
+pub const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
+pub const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
+pub const SYSCALL_SCHED_GETPARAM: usize = 121;
+pub const SYSCALL_SCHED_SETAFFINITY: usize = 122;
+pub const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
 pub const SYSCALL_SOCKET: usize = 198;
@@ -211,6 +217,30 @@ pub fn sys_yield() -> isize {
     syscall(SYSCALL_YIELD, [0, 0, 0])
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SchedParam {
+    pub sched_priority: i32,
+}
+
+pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: &SchedParam) -> isize {
+    syscall(
+        SYSCALL_SCHED_SETSCHEDULER,
+        [pid as usize, policy as usize, param as *const _ as usize],
+    )
+}
+
+pub fn sys_sched_getscheduler(pid: isize) -> isize {
+    syscall(SYSCALL_SCHED_GETSCHEDULER, [pid as usize, 0, 0])
+}
+
+pub fn sys_sched_getparam(pid: isize, param: &mut SchedParam) -> isize {
+    syscall(
+        SYSCALL_SCHED_GETPARAM,
+        [pid as usize, param as *mut _ as usize, 0],
+    )
+}
+
 pub fn sys_get_time(time: &mut TimeVal, tz: usize) -> isize {
     syscall(SYSCALL_GETTIMEOFDAY, [time as *const _ as usize, tz, 0])
 }
@@ -324,8 +354,16 @@ pub fn sys_waitpid(pid: isize, xstatus: *mut i32) -> isize {
     syscall(SYSCALL_WAITPID, [pid as usize, xstatus as usize, 0])
 }
 
+pub fn sys_setpriority(which: i32, who: usize, prio: i32) -> isize {
+    syscall(SYSCALL_SET_PRIORITY, [which as usize, who, prio as usize])
+}
+
+pub fn sys_getpriority(which: i32, who: usize) -> isize {
+    syscall(SYSCALL_GET_PRIORITY, [which as usize, who, 0])
+}
+
 pub fn sys_set_priority(prio: isize) -> isize {
-    syscall(SYSCALL_SET_PRIORITY, [prio as usize, 0, 0])
+    sys_setpriority(0, 0, prio as i32)
 }
 
 pub fn sys_brk(addr: usize) -> isize {
