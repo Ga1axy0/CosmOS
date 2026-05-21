@@ -15,7 +15,7 @@
 //! initialize various pieces of functionality. (See its source code for
 //! details.)
 //!
-//! We then call [`task::run_tasks()`] and for the first time go to
+//! We then call [`sched::run_tasks()`] and for the first time go to
 //! userspace.
 
 #![deny(missing_docs)]
@@ -54,6 +54,7 @@ pub mod syscall;
 pub mod task;
 pub mod timer;
 pub mod random;
+pub mod sched;
 pub mod trap;
 
 use core::arch::global_asm;
@@ -211,7 +212,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     BOOT_DONE.store(true, Ordering::Release);
     println!("[kernel] Hello, world!");
     info!("hart {} entered scheduler", hart_id);
-    task::run_tasks();
+    sched::run_tasks();
     panic!("Unreachable in rust_main!");
 }
 
@@ -225,7 +226,7 @@ fn secondary_hart_main(hart_id: usize) -> ! {
     info!("hart {} boot", hart_id);
     init_local_hart(hart_id);
     debug!("hart {} entered scheduler", hart_id);
-    task::run_tasks();
+    sched::run_tasks();
     panic!("Unreachable in secondary_hart_main!");
 }
 

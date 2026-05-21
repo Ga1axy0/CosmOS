@@ -17,6 +17,10 @@ const MPOL_F_NODE: u32 = 1 << 0;
 const MPOL_F_ADDR: u32 = 1 << 1;
 const MPOL_F_MEMS_ALLOWED: u32 = 1 << 2;
 const GET_MEMPOLICY_SUPPORTED_FLAGS: u32 = MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED;
+const MCL_CURRENT: i32 = 1;
+const MCL_FUTURE: i32 = 2;
+const MCL_ONFAULT: i32 = 4;
+const MLOCKALL_SUPPORTED_FLAGS: i32 = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
 
 fn write_ulong_mask_to_user(mask_ptr: *mut u8, maxnode: usize, mask: usize) -> Result<(), ERRNO> {
     if mask_ptr.is_null() || maxnode == 0 {
@@ -71,9 +75,6 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         // PROT_* currently supports only R/W/X bits.
         if prot & !(MMapProt::PROT_READ.bits() | MMapProt::PROT_WRITE.bits() | MMapProt::PROT_EXEC.bits()) != 0 {
             return Err(ERRNO::EINVAL); // unknown permission bits
-        }
-        if prot & 0x7 == 0 {
-            return Err(ERRNO::EINVAL); // no access at all is meaningless
         }
         if len == 0 {
             return Err(ERRNO::EINVAL);
@@ -280,6 +281,57 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     })
 }
 
+/// Linux `mlock(2)` compatibility stub.
+///
+/// `cyclictest` and similar RT benchmarks use this to reduce paging jitter.
+/// xxOS currently has no swap or pageable user memory, so treating it as a
+/// validated no-op is sufficient for userland compatibility.
+pub fn sys_mlock(addr: usize, len: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mlock",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let _ = addr.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        Ok(0)
+    })
+}
+
+/// Linux `munlock(2)` compatibility stub.
+pub fn sys_munlock(addr: usize, len: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_munlock",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let _ = addr.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        Ok(0)
+    })
+}
+
+/// Linux `mlockall(2)` compatibility stub.
+pub fn sys_mlockall(flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mlockall",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if flags & !MLOCKALL_SUPPORTED_FLAGS != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        Ok(0)
+    })
+}
+
+/// Linux `munlockall(2)` compatibility stub.
+pub fn sys_munlockall() -> isize {
+    trace!(
+        "kernel:pid[{}] sys_munlockall",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    0
+}
+
 pub fn sys_get_mempolicy(
     mode: *mut i32,
     nodemask: *mut u8,
@@ -348,15 +400,14 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
         }
 
         // Translate user PROT_* flags into internal MapPermission.
-        // If no R/W/X bits are set (e.g., PROT_NONE), treat it as a valid
-        // "no access" mapping by using an empty MapPermission, matching
-        // Linux semantics used for guard pages.
+        // If no R/W/X bits are set (e.g., PROT_NONE), keep the U bit so the
+        // region remains a user VMA, but deny all actual accesses.
         let perm = if prot & (MMapProt::PROT_READ.bits()
             | MMapProt::PROT_WRITE.bits()
             | MMapProt::PROT_EXEC.bits())
             == 0
         {
-            MapPermission::empty()
+            MapPermission::U
         } else {
             let mut p = MapPermission::U;
             if prot & MMapProt::PROT_READ.bits() != 0 {

@@ -8,12 +8,13 @@ use crate::{
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, pid2process, remove_from_pid2process,
-        ExitReason, SignalBit, WaitReason,
+        exit_current_and_run_next, ExitReason, SignalBit, WaitReason,
+        current_trap_cx,
     },
 };
+use crate::sched::{add_task, pid2process, remove_from_pid2process};
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -236,12 +237,16 @@ bitflags! {
         const CLONE_VFORK = 0x0000_4000;
         /// 线程组标志，当前暂不支持。
         const CLONE_THREAD = 0x0001_0000;
+        /// 共享 SysV semaphore undo 状态；当前没有 SysV semaphore，线程路径中按 no-op 处理。
+        const CLONE_SYSVSEM = 0x0004_0000;
         /// 设置子任务 TLS 指针，RISC-V 上对应 tp(x4)。
         const CLONE_SETTLS = 0x0008_0000;
         /// 在父地址空间写入子 tid。
         const CLONE_PARENT_SETTID = 0x0010_0000;
-        /// 子任务退出时清理 child_tid，当前暂不支持。
+        /// 子任务退出时清理 child_tid。
         const CLONE_CHILD_CLEARTID = 0x0020_0000;
+        /// 历史遗留标志，Linux 已忽略；这里也按 no-op 处理。
+        const CLONE_DETACHED = 0x0040_0000;
         /// 在子地址空间写入子 tid。
         const CLONE_CHILD_SETTID = 0x0100_0000;
     }
@@ -249,9 +254,7 @@ bitflags! {
 
 /// Linux `clone` syscall。
 ///
-/// 当前支持 fork-like 进程创建、`stack`、`CLONE_SETTLS` 与 set_tid 写入。
-///
-/// `CLONE_CHILD_CLEARTID` 暂时仅告警并忽略，避免 glibc fork 包装因可延后语义失败。
+/// 当前支持 fork-like 进程创建，以及 musl pthread 使用的 CLONE_VM 线程创建子集。
 pub fn sys_clone(
     flags: usize,
     stack: usize,
@@ -290,19 +293,24 @@ pub fn sys_clone(
         );
         return -(ERRNO::EINVAL as isize);
     }
-    if flags.contains(CloneFlags::CLONE_VM) {
-        warn!("kernel: sys_clone unsupported flag CLONE_VM");
+    let thread_clone = flags.contains(CloneFlags::CLONE_VM);
+    if thread_clone && !flags.contains(CloneFlags::CLONE_THREAD) {
+        warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
         return -(ERRNO::EINVAL as isize);
     }
-    if flags.contains(CloneFlags::CLONE_FS) {
+    if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
+        warn!("kernel: sys_clone unsupported process flag CLONE_SYSVSEM");
+        return -(ERRNO::EINVAL as isize);
+    }
+    if !thread_clone && flags.contains(CloneFlags::CLONE_FS) {
         warn!("kernel: sys_clone unsupported flag CLONE_FS");
         return -(ERRNO::EINVAL as isize);
     }
-    if flags.contains(CloneFlags::CLONE_FILES) {
+    if !thread_clone && flags.contains(CloneFlags::CLONE_FILES) {
         warn!("kernel: sys_clone unsupported flag CLONE_FILES");
         return -(ERRNO::EINVAL as isize);
     }
-    if flags.contains(CloneFlags::CLONE_SIGHAND) {
+    if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
         warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
         return -(ERRNO::EINVAL as isize);
     }
@@ -310,16 +318,13 @@ pub fn sys_clone(
         warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
         return -(ERRNO::EINVAL as isize);
     }
-    if flags.contains(CloneFlags::CLONE_THREAD) {
+    if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
         warn!("kernel: sys_clone unsupported flag CLONE_THREAD");
         return -(ERRNO::EINVAL as isize);
     }
-    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
-        // TODO: 在线程退出路径清零 child_tid 并执行 futex wake。
-        warn!(
-            "kernel: sys_clone ignored flag CLONE_CHILD_CLEARTID: child_tid={:#x}",
-            child_tid
-        );
+    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) && child_tid == 0 {
+        warn!("kernel: sys_clone CLONE_CHILD_CLEARTID with null child_tid");
+        return -(ERRNO::EFAULT as isize);
     }
     let mut parent_set_tid = None;
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
@@ -361,6 +366,49 @@ pub fn sys_clone(
         child_tls = Some(tls);
     }
     let current_process = current_process();
+    if thread_clone {
+        return syscall_body!({
+            let parent_task = current_task().unwrap();
+            let (ustack_base, sched_attr, affinity_mask) = {
+                let inner = parent_task.inner_exclusive_access();
+                (
+                    inner.res.as_ref().unwrap().ustack_base(),
+                    inner.sched_attr(),
+                    inner.sched.cpu_affinity_mask,
+                )
+            };
+            let inherited_cx = *current_trap_cx();
+            let new_task = current_process.create_task(ustack_base, true, sched_attr);
+            {
+                let mut new_inner = new_task.inner_exclusive_access();
+                new_inner.sched.cpu_affinity_mask = affinity_mask;
+                if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+                    new_inner.clear_child_tid = child_tid;
+                }
+                let new_tid = new_inner.res.as_ref().unwrap().tid as i32;
+                let trap_cx = new_inner.get_trap_cx();
+                *trap_cx = inherited_cx;
+                trap_cx.kernel_sp = new_task.kstack.get_top();
+                trap_cx.x[10] = 0;
+                if stack != 0 {
+                    trap_cx.x[2] = stack;
+                }
+                if let Some(tls) = child_tls {
+                    trap_cx.x[4] = tls;
+                }
+                if let Some(ptr) = child_set_tid {
+                    write_pod_to_user(ptr as *mut i32, &new_tid)?;
+                }
+                if let Some(ptr) = parent_set_tid {
+                    write_pod_to_user(ptr as *mut i32, &new_tid)?;
+                }
+            }
+            let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid as isize;
+            current_process.attach_task(Arc::clone(&new_task));
+            add_task(new_task);
+            Ok(new_tid)
+        });
+    }
     syscall_body!({
         let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
         let child_pid = new_process.getpid() as i32;

@@ -1,20 +1,22 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
-    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, canonicalize, do_umount,
+    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Pipe, Stat, StatMode, canonicalize, do_umount,
     inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device, truncate_inode,
     rename_at,
     open_file_at, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
+use crate::net::UnixSocketPairEnd;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
 use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
-    block_current_and_run_next, current_process, current_task, current_user_token, FdEntry,
+    current_process, current_task, current_user_token, FdEntry,
     FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
+use crate::sched::block_current_and_run_next;
 use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -32,6 +34,18 @@ pub(super) struct IoVec {
     iov_base: usize,
     /// 用户缓冲区长度。
     iov_len: usize,
+}
+
+fn write_zero_is_broken_pipe(desc: &FileDescription) -> bool {
+    desc.as_any()
+        .downcast_ref::<Pipe>()
+        .map(|pipe| pipe.write_peer_closed())
+        .unwrap_or(false)
+        || desc
+            .as_any()
+            .downcast_ref::<UnixSocketPairEnd>()
+            .map(|socket| socket.write_peer_closed())
+            .unwrap_or(false)
 }
 
 /// `ppoll(2)` 使用的用户态文件描述符数组元素。
@@ -835,9 +849,10 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     const O_NONBLOCK: i32 = FileStatusFlags::NONBLOCK.bits();
     const O_LARGEFILE: i32 = 0x8000;
     const O_DIRECTORY: i32 = OpenFlags::DIRECTORY.bits();
+    const O_NOFOLLOW: i32 = 0x20000;
 
     let access_mode = AccessMode::from_open_bits(flags)?;
-    let ignored_flags = flags & O_LARGEFILE;
+    let ignored_flags = flags & (O_LARGEFILE | O_NOFOLLOW);
     let unsupported_flags = flags & O_NOCTTY;
     let status_flags = FileStatusFlags::from_bits_truncate(flags & (O_APPEND | O_NONBLOCK));
     let effective_flags = flags & !(ignored_flags | O_APPEND | O_NONBLOCK);
@@ -973,9 +988,13 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
-        Ok(desc.write(UserBuffer::new(
+        let written = desc.write(UserBuffer::new(
             translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?,
-        )) as isize)
+        ));
+        if len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
+            return Err(ERRNO::EPIPE);
+        }
+        Ok(written as isize)
     })
 }
 
@@ -1045,6 +1064,9 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                 )?,
             );
             let written = desc.write(user_buf);
+            if iovec.iov_len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
+                return Err(ERRNO::EPIPE);
+            }
             completed += written;
             // 发生短写时立即返回，保留与 `write` 一致的部分写入语义。
             if written < iovec.iov_len {

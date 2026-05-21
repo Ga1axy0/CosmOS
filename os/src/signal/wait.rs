@@ -1,9 +1,8 @@
 //! Registry for tasks blocked in `sigtimedwait`.
 
 use crate::sync::SpinNoIrqLock;
-use crate::task::{
-    current_process, pid2process, wakeup_task, SignalBit, TaskControlBlock,
-};
+use crate::sched::pid2process;
+use crate::task::{current_process, wakeup_task, SignalBit, TaskControlBlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
@@ -279,7 +278,7 @@ fn task_from_pid_ptr(pid: usize, task_ptr: usize) -> Option<Arc<TaskControlBlock
     inner
         .tasks
         .iter()
-        .filter_map(|slot| slot.as_ref())
+        .filter_map(|slot: &Option<Arc<TaskControlBlock>>| slot.as_ref())
         .find(|task| Arc::as_ptr(task) as usize == task_ptr)
         .map(Arc::clone)
 }

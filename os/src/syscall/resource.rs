@@ -1,9 +1,10 @@
 
 use crate::config::USER_STACK_SIZE;
+use crate::sched::pid2process;
 use crate::syscall::{Pod, read_pod_from_user, write_pod_to_user};
 use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
-use crate::task::{current_process, pid2process};
+use crate::task::current_process;
 
 pub const RLIM_INFINITY: u64 = !0u64;
 

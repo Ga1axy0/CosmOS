@@ -20,11 +20,11 @@ use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::syscall;
 use crate::syscall::errno::ERRNO;
+use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
     current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next, on_timer_tick,
-    schedule_if_needed,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
 };
 use crate::timer::{check_timer, get_realtime_ns, get_time, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -152,6 +152,17 @@ pub fn clear_software_interrupt_pending() {
     }
 }
 
+/// Handle a scheduler reschedule IPI.
+///
+/// On a running hart, the IPI requests deferred rescheduling of the current
+/// task. On an idle hart, clearing the pending bit is enough to wake `wfi`
+/// so the idle loop can observe newly queued work on the next iteration.
+fn handle_reschedule_ipi() {
+    handle_ipi();
+    clear_software_interrupt_pending();
+    request_current_task_resched(ReschedReason::HigherRtPriority);
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -254,8 +265,7 @@ pub fn trap_handler() -> ! {
             on_timer_tick();
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
-            handle_ipi();
-            clear_software_interrupt_pending();
+            handle_reschedule_ipi();
         }
         Trap::Interrupt(Interrupt::SupervisorExternal) => {
             crate::drivers::plic::handle_supervisor_external();
@@ -335,10 +345,15 @@ pub fn trap_from_kernel() {
             let now_raw = get_time();
             check_itimers_of_all_processes(now_raw, get_realtime_ns());
             crate::net::poll();
+            // Account CPU time spent while the current task executes in kernel
+            // context as part of its RR quantum as well. This matches Linux's
+            // "running on CPU" notion more closely than charging only
+            // user-mode ticks.
+            on_timer_tick();
+            // crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
-            handle_ipi();
-            clear_software_interrupt_pending();
+            handle_reschedule_ipi();
         }
         _ => {
             panic!("Kernel trap: {:?}, stval = {:#x}", scause.cause(), stval);

@@ -1,5 +1,5 @@
 use super::{page_cache, File, Stat, StatMode};
-use super::rootfs::{VirtualDirNode, VIRT_ROOT};
+use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -792,6 +792,7 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 pub fn init_dev() {
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
+    dev_dir.bind("shm", MemDirNode::new() as Arc<dyn VfsNode>);
     // Register special character devices under /dev
     let null_node = Arc::new(NullDevNode::new());
     dev_dir.bind("null", null_node as Arc<dyn VfsNode>);

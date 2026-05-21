@@ -1,8 +1,9 @@
 /// Keyed wait queue supporting wakeup by selected key.
 use super::{
-    block_current_and_run_next, current_task, wakeup_task, TaskControlBlock, TaskStatus,
+    current_task, wakeup_task, TaskControlBlock, TaskStatus,
     WaitReason,
 };
+use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
 use alloc::{
     collections::{VecDeque},
@@ -95,8 +96,8 @@ impl WaitQueue {
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
                     task_inner.current_wq_handle = None;
-                    task_inner.on_cpu = true;
-                    task_inner.on_rq = false;
+                    task_inner.sched.on_cpu = true;
+                    task_inner.sched.on_rq = false;
                 }
             }
             return;
@@ -111,6 +112,20 @@ impl WaitQueue {
         if let Some(task) = queue.pop_front() {
             wakeup_task(task);
         }
+    }
+
+    /// Wake up to `limit` waiters and return the number actually woken.
+    pub fn wake_up_to(&self, limit: usize) -> usize {
+        let mut queue = self.queue.lock();
+        let mut count = 0;
+        while count < limit {
+            let Some(task) = queue.pop_front() else {
+                break;
+            };
+            wakeup_task(task);
+            count += 1;
+        }
+        count
     }
 
     /// Wake all waiters.
@@ -244,8 +259,8 @@ where
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
                     task_inner.current_wq_handle = None;
-                    task_inner.on_cpu = true;
-                    task_inner.on_rq = false;
+                    task_inner.sched.on_cpu = true;
+                    task_inner.sched.on_rq = false;
                 }
             }
             return;

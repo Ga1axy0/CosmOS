@@ -4,8 +4,12 @@ use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
 use crate::timer::set_realtime_offset_from_time_ns;
 use crate::{
     config::CLOCK_FREQ,
-    task::{current_process, current_task},
-    timer::{get_realtime_ns, get_time, get_time_ns, get_time_ticks, get_time_us, time_to_ticks},
+    sched::block_current_and_run_next,
+    task::{current_process, current_task, WaitReason},
+    timer::{
+        add_timer, get_realtime_ns, get_time, get_time_ms, get_time_ns, get_time_ticks,
+        get_time_us, time_to_ticks,
+    },
 };
 
 /// Linux 兼容的 `clockid_t` 类型。
@@ -15,6 +19,8 @@ pub type ClockId = i32;
 pub const CLOCK_REALTIME: ClockId = 0;
 /// Linux 兼容的单调时钟 ID。
 pub const CLOCK_MONOTONIC: ClockId = 1;
+/// `clock_nanosleep(2)` absolute-deadline flag.
+pub const TIMER_ABSTIME: i32 = 1;
 
 /// Linux `getrusage(2)` 的当前进程选择器。
 pub const RUSAGE_SELF: i32 = 0;
@@ -155,6 +161,20 @@ fn timeval_to_ns(tv: &TimeVal) -> Result<u64, ERRNO> {
     Ok(total as u64)
 }
 
+/// 将 `timespec` 转为纳秒时间长度。
+fn timespec_to_ns(ts: &Timespec) -> Result<u64, ERRNO> {
+    if ts.tv_nsec >= 1_000_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let sec_ns = (ts.tv_sec as u128) * 1_000_000_000u128;
+    let nsec = ts.tv_nsec as u128;
+    let total = sec_ns.saturating_add(nsec);
+    if total > u64::MAX as u128 {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(total as u64)
+}
+
 /// get_time syscall
 pub fn sys_get_time_of_day(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
@@ -285,6 +305,65 @@ pub fn sys_clock_getres(clockid: ClockId, tp: *mut Timespec) -> isize {
         let resolution = clock_resolution(clockid)?;
         if !tp.is_null() {
             write_pod_to_user(tp, &resolution)?;
+        }
+        Ok(0)
+    })
+}
+
+/// `clock_nanosleep(2)` 系统调用。
+pub fn sys_clock_nanosleep(
+    clockid: ClockId,
+    flags: i32,
+    req: *const Timespec,
+    rem: *mut Timespec,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_clock_nanosleep clockid={} flags={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid,
+        flags
+    );
+    syscall_body!({
+        if req.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        if flags & !TIMER_ABSTIME != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        match clockid {
+            CLOCK_REALTIME | CLOCK_MONOTONIC => {}
+            _ => return Err(ERRNO::EINVAL),
+        }
+
+        let req = read_pod_from_user(req)?;
+        let req_ns = timespec_to_ns(&req)?;
+        let now_ns = match clockid {
+            CLOCK_REALTIME => get_realtime_ns(),
+            CLOCK_MONOTONIC => get_time_ns(),
+            _ => unreachable!(),
+        };
+        let sleep_ns = if flags & TIMER_ABSTIME != 0 {
+            req_ns.saturating_sub(now_ns)
+        } else {
+            req_ns
+        };
+
+        if sleep_ns == 0 {
+            if !rem.is_null() {
+                write_pod_to_user(rem, &Timespec { tv_sec: 0, tv_nsec: 0 })?;
+            }
+            return Ok(0);
+        }
+
+        let now_ms = get_time_ms();
+        let sleep_ms = sleep_ns.div_ceil(1_000_000) as usize;
+        let expire_ms = now_ms.saturating_add(sleep_ms.max(1));
+        let task = current_task().unwrap();
+        add_timer(expire_ms, task);
+        block_current_and_run_next(WaitReason::Nanosleep);
+
+        if !rem.is_null() {
+            write_pod_to_user(rem, &Timespec { tv_sec: 0, tv_nsec: 0 })?;
         }
         Ok(0)
     })

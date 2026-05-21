@@ -7,8 +7,6 @@
 
 use core::arch::asm;
 
-pub use crate::task::current_processor;
-
 /// 使用当前已经保存在 `tp` 中的 hart id 完成初始化接口兼容。
 pub fn init() -> usize {
     hartid()
