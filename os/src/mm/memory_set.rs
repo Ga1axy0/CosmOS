@@ -467,6 +467,15 @@ impl MemorySet {
         self.insert_vma_unchecked(vma);
         true
     }
+    /// Like `insert_vma` but always eagerly maps the pages regardless of `should_eager_map`.
+    pub fn insert_vma_eager(&mut self, mut vma: Vma) -> bool {
+        if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
+            return false;
+        }
+        vma.map(&mut self.page_table);
+        self.insert_vma_unchecked(vma);
+        true
+    }
     /// 仅登记一段 VMA 元数据，不立即建立页表映射。
     pub fn register_vma_metadata(&mut self, vma: Vma) -> bool {
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
@@ -1290,11 +1299,11 @@ impl MemorySet {
                 let frame = frame_alloc().unwrap();
                 let page = Arc::new(PrivatePage::new(frame));
                 let ppn = page.ppn();
-                debug!(
-                    "[mmap] allocate private frame for lazy fault: vpn={:#x} ppn={:#x}",
-                    vpn.0,
-                    ppn.0
-                );
+                // debug!(
+                //     "[mmap] allocate private frame for lazy fault: vpn={:#x} ppn={:#x}",
+                //     vpn.0,
+                //     ppn.0
+                // );
                 area.data_frames.insert(vpn, page);
                 ppn
             }
@@ -1313,7 +1322,10 @@ impl MemorySet {
         let Some(area) = self.find_vma_containing(vpn) else {
             return false;
         };
-        if !area.is_heap() || !area.is_user_accessible() || !area.allows_fault_access(access) {
+        if (!area.is_heap() && !area.is_user_stack())
+            || !area.is_user_accessible()
+            || !area.allows_fault_access(access)
+        {
             return false;
         }
         let committed = self.map_private_page_in_vma(vpn);
@@ -2127,7 +2139,7 @@ impl Vma {
     }
     /// 判断当前区域是否需要在建 VMA 时立即分配并建立页表映射。
     pub fn should_eager_map(&self) -> bool {
-        self.file.is_none()
+        self.file.is_none() && !matches!(self.kind, VmaKind::UserStack { .. })
     }
     /// 计算某个虚拟页在底层文件中的页号。
     pub fn file_page_index(&self, vpn: VirtPageNum) -> Option<u64> {

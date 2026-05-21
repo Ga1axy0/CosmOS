@@ -79,7 +79,6 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     task_inner.sched.on_cpu = false;
     task_inner.sched.on_rq = false;
     task_inner.sched.resched_reason = None;
-    task_inner.res = None;
     task_inner.clear_child_tid = 0;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called

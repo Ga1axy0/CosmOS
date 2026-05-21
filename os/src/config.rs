@@ -13,7 +13,7 @@ pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
 /// physical memory end address
-pub const MEMORY_END: usize = 0x88000000;
+pub const MEMORY_END: usize = 0x90000000;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12

@@ -192,14 +192,17 @@ impl TaskUserRes {
         // alloc user stack
         let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
         let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        let _ = process_inner.memory_set.insert_vma(
-            Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid),
-            None,
-        );
+        let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
+        if self.tid == 0 {
+            // Main thread needs eager mapping: kernel writes args/auxv before start.
+            process_inner.memory_set.insert_vma_eager(ustack_vma);
+        } else {
+            process_inner.memory_set.insert_vma(ustack_vma, None);
+        }
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        let _ = process_inner.memory_set.insert_vma(
+        process_inner.memory_set.insert_vma(
             Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
             None,
         );
