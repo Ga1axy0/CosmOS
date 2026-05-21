@@ -1,11 +1,13 @@
 use super::{page_cache, File, Stat, StatFs64, StatMode};
-use super::rootfs::{VirtualDirNode, VIRT_ROOT};
+use super::devfs::{NullDevNode, UrandomDevNode};
+use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
 use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode};
 use crate::fs::procfs::ProcRootNode;
+use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;

@@ -187,7 +187,11 @@ impl VfsNode for MemFileNode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
 
@@ -325,12 +329,16 @@ impl VfsNode for MemDirNode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         self.inner
             .lock()
             .children
             .iter()
-            .map(|(name, node)| (name.clone(), node.is_dir()))
+            .map(|(name, node)| (name.clone(), node.file_type()))
             .collect()
     }
 
