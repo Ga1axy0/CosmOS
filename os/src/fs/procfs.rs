@@ -19,7 +19,8 @@ use crate::config::PAGE_SIZE;
 use crate::fs::inode::snapshot_mount_table;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::mm::frame_allocator_stats;
-use crate::task::{current_process, list_pids, pid2process};
+use crate::sched::{list_pids, pid2process};
+use crate::task::current_process;
 
 fn parse_pid(name: &str) -> Option<usize> {
     if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_digit()) {

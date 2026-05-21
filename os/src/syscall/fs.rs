@@ -6,6 +6,7 @@ use crate::fs::{
     open_file_at_with_status, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
+use crate::fs::Pipe;
 use crate::net::UnixSocketPairEnd;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;

@@ -6,7 +6,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::fs::{
     make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
 };
-use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
+use crate::mm::{translated_ref, translated_refmut, PageFaultAccess, UserBuffer};
 use crate::net::{
     SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file, create_udp_socket_file
 };
@@ -501,7 +501,7 @@ fn accept_common(
                             copy_len,
                         )
                     };
-                    write_user_bytes(token, addr as *mut u8, src)?;
+                    write_bytes_to_user(addr as *mut u8, src)?;
                 }
             }
         }

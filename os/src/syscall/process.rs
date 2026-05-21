@@ -9,14 +9,12 @@ use crate::{
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
-        add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, ExitReason, SignalBit, WaitReason,
-        current_trap_cx,
-        exit_current_and_run_next, pid2process, remove_from_pid2process,
-        ExitReason, ShmAttachment, SignalFlags, WaitReason,
+        add_signal_to_process, current_process, current_task, current_trap_cx,
+        current_user_token, exit_current_and_run_next, ExitReason, ShmAttachment, SignalBit,
+        WaitReason,
     },
 };
-use crate::sched::{add_task, pid2process, remove_from_pid2process};
+use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 /// `execve` 在解析脚本后得到的最终执行目标。
@@ -421,7 +419,7 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
 
         if new_pgid != target_pid {
             let mut found = false;
-            for pid in crate::task::list_pids() {
+            for pid in list_pids() {
                 if let Some(process) = pid2process(pid) {
                     if process.getsid() == target_sid && process.getpgid() as usize == new_pgid {
                         found = true;
@@ -563,25 +561,18 @@ pub fn sys_clone(
         return -(ERRNO::EFAULT as isize);
     }
     let mut parent_set_tid = None;
+    let mut child_set_tid = None;
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         if parent_tid == 0 {
             warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
             return -(ERRNO::EFAULT as isize);
         }
-        if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
-            warn!(
-                "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
-                exit_signal
-            );
-            return Err(ERRNO::EINVAL);
-        }
-        if flags.contains(CloneFlags::CLONE_VM) {
-            warn!("kernel: sys_clone unsupported flag CLONE_VM");
-            return Err(ERRNO::EINVAL);
-        }
-        if flags.contains(CloneFlags::CLONE_FS) {
-            warn!("kernel: sys_clone unsupported flag CLONE_FS");
-            return Err(ERRNO::EINVAL);
+        parent_set_tid = Some(parent_tid);
+    }
+    if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+        if child_tid == 0 {
+            warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
+            return -(ERRNO::EFAULT as isize);
         }
         child_set_tid = Some(child_tid);
     }

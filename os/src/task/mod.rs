@@ -53,6 +53,7 @@ pub use task::{
 pub(crate) use task::TaskControlBlockInner;
 
 use crate::board::QEMUExit;
+use alloc::string::String;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(reason: ExitReason) {
