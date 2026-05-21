@@ -208,11 +208,11 @@ pub fn trap_handler() -> ! {
             }
         }
         Trap::Exception(Exception::LoadPageFault) => {
-            debug!(
-                "[mmap] trap load page fault: bad_addr={:#x} sepc={:#x}",
-                stval,
-                current_trap_cx().sepc
-            );
+            // debug!(
+            //     "[mmap] trap load page fault: bad_addr={:#x} sepc={:#x}",
+            //     stval,
+            //     current_trap_cx().sepc
+            // );
             if !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Read) {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
                     Ok(()) => {}

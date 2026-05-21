@@ -115,8 +115,15 @@ pub fn sys_waittid(tid: usize) -> i32 {
         Some(t) => t.inner_exclusive_access().exit_code,
     };
     if let Some(code) = exit_code {
-        // dealloc the exited thread
-        process_inner.tasks[tid] = None;
+        // Take the task out of the slot so we can drop it after releasing locks.
+        let waited_task = process_inner.tasks[tid].take();
+        // Extract user resources from the zombie task to avoid deadlock:
+        // TaskUserRes::drop() needs the process lock, so we must drop it first.
+        let res = waited_task.as_ref().and_then(|t| t.inner_exclusive_access().res.take());
+        drop(process_inner);
+        drop(task_inner);
+        drop(res);
+        drop(waited_task);
         code
     } else {
         -(ERRNO::EAGAIN as i32) // thread has not exited yet
