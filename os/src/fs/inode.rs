@@ -5,7 +5,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode};
+use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
 use crate::fs::procfs::ProcRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
@@ -576,6 +576,8 @@ pub fn mkdir_at_with_inode(cwd: &str, path: &str) -> Result<Arc<Inode>, ERRNO> {
         } else {
             Err(ERRNO::EIO)
         }
+    } else if lookup_inode_follow(cwd, path, true).is_ok() {
+        Err(ERRNO::EEXIST)
     } else {
         Err(ERRNO::ENOENT)
     }
@@ -1049,6 +1051,9 @@ pub fn init_dev() {
     dev_dir.bind("urandom", Arc::clone(&urandom_node));
     dev_dir.bind("random", Arc::clone(&urandom_node));
     info!("[kernel] /dev/urandom and /dev/random registered");
+
+    let zero_node: Arc<dyn VfsNode> = Arc::new(ZeroDevNode::new());
+    dev_dir.bind("zero", zero_node);
 
     info!("[kernel] /dev initialized");
 }
