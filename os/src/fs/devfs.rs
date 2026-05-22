@@ -19,7 +19,7 @@ use crate::drivers::block::BLOCK_DEVICES;
 use crate::drivers::rtc;
 use crate::fs::{Stat, StatMode};
 use super::{empty_statfs, StatFs64};
-use crate::mm::{translated_ref, translated_refmut};
+use crate::mm::translated_ref;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
@@ -257,6 +257,72 @@ impl VfsNode for NullDevNode {
 
 }
 
+/// VFS node representing the special `/dev/zero` device.
+///
+/// Reads always return zero-filled bytes. Writes discard data and report the
+/// full write length as written.
+#[derive(Default)]
+pub struct ZeroDevNode;
+
+impl ZeroDevNode {
+    /// Create a new `/dev/zero` node.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+// SAFETY: stateless and immutable.
+unsafe impl Send for ZeroDevNode {}
+unsafe impl Sync for ZeroDevNode {}
+
+impl VfsNode for ZeroDevNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> usize {
+        for byte in buf.iter_mut() {
+            *byte = 0;
+        }
+        buf.len()
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        // Discard and report full length written.
+        buf.len()
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), fs::errno::FS_ERRNO> {
+        Ok(())
+    }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
+}
+
 // SAFETY: single-processor kernel; `BlockDevice` is already `Send + Sync`.
 unsafe impl Send for BlockDevNode {}
 unsafe impl Sync for BlockDevNode {}
@@ -358,6 +424,7 @@ impl VfsNode for DevRootNode {
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         let mut entries = alloc::vec![
             (String::from("null"), VfsFileType::Char),
+            (String::from("zero"), VfsFileType::Char),
             (String::from("rtc"), VfsFileType::Char),
             (String::from("rtc0"), VfsFileType::Char),
             (String::from("urandom"), VfsFileType::Char),
@@ -374,6 +441,7 @@ impl VfsNode for DevRootNode {
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         match name {
             "null" => Some(Arc::new(NullDevNode::new()) as Arc<dyn VfsNode>),
+            "zero" => Some(Arc::new(ZeroDevNode::new()) as Arc<dyn VfsNode>),
             "rtc" | "rtc0" => Some(Arc::new(RtcDevNode::new()) as Arc<dyn VfsNode>),
             "urandom" | "random" => Some(Arc::new(UrandomDevNode::new()) as Arc<dyn VfsNode>),
             "misc" => Some(Arc::new(DevMiscNode::new()) as Arc<dyn VfsNode>),
