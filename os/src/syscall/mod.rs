@@ -338,7 +338,7 @@ use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use sync::futex_wake_addr;
 pub(crate) use utils::{
-    read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
+    read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
 };
 
@@ -545,8 +545,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
         ),
         SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
-        SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
-        SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as *mut i32),
+        SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as *mut i32),
         SYSCALL_SENDTO => sys_sendto(
             args[0] as i32,
             args[1] as *const u8,
@@ -561,7 +561,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2],
             args[3] as u32,
             args[4] as *mut SockAddrIn,
-            args[5] as i32,
+            args[5] as *mut i32,
         ),
         SYSCALL_SETSOCKOPT => sys_setsockopt(
             args[0] as i32,

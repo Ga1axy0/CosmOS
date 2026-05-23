@@ -6,11 +6,11 @@ use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::fs::{
     make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
 };
-use crate::mm::{translated_ref, translated_refmut, PageFaultAccess, UserBuffer};
+use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
 use crate::net::{
     SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file, create_udp_socket_file
 };
-use crate::syscall::{translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
+use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
 use crate::task::{current_process, current_user_token, FdEntry, FdFlags};
@@ -472,6 +472,26 @@ fn write_getsockopt_i32(token: usize, optval: *mut u8, optlen: *mut i32, v: i32)
     write_getsockopt_value(token, optval, optlen, &v.to_ne_bytes())
 }
 
+fn copy_sockaddr_to_user(addr: *mut SockAddrIn, addrlen: *mut i32, sockaddr: &SockAddrIn) -> Result<(), ERRNO> {
+    if addr.is_null() || addrlen.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let cap = read_pod_from_user(addrlen as *const i32)?;
+    if cap < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let copy_len = (cap as usize).min(size_of::<SockAddrIn>());
+    if copy_len > 0 {
+        let src = unsafe {
+            core::slice::from_raw_parts((sockaddr as *const SockAddrIn) as *const u8, copy_len)
+        };
+        write_bytes_to_user(addr as *mut u8, src)?;
+    }
+    write_pod_to_user(addrlen, &(size_of::<SockAddrIn>() as i32))?;
+    Ok(())
+}
+
 fn accept_common(
     fd: i32,
     addr: *mut SockAddrIn,
@@ -515,34 +535,13 @@ fn accept_common(
     drop(inner);
 
     if !addr.is_null() {
-        if addrlen.is_null() {
+        if let Some(ep) = peer {
+            copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
+        } else if addrlen.is_null() {
             return Err(ERRNO::EFAULT);
+        } else {
+            write_pod_to_user(addrlen, &(size_of::<SockAddrIn>() as i32))?;
         }
-        let token = current_user_token();
-        let user_addrlen = translated_refmut(token, addrlen).or_errno(ERRNO::EFAULT)?;
-        if *user_addrlen < 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let actual_len = size_of::<SockAddrIn>() as i32;
-        let copy_len = (*user_addrlen as usize).min(size_of::<SockAddrIn>());
-        if copy_len > 0 {
-            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
-            if let Some(ep) = peer {
-                if copy_len == size_of::<SockAddrIn>() {
-                    *out = endpoint_to_sockaddr(ep);
-                } else {
-                    let sockaddr = endpoint_to_sockaddr(ep);
-                    let src = unsafe {
-                        core::slice::from_raw_parts(
-                            (&sockaddr as *const SockAddrIn) as *const u8,
-                            copy_len,
-                        )
-                    };
-                    write_bytes_to_user(addr as *mut u8, src)?;
-                }
-            }
-        }
-        *user_addrlen = actual_len;
     }
 
     Ok(new_fd as isize)
@@ -715,12 +714,8 @@ pub fn sys_accept4(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32, flags: i32
     })
 }
 
-pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
+pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isize {
     syscall_body!({
-        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
-            return Err(ERRNO::EINVAL);
-        }
-
         let fd = fd as usize;
 
         match socket_kind(fd)? {
@@ -729,7 +724,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
                     let ep = udp
                         .local_endpoint()
                         .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
-                    write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
+                    copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
@@ -738,7 +733,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
                     let ep = tcp
                         .local_endpoint()
                         .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
-                    write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
+                    copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
@@ -749,26 +744,22 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
     })
 }
 
-pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
+pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isize {
     syscall_body!({
-        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
-            return Err(ERRNO::EINVAL);
-        }
-
         let fd = fd as usize;
 
         match socket_kind(fd)? {
             SocketKind::Udp => {
                 with_udp_socket(fd, |udp| {
                     let ep = udp.peer_endpoint().ok_or(ERRNO::ENOTCONN)?;
-                    write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
+                    copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
             SocketKind::Tcp => {
                 with_tcp_socket(fd, |tcp| {
                     if let Some(ep) = tcp.remote_endpoint() {
-                        write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
+                        copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
                         Ok(())
                     } else {
                         Err(ERRNO::ENOTCONN)
@@ -840,7 +831,7 @@ pub fn sys_recvfrom(
     len: usize,
     flags: u32,
     addr: *mut SockAddrIn,
-    addrlen: i32,
+    addrlen: *mut i32,
 ) -> isize {
     syscall_body!({
         if flags != 0 {
@@ -852,8 +843,8 @@ pub fn sys_recvfrom(
         if buf.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        if !addr.is_null() && (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
-            return Err(ERRNO::EINVAL);
+        if !addr.is_null() && addrlen.is_null() {
+            return Err(ERRNO::EFAULT);
         }
 
         let mut ubuf = UserBuffer::new(
@@ -877,7 +868,7 @@ pub fn sys_recvfrom(
         };
 
         if !addr.is_null() {
-            write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
+            copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
         }
 
         Ok(n as isize)

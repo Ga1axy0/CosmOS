@@ -715,14 +715,18 @@ impl File for TcpSocketFile {
         true
     }
 
-    fn read_at(&self, _offset: usize, mut buf: UserBuffer) -> usize {
+    fn read_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.read_at_result(_offset, buf).unwrap_or(0)
+    }
+
+    fn read_at_result(&self, _offset: usize, mut buf: UserBuffer) -> Result<usize, ERRNO> {
         if self.listening.load(Ordering::Acquire) {
-            return 0;
+            return Ok(0);
         }
         if buf.len() == 0 {
-            return 0;
+            return Ok(0);
         }
-        self.recv_into_user_buffer(&mut buf).unwrap_or(0)
+        self.recv_into_user_buffer(&mut buf)
     }
 
     fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
@@ -757,13 +761,17 @@ impl File for TcpSocketFile {
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.write_at_result(_offset, buf).unwrap_or(0)
+    }
+
+    fn write_at_result(&self, _offset: usize, buf: UserBuffer) -> Result<usize, ERRNO> {
         if self.listening.load(Ordering::Acquire) {
-            return 0;
+            return Ok(0);
         }
         if buf.len() == 0 {
-            return 0;
+            return Ok(0);
         }
-        self.send_from_user_buffer(&buf).unwrap_or(0)
+        self.send_from_user_buffer(&buf)
     }
 
     fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {

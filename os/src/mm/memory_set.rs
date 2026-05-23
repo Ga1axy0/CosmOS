@@ -1786,7 +1786,12 @@ impl MemorySet {
                 let right_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_end);
                 let mut right_file = area.file.clone();
                 if let Some(file) = right_file.as_mut() {
-                    file.pgoff += overlap_end.0 - area_start.0;
+                    let middle_start = if area_start < overlap_start {
+                        overlap_start
+                    } else {
+                        area_start
+                    };
+                    file.pgoff += overlap_end.0 - middle_start.0;
                 }
                 let right_area = Vma {
                     vpn_range: VPNRange::new(overlap_end, area_end),
