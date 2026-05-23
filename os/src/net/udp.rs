@@ -292,11 +292,39 @@ impl File for UdpSocketFile {
         n
     }
 
+    fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+            let mut guard = NET_STACK.lock();
+            let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+            if socket.can_recv() {
+                if let Ok((data, _meta)) = socket.recv() {
+                    let n = min(data.len(), buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    return Ok(n);
+                }
+            }
+            drop(guard);
+            self.st
+                .read_wait
+                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+        }
+    }
+
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         if buf.len() == 0 {
             return 0;
         }
         self.send_user_buffer(&buf).unwrap_or(0)
+    }
+
+    fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        let ep = *self.connected.lock();
+        let ep = ep.ok_or(ERRNO::EDESTADDRREQ)?;
+        self.send_to(buf, ep)
     }
 
     fn poll(&self, events: u16) -> u16 {

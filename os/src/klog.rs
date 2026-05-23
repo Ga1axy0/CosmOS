@@ -38,6 +38,7 @@ pub const SYSLOG_ACTION_SIZE_BUFFER: usize = 10;
 
 use alloc::collections::VecDeque;
 use alloc::format;
+use core::error;
 use core::fmt;
 use lazy_static::lazy_static;
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -320,5 +321,6 @@ fn syslog_action_size_unread() -> isize {
 }
 
 fn syslog_action_size_buffer() -> isize {
+    debug!("kernel log buffer capacity queried");
     KLOG_BUFFER_CAPACITY as isize
 }

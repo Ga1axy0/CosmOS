@@ -98,6 +98,7 @@ bitflags! {
         const CREATE = 0x40;
         const TRUNC = 0x200;
         const DIRECTORY = 0x10000;
+        const NOFOLLOW = 0x20000;
     }
 }
 
@@ -115,7 +116,7 @@ bitflags! {
 
 bitflags! {
     /// `mmap` 保护位。
-    pub struct MMapProt: usize {
+pub struct MMapProt: usize {
         /// 可读。
         const PROT_READ = 0x1;
         /// 可写。
@@ -124,6 +125,10 @@ bitflags! {
         const PROT_EXEC = 0x4;
     }
 }
+
+pub const IPC_CREAT: i32 = 0o1000;
+pub const IPC_EXCL: i32 = 0o2000;
+pub const IPC_RMID: i32 = 0;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -239,6 +244,36 @@ impl Default for Stat {
     }
 }
 
+/// Filesystem statistics structure, matching `struct statfs64` ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatFs64 {
+    /// Filesystem type magic number.
+    pub f_type: u64,
+    /// Optimal transfer block size.
+    pub f_bsize: u64,
+    /// Total data blocks.
+    pub f_blocks: u64,
+    /// Free blocks.
+    pub f_bfree: u64,
+    /// Free blocks for unprivileged users.
+    pub f_bavail: u64,
+    /// Total inodes.
+    pub f_files: u64,
+    /// Free inodes.
+    pub f_ffree: u64,
+    /// Filesystem ID.
+    pub f_fsid: [i32; 2],
+    /// Maximum filename length.
+    pub f_namelen: u64,
+    /// Fragment size.
+    pub f_frsize: u64,
+    /// Mount flags.
+    pub f_flags: u64,
+    /// Spare fields.
+    pub f_spare: [u64; 4],
+}
+
 bitflags! {
     pub struct StatMode: u32 {
         const NULL  = 0;
@@ -246,6 +281,8 @@ bitflags! {
         const DIR   = 0o040000;
         /// ordinary regular file
         const FILE  = 0o100000;
+        /// symbolic link
+        const LINK  = 0o120000;
         /// socket file
         const SOCK  = 0o140000;
     }
@@ -254,6 +291,7 @@ bitflags! {
 pub const AT_FDCWD: isize = -100;
 pub const AT_REMOVEDIR: usize = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+pub const AT_SYMLINK_FOLLOW: usize = 0x400;
 pub const AT_EMPTY_PATH: usize = 0x1000;
 pub const F_DUPFD: i32 = 0;
 pub const F_GETFD: i32 = 1;
@@ -307,6 +345,17 @@ pub fn link(old_path: &str, new_path: &str) -> isize {
         new_path.as_str(),
         0,
     )
+}
+
+pub fn symlink(target: &str, linkpath: &str) -> isize {
+    let target = to_cstring(target);
+    let linkpath = to_cstring(linkpath);
+    sys_symlinkat(target.as_str(), AT_FDCWD as usize, linkpath.as_str())
+}
+
+pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
+    let path = to_cstring(path);
+    sys_readlinkat(AT_FDCWD as usize, path.as_str(), buf)
 }
 
 pub fn unlink(path: &str) -> isize {
@@ -397,6 +446,22 @@ pub fn getpid() -> isize {
     sys_getpid()
 }
 
+pub fn getpgid(pid: isize) -> isize {
+    sys_getpgid(pid)
+}
+
+pub fn setpgid(pid: isize, pgid: isize) -> isize {
+    sys_setpgid(pid, pgid)
+}
+
+pub fn getsid() -> isize {
+    sys_getsid()
+}
+
+pub fn setsid() -> isize {
+    sys_setsid()
+}
+
 pub fn socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
     sys_socket(domain, socket_type, protocol)
 }
@@ -414,8 +479,20 @@ pub fn listen(fd: usize, backlog: usize) -> isize {
 }
 
 pub fn accept(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
-    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
-    sys_accept(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
+    accept4(fd, addr_out, 0)
+}
+
+pub fn accept4(fd: usize, addr_out: Option<&mut net::SockAddrIn>, flags: usize) -> isize {
+    let addr_ptr = addr_out
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |a| (*a) as *const _ as *mut _);
+    let mut addrlen = core::mem::size_of::<net::SockAddrIn>() as i32;
+    let addrlen_ptr = if addr_out.is_some() {
+        &mut addrlen as *mut i32
+    } else {
+        core::ptr::null_mut()
+    };
+    sys_accept4(fd, addr_ptr, addrlen_ptr, flags)
 }
 
 pub fn connect(fd: usize, addr: &net::SockAddrIn) -> isize {
@@ -553,6 +630,22 @@ pub fn mmap_full(
 
 pub fn munmap(start: usize, len: usize) -> isize {
     sys_munmap(start, len)
+}
+
+pub fn shmget(key: i32, size: usize, flags: i32) -> isize {
+    sys_shmget(key, size, flags)
+}
+
+pub fn shmat(shmid: usize, addr: usize, flags: i32) -> isize {
+    sys_shmat(shmid, addr, flags)
+}
+
+pub fn shmdt(addr: usize) -> isize {
+    sys_shmdt(addr)
+}
+
+pub fn shmctl(shmid: usize, cmd: i32, buf: usize) -> isize {
+    sys_shmctl(shmid, cmd, buf)
 }
 
 pub fn brk(addr: usize) -> isize {

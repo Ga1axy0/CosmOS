@@ -10,6 +10,7 @@ use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::fs::{mapping_for_inode, new_stdio_files, File, FileDescription};
+use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
     MapPermission, MemorySet, PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma,
@@ -31,6 +32,8 @@ const MUSL_INTERP_PATHS: [&str; 2] = [
     "/lib/ld-musl-riscv64-sf.so.1",
     "/lib/ld-musl-riscv64.so.1",
 ];
+/// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
+const DEFAULT_UMASK: u32 = 0o022;
 
 bitflags! {
     /// fd 表项级别的标志位。
@@ -86,6 +89,7 @@ pub struct Credentials {
     pub gid: u32,
     pub egid: u32,
     pub sid: u32,
+    pub pgid: u32,
 }
 
 impl Credentials {
@@ -96,6 +100,7 @@ impl Credentials {
             gid: 0,
             egid: 0,
             sid: 0,
+            pgid: 0,
         }
     }
 }
@@ -142,6 +147,10 @@ pub struct ProcessControlBlockInner {
     pub semaphore_detector: DeadlockDetector,
     /// current working directory (absolute path)
     pub cwd: String,
+    /// absolute path of the last executed image (for /proc/<pid>/exe)
+    pub exec_path: String,
+    /// process file creation mask (`umask`)
+    pub umask: u32,
     /// process credentials
     pub cred: Credentials,
     /// CPU time spent in user mode for this process (raw timer counter units)
@@ -164,6 +173,19 @@ pub struct ProcessControlBlockInner {
     pub itimer_prof: ItimerState,
     /// Robust list
     pub robust_list: RobustList,
+    /// Active SysV shared-memory attachments in this process.
+    pub shm_attachments: Vec<ShmAttachment>,
+}
+
+/// One SysV shared-memory attachment in a process address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShmAttachment {
+    /// Shared memory identifier.
+    pub shmid: usize,
+    /// User virtual address returned by `shmat`.
+    pub addr: usize,
+    /// Mapped byte length.
+    pub size: usize,
 }
 
 pub struct RobustList {
@@ -462,7 +484,7 @@ impl ProcessControlBlock {
     }
 
     /// new process from elf file
-    pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    pub fn new(elf_data: &[u8], exec_path: String) -> Arc<Self> {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
         // assert that initproc is always valid elf
@@ -472,6 +494,8 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // allocate a pid
         let pid_handle = pid_alloc();
+        let mut cred = Credentials::root();
+        cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
@@ -495,7 +519,9 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
-                    cred: Credentials::root(),
+                    exec_path,
+                    umask: DEFAULT_UMASK,
+                    cred,
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -506,6 +532,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
+                    shm_attachments: Vec::new(),
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
@@ -534,7 +561,12 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) -> Result<(), ERRNO> {
+    pub fn exec(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        args: Vec<String>,
+        exec_path: String,
+    ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
 
@@ -665,12 +697,13 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        let (mut old_memory_set, old_token, old_mask, cloexec_entries) = {
+        let (mut old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments) = {
             let mut inner = self.inner_exclusive_access();
             let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             let old_token = old_memory_set.token();
             let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
+            inner.exec_path = exec_path;
             // POSIX: on exec, reset all user-defined signal handlers to SIG_DFL.
             // SIG_IGN dispositions are preserved across exec.
             for action in inner.signal_actions.table.iter_mut() {
@@ -682,12 +715,16 @@ impl ProcessControlBlock {
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
-            (old_memory_set, old_token, old_mask, cloexec_entries)
+            let old_shm_attachments = core::mem::take(&mut inner.shm_attachments);
+            (old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments)
         };
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
         DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
         drop(cloexec_entries);
+        for attachment in old_shm_attachments {
+            ipc::detach_segment(attachment.shmid);
+        }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
@@ -770,6 +807,9 @@ impl ProcessControlBlock {
         let parent_signal_mask = parent.signal_mask;
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
+        let parent_exec_path = parent.exec_path.clone();
+        let parent_umask = parent.umask;
+        let parent_shm_attachments = parent.shm_attachments.clone();
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -805,6 +845,8 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent_cwd,
+                    exec_path: parent_exec_path,
+                    umask: parent_umask,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -816,6 +858,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
+                    shm_attachments: parent_shm_attachments.clone(),
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
@@ -842,6 +885,9 @@ impl ProcessControlBlock {
             self.getpid(),
             child.getpid()
         );
+        for attachment in parent_shm_attachments {
+            ipc::retain_attached_segment(attachment.shmid);
+        }
         child.register_existing_file_mappings();
         // create main thread of child process
         let task = child.create_task(
@@ -893,7 +939,7 @@ impl ProcessControlBlock {
     }
 
     /// Create a child process directly from elf image.
-    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Result<Arc<Self>, ERRNO> {
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8], exec_path: String) -> Result<Arc<Self>, ERRNO> {
         let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data)?;
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
@@ -932,6 +978,8 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                    exec_path,
+                    umask: parent.umask,
                     cred,
                     user_time: 0,
                     kernel_time: 0,
@@ -943,6 +991,7 @@ impl ProcessControlBlock {
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
+                    shm_attachments: Vec::new(),
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
@@ -979,7 +1028,10 @@ impl ProcessControlBlock {
     pub fn getpid(&self) -> usize {
         self.pid.0
     }
-    /// get uid
+    /// Get absolute path of the last executed image.
+    pub fn exec_path(&self) -> String {
+        self.inner.lock().exec_path.clone()
+    }
     pub fn getuid(&self) -> u32 {
         self.inner.lock().cred.uid
     }
@@ -1002,6 +1054,26 @@ impl ProcessControlBlock {
 
     pub fn getsid(&self) -> u32 {
         self.inner.lock().cred.sid
+    }
+
+    pub fn setsid(&self, sid: u32) {
+        self.inner.lock().cred.sid = sid;
+    }
+
+    pub fn getpgid(&self) -> u32 {
+        self.inner.lock().cred.pgid
+    }
+
+    pub fn setpgid(&self, pgid: u32) {
+        self.inner.lock().cred.pgid = pgid;
+    }
+
+    pub fn umask(&self) -> u32 {
+        self.inner.lock().umask
+    }
+
+    pub fn set_umask(&self, umask: u32) {
+        self.inner.lock().umask = umask & 0o777;
     }
 
     /// map an anonymous area with given permission, return true if success
@@ -1086,6 +1158,31 @@ impl ProcessControlBlock {
         reclaim.flush_then_release();
         true
     }
+
+    /// Record a successful SysV shared-memory attachment.
+    pub fn add_shm_attachment(&self, attachment: ShmAttachment) {
+        self.inner.lock().shm_attachments.push(attachment);
+    }
+
+    /// Remove the attachment whose mapping starts at `addr`.
+    pub fn remove_shm_attachment_by_addr(&self, addr: usize) -> Option<ShmAttachment> {
+        let mut inner = self.inner.lock();
+        let idx = inner.shm_attachments.iter().position(|entry| entry.addr == addr)?;
+        Some(inner.shm_attachments.remove(idx))
+    }
+
+    /// Drain all SysV shared-memory attachments during exec/exit teardown.
+    pub fn take_all_shm_attachments(&self) -> Vec<ShmAttachment> {
+        let mut inner = self.inner.lock();
+        core::mem::take(&mut inner.shm_attachments)
+    }
+
+    /// 对当前进程地址空间中的指定范围执行 `msync`。
+    pub fn msync(&self, start: VirtAddr, end: VirtAddr) -> Result<(), ERRNO> {
+        let inner = self.inner.lock();
+        inner.memory_set.msync_range(start, end)
+    }
+
     /// 处理当前进程的私有页写时复制缺页。
     pub fn handle_private_cow_fault(&self, fault_addr: usize) -> bool {
         let Some(reclaim) = ({

@@ -10,8 +10,9 @@ use lazy_static::lazy_static;
 use crate::config::{MEMORY_END, PAGE_SIZE};
 use crate::mm::{
     frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
-    PhysAddr, PhysPageNum,
+    InodeKey, PhysAddr, PhysPageNum,
 };
+use crate::syscall::errno::ERRNO;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
 
@@ -139,7 +140,7 @@ impl PageMappingHandle {
 
     /// 将当前 mapping 中的全部脏页同步到底层文件。
     pub fn sync(&self) {
-        sync_mapping(&self.inner);
+        let _ = sync_mapping(&self.inner);
     }
 
     /// 调整当前文件长度，并同步更新已有缓存页。
@@ -158,12 +159,14 @@ impl PageMappingHandle {
 pub struct PageCacheManager {
     /// 简化版 CLOCK 队列，允许存在重复和失效条目。
     inactive: VecDeque<Weak<SpinNoIrqLock<CachePage>>>,
+    /// 已创建过 page mapping 的 inode 索引，供全局/按文件系统同步使用。
+    mappings: BTreeMap<InodeKey, Weak<SpinNoIrqLock<PageMapping>>>,
     /// 当前缓存页总数。
     pub cached_pages: usize,
     /// 超过该阈值后开始回收。
-    high_watermark: usize,
+    pub high_watermark: usize,
     /// 回收到该阈值后停止。
-    low_watermark: usize,
+    pub low_watermark: usize,
 }
 
 impl PageCacheManager {
@@ -172,6 +175,7 @@ impl PageCacheManager {
         let (high_watermark, low_watermark) = default_watermarks();
         Self {
             inactive: VecDeque::new(),
+            mappings: BTreeMap::new(),
             cached_pages: 0,
             high_watermark,
             low_watermark,
@@ -282,6 +286,33 @@ pub fn sync_inode(inode: &Arc<Inode>) {
     mapping.sync();
 }
 
+/// 同步当前文件系统上所有 page-cache-backed inode 的脏页。
+pub fn sync_fs(fs_id: u64) -> Result<(), ERRNO> {
+    for mapping in collect_mappings(Some(fs_id)) {
+        sync_mapping(&mapping)?;
+    }
+    Ok(())
+}
+
+/// 同步全局所有 page cache 脏页。
+pub fn sync_all() -> Result<(), ERRNO> {
+    for mapping in collect_mappings(None) {
+        sync_mapping(&mapping)?;
+    }
+    Ok(())
+}
+
+/// 同步某个 inode 指定范围内的脏页。
+pub fn sync_inode_range(inode: &Arc<Inode>, offset: usize, len: usize) -> Result<(), ERRNO> {
+    if len == 0 || !is_inode_page_cacheable(inode) {
+        return Ok(());
+    }
+    let Some(mapping) = try_get_mapping(inode) else {
+        return Ok(());
+    };
+    mapping.sync_range(offset, len)
+}
+
 /// 返回指定页对应的 cache page；供后续 `mmap` 缺页路径复用。
 #[allow(dead_code)]
 pub fn get_cached_page(inode: &Arc<Inode>, page_idx: u64) -> Option<Arc<SpinNoIrqLock<CachePage>>> {
@@ -334,6 +365,11 @@ fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> 
         }
     }
     if inserted {
+        let key = InodeKey::from_inode(inode);
+        PAGE_CACHE_MANAGER
+            .lock()
+            .mappings
+            .insert(key, Arc::downgrade(&mapping));
         debug!(
             "[page_cache] mapping miss: inode_ptr={:#x} fs_id={} ino={} size={}",
             Arc::as_ptr(inode) as usize,
@@ -683,25 +719,60 @@ fn mark_page_dirty(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page_guard: &mut C
 }
 
 /// 同步单个 mapping 的全部脏页。
-fn sync_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>) {
+fn sync_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>) -> Result<(), ERRNO> {
     let dirty_pages: alloc::vec::Vec<_> = mapping.lock().dirty_pages.iter().copied().collect();
     for page_idx in dirty_pages {
         let page = mapping.lock().pages.get(&page_idx).cloned();
         if let Some(page) = page {
-            flush_page(mapping, &page);
+            flush_page(mapping, &page)?;
         }
     }
+    Ok(())
+}
+
+/// 同步单个 mapping 中指定范围的脏页。
+fn sync_mapping_range(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    len: usize,
+) -> Result<(), ERRNO> {
+    if len == 0 {
+        return Ok(());
+    }
+    let start_idx = file_page_index(offset);
+    let end_off = offset
+        .checked_add(len.saturating_sub(1))
+        .ok_or(ERRNO::EOVERFLOW)?;
+    let end_idx = file_page_index(end_off);
+    let dirty_pages: alloc::vec::Vec<_> = {
+        let mapping_guard = mapping.lock();
+        mapping_guard
+            .dirty_pages
+            .range(start_idx..=end_idx)
+            .copied()
+            .collect()
+    };
+    for page_idx in dirty_pages {
+        let page = mapping.lock().pages.get(&page_idx).cloned();
+        if let Some(page) = page {
+            flush_page(mapping, &page)?;
+        }
+    }
+    Ok(())
 }
 
 /// 将单个脏页写回底层文件。
-fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLock<CachePage>>) {
+fn flush_page(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    page: &Arc<SpinNoIrqLock<CachePage>>,
+) -> Result<(), ERRNO> {
     loop {
         let (wait_queue, writeback_info) = {
             let mut page_guard = page.lock();
             if page_guard.state.contains(CachePageState::WRITEBACK) {
                 (Some(Arc::clone(&page_guard.wait_queue)), None)
             } else if !page_guard.state.contains(CachePageState::DIRTY) {
-                return;
+                return Ok(());
             } else {
                 page_guard.state.insert(CachePageState::WRITEBACK);
                 page_guard.pin_count += 1;
@@ -729,6 +800,7 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
 
         let (page_idx, valid_bytes, ppn, owner_inode) =
             writeback_info.expect("writeback owner must provide page data");
+        let mut write_ok = true;
         if valid_bytes != 0 {
             let bytes = ppn.get_bytes_array();
             debug!(
@@ -736,13 +808,22 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
                 page_idx,
                 valid_bytes
             );
-            owner_inode.write_at(page_start(page_idx), &bytes[..valid_bytes]);
+            let written = owner_inode.write_at(page_start(page_idx), &bytes[..valid_bytes]);
+            if written != valid_bytes {
+                error!(
+                    "[page_cache] short writeback: page_idx={} expected={} actual={}",
+                    page_idx,
+                    valid_bytes,
+                    written
+                );
+                write_ok = false;
+            }
         }
 
         let wait_queue = {
             let mut page_guard = page.lock();
             if page_guard.state.contains(CachePageState::DIRTY) {
-                if page_guard.map_count > 0 {
+                if !write_ok || page_guard.map_count > 0 {
                     // 共享映射仍然存在时先保守地维持脏状态，避免写回后后续写入无法再次通知内核。
                     // TODO：后续补齐反向映射后，可在写回前清 PTE 脏位并重新写保护，从而精确清脏。
                     mapping.lock().dirty_pages.insert(page_idx);
@@ -756,14 +837,17 @@ fn flush_page(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page: &Arc<SpinNoIrqLoc
             Arc::clone(&page_guard.wait_queue)
         };
         wait_queue.wake_all();
-        return;
+        if write_ok {
+            return Ok(());
+        }
+        return Err(ERRNO::EIO);
     }
 }
 
 /// 若当前缓存压力过大，则回收到低水位。
 pub fn reclaim_if_needed() {
+    refresh_page_cache_watermarks();
     loop {
-        refresh_page_cache_watermarks();
         let need_reclaim = {
             let manager = PAGE_CACHE_MANAGER.lock();
             manager.cached_pages > manager.high_watermark
@@ -823,8 +907,9 @@ fn reclaim_one() -> bool {
             };
 
             if let Some(mapping) = mapping {
-                flush_page(&mapping, &page);
+                let _ = flush_page(&mapping, &page);
             }
+            PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
             return true;
         }
         page_guard.state.insert(CachePageState::EVICTING);
@@ -870,6 +955,12 @@ fn refresh_page_cache_watermarks() {
     let mut manager = PAGE_CACHE_MANAGER.lock();
     manager.high_watermark = high_watermark;
     manager.low_watermark = low_watermark;
+    debug!(
+        "[page_cache] refresh watermarks: high={} low={} cached_pages={}",
+        manager.high_watermark,
+        manager.low_watermark,
+        manager.cached_pages
+    );
 }
 
 /// 使用实时物理页统计动态计算水位。
@@ -878,7 +969,7 @@ fn dynamic_watermarks() -> (usize, usize) {
     if stats.total_pages == 0 {
         return default_watermarks();
     }
-    let base_high = max(128, stats.total_pages / 16);
+    let base_high = max(128, stats.total_pages / 4);
     let pressure_high = stats.free_pages / 2;
     let high_watermark = min(base_high, pressure_high);
     let low_watermark = high_watermark * 3 / 4;
@@ -890,7 +981,7 @@ fn default_watermarks() -> (usize, usize) {
     let managed_start = PhysAddr::from(ekernel as usize).ceil();
     let managed_end = PhysAddr::from(MEMORY_END).floor();
     let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
-    let high_watermark = max(128, total_pages / 16);
+    let high_watermark = max(128, total_pages / 4);
     let low_watermark = max(96, high_watermark * 3 / 4);
     (high_watermark, low_watermark)
 }
@@ -900,10 +991,12 @@ fn alloc_cache_frame() -> FrameTracker {
     if let Some(frame) = frame_alloc() {
         return frame;
     }
+    let _ = sync_all();
     reclaim_if_needed();
     if let Some(frame) = frame_alloc() {
         return frame;
     }
+    let _ = sync_all();
     // 分配失败时再主动推进回收，避免 cache 尚未超过高水位时错过可回收页。
     while reclaim_one() {
         if let Some(frame) = frame_alloc() {
@@ -911,12 +1004,7 @@ fn alloc_cache_frame() -> FrameTracker {
         }
     }
     // TODO：后续可继续接入更积极的回收/等待策略；当前在无可回收页且彻底无页时直接报错。
-    frame_alloc().unwrap_or_else(|| {
-        error!("Page Cache: Out of memory");
-        error!("Frame allocator stats: {:?}", frame_allocator_stats());
-        error!("Watermark: high={} low={}", PAGE_CACHE_MANAGER.lock().high_watermark, PAGE_CACHE_MANAGER.lock().low_watermark);
-        panic!();
-    })
+    frame_alloc().unwrap()
 }
 
 /// 计算文件偏移所属页号。
@@ -938,4 +1026,30 @@ fn page_start(page_idx: u64) -> usize {
 fn page_valid_bytes_for_size(size: usize, page_idx: u64) -> usize {
     let start = page_start(page_idx);
     size.saturating_sub(start).min(PAGE_SIZE)
+}
+
+fn collect_mappings(fs_id: Option<u64>) -> alloc::vec::Vec<Arc<SpinNoIrqLock<PageMapping>>> {
+    let mut manager = PAGE_CACHE_MANAGER.lock();
+    let mut collected = alloc::vec::Vec::new();
+    manager.mappings.retain(|key, weak| {
+        if let Some(target_fs) = fs_id {
+            if key.fs_id() != target_fs {
+                return weak.strong_count() > 0;
+            }
+        }
+        if let Some(mapping) = weak.upgrade() {
+            collected.push(mapping);
+            true
+        } else {
+            false
+        }
+    });
+    collected
+}
+
+impl PageMappingHandle {
+    /// 将当前 mapping 中指定范围的脏页同步到底层文件。
+    pub fn sync_range(&self, offset: usize, len: usize) -> Result<(), ERRNO> {
+        sync_mapping_range(&self.inner, offset, len)
+    }
 }

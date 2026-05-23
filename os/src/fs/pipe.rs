@@ -2,6 +2,7 @@ use super::File;
 use crate::mm::UserBuffer;
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
+use crate::syscall::errno::ERRNO;
 use alloc::sync::{Arc, Weak};
 use crate::fs::{Stat,StatMode}; 
 use crate::task::{WaitQueue, WaitReason};
@@ -195,6 +196,42 @@ impl File for Pipe {
             notify_poll_source(self.source_id(), POLLOUT);
         }
     }
+    fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        trace!("kernel: Pipe::read_bytes_at");
+        assert!(self.readable());
+        let want_to_read = buf.len();
+        let mut already_read = 0usize;
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            let loop_read = ring_buffer.available_read();
+            if loop_read == 0 {
+                if already_read > 0 {
+                    return Ok(already_read);
+                }
+                if ring_buffer.all_write_ends_closed() {
+                    return Ok(already_read);
+                }
+                let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+                drop(ring_buffer);
+                read_wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
+                    let ring_buffer = self.buffer.lock();
+                    ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
+                });
+                continue;
+            }
+            for _ in 0..loop_read {
+                if already_read == want_to_read {
+                    ring_buffer.write_wait_queue.wake_one();
+                    notify_poll_source(self.source_id(), POLLOUT);
+                    return Ok(already_read);
+                }
+                buf[already_read] = ring_buffer.read_byte();
+                already_read += 1;
+            }
+            ring_buffer.write_wait_queue.wake_one();
+            notify_poll_source(self.source_id(), POLLOUT);
+        }
+    }
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         trace!("kernel: Pipe::write");
         assert!(self.writable());
@@ -232,6 +269,35 @@ impl File for Pipe {
                     notify_poll_source(self.source_id(), POLLIN);
                     return already_write;
                 }
+            }
+            ring_buffer.read_wait_queue.wake_one();
+            notify_poll_source(self.source_id(), POLLIN);
+        }
+    }
+    fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        trace!("kernel: Pipe::write_bytes_at");
+        assert!(self.writable());
+        let want_to_write = buf.len();
+        let mut already_write = 0usize;
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            let loop_write = ring_buffer.available_write();
+            if loop_write == 0 {
+                let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+                drop(ring_buffer);
+                write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
+                    self.buffer.lock().available_write() > 0
+                });
+                continue;
+            }
+            for _ in 0..loop_write {
+                if already_write == want_to_write {
+                    ring_buffer.read_wait_queue.wake_one();
+                    notify_poll_source(self.source_id(), POLLIN);
+                    return Ok(already_write);
+                }
+                ring_buffer.write_byte(buf[already_write]);
+                already_write += 1;
             }
             ring_buffer.read_wait_queue.wake_one();
             notify_poll_source(self.source_id(), POLLIN);

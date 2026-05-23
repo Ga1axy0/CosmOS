@@ -24,12 +24,18 @@ pub const SYSCALL_IOCTL: usize = 29;
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
 pub const SYSCALL_UNLINKAT: usize = 35;
+/// symlinkat syscall
+pub const SYSCALL_SYMLINKAT: usize = 36;
 /// linkat syscall
 pub const SYSCALL_LINKAT: usize = 37;
 /// umount syscall
 pub const SYSCALL_UMOUNT: usize = 39;
 /// mount syscall
 pub const SYSCALL_MOUNT: usize = 40;
+/// statfs64 syscall
+pub const SYSCALL_STATFS64: usize = 43;
+/// fstatfs64 syscall
+pub const SYSCALL_FSTATFS64: usize = 44;
 /// truncate syscall
 pub const SYSCALL_TRUNCATE: usize = 45;
 /// ftruncate syscall
@@ -42,6 +48,10 @@ pub const SYSCALL_CHDIR: usize = 49;
 pub const SYSCALL_FCHMOD: usize = 52;
 /// fchmodat syscall
 pub const SYSCALL_FCHMODAT: usize = 53;
+/// fchownat syscall
+pub const SYSCALL_FCHOWNAT: usize = 54;
+/// fchown syscall
+pub const SYSCALL_FCHOWN: usize = 55;
 /// openat syscall
 pub const SYSCALL_OPENAT: usize = 56;
 /// close syscall
@@ -60,16 +70,34 @@ pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_READV: usize = 65;
 /// writev syscall
 pub const SYSCALL_WRITEV: usize = 66;
+/// pread64 syscall
+pub const SYSCALL_PREAD64: usize = 67;
+/// pwrite64 syscall
+pub const SYSCALL_PWRITE64: usize = 68;
+/// preadv syscall
+pub const SYSCALL_PREADV: usize = 69;
+/// pwritev syscall
+pub const SYSCALL_PWRITEV: usize = 70;
+/// sendfile64 syscall
+pub const SYSCALL_SENDFILE64: usize = 71;
 /// pselect6_time32 syscall
 pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
 pub const SYSCALL_PPOLL_TIME32: usize = 73;
+/// readlinkat syscall
+pub const SYSCALL_READLINKAT: usize = 78;
 /// newfstatat syscall
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 /// utimensat syscall
 pub const SYSCALL_UTIMENSAT: usize = 88;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
+/// sync syscall
+pub const SYSCALL_SYNC: usize = 81;
+/// fsync syscall
+pub const SYSCALL_FSYNC: usize = 82;
+/// fdatasync syscall
+pub const SYSCALL_FDATASYNC: usize = 83;
 /// exit syscall
 pub const SYSCALL_EXIT: usize = 93;
 /// exit group syscall
@@ -132,6 +160,10 @@ pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_GET_PRIORITY: usize = 141;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
+/// getpgid syscall
+pub const SYSCALL_GETPGID: usize = 154;
+/// setpgid syscall
+pub const SYSCALL_SETPGID: usize = 155;
 /// getsid syscall
 pub const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
@@ -144,6 +176,8 @@ pub const SYSCALL_GETRLIMIT: usize = 163;
 pub const SYSCALL_SETRLIMIT: usize = 164;
 /// getrusage syscall
 pub const SYSCALL_GETRUSAGE: usize = 165;
+/// umask syscall
+pub const SYSCALL_UMASK: usize = 166;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
@@ -164,6 +198,14 @@ pub const SYSCALL_GETGID: usize = 176;
 pub const SYSCALL_GETEGID: usize = 177;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
+/// shmget syscall
+pub const SYSCALL_SHMGET: usize = 194;
+/// shmctl syscall
+pub const SYSCALL_SHMCTL: usize = 195;
+/// shmat syscall
+pub const SYSCALL_SHMAT: usize = 196;
+/// shmdt syscall
+pub const SYSCALL_SHMDT: usize = 197;
 /// socket syscall
 pub const SYSCALL_SOCKET: usize = 198;
 /// socketpair syscall
@@ -176,6 +218,8 @@ pub const SYSCALL_LISTEN: usize = 201;
 pub const SYSCALL_ACCEPT: usize = 202;
 /// connect syscall
 pub const SYSCALL_CONNECT: usize = 203;
+/// accept4 syscall
+pub const SYSCALL_ACCEPT4: usize = 242;
 /// getsockname syscall
 pub const SYSCALL_GETSOCKNAME: usize = 204;
 /// getpeername syscall
@@ -206,6 +250,8 @@ pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_MMAP: usize = 222;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
+/// msync syscall
+pub const SYSCALL_MSYNC: usize = 227;
 /// mlock syscall
 pub const SYSCALL_MLOCK: usize = 228;
 /// munlock syscall
@@ -222,6 +268,8 @@ pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 pub const SYSCALL_WAIT4: usize = 260;
 /// prlimit64 syscall
 pub const SYSCALL_PRLIMIT64: usize = 261;
+/// syncfs syscall
+pub const SYSCALL_SYNCFS: usize = 267;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -330,6 +378,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_SYMLINKAT => sys_symlinkat(
+            args[0] as *const u8,
+            args[1] as isize,
+            args[2] as *const u8,
+        ),
         SYSCALL_LINKAT => sys_linkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -345,11 +398,21 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4] as *const u8,
         ),
+        SYSCALL_STATFS64 => sys_statfs64(args[0] as *const u8, args[1] as *mut u8),
+        SYSCALL_FSTATFS64 => sys_fstatfs64(args[0] as u32, args[1] as *mut u8),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0] as u32, args[1] as isize),
         SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
         SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
-        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as i32),
+        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_FCHOWNAT => sys_fchownat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+            args[4] as i32,
+        ),
+        SYSCALL_FCHOWN => sys_fchown(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
@@ -359,6 +422,32 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READV => sys_readv(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
         SYSCALL_WRITEV =>
             sys_writev(args[0], args[1] as *const crate::syscall::fs::IoVec, args[2] as i32),
+        SYSCALL_PREAD64 =>
+            sys_pread64(args[0] as u32, args[1] as *const u8, args[2], args[3] as i64),
+        SYSCALL_PWRITE64 =>
+            sys_pwrite64(args[0] as u32, args[1] as *const u8, args[2], args[3] as i64),
+        SYSCALL_PREADV => sys_preadv(
+            args[0],
+            args[1] as *const crate::syscall::fs::IoVec,
+            args[2] as i32,
+            args[3],
+            args[4],
+        ),
+        SYSCALL_PWRITEV => sys_pwritev(
+            args[0],
+            args[1] as *const crate::syscall::fs::IoVec,
+            args[2] as i32,
+            args[3],
+            args[4],
+        ),
+        SYSCALL_SENDFILE64 =>
+            sys_sendfile64(args[0] as i32, args[1] as i32, args[2] as *mut i64, args[3]),
+        SYSCALL_READLINKAT => sys_readlinkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -392,6 +481,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
+        SYSCALL_SYNC => sys_sync(),
+        SYSCALL_FSYNC => sys_fsync(args[0] as u32),
+        SYSCALL_FDATASYNC => sys_fdatasync(args[0] as u32),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
@@ -423,13 +515,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SYSLOG => sys_syslog(args[0] as usize, args[1] as *mut u8, args[2] as usize),
         SYSCALL_YIELD => sys_yield(),
+        SYSCALL_GETPGID => sys_getpgid(args[0] as isize),
+        SYSCALL_SETPGID => sys_setpgid(args[0] as isize, args[1] as isize),
         SYSCALL_GETSID => sys_getsid(),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_UNAME => sys_uname(args[0] as *mut UtsName),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut RUsage),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut rlimit),
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const rlimit),
+        SYSCALL_UMASK => sys_umask(args[0] as i32),
         SYSCALL_PRLIMIT64 => sys_prlimit64(args[0] as i32, args[1], args[2] as *const rlimit, args[3] as *mut rlimit),
+        SYSCALL_SYNCFS => sys_syncfs(args[0] as u32),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
@@ -437,7 +533,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as *mut i32),
         SYSCALL_BIND => sys_bind(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
         SYSCALL_LISTEN => sys_listen(args[0] as i32, args[1] as i32),
-        SYSCALL_ACCEPT => sys_accept(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_ACCEPT => sys_accept(
+            args[0] as i32,
+            args[1] as *mut SockAddrIn,
+            args[2] as *mut i32,
+        ),
+        SYSCALL_ACCEPT4 => sys_accept4(
+            args[0] as i32,
+            args[1] as *mut SockAddrIn,
+            args[2] as *mut i32,
+            args[3] as i32,
+        ),
         SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
         SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
         SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
@@ -481,6 +587,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_GETTID => sys_gettid(),
+        SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),
+        SYSCALL_SHMCTL => sys_shmctl(args[0], args[1] as i32, args[2]),
+        SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2] as i32),
+        SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
@@ -494,6 +604,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
         SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
         SYSCALL_MLOCKALL => sys_mlockall(args[0] as i32),

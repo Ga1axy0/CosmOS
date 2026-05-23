@@ -1,17 +1,19 @@
-use super::{page_cache, File, Stat, StatMode};
+use super::{page_cache, File, Stat, StatFs64, StatMode};
+use super::devfs::{NullDevNode, UrandomDevNode};
 use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, NullDevNode, RtcDevNode, UrandomDevNode};
+use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode};
+use crate::fs::procfs::ProcRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
-use fs::vfs::VfsNode;
+use fs::vfs::{VfsFileType, VfsNode};
 use fs::Inode;
 use lazy_static::*;
 use core::any::Any;
@@ -91,6 +93,10 @@ pub const AT_REMOVEDIR: u32 = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 /// `newfstatat` 标志：允许空路径并直接作用于 `dirfd`。
 pub const AT_EMPTY_PATH: u32 = 0x1000;
+/// `linkat` flag: follow the old path if it is a symbolic link.
+pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
+
+const MAX_SYMLINK_DEPTH: usize = 40;
 
 #[inline]
 fn inode_now() -> fs::vfs::InodeTime {
@@ -113,6 +119,41 @@ lazy_static! {
     /// filesystem and make the full directory tree accessible.
     pub static ref ROOT_INODE: Arc<Inode> =
         Inode::from_vfs_node(Arc::clone(&VIRT_ROOT) as Arc<dyn VfsNode>);
+}
+
+/// A single mount-table entry exposed via `/proc/mounts`.
+#[derive(Clone, Debug)]
+pub(crate) struct MountRecord {
+    pub(crate) source: String,
+    pub(crate) target: String,
+    pub(crate) fs_type: String,
+    pub(crate) options: String,
+}
+
+lazy_static! {
+    /// Current mount table used by procfs.
+    static ref MOUNT_TABLE: SpinNoIrqLock<BTreeMap<String, MountRecord>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+}
+
+pub(crate) fn snapshot_mount_table() -> Vec<MountRecord> {
+    MOUNT_TABLE.lock().values().cloned().collect()
+}
+
+fn record_mount(target: &str, source: &str, fs_type: &str, options: &str) {
+    MOUNT_TABLE.lock().insert(
+        String::from(target),
+        MountRecord {
+            source: String::from(source),
+            target: String::from(target),
+            fs_type: String::from(fs_type),
+            options: String::from(options),
+        },
+    );
+}
+
+fn remove_mount_record(target: &str) {
+    MOUNT_TABLE.lock().remove(target);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +274,8 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
         return Err(ERRNO::EINVAL);
     }
 
+    remove_mount_record(&abs);
+
     // Clean up the registry entry (no-op if `abs` was a real-FS mount, not
     // a VirtualDirNode we created).
     VIRT_DIRS.lock().remove(&abs);
@@ -255,6 +298,7 @@ pub fn init_rootfs() {
         let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
         let root = Fat32FileSystem::root_inode(&vfs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
+        record_mount("/", "rootfs", "fat32", "rw");
     }
     #[cfg(feature = "easyfs")]
     {
@@ -262,6 +306,7 @@ pub fn init_rootfs() {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
+        record_mount("/", "rootfs", "easyfs", "rw");
     }
     #[cfg(feature = "ext4")]
     {
@@ -269,11 +314,12 @@ pub fn init_rootfs() {
         let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
+        record_mount("/", "/dev/vda", "ext4", "rw");
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
     // Automatically make a /tmp directory if it doesn't exist, since many apps expect it.
-    if lookup_inode("/tmp").is_none() {
+    if lookup_inode_follow("/", "/tmp", true).is_err() {
         match mkdir_at("/", "/tmp") {
             Ok(()) => info!("[kernel] created missing /tmp"),
             Err(e) => warn!("[kernel] failed to create /tmp, errno={}", e as isize),
@@ -346,63 +392,175 @@ pub fn lookup_inode(abs_path: &str) -> Option<Arc<Inode>> {
     Some(cur)
 }
 
+fn join_remaining(target: &str, rest: &[String]) -> String {
+    if rest.is_empty() {
+        return String::from(target);
+    }
+    let mut out = String::from(target);
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    for (idx, component) in rest.iter().enumerate() {
+        if idx != 0 {
+            out.push('/');
+        }
+        out.push_str(component);
+    }
+    out
+}
+
+/// Resolve a path and optionally leave the final symlink unresolved.
+pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<Arc<Inode>, ERRNO> {
+    let mut abs = canonicalize(cwd, path);
+    let mut depth = 0usize;
+
+    loop {
+        let components: Vec<String> = abs
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if components.is_empty() {
+            return Ok(Arc::clone(&ROOT_INODE));
+        }
+
+        let mut cur = Arc::clone(&ROOT_INODE);
+        let mut cur_path = String::from("/");
+        let mut restart: Option<String> = None;
+
+        for (idx, component) in components.iter().enumerate() {
+            if !cur.is_dir() {
+                return Err(ERRNO::ENOTDIR);
+            }
+            let child = cur.find(component).ok_or(ERRNO::ENOENT)?;
+            let is_final = idx + 1 == components.len();
+            if child.is_symlink() && (!is_final || follow_final) {
+                depth += 1;
+                if depth > MAX_SYMLINK_DEPTH {
+                    return Err(ERRNO::ELOOP);
+                }
+                let target = child.read_link().map_err(ERRNO::from)?;
+                let base = if target.starts_with('/') {
+                    String::from("/")
+                } else {
+                    cur_path.clone()
+                };
+                let combined = join_remaining(target.as_str(), &components[idx + 1..]);
+                restart = Some(canonicalize(base.as_str(), combined.as_str()));
+                break;
+            }
+
+            cur = child;
+            if cur_path != "/" {
+                cur_path.push('/');
+            }
+            cur_path.push_str(component);
+        }
+
+        if let Some(next_abs) = restart {
+            abs = next_abs;
+        } else {
+            return Ok(cur);
+        }
+    }
+}
+
+/// Resolve parent directory with symlinks followed in all parent components.
+fn resolve_parent_follow(cwd: &str, path: &str) -> Result<(Arc<Inode>, String, String), ERRNO> {
+    let abs = canonicalize(cwd, path);
+    if abs == "/" {
+        return Err(ERRNO::ENOENT);
+    }
+    let (parent_path, filename) = match abs.rfind('/') {
+        Some(0) => (String::from("/"), String::from(&abs[1..])),
+        Some(idx) => (String::from(&abs[..idx]), String::from(&abs[idx + 1..])),
+        None => (String::from("/"), abs.clone()),
+    };
+    if filename.is_empty() {
+        return Err(ERRNO::ENOENT);
+    }
+    let parent = lookup_inode_follow("/", parent_path.as_str(), true)?;
+    Ok((parent, filename, parent_path))
+}
+
 /// Resolve `path` into (parent_directory_inode, filename).
 /// Returns `None` if the parent directory does not exist.
 fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
-    let abs = canonicalize(cwd, path);
-    if abs == "/" {
-        return None; // cannot resolve parent of root
-    }
-    // Split into directory part and filename.
-    let (parent_path, filename) = match abs.rfind('/') {
-        Some(0) => ("/", &abs[1..]),
-        Some(idx) => (&abs[..idx], &abs[idx + 1..]),
-        None => ("/", abs.as_str()),
-    };
-    let parent = lookup_inode(parent_path)?;
-    Some((parent, String::from(filename)))
+    resolve_parent_follow(cwd, path)
+        .ok()
+        .map(|(parent, filename, _)| (parent, filename))
 }
 
 /// Open (or optionally create) a file/directory at `path` relative to `cwd`.
-pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSInode>, ERRNO> {
+pub fn open_file_at_with_status(
+    cwd: &str,
+    path: &str,
+    flags: OpenFlags,
+) -> Result<(Arc<OSInode>, bool), ERRNO> {
     trace!("kernel: open_file_at: cwd={}, path={}, flags={:?}", cwd, path, flags);
     let abs = canonicalize(cwd, path);
     debug!("open_file_at: path = {} -> abs path = {}", path, abs);
 
     if flags.contains(OpenFlags::CREATE) {
         // Navigate to the parent directory and create the file there.
-        let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
+        let (parent, name, parent_path) = resolve_parent_follow(cwd, path)?;
         if let Some(existing) = parent.find(&name) {
             // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
             debug!("EXCL flag valid: {}", flags.contains(OpenFlags::EXCL));
             if flags.contains(OpenFlags::EXCL) {
                 return Err(ERRNO::EEXIST);
             }
-            if flags.contains(OpenFlags::TRUNC) {
-                page_cache::truncate_inode(&existing, 0).map_err(ERRNO::from)?;
+            if existing.is_symlink() && flags.contains(OpenFlags::NOFOLLOW) {
+                return Err(ERRNO::ELOOP);
             }
-            Ok(Arc::new(OSInode::new(existing, abs.clone())))
+            let inode = if existing.is_symlink() {
+                let existing_path = canonicalize(parent_path.as_str(), name.as_str());
+                lookup_inode_follow("/", existing_path.as_str(), true)?
+            } else {
+                existing
+            };
+            if flags.contains(OpenFlags::TRUNC) {
+                page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
+            }
+            Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
         } else {
-            parent.create(&name).map(|inode| {
-                let _ = inode.set_times_now(inode_now());
-                Arc::new(OSInode::new(inode, abs.clone()))
-            }).ok_or(ERRNO::EIO)
+            parent
+                .create(&name)
+                .map(|inode| {
+                    let _ = inode.set_times_now(inode_now());
+                    (Arc::new(OSInode::new(inode, abs.clone())), true)
+                })
+                .ok_or(ERRNO::EIO)
         }
     } else {
-        lookup_inode(&abs).map(|inode| {
+        let inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
+        if inode.is_symlink() {
+            return Err(ERRNO::ELOOP);
+        }
+        {
             if flags.contains(OpenFlags::TRUNC) {
                 debug!("open_file_at: truncating existing file at {}", abs);
                 page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
-            Ok(Arc::new(OSInode::new(inode, abs.clone())))
-        }).ok_or(ERRNO::ENOENT)?
+            Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
+        }
     }
+}
+
+/// Open (or optionally create) a file/directory at `path` relative to `cwd`.
+pub fn open_file_at(cwd: &str, path: &str, flags: OpenFlags) -> Result<Arc<OSInode>, ERRNO> {
+    open_file_at_with_status(cwd, path, flags).map(|(inode, _created)| inode)
 }
 
 /// Create a directory at `path` relative to `cwd`.
 /// Returns `true` on success.
 pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
-    if let Some((parent, name)) = resolve_parent(cwd, path) {
+    mkdir_at_with_inode(cwd, path).map(|_| ())
+}
+
+/// Create a directory at `path` relative to `cwd` and return the new inode.
+pub fn mkdir_at_with_inode(cwd: &str, path: &str) -> Result<Arc<Inode>, ERRNO> {
+    if let Ok((parent, name, _)) = resolve_parent_follow(cwd, path) {
         // 已存在同名目录或文件
         if parent.find(&name).is_some() {
             return Err(ERRNO::EEXIST);
@@ -412,12 +570,12 @@ pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
             return Err(ERRNO::ENOTDIR);
         }
         // 创建失败
-        if let Some(inode) =  parent.mkdir(&name) {
+        if let Some(inode) = parent.mkdir(&name) {
             let _ = inode.set_times_now(inode_now());
+            Ok(inode)
         } else {
-            return Err(ERRNO::EIO);
+            Err(ERRNO::EIO)
         }
-        Ok(())
     } else {
         Err(ERRNO::ENOENT)
     }
@@ -425,7 +583,7 @@ pub fn mkdir_at(cwd: &str, path: &str) -> Result<(), ERRNO> {
 
 bitflags! {
     ///  The flags argument to the open() system call is constructed by ORing together zero or more of the following values:
-    pub struct OpenFlags: i32 {
+pub struct OpenFlags: i32 {
         /// readyonly
         /// TODO: fix the bug of bitflag.
         const RDONLY = 0x000;
@@ -441,6 +599,8 @@ bitflags! {
         const TRUNC = 0x200;
         /// open directory
         const DIRECTORY = 0x10000;
+        /// fail if the final component is a symbolic link
+        const NOFOLLOW = 0x20000;
     }
 }
 
@@ -477,25 +637,43 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             })
         }
     } else {
-        ROOT_INODE.find(name).map(|inode| {
+        ROOT_INODE.find(name).and_then(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 page_cache::truncate_inode(&inode, 0).ok()?;
             }
             Some(Arc::new(OSInode::new(inode, abs)))
         })
-        .flatten()
     }
 }
 
 /// Create a hard link from `old_path` to `new_path`.
 pub fn linkat(old_cwd: &str, old_path: &str, new_cwd: &str, new_path: &str) -> Result<(), ERRNO> {
-    let (_, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
-    let (new_parent, new_name) = resolve_parent(new_cwd, new_path).ok_or(ERRNO::ENOENT)?;
+    linkat_with_flags(old_cwd, old_path, new_cwd, new_path, 0)
+}
+
+/// Create a hard link from `old_path` to `new_path` with Linux `linkat` flags.
+pub fn linkat_with_flags(
+    old_cwd: &str,
+    old_path: &str,
+    new_cwd: &str,
+    new_path: &str,
+    flags: u32,
+) -> Result<(), ERRNO> {
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let (_, old_name, _) = resolve_parent_follow(old_cwd, old_path)?;
+    let (new_parent, new_name, _) = resolve_parent_follow(new_cwd, new_path)?;
     if old_name.is_empty() || new_name.is_empty() {
         return Err(ERRNO::ENOENT);
     }
-    let (old_parent, old_name) = resolve_parent(old_cwd, old_path).ok_or(ERRNO::ENOENT)?;
-    let old_inode = old_parent.find(old_name.as_str()).ok_or(ERRNO::ENOENT)?;
+    let (old_parent, old_name, old_parent_path) = resolve_parent_follow(old_cwd, old_path)?;
+    let old_inode = if flags & AT_SYMLINK_FOLLOW != 0 {
+        let old_abs = canonicalize(old_parent_path.as_str(), old_name.as_str());
+        lookup_inode_follow("/", old_abs.as_str(), true)?
+    } else {
+        old_parent.find(old_name.as_str()).ok_or(ERRNO::ENOENT)?
+    };
     if old_inode.is_dir() {
         return Err(ERRNO::EPERM);
     }
@@ -504,6 +682,17 @@ pub fn linkat(old_cwd: &str, old_path: &str, new_cwd: &str, new_path: &str) -> R
     }
     new_parent
         .link_inode(&old_inode, new_name.as_str())?;
+    Ok(())
+}
+
+/// Create a symbolic link named `link_path` containing `target`.
+pub fn symlinkat(target: &str, cwd: &str, link_path: &str) -> Result<(), ERRNO> {
+    let (parent, name, _) = resolve_parent_follow(cwd, link_path)?;
+    if parent.find(name.as_str()).is_some() {
+        return Err(ERRNO::EEXIST);
+    }
+    let inode = parent.symlink(name.as_str(), target).map_err(ERRNO::from)?;
+    let _ = inode.set_times_now(inode_now());
     Ok(())
 }
 
@@ -564,6 +753,7 @@ pub fn rename_at(
 
 /// Remove a link at `path` relative to `cwd`.
 pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
+    debug!("unlinkat: cwd={}, path={}, flags={:#x}", cwd, path, flags);
     if flags & !AT_REMOVEDIR != 0 {
         return Err(ERRNO::EINVAL);
     }
@@ -576,7 +766,9 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
         if flags & AT_REMOVEDIR == 0 {
             return Err(ERRNO::EISDIR);
         }
-        if !inode.ls().is_empty() {
+        // if !inode.ls().is_empty() {
+        if inode.ls().len() > 2 {
+            // Contains at least one entry other than `.` and `..`
             return Err(ERRNO::ENOTEMPTY);
         }
         parent.rmdir(name.as_str())?
@@ -628,6 +820,14 @@ impl File for OSInode {
         }
         total_read_size
     }
+    fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        let mapping = self.page_mapping();
+        Ok(if let Some(mapping) = mapping.as_ref() {
+            mapping.read(offset, buf)
+        } else {
+            self.inode.read_at(offset, buf)
+        })
+    }
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let mapping = self.page_mapping();
         let mut total_write_size = 0usize;
@@ -643,6 +843,13 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        Ok(if let Some(mapping) = self.page_mapping().as_ref() {
+            mapping.write(offset, buf)
+        } else {
+            self.inode.write_at(offset, buf)
+        })
     }
 
     fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
@@ -677,7 +884,7 @@ impl File for OSInode {
         let start_idx = offset; // entry index, not byte offset
         let mut written = 0usize;
 
-        for (i, (name, is_dir)) in entries.iter().enumerate().skip(start_idx) {
+        for (i, (name, file_type)) in entries.iter().enumerate().skip(start_idx) {
             let name_bytes = name.as_bytes();
             // reclen must be a multiple of 8
             let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
@@ -691,8 +898,17 @@ impl File for OSInode {
             buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
             // d_reclen (u16)
             buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            // d_type (u8): DT_DIR=4, DT_REG=8
-            let dtype: u8 = if *is_dir { 4 } else { 8 };
+            // d_type (u8): DT_DIR=4, DT_LNK=10, DT_REG=8
+            let dtype: u8 = match file_type {
+                VfsFileType::Directory => 4,
+                VfsFileType::Symlink => 10,
+                VfsFileType::Char => 2,
+                VfsFileType::Block => 6,
+                VfsFileType::Fifo => 1,
+                VfsFileType::Socket => 12,
+                VfsFileType::Regular => 8,
+                VfsFileType::Unknown => 0,
+            };
             buf[written + 18] = dtype;
             // d_name: null-terminated, zero-padded to reclen
             buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
@@ -721,6 +937,10 @@ impl File for OSInode {
         inode_stat(&self.inode)
     }
 
+    fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        self.inode.statfs().map_err(ERRNO::from)
+    }
+
     fn sync(&self) -> Result<(), ERRNO> {
         if let Some(mapping) = self.page_mapping() {
             mapping.sync();
@@ -747,13 +967,21 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
     // Read all attributes in one batched call (single lock acquisition for
     // backends like ext4, instead of one per field).
     let attrs = inode.stat_attrs();
-    let is_dir = inode.is_dir();
+    let file_type = inode.file_type();
     let mode = StatMode::from_bits_truncate(attrs.mode.unwrap_or(
-        if is_dir { StatMode::DIR.bits() } else { StatMode::FILE.bits() }
+        match file_type {
+            VfsFileType::Directory => StatMode::DIR.bits() | 0o755,
+            VfsFileType::Symlink => StatMode::LINK.bits() | 0o777,
+            VfsFileType::Char => StatMode::CHAR.bits() | 0o666,
+            VfsFileType::Block => StatMode::BLOCK.bits() | 0o660,
+            VfsFileType::Fifo => StatMode::FIFO.bits() | 0o666,
+            VfsFileType::Socket => StatMode::SOCK.bits() | 0o777,
+            VfsFileType::Regular | VfsFileType::Unknown => StatMode::FILE.bits() | 0o644,
+        }
     ));
     // Prefer the page-cache size for regular files that have dirty mappings;
     // fall back to the batched attribute read otherwise.
-    let size = if !is_dir {
+    let size = if file_type == VfsFileType::Regular {
         page_cache::cached_inode_size_fast(inode, attrs.size)
     } else {
         attrs.size
@@ -763,14 +991,14 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         ino: attrs.ino,
         mode,
         nlink: attrs.nlink,
-        uid: 0,
-        gid: 0,
+        uid: attrs.uid.unwrap_or(0),
+        gid: attrs.gid.unwrap_or(0),
         rdev: 0,
         pad0: 0,
         size: size as i64,
         blksize: 512,
         pad1: 0,
-        blocks: (size as u64 + 511) / 512,
+        blocks: (size as u64).div_ceil(512),
         atime_sec: attrs.atime.map(|t| t.sec as isize).unwrap_or(0),
         atime_nsec: attrs.atime.map(|t| t.nsec as isize).unwrap_or(0),
         mtime_sec: attrs.mtime.map(|t| t.sec as isize).unwrap_or(0),
@@ -788,7 +1016,8 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 /// Populate `/dev` with one [`BlockDevNode`] per discovered block device.
 ///
 /// Must be called **after** both [`probe_block_devices`](crate::drivers::block::probe_block_devices)
-/// and [`init_rootfs`].  The `/dev` virtual directory is created if absent.
+/// and [`init_rootfs`].  The `/dev` directory is provided by a dedicated
+/// devfs mount.
 pub fn init_dev() {
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
@@ -824,6 +1053,18 @@ pub fn init_dev() {
     info!("[kernel] /dev initialized");
 }
 
+/// Mount procfs at `/proc`.
+///
+/// Must be called after `init_rootfs` so the virtual root is ready.
+pub fn init_procfs() {
+    let proc_root: Arc<dyn VfsNode> = Arc::new(ProcRootNode::new());
+    let proc_inode = Inode::from_vfs_node(proc_root);
+    do_mount("/proc", proc_inode)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount procfs at /proc"));
+    record_mount("/proc", "proc", "proc", "rw");
+    info!("[kernel] /proc initialized");
+}
+
 /// Mount the filesystem on `dev_path` at the absolute path `abs_mnt`.
 ///
 /// `dev_path` must resolve to a [`BlockDevNode`] in the VFS (e.g. `/dev/vda`).
@@ -836,7 +1077,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
         abs_mnt,
         fs_type,
     );
-    let dev_inode = lookup_inode(dev_path).ok_or(ERRNO::ENODEV)?;
+    let dev_inode = lookup_inode_follow("/", dev_path, true).or(Err(ERRNO::ENODEV))?;
     let vfs_node = dev_inode.vfs_node();
     let block_dev_node = vfs_node
         .as_any()
@@ -860,5 +1101,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
         _ => return Err(ERRNO::EINVAL),
     };
 
-    do_mount(abs_mnt, fs_root)
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, &canonicalize("/", dev_path), fs_type, "rw");
+    Ok(())
 }

@@ -7,6 +7,10 @@ pub const SYSCALL_DUP: usize = 23;
 pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
+pub const SYSCALL_SYMLINKAT: usize = 36;
+pub const SYSCALL_LINKAT: usize = 37;
+pub const SYSCALL_STATFS64: usize = 43;
+pub const SYSCALL_FSTATFS64: usize = 44;
 pub const SYSCALL_TRUNCATE: usize = 45;
 pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_CHDIR: usize = 49;
@@ -16,8 +20,8 @@ pub const SYSCALL_PIPE: usize = 59;
 pub const SYSCALL_GETDENTS64: usize = 61;
 pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
+pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
-pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_SLEEP: usize = 101;
@@ -35,14 +39,23 @@ pub const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
 pub const SYSCALL_SCHED_GETPARAM: usize = 121;
 pub const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 pub const SYSCALL_SCHED_GETAFFINITY: usize = 123;
+pub const SYSCALL_GETPGID: usize = 154;
+pub const SYSCALL_SETPGID: usize = 155;
+pub const SYSCALL_GETSID: usize = 156;
+pub const SYSCALL_SETSID: usize = 157;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 pub const SYSCALL_GETPID: usize = 172;
+pub const SYSCALL_SHMGET: usize = 194;
+pub const SYSCALL_SHMCTL: usize = 195;
+pub const SYSCALL_SHMAT: usize = 196;
+pub const SYSCALL_SHMDT: usize = 197;
 pub const SYSCALL_SOCKET: usize = 198;
 pub const SYSCALL_SOCKETPAIR: usize = 199;
 pub const SYSCALL_BIND: usize = 200;
 pub const SYSCALL_LISTEN: usize = 201;
 pub const SYSCALL_ACCEPT: usize = 202;
 pub const SYSCALL_CONNECT: usize = 203;
+pub const SYSCALL_ACCEPT4: usize = 242;
 pub const SYSCALL_GETSOCKNAME: usize = 204;
 pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
@@ -153,6 +166,27 @@ pub fn sys_linkat(
     )
 }
 
+pub fn sys_symlinkat(target: &str, new_dirfd: usize, linkpath: &str) -> isize {
+    syscall(
+        SYSCALL_SYMLINKAT,
+        [target.as_ptr() as usize, new_dirfd, linkpath.as_ptr() as usize],
+    )
+}
+
+pub fn sys_readlinkat(dirfd: usize, path: &str, buffer: &mut [u8]) -> isize {
+    syscall6(
+        SYSCALL_READLINKAT,
+        [
+            dirfd,
+            path.as_ptr() as usize,
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+            0,
+            0,
+        ],
+    )
+}
+
 pub fn sys_unlinkat(dirfd: usize, path: &str, flags: usize) -> isize {
     syscall(SYSCALL_UNLINKAT, [dirfd, path.as_ptr() as usize, flags])
 }
@@ -249,6 +283,22 @@ pub fn sys_getpid() -> isize {
     syscall(SYSCALL_GETPID, [0, 0, 0])
 }
 
+pub fn sys_getpgid(pid: isize) -> isize {
+    syscall(SYSCALL_GETPGID, [pid as usize, 0, 0])
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    syscall(SYSCALL_SETPGID, [pid as usize, pgid as usize, 0])
+}
+
+pub fn sys_getsid() -> isize {
+    syscall(SYSCALL_GETSID, [0, 0, 0])
+}
+
+pub fn sys_setsid() -> isize {
+    syscall(SYSCALL_SETSID, [0, 0, 0])
+}
+
 pub fn sys_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
     syscall(SYSCALL_SOCKET, [domain, socket_type, protocol])
 }
@@ -273,8 +323,17 @@ pub fn sys_listen(fd: usize, backlog: usize) -> isize {
     syscall(SYSCALL_LISTEN, [fd, backlog, 0])
 }
 
-pub fn sys_accept(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
-    syscall(SYSCALL_ACCEPT, [fd, addr as usize, addrlen])
+pub fn sys_accept(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: *mut i32) -> isize {
+    syscall(SYSCALL_ACCEPT, [fd, addr as usize, addrlen as usize])
+}
+
+pub fn sys_accept4(
+    fd: usize,
+    addr: *mut crate::net::SockAddrIn,
+    addrlen: *mut i32,
+    flags: usize,
+) -> isize {
+    syscall6(SYSCALL_ACCEPT4, [fd, addr as usize, addrlen as usize, flags, 0, 0])
 }
 
 pub fn sys_connect(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usize) -> isize {
@@ -327,6 +386,22 @@ pub fn sys_sendmsg(fd: usize, msg: *const crate::net::MsgHdr, flags: usize) -> i
 
 pub fn sys_recvmsg(fd: usize, msg: *mut crate::net::MsgHdr, flags: usize) -> isize {
     syscall(SYSCALL_RECVMSG, [fd, msg as usize, flags])
+}
+
+pub fn sys_shmget(key: i32, size: usize, flags: i32) -> isize {
+    syscall(SYSCALL_SHMGET, [key as usize, size, flags as usize])
+}
+
+pub fn sys_shmctl(shmid: usize, cmd: i32, buf: usize) -> isize {
+    syscall(SYSCALL_SHMCTL, [shmid, cmd as usize, buf])
+}
+
+pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
+    syscall(SYSCALL_SHMAT, [shmid, shmaddr, shmflg as usize])
+}
+
+pub fn sys_shmdt(shmaddr: usize) -> isize {
+    syscall(SYSCALL_SHMDT, [shmaddr, 0, 0])
 }
 
 /// Linux `clone` 系统调用封装。
@@ -525,5 +600,33 @@ pub fn sys_getdents64(fd: usize, buffer: &mut [u8]) -> isize {
     syscall(
         SYSCALL_GETDENTS64,
         [fd, buffer.as_mut_ptr() as usize, buffer.len()],
+    )
+}
+
+pub fn sys_statfs64(path: &str, buf: &mut super::StatFs64) -> isize {
+    syscall6(
+        SYSCALL_STATFS64,
+        [
+            path.as_ptr() as usize,
+            buf as *mut _ as usize,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_fstatfs64(fd: usize, buf: &mut super::StatFs64) -> isize {
+    syscall6(
+        SYSCALL_FSTATFS64,
+        [
+            fd,
+            buf as *mut _ as usize,
+            0,
+            0,
+            0,
+            0,
+        ],
     )
 }

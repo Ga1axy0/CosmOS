@@ -36,7 +36,9 @@ pub use easyfs::efs::EasyFileSystem;
 pub use fat32::Fat32FileSystem;
 pub use ext4::Ext4FileSystem;
 pub use dentry_cache::remove_dentry;
-pub use vfs::Inode;
+pub use vfs::{Inode, VfsStatFs, STATFS_MAGIC_EASYFS, STATFS_MAGIC_EXT4, STATFS_MAGIC_MSDOS,
+	STATFS_MAGIC_PIPEFS, STATFS_MAGIC_PROC, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT,
+	STATFS_NAMELEN_EASYFS};
 
 
 pub use block_cache::{get_block_cache, block_cache_sync_all};

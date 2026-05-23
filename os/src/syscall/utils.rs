@@ -18,6 +18,7 @@ pub trait Pod {}
 // i32 是 Linux ABI 中常见的简单写回类型，如 tid/status。
 impl Pod for i16 {}
 impl Pod for i32 {}
+impl Pod for i64 {}
 // u32/u64/usize 是若干 syscall 写回标量结果时使用的基础 ABI 类型。
 impl Pod for u32 {}
 impl Pod for u64 {}

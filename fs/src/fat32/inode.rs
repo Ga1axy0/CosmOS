@@ -2,10 +2,13 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 use spin::Mutex;
 
-use crate::{BLOCK_SZ, fat32::dir::DirAttr};
+use crate::{
+    BLOCK_SZ, STATFS_MAGIC_MSDOS, STATFS_NAMELEN_DEFAULT, VfsStatFs,
+    fat32::dir::DirAttr,
+};
 use crate::block_cache::get_block_cache;
 use crate::errno::FS_ERRNO;
-use crate::vfs::{VfsAttrs, VfsNode};
+use crate::vfs::{VfsAttrs, VfsFileType, VfsNode};
 
 use super::{Fat32FileSystem, dir, fat};
 
@@ -479,7 +482,7 @@ impl VfsNode for FatInode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         let inner = self.inner.lock();
         if !inner.is_dir {
             return Vec::new();
@@ -489,11 +492,14 @@ impl VfsNode for FatInode {
 
         self.iter_dir(dir_cluster)
             .into_iter()
-            .filter(|e| {
-                let name = e.name_string();
-                name != "." && name != ".."
+            .map(|e| {
+                let file_type = if e.sfn.is_dir() {
+                    VfsFileType::Directory
+                } else {
+                    VfsFileType::Regular
+                };
+                (e.name_string(), file_type)
             })
-            .map(|e| (e.name_string(), e.sfn.is_dir()))
             .collect()
     }
 
@@ -713,8 +719,12 @@ impl VfsNode for FatInode {
         Some(Arc::new(inode) as Arc<dyn VfsNode>)
     }
 
-    fn is_dir(&self) -> bool {
-        self.inner.lock().is_dir
+    fn file_type(&self) -> VfsFileType {
+        if self.inner.lock().is_dir {
+            VfsFileType::Directory
+        } else {
+            VfsFileType::Regular
+        }
     }
 
     fn stat_attrs(&self) -> VfsAttrs {
@@ -733,10 +743,35 @@ impl VfsNode for FatInode {
             ino,
             nlink: 1,
             size: inner.size as usize,
+            uid: None,
+            gid: None,
             atime: None,
             mtime: None,
             ctime: None,
         }
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        let bpb = self.fs.bpb();
+        let total_clusters = bpb.max_cluster.saturating_sub(1) as u64;
+        let free_clusters = fat::count_free_clusters(bpb, self.fs.device());
+        Ok(VfsStatFs {
+            f_type: STATFS_MAGIC_MSDOS,
+            f_bsize: bpb.cluster_size_bytes() as u64,
+            f_blocks: total_clusters,
+            f_bfree: free_clusters,
+            f_bavail: free_clusters,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [
+                (Arc::as_ptr(&self.fs) as usize as u32) as i32,
+                ((Arc::as_ptr(&self.fs) as usize as u64 >> 32) as u32) as i32,
+            ],
+            f_namelen: STATFS_NAMELEN_DEFAULT,
+            f_frsize: bpb.cluster_size_bytes() as u64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        })
     }
 
     fn clear(&self) {

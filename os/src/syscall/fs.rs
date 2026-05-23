@@ -1,11 +1,12 @@
 use crate::fs::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, AccessMode, File,
-    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Pipe, Stat, StatMode, canonicalize, do_umount,
-    inode_stat, linkat, lookup_inode, make_pipe, mkdir_at, mount_device, truncate_inode,
-    rename_at,
-    open_file_at, unlinkat,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
+    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, rename_at,
+    sync_page_cache_all, sync_page_cache_fs, truncate_inode,
+    open_file_at_with_status, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
+use crate::fs::Pipe;
 use crate::net::UnixSocketPairEnd;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
@@ -76,6 +77,7 @@ const PPOLL_FALLBACK_POLL_MS: usize = 10;
 /// 单次 `ppoll`/`poll` 调用允许的最大 fd 数量上限，用于防止恶意的大规模分配。
 const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
+const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -633,6 +635,17 @@ fn get_writable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     Ok(desc)
 }
 
+fn get_any_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    inner
+        .fd_table
+        .get(fd)
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| entry.desc.clone())
+        .ok_or(ERRNO::EBADF)
+}
+
 /// 校验 fd 并返回可读打开文件描述。
 fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let desc = get_file_description(fd)?;
@@ -640,6 +653,92 @@ fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
         return Err(ERRNO::EACCES);
     }
     Ok(desc)
+}
+
+fn parse_pos64(pos: i64) -> Result<usize, ERRNO> {
+    if pos < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    usize::try_from(pos).map_err(|_| ERRNO::EINVAL)
+}
+
+fn parse_pos64_halves(pos_l: usize, pos_h: usize) -> Result<usize, ERRNO> {
+    let pos = ((pos_h as u64) << 32) | ((pos_l as u64) & 0xffff_ffff);
+    usize::try_from(pos).map_err(|_| ERRNO::EINVAL)
+}
+
+fn is_regular_file(desc: &Arc<FileDescription>) -> bool {
+    let mode = desc.stat().mode;
+    mode.bits() & StatMode::TYPE_MASK.bits() == StatMode::FILE.bits()
+}
+
+fn preadv_like(
+    desc: &Arc<FileDescription>,
+    iovecs: &[IoVec],
+    mut offset: usize,
+    access: PageFaultAccess,
+) -> Result<isize, ERRNO> {
+    if !desc.is_seekable() {
+        return Err(ERRNO::ESPIPE);
+    }
+
+    let mut total = 0usize;
+    for &iovec in iovecs {
+        if iovec.iov_len == 0 {
+            continue;
+        }
+        let user_buf = UserBuffer::new(translated_byte_buffer_with_access(
+            iovec.iov_base as *const u8,
+            iovec.iov_len,
+            access,
+        )?);
+        let read = desc.read_at(offset, user_buf);
+        total = total.checked_add(read).ok_or(ERRNO::EINVAL)?;
+        offset = offset.checked_add(read).ok_or(ERRNO::EINVAL)?;
+        if read < iovec.iov_len {
+            break;
+        }
+    }
+    Ok(total as isize)
+}
+
+fn pwritev_like(
+    desc: &Arc<FileDescription>,
+    iovecs: &[IoVec],
+    mut offset: usize,
+) -> Result<isize, ERRNO> {
+    if !desc.is_seekable() {
+        return Err(ERRNO::ESPIPE);
+    }
+
+    let mut total_limit = 0usize;
+    for &iovec in iovecs {
+        total_limit = total_limit
+            .checked_add(iovec.iov_len)
+            .ok_or(ERRNO::EINVAL)?;
+        if total_limit > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+    }
+
+    let mut completed = 0usize;
+    for &iovec in iovecs {
+        if iovec.iov_len == 0 {
+            continue;
+        }
+        let user_buf = UserBuffer::new(translated_byte_buffer_with_access(
+            iovec.iov_base as *const u8,
+            iovec.iov_len,
+            PageFaultAccess::Read,
+        )?);
+        let written = desc.write_at(offset, user_buf);
+        completed = completed.checked_add(written).ok_or(ERRNO::EINVAL)?;
+        offset = offset.checked_add(written).ok_or(ERRNO::EINVAL)?;
+        if written < iovec.iov_len {
+            return Ok(completed as isize);
+        }
+    }
+    Ok(completed as isize)
 }
 
 /// 解析 truncate 系统调用传入的目标长度。
@@ -759,7 +858,7 @@ fn resolve_at_target(dirfd: isize, path: &str, flags: i32) -> Result<ResolvedAtT
         }
         if dirfd == AT_FDCWD {
             let cwd = current_process().inner_exclusive_access().cwd.clone();
-            return lookup_inode(cwd.as_str()).ok_or(ERRNO::ENOENT).map(ResolvedAtTarget::Inode);
+            return lookup_inode_follow("/", cwd.as_str(), true).map(ResolvedAtTarget::Inode);
         }
         if dirfd < 0 {
             return Err(ERRNO::EBADF);
@@ -771,15 +870,15 @@ fn resolve_at_target(dirfd: isize, path: &str, flags: i32) -> Result<ResolvedAtT
         }
         // Fall back to path-based lookup if the description recorded an open path.
         if let Some(target_path) = desc.path() {
-            return lookup_inode(target_path.as_str()).ok_or(ERRNO::ENOENT).map(ResolvedAtTarget::Inode);
+            return lookup_inode_follow("/", target_path.as_str(), true).map(ResolvedAtTarget::Inode);
         }
         // Otherwise return the open description itself (e.g. pipe/tty).
         return Ok(ResolvedAtTarget::FileDesc(desc));
     }
 
     let cwd = resolve_dirfd_base(dirfd, path)?;
-    let abs_path = canonicalize(cwd.as_str(), path);
-    lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT).map(ResolvedAtTarget::Inode)
+    let follow_final = flags & AT_SYMLINK_NOFOLLOW as i32 == 0;
+    lookup_inode_follow(cwd.as_str(), path, follow_final).map(ResolvedAtTarget::Inode)
 }
 
 fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
@@ -807,6 +906,22 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     desc.path().ok_or(ERRNO::ENOTDIR)
 }
 
+fn resolve_chown_ids(inode: &Arc<fs::Inode>, uid: u32, gid: u32) -> Result<(u32, u32), ERRNO> {
+    if uid == UID_GID_NO_CHANGE && gid == UID_GID_NO_CHANGE {
+        return Ok((uid, gid));
+    }
+    let attrs = inode.stat_attrs();
+    let mut new_uid = uid;
+    let mut new_gid = gid;
+    if uid == UID_GID_NO_CHANGE {
+        new_uid = attrs.uid.or_else(|| inode.uid()).ok_or(ERRNO::EOPNOTSUPP)?;
+    }
+    if gid == UID_GID_NO_CHANGE {
+        new_gid = attrs.gid.or_else(|| inode.gid()).ok_or(ERRNO::EOPNOTSUPP)?;
+    }
+    Ok((new_uid, new_gid))
+}
+
 const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
@@ -821,6 +936,7 @@ const R_OK: i32 = 4;
 
 const UTIME_NOW: usize = 0x3fff_ffff;
 const UTIME_OMIT: usize = 0x3fff_fffe;
+const UID_GID_NO_CHANGE: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 enum UtimeArg {
@@ -886,7 +1002,7 @@ fn parse_setfl_status(arg: usize) -> Result<FileStatusFlags, ERRNO> {
     let arg = i32::try_from(arg).map_err(|_| ERRNO::EINVAL)?;
     let mutable_mask = FileStatusFlags::APPEND.bits() | FileStatusFlags::NONBLOCK.bits();
     let ignored_mask =
-        0x3 | OpenFlags::CREATE.bits() | OpenFlags::TRUNC.bits() | OpenFlags::DIRECTORY.bits() | 0x100 | 0x8000;
+        0x3 | OpenFlags::CREATE.bits() | OpenFlags::TRUNC.bits() | OpenFlags::DIRECTORY.bits() | OpenFlags::NOFOLLOW.bits() | 0x100 | 0x8000;
     if arg & !(mutable_mask | ignored_mask) != 0 {
         // TODO: 后续若补齐 `O_ASYNC/O_DIRECT/O_NOATIME` 等位，应在这里扩展掩码。
         warn!(
@@ -998,6 +1114,130 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     })
 }
 
+/// pread64 syscall：从固定偏移读取，不推进共享文件偏移。
+pub fn sys_pread64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pread64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let fd = fd as usize;
+        let desc = get_readable_file(fd)?;
+        let offset = parse_pos64(pos)?;
+        if !desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        Ok(desc.read_at(
+            offset,
+            UserBuffer::new(translated_byte_buffer_with_access(
+                buf,
+                len,
+                PageFaultAccess::Write,
+            )?),
+        ) as isize)
+    })
+}
+
+/// pwrite64 syscall：向固定偏移写入，不推进共享文件偏移。
+pub fn sys_pwrite64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pwrite64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let fd = fd as usize;
+        let desc = get_writable_file(fd)?;
+        let offset = parse_pos64(pos)?;
+        if !desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        Ok(desc.write_at(
+            offset,
+            UserBuffer::new(translated_byte_buffer_with_access(
+                buf,
+                len,
+                PageFaultAccess::Read,
+            )?),
+        ) as isize)
+    })
+}
+
+/// sendfile64 syscall：从普通文件搬运数据到另一个 fd，避免用户态中转。
+pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sendfile64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if out_fd < 0 || in_fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        if count > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let out_desc = get_writable_file(out_fd as usize)?;
+        let in_desc = get_readable_file(in_fd as usize)?;
+
+        if out_desc.status_flags().contains(FileStatusFlags::APPEND) {
+            return Err(ERRNO::EINVAL);
+        }
+        if !in_desc.is_seekable() || !is_regular_file(&in_desc) {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let mut in_pos = if offset.is_null() {
+            usize::try_from(in_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?
+        } else {
+            parse_pos64(read_pod_from_user(offset as *const i64)?)?
+        };
+
+        let chunk_len = count.min(SENDFILE_CHUNK_SIZE);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(chunk_len).map_err(|_| ERRNO::ENOMEM)?;
+        buf.resize(chunk_len, 0);
+
+        let mut copied = 0usize;
+        let result: Result<isize, ERRNO> = (|| {
+            while copied < count {
+                let want = (count - copied).min(buf.len());
+                let read = match in_desc.read_bytes_at(in_pos, &mut buf[..want]) {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if read == 0 {
+                    break;
+                }
+
+                let written = match out_desc.write_bytes(&buf[..read]) {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if written == 0 {
+                    break;
+                }
+
+                in_pos = in_pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                copied = copied.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if written < read {
+                    break;
+                }
+            }
+            Ok(copied as isize)
+        })();
+
+        if offset.is_null() {
+            in_desc.seek(in_pos as i64, 0)?;
+        } else {
+            write_pod_to_user(offset, &(in_pos as i64))?;
+        }
+
+        result
+    })
+}
+
 /// readv syscall：按 `iovec` 顺序将多个用户缓冲区从同一个 fd 读出。
 pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
     trace!(
@@ -1078,6 +1318,36 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
     })
 }
 
+/// preadv syscall：从固定偏移按 `iovec` 顺序读取，不推进共享文件偏移。
+pub fn sys_preadv(fd: usize, iov: *const IoVec, iovcnt: i32, pos_l: usize, pos_h: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_preadv",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let desc = get_readable_file(fd)?;
+        let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
+        let offset = parse_pos64_halves(pos_l, pos_h)?;
+        preadv_like(&desc, &iovecs, offset, PageFaultAccess::Write)
+    })
+}
+
+/// pwritev syscall：向固定偏移按 `iovec` 顺序写入，不推进共享文件偏移。
+pub fn sys_pwritev(fd: usize, iov: *const IoVec, iovcnt: i32, pos_l: usize, pos_h: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pwritev",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let desc = get_writable_file(fd)?;
+        let iovecs = copy_user_iovecs(token, iov, iovcnt)?;
+        let offset = parse_pos64_halves(pos_l, pos_h)?;
+        pwritev_like(&desc, &iovecs, offset)
+    })
+}
+
 /// read syscall
 pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     trace!(
@@ -1120,13 +1390,13 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
         let desc = get_file_description(fd)?;
         // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。
         // TODO: tty 实现 `TCGETS/TIOCGWINSZ` 后，这里会开始承载真实终端控制语义。
-        debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
+        // debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
         desc.ioctl(req, arg)
     })
 }
 
 /// open sysall
-pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize {
+pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_open",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -1151,11 +1421,22 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, _mode: u32) -> isize 
             FdFlags::empty()
         };
         let open_state = filter_open_flags(flags & !O_CLOEXEC)?;
-        let inode = open_file_at(
+        let (inode, created) = open_file_at_with_status(
             cwd.as_str(),
             path.as_str(),
             open_state.open_flags,
         )?;
+        if created {
+            // POSIX: mode 仅在“新建”时生效，并受进程 umask 过滤。
+            let requested = mode & StatMode::PERM_MASK.bits();
+            let umask = process.umask();
+            let effective = requested & !umask;
+            let old_mode = inode.stat().mode.bits();
+            let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (effective & StatMode::PERM_MASK.bits());
+            if let Some(backing_inode) = inode.as_inode() {
+                backing_inode.set_mode(new_mode)?;
+            }
+        }
         if open_state.open_flags.contains(OpenFlags::DIRECTORY) && !inode.is_dir() {
             return Err(ERRNO::ENOTDIR);
         }
@@ -1256,6 +1537,41 @@ pub fn sys_close(fd: u32) -> isize {
     };
     drop(closed_entry);
     0
+}
+
+/// sync syscall
+pub fn sys_sync() -> isize {
+    syscall_body!({
+        sync_page_cache_all()?;
+        Ok(0)
+    })
+}
+
+/// fsync syscall
+pub fn sys_fsync(fd: u32) -> isize {
+    syscall_body!({
+        let file = get_any_file(fd as usize)?;
+        file.sync()?;
+        Ok(0)
+    })
+}
+
+/// fdatasync syscall
+pub fn sys_fdatasync(fd: u32) -> isize {
+    syscall_body!({
+        sync_page_cache_all()?;
+        Ok(0)
+    })
+}
+
+/// syncfs syscall
+pub fn sys_syncfs(fd: u32) -> isize {
+    syscall_body!({
+        let file = get_any_file(fd as usize)?;
+        let inode = file.backing_inode().ok_or(ERRNO::EINVAL)?;
+        sync_page_cache_fs(inode.fs_id())?;
+        Ok(0)
+    })
 }
 
 /// pipe syscall
@@ -1388,12 +1704,6 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         if flags & !supported_flags != 0 {
             return Err(ERRNO::EINVAL);
         }
-        if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            // TODO: 当前 VFS 尚未实现 symlink，暂时按普通路径 stat 处理。
-            // warn!(
-            //     "sys_newfstatat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to stat target path"
-            // );
-        }
         if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(ERRNO::ENOENT);
@@ -1415,9 +1725,8 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         }
 let time1 = get_time_us();
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
 let time2 = get_time_us();
-        let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), flags & AT_SYMLINK_NOFOLLOW == 0)?;
 let time3 = get_time_us();
         let stat = inode_stat(&inode);
 let time4 = get_time_us();
@@ -1447,8 +1756,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         }
 
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
-        let inode = lookup_inode(abs_path.as_str()).ok_or(ERRNO::ENOENT)?;
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
         if mode == F_OK {
             return Ok(0);
         }
@@ -1478,7 +1786,7 @@ pub fn sys_linkat(
     );
     let token = current_user_token();
     syscall_body!({
-        if flags != 0 {
+        if flags & !AT_SYMLINK_FOLLOW != 0 {
             return Err(ERRNO::EINVAL);
         }
         let old_path = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
@@ -1491,8 +1799,55 @@ pub fn sys_linkat(
         }
         let old_cwd = resolve_dirfd_base(old_dirfd, old_path.as_str())?;
         let new_cwd = resolve_dirfd_base(new_dirfd, new_path.as_str())?;
-        linkat(old_cwd.as_str(), &old_path, new_cwd.as_str(), &new_path)?;
+        linkat_with_flags(old_cwd.as_str(), &old_path, new_cwd.as_str(), &new_path, flags)?;
         Ok(0)
+    })
+}
+
+/// symlinkat syscall
+pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_symlinkat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let target = translated_str(token, target).or_errno(ERRNO::EFAULT)?;
+        let linkpath = translated_str(token, linkpath).or_errno(ERRNO::EFAULT)?;
+        if target.is_empty() || linkpath.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let cwd = resolve_dirfd_base(new_dirfd, linkpath.as_str())?;
+        symlinkat(target.as_str(), cwd.as_str(), linkpath.as_str())?;
+        Ok(0)
+    })
+}
+
+/// readlinkat syscall
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_readlinkat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        if bufsiz == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), false)?;
+        if !inode.is_symlink() {
+            return Err(ERRNO::EINVAL);
+        }
+        let target = inode.read_link()?;
+        let bytes = target.as_bytes();
+        let n = bytes.len().min(bufsiz);
+        write_bytes_to_user(buf, &bytes[..n])?;
+        Ok(n as isize)
     })
 }
 
@@ -1549,9 +1904,9 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
 
 /// mkdirat – create a directory at `path` relative to the provided directory fd.
 ///
-/// `mode` is accepted but not enforced.
+/// `mode` 仅在创建时使用，并受进程 `umask` 过滤。
 /// Returns 0 on success, −errno on failure.
-pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_mkdirat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -1563,7 +1918,13 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
             return Err(ERRNO::ENOENT);
         }
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        mkdir_at(cwd.as_str(), path.as_str())?;
+        let dir_inode = mkdir_at_with_inode(cwd.as_str(), path.as_str())?;
+        let requested = mode & StatMode::PERM_MASK.bits();
+        let umask = current_process().umask();
+        let effective = requested & !umask;
+        let old_mode = inode_stat(&dir_inode).mode.bits();
+        let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (effective & StatMode::PERM_MASK.bits());
+        dir_inode.set_mode(new_mode)?;
         Ok(0)
     })
 }
@@ -1584,8 +1945,10 @@ pub fn sys_chdir(path: *const u8) -> isize {
         let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
         let cwd = process.inner_exclusive_access().cwd.clone();
         let new_abs = canonicalize(cwd.as_str(), path.as_str());
-        let inode = lookup_inode(new_abs.as_str()).or_errno(ERRNO::ENOENT)?;
+        let inode = lookup_inode_follow("/", new_abs.as_str(), true)?;
         if !inode.is_dir() {
+            warn!("sys_chdir: target '{}' resolved to '{}', which is not a directory",
+                path, new_abs);
             return Err(ERRNO::ENOTDIR);
         }
         process.inner_exclusive_access().cwd = new_abs;
@@ -1641,20 +2004,24 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         if flags & !supported_flags != 0 {
             return Err(ERRNO::EINVAL);
         }
-        if flags & AT_SYMLINK_NOFOLLOW as i32 != 0 {
-            // TODO: 当前 VFS 尚未实现 symlink，先按普通路径处理。
-            // warn!(
-            //     "sys_utimensat: AT_SYMLINK_NOFOLLOW is not implemented, fallback to normal path"
-            // );
-        }
-
-        let path = if path.is_null() && (flags & AT_EMPTY_PATH as i32 != 0) { 
+        // `futimens(2)` is commonly implemented via `utimensat(fd, NULL, ...)`.
+        // Treat that specific shape as an empty-path operation on `dirfd`.
+        let futimens_null_path = path.is_null() && dirfd != AT_FDCWD && (flags & AT_EMPTY_PATH as i32 == 0);
+        let effective_flags = if futimens_null_path {
+            flags | AT_EMPTY_PATH as i32
+        } else {
+            flags
+        };
+        let path = if path.is_null() && (effective_flags & AT_EMPTY_PATH as i32 != 0) {
             String::new()
         } else {
             translated_str(token, path).or_errno(ERRNO::EFAULT)?
         };
-        debug!("sys_utimensat: dirfd = {}, path = {}, flags = {}", dirfd, path, flags);
-        let target = resolve_at_target(dirfd, path.as_str(), flags)?;
+        debug!(
+            "sys_utimensat: dirfd = {}, path = {}, flags = {}, effective_flags = {}",
+            dirfd, path, flags, effective_flags
+        );
+        let target = resolve_at_target(dirfd, path.as_str(), effective_flags)?;
         let inode = match target {
             ResolvedAtTarget::Inode(i) => i,
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
@@ -1690,10 +2057,10 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
     })
 }
 
-/// fchmod(fd, mode) — change permissions of the file referred to by `fd`.
-pub fn sys_fchmod(fd: u32, mode: u32) -> isize {
+/// fchown(fd, user, group) — change ownership of the file referred to by `fd`.
+pub fn sys_fchown(fd: u32, user: u32, group: u32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fchmod",
+        "kernel:pid[{}] sys_fchown",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
@@ -1703,17 +2070,20 @@ pub fn sys_fchmod(fd: u32, mode: u32) -> isize {
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
         };
 
-        let old_mode = inode.mode().unwrap_or(if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() });
-        let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
-        inode.set_mode(new_mode)?;
+        if user == UID_GID_NO_CHANGE && group == UID_GID_NO_CHANGE {
+            return Ok(0);
+        }
+
+        let (uid, gid) = resolve_chown_ids(&inode, user, group)?;
+        inode.set_owner(uid, gid)?;
         Ok(0)
     })
 }
 
-/// fchmodat(dirfd, pathname, mode, flags) — change permissions of a path-relative target.
-pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) -> isize {
+/// fchownat(dirfd, pathname, user, group, flags) — change ownership of a path-relative target.
+pub fn sys_fchownat(dirfd: isize, pathname: *const u8, user: u32, group: u32, flags: i32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fchmodat",
+        "kernel:pid[{}] sys_fchownat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
@@ -1735,9 +2105,60 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32, flags: i32) ->
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
         };
 
-        let old_mode = inode.mode().unwrap_or(if inode.is_dir() { StatMode::DIR.bits() } else { StatMode::FILE.bits() });
+        if user == UID_GID_NO_CHANGE && group == UID_GID_NO_CHANGE {
+            return Ok(0);
+        }
+
+        let (uid, gid) = resolve_chown_ids(&inode, user, group)?;
+        inode.set_owner(uid, gid)?;
+        Ok(0)
+    })
+}
+
+/// fchmod(fd, mode) — change permissions of the file referred to by `fd`.
+pub fn sys_fchmod(fd: u32, mode: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fchmod",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let target = resolve_at_target(fd as isize, "", AT_EMPTY_PATH as i32)?;
+        let inode = match target {
+            ResolvedAtTarget::Inode(i) => i,
+            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
+        };
+
+        let old_mode = inode_stat(&inode).mode.bits();
         let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
         inode.set_mode(new_mode)?;
+        Ok(0)
+    })
+}
+
+/// fchmodat(dirfd, pathname, mode, flags) — change permissions of a path-relative target.
+pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fchmodat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    debug!("sys_fchmodat: dirfd = {}, pathname = {:?}, mode = {:#o}", dirfd, pathname, mode);
+    let token = current_user_token();
+    syscall_body!({
+        let path = translated_str(token, pathname).or_errno(ERRNO::EFAULT)?;
+        if path.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+
+        let target = resolve_at_target(dirfd, path.as_str(), 0)?;
+        let inode = match target {
+            ResolvedAtTarget::Inode(i) => i,
+            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
+        };
+
+        let old_mode = inode_stat(&inode).mode.bits();
+        let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
+        inode.set_mode(new_mode)?;
+        debug!("sys_fchmodat: ok");
         Ok(0)
     })
 }
@@ -1920,6 +2341,46 @@ pub fn sys_renameat2(
         let old_cwd = resolve_dirfd_base(old_dirfd, old_name.as_str())?;
         let new_cwd = resolve_dirfd_base(new_dirfd, new_name.as_str())?;
         rename_at(old_cwd.as_str(), &old_name, new_cwd.as_str(), &new_name)?;
+        Ok(0)
+    })
+}
+
+/// `statfs64(2)` syscall: get filesystem statistics by path.
+pub fn sys_statfs64(path: *const u8, buf: *mut u8) -> isize {
+    trace!("kernel:pid[{}] sys_statfs64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let token = current_user_token();
+    syscall_body!({
+        let path_str = translated_str(token, path).ok_or(ERRNO::EFAULT)?;
+        let cwd = resolve_dirfd_base(AT_FDCWD, path_str.as_str())?;
+        debug!("sys_statfs64: cwd = '{}', path = '{}'", cwd, path_str);
+        let inode = lookup_inode_follow(cwd.as_str(), path_str.as_str(), true)?;
+        let stat = inode.statfs()?;
+        let buf_ptr = buf as *mut StatFs64;
+        write_pod_to_user(buf_ptr, &stat)?;
+        Ok(0)
+    })
+}
+
+/// `fstatfs64(2)` syscall: get filesystem statistics by file descriptor.
+pub fn sys_fstatfs64(fd: u32, buf: *mut u8) -> isize {
+    trace!("kernel:pid[{}] sys_fstatfs64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let fd = fd as usize;
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let file = inner
+            .fd_table
+            .get(fd)
+            .and_then(|f| f.as_ref())
+            .ok_or(ERRNO::EBADF)?;
+        let stat = file.desc.statfs()?;
+        drop(inner);
+        let buf_ptr = buf as *mut StatFs64;
+        write_pod_to_user(buf_ptr, &stat)?;
         Ok(0)
     })
 }

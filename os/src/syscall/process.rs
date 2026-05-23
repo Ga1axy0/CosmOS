@@ -1,3 +1,4 @@
+use crate::mm::{MapPermission, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
@@ -5,14 +6,15 @@ use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
+    ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
-        add_signal_to_process, current_process, current_task, current_user_token,
-        exit_current_and_run_next, ExitReason, SignalBit, WaitReason,
-        current_trap_cx,
+        add_signal_to_process, current_process, current_task, current_trap_cx,
+        current_user_token, exit_current_and_run_next, ExitReason, ShmAttachment, SignalBit,
+        WaitReason,
     },
 };
-use crate::sched::{add_task, pid2process, remove_from_pid2process};
+use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 /// `execve` 在解析脚本后得到的最终执行目标。
@@ -21,6 +23,8 @@ struct ResolvedExecImage {
     elf_data: Vec<u8>,
     /// 按 shebang 规则重写后的参数列表。
     argv: Vec<String>,
+    /// 最终执行映像的绝对路径。
+    exec_path: String,
 }
 
 /// shebang 首行解析结果。
@@ -108,6 +112,7 @@ fn resolve_exec_image(
         return Ok(ResolvedExecImage {
             elf_data: file_data,
             argv,
+            exec_path: abs_path,
         });
     }
 
@@ -205,16 +210,245 @@ pub fn sys_getegid() -> isize {
     process.getegid() as isize
 }
 
+/// umask syscall
+pub fn sys_umask(mask: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_umask",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let old = process.umask();
+        process.set_umask(mask as u32);
+        Ok(old as isize)
+    })
+}
+
+/// SysV `shmget`.
+pub fn sys_shmget(key: i32, size: usize, flag: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmget",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let shmid = ipc::shmget(key, size, flag)?;
+        Ok(shmid as isize)
+    })
+}
+
+/// SysV `shmat`.
+pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmat",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if shmflg != 0 {
+            return Err(ERRNO::ENOSYS);
+        }
+        let segment = ipc::attach_segment(shmid)?;
+        let (size, desc) = {
+            let seg = segment.lock();
+            (seg.size, Arc::clone(&seg.desc))
+        };
+        let process = current_process();
+        let map_addr = if shmaddr == 0 {
+            let len_aligned = size
+                .checked_add(crate::config::PAGE_SIZE - 1)
+                .ok_or(ERRNO::EOVERFLOW)?
+                & !(crate::config::PAGE_SIZE - 1);
+            let (chosen, chosen_end) = {
+                let mut inner = process.inner_exclusive_access();
+                inner.ensure_address_space_capacity(len_aligned)?;
+                let hint = inner.vm_layout.mmap_hint;
+                let base = inner.vm_layout.mmap_base;
+                let chosen = inner
+                    .memory_set
+                    .find_free_mmap_area(hint, base, len_aligned)
+                    .ok_or(ERRNO::ENOMEM)?;
+                let chosen_end = chosen.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
+                let mapped = inner.memory_set.mmap_file(
+                    crate::mm::VirtAddr::from(chosen),
+                    crate::mm::VirtAddr::from(chosen_end),
+                    crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+                    Arc::clone(&desc),
+                    0,
+                    true,
+                );
+                if !mapped {
+                    return Err(ERRNO::ENOMEM);
+                }
+                inner.vm_layout.mmap_hint = chosen_end;
+                (chosen, chosen_end)
+            };
+            if let Some(inode) = desc.backing_inode() {
+                crate::mm::register_file_mapping(&inode, &process);
+            }
+            let _ = chosen_end;
+            chosen
+        } else {
+            if !shmaddr.is_multiple_of(crate::config::PAGE_SIZE) {
+                ipc::detach_segment(shmid);
+                return Err(ERRNO::EINVAL);
+            }
+            let ok = process.mmap_file(
+                VirtAddr::from(shmaddr),
+                VirtAddr::from(shmaddr.checked_add(size).ok_or(ERRNO::EOVERFLOW)?),
+                MapPermission::R | MapPermission::W | MapPermission::U,
+                desc,
+                0,
+                true,
+            );
+            if !ok {
+                ipc::detach_segment(shmid);
+                return Err(ERRNO::ENOMEM);
+            }
+            shmaddr
+        };
+        process.add_shm_attachment(ShmAttachment {
+            shmid,
+            addr: map_addr,
+            size,
+        });
+        Ok(map_addr as isize)
+    })
+}
+
+/// SysV `shmdt`.
+pub fn sys_shmdt(shmaddr: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmdt",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        let attachment = process
+            .remove_shm_attachment_by_addr(shmaddr)
+            .ok_or(ERRNO::EINVAL)?;
+        if !process.munmap(
+            crate::mm::VirtAddr::from(attachment.addr),
+            crate::mm::VirtAddr::from(attachment.addr.checked_add(attachment.size).ok_or(ERRNO::EOVERFLOW)?),
+        ) {
+            process.add_shm_attachment(attachment);
+            return Err(ERRNO::EINVAL);
+        }
+        ipc::detach_segment(attachment.shmid);
+        Ok(0)
+    })
+}
+
+/// SysV `shmctl`.
+pub fn sys_shmctl(shmid: usize, cmd: i32, _buf: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_shmctl",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        match cmd {
+            IPC_RMID => {
+                ipc::mark_segment_for_removal(shmid)?;
+                Ok(0)
+            }
+            _ => Err(ERRNO::ENOSYS),
+        }
+    })
+}
+
 pub fn sys_getsid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getsid pid:{}", process.getpid());
     process.getsid() as isize
 }
 
+pub fn sys_getpgid(pid: isize) -> isize {
+    trace!("kernel: sys_getpgid pid:{}", current_process().getpid());
+    syscall_body!({
+        if pid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let process = if pid == 0 { current_process() } else {
+            pid2process(pid as usize).or_errno(ERRNO::ESRCH)?
+        };
+        Ok(process.getpgid() as isize)
+    })
+}
+
+pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
+    trace!("kernel: sys_setpgid pid:{}", current_process().getpid());
+    syscall_body!({
+        if pid < 0 || pgid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let current = current_process();
+        let current_pid = current.getpid();
+        let target = if pid == 0 { current.clone() } else {
+            pid2process(pid as usize).or_errno(ERRNO::ESRCH)?
+        };
+        let target_pid = target.getpid();
+
+        if target_pid != current_pid {
+            let parent_pid = target
+                .inner_exclusive_access()
+                .parent
+                .clone()
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid());
+            if parent_pid != Some(current_pid) {
+                return Err(ERRNO::EPERM);
+            }
+        }
+
+        let target_sid = target.getsid();
+        if target_sid != current.getsid() {
+            return Err(ERRNO::EPERM);
+        }
+
+        if target_pid as u32 == target_sid {
+            return Err(ERRNO::EPERM);
+        }
+
+        let new_pgid = if pgid == 0 {
+            target_pid
+        } else {
+            pgid as usize
+        };
+        if new_pgid > u32::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+
+        if new_pgid != target_pid {
+            let mut found = false;
+            for pid in list_pids() {
+                if let Some(process) = pid2process(pid) {
+                    if process.getsid() == target_sid && process.getpgid() as usize == new_pgid {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                return Err(ERRNO::EINVAL);
+            }
+        }
+
+        target.setpgid(new_pgid as u32);
+        Ok(0)
+    })
+}
+
 pub fn sys_setsid() -> isize {
     trace!("kernel: sys_setsid pid:{}", current_process().getpid());
-    warn!("kernel: sys_setsid is not fully implemented, just return new sid 1");
-    1
+    syscall_body!({
+        let process = current_process();
+        let pid = process.getpid() as u32;
+        if process.getpgid() == pid {
+            return Err(ERRNO::EPERM);
+        }
+        process.setsid(pid);
+        process.setpgid(pid);
+        Ok(pid as isize)
+    })
 }
 
 /// `clone` 支持的退出信号：当前仅实现 basic 测试需要的 SIGCHLD。
@@ -327,32 +561,17 @@ pub fn sys_clone(
         return -(ERRNO::EFAULT as isize);
     }
     let mut parent_set_tid = None;
+    let mut child_set_tid = None;
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         if parent_tid == 0 {
             warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
             return -(ERRNO::EFAULT as isize);
         }
-        if translated_byte_buffer_with_access(
-            parent_tid as *const u8,
-            core::mem::size_of::<i32>(),
-            PageFaultAccess::Write,
-        ).is_err() {
-            return -(ERRNO::EFAULT as isize);
-        }
         parent_set_tid = Some(parent_tid);
     }
-    let mut child_set_tid = None;
     if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
         if child_tid == 0 {
             warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
-            return -(ERRNO::EFAULT as isize);
-        }
-        // 子地址空间由父地址空间复制而来，创建前先确认该地址在父进程中可写。
-        if translated_byte_buffer_with_access(
-            child_tid as *const u8,
-            core::mem::size_of::<i32>(),
-            PageFaultAccess::Write,
-        ).is_err() {
             return -(ERRNO::EFAULT as isize);
         }
         child_set_tid = Some(child_tid);
@@ -462,8 +681,12 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         debug!(" ------------------- Resolve -----------------------");
         let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
         debug!(" ------------------- End Resolve -----------------------");
-        let ResolvedExecImage { elf_data, argv } = resolved;
-        process.exec(elf_data.as_slice(), argv)?;
+        let ResolvedExecImage {
+            elf_data,
+            argv,
+            exec_path,
+        } = resolved;
+        process.exec(elf_data.as_slice(), argv, exec_path)?;
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
         Ok(0)
@@ -647,7 +870,10 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
         let parent = current_process();
         let all_data = app_inode.read_all();
-        let child = parent.spawn(all_data.as_slice()).or_errno(ERRNO::ENOEXEC)?;
+        let exec_path = canonicalize("/", path.as_str());
+        let child = parent
+            .spawn(all_data.as_slice(), exec_path)
+            .or_errno(ERRNO::ENOEXEC)?;
         Ok(child.getpid() as isize)
     })
 }
