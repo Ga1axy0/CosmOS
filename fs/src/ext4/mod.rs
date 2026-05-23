@@ -146,7 +146,34 @@ impl Ext4Inode {
         }
     }
 
-    /// 查询目录项元数据，返回 `(inode 编号, 是否目录)`。
+    fn inode_file_type(ext4: &Ext4, inode_num: u32) -> VfsFileType {
+        let inode_ref = ext4.get_inode_ref(inode_num);
+        match inode_ref.inode.file_type() {
+            InodeFileType::S_IFDIR => VfsFileType::Directory,
+            InodeFileType::S_IFLNK => VfsFileType::Symlink,
+            InodeFileType::S_IFCHR => VfsFileType::Char,
+            InodeFileType::S_IFBLK => VfsFileType::Block,
+            InodeFileType::S_IFIFO => VfsFileType::Fifo,
+            InodeFileType::S_IFSOCK => VfsFileType::Socket,
+            InodeFileType::S_IFREG => VfsFileType::Regular,
+            _ => VfsFileType::Unknown,
+        }
+    }
+
+    fn dirent_file_type(de_type: u8) -> VfsFileType {
+        match de_type {
+            2 => VfsFileType::Directory,
+            7 => VfsFileType::Symlink,
+            3 => VfsFileType::Char,
+            4 => VfsFileType::Block,
+            5 => VfsFileType::Fifo,
+            6 => VfsFileType::Socket,
+            1 => VfsFileType::Regular,
+            _ => VfsFileType::Unknown,
+        }
+    }
+
+    /// 查询目录项元数据，返回 `(inode 编号, 文件类型)`。
     fn lookup_child_meta(&self, name: &str) -> Option<(u32, VfsFileType)> {
         if self.file_type != VfsFileType::Directory {
             return None;
@@ -156,11 +183,10 @@ impl Ext4Inode {
             .into_iter()
             .find(|de| de.get_name() == name)
             .map(|de| {
-                let file_type = match de.get_de_type() {
-                    2 => VfsFileType::Directory,
-                    7 => VfsFileType::Symlink,
-                    _ => VfsFileType::Regular,
-                };
+                // Trust the inode's mode bits over the directory entry type.
+                // A stale/corrupt d_type can otherwise turn a non-directory inode
+                // into a cached "directory" and later panic inside ext4 dir helpers.
+                let file_type = Self::inode_file_type(&ext4, de.inode);
                 (de.inode, file_type)
             })
     }
@@ -297,10 +323,12 @@ impl VfsNode for Ext4Inode {
             .ext4_dir_get_entries(self.inode_num)
             .into_iter()
             .map(|de| {
-                let file_type = match de.get_de_type() {
-                    2 => VfsFileType::Directory,
-                    7 => VfsFileType::Symlink,
-                    _ => VfsFileType::Regular,
+                let disk_type = Self::inode_file_type(&ext4, de.inode);
+                let dirent_type = Self::dirent_file_type(de.get_de_type());
+                let file_type = if disk_type == VfsFileType::Unknown {
+                    dirent_type
+                } else {
+                    disk_type
                 };
                 (de.get_name(), file_type)
             })
@@ -557,6 +585,10 @@ impl VfsNode for Ext4Inode {
 
     fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
         if self.file_type != VfsFileType::Directory {
+            return Err(FS_ERRNO::ENOTDIR);
+        }
+        let (_, child_type) = self.lookup_child_meta(name).ok_or(FS_ERRNO::ENOENT)?;
+        if child_type != VfsFileType::Directory {
             return Err(FS_ERRNO::ENOTDIR);
         }
         let ext4 = self.fs.ext4.lock();
