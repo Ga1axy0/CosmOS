@@ -39,6 +39,7 @@ bitflags! {
     pub struct MMapFlags: usize {
         const MAP_SHARED = 0x1;
         const MAP_PRIVATE = 0x2;
+        const MAP_FIXED = 0x10;
         const MAP_ANONYMOUS = 0x20;
     }
     pub struct MMapProt: usize {
@@ -195,6 +196,11 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             );
             chosen
         } else {
+            if MMapFlags::from_bits_truncate(flags).contains(MMapFlags::MAP_FIXED) {
+                // glibc's dynamic loader maps a DSO, then MAP_FIXED-remaps
+                // writable subranges over the first mapping.
+                let _ = process.munmap(VirtAddr::from(addr), VirtAddr::from(end));
+            }
             let mapped = if let Some(file) = file_desc.as_ref() {
                 process.mmap_file(
                     VirtAddr::from(addr),

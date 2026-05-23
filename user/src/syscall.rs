@@ -340,12 +340,12 @@ pub fn sys_connect(fd: usize, addr: *const crate::net::SockAddrIn, addrlen: usiz
     syscall(SYSCALL_CONNECT, [fd, addr as usize, addrlen])
 }
 
-pub fn sys_getsockname(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
-    syscall(SYSCALL_GETSOCKNAME, [fd, addr as usize, addrlen])
+pub fn sys_getsockname(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: *mut i32) -> isize {
+    syscall(SYSCALL_GETSOCKNAME, [fd, addr as usize, addrlen as usize])
 }
 
-pub fn sys_getpeername(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: usize) -> isize {
-    syscall(SYSCALL_GETPEERNAME, [fd, addr as usize, addrlen])
+pub fn sys_getpeername(fd: usize, addr: *mut crate::net::SockAddrIn, addrlen: *mut i32) -> isize {
+    syscall(SYSCALL_GETPEERNAME, [fd, addr as usize, addrlen as usize])
 }
 
 pub fn sys_sendto(
@@ -368,11 +368,11 @@ pub fn sys_recvfrom(
     len: usize,
     flags: usize,
     addr: *mut crate::net::SockAddrIn,
-    addrlen: usize,
+    addrlen: *mut i32,
 ) -> isize {
     syscall6(
         SYSCALL_RECVFROM,
-        [fd, buf as usize, len, flags, addr as usize, addrlen],
+        [fd, buf as usize, len, flags, addr as usize, addrlen as usize],
     )
 }
 

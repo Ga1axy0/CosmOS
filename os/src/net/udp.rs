@@ -282,14 +282,15 @@ impl File for UdpSocketFile {
         true
     }
 
-    fn read_at(&self, _offset: usize, mut buf: UserBuffer) -> usize {
+    fn read_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.read_at_result(_offset, buf).unwrap_or(0)
+    }
+
+    fn read_at_result(&self, _offset: usize, mut buf: UserBuffer) -> Result<usize, ERRNO> {
         if buf.len() == 0 {
-            return 0;
+            return Ok(0);
         }
-        let Ok((n, _)) = self.recv_from_user_buffer(&mut buf) else {
-            return 0;
-        };
-        n
+        self.recv_from_user_buffer(&mut buf).map(|(n, _)| n)
     }
 
     fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
@@ -315,10 +316,14 @@ impl File for UdpSocketFile {
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.write_at_result(_offset, buf).unwrap_or(0)
+    }
+
+    fn write_at_result(&self, _offset: usize, buf: UserBuffer) -> Result<usize, ERRNO> {
         if buf.len() == 0 {
-            return 0;
+            return Ok(0);
         }
-        self.send_user_buffer(&buf).unwrap_or(0)
+        self.send_user_buffer(&buf)
     }
 
     fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
