@@ -6,7 +6,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::fs::{
     make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
 };
-use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
+use crate::mm::{translated_ref, translated_refmut, PageFaultAccess, UserBuffer};
 use crate::net::{
     SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file, create_udp_socket_file
 };
@@ -435,6 +435,82 @@ fn write_getsockopt_i32(token: usize, optval: *mut u8, optlen: *mut i32, v: i32)
     write_getsockopt_value(token, optval, optlen, &v.to_ne_bytes())
 }
 
+fn accept_common(
+    fd: i32,
+    addr: *mut SockAddrIn,
+    addrlen: *mut i32,
+    flags: i32,
+) -> Result<isize, ERRNO> {
+    let supported_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
+    if flags & !supported_flags != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let fd = fd as usize;
+    let (accepted, peer) = match socket_kind(fd)? {
+        SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.accept())?,
+        SocketKind::Udp | SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+    };
+
+    let status_flags = if (flags & SOCK_NONBLOCK) != 0 {
+        FileStatusFlags::NONBLOCK
+    } else {
+        FileStatusFlags::empty()
+    };
+    let cloexec = (flags & SOCK_CLOEXEC) != 0;
+
+    let accepted_file: Arc<dyn File + Send + Sync> = accepted;
+    let accepted_desc = Arc::new(FileDescription::new(
+        accepted_file,
+        AccessMode::ReadWrite,
+        status_flags,
+        0,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let new_fd = inner.alloc_fd()?;
+    let mut entry = FdEntry::new(accepted_desc);
+    if cloexec {
+        entry.flags |= FdFlags::CLOEXEC;
+    }
+    inner.fd_table[new_fd] = Some(entry);
+    drop(inner);
+
+    if !addr.is_null() {
+        if addrlen.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let token = current_user_token();
+        let user_addrlen = translated_refmut(token, addrlen).or_errno(ERRNO::EFAULT)?;
+        if *user_addrlen < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let actual_len = size_of::<SockAddrIn>() as i32;
+        let copy_len = (*user_addrlen as usize).min(size_of::<SockAddrIn>());
+        if copy_len > 0 {
+            let out = translated_refmut(token, addr).or_errno(ERRNO::EFAULT)?;
+            if let Some(ep) = peer {
+                if copy_len == size_of::<SockAddrIn>() {
+                    *out = endpoint_to_sockaddr(ep);
+                } else {
+                    let sockaddr = endpoint_to_sockaddr(ep);
+                    let src = unsafe {
+                        core::slice::from_raw_parts(
+                            (&sockaddr as *const SockAddrIn) as *const u8,
+                            copy_len,
+                        )
+                    };
+                    write_bytes_to_user(addr as *mut u8, src)?;
+                }
+            }
+        }
+        *user_addrlen = actual_len;
+    }
+
+    Ok(new_fd as isize)
+}
+
 pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
     syscall_body!({
         if domain != AF_INET as i32 {
@@ -590,35 +666,15 @@ pub fn sys_listen(fd: i32, backlog: i32) -> isize {
     })
 }
 
-pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: i32) -> isize {
+pub fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isize {
     syscall_body!({
-        let fd = fd as usize;
-        let (accepted, peer) = match socket_kind(fd)? {
-            SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.accept())?,
-            SocketKind::Udp | SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
-        };
+        accept_common(fd, addr, addrlen, 0)
+    })
+}
 
-        let accepted_file: Arc<dyn File + Send + Sync> = accepted;
-        let accepted_desc = Arc::new(FileDescription::new(
-            accepted_file,
-            AccessMode::ReadWrite,
-            FileStatusFlags::empty(),
-            0,
-        ));
-
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let new_fd = inner.alloc_fd()?;
-        inner.fd_table[new_fd] = Some(FdEntry::new(accepted_desc));
-        drop(inner);
-
-        if !addr.is_null() && (addrlen as usize) >= core::mem::size_of::<SockAddrIn>() {
-            if let Some(ep) = peer {
-                write_pod_to_user(addr, &endpoint_to_sockaddr(ep))?;
-            }
-        }
-
-        Ok(new_fd as isize)
+pub fn sys_accept4(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32, flags: i32) -> isize {
+    syscall_body!({
+        accept_common(fd, addr, addrlen, flags)
     })
 }
 

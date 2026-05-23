@@ -725,6 +725,37 @@ impl File for TcpSocketFile {
         self.recv_into_user_buffer(&mut buf).unwrap_or(0)
     }
 
+    fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        if self.listening.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+            let st = self.state();
+            {
+                let mut guard = NET_STACK.lock();
+                let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+                let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+                if socket.can_recv() {
+                    return socket.recv_slice(buf).map_err(|_| ERRNO::EIO);
+                }
+                if !socket.may_recv() {
+                    return Ok(0);
+                }
+            }
+            st.read_wait
+                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+        }
+    }
+
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
         if self.listening.load(Ordering::Acquire) {
             return 0;
@@ -733,6 +764,40 @@ impl File for TcpSocketFile {
             return 0;
         }
         self.send_from_user_buffer(&buf).unwrap_or(0)
+    }
+
+    fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        if self.listening.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+            let st = self.state();
+            {
+                let mut guard = NET_STACK.lock();
+                let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+                let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+                if socket.can_send() {
+                    let n = socket.send_slice(buf).map_err(|_| ERRNO::EIO)?;
+                    if n == 0 {
+                        return Err(ERRNO::EIO);
+                    }
+                    stack.poll();
+                    NEED_POLL.store(true, Ordering::Release);
+                    return Ok(n);
+                }
+            }
+            st.write_wait
+                .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+        }
     }
 
     fn poll(&self, events: u16) -> u16 {

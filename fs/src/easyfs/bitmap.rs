@@ -70,4 +70,20 @@ impl Bitmap {
     pub fn maximum(&self) -> usize {
         self.blocks * BLOCK_BITS
     }
+
+    /// Count how many bits are currently allocated.
+    pub fn count_allocated(&self, block_device: &Arc<dyn BlockDevice>) -> usize {
+        let mut used = 0usize;
+        for block_id in 0..self.blocks {
+            let cache = get_block_cache(
+                block_id + self.start_block_id as usize,
+                Arc::clone(block_device),
+            );
+            let block_used = cache.lock().read(0, |bitmap_block: &BitmapBlock| {
+                bitmap_block.iter().map(|bits64| bits64.count_ones() as usize).sum::<usize>()
+            });
+            used += block_used;
+        }
+        used
+    }
 }

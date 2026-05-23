@@ -4,7 +4,7 @@ use spin::Mutex;
 
 use crate::dentry_cache::{insert_dentry, lookup_dentry, remove_dentry};
 use crate::errno::FS_ERRNO;
-use crate::inode_cache::get_or_create_inode;
+use crate::inode_cache::{get_or_create_inode, remove_cached_inode, remove_cached_node};
 
 /// Linux-style inode timestamp snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,9 +30,54 @@ pub struct VfsAttrs {
     pub ino: u64,
     pub nlink: u32,
     pub size: usize,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
     pub atime: Option<InodeTime>,
     pub mtime: Option<InodeTime>,
     pub ctime: Option<InodeTime>,
+}
+
+/// Filesystem statistics snapshot shared by VFS backends.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VfsStatFs {
+    pub f_type: u64,
+    pub f_bsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: u64,
+    pub f_frsize: u64,
+    pub f_flags: u64,
+    pub f_spare: [u64; 4],
+}
+
+/// Linux magic numbers used by the in-tree filesystem backends.
+pub const STATFS_MAGIC_EASYFS: u64 = 0x0041_4A53;
+pub const STATFS_MAGIC_EXT4: u64 = 0x0000_EF53;
+pub const STATFS_MAGIC_MSDOS: u64 = 0x0000_4D44;
+pub const STATFS_MAGIC_PROC: u64 = 0x0000_9FA0;
+pub const STATFS_MAGIC_TMPFS: u64 = 0x0102_1994;
+pub const STATFS_MAGIC_PIPEFS: u64 = 0x5049_5045;
+
+/// Generic filename-length defaults used by the in-tree filesystems.
+pub const STATFS_NAMELEN_DEFAULT: u64 = 255;
+pub const STATFS_NAMELEN_EASYFS: u64 = 27;
+
+/// VFS-visible inode file type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfsFileType {
+    Regular,
+    Directory,
+    Symlink,
+    Char,
+    Block,
+    Fifo,
+    Socket,
+    Unknown,
 }
 
 /// Common VFS node interface.
@@ -41,15 +86,27 @@ pub struct VfsAttrs {
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
 pub trait VfsNode: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
-    /// List directory entries as `(name, is_dir)` pairs.
-    fn ls(&self) -> Vec<(String, bool)>;
+    /// List directory entries as `(name, file_type)` pairs.
+    fn ls(&self) -> Vec<(String, VfsFileType)>;
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Create a sub-directory named `name` inside this directory.
     /// Returns the new directory inode, or `None` on failure.
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Returns true if this node is a directory.
-    fn is_dir(&self) -> bool;
+    fn file_type(&self) -> VfsFileType;
+    fn is_dir(&self) -> bool {
+        self.file_type() == VfsFileType::Directory
+    }
+    fn is_symlink(&self) -> bool {
+        self.file_type() == VfsFileType::Symlink
+    }
+    fn read_link(&self) -> Result<String, FS_ERRNO> {
+        Err(FS_ERRNO::EINVAL)
+    }
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
     fn clear(&self);
     /// 调整常规文件逻辑长度。
     fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
@@ -79,8 +136,23 @@ pub trait VfsNode: Send + Sync + Any {
         None
     }
 
+    /// File owner uid for stat-like metadata.
+    fn uid(&self) -> Option<u32> {
+        None
+    }
+
+    /// File owner gid for stat-like metadata.
+    fn gid(&self) -> Option<u32> {
+        None
+    }
+
     /// Set file mode bits. This is used by `chmod` and `mkdir` syscalls to set permissions and type bits.
     fn set_mode(&self, _mode: u32) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+
+    /// Set file owner uid/gid.
+    fn set_owner(&self, _uid: u32, _gid: u32) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
 
@@ -151,10 +223,17 @@ pub trait VfsNode: Send + Sync + Any {
             ino: self.ino(),
             nlink: self.nlink(),
             size: self.size(),
+            uid: self.uid(),
+            gid: self.gid(),
             atime: self.atime(),
             mtime: self.mtime(),
             ctime: self.ctime(),
         }
+    }
+
+    /// Read filesystem-wide statistics.
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        Err(FS_ERRNO::ENOSYS)
     }
 
     /// Rename or move a child entry from this directory to `new_parent/new_name`.
@@ -203,7 +282,7 @@ impl Inode {
         Self::from_vfs_node(node)
     }
 
-    pub fn ls(&self) -> Vec<(String, bool)> {
+    pub fn ls(&self) -> Vec<(String, VfsFileType)> {
         self.inner.ls()
     }
 
@@ -228,6 +307,7 @@ impl Inode {
                 let new_mode = (cur_mode & !perms_mask) | (0o644u32 & perms_mask);
                 let _ = i.set_mode(new_mode);
             }
+            remove_cached_node(i.as_ref());
             Self::wrap(i)
         })?;
         let fs_id = self.fs_id();
@@ -244,6 +324,7 @@ impl Inode {
                 let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
                 let _ = i.set_mode(new_mode);
             }
+            remove_cached_node(i.as_ref());
             Self::wrap(i)
         })?;
         let fs_id = self.fs_id();
@@ -255,6 +336,29 @@ impl Inode {
 
     pub fn is_dir(&self) -> bool {
         self.inner.is_dir()
+    }
+
+    pub fn file_type(&self) -> VfsFileType {
+        self.inner.file_type()
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.inner.is_symlink()
+    }
+
+    pub fn read_link(&self) -> Result<String, FS_ERRNO> {
+        self.inner.read_link()
+    }
+
+    pub fn symlink(&self, name: &str, target: &str) -> Result<Arc<Inode>, FS_ERRNO> {
+        let node = self.inner.symlink(name, target)?;
+        remove_cached_node(node.as_ref());
+        let child = Self::wrap(node);
+        let fs_id = self.fs_id();
+        if fs_id != 0 {
+            insert_dentry(fs_id, self.ino(), name, &child);
+        }
+        Ok(child)
     }
 
     pub fn clear(&self) {
@@ -288,6 +392,11 @@ impl Inode {
         self.inner.stat_attrs()
     }
 
+    /// Read filesystem-wide statistics.
+    pub fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        self.inner.statfs()
+    }
+
     pub fn nlink(&self) -> u32 {
         self.inner.nlink()
     }
@@ -300,9 +409,22 @@ impl Inode {
         self.inner.mode()
     }
 
+    pub fn uid(&self) -> Option<u32> {
+        self.inner.uid()
+    }
+
+    pub fn gid(&self) -> Option<u32> {
+        self.inner.gid()
+    }
+
     /// Set file mode bits on the underlying node.
     pub fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
         self.inner.set_mode(mode)
+    }
+
+    /// Set file owner uid/gid on the underlying node.
+    pub fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        self.inner.set_owner(uid, gid)
     }
 
     pub fn check_access(&self, uid: u32, gid: u32, mode: u32) -> bool {
@@ -323,19 +445,30 @@ impl Inode {
     }
 
     pub fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
+        let child_to_drop = self
+            .find(name)
+            .filter(|child| child.nlink() <= 1)
+            .map(|child| (child.fs_id(), child.ino()));
         self.inner.unlink(name)?;
         let fs_id = self.fs_id();
         if fs_id != 0 {
             remove_dentry(fs_id, self.ino(), name);
         }
+        if let Some((child_fs, child_ino)) = child_to_drop {
+            remove_cached_inode(child_fs, child_ino);
+        }
         Ok(())
     }
 
     pub fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
+        let child_to_drop = self.find(name).map(|child| (child.fs_id(), child.ino()));
         self.inner.rmdir(name)?;
         let fs_id = self.fs_id();
         if fs_id != 0 {
             remove_dentry(fs_id, self.ino(), name);
+        }
+        if let Some((child_fs, child_ino)) = child_to_drop {
+            remove_cached_inode(child_fs, child_ino);
         }
         Ok(())
     }
@@ -367,6 +500,14 @@ impl Inode {
     }
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
+        let old_child = self.find(old_name).map(|child| (child.fs_id(), child.ino()));
+        let replaced_child = new_parent
+            .find(new_name)
+            .filter(|child| {
+                let child_key = (child.fs_id(), child.ino());
+                Some(child_key) != old_child && (child.is_dir() || child.nlink() <= 1)
+            })
+            .map(|child| (child.fs_id(), child.ino()));
         self.inner.rename_child(old_name, &new_parent.inner, new_name)?;
         let old_fs = self.fs_id();
         if old_fs != 0 {
@@ -375,6 +516,9 @@ impl Inode {
         let new_fs = new_parent.fs_id();
         if new_fs != 0 {
             remove_dentry(new_fs, new_parent.ino(), new_name);
+        }
+        if let Some((child_fs, child_ino)) = replaced_child {
+            remove_cached_inode(child_fs, child_ino);
         }
         Ok(())
     }

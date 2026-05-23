@@ -1,13 +1,14 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
-use log::debug;
+use log::{debug, info};
 use spin::Mutex;
 
 use crate::block_cache::get_block_cache;
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::errno::FS_ERRNO;
-use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsNode};
+use crate::{STATFS_MAGIC_EXT4, STATFS_NAMELEN_DEFAULT, VfsStatFs};
+use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsFileType, VfsNode};
 use crate::BLOCK_SZ;
 
 use ext4_rs::{
@@ -124,7 +125,7 @@ impl Ext4FileSystem {
 pub struct Ext4Inode {
     fs: Arc<Ext4FileSystem>,
     inode_num: u32,
-    is_dir: bool,
+    file_type: VfsFileType,
 }
 
 impl Ext4Inode {
@@ -133,25 +134,40 @@ impl Ext4Inode {
         Self {
             fs,
             inode_num,
-            is_dir,
+            file_type: if is_dir { VfsFileType::Directory } else { VfsFileType::Regular },
+        }
+    }
+
+    fn new_with_type(fs: Arc<Ext4FileSystem>, inode_num: u32, file_type: VfsFileType) -> Self {
+        Self {
+            fs,
+            inode_num,
+            file_type,
         }
     }
 
     /// 查询目录项元数据，返回 `(inode 编号, 是否目录)`。
-    fn lookup_child_meta(&self, name: &str) -> Option<(u32, bool)> {
-        if !self.is_dir {
+    fn lookup_child_meta(&self, name: &str) -> Option<(u32, VfsFileType)> {
+        if self.file_type != VfsFileType::Directory {
             return None;
         }
         let ext4 = self.fs.ext4.lock();
         ext4.ext4_dir_get_entries(self.inode_num)
             .into_iter()
             .find(|de| de.get_name() == name)
-            .map(|de| (de.inode, de.get_de_type() == 2))
+            .map(|de| {
+                let file_type = match de.get_de_type() {
+                    2 => VfsFileType::Directory,
+                    7 => VfsFileType::Symlink,
+                    _ => VfsFileType::Regular,
+                };
+                (de.inode, file_type)
+            })
     }
 
     /// 在 ext4 后端内实现完整 truncate 语义。
     fn truncate_file(&self, new_size: usize) -> Result<(), FS_ERRNO> {
-        if self.is_dir {
+        if self.file_type == VfsFileType::Directory {
             return Err(FS_ERRNO::EISDIR);
         }
 
@@ -223,7 +239,7 @@ impl Ext4Inode {
 
     /// 将目录项从当前目录重命名到新父目录。
     fn rename_child_to(&self, old_name: &str, new_parent: &Self, new_name: &str) -> Result<(), FS_ERRNO> {
-        if !self.is_dir || !new_parent.is_dir {
+        if self.file_type != VfsFileType::Directory || new_parent.file_type != VfsFileType::Directory {
             return Err(FS_ERRNO::ENOTDIR);
         }
         if !Arc::ptr_eq(&self.fs, &new_parent.fs) {
@@ -272,51 +288,82 @@ impl VfsNode for Ext4Inode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
-        if !self.is_dir {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        if self.file_type != VfsFileType::Directory {
             return Vec::new();
         }
         let ext4 = self.fs.ext4.lock();
         ext4
             .ext4_dir_get_entries(self.inode_num)
             .into_iter()
-            .filter(|de| {
-                let name = de.get_name();
-                name != "." && name != ".."
+            .map(|de| {
+                let file_type = match de.get_de_type() {
+                    2 => VfsFileType::Directory,
+                    7 => VfsFileType::Symlink,
+                    _ => VfsFileType::Regular,
+                };
+                (de.get_name(), file_type)
             })
-            .map(|de| (de.get_name(), de.get_de_type() == 2))
             .collect()
     }
 
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        let (inode_num, is_dir) = self.lookup_child_meta(name)?;
-        Some(Arc::new(Self::new(Arc::clone(&self.fs), inode_num, is_dir)) as Arc<dyn VfsNode>)
+        let (inode_num, file_type) = self.lookup_child_meta(name)?;
+        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode_num, file_type)) as Arc<dyn VfsNode>)
     }
 
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        if !self.is_dir {
+        if self.file_type != VfsFileType::Directory {
             return None;
         }
         let ext4 = self.fs.ext4.lock();
         let inode = ext4
             .create(self.inode_num, name, InodeFileType::S_IFREG.bits())
             .ok()?;
-        Some(Arc::new(Self::new(Arc::clone(&self.fs), inode.inode_num, false)) as Arc<dyn VfsNode>)
+        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Regular)) as Arc<dyn VfsNode>)
     }
 
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        if !self.is_dir {
+        if self.file_type != VfsFileType::Directory {
             return None;
         }
         let ext4 = self.fs.ext4.lock();
         let inode = ext4
             .create(self.inode_num, name, InodeFileType::S_IFDIR.bits())
             .ok()?;
-        Some(Arc::new(Self::new(Arc::clone(&self.fs), inode.inode_num, true)) as Arc<dyn VfsNode>)
+        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Directory)) as Arc<dyn VfsNode>)
     }
 
-    fn is_dir(&self) -> bool {
-        self.is_dir
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        if self.file_type != VfsFileType::Directory {
+            return Err(FS_ERRNO::ENOTDIR);
+        }
+        let ext4 = self.fs.ext4.lock();
+        let inode = ext4
+            .create(self.inode_num, name, InodeFileType::S_IFLNK.bits() | 0o777)
+            .map_err(FS_ERRNO::from)?;
+        ext4.write_at(inode.inode_num, 0, target.as_bytes()).map_err(FS_ERRNO::from)?;
+        Ok(Arc::new(Self::new_with_type(
+            Arc::clone(&self.fs),
+            inode.inode_num,
+            VfsFileType::Symlink,
+        )) as Arc<dyn VfsNode>)
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        self.file_type
+    }
+
+    fn read_link(&self) -> Result<String, FS_ERRNO> {
+        if self.file_type != VfsFileType::Symlink {
+            return Err(FS_ERRNO::EINVAL);
+        }
+        let size = self.size();
+        let mut buf = vec![0u8; size];
+        let ext4 = self.fs.ext4.lock();
+        let read = ext4.read_at(self.inode_num, 0, &mut buf).map_err(FS_ERRNO::from)?;
+        buf.truncate(read);
+        String::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)
     }
 
     fn stat_attrs(&self) -> VfsAttrs {
@@ -328,11 +375,35 @@ impl VfsNode for Ext4Inode {
             ino: self.inode_num as u64,
             nlink: i.links_count() as u32,
             size: i.size() as usize,
+            uid: Some(i.uid() as u32),
+            gid: Some(i.gid() as u32),
             atime: Some(decode_ext4_time(i.atime(), i.i_atime_extra())),
             mtime: Some(decode_ext4_time(i.mtime(), i.i_mtime_extra())),
             ctime: Some(decode_ext4_time(i.ctime(), i.i_ctime_extra())),
         };
         ret
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        let ext4 = self.fs.ext4.lock();
+        let sb = ext4.super_block;
+        Ok(VfsStatFs {
+            f_type: STATFS_MAGIC_EXT4,
+            f_bsize: sb.block_size() as u64,
+            f_blocks: sb.blocks_count() as u64,
+            f_bfree: sb.free_blocks_count(),
+            f_bavail: sb.free_blocks_count(),
+            f_files: sb.total_inodes() as u64,
+            f_ffree: sb.free_inodes_count() as u64,
+            f_fsid: [
+                (Arc::as_ptr(&self.fs) as usize as u32) as i32,
+                ((Arc::as_ptr(&self.fs) as usize as u64 >> 32) as u32) as i32,
+            ],
+            f_namelen: STATFS_NAMELEN_DEFAULT,
+            f_frsize: sb.block_size() as u64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        })
     }
 
     fn clear(&self) {
@@ -379,10 +450,35 @@ impl VfsNode for Ext4Inode {
         Some(inode_ref.inode.mode() as u32)
     }
 
+    fn uid(&self) -> Option<u32> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(inode_ref.inode.uid() as u32)
+    }
+
+    fn gid(&self) -> Option<u32> {
+        let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        Some(inode_ref.inode.gid() as u32)
+    }
+
     fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
+        info!("Ext4Inode set_mode: ino={} mode={:#o}", self.inode_num, mode);
         let ext4 = self.fs.ext4.lock();
         let mut inode_ref = ext4.get_inode_ref(self.inode_num);
         inode_ref.inode.set_mode(mode as u16);
+        ext4.write_back_inode(&mut inode_ref);
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        if uid > u16::MAX as u32 || gid > u16::MAX as u32 {
+            return Err(FS_ERRNO::EOVERFLOW);
+        }
+        let ext4 = self.fs.ext4.lock();
+        let mut inode_ref = ext4.get_inode_ref(self.inode_num);
+        inode_ref.inode.set_uid(uid as u16);
+        inode_ref.inode.set_gid(gid as u16);
         ext4.write_back_inode(&mut inode_ref);
         Ok(())
     }
@@ -396,7 +492,7 @@ impl VfsNode for Ext4Inode {
     }
 
     fn link(&self, _old_name: &str, _new_name: &str) -> Result<(), FS_ERRNO> {
-        if !self.is_dir {
+        if self.file_type != VfsFileType::Directory {
             return Err(FS_ERRNO::ENOTDIR);
         }
         let (child_ino, _) = self.lookup_child_meta(_old_name).ok_or(FS_ERRNO::ENOENT)?;
@@ -411,11 +507,11 @@ impl VfsNode for Ext4Inode {
     }
 
     fn link_inode(&self, child: &Arc<dyn VfsNode>, new_name: &str) -> Result<(), FS_ERRNO> {
-        if !self.is_dir {
+        if self.file_type != VfsFileType::Directory {
             return Err(FS_ERRNO::ENOTDIR);
         }
         let child = child.as_any().downcast_ref::<Self>().ok_or(FS_ERRNO::EINVAL)?;
-        if child.is_dir {
+        if child.file_type == VfsFileType::Directory {
             return Err(FS_ERRNO::EISDIR);
         }
         let ext4 = self.fs.ext4.lock();
@@ -428,19 +524,19 @@ impl VfsNode for Ext4Inode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
-        if !self.is_dir {
+        if self.file_type != VfsFileType::Directory {
             return Err(FS_ERRNO::ENOTDIR);
         }
         debug!("Ext4Inode unlink: parent_inode={}, name='{}'", self.inode_num, name);
-        let (child_ino, is_dir) = self.lookup_child_meta(name).ok_or(FS_ERRNO::ENOENT)?;
-        if is_dir {
+        let (child_ino, child_type) = self.lookup_child_meta(name).ok_or(FS_ERRNO::ENOENT)?;
+        if child_type == VfsFileType::Directory {
             return Err(FS_ERRNO::EISDIR);
         }
         let ext4 = self.fs.ext4.lock();
         let mut parent_ref = ext4.get_inode_ref(self.inode_num);
         let mut child_ref = ext4.get_inode_ref(child_ino);
         // Hard-link case: remove only this directory entry and decrement nlink.
-        if !is_dir && child_ref.inode.links_count() > 1 {
+        if child_ref.inode.links_count() > 1 {
             ext4.dir_remove_entry(&mut parent_ref, name)?;
             let new_links = child_ref.inode.links_count() - 1;
             child_ref.inode.set_links_count(new_links);
@@ -450,7 +546,7 @@ impl VfsNode for Ext4Inode {
             return Ok(());
         }
         // Normal case: remove directory entry, decrement nlink, and truncate if this is the last link.
-        if !is_dir && child_ref.inode.links_count() == 1 {
+        if child_ref.inode.links_count() == 1 {
             ext4.truncate_inode(&mut child_ref, 0)?;
             log::debug!("Ext4Inode unlink: truncated inode {} to 0 length", child_ino);
         }
@@ -460,7 +556,7 @@ impl VfsNode for Ext4Inode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
-        if !self.is_dir {
+        if self.file_type != VfsFileType::Directory {
             return Err(FS_ERRNO::ENOTDIR);
         }
         let ext4 = self.fs.ext4.lock();

@@ -4,9 +4,7 @@ use crate::{
     syscall::errno::ERRNO,
     syscall::{write_bytes_to_user, write_pod_to_user},
     syscall_body,
-    task::{
-        current_process, current_task, mprotect_current_process, munmap_current_process,
-    },
+    task::{current_process, current_task, mprotect_current_process, msync_current_process, munmap_current_process},
 };
 
 use alloc::vec::Vec;
@@ -51,6 +49,10 @@ bitflags! {
         const PROT_GROWSUP = 0x02000000;
     }
 }
+
+const MS_ASYNC: i32 = 1;
+const MS_INVALIDATE: i32 = 2;
+const MS_SYNC: i32 = 4;
 /// mmap syscall
 pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
     trace!(
@@ -330,6 +332,31 @@ pub fn sys_munlockall() -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     0
+}
+
+/// msync syscall
+pub fn sys_msync(addr: usize, len: usize, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_msync",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if addr & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if (flags & MS_ASYNC != 0) && (flags & MS_SYNC != 0) {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = addr.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        msync_current_process(VirtAddr::from(addr), VirtAddr::from(end))?;
+        Ok(0)
+    })
 }
 
 pub fn sys_get_mempolicy(

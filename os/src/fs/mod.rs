@@ -7,6 +7,7 @@ mod stdio;
 mod tty;
 pub mod rootfs;
 pub mod devfs;
+pub mod procfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -18,9 +19,36 @@ use crate::syscall::Pod;
 use core::any::Any;
 pub use fs::vfs::InodeTime;
 pub use page_cache::{
-    mapping_for_inode, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
+    mapping_for_inode, sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
+    sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
     retain_mapped_page, PAGE_CACHE_MANAGER
 };
+
+/// Kernel-side alias for the shared filesystem statistics snapshot.
+pub type StatFs64 = fs::VfsStatFs;
+
+/// Convert a 64-bit seed into a stable `fsid_t`-style pair.
+pub(crate) fn fsid_from_u64(seed: u64) -> [i32; 2] {
+    [(seed as u32) as i32, (seed >> 32) as u32 as i32]
+}
+
+/// Build a zero-initialised filesystem stat snapshot.
+pub(crate) fn empty_statfs(f_type: u64, bsize: u64, fsid_seed: u64, namelen: u64) -> StatFs64 {
+    StatFs64 {
+        f_type,
+        f_bsize: bsize,
+        f_blocks: 0,
+        f_bfree: 0,
+        f_bavail: 0,
+        f_files: 0,
+        f_ffree: 0,
+        f_fsid: fsid_from_u64(fsid_seed),
+        f_namelen: namelen,
+        f_frsize: bsize,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
 
 bitflags! {
     /// `fcntl(F_GETFL/F_SETFL)` 可见的文件状态位。
@@ -156,9 +184,38 @@ impl FileDescription {
         self.file.read_at(offset, buf)
     }
 
+    /// 从固定偏移读取到内核缓冲区，不影响共享文件偏移。
+    pub fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        self.file.read_bytes_at(offset, buf)
+    }
+
     /// 向固定偏移写入，不影响共享文件偏移。
     pub fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         self.file.write_at(offset, buf)
+    }
+
+    /// 将内核缓冲区顺序写入并推进共享文件偏移。
+    pub fn write_bytes(&self, buf: &[u8]) -> Result<usize, ERRNO> {
+        if self.file.is_seekable() {
+            let mut inner = self.inner.lock();
+            if inner.status_flags.contains(FileStatusFlags::APPEND) {
+                inner.offset = self.file.stat().size.max(0) as usize;
+            }
+            let write_size = self.file.write_bytes_at(inner.offset, buf)?;
+            inner.offset += write_size;
+            return Ok(write_size);
+        }
+        self.file.write_bytes_at(0, buf)
+    }
+
+    /// 将内核缓冲区写入固定偏移，不影响共享文件偏移。
+    pub fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        self.file.write_bytes_at(offset, buf)
+    }
+
+    /// 返回该打开文件描述是否支持位置相关 I/O（`lseek/pread/pwrite`）。
+    pub fn is_seekable(&self) -> bool {
+        self.file.is_seekable()
     }
 
     /// 调整底层文件对象的逻辑长度。
@@ -190,6 +247,16 @@ impl FileDescription {
     /// 转发 `stat` 到底层文件对象。
     pub fn stat(&self) -> Stat {
         self.file.stat()
+    }
+
+    /// 将底层文件对象的脏数据同步到底层存储。
+    pub fn sync(&self) -> Result<(), ERRNO> {
+        self.file.sync()
+    }
+
+    /// 转发 `statfs` 到底层文件对象。
+    pub fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        self.file.statfs()
     }
 
     /// 返回底层文件对象是否为目录。
@@ -304,9 +371,17 @@ pub trait File: Send + Sync + Any {
     fn read_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
     }
+    /// 从固定偏移读取到内核缓冲区。
+    fn read_bytes_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
+    }
     /// 向固定偏移写入数据。
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
+    }
+    /// 从内核缓冲区向固定偏移写入。
+    fn write_bytes_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
     }
     /// 调整文件逻辑长度。
     fn truncate(&self, _new_size: usize) -> Result<(), ERRNO> {
@@ -351,6 +426,10 @@ pub trait File: Send + Sync + Any {
     }
     /// get file metadata
     fn stat(&self) -> Stat;
+    /// get filesystem metadata
+    fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        Err(ERRNO::ENOSYS)
+    }
     /// 将该文件对象的脏数据同步到底层存储。
     fn sync(&self) -> Result<(), ERRNO> {
         Ok(())
@@ -420,6 +499,8 @@ pub struct Stat {
 
 impl Pod for Stat {}
 
+impl Pod for StatFs64 {}
+
 bitflags! {
     /// The mode of a inode
     /// Linux-style `st_mode` bits: file type + special bits + rwx permissions.
@@ -472,9 +553,11 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_mount, do_umount, init_dev, init_rootfs, inode_stat, linkat,
-    list_apps, lookup_inode, mkdir_at, mount_device, open_file, open_file_at,
-    rename_at, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW,
+    canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
+    linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at,
+    mkdir_at_with_inode, mount_device, open_file, open_file_at, open_file_at_with_status,
+    rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
+    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};
@@ -485,4 +568,5 @@ pub use tty::{Termios, TtyCore, TtyFile, WinSize};
 pub fn init() {
     init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
     init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+    init_procfs();  // Initialize procfs for /proc entries.
 }

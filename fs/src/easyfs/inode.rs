@@ -3,11 +3,11 @@ use core::any::Any;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
-    BlockDevice, EasyFileSystem,
+    BlockDevice, EasyFileSystem, STATFS_MAGIC_EASYFS, STATFS_NAMELEN_EASYFS, VfsStatFs,
     block_cache::get_block_cache,
-    easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType},
+    easyfs::layout::{DIRENT_SZ, DirEntry, DiskInode, DiskInodeType, SuperBlock},
     errno::FS_ERRNO,
-    vfs::{Inode, VfsAttrs, VfsNode},
+    vfs::{Inode, VfsAttrs, VfsFileType, VfsNode},
 };
 
 /// EasyFS-backed inode implementation.
@@ -87,7 +87,7 @@ impl VfsNode for EasyInode {
         self
     }
 
-    fn ls(&self) -> Vec<(String, bool)> {
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
         // Phase 1: collect (name, block_id, block_offset) while holding the fs lock.
         let entries: Vec<(String, u32, usize)> = {
             let fs = self.fs.lock();
@@ -107,13 +107,17 @@ impl VfsNode for EasyInode {
                 v
             })
         };
-        // Phase 2: resolve is_dir for each child without holding any locks.
+        // Phase 2: resolve file type for each child without holding any locks.
         entries
             .into_iter()
             .map(|(name, block_id, block_offset)| {
                 let child = Self::new(block_id, block_offset, self.fs.clone(), self.block_device.clone());
-                let is_dir = child.read_disk_inode(|di| di.is_dir());
-                (name, is_dir)
+                let file_type = if child.read_disk_inode(|di| di.is_dir()) {
+                    VfsFileType::Directory
+                } else {
+                    VfsFileType::Regular
+                };
+                (name, file_type)
             })
             .collect()
     }
@@ -186,8 +190,12 @@ impl VfsNode for EasyInode {
         None
     }
 
-    fn is_dir(&self) -> bool {
-        self.read_disk_inode(|d| d.is_dir())
+    fn file_type(&self) -> VfsFileType {
+        if self.read_disk_inode(|d| d.is_dir()) {
+            VfsFileType::Directory
+        } else {
+            VfsFileType::Regular
+        }
     }
 
     fn stat_attrs(&self) -> VfsAttrs {
@@ -199,10 +207,47 @@ impl VfsNode for EasyInode {
             ino,
             nlink: 1,
             size,
+            uid: None,
+            gid: None,
             atime: None,
             mtime: None,
             ctime: None,
         }
+    }
+
+    fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {
+        let fs = self.fs.lock();
+        let block_device = Arc::clone(&fs.block_device);
+
+        let (total_blocks, data_area_blocks) = get_block_cache(0, Arc::clone(&block_device))
+            .lock()
+            .read(0, |super_block: &SuperBlock| {
+                (super_block.total_blocks as u64, super_block.data_area_blocks as u64)
+            });
+
+        let total_inodes = fs.inode_bitmap.maximum() as u64;
+        let used_inodes = fs.inode_bitmap.count_allocated(&block_device) as u64;
+        let used_data_blocks = fs.data_bitmap.count_allocated(&block_device) as u64;
+
+        let mut stat = VfsStatFs {
+            f_type: STATFS_MAGIC_EASYFS,
+            f_bsize: crate::BLOCK_SZ as u64,
+            f_blocks: total_blocks,
+            f_bfree: data_area_blocks.saturating_sub(used_data_blocks),
+            f_bavail: data_area_blocks.saturating_sub(used_data_blocks),
+            f_files: total_inodes,
+            f_ffree: total_inodes.saturating_sub(used_inodes),
+            f_fsid: [(Arc::as_ptr(&self.fs) as usize as u32) as i32, ((Arc::as_ptr(&self.fs) as usize as u64 >> 32) as u32) as i32],
+            f_namelen: STATFS_NAMELEN_EASYFS,
+            f_frsize: crate::BLOCK_SZ as u64,
+            f_flags: 0,
+            f_spare: [0; 4],
+        };
+        if stat.f_bfree > stat.f_blocks {
+            stat.f_bfree = stat.f_blocks;
+            stat.f_bavail = stat.f_blocks;
+        }
+        Ok(stat)
     }
 
     fn clear(&self) {

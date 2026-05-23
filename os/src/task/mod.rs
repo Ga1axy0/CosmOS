@@ -21,6 +21,7 @@ use crate::sched::{
     TaskContext,
 };
 use crate::fs::{open_file, OpenFlags};
+use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::syscall::{futex_wake_addr, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
@@ -40,7 +41,7 @@ pub use crate::signal::{
     SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
-pub use process::{ExitReason, FdEntry, FdFlags};
+pub use process::{ExitReason, FdEntry, FdFlags, ShmAttachment};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
     clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
@@ -52,6 +53,7 @@ pub use task::{
 pub(crate) use task::TaskControlBlockInner;
 
 use crate::board::QEMUExit;
+use alloc::string::String;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(reason: ExitReason) {
@@ -150,7 +152,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         drop(process_inner);
         recycle_res.clear();
 
-        let (closed_fds, parent_weak, reclaim) = {
+        let (closed_fds, parent_weak, reclaim, shm_attachments) = {
             let mut process_inner = process.inner_exclusive_access();
             process_inner.children.clear();
             // deallocate other data in user space i.e. program code/data section
@@ -165,10 +167,14 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             process_inner.tasks.clear();
 
             let parent_weak = process_inner.parent.clone();
-            (closed_fds, parent_weak, reclaim)
+            let shm_attachments = core::mem::take(&mut process_inner.shm_attachments);
+            (closed_fds, parent_weak, reclaim, shm_attachments)
         };
         reclaim.flush_then_release();
         drop(closed_fds);
+        for attachment in shm_attachments {
+            ipc::detach_segment(attachment.shmid);
+        }
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
             add_signal_to_process(&parent, SignalBit::SIGCHLD);
@@ -193,7 +199,7 @@ lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         let inode = open_file("initproc", OpenFlags::RDONLY).expect("Initproc not found! Rebuild image to include initproc.");
         let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice())
+        ProcessControlBlock::new(v.as_slice(), String::from("/initproc"))
     };
 }
 
@@ -317,6 +323,11 @@ pub fn mmap_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission)
 /// Unmap an anonymous area in current process.
 pub fn munmap_current_process(start: VirtAddr, end: VirtAddr) -> bool {
     current_process().munmap(start, end)
+}
+
+/// Sync a mapped range in current process.
+pub fn msync_current_process(start: VirtAddr, end: VirtAddr) -> Result<(), crate::syscall::errno::ERRNO> {
+    current_process().msync(start, end)
 }
 
 /// Change permissions on a range in current process.
