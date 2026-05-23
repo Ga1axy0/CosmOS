@@ -745,6 +745,7 @@ impl VfsNode for FatInode {
             size: inner.size as usize,
             uid: None,
             gid: None,
+            rdev: 0,
             atime: None,
             mtime: None,
             ctime: None,

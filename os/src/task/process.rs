@@ -273,11 +273,27 @@ fn init_user_stack_from_strings(
     token: usize,
     stack_top: usize,
     args: &[String],
+    envs: &[String],
     auxv_extra: &[(usize, usize)],
 ) -> usize {
     let mut user_sp = stack_top;
+
+    // Place environment strings at high addresses (reverse order so pointers end up in order).
+    let mut env_ptrs: Vec<usize> = Vec::with_capacity(envs.len());
+    for env in envs.iter().rev() {
+        user_sp -= env.len() + 1;
+        let mut p = user_sp;
+        for c in env.as_bytes() {
+            *translated_refmut(token, p as *mut u8).unwrap() = *c;
+            p += 1;
+        }
+        *translated_refmut(token, p as *mut u8).unwrap() = 0;
+        env_ptrs.push(user_sp);
+    }
+    env_ptrs.reverse();
+
+    // Place argument strings.
     let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
-    // 参数字符串放在高地址区域，argv 表只保存用户态指针。
     for arg in args.iter().rev() {
         user_sp -= arg.len() + 1;
         let mut p = user_sp;
@@ -292,7 +308,7 @@ fn init_user_stack_from_strings(
 
     user_sp &= !0xf_usize;
 
-    // glibc 会读取 AT_RANDOM，这里先提供固定的 16 字节随机区。
+    // AT_RANDOM: 16 bytes of pseudo-random data for stack canary.
     // TODO: 后续接入真正的随机源，避免固定 canary。
     user_sp -= 8;
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
@@ -300,7 +316,7 @@ fn init_user_stack_from_strings(
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
     let at_random_ptr = user_sp;
 
-    // 先放入 AT_NULL，再倒序放入额外 auxv 与基础 auxv，保证内存中按正序排列。
+    // auxv: AT_NULL terminator, then extra entries (reversed), then base entries.
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
     user_sp -= core::mem::size_of::<usize>();
@@ -316,9 +332,15 @@ fn init_user_stack_from_strings(
         *translated_refmut(token, user_sp as *mut usize).unwrap() = word;
     }
 
+    // envp array: NULL terminator, then pointers in reverse.
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    for &ptr in env_ptrs.iter().rev() {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = ptr;
+    }
 
+    // argv array: NULL terminator, then pointers in reverse.
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
     for &ptr in arg_ptrs.iter().rev() {
@@ -326,15 +348,15 @@ fn init_user_stack_from_strings(
         *translated_refmut(token, user_sp as *mut usize).unwrap() = ptr;
     }
 
+    // argc
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = args.len();
     user_sp
 }
 
-/// 便捷封装：从静态字符串参数构造用户初始栈。
 fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
     let args: Vec<String> = args.iter().map(|arg| String::from(*arg)).collect();
-    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[])
+    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[], &[])
 }
 
 impl ProcessControlBlockInner {
@@ -565,6 +587,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         elf_data: &[u8],
         args: Vec<String>,
+        envs: Vec<String>,
         exec_path: String,
     ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
@@ -734,23 +757,17 @@ impl ProcessControlBlock {
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
         // push arguments on user stack — Linux ELF ABI layout:
-        //   [sp+0*8]          argc
-        //   [sp+1*8..argc*8]  argv[0..argc-1]
-        //   [sp+(argc+1)*8]   NULL           (argv terminator)
-        //   [sp+(argc+2)*8]   NULL           (envp terminator, empty env)
-        //   [sp+(argc+3)*8]   AT_PAGESZ = 6  \
-        //   [sp+(argc+4)*8]   4096            |
-        //   [sp+(argc+5)*8]   AT_RANDOM = 25  | auxv
-        //   [sp+(argc+6)*8]   &random[0]      |
-        //   [sp+(argc+7)*8]   ... (dynamic linking auxv if needed)
-        //   [sp+(argc+?)*8]   AT_NULL = 0     |
-        //   [sp+(argc+?)*8]   0              /
-        //   [above + 16 bytes random data, 16-byte aligned]  argument strings
+        //   [sp]  argc
+        //         argv[0..argc-1], NULL
+        //         envp[0..envc-1], NULL
+        //         auxv pairs..., AT_NULL
+        //         random bytes, argument/environment strings
         trace!("kernel: exec .. push arguments on user stack");
         let user_sp = init_user_stack_from_strings(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             args.as_slice(),
+            envs.as_slice(),
             auxv_extra.as_slice(),
         );
 

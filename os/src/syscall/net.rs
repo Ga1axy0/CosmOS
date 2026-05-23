@@ -55,6 +55,43 @@ const MAX_MSG_CONTROL: usize = 16 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+struct LinuxTcpInfo {
+    tcpi_state: u8,
+    tcpi_ca_state: u8,
+    tcpi_retransmits: u8,
+    tcpi_probes: u8,
+    tcpi_backoff: u8,
+    tcpi_options: u8,
+    tcpi_snd_rcv_wscale: u8,
+    tcpi_delivery_rate_app_limited: u8,
+    tcpi_rto: u32,
+    tcpi_ato: u32,
+    tcpi_snd_mss: u32,
+    tcpi_rcv_mss: u32,
+    tcpi_unacked: u32,
+    tcpi_sacked: u32,
+    tcpi_lost: u32,
+    tcpi_retrans: u32,
+    tcpi_fackets: u32,
+    tcpi_last_data_sent: u32,
+    tcpi_last_ack_sent: u32,
+    tcpi_last_data_recv: u32,
+    tcpi_last_ack_recv: u32,
+    tcpi_pmtu: u32,
+    tcpi_rcv_ssthresh: u32,
+    tcpi_rtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_advmss: u32,
+    tcpi_reordering: u32,
+    tcpi_rcv_rtt: u32,
+    tcpi_rcv_space: u32,
+    tcpi_total_retrans: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MsgHdr {
     pub msg_name: usize,
     pub msg_namelen: usize,
@@ -1034,6 +1071,17 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     write_getsockopt_value(token, optval, optlen, CONGESTION.as_bytes())?;
                     Ok(0)
                 },
+                Some(PosixTcpSocketOption::Info) => {
+                    let info = LinuxTcpInfo::default();
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            &info as *const _ as *const u8,
+                            core::mem::size_of::<LinuxTcpInfo>(),
+                        )
+                    };
+                    write_getsockopt_value(token, optval, optlen, bytes)?;
+                    Ok(0)
+                }
                 _ => {
                     warn!(
                         "getsockopt(fd={}, level={}, optname={}) not implemented for IP/TCP, ignored",

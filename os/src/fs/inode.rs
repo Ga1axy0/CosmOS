@@ -995,7 +995,7 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         nlink: attrs.nlink,
         uid: attrs.uid.unwrap_or(0),
         gid: attrs.gid.unwrap_or(0),
-        rdev: 0,
+        rdev: attrs.rdev,
         pad0: 0,
         size: size as i64,
         blksize: 512,
@@ -1032,7 +1032,8 @@ pub fn init_dev() {
     // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
-        let node = Arc::new(BlockDevNode::new(Arc::clone(dev)));
+        let minor = super::devfs::blkdev_minor_from_name(dev_name);
+        let node = Arc::new(BlockDevNode::new(Arc::clone(dev), minor));
         dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);
         info!("[kernel] /dev/{} registered", dev_name);
     }
