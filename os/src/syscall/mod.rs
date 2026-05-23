@@ -363,7 +363,7 @@ macro_rules! syscall_body {
         match result {
             Ok(v) => v,
             Err(e) => {
-                // warn!("syscall error: {:?}", e);
+                warn!("syscall error: {:?}", e);
                 -(e as isize)
             },
         }

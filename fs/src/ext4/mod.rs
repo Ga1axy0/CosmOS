@@ -405,6 +405,7 @@ impl VfsNode for Ext4Inode {
             size: i.size() as usize,
             uid: Some(i.uid() as u32),
             gid: Some(i.gid() as u32),
+            rdev: 0,
             atime: Some(decode_ext4_time(i.atime(), i.i_atime_extra())),
             mtime: Some(decode_ext4_time(i.mtime(), i.i_mtime_extra())),
             ctime: Some(decode_ext4_time(i.ctime(), i.i_ctime_extra())),

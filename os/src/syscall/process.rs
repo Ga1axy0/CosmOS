@@ -664,13 +664,13 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
                 args = args.add(1);
             }
         }
-        // TODO：当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
+        let mut envs_vec: Vec<String> = Vec::new();
         loop {
             let env_str_ptr = *translated_ref(token, envp).or_errno(ERRNO::EFAULT)?;
             if env_str_ptr == 0 {
                 break;
             }
-            translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?;
+            envs_vec.push(translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
             unsafe {
                 envp = envp.add(1);
             }
@@ -686,7 +686,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
             argv,
             exec_path,
         } = resolved;
-        process.exec(elf_data.as_slice(), argv, exec_path)?;
+        process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
         Ok(0)

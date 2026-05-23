@@ -38,6 +38,19 @@ fn devfs_statfs() -> StatFs64 {
     )
 }
 
+const fn makedev(major: u64, minor: u64) -> u64 {
+    (major << 8) | minor
+}
+
+/// Derive minor device number from a block device name (e.g. "vda" → 0, "vdb" → 1).
+pub fn blkdev_minor_from_name(name: &str) -> u64 {
+    let name = name.strip_prefix("vd").unwrap_or(name);
+    name.bytes()
+        .next()
+        .map(|b| (b.wrapping_sub(b'a')) as u64)
+        .unwrap_or(0)
+}
+
 /// Linux `struct rtc_time` ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -183,12 +196,14 @@ fn unix_secs_from_rtc_time(tm: LinuxRtcTime) -> Option<i64> {
 pub struct BlockDevNode {
     /// The underlying block device driver.
     pub device: Arc<dyn BlockDevice>,
+    /// Minor device number for stat reporting.
+    minor: u64,
 }
 
 impl BlockDevNode {
-    /// Wrap `device` in a new node.
-    pub fn new(device: Arc<dyn BlockDevice>) -> Self {
-        Self { device }
+    /// Wrap `device` in a new node with the given minor number.
+    pub fn new(device: Arc<dyn BlockDevice>, minor: u64) -> Self {
+        Self { device, minor }
     }
 }
 
@@ -217,6 +232,10 @@ impl VfsNode for NullDevNode {
 
     fn file_type(&self) -> VfsFileType {
         VfsFileType::Char
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(1, 3)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
@@ -284,6 +303,10 @@ impl VfsNode for ZeroDevNode {
         VfsFileType::Char
     }
 
+    fn rdev(&self) -> u64 {
+        makedev(1, 5)
+    }
+
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
@@ -334,6 +357,10 @@ impl VfsNode for BlockDevNode {
 
     fn file_type(&self) -> VfsFileType {
         VfsFileType::Block
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(254, self.minor)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
@@ -448,7 +475,8 @@ impl VfsNode for DevRootNode {
             _ => {
                 let map = BLOCK_DEVICES.lock();
                 let dev = map.get(name)?;
-                Some(Arc::new(BlockDevNode::new(Arc::clone(dev))) as Arc<dyn VfsNode>)
+                let minor = blkdev_minor_from_name(name);
+                Some(Arc::new(BlockDevNode::new(Arc::clone(dev), minor)) as Arc<dyn VfsNode>)
             }
         }
     }
@@ -611,6 +639,10 @@ impl VfsNode for RtcDevNode {
         VfsFileType::Char
     }
 
+    fn rdev(&self) -> u64 {
+        makedev(253, 0)
+    }
+
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
@@ -668,6 +700,10 @@ impl VfsNode for UrandomDevNode {
 
     fn file_type(&self) -> VfsFileType {
         VfsFileType::Char
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(1, 9)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {

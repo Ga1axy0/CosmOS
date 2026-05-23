@@ -32,6 +32,7 @@ pub struct VfsAttrs {
     pub size: usize,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    pub rdev: u64,
     pub atime: Option<InodeTime>,
     pub mtime: Option<InodeTime>,
     pub ctime: Option<InodeTime>,
@@ -136,6 +137,11 @@ pub trait VfsNode: Send + Sync + Any {
         None
     }
 
+    /// Device number (major/minor) for char/block device nodes.
+    fn rdev(&self) -> u64 {
+        0
+    }
+
     /// File owner uid for stat-like metadata.
     fn uid(&self) -> Option<u32> {
         None
@@ -225,6 +231,7 @@ pub trait VfsNode: Send + Sync + Any {
             size: self.size(),
             uid: self.uid(),
             gid: self.gid(),
+            rdev: self.rdev(),
             atime: self.atime(),
             mtime: self.mtime(),
             ctime: self.ctime(),
