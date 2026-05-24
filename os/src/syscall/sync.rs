@@ -79,7 +79,10 @@ pub fn sys_futex(
                 Ok(0)
             }
             FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
-            _ => Err(ERRNO::ENOSYS),
+            _ => {
+                warn!("Unsupported futex op: {}", op);
+                Err(ERRNO::EINVAL)
+            },
         }
     })
 }

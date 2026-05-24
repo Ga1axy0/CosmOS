@@ -2,10 +2,16 @@
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
-/// Highest supported Linux signal number for per-process signal tables.
-pub const MAX_SIG: usize = 31;
+/// Highest supported Linux signal number.
+pub const MAX_SIG: usize = 64;
+/// First Linux realtime signal number in the kernel-visible range.
+pub const FIRST_RT_SIG: usize = 32;
+/// Highest Linux realtime signal number in the kernel-visible range.
+pub const LAST_RT_SIG: usize = MAX_SIG;
+/// libc-internal cancellation signal used by glibc/musl on Linux.
+pub const SIGCANCEL: usize = 33;
 
-const SUPPORTED_SIGNAL_BITS: u64 = (1u64 << MAX_SIG) - 1;
+const SUPPORTED_SIGNAL_BITS: u64 = u64::MAX;
 
 /// Linux 信号编号。
 ///
@@ -146,7 +152,11 @@ impl SignalBit {
 
     /// 从 Linux 信号编号构造集合。
     pub fn from_signum(signum: u32) -> Option<Self> {
-        SignalNum::from_number(signum).map(Self::from_signal_num)
+        if signum == 0 || signum as usize > MAX_SIG {
+            None
+        } else {
+            Some(Self(1u64 << (signum - 1)))
+        }
     }
 
     /// 从内核支持范围内的 Linux `sigset_t` 低 64 位构造集合。

@@ -27,7 +27,7 @@ use crate::syscall::{futex_wake_addr, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::remove_timer;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use lazy_static::*;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub use crate::sched::{
@@ -72,6 +72,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     process.pause_cpu_accounting(get_time());
     let mut task_inner = task.inner_exclusive_access();
     let tid = task_inner.res.as_ref().unwrap().tid;
+    let thread_id = task_inner.res.as_ref().unwrap().thread_id();
     let clear_child_tid = task_inner.clear_child_tid;
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
@@ -87,6 +88,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let _ = write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32);
         let _ = futex_wake_addr(clear_child_tid, 1);
     }
+    remove_from_tid2task(thread_id);
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
     if tid == 0 {
@@ -132,6 +134,13 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let mut recycle_res = Vec::<TaskUserRes>::new();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
+            let thread_id = task
+                .inner_exclusive_access()
+                .res
+                .as_ref()
+                .unwrap()
+                .thread_id();
+            remove_from_tid2task(thread_id);
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
             // expired, we should remove them.
             //
@@ -200,6 +209,8 @@ lazy_static! {
         let v = inode.read_all();
         ProcessControlBlock::new(v.as_slice(), String::from("/initproc"))
     };
+    static ref TID2TASK: crate::sync::SpinNoIrqLock<BTreeMap<usize, alloc::sync::Weak<TaskControlBlock>>> =
+        crate::sync::SpinNoIrqLock::new(BTreeMap::new());
 }
 
 ///Add init process to the manager
@@ -207,13 +218,72 @@ pub fn add_initproc() {
     let _initproc = INITPROC.clone();
 }
 
+/// Look up a live task by its Linux-visible thread id.
+pub fn thread_id2task(thread_id: usize) -> Option<Arc<TaskControlBlock>> {
+    let mut map = TID2TASK.lock();
+    let task = map.get(&thread_id).and_then(|task| task.upgrade());
+    if task.is_none() {
+        map.remove(&thread_id);
+    }
+    task
+}
+
+/// Publish one task in the global Linux-visible thread-id index.
+pub fn insert_into_tid2task(thread_id: usize, task: &Arc<TaskControlBlock>) {
+    TID2TASK.lock().insert(thread_id, Arc::downgrade(task));
+}
+
+/// Remove one task from the global Linux-visible thread-id index.
+pub fn remove_from_tid2task(thread_id: usize) {
+    TID2TASK.lock().remove(&thread_id);
+}
+
+fn wake_signal_waiters(tasks: Vec<Arc<TaskControlBlock>>) {
+    for task in tasks {
+        if task_has_inflight_keyed_poll_wait(&task) {
+            continue;
+        }
+        let handle = {
+            let task_inner = task.inner_exclusive_access();
+            task_inner.current_wq_handle.clone()
+        };
+        if let Some(handle) = handle {
+            handle.wake_waiter(&task);
+            continue;
+        }
+        let should_wake = {
+            let task_inner = task.inner_exclusive_access();
+            matches!(task_inner.task_status, TaskStatus::Interruptible)
+        };
+        if should_wake {
+            wakeup_task(task);
+        }
+    }
+}
+
 /// Check if the current task has any fatal signal to handle
 /// 因为只检查致命信号，所以可不复位pending_signals
 pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
+    let task = current_task().unwrap();
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
-    let pending = process_inner.pending_signals & !process_inner.signal_mask;
-    pending.check_error()
+    let task_inner = task.inner_exclusive_access();
+    let pending = (task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask;
+    for signum in 1..=MAX_SIG {
+        let Some(flag) = SignalBit::from_signum(signum as u32) else {
+            continue;
+        };
+        if !pending.contains(flag) {
+            continue;
+        }
+        let action = process_inner.signal_actions.table[signum];
+        if action.handler == SIG_DFL {
+            if let Some(error) = flag.check_error() {
+                return Some(error);
+            }
+        }
+    }
+    None
 }
 
 
@@ -230,65 +300,63 @@ pub fn current_process_is_zombie() -> bool {
 /// When the delivered signal introduces a **newly pending and unmasked** bit,
 /// proactively wake poll waiters of this process so `ppoll` can return `EINTR`.
 pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalBit) {
-    let (pid, should_notify_poll) = {
+    let (pid, newly_pending, tasks) = {
         let mut process_inner = process.inner_exclusive_access();
+        let tasks = process_inner
+            .tasks
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(Arc::clone))
+            .collect::<Vec<_>>();
         let newly_pending = signal & !process_inner.pending_signals;
         process_inner.pending_signals |= signal;
-        let newly_unmasked = newly_pending & !process_inner.signal_mask;
-        (process.getpid(), !newly_unmasked.is_empty())
+        (process.getpid(), newly_pending, tasks)
     };
 
     crate::signal::notify_signal_wait_pid(pid, signal.bits());
 
-    if should_notify_poll {
+    let deliverable_tasks = tasks
+        .into_iter()
+        .filter(|task| {
+            let task_inner = task.inner_exclusive_access();
+            !(newly_pending & !task_inner.signal_mask).is_empty()
+        })
+        .collect::<Vec<_>>();
+
+    if !deliverable_tasks.is_empty() {
         debug!(
-            "add_signal_to_process: pid={} added signal {:#x} which is unmasked, should notify poll",
+            "add_signal_to_process: pid={} added signal {:#x} deliverable to {} task(s)",
             pid,
-            signal.bits()
+            signal.bits(),
+            deliverable_tasks.len()
         );
         crate::poll::notify_poll_signal_pid(pid);
+        wake_signal_waiters(deliverable_tasks);
+    }
+}
 
-        // When an unmasked signal arrives, wake interruptible tasks so they
-        // return -EINTR.  Use the WaitQueueHandle (if the task is enqueued)
-        // to properly remove it from its wait queue before waking.
-        // Keyed-poll tasks are already handled by notify_poll_signal_pid above.
-        let tasks: Vec<Arc<TaskControlBlock>> = {
-            let process_inner = process.inner_exclusive_access();
-            process_inner
-                .tasks
-                .iter()
-                .filter_map(|slot| slot.as_ref().map(Arc::clone))
-                .collect()
-        };
-        for task in tasks {
-            if task_has_inflight_keyed_poll_wait(&task) {
-                continue;
-            }
-            let handle = {
-                let task_inner = task.inner_exclusive_access();
-                task_inner.current_wq_handle.clone()
-            };
-            if let Some(handle) = handle {
-                debug!("Wakeup with handle, reason = {:?}", task.inner_exclusive_access().wait_reason.unwrap_or(WaitReason::Unknown));
-                handle.wake_waiter(&task);
-            } else {
-                debug!("Wakeup task without handle, reason = {:?}", task.inner_exclusive_access().wait_reason.unwrap_or(WaitReason::Unknown));
-                let should_wake = {
-                    let task_inner = task.inner_exclusive_access();
-                    matches!(task_inner.task_status, TaskStatus::Interruptible)
-                };
-                if should_wake {
-                    wakeup_task(task);
-                }
-            }
-        }
+/// Add one pending signal directly to a specific thread.
+pub fn add_signal_to_task(task: &Arc<TaskControlBlock>, signal: SignalBit) {
+    let process = task.process.upgrade().unwrap();
+    let pid = process.getpid();
+    let newly_unmasked = {
+        let mut task_inner = task.inner_exclusive_access();
+        let newly_pending = signal & !task_inner.pending_signals;
+        task_inner.pending_signals |= signal;
+        newly_pending & !task_inner.signal_mask
+    };
+
+    crate::signal::notify_signal_wait_task(task, signal.bits());
+
+    if !newly_unmasked.is_empty() {
+        crate::poll::notify_poll_signal_pid(pid);
+        wake_signal_waiters(vec![Arc::clone(task)]);
     }
 }
 
 /// Add signal to the current task
 pub fn current_add_signal(signal: SignalBit) {
-    let process = current_process();
-    add_signal_to_process(&process, signal);
+    let task = current_task().unwrap();
+    add_signal_to_task(&task, signal);
 }
 
 /// 扫描所有进程的 interval timer，到期则投递对应信号。

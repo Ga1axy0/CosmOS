@@ -2,7 +2,7 @@
 #![allow(deprecated)]
 
 use super::id::RecycleAllocator;
-use super::{SchedAttr, TaskControlBlock};
+use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
 use super::{SignalAction, SignalActions, SignalBit, SIG_IGN};
 use crate::sched::add_task;
 use crate::sched::insert_into_pid2process;
@@ -137,8 +137,6 @@ pub struct ProcessControlBlockInner {
     pub resource_limits: ResourceLimits,
     /// pending process signals
     pub pending_signals: SignalBit,
-    /// blocked process signals
-    pub signal_mask: SignalBit,
     /// installed signal actions
     pub signal_actions: SignalActions,
     /// tasks(also known as threads)
@@ -509,12 +507,18 @@ impl ProcessControlBlock {
 
     /// Attach a created task to this process's task table without scheduling it.
     pub fn attach_task(self: &Arc<Self>, task: Arc<TaskControlBlock>) {
-        let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+        let task_inner = task.inner_exclusive_access();
+        let res = task_inner.res.as_ref().unwrap();
+        let tid = res.tid;
+        let thread_id = res.thread_id();
+        drop(task_inner);
         let mut inner = self.inner_exclusive_access();
         while inner.tasks.len() <= tid {
             inner.tasks.push(None);
         }
-        inner.tasks[tid] = Some(task);
+        inner.tasks[tid] = Some(Arc::clone(&task));
+        drop(inner);
+        insert_into_tid2task(thread_id, &task);
     }
 
     /// new process from elf file
@@ -542,7 +546,6 @@ impl ProcessControlBlock {
                     fd_table: new_stdio_files(),
                     resource_limits: ResourceLimits::default(),
                     pending_signals: SignalBit::empty(),
-                    signal_mask: SignalBit::empty(),
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -777,6 +780,7 @@ impl ProcessControlBlock {
         task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
+        task_inner.pending_signals = SignalBit::empty();
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
         //         argv[0..argc-1], NULL
@@ -842,7 +846,6 @@ impl ProcessControlBlock {
         };
         let vm_layout = parent.vm_layout;
         let cred = parent.cred;
-        let parent_signal_mask = parent.signal_mask;
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
         let parent_exec_path = parent.exec_path.clone();
@@ -872,7 +875,6 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
-                    signal_mask: parent_signal_mask,
                     signal_actions: parent_signal_actions,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -907,6 +909,7 @@ impl ProcessControlBlock {
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_sched_attr = parent_task_inner.sched_attr();
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
+        let parent_signal_mask = parent_task_inner.signal_mask;
         drop(parent_task_inner);
         drop(parent);
         if parent_mask != 0 {
@@ -935,7 +938,11 @@ impl ProcessControlBlock {
             false,
             parent_sched_attr,
         );
-        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
+            task_inner.signal_mask = parent_signal_mask;
+        }
         // attach task to child process before publishing it
         child.attach_task(Arc::clone(&task));
         // Finalize the child's trap context before publishing it to the scheduler.
@@ -1005,7 +1012,6 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
-                    signal_mask: parent.signal_mask,
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -1038,11 +1044,16 @@ impl ProcessControlBlock {
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_sched_attr = parent_task_inner.sched_attr();
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
+        let parent_signal_mask = parent_task_inner.signal_mask;
         drop(parent_task_inner);
         drop(parent);
 
         let task = child.create_task(ustack_base, true, parent_sched_attr);
-        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
+            task_inner.signal_mask = parent_signal_mask;
+        }
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
