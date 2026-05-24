@@ -2,25 +2,19 @@ use crate::{
     mm::kernel_token,
     sched::add_task,
     syscall::errno::ERRNO,
-    task::{current_process, current_task},
+    task::{current_process, current_task, remove_from_tid2task},
     trap::{trap_handler, TrapContext},
 };
 use alloc::sync::Arc;
 
 fn linux_visible_tid() -> isize {
-    let task = current_task().unwrap();
-    let process = task.process.upgrade().unwrap();
-    let tid = task
+    current_task()
+        .unwrap()
         .inner_exclusive_access()
         .res
         .as_ref()
         .unwrap()
-        .tid;
-    if tid == 0 {
-        process.getpid() as isize
-    } else {
-        tid as isize
-    }
+        .thread_id() as isize
 }
 /// thread create syscall
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
@@ -37,22 +31,25 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     );
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let (ustack_base, sched_attr) = {
+    let (ustack_base, sched_attr, affinity_mask, signal_mask) = {
         let task_inner = task.inner_exclusive_access();
         (
             task_inner.res.as_ref().unwrap().ustack_base,
             task_inner.sched_attr(),
+            task_inner.sched.cpu_affinity_mask,
+            task_inner.signal_mask,
         )
     };
     // create a new thread
     let new_task = process.create_task(ustack_base, true, sched_attr);
     {
-        let affinity_mask = task.inner_exclusive_access().sched.cpu_affinity_mask;
-        new_task.inner_exclusive_access().sched.cpu_affinity_mask = affinity_mask;
+        let mut new_task_inner = new_task.inner_exclusive_access();
+        new_task_inner.sched.cpu_affinity_mask = affinity_mask;
+        new_task_inner.signal_mask = signal_mask;
     }
     let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
-    let new_task_tid = new_task_res.tid;
+    let new_task_tid = new_task_res.thread_id();
     let new_task_trap_cx = new_task_inner.get_trap_cx();
     *new_task_trap_cx = TrapContext::app_init_context(
         entry,
@@ -117,6 +114,15 @@ pub fn sys_waittid(tid: usize) -> i32 {
     if let Some(code) = exit_code {
         // Take the task out of the slot so we can drop it after releasing locks.
         let waited_task = process_inner.tasks[tid].take();
+        if let Some(waited_task) = waited_task.as_ref() {
+            let thread_id = waited_task
+                .inner_exclusive_access()
+                .res
+                .as_ref()
+                .unwrap()
+                .thread_id();
+            remove_from_tid2task(thread_id);
+        }
         // Extract user resources from the zombie task to avoid deadlock:
         // TaskUserRes::drop() needs the process lock, so we must drop it first.
         let res = waited_task.as_ref().and_then(|t| t.inner_exclusive_access().res.take());

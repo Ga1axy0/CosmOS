@@ -283,8 +283,8 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
         };
 
         let old_bits = {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
             let old_mask = inner.signal_mask;
             if let Some(new_mask) = new_mask {
                 match how {
@@ -337,10 +337,11 @@ pub fn sys_sigreturn() -> isize {
 
         // Restore signal mask
         {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
             let mask = SignalBit::from_user_bits(ucontext.uc_sigmask);
             inner.signal_mask = mask;
+            inner.signal_mask_backup = None;
             debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
         }
 
@@ -388,16 +389,16 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
             return Err(ERRNO::EINVAL);
         }
 
-        let process = current_process();
-
         // Read new mask from user space.
         let new_mask = read_user_sigset(mask, sigsetsize)?;
 
         // Save old mask and atomically set new mask
         let old_mask = {
-            let mut inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
             let old = inner.signal_mask;
             inner.signal_mask = new_mask;
+            inner.signal_mask_backup = Some(old);
             debug!(
                 "sys_sigsuspend: changed mask from {:#x} to {:#x}",
                 old.bits(),
@@ -408,11 +409,7 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
 
         // Block until a signal arrives.
         // Check if any unmasked signals are already pending.
-        let has_pending = {
-            let inner = process.inner_exclusive_access();
-            let unmasked_pending = inner.pending_signals & !inner.signal_mask;
-            !unmasked_pending.is_empty()
-        };
+        let has_pending = crate::signal::has_unmasked_pending_signal();
 
         if !has_pending {
             // Block directly without enqueuing in any WaitQueue.
@@ -431,11 +428,7 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
             }
 
             // Re-check: did a signal arrive before we could block?
-            let should_block = {
-                let inner = process.inner_exclusive_access();
-                let unmasked_pending = inner.pending_signals & !inner.signal_mask;
-                unmasked_pending.is_empty()
-            };
+            let should_block = !crate::signal::has_unmasked_pending_signal();
 
             if should_block {
                 crate::task::block_current_and_run_next(WaitReason::SignalSuspend);
@@ -450,13 +443,6 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
                     task_inner.wait_reason = None;
                 }
             }
-        }
-
-        // When we wake up, restore the old signal mask
-        {
-            let mut inner = process.inner_exclusive_access();
-            inner.signal_mask = old_mask;
-            debug!("sys_sigsuspend: restored mask to {:#x}", old_mask.bits());
         }
 
         // sigsuspend always returns -EINTR after signal delivery

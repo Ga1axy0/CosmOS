@@ -216,6 +216,30 @@ pub(crate) fn notify_signal_wait_pid(pid: usize, pending_bits: u64) {
     }
 }
 
+pub(crate) fn notify_signal_wait_task(task: &Arc<TaskControlBlock>, pending_bits: u64) {
+    if pending_bits == 0 {
+        return;
+    }
+    let task_ptr = Arc::as_ptr(task) as usize;
+    let mut should_wake = false;
+    {
+        let mut registry = SIGNAL_WAIT_REGISTRY.lock();
+        for slot in registry.slots.iter_mut() {
+            if slot.task_ptr != task_ptr || !matches!(slot.state, SignalWaitState::Active) {
+                continue;
+            }
+            if (slot.signal_bits & pending_bits) == 0 {
+                continue;
+            }
+            slot.state = SignalWaitState::Ready;
+            should_wake = true;
+        }
+    }
+    if should_wake {
+        wakeup_task(Arc::clone(task));
+    }
+}
+
 pub(crate) fn handle_signal_wait_timeout(
     tag: SignalTimerTag,
     task: &Arc<TaskControlBlock>,
@@ -245,27 +269,38 @@ pub(crate) fn handle_signal_wait_timeout(
 }
 
 pub(crate) fn has_pending_signal_in_set(signal_set: SignalBit) -> bool {
+    let task = crate::task::current_task().unwrap();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    !(inner.pending_signals & signal_set).is_empty()
+    let process_inner = process.inner_exclusive_access();
+    let task_inner = task.inner_exclusive_access();
+    !((task_inner.pending_signals | process_inner.pending_signals) & signal_set).is_empty()
 }
 
 pub(crate) fn has_unmasked_pending_signal() -> bool {
+    let task = crate::task::current_task().unwrap();
     let process = current_process();
-    let inner = process.inner_exclusive_access();
-    !(inner.pending_signals & !inner.signal_mask).is_empty()
+    let process_inner = process.inner_exclusive_access();
+    let task_inner = task.inner_exclusive_access();
+    !((task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask).is_empty()
 }
 
 pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<i32> {
+    let task = crate::task::current_task().unwrap();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let pending = inner.pending_signals & signal_set;
+    let mut process_inner = process.inner_exclusive_access();
+    let mut task_inner = task.inner_exclusive_access();
+    let thread_pending = task_inner.pending_signals & signal_set;
+    let process_pending = process_inner.pending_signals & signal_set;
     for signum in 1..=crate::signal::MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {
             continue;
         };
-        if pending.contains(flag) {
-            inner.pending_signals &= !flag;
+        if thread_pending.contains(flag) {
+            task_inner.pending_signals &= !flag;
+            return Some(signum as i32);
+        }
+        if process_pending.contains(flag) {
+            process_inner.pending_signals &= !flag;
             return Some(signum as i32);
         }
     }

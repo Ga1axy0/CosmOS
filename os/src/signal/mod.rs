@@ -3,7 +3,7 @@
 use crate::{
     config::USER_VDSO_RT_SIGRETURN,
     syscall::write_pod_to_user,
-    task::{current_process, current_trap_cx},
+    task::{current_task, current_trap_cx},
 };
 
 mod action;
@@ -11,12 +11,12 @@ mod signals;
 mod wait;
 
 pub use action::{MContext, SigInfo, StackT, UContext, SignalAction, SignalActions};
-pub use signals::{SignalBit, SignalNum, MAX_SIG};
+pub use signals::{SignalBit, SignalNum, FIRST_RT_SIG, LAST_RT_SIG, MAX_SIG, SIGCANCEL};
 pub(crate) use wait::{
     cleanup_signal_wait, cleanup_signal_wait_for_task, handle_signal_wait_timeout,
     has_pending_signal_in_set, has_unmasked_pending_signal, notify_signal_wait_pid,
-    register_signal_wait, signal_wait_should_skip, signal_wait_state, take_pending_signal_in_set,
-    SignalTimerTag, SignalWaitHandle, SignalWakeState,
+    notify_signal_wait_task, register_signal_wait, signal_wait_should_skip, signal_wait_state,
+    take_pending_signal_in_set, SignalTimerTag, SignalWaitHandle, SignalWakeState,
 };
 
 bitflags! {
@@ -50,20 +50,28 @@ pub const SIG_IGN: usize = 1;
 /// Returns Some((signum, action)) if a signal needs to be handled by user handler.
 /// Handles SIG_IGN by clearing the signal, and SIG_DFL by default behavior.
 pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
-    let process = current_process();
+    let task = current_task().unwrap();
+    let process = crate::task::current_process();
     let mut process_inner = process.inner_exclusive_access();
-    let pending = process_inner.pending_signals & !process_inner.signal_mask;
+    let mut task_inner = task.inner_exclusive_access();
+    let thread_pending = task_inner.pending_signals;
+    let pending = (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask;
 
     // Find the first pending signal
     for signum in 1..=MAX_SIG {
         let flag = SignalBit::from_signum(signum as u32);
         if let Some(flag) = flag {
             if pending.contains(flag) {
+                let from_thread = thread_pending.contains(flag);
                 let action = process_inner.signal_actions.table[signum];
 
                 // SIG_IGN: clear the signal and continue
                 if action.handler == SIG_IGN {
-                    process_inner.pending_signals &= !flag;
+                    if from_thread {
+                        task_inner.pending_signals &= !flag;
+                    } else {
+                        process_inner.pending_signals &= !flag;
+                    }
                     debug!("check_signals: signum={} ignored (SIG_IGN)", signum);
                     continue;
                 }
@@ -74,7 +82,11 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
                     if flag.check_error().is_some() {
                         continue;
                     } else {
-                        process_inner.pending_signals &= !flag;
+                        if from_thread {
+                            task_inner.pending_signals &= !flag;
+                        } else {
+                            process_inner.pending_signals &= !flag;
+                        }
                         debug!(
                             "check_signals: signum={} cleared (SIG_DFL, non-fatal)",
                             signum
@@ -85,7 +97,11 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
 
                 // User-defined handler
                 if action.handler > 1 {
-                    process_inner.pending_signals &= !flag;
+                    if from_thread {
+                        task_inner.pending_signals &= !flag;
+                    } else {
+                        process_inner.pending_signals &= !flag;
+                    }
                     debug!(
                         "check_signals: signum={} dispatching to handler={:#x}, flags={:#x}",
                         signum, action.handler, action.sa_flags
@@ -94,6 +110,9 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
                 }
             }
         }
+    }
+    if let Some(old_mask) = task_inner.signal_mask_backup.take() {
+        task_inner.signal_mask = old_mask;
     }
     None
 }
@@ -114,8 +133,6 @@ pub fn handle_signals() {
     };
 
     let trap_cx = current_trap_cx();
-    let process = current_process();
-
     // Save the current user stack pointer
     let mut user_sp = trap_cx.x[2]; // sp register
 
@@ -143,8 +160,13 @@ pub fn handle_signals() {
 
     // Construct ucontext_t
     let old_mask = {
-        let inner = process.inner_exclusive_access();
-        inner.signal_mask.bits()
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
+        inner
+            .signal_mask_backup
+            .take()
+            .unwrap_or(inner.signal_mask)
+            .bits()
     };
 
     let mut mcontext = MContext {
@@ -194,7 +216,8 @@ pub fn handle_signals() {
 
     // Apply signal mask during handler execution
     {
-        let mut inner = process.inner_exclusive_access();
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
         // sa_mask 使用 Linux sigset_t bit 布局，可直接转为内核 SignalBit。
         if let Some(new_mask) = SignalBit::from_bits(action.sa_mask) {
             // SA_NODEFER: don't automatically block the signal being handled

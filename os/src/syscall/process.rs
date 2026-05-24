@@ -9,9 +9,9 @@ use crate::{
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
-        add_signal_to_process, current_process, current_task, current_trap_cx,
-        current_user_token, exit_current_and_run_next, ExitReason, ShmAttachment, SignalBit,
-        WaitReason,
+        add_signal_to_process, add_signal_to_task, current_process, current_task, current_trap_cx,
+        current_user_token, exit_current_and_run_next, thread_id2task, ExitReason,
+        ShmAttachment, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -588,23 +588,30 @@ pub fn sys_clone(
     if thread_clone {
         return syscall_body!({
             let parent_task = current_task().unwrap();
-            let (ustack_base, sched_attr, affinity_mask) = {
+            let (ustack_base, sched_attr, affinity_mask, signal_mask) = {
                 let inner = parent_task.inner_exclusive_access();
                 (
                     inner.res.as_ref().unwrap().ustack_base(),
                     inner.sched_attr(),
                     inner.sched.cpu_affinity_mask,
+                    inner.signal_mask,
                 )
             };
             let inherited_cx = *current_trap_cx();
             let new_task = current_process.create_task(ustack_base, true, sched_attr);
+            let new_tid = new_task
+                .inner_exclusive_access()
+                .res
+                .as_ref()
+                .unwrap()
+                .thread_id() as i32;
             {
                 let mut new_inner = new_task.inner_exclusive_access();
                 new_inner.sched.cpu_affinity_mask = affinity_mask;
+                new_inner.signal_mask = signal_mask;
                 if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
                     new_inner.clear_child_tid = child_tid;
                 }
-                let new_tid = new_inner.res.as_ref().unwrap().tid as i32;
                 let trap_cx = new_inner.get_trap_cx();
                 *trap_cx = inherited_cx;
                 trap_cx.kernel_sp = new_task.kstack.get_top();
@@ -622,10 +629,9 @@ pub fn sys_clone(
                     write_pod_to_user(ptr as *mut i32, &new_tid)?;
                 }
             }
-            let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid as isize;
             current_process.attach_task(Arc::clone(&new_task));
             add_task(new_task);
-            Ok(new_tid)
+            Ok(new_tid as isize)
         });
     }
     syscall_body!({
@@ -778,8 +784,11 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 
             // If woken by a deliverable user-handled signal, return EINTR so the trap handler can dispatch it.
             {
+                let task = current_task().unwrap();
                 let inner = process.inner_exclusive_access();
-                let pending_unmasked = inner.pending_signals & !inner.signal_mask;
+                let task_inner = task.inner_exclusive_access();
+                let pending_unmasked =
+                    (task_inner.pending_signals | inner.pending_signals) & !task_inner.signal_mask;
                 let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
                     let Some(flag) = SignalBit::from_signum(signum as u32) else { return false; };
                     if !pending_unmasked.contains(flag) {
@@ -821,16 +830,14 @@ pub fn sys_tkill(tid: usize, signal: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let process = current_process();
-        let target_exists = {
-            let inner = process.inner_exclusive_access();
-            tid < inner.tasks.len() && inner.tasks[tid].is_some()
-        };
-        if !target_exists {
+        let task = thread_id2task(tid).or_errno(ERRNO::ESRCH)?;
+        if task.process.upgrade().unwrap().getpid()
+            != current_task().unwrap().process.upgrade().unwrap().getpid()
+        {
             return Err(ERRNO::ESRCH);
         }
         let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
-        add_signal_to_process(&process, flag);
+        add_signal_to_task(&task, flag);
         Ok(0)
     })
 }
@@ -844,16 +851,13 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let process = pid2process(tgid).or_errno(ERRNO::ESRCH)?;
-        let target_exists = {
-            let inner = process.inner_exclusive_access();
-            tid < inner.tasks.len() && inner.tasks[tid].is_some()
-        };
-        if !target_exists {
+        let task = thread_id2task(tid).or_errno(ERRNO::ESRCH)?;
+        let process = task.process.upgrade().unwrap();
+        if process.getpid() != tgid {
             return Err(ERRNO::ESRCH);
         }
         let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
-        add_signal_to_process(&process, flag);
+        add_signal_to_task(&task, flag);
         Ok(0)
     })
 }

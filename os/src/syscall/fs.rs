@@ -201,9 +201,12 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
 }
 
 fn has_unmasked_pending_signal() -> bool {
+    let task = current_task().unwrap();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let pending = inner.pending_signals & !inner.signal_mask;
+    let mut process_inner = process.inner_exclusive_access();
+    let mut task_inner = task.inner_exclusive_access();
+    let thread_pending = task_inner.pending_signals;
+    let pending = (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask;
 
     for signum in 1..=crate::task::MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {
@@ -213,13 +216,22 @@ fn has_unmasked_pending_signal() -> bool {
             continue;
         }
 
-        let action = inner.signal_actions.table[signum];
+        let from_thread = thread_pending.contains(flag);
+        let action = process_inner.signal_actions.table[signum];
         if action.handler == SIG_IGN {
-            inner.pending_signals &= !flag;
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
+            }
             continue;
         }
         if action.handler == SIG_DFL && flag.check_error().is_none() {
-            inner.pending_signals &= !flag;
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
+            }
             continue;
         }
         return true;
@@ -277,8 +289,8 @@ fn apply_temp_signal_mask(
         let new_mask_bits = read_pod_from_user(sigmask as *const u32)?;
         SignalBit::from_user_bits(new_mask_bits as u64)
     };
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
     let old = inner.signal_mask;
     inner.signal_mask = new_mask;
     Ok(Some(old))
@@ -286,7 +298,7 @@ fn apply_temp_signal_mask(
 
 fn restore_temp_signal_mask(old_mask: Option<SignalBit>) {
     if let Some(old) = old_mask {
-        current_process().inner_exclusive_access().signal_mask = old;
+        current_task().unwrap().inner_exclusive_access().signal_mask = old;
     }
 }
 
