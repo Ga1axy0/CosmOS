@@ -14,7 +14,7 @@
 
 mod context;
 
-use crate::config::TRAMPOLINE;
+use crate::config::{PAGE_SIZE, TRAMPOLINE};
 use crate::hart::hartid;
 use crate::mm::{handle_ipi, PageFaultAccess};
 use crate::signal::{SignalBit, handle_signals};
@@ -175,12 +175,11 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::UserEnvCall) => {
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
+            let syscall_id = cx.x[17];
+            let syscall_args = [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]];
             cx.sepc += 4;
             // get system call return value
-            let result = syscall(
-                cx.x[17],
-                [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
-            );
+            let result = syscall(syscall_id, syscall_args);
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
             cx.x[10] = result as usize;
@@ -191,9 +190,10 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            if !current_process().handle_private_cow_fault(stval)
-                && !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Write)
-            {
+            let process = current_process();
+            let handled = process.handle_private_cow_fault(stval)
+                || process.handle_lazy_heap_fault(stval, PageFaultAccess::Write);
+            if !handled {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
                     Ok(()) => {}
                     Err(ERRNO::ENXIO) => {
@@ -204,6 +204,19 @@ pub fn trap_handler() -> ! {
                         log_user_fault("store page fault", "write", stval, "SIGSEGV");
                         current_add_signal(SignalBit::SIGSEGV);
                     }
+                }
+            } else if process.exec_path().ends_with("entry-static.exe") {
+                let start_brk = {
+                    let inner = process.inner_exclusive_access();
+                    inner.vm_layout.start_brk
+                };
+                let tls_page = start_brk & !(PAGE_SIZE - 1);
+                if (stval & !(PAGE_SIZE - 1)) == tls_page {
+                    debug!(
+                        "[entry-static errno] store fault mapped tls page: fault_addr={:#x} tls_page={:#x}",
+                        stval,
+                        tls_page
+                    );
                 }
             }
         }

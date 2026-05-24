@@ -72,6 +72,18 @@ pub enum ExitReason {
     Signal(u32),
 }
 
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+enum Auxv {
+    Phdr = 3,     // program headers for program
+    Phent = 4,    // size of program header entry
+    Phnum = 5,    // number of program header entries
+    Pagesz = 6,   // system page size
+    Base = 7,     // base address of interpreter
+    Entry = 9,    // entry point of program
+    Random = 25,  // address of 16 random bytes
+}
+
 /// Process Control Block
 pub struct ProcessControlBlock {
     /// immutable
@@ -274,7 +286,7 @@ fn init_user_stack_from_strings(
     stack_top: usize,
     args: &[String],
     envs: &[String],
-    auxv_extra: &[(usize, usize)],
+    auxv_extra: &[(Auxv, usize)],
 ) -> usize {
     let mut user_sp = stack_top;
 
@@ -325,7 +337,7 @@ fn init_user_stack_from_strings(
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(token, user_sp as *mut usize).unwrap() = val;
         user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(token, user_sp as *mut usize).unwrap() = tag;
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = tag as usize;
     }
     for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
         user_sp -= core::mem::size_of::<usize>();
@@ -701,18 +713,27 @@ impl ProcessControlBlock {
 
             // 构造auxv：告诉动态链接器原程序的信息
             let auxv_extra = vec![
-                (3usize, app_load_info.phdr_vaddr),  // AT_PHDR
-                (4usize, app_load_info.phent_size),  // AT_PHENT
-                (5usize, app_load_info.phnum),       // AT_PHNUM
-                (9usize, app_load_info.entry_point), // AT_ENTRY
-                (7usize, interp_base),               // AT_BASE - 动态链接器实际加载的基地址
+                (Auxv::Phdr, app_load_info.phdr_vaddr),  // AT_PHDR
+                (Auxv::Phent, app_load_info.phent_size),  // AT_PHENT
+                (Auxv::Phnum, app_load_info.phnum),       // AT_PHNUM
+                (Auxv::Pagesz, crate::config::PAGE_SIZE),     // AT_PAGESZ
+                (Auxv::Base, interp_base),               // AT_BASE - 动态链接器实际加载的基地址
+                (Auxv::Entry, app_load_info.entry_point), // AT_ENTRY
             ];
 
             (relocated_entry, auxv_extra)
         } else {
             // 静态链接程序
             debug!("Static linking, using application entry directly");
-            (app_load_info.entry_point, vec![])
+            debug!("App PHDR vaddr: {:#x}, phnum: {}", app_load_info.phdr_vaddr, app_load_info.phnum);
+            let auxv_extra = vec![
+                (Auxv::Phdr, app_load_info.phdr_vaddr),  // AT_PHDR
+                (Auxv::Phent, app_load_info.phent_size),  // AT_PHENT
+                (Auxv::Phnum, app_load_info.phnum),       // AT_PHNUM
+                (Auxv::Pagesz, crate::config::PAGE_SIZE),     // AT_PAGESZ
+                (Auxv::Entry, app_load_info.entry_point), // AT_ENTRY
+            ];
+            (app_load_info.entry_point, auxv_extra)
         };
 
         let ustack_base = user_layout.ustack_base;
@@ -1361,6 +1382,13 @@ impl ProcessControlBlock {
                 || new_brk >= inner.vm_layout.mmap_base
                 || new_brk >= inner.vm_layout.start_stack
             {
+                warn!(
+                    "set_program_brk: FAILED at range check: start_brk={:#x}, mmap_base={:#x}, start_stack={:#x}, new_brk={:#x}",
+                    inner.vm_layout.start_brk,
+                    inner.vm_layout.mmap_base,
+                    inner.vm_layout.start_stack,
+                    new_brk
+                );
                 return old_brk;
             }
             if new_brk == old_brk {
@@ -1376,6 +1404,7 @@ impl ProcessControlBlock {
             if new_end_vpn > old_end_vpn {
                 let additional = (new_end_vpn.0 - old_end_vpn.0) * PAGE_SIZE;
                 if inner.ensure_address_space_capacity(additional).is_err() {
+                    warn!("set_program_brk: FAILED at ensure address space capacity");
                     return old_brk;
                 }
             }
@@ -1388,6 +1417,7 @@ impl ProcessControlBlock {
                         MapPermission::R | MapPermission::W | MapPermission::U,
                     ));
                 if !success {
+                    warn!("set_program_brk: FAILED at append metadata to heap ({:#x} -> {:#x})", old_brk, new_brk);
                     return old_brk;
                 }
             } else if new_brk == inner.vm_layout.start_brk {
@@ -1396,6 +1426,7 @@ impl ProcessControlBlock {
                     .remove_vma_with_start_vpn_user_deferred(heap_start.floor()));
             } else if old_end_vpn != new_end_vpn {
                 let Some(shrink_batch) = inner.memory_set.shrink_to_deferred(heap_start, new_brk_va) else {
+                    warn!("set_program_brk: FAILED at shrink to deferred");
                     return old_brk;
                 };
                 batch = Some(shrink_batch);

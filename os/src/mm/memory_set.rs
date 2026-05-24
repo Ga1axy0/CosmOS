@@ -20,6 +20,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::Inode;
@@ -155,6 +156,21 @@ pub fn invalidate_inode_mappings_after_truncate(inode: &Arc<Inode>, new_size: us
 fn align_up(value: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
     value.checked_add(align - 1).map(|v| v & !(align - 1))
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx > 0 {
+            if idx % 16 == 0 {
+                out.push_str(" | ");
+            } else {
+                out.push(' ');
+            }
+        }
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
 }
 
 /// address space
@@ -710,9 +726,10 @@ impl MemorySet {
 
         for i in 0..ph_count {
             let ph = elf.program_header(i).map_err(|_| ERRNO::ENOEXEC)?;
+            let ph_type = ph.get_type().map_err(|_| ERRNO::ENOEXEC)?;
 
             // 检查 INTERP 段
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+            if ph_type == xmas_elf::program::Type::Interp {
                 debug!("Found INTERP segment in ELF program header");
                 let offset = ph.offset() as usize;
                 let size = ph.file_size() as usize;
@@ -727,7 +744,7 @@ impl MemorySet {
                 }
             }
 
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+            if ph_type == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
 
@@ -1076,6 +1093,11 @@ impl MemorySet {
         let Some(old_end) = self.vmas.get(&start_vpn).map(|vma| vma.end_vpn()) else {
             return false;
         };
+        // `brk` 增长到恰好页边界时，页粒度的 VMA 上界并不会变化；
+        // 这种情况下应视为成功的 no-op，而不是误判为区间非法。
+        if new_end_vpn == old_end {
+            return true;
+        }
         if self.overlaps_vma_range(old_end, new_end_vpn) {
             return false;
         }
