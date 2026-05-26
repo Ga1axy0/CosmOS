@@ -12,7 +12,12 @@ use lazy_static::lazy_static;
 const DEADLOCK_DETECTED: isize = -0xDEAD;
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
+const FUTEX_WAIT_BITSET: i32 = 9;
+const FUTEX_WAKE_BITSET: i32 = 10;
 const FUTEX_CMD_MASK: i32 = 0x7f;
+const FUTEX_PRIVATE_FLAG: i32 = 128;
+const FUTEX_CLOCK_REALTIME: i32 = 256;
+const FUTEX_BITSET_MATCH_ANY: i32 = -1;
 
 lazy_static! {
     static ref FUTEX_QUEUES: crate::sync::SpinNoIrqLock<HashMap<usize, Arc<WaitQueue>>> =
@@ -45,14 +50,32 @@ pub(crate) fn futex_wake_addr(uaddr: usize, max_count: usize) -> isize {
     queue.map(|q| q.wake_up_to(max_count) as isize).unwrap_or(0)
 }
 
+fn futex_wait_addr(uaddr: *const i32, expected: i32) -> Result<isize, ERRNO> {
+    let current = read_pod_from_user(uaddr)?;
+    if current != expected {
+        return Err(ERRNO::EAGAIN);
+    }
+    let queue = futex_queue(uaddr as usize);
+    queue.wait_with_reason_or_skip(WaitReason::Futex, || {
+        read_pod_from_user(uaddr)
+            .map(|current| current != expected)
+            .unwrap_or(true)
+    });
+    if crate::signal::has_unmasked_pending_signal() {
+        debug!("futex_wait_addr: interrupted by signal");
+        return Err(ERRNO::EINTR);
+    }
+    Ok(0)
+}
+
 /// Minimal Linux futex syscall implementation for pthread wait/wake paths.
 pub fn sys_futex(
     uaddr: *const i32,
     op: i32,
     val: i32,
-    _timeout: usize,
+    timeout: usize,
     _uaddr2: usize,
-    _val3: i32,
+    val3: i32,
 ) -> isize {
     trace!(
         "kernel:pid[{}] tid[{}] sys_futex",
@@ -64,23 +87,64 @@ pub fn sys_futex(
             return Err(ERRNO::EINVAL);
         }
         match op & FUTEX_CMD_MASK {
-            FUTEX_WAIT => {
-                let expected = val;
-                let current = read_pod_from_user(uaddr)?;
-                if current != expected {
-                    return Err(ERRNO::EAGAIN);
-                }
-                let queue = futex_queue(uaddr as usize);
-                queue.wait_with_reason_or_skip(WaitReason::Futex, || {
-                    read_pod_from_user(uaddr)
-                        .map(|current| current != expected)
-                        .unwrap_or(true)
-                });
-                Ok(0)
-            }
+            FUTEX_WAIT => futex_wait_addr(uaddr, val),
             FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
+            FUTEX_WAIT_BITSET => {
+                let flags = op & !FUTEX_CMD_MASK;
+                if val3 != FUTEX_BITSET_MATCH_ANY {
+                    warn!(
+                        "Unsupported futex WAIT_BITSET mask: op={:#x} bitset={:#x}",
+                        op,
+                        val3
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if timeout != 0 {
+                    warn!(
+                        "Unsupported futex WAIT_BITSET timeout: op={:#x} timeout={:#x}",
+                        op,
+                        timeout
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                let supported_flags = FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME;
+                if flags & !supported_flags != 0 {
+                    warn!(
+                        "Unsupported futex WAIT_BITSET flags: op={:#x} flags={:#x}",
+                        op,
+                        flags
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                futex_wait_addr(uaddr, val)
+            }
+            FUTEX_WAKE_BITSET => {
+                let flags = op & !FUTEX_CMD_MASK;
+                if val3 != FUTEX_BITSET_MATCH_ANY {
+                    warn!(
+                        "Unsupported futex WAKE_BITSET mask: op={:#x} bitset={:#x}",
+                        op,
+                        val3
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if flags & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0 {
+                    warn!(
+                        "Unsupported futex WAKE_BITSET flags: op={:#x} flags={:#x}",
+                        op,
+                        flags
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize))
+            }
             _ => {
-                warn!("Unsupported futex op: {}", op);
+                warn!(
+                    "Unsupported futex op: raw={:#x} cmd={} flags={:#x}",
+                    op,
+                    op & FUTEX_CMD_MASK,
+                    op & !FUTEX_CMD_MASK
+                );
                 Err(ERRNO::EINVAL)
             },
         }

@@ -1,5 +1,5 @@
     .section .text.entry
-    .equ BOOT_STACK_SHIFT, 18
+    .equ BOOT_STACK_SHIFT, 20
     .equ BOOT_STACK_SIZE, 1 << BOOT_STACK_SHIFT
     .equ BOOT_STACK_HARTS, 8
 

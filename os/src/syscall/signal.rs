@@ -332,14 +332,15 @@ pub fn sys_sigreturn() -> isize {
 
         debug!(
             "sys_sigreturn: restoring context from {:#x}, sigmask={:#x}",
-            ucontext_ptr, ucontext.uc_sigmask
+            ucontext_ptr,
+            ucontext.uc_sigmask.low_bits()
         );
 
         // Restore signal mask
         {
             let task = current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            let mask = SignalBit::from_user_bits(ucontext.uc_sigmask);
+            let mask = SignalBit::from_user_bits(ucontext.uc_sigmask.low_bits());
             inner.signal_mask = mask;
             inner.signal_mask_backup = None;
             debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
@@ -348,15 +349,18 @@ pub fn sys_sigreturn() -> isize {
         // Restore registers from mcontext
         let mcontext = &ucontext.uc_mcontext;
 
-        // Restore ALL registers from saved context, including ra
-        trap_cx.x.copy_from_slice(&mcontext.gregs);
+        trap_cx.x[0] = 0;
+        trap_cx.x[1..].copy_from_slice(&mcontext.gregs[1..]);
+        trap_cx.sepc = mcontext.gregs[0];
 
-        // Restore sepc (program counter)
-        trap_cx.sepc = mcontext.pc;
+        debug!(
+            "sys_sigreturn: restored sepc={:#x}, a0={:#x}",
+            trap_cx.sepc, trap_cx.x[10]
+        );
 
         // Restore floating-point registers
-        trap_cx.f.copy_from_slice(&mcontext.fpregs);
-        trap_cx.fcsr = mcontext.fcsr;
+        trap_cx.f.copy_from_slice(&mcontext.fpstate.fpregs);
+        trap_cx.fcsr = mcontext.fpstate.fcsr as usize;
 
         // Return the original a0 value (which was saved in the trap context)
         Ok(trap_cx.x[10] as isize)
@@ -476,9 +480,10 @@ pub fn sys_rt_sigtimedwait_time32(
         let deadline = timeout_ms_to_deadline(timeout_ms)?;
 
         loop {
-            if let Some(signum) = crate::signal::take_pending_signal_in_set(signal_set) {
+            if let Some((signum, siginfo)) = crate::signal::take_pending_signal_in_set(signal_set)
+            {
                 if !uinfo.is_null() {
-                    write_pod_to_user(uinfo, &SigInfo::new(signum))?;
+                    write_pod_to_user(uinfo, &siginfo)?;
                 }
                 return Ok(signum as isize);
             }

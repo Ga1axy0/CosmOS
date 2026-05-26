@@ -2,7 +2,7 @@
 
 use crate::sync::SpinNoIrqLock;
 use crate::sched::pid2process;
-use crate::task::{current_process, wakeup_task, SignalBit, TaskControlBlock};
+use crate::task::{current_process, wakeup_task, SigInfo, SignalBit, TaskControlBlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
@@ -284,7 +284,7 @@ pub(crate) fn has_unmasked_pending_signal() -> bool {
     !((task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask).is_empty()
 }
 
-pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<i32> {
+pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<(i32, SigInfo)> {
     let task = crate::task::current_task().unwrap();
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
@@ -296,12 +296,14 @@ pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<i32> {
             continue;
         };
         if thread_pending.contains(flag) {
+            let siginfo = task_inner.pending_siginfo[signum];
             task_inner.pending_signals &= !flag;
-            return Some(signum as i32);
+            return Some((signum as i32, siginfo));
         }
         if process_pending.contains(flag) {
+            let siginfo = process_inner.pending_siginfo[signum];
             process_inner.pending_signals &= !flag;
-            return Some(signum as i32);
+            return Some((signum as i32, siginfo));
         }
     }
     None

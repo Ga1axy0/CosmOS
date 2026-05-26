@@ -295,11 +295,33 @@ pub fn current_process_is_zombie() -> bool {
     process_inner.is_zombie
 }
 
+fn first_signum_in_set(signal: SignalBit) -> Option<usize> {
+    for signum in 1..=MAX_SIG {
+        let Some(flag) = SignalBit::from_signum(signum as u32) else {
+            continue;
+        };
+        if signal.contains(flag) {
+            return Some(signum);
+        }
+    }
+    None
+}
+
 /// Add signal to target process.
 ///
 /// When the delivered signal introduces a **newly pending and unmasked** bit,
 /// proactively wake poll waiters of this process so `ppoll` can return `EINTR`.
 pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalBit) {
+    let signum = first_signum_in_set(signal).map(|num| num as i32).unwrap_or_default();
+    add_signal_to_process_with_siginfo(process, signal, SigInfo::for_kernel(signum));
+}
+
+/// Add signal to target process with explicit siginfo metadata.
+pub fn add_signal_to_process_with_siginfo(
+    process: &Arc<ProcessControlBlock>,
+    signal: SignalBit,
+    siginfo: SigInfo,
+) {
     let (pid, newly_pending, tasks) = {
         let mut process_inner = process.inner_exclusive_access();
         let tasks = process_inner
@@ -309,6 +331,9 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalB
             .collect::<Vec<_>>();
         let newly_pending = signal & !process_inner.pending_signals;
         process_inner.pending_signals |= signal;
+        if let Some(signum) = first_signum_in_set(signal) {
+            process_inner.pending_siginfo[signum] = siginfo;
+        }
         (process.getpid(), newly_pending, tasks)
     };
 
@@ -336,12 +361,25 @@ pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalB
 
 /// Add one pending signal directly to a specific thread.
 pub fn add_signal_to_task(task: &Arc<TaskControlBlock>, signal: SignalBit) {
+    let signum = first_signum_in_set(signal).map(|num| num as i32).unwrap_or_default();
+    add_signal_to_task_with_siginfo(task, signal, SigInfo::for_kernel(signum));
+}
+
+/// Add one pending signal directly to a specific thread with explicit siginfo.
+pub fn add_signal_to_task_with_siginfo(
+    task: &Arc<TaskControlBlock>,
+    signal: SignalBit,
+    siginfo: SigInfo,
+) {
     let process = task.process.upgrade().unwrap();
     let pid = process.getpid();
     let newly_unmasked = {
         let mut task_inner = task.inner_exclusive_access();
         let newly_pending = signal & !task_inner.pending_signals;
         task_inner.pending_signals |= signal;
+        if let Some(signum) = first_signum_in_set(signal) {
+            task_inner.pending_siginfo[signum] = siginfo;
+        }
         newly_pending & !task_inner.signal_mask
     };
 
