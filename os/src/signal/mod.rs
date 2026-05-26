@@ -10,8 +10,8 @@ mod action;
 mod signals;
 mod wait;
 
-pub use action::{MContext, SigInfo, StackT, UContext, SignalAction, SignalActions};
-pub use signals::{SignalBit, SignalNum, FIRST_RT_SIG, LAST_RT_SIG, MAX_SIG, SIGCANCEL};
+pub use action::{FpState, MContext, SigInfo, SigSetT, StackT, UContext, SignalAction, SignalActions};
+pub use signals::{SignalBit, SignalNum, FIRST_RT_SIG, LAST_RT_SIG, MAX_SIG};
 pub(crate) use wait::{
     cleanup_signal_wait, cleanup_signal_wait_for_task, handle_signal_wait_timeout,
     has_pending_signal_in_set, has_unmasked_pending_signal, notify_signal_wait_pid,
@@ -47,9 +47,9 @@ pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 
 /// Check and handle non-fatal signals for the current process.
-/// Returns Some((signum, action)) if a signal needs to be handled by user handler.
+/// Returns Some((signum, action, siginfo)) if a signal needs to be handled by user handler.
 /// Handles SIG_IGN by clearing the signal, and SIG_DFL by default behavior.
-pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
+pub fn check_signals_of_current() -> Option<(i32, SignalAction, SigInfo)> {
     let task = current_task().unwrap();
     let process = crate::task::current_process();
     let mut process_inner = process.inner_exclusive_access();
@@ -97,16 +97,27 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
 
                 // User-defined handler
                 if action.handler > 1 {
+                    let siginfo = if from_thread {
+                        task_inner.pending_siginfo[signum]
+                    } else {
+                        process_inner.pending_siginfo[signum]
+                    };
                     if from_thread {
                         task_inner.pending_signals &= !flag;
                     } else {
                         process_inner.pending_signals &= !flag;
                     }
                     debug!(
-                        "check_signals: signum={} dispatching to handler={:#x}, flags={:#x}",
-                        signum, action.handler, action.sa_flags
+                        "check_signals: signum={} dispatching to handler={:#x}, flags={:#x}, si_code={}, si_pid={}, si_uid={}, from_thread={}",
+                        signum,
+                        action.handler,
+                        action.sa_flags,
+                        siginfo.si_code,
+                        siginfo.si_pid,
+                        siginfo.si_uid,
+                        from_thread
                     );
-                    return Some((signum as i32, action));
+                    return Some((signum as i32, action, siginfo));
                 }
             }
         }
@@ -127,7 +138,7 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction)> {
 ///   [siginfo_t] (if SA_SIGINFO)
 ///   [ucontext_t] <- aligned sp (this is what sp points to on entry to handler)
 pub fn handle_signals() {
-    let (signum, action) = match check_signals_of_current() {
+    let (signum, action, siginfo) = match check_signals_of_current() {
         Some(signal_info) => signal_info,
         None => return,
     };
@@ -170,16 +181,42 @@ pub fn handle_signals() {
     };
 
     let mut mcontext = MContext {
-        pc: trap_cx.sepc, // Save program counter
         gregs: [0; 32],
-        fpregs: [0; 32],
-        fcsr: 0,
+        fpstate: FpState::default(),
     };
-    // Copy general-purpose registers
-    mcontext.gregs.copy_from_slice(&trap_cx.x);
-    // Copy floating-point registers
-    mcontext.fpregs.copy_from_slice(&trap_cx.f);
-    mcontext.fcsr = trap_cx.fcsr;
+    // riscv64 glibc expects the saved PC in gregs[0], followed by x1..x31.
+    mcontext.gregs[0] = trap_cx.sepc;
+    mcontext.gregs[1..].copy_from_slice(&trap_cx.x[1..]);
+    mcontext.fpstate.fpregs.copy_from_slice(&trap_cx.f);
+    mcontext.fpstate.fcsr = trap_cx.fcsr as u32;
+
+    // Syscall restart: if the signal interrupted a syscall that returned -EINTR
+    // and SA_RESTART is set, back up PC to the ecall instruction and restore
+    // original a0 so the syscall can be restarted after sigreturn.
+    if trap_cx.in_syscall {
+        let result = trap_cx.x[10] as isize;
+        if result == -(crate::syscall::errno::ERRNO::EINTR as isize) {
+            if action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
+                debug!(
+                    "handle_signals: syscall restart: backing up PC from {:#x} to {:#x}, restoring a0 from {:#x} to {:#x}",
+                    mcontext.gregs[0], trap_cx.sepc.wrapping_sub(4),
+                    mcontext.gregs[10], trap_cx.orig_a0
+                );
+                mcontext.gregs[0] = trap_cx.sepc.wrapping_sub(4);
+                mcontext.gregs[10] = trap_cx.orig_a0;
+            }
+        } else {
+            debug!(
+                "handle_signals: in_syscall=true but result={:#x} (not EINTR), no restart",
+                result as usize
+            );
+        }
+    } else {
+        debug!(
+            "handle_signals: in_syscall=false, saved PC={:#x}",
+            mcontext.gregs[0]
+        );
+    }
 
     let ucontext = UContext {
         uc_flags: 0,
@@ -189,7 +226,7 @@ pub fn handle_signals() {
             ss_flags: 0,
             ss_size: 0,
         },
-        uc_sigmask: old_mask,
+        uc_sigmask: SigSetT::from_signal_bits(old_mask),
         uc_mcontext: mcontext,
     };
 
@@ -204,7 +241,6 @@ pub fn handle_signals() {
 
     // Write siginfo if SA_SIGINFO is set
     if action.sa_flags & SaFlags::SA_SIGINFO.bits() != 0 {
-        let siginfo = SigInfo::new(signum);
         if let Err(err) = write_pod_to_user(siginfo_ptr as *mut SigInfo, &siginfo) {
             warn!(
                 "[kernel] handle_signals: failed to write siginfo for signal {}: {:?}",

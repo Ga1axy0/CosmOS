@@ -3,7 +3,7 @@
 
 use super::id::RecycleAllocator;
 use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
-use super::{SignalAction, SignalActions, SignalBit, SIG_IGN};
+use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
 use crate::sched::add_task;
 use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
@@ -137,6 +137,8 @@ pub struct ProcessControlBlockInner {
     pub resource_limits: ResourceLimits,
     /// pending process signals
     pub pending_signals: SignalBit,
+    /// Per-signal metadata paired with `pending_signals`.
+    pub pending_siginfo: [SigInfo; MAX_SIG + 1],
     /// installed signal actions
     pub signal_actions: SignalActions,
     /// tasks(also known as threads)
@@ -546,6 +548,7 @@ impl ProcessControlBlock {
                     fd_table: new_stdio_files(),
                     resource_limits: ResourceLimits::default(),
                     pending_signals: SignalBit::empty(),
+                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -759,6 +762,7 @@ impl ProcessControlBlock {
                 }
             }
             inner.pending_signals = SignalBit::empty();
+            inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
@@ -781,6 +785,7 @@ impl ProcessControlBlock {
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
         task_inner.pending_signals = SignalBit::empty();
+        task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
         //         argv[0..argc-1], NULL
@@ -875,6 +880,7 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
+                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                     signal_actions: parent_signal_actions,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -1012,6 +1018,7 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
+                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),

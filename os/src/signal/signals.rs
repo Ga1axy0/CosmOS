@@ -8,8 +8,6 @@ pub const MAX_SIG: usize = 64;
 pub const FIRST_RT_SIG: usize = 32;
 /// Highest Linux realtime signal number in the kernel-visible range.
 pub const LAST_RT_SIG: usize = MAX_SIG;
-/// libc-internal cancellation signal used by glibc/musl on Linux.
-pub const SIGCANCEL: usize = 33;
 
 const SUPPORTED_SIGNAL_BITS: u64 = u64::MAX;
 

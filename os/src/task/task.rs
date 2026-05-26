@@ -2,7 +2,7 @@
 
 use super::id::TaskUserRes;
 use super::wait_queue::WaitQueueHandle;
-use super::{kstack_alloc, KernelStack, ProcessControlBlock, SignalBit};
+use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
 use crate::config::MAX_HARTS;
 use crate::mm::PhysPageNum;
 use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
@@ -148,6 +148,8 @@ pub struct TaskControlBlockInner {
     pub clear_child_tid: usize,
     /// Signals pending specifically for this thread.
     pub pending_signals: SignalBit,
+    /// Per-signal metadata paired with `pending_signals`.
+    pub pending_siginfo: [SigInfo; MAX_SIG + 1],
     /// Per-thread blocked signal mask.
     pub signal_mask: SignalBit,
     /// Backup of the pre-sigsuspend mask, restored by rt_sigreturn or when no handler runs.
@@ -226,6 +228,7 @@ impl TaskControlBlock {
                 current_wq_handle: None,
                 clear_child_tid: 0,
                 pending_signals: SignalBit::empty(),
+                pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
             }),

@@ -168,6 +168,7 @@ fn handle_reschedule_ipi() {
 pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
     current_process().enter_kernel(get_time());
+    current_trap_cx().in_syscall = false;
     let scause = scause::read();
     let stval = stval::read();
     // trace!("into {:?}", scause.cause());
@@ -177,12 +178,14 @@ pub fn trap_handler() -> ! {
             let mut cx = current_trap_cx();
             let syscall_id = cx.x[17];
             let syscall_args = [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]];
+            cx.orig_a0 = cx.x[10];
             cx.sepc += 4;
             // get system call return value
             let result = syscall(syscall_id, syscall_args);
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
             cx.x[10] = result as usize;
+            cx.in_syscall = true;
         }
         Trap::Exception(Exception::StorePageFault) => {
             debug!(
