@@ -10,7 +10,7 @@ use crate::hart::hartid;
 use crate::poll::{self, PollTimerTag};
 use crate::signal::{handle_signal_wait_timeout, SignalTimerTag};
 use crate::sbi::set_timer;
-use crate::sync::SpinNoIrqLock;
+use crate::sync::{FutexTimerTag, SpinNoIrqLock, handle_futex_wait_timeout};
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
@@ -122,6 +122,7 @@ pub struct TimerCondVar {
 pub(crate) enum TimerTagKind {
     Poll(PollTimerTag),
     Signal(SignalTimerTag),
+    Futex(FutexTimerTag),
 }
 
 impl PartialEq for TimerCondVar {
@@ -182,6 +183,15 @@ pub(crate) fn add_timer_with_signal_tag(
     add_timer_with_tag(expire_ms, task, signal_tag.map(TimerTagKind::Signal));
 }
 
+/// Add a timer with an optional futex wait timeout identity.
+pub(crate) fn add_timer_with_futex_tag(
+    expire_ms: usize,
+    task: Arc<TaskControlBlock>,
+    futex_tag: Option<FutexTimerTag>,
+) {
+    add_timer_with_tag(expire_ms, task, futex_tag.map(TimerTagKind::Futex));
+}
+
 fn add_timer_with_tag(
     expire_ms: usize,
     task: Arc<TaskControlBlock>,
@@ -234,6 +244,11 @@ pub fn check_timer() {
                     }
                     TimerTagKind::Signal(signal_tag) => {
                         if handle_signal_wait_timeout(signal_tag, &timer.task) {
+                            timers.pop();
+                        }
+                    }
+                    TimerTagKind::Futex(futex_tag) => {
+                        if handle_futex_wait_timeout(futex_tag, &timer.task) {
                             timers.pop();
                         }
                     }
