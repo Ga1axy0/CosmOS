@@ -160,7 +160,7 @@ impl Default for SigSetT {
 impl Pod for SigSetT {}
 
 /// Floating-point state area embedded in riscv64 Linux `mcontext_t`.
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct FpState {
     /// 32 double-precision FP registers.

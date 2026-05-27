@@ -373,14 +373,19 @@ pub fn add_signal_to_task_with_siginfo(
 ) {
     let process = task.process.upgrade().unwrap();
     let pid = process.getpid();
-    let newly_unmasked = {
+    let (thread_id, inner_tid, signal_mask_bits, newly_unmasked) = {
         let mut task_inner = task.inner_exclusive_access();
         let newly_pending = signal & !task_inner.pending_signals;
         task_inner.pending_signals |= signal;
         if let Some(signum) = first_signum_in_set(signal) {
             task_inner.pending_siginfo[signum] = siginfo;
         }
-        newly_pending & !task_inner.signal_mask
+        (
+            task_inner.res.as_ref().unwrap().thread_id(),
+            task_inner.res.as_ref().unwrap().tid,
+            task_inner.signal_mask.bits(),
+            newly_pending & !task_inner.signal_mask,
+        )
     };
 
     crate::signal::notify_signal_wait_task(task, signal.bits());
