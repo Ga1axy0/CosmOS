@@ -6,8 +6,9 @@ use super::{
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
 use alloc::{
-    collections::{VecDeque},
+    collections::VecDeque,
     sync::Arc,
+    vec::Vec,
 };
 use hashbrown::HashMap;
 
@@ -32,6 +33,10 @@ impl WaitQueueHandle {
     /// and then calling `wakeup_task`.
     pub fn wake_waiter(&self, task: &Arc<TaskControlBlock>) {
         (self.wake_fn)(self.ptr, task);
+    }
+
+    fn points_to(&self, ptr: *const ()) -> bool {
+        self.ptr == ptr
     }
 }
 
@@ -136,8 +141,96 @@ impl WaitQueue {
         }
     }
 
+    /// Wake some waiters from this queue and requeue the rest onto `dst`.
+    pub fn wake_and_requeue(
+        &self,
+        dst: &WaitQueue,
+        wake_count: usize,
+        requeue_count: usize,
+    ) -> usize {
+        if core::ptr::eq(self, dst) {
+            return self.wake_up_to(wake_count);
+        }
+
+        let src_ptr = self as *const Self as usize;
+        let dst_ptr = dst as *const Self as usize;
+        let dst_handle = dst.to_handle();
+        let mut wake_list = Vec::new();
+        let mut requeue_list = Vec::new();
+
+        if src_ptr < dst_ptr {
+            let mut src_queue = self.queue.lock();
+            let mut dst_queue = dst.queue.lock();
+            Self::collect_wake_and_requeue(
+                &mut src_queue,
+                &mut dst_queue,
+                &dst_handle,
+                wake_count,
+                requeue_count,
+                &mut wake_list,
+                &mut requeue_list,
+            );
+        } else {
+            let mut dst_queue = dst.queue.lock();
+            let mut src_queue = self.queue.lock();
+            Self::collect_wake_and_requeue(
+                &mut src_queue,
+                &mut dst_queue,
+                &dst_handle,
+                wake_count,
+                requeue_count,
+                &mut wake_list,
+                &mut requeue_list,
+            );
+        }
+
+        let moved = wake_list.len() + requeue_list.len();
+
+        for task in wake_list {
+            wakeup_task(task);
+        }
+
+        moved
+    }
+
+    fn collect_wake_and_requeue(
+        src_queue: &mut VecDeque<Arc<TaskControlBlock>>,
+        dst_queue: &mut VecDeque<Arc<TaskControlBlock>>,
+        dst_handle: &WaitQueueHandle,
+        wake_count: usize,
+        requeue_count: usize,
+        wake_list: &mut Vec<Arc<TaskControlBlock>>,
+        requeue_list: &mut Vec<Arc<TaskControlBlock>>,
+    ) {
+        for _ in 0..wake_count {
+            let Some(task) = src_queue.pop_front() else {
+                break;
+            };
+            wake_list.push(task);
+        }
+
+        for _ in 0..requeue_count {
+            let Some(task) = src_queue.pop_front() else {
+                break;
+            };
+            task.inner_exclusive_access().current_wq_handle = Some(dst_handle.clone());
+            dst_queue.push_back(task.clone());
+            requeue_list.push(task);
+        }
+    }
+
     /// Remove this specific task from the queue and wake it.
     pub fn wake_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
+        let current_handle = {
+            let task_inner = task.inner_exclusive_access();
+            task_inner.current_wq_handle.clone()
+        };
+        if let Some(handle) = current_handle {
+            if !handle.points_to(self as *const Self as *const ()) {
+                handle.wake_waiter(task);
+                return;
+            }
+        }
         let task_ptr = Arc::as_ptr(task);
         self.queue.lock().retain(|t| Arc::as_ptr(t) != task_ptr);
         wakeup_task(task.clone());

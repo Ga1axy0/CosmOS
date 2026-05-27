@@ -12,6 +12,7 @@ use lazy_static::lazy_static;
 const DEADLOCK_DETECTED: isize = -0xDEAD;
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
+const FUTEX_REQUEUE: i32 = 3;
 const FUTEX_WAIT_BITSET: i32 = 9;
 const FUTEX_WAKE_BITSET: i32 = 10;
 const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -62,7 +63,6 @@ fn futex_wait_addr(uaddr: *const i32, expected: i32) -> Result<isize, ERRNO> {
             .unwrap_or(true)
     });
     if crate::signal::has_unmasked_pending_signal() {
-        debug!("futex_wait_addr: interrupted by signal");
         return Err(ERRNO::EINTR);
     }
     Ok(0)
@@ -74,7 +74,7 @@ pub fn sys_futex(
     op: i32,
     val: i32,
     timeout: usize,
-    _uaddr2: usize,
+    uaddr2: usize,
     val3: i32,
 ) -> isize {
     trace!(
@@ -89,6 +89,29 @@ pub fn sys_futex(
         match op & FUTEX_CMD_MASK {
             FUTEX_WAIT => futex_wait_addr(uaddr, val),
             FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
+            FUTEX_REQUEUE => {
+                let flags = op & !FUTEX_CMD_MASK;
+                if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0
+                {
+                    warn!(
+                        "Unsupported futex REQUEUE target: op={:#x} uaddr2={:#x}",
+                        op,
+                        uaddr2
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if flags & !FUTEX_PRIVATE_FLAG != 0 {
+                    warn!(
+                        "Unsupported futex REQUEUE flags: op={:#x} flags={:#x}",
+                        op,
+                        flags
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                let src = futex_queue(uaddr as usize);
+                let dst = futex_queue(uaddr2);
+                Ok(src.wake_and_requeue(&dst, val.max(0) as usize, timeout) as isize)
+            }
             FUTEX_WAIT_BITSET => {
                 let flags = op & !FUTEX_CMD_MASK;
                 if val3 != FUTEX_BITSET_MATCH_ANY {

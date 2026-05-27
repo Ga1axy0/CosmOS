@@ -831,9 +831,8 @@ pub fn sys_tkill(tid: usize, signal: u32) -> isize {
     );
     syscall_body!({
         let task = thread_id2task(tid).or_errno(ERRNO::ESRCH)?;
-        if task.process.upgrade().unwrap().getpid()
-            != current_task().unwrap().process.upgrade().unwrap().getpid()
-        {
+        let process = task.process.upgrade().unwrap();
+        if process.getpid() != current_task().unwrap().process.upgrade().unwrap().getpid() {
             return Err(ERRNO::ESRCH);
         }
         let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
