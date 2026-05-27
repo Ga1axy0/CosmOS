@@ -336,11 +336,11 @@ use signal::*;
 use times::*;
 use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
-pub(crate) use sync::futex_wake_addr;
 pub(crate) use utils::{
     read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
 };
+pub use times::Timespec;
 
 
 use crate::{fs::Stat, net::SockAddrIn, syscall::errno::ERRNO};

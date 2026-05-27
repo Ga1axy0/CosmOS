@@ -121,14 +121,28 @@ impl WaitQueue {
 
     /// Wake up to `limit` waiters and return the number actually woken.
     pub fn wake_up_to(&self, limit: usize) -> usize {
+        self.wake_up_to_with(limit, |_| {})
+    }
+
+    /// Wake up to `limit` waiters and run a callback before each wakeup.
+    pub fn wake_up_to_with<F>(&self, limit: usize, mut on_wake: F) -> usize
+    where
+        F: FnMut(&Arc<TaskControlBlock>),
+    {
         let mut queue = self.queue.lock();
+        let mut wake_list = Vec::new();
         let mut count = 0;
         while count < limit {
             let Some(task) = queue.pop_front() else {
                 break;
             };
-            wakeup_task(task);
+            wake_list.push(task);
             count += 1;
+        }
+        drop(queue);
+        for task in wake_list {
+            on_wake(&task);
+            wakeup_task(task);
         }
         count
     }
@@ -148,8 +162,23 @@ impl WaitQueue {
         wake_count: usize,
         requeue_count: usize,
     ) -> usize {
+        self.wake_and_requeue_with(dst, wake_count, requeue_count, |_| {})
+    }
+
+    /// Wake some waiters from this queue, running a callback before wakeup,
+    /// and requeue the rest onto `dst`.
+    pub fn wake_and_requeue_with<F>(
+        &self,
+        dst: &WaitQueue,
+        wake_count: usize,
+        requeue_count: usize,
+        mut on_wake: F,
+    ) -> usize
+    where
+        F: FnMut(&Arc<TaskControlBlock>),
+    {
         if core::ptr::eq(self, dst) {
-            return self.wake_up_to(wake_count);
+            return self.wake_up_to_with(wake_count, on_wake);
         }
 
         let src_ptr = self as *const Self as usize;
@@ -187,6 +216,7 @@ impl WaitQueue {
         let moved = wake_list.len() + requeue_list.len();
 
         for task in wake_list {
+            on_wake(&task);
             wakeup_task(task);
         }
 

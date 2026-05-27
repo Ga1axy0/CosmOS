@@ -83,7 +83,9 @@ impl Pod for RUsage {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Timespec {
+    /// second
     pub tv_sec: usize,
+    /// nanosecond
     pub tv_nsec: usize,
 }
 

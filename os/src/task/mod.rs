@@ -23,7 +23,9 @@ use crate::sched::{
 use crate::fs::{open_file, OpenFlags};
 use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
-use crate::syscall::{futex_wake_addr, write_pod_to_process_user};
+use crate::signal::cleanup_signal_wait_for_task;
+use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
+use crate::syscall::write_pod_to_process_user;
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::remove_timer;
@@ -88,6 +90,9 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let _ = write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32);
         let _ = futex_wake_addr(clear_child_tid, 1);
     }
+    cleanup_signal_wait_for_task(&task);
+    cleanup_futex_wait_for_task(&task);
+    remove_timer(Arc::clone(&task));
     remove_from_tid2task(thread_id);
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
@@ -420,7 +425,8 @@ pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
 /// the inactive(blocked) tasks are removed when the PCB is deallocated.(called by exit_current_and_run_next)
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_task(Arc::clone(&task));
-    crate::signal::cleanup_signal_wait_for_task(&task);
+    cleanup_signal_wait_for_task(&task);
+    cleanup_futex_wait_for_task(&task);
     trace!("kernel: remove_inactive_task .. remove_timer");
     remove_timer(Arc::clone(&task));
 }
