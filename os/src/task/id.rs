@@ -3,7 +3,7 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{
-    defer_release, flush_deferred, has_deferred, online_mask, DeferredUserReclaim,
+    defer_release, deferred_kstack_id_count, flush_deferred, online_mask, DeferredUserReclaim,
     MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{SpinNoIrqLock};
@@ -55,6 +55,9 @@ lazy_static! {
     static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
 }
 
+/// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
+const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 128;
+
 /// The idle task's pid is 0
 pub const IDLE_PID: usize = 0;
 
@@ -99,7 +102,7 @@ pub struct KernelStack(pub usize);
 
 /// Allocate a kernel stack for a task
 pub fn kstack_alloc() -> KernelStack {
-    if has_deferred() {
+    if deferred_kstack_id_count() > KSTACK_DEFERRED_RECYCLE_WATERMARK {
         flush_deferred(online_mask());
     }
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
