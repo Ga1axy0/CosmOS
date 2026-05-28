@@ -2,7 +2,7 @@ use crate::signal::{SigInfo, SignalWaitHandle, SignalWakeState, register_signal_
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::task::UContext;
 use crate::{
-    mm::translated_ref,
+    mm::{PageFaultAccess, VirtAddr, translated_ref},
     syscall_body,
     task::{
         block_current_and_run_next, current_process, current_task, current_user_token,
@@ -151,6 +151,22 @@ impl From<SignalAction> for UserSigAction {
     }
 }
 
+fn is_valid_signal_handler_address(handler: usize) -> bool {
+    if handler == crate::task::SIG_DFL || handler == crate::task::SIG_IGN {
+        return true;
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let Some(vma) = inner
+        .memory_set
+        .find_vma_containing(VirtAddr::from(handler).floor())
+    else {
+        return false;
+    };
+    vma.allows_fault_access(PageFaultAccess::Exec)
+}
+
 /// rt_sigaction 系统调用
 pub fn sys_sigaction(
     signum: i32,
@@ -219,11 +235,9 @@ pub fn sys_sigaction(
                 new_action.sa_flags,
                 new_action.sa_mask
             );
-            // Validate handler address (SIG_DFL=0, SIG_IGN=1, or valid user address)
-            if new_action.handler != crate::task::SIG_DFL
-                && new_action.handler != crate::task::SIG_IGN
-                && new_action.handler < 0x1000
-            {
+            // Validate handler address: SIG_DFL/SIG_IGN are always accepted;
+            // user handlers must land in an executable user VMA.
+            if !is_valid_signal_handler_address(new_action.handler) {
                 warn!(
                     "sys_sigaction: invalid handler address {:#x}",
                     new_action.handler

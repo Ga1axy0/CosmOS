@@ -686,7 +686,7 @@ pub fn spawn(path: &str) -> isize {
 pub fn dup(fd: usize) -> isize {
     sys_dup(fd)
 }
-pub fn pipe(pipe_fd: &mut [usize]) -> isize {
+pub fn pipe(pipe_fd: &mut [i32]) -> isize {
     sys_pipe(pipe_fd)
 }
 
