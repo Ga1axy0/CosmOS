@@ -40,6 +40,8 @@ pub const SYSCALL_FSTATFS64: usize = 44;
 pub const SYSCALL_TRUNCATE: usize = 45;
 /// ftruncate syscall
 pub const SYSCALL_FTRUNCATE: usize = 46;
+/// fallocate syscall
+pub const SYSCALL_FALLOCATE: usize = 47;
 /// faccessat syscall
 pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
@@ -442,6 +444,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTATFS64 => sys_fstatfs64(args[0] as u32, args[1] as *mut u8),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0] as u32, args[1] as isize),
+        SYSCALL_FALLOCATE => sys_fallocate(args[0] as u32, args[1] as i32, args[2] as i64, args[3] as i64),
         SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
         SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),

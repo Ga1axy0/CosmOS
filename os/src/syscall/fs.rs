@@ -2403,3 +2403,20 @@ pub fn sys_fstatfs64(fd: u32, buf: *mut u8) -> isize {
         Ok(0)
     })
 }
+
+pub fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> isize {
+    syscall_body!({
+        if mode != 0 {
+            // Linux fallocate 仅支持 mode=0（标准空间预分配）
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        if offset < 0 || len <= 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        
+        let new_size = offset as usize + len as usize;
+        let desc = get_writable_file(fd as usize)?;
+        desc.truncate(new_size)?;
+        Ok(0)
+    })
+}

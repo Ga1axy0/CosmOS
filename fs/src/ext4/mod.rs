@@ -227,8 +227,8 @@ impl Ext4Inode {
 
             let mut inode_ref = ext4.get_inode_ref(self.inode_num);
             let block_size = BLOCK_SIZE as u64;
-            let new_blocks = ((new_size as u64) + block_size - 1) / block_size;
-            let old_blocks = ((old_size as u64) + block_size - 1) / block_size;
+            let new_blocks = (new_size as u64).div_ceil(block_size);
+            let old_blocks = (old_size as u64).div_ceil(block_size);
             if old_blocks > new_blocks {
                 debug!(
                     "Ext4Inode truncate shrink blocks: ino={} old_blocks={} new_blocks={}",
