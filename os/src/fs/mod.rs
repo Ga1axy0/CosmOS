@@ -153,30 +153,40 @@ impl FileDescription {
 
     /// 顺序读取并推进共享文件偏移。
     pub fn read(&self, buf: UserBuffer) -> usize {
+        self.read_result(buf).unwrap_or(0)
+    }
+
+    /// 顺序读取并推进共享文件偏移，同时保留底层 errno。
+    pub fn read_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
-            let read_size = self.file.read_at(inner.offset, buf);
+            let read_size = self.file.read_at_result(inner.offset, buf)?;
             inner.offset += read_size;
-            return read_size;
+            return Ok(read_size);
         }
         // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
-        self.file.read_at(0, buf)
+        self.file.read_at_result(0, buf)
     }
 
     /// 顺序写入并推进共享文件偏移。
     pub fn write(&self, buf: UserBuffer) -> usize {
+        self.write_result(buf).unwrap_or(0)
+    }
+
+    /// 顺序写入并推进共享文件偏移，同时保留底层 errno。
+    pub fn write_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
             if inner.status_flags.contains(FileStatusFlags::APPEND) {
                 // TODO: 当前仅保证同一 FileDescription 内的追加写顺序；跨描述竞争仍需 inode 级串行化。
                 inner.offset = self.file.stat().size.max(0) as usize;
             }
-            let write_size = self.file.write_at(inner.offset, buf);
+            let write_size = self.file.write_at_result(inner.offset, buf)?;
             inner.offset += write_size;
-            return write_size;
+            return Ok(write_size);
         }
         // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
-        self.file.write_at(0, buf)
+        self.file.write_at_result(0, buf)
     }
 
     /// 从固定偏移读取，不影响共享文件偏移。
@@ -371,6 +381,10 @@ pub trait File: Send + Sync + Any {
     fn read_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
     }
+    /// 从固定偏移读取数据，同时保留底层 errno。
+    fn read_at_result(&self, offset: usize, buf: UserBuffer) -> Result<usize, ERRNO> {
+        Ok(self.read_at(offset, buf))
+    }
     /// 从固定偏移读取到内核缓冲区。
     fn read_bytes_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, ERRNO> {
         Err(ERRNO::EOPNOTSUPP)
@@ -378,6 +392,10 @@ pub trait File: Send + Sync + Any {
     /// 向固定偏移写入数据。
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {
         0
+    }
+    /// 向固定偏移写入数据，同时保留底层 errno。
+    fn write_at_result(&self, offset: usize, buf: UserBuffer) -> Result<usize, ERRNO> {
+        Ok(self.write_at(offset, buf))
     }
     /// 从内核缓冲区向固定偏移写入。
     fn write_bytes_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, ERRNO> {

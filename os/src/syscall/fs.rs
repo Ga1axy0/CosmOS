@@ -10,7 +10,7 @@ use crate::fs::Pipe;
 use crate::net::UnixSocketPairEnd;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
-use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
+use crate::syscall::{read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
@@ -78,6 +78,7 @@ const PPOLL_FALLBACK_POLL_MS: usize = 10;
 const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
 const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
+const PATH_MAX: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -200,9 +201,12 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
 }
 
 fn has_unmasked_pending_signal() -> bool {
+    let task = current_task().unwrap();
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let pending = inner.pending_signals & !inner.signal_mask;
+    let mut process_inner = process.inner_exclusive_access();
+    let mut task_inner = task.inner_exclusive_access();
+    let thread_pending = task_inner.pending_signals;
+    let pending = (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask;
 
     for signum in 1..=crate::task::MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {
@@ -212,13 +216,22 @@ fn has_unmasked_pending_signal() -> bool {
             continue;
         }
 
-        let action = inner.signal_actions.table[signum];
+        let from_thread = thread_pending.contains(flag);
+        let action = process_inner.signal_actions.table[signum];
         if action.handler == SIG_IGN {
-            inner.pending_signals &= !flag;
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
+            }
             continue;
         }
         if action.handler == SIG_DFL && flag.check_error().is_none() {
-            inner.pending_signals &= !flag;
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
+            }
             continue;
         }
         return true;
@@ -276,8 +289,8 @@ fn apply_temp_signal_mask(
         let new_mask_bits = read_pod_from_user(sigmask as *const u32)?;
         SignalBit::from_user_bits(new_mask_bits as u64)
     };
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
     let old = inner.signal_mask;
     inner.signal_mask = new_mask;
     Ok(Some(old))
@@ -285,7 +298,7 @@ fn apply_temp_signal_mask(
 
 fn restore_temp_signal_mask(old_mask: Option<SignalBit>) {
     if let Some(old) = old_mask {
-        current_process().inner_exclusive_access().signal_mask = old;
+        current_task().unwrap().inner_exclusive_access().signal_mask = old;
     }
 }
 
@@ -1104,9 +1117,9 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
-        let written = desc.write(UserBuffer::new(
+        let written = desc.write_result(UserBuffer::new(
             translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?,
-        ));
+        ))?;
         if len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
             return Err(ERRNO::EPIPE);
         }
@@ -1261,7 +1274,7 @@ pub fn sys_readv(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                     PageFaultAccess::Write,
                 )?,
             );
-            let read = desc.read(user_buf);
+            let read = desc.read_result(user_buf)?;
             read_total = read_total.checked_add(read).ok_or(ERRNO::EINVAL)?;
             if read < iovec.iov_len {
                 break;
@@ -1303,7 +1316,7 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
                     PageFaultAccess::Read,
                 )?,
             );
-            let written = desc.write(user_buf);
+            let written = desc.write_result(user_buf)?;
             if iovec.iov_len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
                 return Err(ERRNO::EPIPE);
             }
@@ -1358,9 +1371,9 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
         let fd = fd as usize;
         let desc = get_readable_file(fd)?;
         trace!("kernel: sys_read .. desc.read");
-        Ok(desc.read(UserBuffer::new(
+        Ok(desc.read_result(UserBuffer::new(
             translated_byte_buffer_with_access(buf, len, PageFaultAccess::Write)?,
-        )) as isize)
+        ))? as isize)
     })
 }
 
@@ -1696,14 +1709,20 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         "kernel:pid[{}] sys_newfstatat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
         let flags = flags as u32;
         let supported_flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
         if flags & !supported_flags != 0 {
             return Err(ERRNO::EINVAL);
         }
+        let path = if path.is_null() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(ERRNO::EFAULT);
+            }
+            String::new()
+        } else {
+            read_cstring_from_user(path, PATH_MAX)?
+        };
         if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(ERRNO::ENOENT);

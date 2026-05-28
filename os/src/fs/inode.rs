@@ -5,7 +5,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode};
+use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
 use crate::fs::procfs::ProcRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
@@ -576,6 +576,8 @@ pub fn mkdir_at_with_inode(cwd: &str, path: &str) -> Result<Arc<Inode>, ERRNO> {
         } else {
             Err(ERRNO::EIO)
         }
+    } else if lookup_inode_follow(cwd, path, true).is_ok() {
+        Err(ERRNO::EEXIST)
     } else {
         Err(ERRNO::ENOENT)
     }
@@ -993,7 +995,7 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         nlink: attrs.nlink,
         uid: attrs.uid.unwrap_or(0),
         gid: attrs.gid.unwrap_or(0),
-        rdev: 0,
+        rdev: attrs.rdev,
         pad0: 0,
         size: size as i64,
         blksize: 512,
@@ -1030,7 +1032,8 @@ pub fn init_dev() {
     // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
-        let node = Arc::new(BlockDevNode::new(Arc::clone(dev)));
+        let minor = super::devfs::blkdev_minor_from_name(dev_name);
+        let node = Arc::new(BlockDevNode::new(Arc::clone(dev), minor));
         dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);
         info!("[kernel] /dev/{} registered", dev_name);
     }
@@ -1049,6 +1052,9 @@ pub fn init_dev() {
     dev_dir.bind("urandom", Arc::clone(&urandom_node));
     dev_dir.bind("random", Arc::clone(&urandom_node));
     info!("[kernel] /dev/urandom and /dev/random registered");
+
+    let zero_node: Arc<dyn VfsNode> = Arc::new(ZeroDevNode::new());
+    dev_dir.bind("zero", zero_node);
 
     info!("[kernel] /dev initialized");
 }

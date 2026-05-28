@@ -4,7 +4,10 @@ use crate::{
     syscall::errno::ERRNO,
     syscall::{write_bytes_to_user, write_pod_to_user},
     syscall_body,
-    task::{current_process, current_task, mprotect_current_process, msync_current_process, munmap_current_process},
+    task::{
+        current_process, current_task, current_trap_cx, mprotect_current_process,
+        msync_current_process, munmap_current_process,
+    },
 };
 
 use alloc::vec::Vec;
@@ -39,6 +42,7 @@ bitflags! {
     pub struct MMapFlags: usize {
         const MAP_SHARED = 0x1;
         const MAP_PRIVATE = 0x2;
+        const MAP_FIXED = 0x10;
         const MAP_ANONYMOUS = 0x20;
     }
     pub struct MMapProt: usize {
@@ -195,6 +199,11 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             );
             chosen
         } else {
+            if MMapFlags::from_bits_truncate(flags).contains(MMapFlags::MAP_FIXED) {
+                // glibc's dynamic loader maps a DSO, then MAP_FIXED-remaps
+                // writable subranges over the first mapping.
+                let _ = process.munmap(VirtAddr::from(addr), VirtAddr::from(end));
+            }
             let mapped = if let Some(file) = file_desc.as_ref() {
                 process.mmap_file(
                     VirtAddr::from(addr),
@@ -240,9 +249,15 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
 
 /// change data segment size
 pub fn sys_brk(addr: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_brk",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+    let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
+    let cx = current_trap_cx();
+    debug!(
+        "sys_brk: pid={} addr={:#x} tp={:#x} sp={:#x} sepc={:#x}",
+        pid,
+        addr,
+        cx.x[4],
+        cx.x[2],
+        cx.sepc
     );
     current_process().set_program_brk(addr) as isize
 }

@@ -2,6 +2,7 @@ use crate::mm::{MapPermission, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
+use crate::task::yield_current_and_run_next;
 use crate::timer::get_time_ns;
 use crate::{
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
@@ -9,9 +10,9 @@ use crate::{
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
-        add_signal_to_process, current_process, current_task, current_trap_cx,
-        current_user_token, exit_current_and_run_next, ExitReason, ShmAttachment, SignalBit,
-        WaitReason,
+        current_process, current_task, current_trap_cx, current_user_token,
+        exit_current_and_run_next, thread_id2task, ExitReason, ShmAttachment, SigInfo,
+        SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -496,115 +497,120 @@ pub fn sys_clone(
     tls: usize,
     child_tid: usize,
 ) -> isize {
-    let clone_flags_arg = flags;
-    trace!(
-        "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
-        current_task().unwrap().process.upgrade().unwrap().getpid(),
-        flags,
-        stack,
-    );
-    debug!(
-        "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
-        clone_flags_arg,
-        parent_tid,
-        child_tid
-    );
-    let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
-    let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
-    let flags = CloneFlags::from_bits_truncate(raw_clone_flags);
-    let unsupported_flags = raw_clone_flags & !CloneFlags::all().bits();
-    if unsupported_flags != 0 {
-        warn!(
-            "kernel: sys_clone unknown clone flags {:#x}",
-            unsupported_flags
+    syscall_body!({
+        let clone_flags_arg = flags;
+        trace!(
+            "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
+            current_task().unwrap().process.upgrade().unwrap().getpid(),
+            flags,
+            stack,
         );
-        return -(ERRNO::EINVAL as isize);
-    }
-    if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
-        warn!(
-            "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
-            exit_signal
-        );
-        return -(ERRNO::EINVAL as isize);
-    }
-    let thread_clone = flags.contains(CloneFlags::CLONE_VM);
-    if thread_clone && !flags.contains(CloneFlags::CLONE_THREAD) {
-        warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
-        warn!("kernel: sys_clone unsupported process flag CLONE_SYSVSEM");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if !thread_clone && flags.contains(CloneFlags::CLONE_FS) {
-        warn!("kernel: sys_clone unsupported flag CLONE_FS");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if !thread_clone && flags.contains(CloneFlags::CLONE_FILES) {
-        warn!("kernel: sys_clone unsupported flag CLONE_FILES");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
-        warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if flags.contains(CloneFlags::CLONE_VFORK) {
-        warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
-        warn!("kernel: sys_clone unsupported flag CLONE_THREAD");
-        return -(ERRNO::EINVAL as isize);
-    }
-    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) && child_tid == 0 {
-        warn!("kernel: sys_clone CLONE_CHILD_CLEARTID with null child_tid");
-        return -(ERRNO::EFAULT as isize);
-    }
-    let mut parent_set_tid = None;
-    let mut child_set_tid = None;
-    if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
-        if parent_tid == 0 {
-            warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
-            return -(ERRNO::EFAULT as isize);
-        }
-        parent_set_tid = Some(parent_tid);
-    }
-    if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-        if child_tid == 0 {
-            warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
-            return -(ERRNO::EFAULT as isize);
-        }
-        child_set_tid = Some(child_tid);
-    }
-    let mut child_tls = None;
-    if flags.contains(CloneFlags::CLONE_SETTLS) {
         debug!(
-            "kernel: sys_clone set child TLS to {:#x}",
-            tls
+            "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
+            clone_flags_arg,
+            parent_tid,
+            child_tid
         );
-        child_tls = Some(tls);
-    }
-    let current_process = current_process();
-    if thread_clone {
-        return syscall_body!({
+
+        let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
+        let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
+        let flags = CloneFlags::from_bits_truncate(raw_clone_flags);
+        let unsupported_flags = raw_clone_flags & !CloneFlags::all().bits();
+        if unsupported_flags != 0 {
+            warn!(
+                "kernel: sys_clone unknown clone flags {:#x}",
+                unsupported_flags
+            );
+            return Err(ERRNO::EINVAL);
+        }
+        if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
+            warn!(
+                "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
+                exit_signal
+            );
+            return Err(ERRNO::EINVAL);
+        }
+        let thread_clone = flags.contains(CloneFlags::CLONE_VM);
+        if thread_clone && !flags.contains(CloneFlags::CLONE_THREAD) {
+            warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
+            return Err(ERRNO::EINVAL);
+        }
+        if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
+            warn!("kernel: sys_clone unsupported process flag CLONE_SYSVSEM");
+            return Err(ERRNO::EINVAL);
+        }
+        if !thread_clone && flags.contains(CloneFlags::CLONE_FS) {
+            warn!("kernel: sys_clone unsupported flag CLONE_FS");
+            return Err(ERRNO::EINVAL);
+        }
+        if !thread_clone && flags.contains(CloneFlags::CLONE_FILES) {
+            warn!("kernel: sys_clone unsupported flag CLONE_FILES");
+            return Err(ERRNO::EINVAL);
+        }
+        if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
+            warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
+            return Err(ERRNO::EINVAL);
+        }
+        if flags.contains(CloneFlags::CLONE_VFORK) {
+            warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
+            return Err(ERRNO::EINVAL);
+        }
+        if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
+            warn!("kernel: sys_clone unsupported flag CLONE_THREAD");
+            return Err(ERRNO::EINVAL);
+        }
+        if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) && child_tid == 0 {
+            warn!("kernel: sys_clone CLONE_CHILD_CLEARTID with null child_tid");
+            return Err(ERRNO::EFAULT);
+        }
+        let mut parent_set_tid = None;
+        let mut child_set_tid = None;
+        if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+            if parent_tid == 0 {
+                warn!("kernel: sys_clone CLONE_PARENT_SETTID with null parent_tid");
+                return Err(ERRNO::EFAULT);
+            }
+            parent_set_tid = Some(parent_tid);
+        }
+        if flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+            if child_tid == 0 {
+                warn!("kernel: sys_clone CLONE_CHILD_SETTID with null child_tid");
+                return Err(ERRNO::EFAULT);
+            }
+            child_set_tid = Some(child_tid);
+        }
+        let mut child_tls = None;
+        if flags.contains(CloneFlags::CLONE_SETTLS) {
+            debug!("kernel: sys_clone set child TLS to {:#x}", tls);
+            child_tls = Some(tls);
+        }
+        let current_process = current_process();
+        if thread_clone {
             let parent_task = current_task().unwrap();
-            let (ustack_base, sched_attr, affinity_mask) = {
+            let (ustack_base, sched_attr, affinity_mask, signal_mask) = {
                 let inner = parent_task.inner_exclusive_access();
                 (
                     inner.res.as_ref().unwrap().ustack_base(),
                     inner.sched_attr(),
                     inner.sched.cpu_affinity_mask,
+                    inner.signal_mask,
                 )
             };
             let inherited_cx = *current_trap_cx();
             let new_task = current_process.create_task(ustack_base, true, sched_attr);
+            let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
+            let new_inner_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid;
+            debug!(
+                "kernel: sys_clone thread: new_tid(thread_id)={} inner_tid={} parent_set_tid_addr={:#x}",
+                new_tid, new_inner_tid, parent_set_tid.unwrap_or(0)
+            );
             {
                 let mut new_inner = new_task.inner_exclusive_access();
                 new_inner.sched.cpu_affinity_mask = affinity_mask;
+                new_inner.signal_mask = signal_mask;
                 if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
                     new_inner.clear_child_tid = child_tid;
                 }
-                let new_tid = new_inner.res.as_ref().unwrap().tid as i32;
                 let trap_cx = new_inner.get_trap_cx();
                 *trap_cx = inherited_cx;
                 trap_cx.kernel_sp = new_task.kstack.get_top();
@@ -622,26 +628,24 @@ pub fn sys_clone(
                     write_pod_to_user(ptr as *mut i32, &new_tid)?;
                 }
             }
-            let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid as isize;
             current_process.attach_task(Arc::clone(&new_task));
             add_task(new_task);
-            Ok(new_tid)
-        });
-    }
-    syscall_body!({
-        let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
-        let child_pid = new_process.getpid() as i32;
-        debug!(
-            "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
-            clone_flags_arg,
-            parent_tid,
-            child_tid,
-            child_pid
-        );
-        if let Some(ptr) = parent_set_tid {
-            write_pod_to_user(ptr as *mut i32, &child_pid)?;
+            Ok(new_tid as isize)
+        } else {
+            let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
+            let child_pid = new_process.getpid() as i32;
+            debug!(
+                "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
+                clone_flags_arg,
+                parent_tid,
+                child_tid,
+                child_pid
+            );
+            if let Some(ptr) = parent_set_tid {
+                write_pod_to_user(ptr as *mut i32, &child_pid)?;
+            }
+            Ok(child_pid as isize)
         }
-        Ok(child_pid as isize)
     })
 }
 /// sys_execve
@@ -664,13 +668,13 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
                 args = args.add(1);
             }
         }
-        // TODO：当前内核尚未实现进程环境变量表，这里先完成 ABI 级别的解析与校验。
+        let mut envs_vec: Vec<String> = Vec::new();
         loop {
             let env_str_ptr = *translated_ref(token, envp).or_errno(ERRNO::EFAULT)?;
             if env_str_ptr == 0 {
                 break;
             }
-            translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?;
+            envs_vec.push(translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
             unsafe {
                 envp = envp.add(1);
             }
@@ -686,7 +690,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
             argv,
             exec_path,
         } = resolved;
-        process.exec(elf_data.as_slice(), argv, exec_path)?;
+        process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
         Ok(0)
@@ -778,8 +782,11 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 
             // If woken by a deliverable user-handled signal, return EINTR so the trap handler can dispatch it.
             {
+                let task = current_task().unwrap();
                 let inner = process.inner_exclusive_access();
-                let pending_unmasked = inner.pending_signals & !inner.signal_mask;
+                let task_inner = task.inner_exclusive_access();
+                let pending_unmasked =
+                    (task_inner.pending_signals | inner.pending_signals) & !task_inner.signal_mask;
                 let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
                     let Some(flag) = SignalBit::from_signum(signum as u32) else { return false; };
                     if !pending_unmasked.contains(flag) {
@@ -807,7 +814,9 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     syscall_body!({
         let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
         let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
-        add_signal_to_process(&process, flag);
+        let sender = current_process();
+        let siginfo = SigInfo::for_kill(signal as i32, sender.getpid(), sender.getuid());
+        crate::task::add_signal_to_process_with_siginfo(&process, flag, siginfo);
         Ok(0)
     })
 }
@@ -821,39 +830,38 @@ pub fn sys_tkill(tid: usize, signal: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let process = current_process();
-        let target_exists = {
-            let inner = process.inner_exclusive_access();
-            tid < inner.tasks.len() && inner.tasks[tid].is_some()
-        };
-        if !target_exists {
+        let task = thread_id2task(tid).or_errno(ERRNO::ESRCH)?;
+        let process = task.process.upgrade().unwrap();
+        if process.getpid() != current_task().unwrap().process.upgrade().unwrap().getpid() {
             return Err(ERRNO::ESRCH);
         }
         let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
-        add_signal_to_process(&process, flag);
+        let sender = current_process();
+        let siginfo = SigInfo::for_tkill(signal as i32, sender.getpid(), sender.getuid());
+        crate::task::add_signal_to_task_with_siginfo(&task, flag, siginfo);
         Ok(0)
     })
 }
 
 /// tgkill syscall
 ///
-/// 当前实现按“进程号 + 进程内 tid 索引”最小语义处理。
+/// 当前实现按”进程号 + 进程内 tid 索引”最小语义处理。
 pub fn sys_tgkill(tgid: usize, tid: usize, signal: u32) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_tgkill",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
     syscall_body!({
-        let process = pid2process(tgid).or_errno(ERRNO::ESRCH)?;
-        let target_exists = {
-            let inner = process.inner_exclusive_access();
-            tid < inner.tasks.len() && inner.tasks[tid].is_some()
-        };
-        if !target_exists {
+        let task = thread_id2task(tid).or_errno(ERRNO::ESRCH)?;
+        let process = task.process.upgrade().unwrap();
+        if process.getpid() != tgid {
             return Err(ERRNO::ESRCH);
         }
         let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
-        add_signal_to_process(&process, flag);
+        let sender = current_process();
+        let siginfo = SigInfo::for_tkill(signal as i32, sender.getpid(), sender.getuid());
+        let target_inner_tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+        debug!(
+            "sys_tgkill: tgid={} tid={} signal={} -> target_task inner_tid={}",
+            tgid, tid, signal, target_inner_tid
+        );
+        crate::task::add_signal_to_task_with_siginfo(&task, flag, siginfo);
         Ok(0)
     })
 }

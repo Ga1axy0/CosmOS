@@ -20,6 +20,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::Inode;
@@ -155,6 +156,21 @@ pub fn invalidate_inode_mappings_after_truncate(inode: &Arc<Inode>, new_size: us
 fn align_up(value: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
     value.checked_add(align - 1).map(|v| v & !(align - 1))
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx > 0 {
+            if idx % 16 == 0 {
+                out.push_str(" | ");
+            } else {
+                out.push(' ');
+            }
+        }
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
 }
 
 /// address space
@@ -467,6 +483,15 @@ impl MemorySet {
         self.insert_vma_unchecked(vma);
         true
     }
+    /// Like `insert_vma` but always eagerly maps the pages regardless of `should_eager_map`.
+    pub fn insert_vma_eager(&mut self, mut vma: Vma) -> bool {
+        if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
+            return false;
+        }
+        vma.map(&mut self.page_table);
+        self.insert_vma_unchecked(vma);
+        true
+    }
     /// 仅登记一段 VMA 元数据，不立即建立页表映射。
     pub fn register_vma_metadata(&mut self, vma: Vma) -> bool {
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
@@ -701,9 +726,10 @@ impl MemorySet {
 
         for i in 0..ph_count {
             let ph = elf.program_header(i).map_err(|_| ERRNO::ENOEXEC)?;
+            let ph_type = ph.get_type().map_err(|_| ERRNO::ENOEXEC)?;
 
             // 检查 INTERP 段
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+            if ph_type == xmas_elf::program::Type::Interp {
                 debug!("Found INTERP segment in ELF program header");
                 let offset = ph.offset() as usize;
                 let size = ph.file_size() as usize;
@@ -718,7 +744,7 @@ impl MemorySet {
                 }
             }
 
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+            if ph_type == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
 
@@ -1067,6 +1093,11 @@ impl MemorySet {
         let Some(old_end) = self.vmas.get(&start_vpn).map(|vma| vma.end_vpn()) else {
             return false;
         };
+        // `brk` 增长到恰好页边界时，页粒度的 VMA 上界并不会变化；
+        // 这种情况下应视为成功的 no-op，而不是误判为区间非法。
+        if new_end_vpn == old_end {
+            return true;
+        }
         if self.overlaps_vma_range(old_end, new_end_vpn) {
             return false;
         }
@@ -1290,11 +1321,11 @@ impl MemorySet {
                 let frame = frame_alloc().unwrap();
                 let page = Arc::new(PrivatePage::new(frame));
                 let ppn = page.ppn();
-                debug!(
-                    "[mmap] allocate private frame for lazy fault: vpn={:#x} ppn={:#x}",
-                    vpn.0,
-                    ppn.0
-                );
+                // debug!(
+                //     "[mmap] allocate private frame for lazy fault: vpn={:#x} ppn={:#x}",
+                //     vpn.0,
+                //     ppn.0
+                // );
                 area.data_frames.insert(vpn, page);
                 ppn
             }
@@ -1313,7 +1344,10 @@ impl MemorySet {
         let Some(area) = self.find_vma_containing(vpn) else {
             return false;
         };
-        if !area.is_heap() || !area.is_user_accessible() || !area.allows_fault_access(access) {
+        if (!area.is_heap() && !area.is_user_stack())
+            || !area.is_user_accessible()
+            || !area.allows_fault_access(access)
+        {
             return false;
         }
         let committed = self.map_private_page_in_vma(vpn);
@@ -1774,7 +1808,12 @@ impl MemorySet {
                 let right_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_end);
                 let mut right_file = area.file.clone();
                 if let Some(file) = right_file.as_mut() {
-                    file.pgoff += overlap_end.0 - area_start.0;
+                    let middle_start = if area_start < overlap_start {
+                        overlap_start
+                    } else {
+                        area_start
+                    };
+                    file.pgoff += overlap_end.0 - middle_start.0;
                 }
                 let right_area = Vma {
                     vpn_range: VPNRange::new(overlap_end, area_end),
@@ -2127,7 +2166,7 @@ impl Vma {
     }
     /// 判断当前区域是否需要在建 VMA 时立即分配并建立页表映射。
     pub fn should_eager_map(&self) -> bool {
-        self.file.is_none()
+        self.file.is_none() && !matches!(self.kind, VmaKind::UserStack { .. })
     }
     /// 计算某个虚拟页在底层文件中的页号。
     pub fn file_page_index(&self, vpn: VirtPageNum) -> Option<u64> {

@@ -245,6 +245,7 @@ fn install_runtime_libs(libc: BusyBoxLibc) -> bool {
     true
 }
 
+#[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
     const TOTAL_STEPS: usize = 5;
     let busybox_libc = match BusyBoxLibc::from_args(argv) {

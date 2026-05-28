@@ -27,6 +27,12 @@ pub struct TrapContext {
     pub f: [u64; 32],
     /// Floating-point control and status register
     pub fcsr: usize,
+    /// Whether the current trap originated from a syscall (UserEnvCall).
+    /// Used by signal delivery to implement syscall restart (SA_RESTART).
+    pub in_syscall: bool,
+    /// Original a0 value before the syscall overwrote it with the return value.
+    /// Used to restore a0 when restarting a syscall after signal delivery.
+    pub orig_a0: usize,
 }
 
 impl TrapContext {
@@ -56,6 +62,8 @@ impl TrapContext {
             trap_handler, // addr of trap_handler function
             f: [0; 32],
             fcsr: 0,
+            in_syscall: false,
+            orig_a0: 0,
         };
         cx.set_sp(sp); // app's user stack pointer
         cx // return initial Trap Context of app

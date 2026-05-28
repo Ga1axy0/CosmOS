@@ -515,11 +515,12 @@ pub fn recvfrom(
     flags: usize,
     addr_out: Option<&mut net::SockAddrIn>,
 ) -> isize {
-    let (addr_ptr, addrlen) = match addr_out {
-        Some(a) => (a as *mut _, core::mem::size_of::<net::SockAddrIn>()),
-        None => (core::ptr::null_mut(), 0),
+    let mut addrlen = core::mem::size_of::<net::SockAddrIn>() as i32;
+    let (addr_ptr, addrlen_ptr) = match addr_out {
+        Some(a) => (a as *mut _, &mut addrlen as *mut i32),
+        None => (core::ptr::null_mut(), core::ptr::null_mut()),
     };
-    sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, addr_ptr, addrlen)
+    sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, addr_ptr, addrlen_ptr)
 }
 
 pub fn shutdown(fd: usize, how: usize) -> isize {
@@ -535,13 +536,21 @@ pub fn recvmsg(fd: usize, msg: &mut net::MsgHdr, flags: usize) -> isize {
 }
 
 pub fn getsockname(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
-    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
-    sys_getsockname(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
+    let mut addrlen = core::mem::size_of::<net::SockAddrIn>() as i32;
+    let (addr_ptr, addrlen_ptr) = match addr_out {
+        Some(a) => (a as *mut _, &mut addrlen as *mut i32),
+        None => (core::ptr::null_mut(), core::ptr::null_mut()),
+    };
+    sys_getsockname(fd, addr_ptr, addrlen_ptr)
 }
 
 pub fn getpeername(fd: usize, addr_out: Option<&mut net::SockAddrIn>) -> isize {
-    let addr_ptr = addr_out.map_or(core::ptr::null_mut(), |a| a as *mut _);
-    sys_getpeername(fd, addr_ptr, core::mem::size_of::<net::SockAddrIn>())
+    let mut addrlen = core::mem::size_of::<net::SockAddrIn>() as i32;
+    let (addr_ptr, addrlen_ptr) = match addr_out {
+        Some(a) => (a as *mut _, &mut addrlen as *mut i32),
+        None => (core::ptr::null_mut(), core::ptr::null_mut()),
+    };
+    sys_getpeername(fd, addr_ptr, addrlen_ptr)
 }
 
 pub fn fork() -> isize {
@@ -677,7 +686,7 @@ pub fn spawn(path: &str) -> isize {
 pub fn dup(fd: usize) -> isize {
     sys_dup(fd)
 }
-pub fn pipe(pipe_fd: &mut [usize]) -> isize {
+pub fn pipe(pipe_fd: &mut [i32]) -> isize {
     sys_pipe(pipe_fd)
 }
 

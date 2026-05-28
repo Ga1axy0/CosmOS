@@ -19,7 +19,7 @@ use crate::drivers::block::BLOCK_DEVICES;
 use crate::drivers::rtc;
 use crate::fs::{Stat, StatMode};
 use super::{empty_statfs, StatFs64};
-use crate::mm::{translated_ref, translated_refmut};
+use crate::mm::translated_ref;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
@@ -36,6 +36,19 @@ fn devfs_statfs() -> StatFs64 {
         STATFS_MAGIC_TMPFS,
         STATFS_NAMELEN_DEFAULT,
     )
+}
+
+const fn makedev(major: u64, minor: u64) -> u64 {
+    (major << 8) | minor
+}
+
+/// Derive minor device number from a block device name (e.g. "vda" → 0, "vdb" → 1).
+pub fn blkdev_minor_from_name(name: &str) -> u64 {
+    let name = name.strip_prefix("vd").unwrap_or(name);
+    name.bytes()
+        .next()
+        .map(|b| (b.wrapping_sub(b'a')) as u64)
+        .unwrap_or(0)
 }
 
 /// Linux `struct rtc_time` ABI.
@@ -183,12 +196,14 @@ fn unix_secs_from_rtc_time(tm: LinuxRtcTime) -> Option<i64> {
 pub struct BlockDevNode {
     /// The underlying block device driver.
     pub device: Arc<dyn BlockDevice>,
+    /// Minor device number for stat reporting.
+    minor: u64,
 }
 
 impl BlockDevNode {
-    /// Wrap `device` in a new node.
-    pub fn new(device: Arc<dyn BlockDevice>) -> Self {
-        Self { device }
+    /// Wrap `device` in a new node with the given minor number.
+    pub fn new(device: Arc<dyn BlockDevice>, minor: u64) -> Self {
+        Self { device, minor }
     }
 }
 
@@ -217,6 +232,10 @@ impl VfsNode for NullDevNode {
 
     fn file_type(&self) -> VfsFileType {
         VfsFileType::Char
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(1, 3)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
@@ -257,6 +276,76 @@ impl VfsNode for NullDevNode {
 
 }
 
+/// VFS node representing the special `/dev/zero` device.
+///
+/// Reads always return zero-filled bytes. Writes discard data and report the
+/// full write length as written.
+#[derive(Default)]
+pub struct ZeroDevNode;
+
+impl ZeroDevNode {
+    /// Create a new `/dev/zero` node.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+// SAFETY: stateless and immutable.
+unsafe impl Send for ZeroDevNode {}
+unsafe impl Sync for ZeroDevNode {}
+
+impl VfsNode for ZeroDevNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(1, 5)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> usize {
+        for byte in buf.iter_mut() {
+            *byte = 0;
+        }
+        buf.len()
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        // Discard and report full length written.
+        buf.len()
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), fs::errno::FS_ERRNO> {
+        Ok(())
+    }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
+}
+
 // SAFETY: single-processor kernel; `BlockDevice` is already `Send + Sync`.
 unsafe impl Send for BlockDevNode {}
 unsafe impl Sync for BlockDevNode {}
@@ -268,6 +357,10 @@ impl VfsNode for BlockDevNode {
 
     fn file_type(&self) -> VfsFileType {
         VfsFileType::Block
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(254, self.minor)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
@@ -358,6 +451,7 @@ impl VfsNode for DevRootNode {
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         let mut entries = alloc::vec![
             (String::from("null"), VfsFileType::Char),
+            (String::from("zero"), VfsFileType::Char),
             (String::from("rtc"), VfsFileType::Char),
             (String::from("rtc0"), VfsFileType::Char),
             (String::from("urandom"), VfsFileType::Char),
@@ -374,13 +468,15 @@ impl VfsNode for DevRootNode {
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         match name {
             "null" => Some(Arc::new(NullDevNode::new()) as Arc<dyn VfsNode>),
+            "zero" => Some(Arc::new(ZeroDevNode::new()) as Arc<dyn VfsNode>),
             "rtc" | "rtc0" => Some(Arc::new(RtcDevNode::new()) as Arc<dyn VfsNode>),
             "urandom" | "random" => Some(Arc::new(UrandomDevNode::new()) as Arc<dyn VfsNode>),
             "misc" => Some(Arc::new(DevMiscNode::new()) as Arc<dyn VfsNode>),
             _ => {
                 let map = BLOCK_DEVICES.lock();
                 let dev = map.get(name)?;
-                Some(Arc::new(BlockDevNode::new(Arc::clone(dev))) as Arc<dyn VfsNode>)
+                let minor = blkdev_minor_from_name(name);
+                Some(Arc::new(BlockDevNode::new(Arc::clone(dev), minor)) as Arc<dyn VfsNode>)
             }
         }
     }
@@ -543,6 +639,10 @@ impl VfsNode for RtcDevNode {
         VfsFileType::Char
     }
 
+    fn rdev(&self) -> u64 {
+        makedev(253, 0)
+    }
+
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         Vec::new()
     }
@@ -600,6 +700,10 @@ impl VfsNode for UrandomDevNode {
 
     fn file_type(&self) -> VfsFileType {
         VfsFileType::Char
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(1, 9)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
