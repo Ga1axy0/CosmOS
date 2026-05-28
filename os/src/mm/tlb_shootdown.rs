@@ -230,6 +230,11 @@ pub fn deferred_frame_count() -> usize {
     DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_frames.len()
 }
 
+/// 返回当前等待 flush 后回收的 kernel stack id 数量。
+pub fn deferred_kstack_id_count() -> usize {
+    DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_kstack_ids.len()
+}
+
 /// 判断当前是否存在待后续全局 flush 处理的内核态延迟回收状态。
 pub fn has_deferred() -> bool {
     let state = DEFERRED_KERNEL_RECYCLE_STATE.lock();
