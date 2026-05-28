@@ -73,6 +73,20 @@ impl Drop for PidHandle {
     }
 }
 
+/// A handle to a Linux-visible thread id that shares the global pid/tid namespace.
+pub struct ThreadIdHandle(pub usize);
+
+/// Allocate a globally unique Linux-visible thread id.
+pub fn thread_id_alloc() -> ThreadIdHandle {
+    ThreadIdHandle(PID_ALLOCATOR.lock().alloc())
+}
+
+impl Drop for ThreadIdHandle {
+    fn drop(&mut self) {
+        PID_ALLOCATOR.lock().dealloc(self.0);
+    }
+}
+
 /// Return (bottom, top) of a kernel stack in kernel space.
 pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
     let top = TRAMPOLINE - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
@@ -153,6 +167,10 @@ impl KernelStack {
 pub struct TaskUserRes {
     /// task id
     pub tid: usize,
+    /// Linux-visible thread id used by gettid/tgkill.
+    pub thread_id: usize,
+    /// Handle that owns the globally unique thread id for non-leader threads.
+    pub thread_id_handle: Option<ThreadIdHandle>,
     /// user stack base
     pub ustack_base: usize,
     /// process belongs to
@@ -175,8 +193,19 @@ impl TaskUserRes {
         alloc_user_res: bool,
     ) -> Self {
         let tid = process.inner_exclusive_access().alloc_tid();
+        let thread_id_handle = if tid == 0 {
+            None
+        } else {
+            Some(thread_id_alloc())
+        };
+        let thread_id = thread_id_handle
+            .as_ref()
+            .map(|handle| handle.0)
+            .unwrap_or_else(|| process.getpid());
         let task_user_res = Self {
             tid,
+            thread_id,
+            thread_id_handle,
             ustack_base,
             process: Arc::downgrade(&process),
         };
@@ -192,14 +221,17 @@ impl TaskUserRes {
         // alloc user stack
         let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
         let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        let _ = process_inner.memory_set.insert_vma(
-            Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid),
-            None,
-        );
+        let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
+        if self.tid == 0 {
+            // Main thread needs eager mapping: kernel writes args/auxv before start.
+            process_inner.memory_set.insert_vma_eager(ustack_vma);
+        } else {
+            process_inner.memory_set.insert_vma(ustack_vma, None);
+        }
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        let _ = process_inner.memory_set.insert_vma(
+        process_inner.memory_set.insert_vma(
             Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
             None,
         );
@@ -270,6 +302,12 @@ impl TaskUserRes {
     pub fn ustack_base(&self) -> usize {
         self.ustack_base
     }
+
+    /// Linux-visible thread id for this task.
+    pub fn thread_id(&self) -> usize {
+        self.thread_id
+    }
+
     /// the top addr (high addr) of the user stack for a task
     pub fn ustack_top(&self) -> usize {
         ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE

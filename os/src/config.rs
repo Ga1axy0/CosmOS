@@ -5,7 +5,7 @@
 /// user app's stack size (increased to avoid user-space stack overflow for glibc/busybox)
 pub const USER_STACK_SIZE: usize = 1024 * 512; // 512 KiB
 /// kernel stack size
-pub const KERNEL_STACK_SIZE: usize = 4096 * 8;
+pub const KERNEL_STACK_SIZE: usize = 4096 * 32;
 /// kernel heap size
 pub const MAX_KERNEL_HEAP_SIZE: usize = 0x400_0000;
 /// base address of the dynamically mapped kernel heap window
@@ -13,7 +13,7 @@ pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
 /// physical memory end address
-pub const MEMORY_END: usize = 0x88000000;
+pub const MEMORY_END: usize = 0xa0000000;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12

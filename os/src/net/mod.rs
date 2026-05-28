@@ -5,6 +5,7 @@
 //! - Socket side uses per-socket wait queues + poll source notifications.
 
 mod loopback;
+mod socket_timeout;
 mod tcp;
 mod udp;
 mod unix_socket;
@@ -30,6 +31,10 @@ use crate::{
 
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
+pub(crate) use socket_timeout::{
+    cleanup_socket_wait, handle_socket_wait_timeout, register_socket_wait, socket_wait_mark_ready,
+    socket_wait_should_skip, socket_wait_state, timeout_ns_to_ms, SocketTimerTag, SocketWakeState,
+};
 pub use unix_socket::{
     UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SocketLevel
 };
@@ -44,6 +49,7 @@ const TCP_TX_BUF: usize = 128 * 1024;
 
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
+const MAX_IMMEDIATE_POLLS: usize = 4;
 
 const NO_POLL_DEADLINE_MS: u64 = u64::MAX;
 
@@ -198,7 +204,24 @@ impl NetStack {
     }
 
     fn poll(&mut self) {
-        // print!("p");
+        for _ in 0..MAX_IMMEDIATE_POLLS {
+            self.poll_once();
+
+            // Loopback packets and newly queued socket work often need another
+            // immediate pass to become visible to recv()/poll() callers.
+            let need_repoll =
+                !self.device.loopback.queue.is_empty() || NEED_POLL.swap(false, Ordering::AcqRel);
+            if !need_repoll {
+                return;
+            }
+        }
+
+        if !self.device.loopback.queue.is_empty() {
+            NEED_POLL.store(true, Ordering::Release);
+        }
+    }
+
+    fn poll_once(&mut self) {
         let ts = now();
         let poll_result = self.iface.poll(ts, &mut self.device, &mut self.sockets);
         trace!("NetStack::poll result={:?}, loopback queue len after={}", poll_result, self.device.loopback.queue.len());

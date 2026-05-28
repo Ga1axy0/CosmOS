@@ -2,8 +2,8 @@
 #![allow(deprecated)]
 
 use super::id::RecycleAllocator;
-use super::{SchedAttr, TaskControlBlock};
-use super::{SignalAction, SignalActions, SignalBit, SIG_IGN};
+use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
+use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
 use crate::sched::add_task;
 use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
@@ -72,6 +72,18 @@ pub enum ExitReason {
     Signal(u32),
 }
 
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+enum Auxv {
+    Phdr = 3,     // program headers for program
+    Phent = 4,    // size of program header entry
+    Phnum = 5,    // number of program header entries
+    Pagesz = 6,   // system page size
+    Base = 7,     // base address of interpreter
+    Entry = 9,    // entry point of program
+    Random = 25,  // address of 16 random bytes
+}
+
 /// Process Control Block
 pub struct ProcessControlBlock {
     /// immutable
@@ -125,8 +137,8 @@ pub struct ProcessControlBlockInner {
     pub resource_limits: ResourceLimits,
     /// pending process signals
     pub pending_signals: SignalBit,
-    /// blocked process signals
-    pub signal_mask: SignalBit,
+    /// Per-signal metadata paired with `pending_signals`.
+    pub pending_siginfo: [SigInfo; MAX_SIG + 1],
     /// installed signal actions
     pub signal_actions: SignalActions,
     /// tasks(also known as threads)
@@ -273,11 +285,27 @@ fn init_user_stack_from_strings(
     token: usize,
     stack_top: usize,
     args: &[String],
-    auxv_extra: &[(usize, usize)],
+    envs: &[String],
+    auxv_extra: &[(Auxv, usize)],
 ) -> usize {
     let mut user_sp = stack_top;
+
+    // Place environment strings at high addresses (reverse order so pointers end up in order).
+    let mut env_ptrs: Vec<usize> = Vec::with_capacity(envs.len());
+    for env in envs.iter().rev() {
+        user_sp -= env.len() + 1;
+        let mut p = user_sp;
+        for c in env.as_bytes() {
+            *translated_refmut(token, p as *mut u8).unwrap() = *c;
+            p += 1;
+        }
+        *translated_refmut(token, p as *mut u8).unwrap() = 0;
+        env_ptrs.push(user_sp);
+    }
+    env_ptrs.reverse();
+
+    // Place argument strings.
     let mut arg_ptrs: Vec<usize> = Vec::with_capacity(args.len());
-    // 参数字符串放在高地址区域，argv 表只保存用户态指针。
     for arg in args.iter().rev() {
         user_sp -= arg.len() + 1;
         let mut p = user_sp;
@@ -292,7 +320,7 @@ fn init_user_stack_from_strings(
 
     user_sp &= !0xf_usize;
 
-    // glibc 会读取 AT_RANDOM，这里先提供固定的 16 字节随机区。
+    // AT_RANDOM: 16 bytes of pseudo-random data for stack canary.
     // TODO: 后续接入真正的随机源，避免固定 canary。
     user_sp -= 8;
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0xdeadbeef_cafebabe_usize;
@@ -300,7 +328,7 @@ fn init_user_stack_from_strings(
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0x0102030405060708_usize;
     let at_random_ptr = user_sp;
 
-    // 先放入 AT_NULL，再倒序放入额外 auxv 与基础 auxv，保证内存中按正序排列。
+    // auxv: AT_NULL terminator, then extra entries (reversed), then base entries.
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
     user_sp -= core::mem::size_of::<usize>();
@@ -309,16 +337,22 @@ fn init_user_stack_from_strings(
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(token, user_sp as *mut usize).unwrap() = val;
         user_sp -= core::mem::size_of::<usize>();
-        *translated_refmut(token, user_sp as *mut usize).unwrap() = tag;
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = tag as usize;
     }
     for &word in &[at_random_ptr, 25, crate::config::PAGE_SIZE, 6usize] {
         user_sp -= core::mem::size_of::<usize>();
         *translated_refmut(token, user_sp as *mut usize).unwrap() = word;
     }
 
+    // envp array: NULL terminator, then pointers in reverse.
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
+    for &ptr in env_ptrs.iter().rev() {
+        user_sp -= core::mem::size_of::<usize>();
+        *translated_refmut(token, user_sp as *mut usize).unwrap() = ptr;
+    }
 
+    // argv array: NULL terminator, then pointers in reverse.
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = 0;
     for &ptr in arg_ptrs.iter().rev() {
@@ -326,15 +360,15 @@ fn init_user_stack_from_strings(
         *translated_refmut(token, user_sp as *mut usize).unwrap() = ptr;
     }
 
+    // argc
     user_sp -= core::mem::size_of::<usize>();
     *translated_refmut(token, user_sp as *mut usize).unwrap() = args.len();
     user_sp
 }
 
-/// 便捷封装：从静态字符串参数构造用户初始栈。
 fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
     let args: Vec<String> = args.iter().map(|arg| String::from(*arg)).collect();
-    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[])
+    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[], &[])
 }
 
 impl ProcessControlBlockInner {
@@ -475,12 +509,18 @@ impl ProcessControlBlock {
 
     /// Attach a created task to this process's task table without scheduling it.
     pub fn attach_task(self: &Arc<Self>, task: Arc<TaskControlBlock>) {
-        let tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
+        let task_inner = task.inner_exclusive_access();
+        let res = task_inner.res.as_ref().unwrap();
+        let tid = res.tid;
+        let thread_id = res.thread_id();
+        drop(task_inner);
         let mut inner = self.inner_exclusive_access();
         while inner.tasks.len() <= tid {
             inner.tasks.push(None);
         }
-        inner.tasks[tid] = Some(task);
+        inner.tasks[tid] = Some(Arc::clone(&task));
+        drop(inner);
+        insert_into_tid2task(thread_id, &task);
     }
 
     /// new process from elf file
@@ -508,7 +548,7 @@ impl ProcessControlBlock {
                     fd_table: new_stdio_files(),
                     resource_limits: ResourceLimits::default(),
                     pending_signals: SignalBit::empty(),
-                    signal_mask: SignalBit::empty(),
+                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                     signal_actions: SignalActions::default(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -565,6 +605,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         elf_data: &[u8],
         args: Vec<String>,
+        envs: Vec<String>,
         exec_path: String,
     ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
@@ -678,18 +719,27 @@ impl ProcessControlBlock {
 
             // 构造auxv：告诉动态链接器原程序的信息
             let auxv_extra = vec![
-                (3usize, app_load_info.phdr_vaddr),  // AT_PHDR
-                (4usize, app_load_info.phent_size),  // AT_PHENT
-                (5usize, app_load_info.phnum),       // AT_PHNUM
-                (9usize, app_load_info.entry_point), // AT_ENTRY
-                (7usize, interp_base),               // AT_BASE - 动态链接器实际加载的基地址
+                (Auxv::Phdr, app_load_info.phdr_vaddr),  // AT_PHDR
+                (Auxv::Phent, app_load_info.phent_size),  // AT_PHENT
+                (Auxv::Phnum, app_load_info.phnum),       // AT_PHNUM
+                (Auxv::Pagesz, crate::config::PAGE_SIZE),     // AT_PAGESZ
+                (Auxv::Base, interp_base),               // AT_BASE - 动态链接器实际加载的基地址
+                (Auxv::Entry, app_load_info.entry_point), // AT_ENTRY
             ];
 
             (relocated_entry, auxv_extra)
         } else {
             // 静态链接程序
             debug!("Static linking, using application entry directly");
-            (app_load_info.entry_point, vec![])
+            debug!("App PHDR vaddr: {:#x}, phnum: {}", app_load_info.phdr_vaddr, app_load_info.phnum);
+            let auxv_extra = vec![
+                (Auxv::Phdr, app_load_info.phdr_vaddr),  // AT_PHDR
+                (Auxv::Phent, app_load_info.phent_size),  // AT_PHENT
+                (Auxv::Phnum, app_load_info.phnum),       // AT_PHNUM
+                (Auxv::Pagesz, crate::config::PAGE_SIZE),     // AT_PAGESZ
+                (Auxv::Entry, app_load_info.entry_point), // AT_ENTRY
+            ];
+            (app_load_info.entry_point, auxv_extra)
         };
 
         let ustack_base = user_layout.ustack_base;
@@ -712,6 +762,7 @@ impl ProcessControlBlock {
                 }
             }
             inner.pending_signals = SignalBit::empty();
+            inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
@@ -733,24 +784,20 @@ impl ProcessControlBlock {
         task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
+        task_inner.pending_signals = SignalBit::empty();
+        task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
         // push arguments on user stack — Linux ELF ABI layout:
-        //   [sp+0*8]          argc
-        //   [sp+1*8..argc*8]  argv[0..argc-1]
-        //   [sp+(argc+1)*8]   NULL           (argv terminator)
-        //   [sp+(argc+2)*8]   NULL           (envp terminator, empty env)
-        //   [sp+(argc+3)*8]   AT_PAGESZ = 6  \
-        //   [sp+(argc+4)*8]   4096            |
-        //   [sp+(argc+5)*8]   AT_RANDOM = 25  | auxv
-        //   [sp+(argc+6)*8]   &random[0]      |
-        //   [sp+(argc+7)*8]   ... (dynamic linking auxv if needed)
-        //   [sp+(argc+?)*8]   AT_NULL = 0     |
-        //   [sp+(argc+?)*8]   0              /
-        //   [above + 16 bytes random data, 16-byte aligned]  argument strings
+        //   [sp]  argc
+        //         argv[0..argc-1], NULL
+        //         envp[0..envc-1], NULL
+        //         auxv pairs..., AT_NULL
+        //         random bytes, argument/environment strings
         trace!("kernel: exec .. push arguments on user stack");
         let user_sp = init_user_stack_from_strings(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
             args.as_slice(),
+            envs.as_slice(),
             auxv_extra.as_slice(),
         );
 
@@ -804,7 +851,6 @@ impl ProcessControlBlock {
         };
         let vm_layout = parent.vm_layout;
         let cred = parent.cred;
-        let parent_signal_mask = parent.signal_mask;
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
         let parent_exec_path = parent.exec_path.clone();
@@ -834,7 +880,7 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
-                    signal_mask: parent_signal_mask,
+                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                     signal_actions: parent_signal_actions,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -869,6 +915,7 @@ impl ProcessControlBlock {
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_sched_attr = parent_task_inner.sched_attr();
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
+        let parent_signal_mask = parent_task_inner.signal_mask;
         drop(parent_task_inner);
         drop(parent);
         if parent_mask != 0 {
@@ -897,7 +944,11 @@ impl ProcessControlBlock {
             false,
             parent_sched_attr,
         );
-        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
+            task_inner.signal_mask = parent_signal_mask;
+        }
         // attach task to child process before publishing it
         child.attach_task(Arc::clone(&task));
         // Finalize the child's trap context before publishing it to the scheduler.
@@ -967,7 +1018,7 @@ impl ProcessControlBlock {
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
-                    signal_mask: parent.signal_mask,
+                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                     signal_actions: parent.signal_actions.clone(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -1000,11 +1051,16 @@ impl ProcessControlBlock {
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_sched_attr = parent_task_inner.sched_attr();
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
+        let parent_signal_mask = parent_task_inner.signal_mask;
         drop(parent_task_inner);
         drop(parent);
 
         let task = child.create_task(ustack_base, true, parent_sched_attr);
-        task.inner_exclusive_access().sched.cpu_affinity_mask = parent_affinity_mask;
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
+            task_inner.signal_mask = parent_signal_mask;
+        }
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
@@ -1344,6 +1400,13 @@ impl ProcessControlBlock {
                 || new_brk >= inner.vm_layout.mmap_base
                 || new_brk >= inner.vm_layout.start_stack
             {
+                warn!(
+                    "set_program_brk: FAILED at range check: start_brk={:#x}, mmap_base={:#x}, start_stack={:#x}, new_brk={:#x}",
+                    inner.vm_layout.start_brk,
+                    inner.vm_layout.mmap_base,
+                    inner.vm_layout.start_stack,
+                    new_brk
+                );
                 return old_brk;
             }
             if new_brk == old_brk {
@@ -1359,6 +1422,7 @@ impl ProcessControlBlock {
             if new_end_vpn > old_end_vpn {
                 let additional = (new_end_vpn.0 - old_end_vpn.0) * PAGE_SIZE;
                 if inner.ensure_address_space_capacity(additional).is_err() {
+                    warn!("set_program_brk: FAILED at ensure address space capacity");
                     return old_brk;
                 }
             }
@@ -1371,6 +1435,7 @@ impl ProcessControlBlock {
                         MapPermission::R | MapPermission::W | MapPermission::U,
                     ));
                 if !success {
+                    warn!("set_program_brk: FAILED at append metadata to heap ({:#x} -> {:#x})", old_brk, new_brk);
                     return old_brk;
                 }
             } else if new_brk == inner.vm_layout.start_brk {
@@ -1379,6 +1444,7 @@ impl ProcessControlBlock {
                     .remove_vma_with_start_vpn_user_deferred(heap_start.floor()));
             } else if old_end_vpn != new_end_vpn {
                 let Some(shrink_batch) = inner.memory_set.shrink_to_deferred(heap_start, new_brk_va) else {
+                    warn!("set_program_brk: FAILED at shrink to deferred");
                     return old_brk;
                 };
                 batch = Some(shrink_batch);

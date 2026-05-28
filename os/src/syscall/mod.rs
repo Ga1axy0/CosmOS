@@ -336,11 +336,11 @@ use signal::*;
 use times::*;
 use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
-pub(crate) use sync::futex_wake_addr;
 pub(crate) use utils::{
-    read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
+    read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
 };
+pub use times::Timespec;
 
 
 use crate::{fs::Stat, net::SockAddrIn, syscall::errno::ERRNO};
@@ -362,17 +362,57 @@ macro_rules! syscall_body {
         let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
         match result {
             Ok(v) => v,
-            Err(e) => {
-                // warn!("syscall error: {:?}", e);
-                -(e as isize)
-            },
+            Err(e) => -(e as isize),
         }
     }};
 }
 
+fn errno_name(errno: isize) -> &'static str {
+    match errno as i32 {
+        x if x == ERRNO::EPERM as i32 => "EPERM",
+        x if x == ERRNO::ENOENT as i32 => "ENOENT",
+        x if x == ERRNO::ESRCH as i32 => "ESRCH",
+        x if x == ERRNO::EINTR as i32 => "EINTR",
+        x if x == ERRNO::EIO as i32 => "EIO",
+        x if x == ERRNO::ENXIO as i32 => "ENXIO",
+        x if x == ERRNO::E2BIG as i32 => "E2BIG",
+        x if x == ERRNO::ENOEXEC as i32 => "ENOEXEC",
+        x if x == ERRNO::EBADF as i32 => "EBADF",
+        x if x == ERRNO::ECHILD as i32 => "ECHILD",
+        x if x == ERRNO::EAGAIN as i32 => "EAGAIN",
+        x if x == ERRNO::ENOMEM as i32 => "ENOMEM",
+        x if x == ERRNO::EACCES as i32 => "EACCES",
+        x if x == ERRNO::EFAULT as i32 => "EFAULT",
+        x if x == ERRNO::EBUSY as i32 => "EBUSY",
+        x if x == ERRNO::EEXIST as i32 => "EEXIST",
+        x if x == ERRNO::ENODEV as i32 => "ENODEV",
+        x if x == ERRNO::ENOTDIR as i32 => "ENOTDIR",
+        x if x == ERRNO::EISDIR as i32 => "EISDIR",
+        x if x == ERRNO::EINVAL as i32 => "EINVAL",
+        x if x == ERRNO::EMFILE as i32 => "EMFILE",
+        x if x == ERRNO::ENOTTY as i32 => "ENOTTY",
+        x if x == ERRNO::EPIPE as i32 => "EPIPE",
+        x if x == ERRNO::ENAMETOOLONG as i32 => "ENAMETOOLONG",
+        x if x == ERRNO::ENOSYS as i32 => "ENOSYS",
+        x if x == ERRNO::ENOTEMPTY as i32 => "ENOTEMPTY",
+        x if x == ERRNO::ELOOP as i32 => "ELOOP",
+        x if x == ERRNO::EOVERFLOW as i32 => "EOVERFLOW",
+        x if x == ERRNO::ENOTSOCK as i32 => "ENOTSOCK",
+        x if x == ERRNO::EOPNOTSUPP as i32 => "EOPNOTSUPP",
+        x if x == ERRNO::EADDRINUSE as i32 => "EADDRINUSE",
+        x if x == ERRNO::EADDRNOTAVAIL as i32 => "EADDRNOTAVAIL",
+        x if x == ERRNO::ECONNRESET as i32 => "ECONNRESET",
+        x if x == ERRNO::ENOTCONN as i32 => "ENOTCONN",
+        x if x == ERRNO::ETIMEDOUT as i32 => "ETIMEDOUT",
+        x if x == ERRNO::ECONNREFUSED as i32 => "ECONNREFUSED",
+        x if x == ERRNO::ECANCELED as i32 => "ECANCELED",
+        _ => "UNKNOWN",
+    }
+}
+
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    match syscall_id {
+    let result = match syscall_id {
         SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
@@ -545,8 +585,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
         ),
         SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
-        SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
-        SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as i32),
+        SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as *mut i32),
+        SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as *mut i32),
         SYSCALL_SENDTO => sys_sendto(
             args[0] as i32,
             args[1] as *const u8,
@@ -561,7 +601,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2],
             args[3] as u32,
             args[4] as *mut SockAddrIn,
-            args[5] as i32,
+            args[5] as *mut i32,
         ),
         SYSCALL_SETSOCKOPT => sys_setsockopt(
             args[0] as i32,
@@ -669,7 +709,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TKILL => sys_tkill(args[0], args[1] as u32),
         SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as u32),
         _ => sys_nisyscall(syscall_id, args),
+    };
+    if (-4095..0).contains(&result) {
+        let errno = -result;
+        warn!(
+            "syscall error: id={} errno={}({}) result={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            syscall_id,
+            errno,
+            errno_name(errno),
+            result,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        );
     }
+    result
 }
 
 /// Syscalls that are invalid or not implemented yet

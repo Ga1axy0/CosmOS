@@ -4,6 +4,7 @@ use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::task::{current_process, current_user_token, ProcessControlBlock};
 
 use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use core::mem::{size_of, MaybeUninit};
@@ -189,6 +190,26 @@ pub fn read_bytes_from_user(ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO
         bytes.extend_from_slice(buffer);
     }
     Ok(bytes)
+}
+
+/// Read a NUL-terminated user string, faulting in lazy/file-backed pages as needed.
+pub fn read_cstring_from_user(ptr: *const u8, max_len: usize) -> Result<String, ERRNO> {
+    if ptr.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let mut out = String::new();
+    for offset in 0..max_len {
+        let ch = translated_byte_buffer_with_access(
+            unsafe { ptr.add(offset) },
+            1,
+            PageFaultAccess::Read,
+        )?[0][0];
+        if ch == 0 {
+            return Ok(out);
+        }
+        out.push(ch as char);
+    }
+    Err(ERRNO::ENAMETOOLONG)
 }
 
 /// 从用户地址空间读取一个 POD 结构，允许结构体跨越多个用户页。

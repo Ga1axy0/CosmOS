@@ -2,7 +2,7 @@ use crate::signal::{SigInfo, SignalWaitHandle, SignalWakeState, register_signal_
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::task::UContext;
 use crate::{
-    mm::translated_ref,
+    mm::{PageFaultAccess, VirtAddr, translated_ref},
     syscall_body,
     task::{
         block_current_and_run_next, current_process, current_task, current_user_token,
@@ -151,6 +151,22 @@ impl From<SignalAction> for UserSigAction {
     }
 }
 
+fn is_valid_signal_handler_address(handler: usize) -> bool {
+    if handler == crate::task::SIG_DFL || handler == crate::task::SIG_IGN {
+        return true;
+    }
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let Some(vma) = inner
+        .memory_set
+        .find_vma_containing(VirtAddr::from(handler).floor())
+    else {
+        return false;
+    };
+    vma.allows_fault_access(PageFaultAccess::Exec)
+}
+
 /// rt_sigaction 系统调用
 pub fn sys_sigaction(
     signum: i32,
@@ -219,11 +235,9 @@ pub fn sys_sigaction(
                 new_action.sa_flags,
                 new_action.sa_mask
             );
-            // Validate handler address (SIG_DFL=0, SIG_IGN=1, or valid user address)
-            if new_action.handler != crate::task::SIG_DFL
-                && new_action.handler != crate::task::SIG_IGN
-                && new_action.handler < 0x1000
-            {
+            // Validate handler address: SIG_DFL/SIG_IGN are always accepted;
+            // user handlers must land in an executable user VMA.
+            if !is_valid_signal_handler_address(new_action.handler) {
                 warn!(
                     "sys_sigaction: invalid handler address {:#x}",
                     new_action.handler
@@ -283,8 +297,8 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
         };
 
         let old_bits = {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
             let old_mask = inner.signal_mask;
             if let Some(new_mask) = new_mask {
                 match how {
@@ -332,30 +346,35 @@ pub fn sys_sigreturn() -> isize {
 
         debug!(
             "sys_sigreturn: restoring context from {:#x}, sigmask={:#x}",
-            ucontext_ptr, ucontext.uc_sigmask
+            ucontext_ptr,
+            ucontext.uc_sigmask.low_bits()
         );
 
         // Restore signal mask
         {
-            let process = current_process();
-            let mut inner = process.inner_exclusive_access();
-            let mask = SignalBit::from_user_bits(ucontext.uc_sigmask);
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let mask = SignalBit::from_user_bits(ucontext.uc_sigmask.low_bits());
             inner.signal_mask = mask;
+            inner.signal_mask_backup = None;
             debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
         }
 
         // Restore registers from mcontext
         let mcontext = &ucontext.uc_mcontext;
 
-        // Restore ALL registers from saved context, including ra
-        trap_cx.x.copy_from_slice(&mcontext.gregs);
+        trap_cx.x[0] = 0;
+        trap_cx.x[1..].copy_from_slice(&mcontext.gregs[1..]);
+        trap_cx.sepc = mcontext.gregs[0];
 
-        // Restore sepc (program counter)
-        trap_cx.sepc = mcontext.pc;
+        debug!(
+            "sys_sigreturn: restored sepc={:#x}, a0={:#x}",
+            trap_cx.sepc, trap_cx.x[10]
+        );
 
         // Restore floating-point registers
-        trap_cx.f.copy_from_slice(&mcontext.fpregs);
-        trap_cx.fcsr = mcontext.fcsr;
+        trap_cx.f.copy_from_slice(&mcontext.fpstate.fpregs);
+        trap_cx.fcsr = mcontext.fpstate.fcsr as usize;
 
         // Return the original a0 value (which was saved in the trap context)
         Ok(trap_cx.x[10] as isize)
@@ -388,16 +407,16 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
             return Err(ERRNO::EINVAL);
         }
 
-        let process = current_process();
-
         // Read new mask from user space.
         let new_mask = read_user_sigset(mask, sigsetsize)?;
 
         // Save old mask and atomically set new mask
         let old_mask = {
-            let mut inner = process.inner_exclusive_access();
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
             let old = inner.signal_mask;
             inner.signal_mask = new_mask;
+            inner.signal_mask_backup = Some(old);
             debug!(
                 "sys_sigsuspend: changed mask from {:#x} to {:#x}",
                 old.bits(),
@@ -408,11 +427,7 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
 
         // Block until a signal arrives.
         // Check if any unmasked signals are already pending.
-        let has_pending = {
-            let inner = process.inner_exclusive_access();
-            let unmasked_pending = inner.pending_signals & !inner.signal_mask;
-            !unmasked_pending.is_empty()
-        };
+        let has_pending = crate::signal::has_unmasked_pending_signal();
 
         if !has_pending {
             // Block directly without enqueuing in any WaitQueue.
@@ -431,11 +446,7 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
             }
 
             // Re-check: did a signal arrive before we could block?
-            let should_block = {
-                let inner = process.inner_exclusive_access();
-                let unmasked_pending = inner.pending_signals & !inner.signal_mask;
-                unmasked_pending.is_empty()
-            };
+            let should_block = !crate::signal::has_unmasked_pending_signal();
 
             if should_block {
                 crate::task::block_current_and_run_next(WaitReason::SignalSuspend);
@@ -450,13 +461,6 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
                     task_inner.wait_reason = None;
                 }
             }
-        }
-
-        // When we wake up, restore the old signal mask
-        {
-            let mut inner = process.inner_exclusive_access();
-            inner.signal_mask = old_mask;
-            debug!("sys_sigsuspend: restored mask to {:#x}", old_mask.bits());
         }
 
         // sigsuspend always returns -EINTR after signal delivery
@@ -490,9 +494,10 @@ pub fn sys_rt_sigtimedwait_time32(
         let deadline = timeout_ms_to_deadline(timeout_ms)?;
 
         loop {
-            if let Some(signum) = crate::signal::take_pending_signal_in_set(signal_set) {
+            if let Some((signum, siginfo)) = crate::signal::take_pending_signal_in_set(signal_set)
+            {
                 if !uinfo.is_null() {
-                    write_pod_to_user(uinfo, &SigInfo::new(signum))?;
+                    write_pod_to_user(uinfo, &siginfo)?;
                 }
                 return Ok(signum as isize);
             }
