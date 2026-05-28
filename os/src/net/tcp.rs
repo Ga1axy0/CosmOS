@@ -6,18 +6,22 @@ use alloc::{
     vec::Vec,
 };
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use smoltcp::socket::tcp as tcp_socket;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
-use crate::net::{NEED_POLL, NET_STACK};
+use crate::net::{
+    cleanup_socket_wait, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
+    socket_wait_state, timeout_ns_to_ms, SocketWakeState, NEED_POLL, NET_STACK,
+};
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
-use crate::task::{WaitQueue, WaitReason};
+use crate::task::{current_task, WaitQueue, WaitReason};
+use crate::timer::{add_timer_with_socket_tag, get_time_ms};
 
 const SOMAXCONN: usize = 128;
 
@@ -236,6 +240,8 @@ pub(crate) struct TcpSocketFile {
     bound_endpoint: SpinNoIrqLock<Option<IpListenEndpoint>>,
     listening: AtomicBool,
     listener: SpinNoIrqLock<Option<Arc<TcpListenerShared>>>,
+    recv_timeout_ns: AtomicU64,
+    send_timeout_ns: AtomicU64,
 }
 
 impl TcpSocketFile {
@@ -245,6 +251,8 @@ impl TcpSocketFile {
             bound_endpoint: SpinNoIrqLock::new(None),
             listening: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
+            recv_timeout_ns: AtomicU64::new(0),
+            send_timeout_ns: AtomicU64::new(0),
         }
     }
 
@@ -258,6 +266,22 @@ impl TcpSocketFile {
 
     pub(crate) fn is_listening(&self) -> bool {
         self.listening.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_recv_timeout_ns(&self, timeout_ns: u64) {
+        self.recv_timeout_ns.store(timeout_ns, Ordering::Release);
+    }
+
+    pub(crate) fn recv_timeout_ns(&self) -> u64 {
+        self.recv_timeout_ns.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_send_timeout_ns(&self, timeout_ns: u64) {
+        self.send_timeout_ns.store(timeout_ns, Ordering::Release);
+    }
+
+    pub(crate) fn send_timeout_ns(&self) -> u64 {
+        self.send_timeout_ns.load(Ordering::Acquire)
     }
 
     /// Return the local endpoint of this TCP socket, or None if unavailable.
@@ -447,6 +471,8 @@ impl TcpSocketFile {
                     bound_endpoint: SpinNoIrqLock::new(Some(listener.endpoint())),
                     listening: AtomicBool::new(false),
                     listener: SpinNoIrqLock::new(None),
+                    recv_timeout_ns: AtomicU64::new(self.recv_timeout_ns()),
+                    send_timeout_ns: AtomicU64::new(self.send_timeout_ns()),
                 });
 
                 NEED_POLL.store(true, Ordering::Release);
@@ -564,8 +590,14 @@ impl TcpSocketFile {
         if buf.len() == 0 {
             return Ok(0);
         }
+        let timeout_ms = timeout_ns_to_ms(self.recv_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let st = self.state();
@@ -588,10 +620,17 @@ impl TcpSocketFile {
                             break;
                         }
                     }
+                    if let Some(handle) = timeout_handle.take() {
+                        socket_wait_mark_ready(handle);
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok(total);
                 }
                 if !socket.may_recv() {
                     debug!("tcp recv eof: source_id={} buf_len={}", st.source_id(), buf.len());
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok(0);
                 }
                 debug!(
@@ -602,10 +641,55 @@ impl TcpSocketFile {
                     socket.may_recv()
                 );
             }
-            st.read_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
-            if crate::signal::has_unmasked_pending_signal() {
-                return Err(ERRNO::EINTR);
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                    self.recv_ready() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.recv_ready() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                st.read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
             }
         }
     }
@@ -619,8 +703,14 @@ impl TcpSocketFile {
         if buf.len() == 0 {
             return Ok(0);
         }
+        let timeout_ms = timeout_ns_to_ms(self.send_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let st = self.state();
@@ -638,6 +728,9 @@ impl TcpSocketFile {
                             }
                             let n = socket.send_slice(&slice[off..]).map_err(|_| ERRNO::EIO)?;
                             if n == 0 {
+                                if let Some(handle) = timeout_handle.take() {
+                                    cleanup_socket_wait(handle);
+                                }
                                 return Err(ERRNO::EIO);
                             }
                             total += n;
@@ -650,17 +743,69 @@ impl TcpSocketFile {
                     if total > 0 {
                         stack.poll();
                         NEED_POLL.store(true, Ordering::Release);
+                        if let Some(handle) = timeout_handle.take() {
+                            socket_wait_mark_ready(handle);
+                            cleanup_socket_wait(handle);
+                        }
                         return Ok(total);
                     }
                 }
                 if !socket.may_send() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok(0);
                 }
             }
-            st.write_wait
-                .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
-            if crate::signal::has_unmasked_pending_signal() {
-                return Err(ERRNO::EINTR);
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                    self.send_ready() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.send_ready() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                st.write_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
             }
         }
     }
@@ -736,8 +881,14 @@ impl File for TcpSocketFile {
         if buf.is_empty() {
             return Ok(0);
         }
+        let timeout_ms = timeout_ns_to_ms(self.recv_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let st = self.state();
@@ -746,16 +897,69 @@ impl File for TcpSocketFile {
                 let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 if socket.can_recv() {
-                    return socket.recv_slice(buf).map_err(|_| ERRNO::EIO);
+                    let n = socket.recv_slice(buf).map_err(|_| ERRNO::EIO)?;
+                    if let Some(handle) = timeout_handle.take() {
+                        socket_wait_mark_ready(handle);
+                        cleanup_socket_wait(handle);
+                    }
+                    return Ok(n);
                 }
                 if !socket.may_recv() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok(0);
                 }
             }
-            st.read_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
-            if crate::signal::has_unmasked_pending_signal() {
-                return Err(ERRNO::EINTR);
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                    self.recv_ready() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.recv_ready() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                st.read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
             }
         }
     }
@@ -781,8 +985,14 @@ impl File for TcpSocketFile {
         if buf.is_empty() {
             return Ok(0);
         }
+        let timeout_ms = timeout_ns_to_ms(self.send_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let st = self.state();
@@ -793,17 +1003,69 @@ impl File for TcpSocketFile {
                 if socket.can_send() {
                     let n = socket.send_slice(buf).map_err(|_| ERRNO::EIO)?;
                     if n == 0 {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
                         return Err(ERRNO::EIO);
                     }
                     stack.poll();
                     NEED_POLL.store(true, Ordering::Release);
+                    if let Some(handle) = timeout_handle.take() {
+                        socket_wait_mark_ready(handle);
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok(n);
                 }
             }
-            st.write_wait
-                .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
-            if crate::signal::has_unmasked_pending_signal() {
-                return Err(ERRNO::EINTR);
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                    self.send_ready() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.send_ready() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                st.write_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
             }
         }
     }

@@ -1,8 +1,8 @@
 use alloc::{sync::Arc, vec::Vec};
 use strum_macros::FromRepr;
-use core::mem::size_of;
+use core::{mem::size_of, slice};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
-
+use crate::syscall::times::TimeVal;
 use crate::fs::{
     make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
 };
@@ -29,12 +29,15 @@ const SHUT_RDWR: i32 = 2;
 
 #[repr(i32)]
 #[derive(FromRepr)]
+#[allow(clippy::enum_variant_names)]
 enum PosixSocketOption {
     SoType = 3,
     SoError = 4,
     SoSndBuf = 7,
     SoRcvBuf = 8,
     SoPassCred = 16,
+    SoRecvTimeo = 20,
+    SoSndTimeo = 21,
     SoAcceptConn = 30,
 }
 
@@ -437,6 +440,20 @@ fn socket_kind(fd: usize) -> Result<SocketKind, ERRNO> {
     Err(ERRNO::ENOTSOCK)
 }
 
+fn parse_socket_type_flags(socket_type: i32) -> Result<(i32, FileStatusFlags, bool), ERRNO> {
+    let extra_flags = socket_type & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if extra_flags != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let status_flags = if (socket_type & SOCK_NONBLOCK) != 0 {
+        FileStatusFlags::NONBLOCK
+    } else {
+        FileStatusFlags::empty()
+    };
+    let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
+    Ok((socket_type & SOCK_TYPE_MASK, status_flags, cloexec))
+}
+
 fn read_sockopt_i32(token: usize, optval: *const u8, optlen: i32) -> Result<i32, ERRNO> {
     if optlen < size_of::<i32>() as i32 {
         return Err(ERRNO::EINVAL);
@@ -446,6 +463,36 @@ fn read_sockopt_i32(token: usize, optval: *const u8, optlen: i32) -> Result<i32,
     }
     let raw = copy_user_bytes(token, optval, size_of::<i32>())?;
     Ok(i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_sockopt_timeval(optval: *const u8, optlen: i32) -> Result<TimeVal, ERRNO> {
+    if optlen < size_of::<TimeVal>() as i32 {
+        return Err(ERRNO::EINVAL);
+    }
+    if optval.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    read_pod_from_user(optval as *const TimeVal)
+}
+
+fn timeval_to_ns(timeval: &TimeVal) -> Result<u64, ERRNO> {
+    if timeval.usec >= 1_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let sec_ns = (timeval.sec as u128) * 1_000_000_000u128;
+    let usec_ns = (timeval.usec as u128) * 1_000u128;
+    let total = sec_ns.saturating_add(usec_ns);
+    if total > u64::MAX as u128 {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(total as u64)
+}
+
+fn timeval_from_ns(ns: u64) -> TimeVal {
+    TimeVal {
+        sec: (ns / 1_000_000_000) as usize,
+        usec: ((ns % 1_000_000_000) / 1_000) as usize,
+    }
 }
 
 fn write_getsockopt_value(token: usize, optval: *mut u8, optlen: *mut i32, val: &[u8]) -> Result<(), ERRNO> {
@@ -553,7 +600,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
             return Err(ERRNO::EAFNOSUPPORT);
         }
 
-        let base_type = socket_type & SOCK_TYPE_MASK;
+        let (base_type, status_flags, cloexec) = parse_socket_type_flags(socket_type)?;
         let file: Arc<dyn File + Send + Sync> = match base_type {
             SOCK_DGRAM => create_udp_socket_file()
                 .map(|f| f as Arc<dyn File + Send + Sync>)
@@ -567,14 +614,18 @@ pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
         let desc = Arc::new(FileDescription::new(
             file,
             AccessMode::ReadWrite,
-            FileStatusFlags::empty(),
+            status_flags,
             0,
         ));
 
         let process = current_process();
         let mut inner = process.inner_exclusive_access();
         let fd = inner.alloc_fd()?;
-        inner.fd_table[fd] = Some(FdEntry::new(desc));
+        let mut entry = FdEntry::new(desc);
+        if cloexec {
+            entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[fd] = Some(entry);
         Ok(fd as isize)
     })
 }
@@ -591,11 +642,7 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
             return Err(ERRNO::EPROTONOSUPPORT);
         }
 
-        let extra_flags = socket_type & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if extra_flags != 0 {
-            return Err(ERRNO::EINVAL);
-        }
-        let base_type = socket_type & SOCK_TYPE_MASK;
+        let (base_type, status_flags, cloexec) = parse_socket_type_flags(socket_type)?;
         if base_type != SOCK_STREAM {
             return Err(ERRNO::ESOCKTNOSUPPORT);
         }
@@ -606,13 +653,6 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         let (end0_raw, end1_raw) = UnixSocketPairEnd::new_pair(ba_read, ab_write, ab_read, ba_write);
         let end0: Arc<dyn File + Send + Sync> = end0_raw;
         let end1: Arc<dyn File + Send + Sync> = end1_raw;
-
-        let status_flags = if (socket_type & SOCK_NONBLOCK) != 0 {
-            FileStatusFlags::NONBLOCK
-        } else {
-            FileStatusFlags::empty()
-        };
-        let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
 
         let desc0 = Arc::new(FileDescription::new(
             end0,
@@ -898,6 +938,7 @@ pub fn sys_shutdown(fd: i32, how: i32) -> isize {
     })
 }
 
+#[allow(unused_variables)]
 pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optlen: i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
@@ -919,6 +960,52 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                         unix.set_passcred(enabled);
                         Ok(())
                     })?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoRecvTimeo) => {
+                    let timeval = read_sockopt_timeval(optval, optlen)?;
+                    let timeout_ns = timeval_to_ns(&timeval)?;
+                    match kind {
+                        SocketKind::Udp => with_udp_socket(fd, |udp| {
+                            udp.set_recv_timeout_ns(timeout_ns);
+                            Ok(())
+                        })?,
+                        SocketKind::Tcp => with_tcp_socket(fd, |tcp| {
+                            tcp.set_recv_timeout_ns(timeout_ns);
+                            Ok(())
+                        })?,
+                        SocketKind::Unix => {
+                            warn!(
+                                "setsockopt(fd={}, level={}, optname={}) unsupported on UNIX socket, ignored",
+                                fd,
+                                level,
+                                optname
+                            );
+                        }
+                    }
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoSndTimeo) => {
+                    let timeval = read_sockopt_timeval(optval, optlen)?;
+                    let timeout_ns = timeval_to_ns(&timeval)?;
+                    match kind {
+                        SocketKind::Udp => with_udp_socket(fd, |udp| {
+                            udp.set_send_timeout_ns(timeout_ns);
+                            Ok(())
+                        })?,
+                        SocketKind::Tcp => with_tcp_socket(fd, |tcp| {
+                            tcp.set_send_timeout_ns(timeout_ns);
+                            Ok(())
+                        })?,
+                        SocketKind::Unix => {
+                            warn!(
+                                "setsockopt(fd={}, level={}, optname={}) unsupported on UNIX socket, ignored",
+                                fd,
+                                level,
+                                optname
+                            );
+                        }
+                    }
                     Ok(0)
                 }
                 _ => {
@@ -1012,6 +1099,53 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                         return Ok(0);
                     }
                     write_getsockopt_i32(token, optval, optlen, size)?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoRecvTimeo) => {
+                    let timeout_ns = match kind {
+                        SocketKind::Udp => {
+                            let mut ns = 0u64;
+                            with_udp_socket(fd, |udp| { ns = udp.recv_timeout_ns(); Ok(()) })?;
+                            ns
+                        }
+                        SocketKind::Tcp => {
+                            let mut ns = 0u64;
+                            with_tcp_socket(fd, |tcp| { ns = tcp.recv_timeout_ns(); Ok(()) })?;
+                            ns
+                        }
+                        SocketKind::Unix => 0,
+                    };
+                    let timeval = timeval_from_ns(timeout_ns);
+                    let bytes = unsafe {
+                        slice::from_raw_parts(
+                            (&timeval as *const TimeVal) as *const u8,
+                            size_of::<TimeVal>(),
+                        )
+                    };
+                    write_getsockopt_value(token, optval, optlen, bytes)?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoSndTimeo) => {
+                    let timeout_ns = match kind {
+                        SocketKind::Udp => {
+                            let mut ns = 0u64;
+                            with_udp_socket(fd, |udp| { ns = udp.send_timeout_ns(); Ok(())})?;
+                            ns
+                        }
+                        SocketKind::Tcp => {
+                            let mut ns = 0u64;
+                            with_tcp_socket(fd, |tcp| { ns = tcp.send_timeout_ns(); Ok(())})?;
+                            ns
+                        }
+                        SocketKind::Unix => 0,
+                    };
+                    let timeval = timeval_from_ns(timeout_ns);
+                    let bytes = unsafe {
+                        slice::from_raw_parts(
+                            (&timeval as *const TimeVal) as *const u8, size_of::<TimeVal>(),
+                        )
+                    };
+                    write_getsockopt_value(token, optval, optlen, bytes)?;
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoError) => {

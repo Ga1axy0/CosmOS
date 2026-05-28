@@ -122,7 +122,7 @@ fast-run: kernel
 
 run-inner:
 	@$(QEMU) \
-		-m 256M \
+		-m 512M \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \
@@ -139,7 +139,7 @@ run-inner:
 
 run-inner-trace:
 	@$(QEMU) \
-		-m 256M \
+		-m 512M \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \
@@ -159,14 +159,14 @@ run-inner-trace:
 debug: MODE=debug
 debug: build
 	@tmux new-session -d \
-		"$(QEMU) -m 256M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
+		"$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
 		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: MODE=debug
 gdbserver: build
-	@$(QEMU) -m 256M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+	@$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 	        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
 		-s -S

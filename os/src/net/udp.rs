@@ -3,7 +3,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use smoltcp::socket::udp as udp_socket;
 use smoltcp::socket::udp::SendError;
@@ -11,11 +11,15 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
-use crate::net::{NEED_POLL, NET_STACK};
+use crate::net::{
+    cleanup_socket_wait, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
+    socket_wait_state, timeout_ns_to_ms, SocketWakeState, NEED_POLL, NET_STACK,
+};
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
-use crate::task::{WaitQueue, WaitReason};
+use crate::task::{current_task, WaitQueue, WaitReason};
+use crate::timer::{add_timer_with_socket_tag, get_time_ms};
 
 #[inline]
 fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
@@ -60,6 +64,8 @@ impl UdpSocketState {
 pub(crate) struct UdpSocketFile {
     st: Arc<UdpSocketState>,
     connected: SpinNoIrqLock<Option<IpEndpoint>>,
+    recv_timeout_ns: AtomicU64,
+    send_timeout_ns: AtomicU64,
 }
 
 impl UdpSocketFile {
@@ -67,6 +73,8 @@ impl UdpSocketFile {
         Self {
             st,
             connected: SpinNoIrqLock::new(None),
+            recv_timeout_ns: AtomicU64::new(0),
+            send_timeout_ns: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +84,22 @@ impl UdpSocketFile {
 
     pub(crate) fn send_buffer_size(&self) -> usize {
         super::UDP_BUF
+    }
+
+    pub(crate) fn set_recv_timeout_ns(&self, timeout_ns: u64) {
+        self.recv_timeout_ns.store(timeout_ns, Ordering::Release);
+    }
+
+    pub(crate) fn recv_timeout_ns(&self) -> u64 {
+        self.recv_timeout_ns.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_send_timeout_ns(&self, timeout_ns: u64) {
+        self.send_timeout_ns.store(timeout_ns, Ordering::Release);
+    }
+
+    pub(crate) fn send_timeout_ns(&self) -> u64 {
+        self.send_timeout_ns.load(Ordering::Acquire)
     }
 
     /// Return the local (bound) endpoint of this UDP socket. If not bound, returns None.
@@ -157,8 +181,14 @@ impl UdpSocketFile {
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
         trace!("udp send_to: data_len={} ep={} handle={:?}", data.len(), ep, self.st.handle);
+        let timeout_ms = timeout_ns_to_ms(self.send_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let mut guard = NET_STACK.lock();
@@ -180,10 +210,17 @@ impl UdpSocketFile {
 
                         stack.poll();
                         NEED_POLL.store(true, Ordering::Release);
+                        if let Some(handle) = timeout_handle.take() {
+                            socket_wait_mark_ready(handle);
+                            cleanup_socket_wait(handle);
+                        }
                         return Ok(data.len());
                     }
                     Err(e) => {
                         error!("udp send_slice failed for socket {:?}: {:?}, ep = {}", self.st.handle, e, ep);
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
                         return match e {
                             SendError::Unaddressable => Err(ERRNO::EHOSTUNREACH),
                             SendError::BufferFull => Err(ERRNO::ENOBUFS),
@@ -193,9 +230,57 @@ impl UdpSocketFile {
             }
             debug!("udp socket {:?} cannot send, waiting", self.st.handle);
             drop(guard);
-            self.st
-                .write_wait
-                .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.can_send_now());
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                self.st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                    self.can_send_now() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.can_send_now() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                self.st
+                    .write_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.can_send_now());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
+            }
         }
     }
 
@@ -222,8 +307,14 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn recv_from_user_buffer(&self, out: &mut UserBuffer) -> Result<(usize, IpEndpoint), ERRNO> {
+        let timeout_ms = timeout_ns_to_ms(self.recv_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let mut guard = NET_STACK.lock();
@@ -240,13 +331,65 @@ impl UdpSocketFile {
                         slice[..(end - off)].copy_from_slice(&data[off..end]);
                         off = end;
                     }
+                    if let Some(handle) = timeout_handle.take() {
+                        socket_wait_mark_ready(handle);
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok((off, meta.endpoint));
                 }
             }
             drop(guard);
-            self.st
-                .read_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                self.st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                    self.can_recv_now() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.can_recv_now() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                self.st
+                    .read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
+            }
         }
     }
 
@@ -294,8 +437,14 @@ impl File for UdpSocketFile {
     }
 
     fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
+        let timeout_ms = timeout_ns_to_ms(self.recv_timeout_ns())?;
+        let mut timeout_handle = None;
+        let mut deadline_ms = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
+                if let Some(handle) = timeout_handle.take() {
+                    cleanup_socket_wait(handle);
+                }
                 return Err(ERRNO::EINTR);
             }
             let mut guard = NET_STACK.lock();
@@ -305,13 +454,65 @@ impl File for UdpSocketFile {
                 if let Ok((data, _meta)) = socket.recv() {
                     let n = min(data.len(), buf.len());
                     buf[..n].copy_from_slice(&data[..n]);
+                    if let Some(handle) = timeout_handle.take() {
+                        socket_wait_mark_ready(handle);
+                        cleanup_socket_wait(handle);
+                    }
                     return Ok(n);
                 }
             }
             drop(guard);
-            self.st
-                .read_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+            if let Some(timeout_ms) = timeout_ms {
+                if timeout_handle.is_none() {
+                    let task = current_task().unwrap();
+                    let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
+                    let now_ms = get_time_ms();
+                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    timeout_handle = Some(handle);
+                    deadline_ms = Some(deadline);
+                }
+                if let Some(deadline) = deadline_ms {
+                    if get_time_ms() >= deadline {
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+                let handle = timeout_handle.expect("socket wait handle must exist");
+                self.st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                    self.can_recv_now() || socket_wait_should_skip(handle)
+                });
+                if crate::signal::has_unmasked_pending_signal() {
+                    if let Some(handle) = timeout_handle.take() {
+                        cleanup_socket_wait(handle);
+                    }
+                    return Err(ERRNO::EINTR);
+                }
+                if let Some(handle) = timeout_handle {
+                    if matches!(socket_wait_state(handle), SocketWakeState::TimedOut) {
+                        if self.can_recv_now() {
+                            if let Some(handle) = timeout_handle.take() {
+                                cleanup_socket_wait(handle);
+                            }
+                            deadline_ms = None;
+                            continue;
+                        }
+                        if let Some(handle) = timeout_handle.take() {
+                            cleanup_socket_wait(handle);
+                        }
+                        return Err(ERRNO::EAGAIN);
+                    }
+                }
+            } else {
+                self.st
+                    .read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+                if crate::signal::has_unmasked_pending_signal() {
+                    return Err(ERRNO::EINTR);
+                }
+            }
         }
     }
 
