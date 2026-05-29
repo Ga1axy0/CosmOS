@@ -6,6 +6,7 @@ use spin::Mutex;
 
 use crate::block_cache::get_block_cache;
 use crate::block_dev::BlockDevice as OsBlockDevice;
+use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
 use crate::{STATFS_MAGIC_EXT4, STATFS_NAMELEN_DEFAULT, VfsStatFs};
 use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsFileType, VfsNode};
@@ -173,22 +174,96 @@ impl Ext4Inode {
         }
     }
 
+    fn linux_dirent_file_type(dtype: u8) -> VfsFileType {
+        match dtype {
+            4 => VfsFileType::Directory,
+            10 => VfsFileType::Symlink,
+            2 => VfsFileType::Char,
+            6 => VfsFileType::Block,
+            1 => VfsFileType::Fifo,
+            12 => VfsFileType::Socket,
+            8 => VfsFileType::Regular,
+            _ => VfsFileType::Unknown,
+        }
+    }
+
+    fn prime_dentry_cache_from_dirents(&self, ext4: &Ext4, buf: &[u8]) {
+        let fs_id = self.fs_id();
+        let parent_ino = self.ino();
+        let mut cursor = 0usize;
+        while cursor + 19 <= buf.len() {
+            let reclen = u16::from_le_bytes([buf[cursor + 16], buf[cursor + 17]]) as usize;
+            if reclen == 0 || cursor + reclen > buf.len() {
+                break;
+            }
+            let name_end = buf[cursor + 19..cursor + reclen]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|idx| cursor + 19 + idx)
+                .unwrap_or(cursor + reclen);
+            if name_end == cursor + 19 {
+                cursor += reclen;
+                continue;
+            }
+
+            let ino = u64::from_le_bytes([
+                buf[cursor],
+                buf[cursor + 1],
+                buf[cursor + 2],
+                buf[cursor + 3],
+                buf[cursor + 4],
+                buf[cursor + 5],
+                buf[cursor + 6],
+                buf[cursor + 7],
+            ]);
+            let Ok(name) = core::str::from_utf8(&buf[cursor + 19..name_end]) else {
+                cursor += reclen;
+                continue;
+            };
+            if ino == 0 || name == "." || name == ".." {
+                cursor += reclen;
+                continue;
+            }
+
+            let mut file_type = Self::linux_dirent_file_type(buf[cursor + 18]);
+            if file_type == VfsFileType::Unknown {
+                file_type = Self::inode_file_type(ext4, ino as u32);
+            }
+            let child = Inode::from_vfs_node(
+                Arc::new(Self::new_with_type(Arc::clone(&self.fs), ino as u32, file_type))
+                    as Arc<dyn VfsNode>,
+            );
+            insert_dentry(fs_id, parent_ino, name, &child);
+            cursor += reclen;
+        }
+    }
+
+    fn ext4_getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if self.file_type != VfsFileType::Directory {
+            return 0;
+        }
+
+        let ext4 = self.fs.ext4.lock();
+        let written = ext4.ext4_dir_getdents64(self.inode_num, offset, buf);
+        if written != 0 {
+            self.prime_dentry_cache_from_dirents(&ext4, &buf[..written]);
+        }
+        written
+    }
+
     /// 查询目录项元数据，返回 `(inode 编号, 文件类型)`。
     fn lookup_child_meta(&self, name: &str) -> Option<(u32, VfsFileType)> {
         if self.file_type != VfsFileType::Directory {
             return None;
         }
         let ext4 = self.fs.ext4.lock();
-        ext4.ext4_dir_get_entries(self.inode_num)
-            .into_iter()
-            .find(|de| de.get_name() == name)
-            .map(|de| {
-                // Trust the inode's mode bits over the directory entry type.
-                // A stale/corrupt d_type can otherwise turn a non-directory inode
-                // into a cached "directory" and later panic inside ext4 dir helpers.
-                let file_type = Self::inode_file_type(&ext4, de.inode);
-                (de.inode, file_type)
-            })
+        ext4.ext4_dir_lookup(self.inode_num, name).map(|(inode_num, _de_type)| {
+            // Trust the inode's mode bits over the directory entry type.
+            // A stale/corrupt d_type can otherwise turn a non-directory inode
+            // into a cached "directory" and later panic inside ext4 dir helpers.
+            let file_type = Self::inode_file_type(&ext4, inode_num);
+            (inode_num, file_type)
+        })
     }
 
     /// 在 ext4 后端内实现完整 truncate 语义。
@@ -323,16 +398,19 @@ impl VfsNode for Ext4Inode {
             .ext4_dir_get_entries(self.inode_num)
             .into_iter()
             .map(|de| {
-                let disk_type = Self::inode_file_type(&ext4, de.inode);
                 let dirent_type = Self::dirent_file_type(de.get_de_type());
-                let file_type = if disk_type == VfsFileType::Unknown {
-                    dirent_type
+                let file_type = if dirent_type == VfsFileType::Unknown {
+                    Self::inode_file_type(&ext4, de.inode)
                 } else {
-                    disk_type
+                    dirent_type
                 };
                 (de.get_name(), file_type)
             })
             .collect()
+    }
+
+    fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.ext4_getdents64(offset, buf)
     }
 
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {

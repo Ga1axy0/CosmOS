@@ -865,62 +865,11 @@ impl File for OSInode {
         }
         Err(ERRNO::ENOTTY)
     }
-    /// Fill `buf` with `linux_dirent64` records from the directory.
-    ///
-    /// `offset` is used as an **entry index** (not a byte offset) so that
-    /// callers can place the shared directory position in `FileDescription`.
-    ///
-    /// Each record layout (`linux_dirent64`):
-    /// ```text
-    ///   +0   d_ino    u64  (entry index)
-    ///   +8   d_off    i64  (index of next entry, −1 for last)
-    ///   +16  d_reclen u16  (total length of this record, aligned to 8 B)
-    ///   +18  d_type   u8   (DT_DIR=4, DT_REG=8, DT_UNKNOWN=0)
-    ///   +19  d_name[] null-terminated name, padded to make reclen a multiple of 8
-    /// ```
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
         if !self.inode.is_dir() {
             return 0;
         }
-        let entries = self.inode.ls();
-        let start_idx = offset; // entry index, not byte offset
-        let mut written = 0usize;
-
-        for (i, (name, file_type)) in entries.iter().enumerate().skip(start_idx) {
-            let name_bytes = name.as_bytes();
-            // reclen must be a multiple of 8
-            let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
-            if written + reclen > buf.len() {
-                break;
-            }
-            // d_ino (u64)
-            buf[written..written + 8].copy_from_slice(&(i as u64).to_le_bytes());
-            // d_off (i64): offset of *next* entry
-            let next_off = (i + 1) as i64;
-            buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
-            // d_reclen (u16)
-            buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            // d_type (u8): DT_DIR=4, DT_LNK=10, DT_REG=8
-            let dtype: u8 = match file_type {
-                VfsFileType::Directory => 4,
-                VfsFileType::Symlink => 10,
-                VfsFileType::Char => 2,
-                VfsFileType::Block => 6,
-                VfsFileType::Fifo => 1,
-                VfsFileType::Socket => 12,
-                VfsFileType::Regular => 8,
-                VfsFileType::Unknown => 0,
-            };
-            buf[written + 18] = dtype;
-            // d_name: null-terminated, zero-padded to reclen
-            buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
-            buf[written + 19 + name_bytes.len()] = 0;
-            for b in &mut buf[written + 19 + name_bytes.len() + 1..written + reclen] {
-                *b = 0;
-            }
-            written += reclen;
-        }
-        written
+        self.inode.getdents64(offset, buf)
     }
 
     fn is_seekable(&self) -> bool {
