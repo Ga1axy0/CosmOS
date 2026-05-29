@@ -89,6 +89,47 @@ pub trait VfsNode: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
     /// List directory entries as `(name, file_type)` pairs.
     fn ls(&self) -> Vec<(String, VfsFileType)>;
+    /// Fill `buf` with `linux_dirent64` records starting from the backend-defined
+    /// directory position `offset`.
+    ///
+    /// The default implementation preserves the historical behavior used by the
+    /// in-tree backends: `offset` is treated as an entry index and the method
+    /// is implemented on top of `ls()`.
+    fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let entries = self.ls();
+        let mut written = 0usize;
+
+        for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
+            let name_bytes = name.as_bytes();
+            let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
+            if written + reclen > buf.len() {
+                break;
+            }
+
+            buf[written..written + 8].copy_from_slice(&(i as u64).to_le_bytes());
+            let next_off = (i + 1) as i64;
+            buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
+            buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            buf[written + 18] = match file_type {
+                VfsFileType::Directory => 4,
+                VfsFileType::Symlink => 10,
+                VfsFileType::Char => 2,
+                VfsFileType::Block => 6,
+                VfsFileType::Fifo => 1,
+                VfsFileType::Socket => 12,
+                VfsFileType::Regular => 8,
+                VfsFileType::Unknown => 0,
+            };
+            buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+            buf[written + 19 + name_bytes.len()] = 0;
+            for b in &mut buf[written + 19 + name_bytes.len() + 1..written + reclen] {
+                *b = 0;
+            }
+            written += reclen;
+        }
+
+        written
+    }
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Create a sub-directory named `name` inside this directory.
@@ -291,6 +332,10 @@ impl Inode {
 
     pub fn ls(&self) -> Vec<(String, VfsFileType)> {
         self.inner.ls()
+    }
+
+    pub fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.inner.getdents64(offset, buf)
     }
 
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {

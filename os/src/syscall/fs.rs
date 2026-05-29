@@ -21,7 +21,7 @@ use crate::sched::block_current_and_run_next;
 use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{vec::Vec, vec};
 use core::{mem::{offset_of, size_of}, slice};
 use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
 use crate::task::SignalBit;
@@ -1999,9 +1999,11 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
         // Fill a kernel-side temporary buffer …
-        let mut tmp: Vec<u8> = Vec::with_capacity(count);
-        tmp.extend(core::iter::repeat(0u8).take(count));
+        let mut tmp: Vec<u8> = vec![0; count];
+let start = get_time_us();
         let bytes = desc.getdents64(&mut tmp);
+let end = get_time_us();
+debug!("sys_getdents64: fd={}, count={}, time_us={}", fd, count, end - start);
         if bytes == 0 {
             return Ok(0);
         }
