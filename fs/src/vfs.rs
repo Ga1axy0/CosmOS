@@ -304,6 +304,8 @@ pub struct Inode {
 struct InodeState {
     /// 由 OS 层按需挂载的 page cache 宿主对象。
     page_cache: Option<Arc<dyn Any + Send + Sync>>,
+    /// 最近一次读取到的 stat 元数据快照。
+    stat_attrs: Option<VfsAttrs>,
 }
 
 impl Inode {
@@ -311,7 +313,10 @@ impl Inode {
     fn new(inner: Arc<dyn VfsNode>) -> Self {
         Self {
             inner,
-            state: Mutex::new(InodeState { page_cache: None }),
+            state: Mutex::new(InodeState {
+                page_cache: None,
+                stat_attrs: None,
+            }),
         }
     }
 
@@ -419,7 +424,9 @@ impl Inode {
 
     /// 调整 inode 对应常规文件的逻辑长度。
     pub fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
-        self.inner.truncate(new_size)
+        self.inner.truncate(new_size)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -427,7 +434,11 @@ impl Inode {
     }
 
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        self.inner.write_at(offset, buf)
+        let written = self.inner.write_at(offset, buf);
+        if written != 0 {
+            self.invalidate_stat_cache();
+        }
+        written
     }
 
     pub fn ino(&self) -> u64 {
@@ -441,7 +452,12 @@ impl Inode {
 
     /// Read all stat-relevant attributes in one call.
     pub fn stat_attrs(&self) -> VfsAttrs {
-        self.inner.stat_attrs()
+        if let Some(attrs) = self.state.lock().stat_attrs.clone() {
+            return attrs;
+        }
+        let attrs = self.inner.stat_attrs();
+        self.state.lock().stat_attrs = Some(attrs.clone());
+        attrs
     }
 
     /// Read filesystem-wide statistics.
@@ -471,12 +487,16 @@ impl Inode {
 
     /// Set file mode bits on the underlying node.
     pub fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
-        self.inner.set_mode(mode)
+        self.inner.set_mode(mode)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     /// Set file owner uid/gid on the underlying node.
     pub fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
-        self.inner.set_owner(uid, gid)
+        self.inner.set_owner(uid, gid)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     pub fn check_access(&self, uid: u32, gid: u32, mode: u32) -> bool {
@@ -489,6 +509,8 @@ impl Inode {
 
     pub fn link_inode(&self, child: &Arc<Inode>, new_name: &str) -> Result<(), FS_ERRNO> {
         self.inner.link_inode(&child.inner, new_name)?;
+        self.invalidate_stat_cache();
+        child.invalidate_stat_cache();
         let fs_id = self.fs_id();
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), new_name, child);
@@ -514,6 +536,7 @@ impl Inode {
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
         }
+        self.invalidate_stat_cache();
         Ok(())
     }
 
@@ -532,6 +555,7 @@ impl Inode {
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
         }
+        self.invalidate_stat_cache();
         Ok(())
     }
 
@@ -553,12 +577,16 @@ impl Inode {
         mtime: Option<InodeTime>,
         ctime: Option<InodeTime>,
     ) -> Result<(), FS_ERRNO> {
-        self.inner.set_times(atime, mtime, ctime)
+        self.inner.set_times(atime, mtime, ctime)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     /// Update `atime`/`mtime`/`ctime` to the same timestamp.
     pub fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
-        self.inner.set_times_now(now)
+        self.inner.set_times_now(now)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
@@ -582,7 +610,14 @@ impl Inode {
         if let Some((child_fs, child_ino)) = replaced_child {
             remove_cached_inode(child_fs, child_ino);
         }
+        self.invalidate_stat_cache();
+        new_parent.invalidate_stat_cache();
         Ok(())
+    }
+
+    /// Drop the cached stat snapshot for this inode.
+    pub fn invalidate_stat_cache(&self) {
+        self.state.lock().stat_attrs = None;
     }
 
     /// 获取当前 inode 挂载的 page cache 宿主对象。
