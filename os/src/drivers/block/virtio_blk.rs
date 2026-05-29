@@ -16,11 +16,28 @@ pub struct VirtIOBlock {
     wait_queue: WaitQueueKeyed<u16>,
 }
 
+// static mut READ_RECORDS: SpinNoIrqLock<([usize; 512], usize)> = SpinNoIrqLock::new(([0; 512], 0));
+
 impl BlockDevice for VirtIOBlock {
     /// Read a block from the virtio_blk device
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
+        
+        // unsafe {
+        //     let mut records = READ_RECORDS.lock();
+        //     let idx = records.1 % 512;
+        //     records.0[idx] = block_id;
+        //     records.1 += 1;
+        //     if idx.is_multiple_of(512) {
+        //         // Debug-print the inner array, not the lock guard (which doesn't implement Debug).
+        //         warn!(
+        //             "Recent 512 VirtIOBlk read block_ids: {:?}",
+        //             &records.0
+        //         );
+        //     }
+        // }
+
         // debug!("Submitting VirtIOBlk read for block_id {}", block_id);
         let token = unsafe {
             self.inner
