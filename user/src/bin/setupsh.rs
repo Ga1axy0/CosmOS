@@ -14,9 +14,11 @@ const EEXIST: isize = -17;
 
 const BIN_DIR: &str = "/bin";
 const BIN_DIR_CSTR: &str = "/bin\0";
+const BIN_BASH: &str = "/bin/bash";
 const BIN_BUSYBOX: &str = "/bin/busybox";
 const LIB_DIR: &str = "/lib";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
+const ROOT_BASH: &str = "/bash";
 const ROOT_BUSYBOX: &str = "/busybox";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_BUSYBOX_PATH_CSTR: &str = "/musl/busybox\0";
@@ -247,7 +249,7 @@ fn install_runtime_libs(libc: BusyBoxLibc) -> bool {
 
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 5;
+    const TOTAL_STEPS: usize = 6;
     let busybox_libc = match BusyBoxLibc::from_args(argv) {
         Some(libc) => libc,
         None => return 1,
@@ -280,7 +282,12 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return install_exit;
     }
 
-    print_step(4, TOTAL_STEPS, "create /busybox hard link");
+    print_step(4, TOTAL_STEPS, "install /bin/bash compatibility shim");
+    if !ensure_hard_link(ROOT_BASH, BIN_BASH) {
+        return 1;
+    }
+
+    print_step(5, TOTAL_STEPS, "create /busybox hard link");
     if !ensure_hard_link(busybox_path, ROOT_BUSYBOX) {
         return 1;
     }
@@ -288,7 +295,7 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(5, TOTAL_STEPS, "launch /bin/sh");
+    print_step(6, TOTAL_STEPS, "launch /bin/sh");
     let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
     let shell_exit = spawn_and_wait(BIN_SH_CSTR, &shell_argv);
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
