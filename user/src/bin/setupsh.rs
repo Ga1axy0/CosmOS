@@ -9,7 +9,7 @@ use alloc::string::String;
 use core::ptr;
 
 use user_lib::{
-    close, exec, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
+    chdir, close, exec, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
     OpenFlags, Stat,
 };
 
@@ -23,10 +23,14 @@ const BIN_BUSYBOX: &str = "/bin/busybox";
 const BIN_BUSYBOX_CSTR: &str = "/bin/busybox\0";
 const LIB_DIR: &str = "/lib";
 const ETC_DIR: &str = "/etc";
+const HOME_DIR: &str = "/home";
+const ROOT_HOME_DIR: &str = "/root";
+const TMP_DIR: &str = "/tmp";
 const USR_DIR: &str = "/usr";
 const USR_BIN_DIR: &str = "/usr/bin";
 const USR_BIN_DIR_CSTR: &str = "/usr/bin\0";
 const USR_LIB_DIR: &str = "/usr/lib";
+const VAR_DIR: &str = "/var";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const BUSYBOX_ARG0_CSTR: &str = "busybox\0";
 const ROOT_BASH: &str = "/bash";
@@ -321,9 +325,13 @@ fn ensure_dirs() -> bool {
         BIN_DIR,
         LIB_DIR,
         ETC_DIR,
+        HOME_DIR,
+        ROOT_HOME_DIR,
+        TMP_DIR,
         USR_DIR,
         USR_BIN_DIR,
         USR_LIB_DIR,
+        VAR_DIR,
         MUSL_LIB_DIR,
         GLIBC_LIB_DIR,
         GLIBC_USR_LIB_DIR,
@@ -469,6 +477,13 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
     }
 
     print_step(8, TOTAL_STEPS, "launch /bin/sh");
+    let chdir_ret = chdir(ROOT_HOME_DIR);
+    if chdir_ret < 0 {
+        println!(
+            "[setupsh] chdir {} failed: {}, continuing from current directory",
+            ROOT_HOME_DIR, chdir_ret
+        );
+    }
     let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
     let shell_exit = spawn_and_wait(BIN_SH_CSTR, &shell_argv);
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
