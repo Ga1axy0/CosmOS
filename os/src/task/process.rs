@@ -27,12 +27,6 @@ use alloc::vec::Vec;
 
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
-const MUSL_LIBC_FALLBACK: &str = "/musl/lib/libc.so";
-const MUSL_INTERP_PATHS: [&str; 3] = [
-    "/lib/ld-musl-riscv64-sf.so.1",
-    "/lib/ld-musl-riscv64.so.1",
-    "/lib/ld-linux-riscv64-lp64d.so.1"
-];
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
 
@@ -647,22 +641,6 @@ impl ProcessControlBlock {
                 crate::fs::OpenFlags::RDONLY,
             ) {
                 Ok(inode) => inode,
-                Err(_) if MUSL_INTERP_PATHS.iter().any(|path| interp_path == path) => {
-                    let fallback = crate::fs::open_file_at(
-                        cwd.as_str(),
-                        MUSL_LIBC_FALLBACK,
-                        crate::fs::OpenFlags::RDONLY,
-                    ).map_err(|_| {
-                        error!("Failed to open interpreter {}", interp_path);
-                        ERRNO::ENOENT
-                    })?;
-                    warn!(
-                        "Interpreter {} missing, falling back to {}",
-                        interp_path,
-                        MUSL_LIBC_FALLBACK
-                    );
-                    fallback
-                }
                 Err(_) => {
                     error!("Failed to open interpreter {}", interp_path);
                     return Err(ERRNO::ENOENT);
