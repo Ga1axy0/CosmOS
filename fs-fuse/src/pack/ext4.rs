@@ -7,6 +7,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const LINUX_DIRS: &[&str] = &[
+    "/bin", "/etc", "/home", "/root", "/tmp", "/usr", "/usr/bin", "/usr/lib", "/var",
+];
+
+const ROOT_SEED_APPS: &[&str] = &["initproc", "setupsh", "sh", "bash", "busybox"];
+
 fn run_checked(cmd: &mut Command, what: &str) -> io::Result<()> {
     let output = cmd.output()?;
     if output.status.success() {
@@ -43,11 +49,48 @@ fn resolve_tool(tool: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+fn run_debugfs_ignore_error(debugfs: &Path, img_path: &Path, command: String) {
+    let _ = Command::new(debugfs)
+        .arg("-w")
+        .arg("-R")
+        .arg(command)
+        .arg(img_path)
+        .output();
+}
+
+fn run_debugfs_checked(
+    debugfs: &Path,
+    img_path: &Path,
+    command: String,
+    what: &str,
+) -> io::Result<()> {
+    run_checked(
+        Command::new(debugfs)
+            .arg("-w")
+            .arg("-R")
+            .arg(command)
+            .arg(img_path),
+        what,
+    )
+}
+
+fn is_root_seed_app(name: &str) -> bool {
+    ROOT_SEED_APPS.contains(&name)
+}
+
+fn image_target_path(app: &AppFile) -> String {
+    if is_root_seed_app(app.name.as_str()) {
+        format!("/{}", app.name)
+    } else {
+        format!("/root/{}", app.name)
+    }
+}
+
 /// Pack files into a raw ext4 image.
 ///
 /// This implementation uses host tools from e2fsprogs:
 /// - `mkfs.ext4` to format the image
-/// - `debugfs` to write files into the root directory
+/// - `debugfs` to write files into a Linux-style directory layout
 pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
     let debugfs = resolve_tool("debugfs").ok_or_else(|| {
         io::Error::new(
@@ -105,21 +148,20 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
         )?;
     }
 
+    for dir in LINUX_DIRS {
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("mkdir {}", dir));
+    }
+
     for app in apps {
-        println!("Adding file: {}", app.name);
-        let _ = Command::new(&debugfs)
-            .arg("-w")
-            .arg("-R")
-            .arg(format!("rm /{}", app.name))
-            .arg(&cfg.img_path)
-            .output();
-        run_checked(
-            Command::new(&debugfs)
-                .arg("-w")
-                .arg("-R")
-                .arg(format!("write {} /{}", app.host_path.display(), app.name))
-                .arg(&cfg.img_path),
-            &format!("debugfs write {}", app.name),
+        let target_path = image_target_path(app);
+        println!("Adding file: {} -> {}", app.name, target_path);
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("rm /{}", app.name));
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("rm /root/{}", app.name));
+        run_debugfs_checked(
+            &debugfs,
+            &cfg.img_path,
+            format!("write {} {}", app.host_path.display(), target_path),
+            &format!("debugfs write {}", target_path),
         )?;
     }
 
@@ -164,6 +206,16 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
     println!(
         "debugfs ls -l /:\n{}",
         String::from_utf8_lossy(&output_ls.stdout)
+    );
+
+    let output_ls_root = Command::new(&debugfs)
+        .arg("-R")
+        .arg("ls -l /root")
+        .arg(&cfg.img_path)
+        .output()?;
+    println!(
+        "debugfs ls -l /root:\n{}",
+        String::from_utf8_lossy(&output_ls_root.stdout)
     );
 
     Ok(())
