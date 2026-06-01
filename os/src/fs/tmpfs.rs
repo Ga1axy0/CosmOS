@@ -39,6 +39,8 @@ fn tmpfs_statfs() -> StatFs64 {
 #[derive(Clone, Copy)]
 struct TmpfsMeta {
     mode: u32,
+    uid: u32,
+    gid: u32,
     atime: Option<InodeTime>,
     mtime: Option<InodeTime>,
     ctime: Option<InodeTime>,
@@ -48,6 +50,8 @@ impl TmpfsMeta {
     fn new(mode: u32) -> Self {
         Self {
             mode,
+            uid: 0,
+            gid: 0,
             atime: None,
             mtime: None,
             ctime: None,
@@ -262,6 +266,21 @@ impl VfsNode for TmpfsFileNode {
         Ok(())
     }
 
+    fn uid(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.uid)
+    }
+
+    fn gid(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.gid)
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        let mut inner = self.state.inner.lock();
+        inner.meta.uid = uid;
+        inner.meta.gid = gid;
+        Ok(())
+    }
+
     fn atime(&self) -> Option<InodeTime> {
         self.state.inner.lock().meta.atime
     }
@@ -294,8 +313,8 @@ impl VfsNode for TmpfsFileNode {
             ino: self.state.ino,
             nlink: 1,
             size: inner.data.len(),
-            uid: Some(0),
-            gid: Some(0),
+            uid: Some(inner.meta.uid),
+            gid: Some(inner.meta.gid),
             rdev: 0,
             atime: inner.meta.atime,
             mtime: inner.meta.mtime,
@@ -394,6 +413,21 @@ impl VfsNode for TmpfsDirNode {
         Ok(())
     }
 
+    fn uid(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.uid)
+    }
+
+    fn gid(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.gid)
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        let mut inner = self.state.inner.lock();
+        inner.meta.uid = uid;
+        inner.meta.gid = gid;
+        Ok(())
+    }
+
     fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
         let mut inner = self.state.inner.lock();
         match inner.children.get(name) {
@@ -453,8 +487,8 @@ impl VfsNode for TmpfsDirNode {
             ino: self.state.ino,
             nlink: 2,
             size: 0,
-            uid: Some(0),
-            gid: Some(0),
+            uid: Some(inner.meta.uid),
+            gid: Some(inner.meta.gid),
             rdev: 0,
             atime: inner.meta.atime,
             mtime: inner.meta.mtime,

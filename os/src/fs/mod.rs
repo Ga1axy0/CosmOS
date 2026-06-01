@@ -575,7 +575,7 @@ bitflags! {
 pub use inode::{
     canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
     linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at,
-    mkdir_at_with_inode, mount_device, open_file, open_file_at, open_file_at_with_status,
+    mkdir_at_with_inode, mount_device, mount_tmpfs, open_file, open_file_at, open_file_at_with_status,
     rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,
