@@ -363,6 +363,18 @@ pub fn unlink(path: &str) -> isize {
     sys_unlinkat(AT_FDCWD as usize, path.as_str(), 0)
 }
 
+pub fn rename(old_path: &str, new_path: &str) -> isize {
+    let old_path = to_cstring(old_path);
+    let new_path = to_cstring(new_path);
+    sys_renameat2(
+        AT_FDCWD as usize,
+        old_path.as_str(),
+        AT_FDCWD as usize,
+        new_path.as_str(),
+        0,
+    )
+}
+
 /// 按路径调整常规文件长度。
 pub fn truncate(path: &str, len: isize) -> isize {
     let path = to_cstring(path);
