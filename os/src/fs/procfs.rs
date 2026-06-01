@@ -386,17 +386,20 @@ impl VfsNode for ProcPidDirNode {
         if pid2process(self.pid).is_none() {
             return Vec::new();
         }
-        alloc::vec![(String::from("exe"), VfsFileType::Symlink)]
+        alloc::vec![
+            (String::from("exe"), VfsFileType::Symlink),
+            (String::from("mounts"), VfsFileType::Regular),
+        ]
     }
 
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        if name != "exe" {
+        if pid2process(self.pid).is_none() {
             return None;
         }
-        if pid2process(self.pid).is_some() {
-            Some(Arc::new(ProcPidExeLinkNode::new(self.pid)) as Arc<dyn VfsNode>)
-        } else {
-            None
+        match name {
+            "exe" => Some(Arc::new(ProcPidExeLinkNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            _ => None,
         }
     }
 
