@@ -1061,3 +1061,11 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
     record_mount(abs_mnt, &canonicalize("/", dev_path), fs_type, "rw");
     Ok(())
 }
+
+/// Mount a fresh tmpfs instance at `abs_mnt`.
+pub fn mount_tmpfs(abs_mnt: &str) -> Result<(), ERRNO> {
+    let fs_root = Inode::from_vfs_node(new_tmpfs_root());
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, "tmpfs", "tmpfs", "rw");
+    Ok(())
+}
