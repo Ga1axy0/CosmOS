@@ -1,6 +1,7 @@
 use super::{page_cache, File, Stat, StatFs64, StatMode};
 use super::devfs::{NullDevNode, UrandomDevNode};
-use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
+use super::rootfs::{VirtualDirNode, VIRT_ROOT};
+use super::tmpfs::new_tmpfs_root;
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -318,13 +319,10 @@ pub fn init_rootfs() {
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
-    // Automatically make a /tmp directory if it doesn't exist, since many apps expect it.
-    if lookup_inode_follow("/", "/tmp", true).is_err() {
-        match mkdir_at("/", "/tmp") {
-            Ok(()) => info!("[kernel] created missing /tmp"),
-            Err(e) => warn!("[kernel] failed to create /tmp, errno={}", e as isize),
-        }
-    }
+    let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
+    do_mount("/tmp", tmpfs_root)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount tmpfs at /tmp"));
+    record_mount("/tmp", "tmpfs", "tmpfs", "rw");
 
     info!("[kernel] rootfs initialised");
 }
@@ -972,7 +970,10 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 pub fn init_dev() {
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
-    dev_dir.bind("shm", MemDirNode::new() as Arc<dyn VfsNode>);
+    let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
+    do_mount("/dev/shm", tmpfs_root)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount tmpfs at /dev/shm"));
+    record_mount("/dev/shm", "tmpfs", "tmpfs", "rw");
     // Register special character devices under /dev
     let null_node = Arc::new(NullDevNode::new());
     dev_dir.bind("null", null_node as Arc<dyn VfsNode>);
