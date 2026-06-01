@@ -1,7 +1,7 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, rename_at,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, mount_tmpfs, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode,
     open_file_at_with_status, symlinkat, unlinkat,
 };
@@ -2218,7 +2218,11 @@ pub fn sys_mount(
             fs_type,
             _data
         );
-        mount_device(&dev_name, &abs_mnt, &fs_type)?;
+        if fs_type == "tmpfs" {
+            mount_tmpfs(&abs_mnt)?;
+        } else {
+            mount_device(&dev_name, &abs_mnt, &fs_type)?;
+        }
         Ok(0)
     })
 }
