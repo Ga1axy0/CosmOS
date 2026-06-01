@@ -8,6 +8,8 @@ mod tty;
 pub mod rootfs;
 pub mod devfs;
 pub mod procfs;
+/// In-memory tmpfs backend that can be mounted into the virtual namespace.
+pub mod tmpfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;

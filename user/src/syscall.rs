@@ -67,6 +67,7 @@ pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_CLONE: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
+pub const SYSCALL_RENAMEAT2: usize = 276;
 pub const SYSCALL_BRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
 pub const SYSCALL_MMAP: usize = 222;
@@ -189,6 +190,26 @@ pub fn sys_readlinkat(dirfd: usize, path: &str, buffer: &mut [u8]) -> isize {
 
 pub fn sys_unlinkat(dirfd: usize, path: &str, flags: usize) -> isize {
     syscall(SYSCALL_UNLINKAT, [dirfd, path.as_ptr() as usize, flags])
+}
+
+pub fn sys_renameat2(
+    old_dirfd: usize,
+    old_path: &str,
+    new_dirfd: usize,
+    new_path: &str,
+    flags: u32,
+) -> isize {
+    syscall6(
+        SYSCALL_RENAMEAT2,
+        [
+            old_dirfd,
+            old_path.as_ptr() as usize,
+            new_dirfd,
+            new_path.as_ptr() as usize,
+            flags as usize,
+            0,
+        ],
+    )
 }
 
 /// `truncate` 用户态封装：按路径调整文件长度。
