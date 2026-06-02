@@ -298,19 +298,18 @@ pub fn frame_allocator_stats() -> FrameAllocatorStats {
 
 /// Allocate a physical page frame in FrameTracker style
 pub fn frame_alloc() -> Option<FrameTracker> {
-    Some(FRAME_ALLOCATOR.lock().alloc().map(FrameTracker::new).unwrap_or_else(|| {        
-        error!("Page Cache: Out of memory");
+    FRAME_ALLOCATOR.lock().alloc().map(FrameTracker::new).or_else(|| {
         let frame_allocator_stats = frame_allocator_stats();
-        error!("Free {} | PageCache {} | Low watermark {} | High watermark {} | Total {}",
+        error!(
+            "frame_alloc: out of memory (free={} cached={} low={} high={} total={})",
             frame_allocator_stats.free_pages,
             PAGE_CACHE_MANAGER.lock().cached_pages,
             PAGE_CACHE_MANAGER.lock().low_watermark,
             PAGE_CACHE_MANAGER.lock().high_watermark,
             frame_allocator_stats.total_pages,
         );
-        panic!();
-        }
-    ))
+        None
+    })
 }
 
 /// Deallocate a physical page frame with a given ppn

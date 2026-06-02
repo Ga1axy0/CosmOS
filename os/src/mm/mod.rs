@@ -14,6 +14,35 @@ mod page_table;
 mod tlb_shootdown;
 
 use address::VPNRange;
+
+/// Internal memory-management error used below syscall/trap ABI boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MmError {
+    /// No frame or page-table memory is available.
+    OutOfMemory,
+    /// The requested virtual-memory range is malformed.
+    InvalidRange,
+    /// The requested mapping conflicts with an existing VMA or PTE state.
+    Conflict,
+    /// No matching mapping or page-table entry exists.
+    NoMapping,
+    /// The attempted access violates mapping permissions.
+    PermissionDenied,
+    /// A file-backed fault reached beyond the file's logical end.
+    BeyondFileEnd,
+    /// ELF metadata is invalid during address-space construction.
+    InvalidElf,
+}
+
+/// Outcome of one page-fault sub-handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageFaultHandled {
+    /// The fault matched this handler and was resolved.
+    Handled,
+    /// The fault does not belong to this handler.
+    NotHandled,
+}
+
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_allocator_stats, frame_dealloc,

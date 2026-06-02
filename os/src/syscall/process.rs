@@ -276,9 +276,7 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
                     0,
                     true,
                 );
-                if !mapped {
-                    return Err(ERRNO::ENOMEM);
-                }
+                mapped.map_err(|_| ERRNO::ENOMEM)?;
                 inner.vm_layout.mmap_hint = chosen_end;
                 (chosen, chosen_end)
             };
@@ -300,9 +298,9 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
                 0,
                 true,
             );
-            if !ok {
+            if let Err(err) = ok {
                 ipc::detach_segment(shmid);
-                return Err(ERRNO::ENOMEM);
+                return Err(err);
             }
             shmaddr
         };
@@ -597,7 +595,9 @@ pub fn sys_clone(
                 )
             };
             let inherited_cx = *current_trap_cx();
-            let new_task = current_process.create_task(ustack_base, true, sched_attr);
+            let new_task = current_process
+                .create_task(ustack_base, true, sched_attr)
+                .map_err(|_| ERRNO::ENOMEM)?;
             let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
             let new_inner_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid;
             debug!(
@@ -632,7 +632,7 @@ pub fn sys_clone(
             add_task(new_task);
             Ok(new_tid as isize)
         } else {
-            let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
+            let new_process = current_process.clone_process(stack, child_tls, child_set_tid)?;
             let child_pid = new_process.getpid() as i32;
             debug!(
                 "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",

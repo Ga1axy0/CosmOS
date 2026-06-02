@@ -196,7 +196,7 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
             return false;
         };
         let ppn = frame.ppn;
-        kernel_space.page_table.map_kernel_untracked(
+        let _ = kernel_space.page_table.map_kernel_untracked(
             vpn,
             ppn,
             super::page_table::PTEFlags::R | super::page_table::PTEFlags::W,

@@ -13,8 +13,8 @@ use crate::fs::{mapping_for_inode, new_stdio_files, File, FileDescription};
 use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
-    MapPermission, MemorySet, PageFaultAccess, ShootdownKind, UserSpaceLayout, VirtAddr, Vma,
-    KERNEL_SPACE,
+    MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
+    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
@@ -35,6 +35,18 @@ const MUSL_INTERP_PATHS: [&str; 3] = [
 ];
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
+
+fn mm_error_to_errno(err: MmError) -> ERRNO {
+    match err {
+        MmError::OutOfMemory => ERRNO::ENOMEM,
+        MmError::InvalidRange => ERRNO::EINVAL,
+        MmError::Conflict => ERRNO::EACCES,
+        MmError::NoMapping => ERRNO::EFAULT,
+        MmError::PermissionDenied => ERRNO::EFAULT,
+        MmError::BeyondFileEnd => ERRNO::ENXIO,
+        MmError::InvalidElf => ERRNO::ENOEXEC,
+    }
+}
 
 bitflags! {
     /// fd 表项级别的标志位。
@@ -499,13 +511,13 @@ impl ProcessControlBlock {
         ustack_base: usize,
         alloc_user_res: bool,
         sched_attr: SchedAttr,
-    ) -> Arc<TaskControlBlock> {
-        Arc::new(TaskControlBlock::new(
+    ) -> Result<Arc<TaskControlBlock>, MmError> {
+        Ok(Arc::new(TaskControlBlock::new(
             Arc::clone(self),
             ustack_base,
             alloc_user_res,
             sched_attr,
-        ))
+        )?))
     }
 
     /// Attach a created task to this process's task table without scheduling it.
@@ -529,7 +541,8 @@ impl ProcessControlBlock {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
         // assert that initproc is always valid elf
-        let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data).unwrap();
+        let (memory_set, user_layout, load_info) =
+            MemorySet::from_elf(elf_data).expect("failed to build init process address space");
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
@@ -578,7 +591,9 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
-        let task = process.create_task(ustack_base, true, SchedAttr::default());
+        let task = process
+            .create_task(ustack_base, true, SchedAttr::default())
+            .expect("failed to allocate init task");
         // prepare trap_cx of main thread
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
@@ -614,7 +629,8 @@ impl ProcessControlBlock {
 
         // 首先加载原始程序
         trace!("kernel: exec .. MemorySet::from_elf for application");
-        let (mut memory_set, user_layout, app_load_info) = MemorySet::from_elf(elf_data)?;
+        let (mut memory_set, user_layout, app_load_info) =
+            MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
 
         // 获取当前进程的cwd，用于打开动态链接器
         let cwd = self.inner_exclusive_access().cwd.clone();
@@ -705,11 +721,9 @@ impl ProcessControlBlock {
                     } else {
                         raw
                     };
-                    if !memory_set.insert_vma(vma, Some(seg_data)) {
-                        warn!("Failed to insert interpreter VMA at [{:#x}, {:#x})",
-                            usize::from(start_va), usize::from(end_va));
-                        return Err(ERRNO::EACCES);
-                    }
+                    memory_set
+                        .insert_vma(vma, Some(seg_data))
+                        .map_err(mm_error_to_errno)?;
                 }
             }
 
@@ -783,7 +797,12 @@ impl ProcessControlBlock {
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
         task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
-        task_inner.res.as_mut().unwrap().alloc_user_res();
+        task_inner
+            .res
+            .as_mut()
+            .unwrap()
+            .alloc_user_res()
+            .map_err(mm_error_to_errno)?;
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
         task_inner.pending_signals = SignalBit::empty();
         task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
@@ -832,10 +851,18 @@ impl ProcessControlBlock {
         child_stack: usize,
         child_tls: Option<usize>,
         child_set_tid: Option<usize>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
         let mut parent = self.inner_exclusive_access();
-        assert_eq!(parent.thread_count(), 1);
+        // assert_eq!(parent.thread_count(), 1);
+        if parent.thread_count() != 1 {
+            warn!(
+                "clone_process with multiple threads is not fully supported: parent_pid={} thread_count={}",
+                self.getpid(),
+                parent.thread_count()
+            );
+            return Err(ERRNO::EINVAL)
+        }
         debug!(
             "[cow] clone_process begin: parent_pid={} parent_threads={}",
             self.getpid(),
@@ -843,7 +870,7 @@ impl ProcessControlBlock {
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let (memory_set, parent_tlb_needs_flush) =
-            MemorySet::from_existed_user(&mut parent.memory_set);
+            MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
         let parent_token = parent.memory_set.token();
         let parent_mask = if parent_tlb_needs_flush {
             parent.memory_set.loaded_user_harts()
@@ -933,10 +960,6 @@ impl ProcessControlBlock {
             self.getpid(),
             child.getpid()
         );
-        for attachment in parent_shm_attachments {
-            ipc::retain_attached_segment(attachment.shmid);
-        }
-        child.register_existing_file_mappings();
         // create main thread of child process
         let task = child.create_task(
             parent_ustack_base,
@@ -944,7 +967,12 @@ impl ProcessControlBlock {
             // but mention that we allocate a new kstack here
             false,
             parent_sched_attr,
-        );
+        ).map_err(|err| {
+            self.inner_exclusive_access()
+                .children
+                .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+            mm_error_to_errno(err)
+        })?;
         {
             let mut task_inner = task.inner_exclusive_access();
             task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
@@ -970,16 +998,19 @@ impl ProcessControlBlock {
         drop(task_inner);
         if let Some(child_tid_ptr) = child_set_tid {
             let child_tid_value = child.getpid() as i32;
-            if write_pod_to_process_user(&child, child_tid_ptr as *mut i32, &child_tid_value)
-                .is_err()
+            if let Err(err) =
+                write_pod_to_process_user(&child, child_tid_ptr as *mut i32, &child_tid_value)
             {
-                // TODO：当前 clone_process 尚未实现失败回滚，只能保守记录异常。
-                warn!(
-                    "kernel: clone_process failed to write child_tid at {:#x}",
-                    child_tid_ptr
-                );
+                self.inner_exclusive_access()
+                    .children
+                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                return Err(err);
             }
         }
+        for attachment in parent_shm_attachments {
+            ipc::retain_attached_segment(attachment.shmid);
+        }
+        child.register_existing_file_mappings();
         debug!(
             "[cow] clone_process complete: parent_pid={} child_pid={}",
             self.getpid(),
@@ -987,12 +1018,13 @@ impl ProcessControlBlock {
         );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
-        child
+        Ok(child)
     }
 
     /// Create a child process directly from elf image.
     pub fn spawn(self: &Arc<Self>, elf_data: &[u8], exec_path: String) -> Result<Arc<Self>, ERRNO> {
-        let (memory_set, user_layout, load_info) = MemorySet::from_elf(elf_data)?;
+        let (memory_set, user_layout, load_info) =
+            MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
@@ -1056,7 +1088,14 @@ impl ProcessControlBlock {
         drop(parent_task_inner);
         drop(parent);
 
-        let task = child.create_task(ustack_base, true, parent_sched_attr);
+        let task = child
+            .create_task(ustack_base, true, parent_sched_attr)
+            .map_err(|err| {
+                self.inner_exclusive_access()
+                    .children
+                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                mm_error_to_errno(err)
+            })?;
         {
             let mut task_inner = task.inner_exclusive_access();
             task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
@@ -1134,13 +1173,11 @@ impl ProcessControlBlock {
     }
 
     /// map an anonymous area with given permission, return true if success
-    pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+    pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> Result<(), ERRNO> {
         let len = usize::from(end).saturating_sub(usize::from(start));
         let mut inner = self.inner.lock();
-        if inner.ensure_address_space_capacity(len).is_err() {
-            return false;
-        }
-        inner.memory_set.mmap_anonymous(start, end, perm)
+        inner.ensure_address_space_capacity(len)?;
+        inner.memory_set.mmap_anonymous(start, end, perm).map_err(mm_error_to_errno)
     }
     /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
     pub fn mmap_file(
@@ -1151,22 +1188,20 @@ impl ProcessControlBlock {
         file: Arc<FileDescription>,
         pgoff: usize,
         shared: bool,
-    ) -> bool {
+    ) -> Result<(), ERRNO> {
         let len = usize::from(end).saturating_sub(usize::from(start));
-        let mapped = {
+        {
             let mut inner = self.inner.lock();
-            if inner.ensure_address_space_capacity(len).is_err() {
-                false
-            } else {
-                inner.memory_set.mmap_file(start, end, perm, file.clone(), pgoff, shared)
-            }
-        };
-        if mapped {
-            if let Some(inode) = file.backing_inode() {
-                register_file_mapping(&inode, self);
-            }
+            inner.ensure_address_space_capacity(len)?;
+            inner
+                .memory_set
+                .mmap_file(start, end, perm, file.clone(), pgoff, shared)
+                .map_err(mm_error_to_errno)?;
         }
-        mapped
+        if let Some(inode) = file.backing_inode() {
+            register_file_mapping(&inode, self);
+        }
+        Ok(())
     }
 
     /// 失效当前进程中因 truncate 越过 EOF 的 file-backed 用户映射。
@@ -1241,30 +1276,44 @@ impl ProcessControlBlock {
     }
 
     /// 处理当前进程的私有页写时复制缺页。
-    pub fn handle_private_cow_fault(&self, fault_addr: usize) -> bool {
-        let Some(reclaim) = ({
+    pub fn handle_private_cow_fault(
+        &self,
+        fault_addr: usize,
+    ) -> Result<PageFaultHandled, MmError> {
+        let (handled, reclaim) = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
             let mask = inner.memory_set.loaded_user_harts();
-            inner
+            let (handled, batch) = inner
                 .memory_set
-                .handle_private_cow_fault(VirtAddr::from(fault_addr))
-                .map(|batch| DeferredUserReclaim::new(token, mask, batch))
-        }) else {
-            return false;
+                .handle_private_cow_fault(VirtAddr::from(fault_addr))?;
+            (
+                handled,
+                batch.map(|batch| DeferredUserReclaim::new(token, mask, batch)),
+            )
         };
-        reclaim.flush_then_release();
-        true
+        if let Some(reclaim) = reclaim {
+            reclaim.flush_then_release();
+        }
+        Ok(handled)
     }
     /// 处理当前进程的 heap 懒分配缺页。
-    pub fn handle_lazy_heap_fault(&self, fault_addr: usize, access: PageFaultAccess) -> bool {
+    pub fn handle_lazy_heap_fault(
+        &self,
+        fault_addr: usize,
+        access: PageFaultAccess,
+    ) -> Result<PageFaultHandled, MmError> {
         self.inner
             .lock()
             .memory_set
             .handle_lazy_heap_fault(VirtAddr::from(fault_addr), access)
     }
     /// 处理当前进程的 file-backed 缺页。
-    pub fn handle_file_page_fault(&self, fault_addr: usize, access: PageFaultAccess) -> Result<(), ERRNO> {
+    pub fn handle_file_page_fault(
+        &self,
+        fault_addr: usize,
+        access: PageFaultAccess,
+    ) -> Result<PageFaultHandled, MmError> {
         debug!(
             "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
             self.getpid(),
@@ -1284,7 +1333,7 @@ impl ProcessControlBlock {
                     self.getpid(),
                     fault_addr
                 );
-                return Ok(());
+                return Ok(PageFaultHandled::Handled);
             }
         }
         let plan = {
@@ -1300,13 +1349,13 @@ impl ProcessControlBlock {
                 fault_addr,
                 access
             );
-            return Err(ERRNO::EFAULT);
+            return Ok(PageFaultHandled::NotHandled);
         };
         let Some(inode) = plan.file.backing_inode() else {
-            return Err(ERRNO::EFAULT);
+            return Ok(PageFaultHandled::NotHandled);
         };
         let Some(mapping) = mapping_for_inode(&inode) else {
-            return Err(ERRNO::EFAULT);
+            return Ok(PageFaultHandled::NotHandled);
         };
         let page_start = plan.page_idx as usize * PAGE_SIZE;
         let file_size = mapping.size();
@@ -1319,7 +1368,7 @@ impl ProcessControlBlock {
                 page_start,
                 file_size
             );
-            return Err(ERRNO::ENXIO);
+            return Err(MmError::BeyondFileEnd);
         };
         debug!(
             "[mmap] page fault lazy load: pid={} vpn={:#x} page_idx={} shared={} path={:?}",
@@ -1329,7 +1378,7 @@ impl ProcessControlBlock {
             plan.shared,
             plan.file.path()
         );
-        let page = mapping.get_page(plan.page_idx);
+        let page = mapping.try_get_page(plan.page_idx)?;
         let mut inner = self.inner.lock();
         // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
         // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。
@@ -1337,19 +1386,15 @@ impl ProcessControlBlock {
             inner.memory_set.map_shared_file_page(&plan, page)
         } else {
             inner.memory_set.map_private_file_page(&plan, page)
-        };
+        }?;
         debug!(
             "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
             self.getpid(),
             plan.vpn.0,
             plan.shared,
-            committed
+            committed == PageFaultHandled::Handled
         );
-        if committed {
-            Ok(())
-        } else {
-            Err(ERRNO::EFAULT)
-        }
+        Ok(committed)
     }
 
     /// change permissions of a mapped range. return true if success
@@ -1430,11 +1475,14 @@ impl ProcessControlBlock {
 
             if new_brk > old_brk {
                 let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
-                    || inner.memory_set.register_vma_metadata(Vma::new_heap(
-                        heap_start,
-                        new_brk_va,
-                        MapPermission::R | MapPermission::W | MapPermission::U,
-                    ));
+                    || inner
+                        .memory_set
+                        .register_vma_metadata(Vma::new_heap(
+                            heap_start,
+                            new_brk_va,
+                            MapPermission::R | MapPermission::W | MapPermission::U,
+                        ))
+                        .is_ok();
                 if !success {
                     warn!("set_program_brk: FAILED at append metadata to heap ({:#x} -> {:#x})", old_brk, new_brk);
                     return old_brk;
