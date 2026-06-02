@@ -1,4 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt::Debug;
+use log::warn;
 use core::any::Any;
 use spin::Mutex;
 
@@ -85,7 +87,7 @@ pub enum VfsFileType {
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
-pub trait VfsNode: Send + Sync + Any {
+pub trait VfsNode: Send + Sync + Any + Debug {
     fn as_any(&self) -> &dyn Any;
     /// List directory entries as `(name, file_type)` pairs.
     fn ls(&self) -> Vec<(String, VfsFileType)>;
