@@ -433,7 +433,11 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
 }
 
 /// Map an anonymous area in current process with given permission.
-pub fn mmap_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+pub fn mmap_current_process(
+    start: VirtAddr,
+    end: VirtAddr,
+    perm: MapPermission,
+) -> Result<(), crate::syscall::errno::ERRNO> {
     current_process().mmap(start, end, perm)
 }
 

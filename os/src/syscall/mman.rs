@@ -180,9 +180,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                         perm,
                     )
                 };
-                if !mapped {
-                    return Err(ERRNO::ENOMEM);
-                }
+                mapped.map_err(|_| ERRNO::ENOMEM)?;
                 inner.vm_layout.mmap_hint = chosen_end;
                 (chosen, chosen_end, hint)
             };
@@ -216,9 +214,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             } else {
                 process.mmap(VirtAddr::from(addr), VirtAddr::from(end), perm)
             };
-            if !mapped {
-                return Err(ERRNO::ENOMEM);
-            }
+            mapped?;
             debug!(
                 "[mmap] fixed range registered: pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
                 pid,
