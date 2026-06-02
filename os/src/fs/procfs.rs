@@ -245,7 +245,7 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
             sig_caught,
             text_start,
             text_end,
-            inner.tasks.get(0).and_then(|task| task.as_ref()).cloned(),
+            inner.tasks.first().and_then(|task| task.as_ref()).cloned(),
         )
     };
 
@@ -431,7 +431,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
             text_start,
             text_end,
             is_zombie,
-            inner.tasks.get(0).and_then(|task| task.as_ref()).cloned(),
+            inner.tasks.first().and_then(|task| task.as_ref()).cloned(),
         )
     };
 
@@ -505,7 +505,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
 }
 
 /// `/proc` root directory node.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ProcRootNode;
 
 impl ProcRootNode {
@@ -580,7 +580,7 @@ impl VfsNode for ProcRootNode {
 }
 
 /// `/proc/meminfo` node.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ProcMeminfoNode;
 
 impl ProcMeminfoNode {
@@ -640,7 +640,7 @@ impl VfsNode for ProcMeminfoNode {
 }
 
 /// `/proc/mounts` node.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ProcMountsNode;
 
 impl ProcMountsNode {
@@ -700,7 +700,7 @@ impl VfsNode for ProcMountsNode {
 }
 
 /// `/proc/self` symlink node.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ProcSelfLinkNode;
 
 impl ProcSelfLinkNode {
@@ -769,6 +769,7 @@ impl VfsNode for ProcSelfLinkNode {
 }
 
 /// `/proc/<pid>` directory node.
+#[derive(Debug)]
 pub struct ProcPidDirNode {
     pid: usize,
 }
@@ -802,9 +803,7 @@ impl VfsNode for ProcPidDirNode {
     }
 
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        if pid2process(self.pid).is_none() {
-            return None;
-        }
+        pid2process(self.pid)?;
         match name {
             "exe" => Some(Arc::new(ProcPidExeLinkNode::new(self.pid)) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
@@ -843,6 +842,7 @@ impl VfsNode for ProcPidDirNode {
 }
 
 /// `/proc/<pid>/exe` symlink node.
+#[derive(Debug)]
 pub struct ProcPidExeLinkNode {
     pid: usize,
 }
@@ -917,6 +917,7 @@ impl VfsNode for ProcPidExeLinkNode {
 }
 
 /// `/proc/<pid>/stat` node.
+#[derive(Debug)]
 pub struct ProcPidStatNode {
     pid: usize,
 }
@@ -981,6 +982,7 @@ impl VfsNode for ProcPidStatNode {
 }
 
 /// `/proc/<pid>/status` node.
+#[derive(Debug)]
 pub struct ProcPidStatusNode {
     pid: usize,
 }

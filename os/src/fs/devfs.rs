@@ -11,6 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::fmt;
 
 use fs::vfs::{VfsFileType, VfsNode};
 use fs::{BlockDevice, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT};
@@ -207,11 +208,20 @@ impl BlockDevNode {
     }
 }
 
+impl fmt::Debug for BlockDevNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockDevNode")
+            .field("minor", &self.minor)
+            .field("device_ptr", &format_args!("{:p}", Arc::as_ptr(&self.device)))
+            .finish()
+    }
+}
+
 /// VFS node representing the special `/dev/null` device.
 ///
 /// Reads always return EOF (0 bytes). Writes discard data and report the
 /// full write length as written.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct NullDevNode;
 
 impl NullDevNode {
@@ -280,7 +290,7 @@ impl VfsNode for NullDevNode {
 ///
 /// Reads always return zero-filled bytes. Writes discard data and report the
 /// full write length as written.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ZeroDevNode;
 
 impl ZeroDevNode {
@@ -429,7 +439,7 @@ impl VfsNode for BlockDevNode {
 }
 
 /// Root directory node for the `/dev` filesystem.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DevRootNode;
 
 impl DevRootNode {
@@ -505,7 +515,7 @@ impl VfsNode for DevRootNode {
 }
 
 /// `/dev/misc` directory node.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DevMiscNode;
 
 impl DevMiscNode {
@@ -559,6 +569,7 @@ impl VfsNode for DevMiscNode {
 }
 
 /// VFS node representing RTC char device (`/dev/rtc*`, `/dev/misc/rtc`).
+#[derive(Debug)]
 pub struct RtcDevNode;
 
 impl Default for RtcDevNode {
@@ -678,6 +689,7 @@ impl VfsNode for RtcDevNode {
 ///
 /// Reads block until the kernel RNG is seeded (initial seed), then fills the
 /// provided buffer with cryptographic random bytes via `random::fill_bytes`.
+#[derive(Debug)]
 pub struct UrandomDevNode;
 
 impl UrandomDevNode {
