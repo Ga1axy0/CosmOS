@@ -4,7 +4,7 @@ use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{
     defer_release, deferred_frame_count, deferred_kstack_id_count, flush_deferred, online_mask,
-    DeferredUserReclaim, MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
+    DeferredUserReclaim, MapPermission, MmError, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{SpinNoIrqLock};
 use alloc::{
@@ -103,7 +103,7 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 pub struct KernelStack(pub usize);
 
 /// Allocate a kernel stack for a task
-pub fn kstack_alloc() -> KernelStack {
+pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     if deferred_kstack_id_count() > KSTACK_DEFERRED_RECYCLE_WATERMARK
         || deferred_frame_count() > DEFERRED_FRAME_RECYCLE_WATERMARK
     {
@@ -115,8 +115,8 @@ pub fn kstack_alloc() -> KernelStack {
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
-    );
-    KernelStack(kstack_id)
+    )?;
+    Ok(KernelStack(kstack_id))
 }
 
 impl Drop for KernelStack {
@@ -203,7 +203,7 @@ impl TaskUserRes {
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
         alloc_user_res: bool,
-    ) -> Self {
+    ) -> Result<Self, MmError> {
         let tid = process.inner_exclusive_access().alloc_tid();
         let thread_id_handle = if tid == 0 {
             None
@@ -222,12 +222,12 @@ impl TaskUserRes {
             process: Arc::downgrade(&process),
         };
         if alloc_user_res {
-            task_user_res.alloc_user_res();
+            task_user_res.alloc_user_res()?;
         }
-        task_user_res
+        Ok(task_user_res)
     }
     /// Allocate user resource for a task
-    pub fn alloc_user_res(&self) {
+    pub fn alloc_user_res(&self) -> Result<(), MmError> {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         // alloc user stack
@@ -236,9 +236,9 @@ impl TaskUserRes {
         let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
         if self.tid == 0 {
             // Main thread needs eager mapping: kernel writes args/auxv before start.
-            process_inner.memory_set.insert_vma_eager(ustack_vma);
+            process_inner.memory_set.insert_vma_eager(ustack_vma)?;
         } else {
-            process_inner.memory_set.insert_vma(ustack_vma, None);
+            process_inner.memory_set.insert_vma(ustack_vma, None)?;
         }
         // alloc trap_cx
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
@@ -246,7 +246,8 @@ impl TaskUserRes {
         process_inner.memory_set.insert_vma(
             Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
             None,
-        );
+        )?;
+        Ok(())
     }
     /// Deallocate user resource for a task
     fn dealloc_user_res(&self) {

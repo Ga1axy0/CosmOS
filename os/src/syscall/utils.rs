@@ -1,5 +1,5 @@
 use crate::config::PAGE_SIZE;
-use crate::mm::{translated_byte_buffer, PageFaultAccess, PageTable, VirtAddr};
+use crate::mm::{translated_byte_buffer, MmError, PageFaultAccess, PageFaultHandled, PageTable, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::task::{current_process, current_user_token, ProcessControlBlock};
 
@@ -63,31 +63,54 @@ fn prefault_user_pages(
             Some(pte) => {
                 // 映射已存在但不可写：可能是 COW 或 MAP_SHARED 写通知页。
                 if access == PageFaultAccess::Write && !pte.writable() {
-                    if !process.handle_private_cow_fault(page_start) {
+                    if process
+                        .handle_private_cow_fault(page_start)
+                        .map_err(|err| match err {
+                            MmError::OutOfMemory => ERRNO::ENOMEM,
+                            _ => ERRNO::EFAULT,
+                        })?
+                        != PageFaultHandled::Handled
+                    {
                         match process.handle_file_page_fault(page_start, PageFaultAccess::Write) {
-                            Ok(()) => {}
-                            // 用户态缺页此场景会被视为 SIGBUS，这里按 copyin/copyout 语义返回 EFAULT。
-                            Err(ERRNO::ENXIO) => return Err(ERRNO::EFAULT),
-                            Err(e) => return Err(e),
+                            Ok(PageFaultHandled::Handled) => {}
+                            Ok(PageFaultHandled::NotHandled) => return Err(ERRNO::EFAULT),
+                            Err(MmError::BeyondFileEnd) => return Err(ERRNO::EFAULT),
+                            Err(MmError::OutOfMemory) => return Err(ERRNO::ENOMEM),
+                            Err(_) => return Err(ERRNO::EFAULT),
                         }
                     }
                 }
             }
             None => {
-                if access == PageFaultAccess::Write && process.handle_private_cow_fault(page_start)
+                if access == PageFaultAccess::Write
+                    && process
+                        .handle_private_cow_fault(page_start)
+                        .map_err(|err| match err {
+                            MmError::OutOfMemory => ERRNO::ENOMEM,
+                            _ => ERRNO::EFAULT,
+                        })?
+                        == PageFaultHandled::Handled
                 {
                     page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
                     continue;
                 }
-                if process.handle_lazy_heap_fault(page_start, access) {
+                if process
+                    .handle_lazy_heap_fault(page_start, access)
+                    .map_err(|err| match err {
+                        MmError::OutOfMemory => ERRNO::ENOMEM,
+                        _ => ERRNO::EFAULT,
+                    })?
+                    == PageFaultHandled::Handled
+                {
                     page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
                     continue;
                 }
                 match process.handle_file_page_fault(page_start, access) {
-                    Ok(()) => {}
-                    // 用户态缺页此场景会被视为 SIGBUS，这里按 copyin/copyout 语义返回 EFAULT。
-                    Err(ERRNO::ENXIO) => return Err(ERRNO::EFAULT),
-                    Err(e) => return Err(e),
+                    Ok(PageFaultHandled::Handled) => {}
+                    Ok(PageFaultHandled::NotHandled) => return Err(ERRNO::EFAULT),
+                    Err(MmError::BeyondFileEnd) => return Err(ERRNO::EFAULT),
+                    Err(MmError::OutOfMemory) => return Err(ERRNO::ENOMEM),
+                    Err(_) => return Err(ERRNO::EFAULT),
                 }
             }
         }

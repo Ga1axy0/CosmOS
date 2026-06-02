@@ -3,6 +3,7 @@
 use super::id::TaskUserRes;
 use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
+use crate::mm::MmError;
 use crate::config::MAX_HARTS;
 use crate::mm::PhysPageNum;
 use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
@@ -209,12 +210,12 @@ impl TaskControlBlock {
         ustack_base: usize,
         alloc_user_res: bool,
         sched_attr: SchedAttr,
-    ) -> Self {
-        let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
+    ) -> Result<Self, MmError> {
+        let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res)?;
         let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc();
+        let kstack = kstack_alloc()?;
         let kstack_top = kstack.get_top();
-        Self {
+        Ok(Self {
             process: Arc::downgrade(&process),
             kstack,
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
@@ -232,7 +233,7 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
             }),
-        }
+        })
     }
 }
 

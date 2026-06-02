@@ -1,6 +1,6 @@
 //! Address Space [`MemorySet`] management of Process
 
-use super::{frame_alloc, shootdown, FrameTracker, ShootdownKind};
+use super::{frame_alloc, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
 use super::page_table::PTEFlags;
 use super::{PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
@@ -294,7 +294,7 @@ impl MemorySet {
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
         Self {
-            page_table: PageTable::new(),
+            page_table: PageTable::new().expect("failed to allocate root page table"),
             vmas: BTreeMap::new(),
             loaded_user_harts: AtomicUsize::new(0),
         }
@@ -365,23 +365,18 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) {
-        let _ = self.insert_vma(
+    ) -> Result<(), MmError> {
+        self.insert_vma(
             Vma::new(start_va, end_va, MapType::Framed, permission, VmaKind::Anonymous),
             None,
-        );
+        )
     }
     /// 映射最小用户态 vDSO 页，用于 signal handler 返回时进入 rt_sigreturn。
-    pub fn map_user_vdso(&mut self) {
+    pub fn map_user_vdso(&mut self) -> Result<(), MmError> {
         let start_va = VirtAddr::from(USER_VDSO_BASE);
         let end_va = VirtAddr::from(USER_VDSO_BASE + PAGE_SIZE);
         let vma = Vma::new_vdso(start_va, end_va);
-        if !self.insert_vma(vma, Some(&USER_VDSO_CODE)) {
-            warn!(
-                "[vdso] failed to map user signal trampoline at {:#x}",
-                USER_VDSO_BASE
-            );
-        }
+        self.insert_vma(vma, Some(&USER_VDSO_CODE))
     }
     /// 根据起始虚拟页号删除一段用户区域，并延迟释放拆下的旧页对象。
     pub(crate) fn remove_vma_with_start_vpn_user_deferred(
@@ -470,35 +465,35 @@ impl MemorySet {
         }
     }
     /// 将一段区域登记到地址空间并立即建立页表映射；若与现有区域冲突则失败。
-    pub fn insert_vma(&mut self, mut vma: Vma, data: Option<&[u8]>) -> bool {
+    pub fn insert_vma(&mut self, mut vma: Vma, data: Option<&[u8]>) -> Result<(), MmError> {
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
-            return false;
+            return Err(MmError::Conflict);
         }
         if vma.should_eager_map() {
-            vma.map(&mut self.page_table);
+            vma.map(&mut self.page_table)?;
         }
         if let Some(data) = data {
             vma.copy_data(&mut self.page_table, data);
         }
         self.insert_vma_unchecked(vma);
-        true
+        Ok(())
     }
     /// Like `insert_vma` but always eagerly maps the pages regardless of `should_eager_map`.
-    pub fn insert_vma_eager(&mut self, mut vma: Vma) -> bool {
+    pub fn insert_vma_eager(&mut self, mut vma: Vma) -> Result<(), MmError> {
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
-            return false;
+            return Err(MmError::Conflict);
         }
-        vma.map(&mut self.page_table);
+        vma.map(&mut self.page_table)?;
         self.insert_vma_unchecked(vma);
-        true
+        Ok(())
     }
     /// 仅登记一段 VMA 元数据，不立即建立页表映射。
-    pub fn register_vma_metadata(&mut self, vma: Vma) -> bool {
+    pub fn register_vma_metadata(&mut self, vma: Vma) -> Result<(), MmError> {
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
-            return false;
+            return Err(MmError::Conflict);
         }
         self.insert_vma_unchecked(vma);
-        true
+        Ok(())
     }
     /// 把一张已有私有页接入指定虚拟页，供 `fork` 共享与后续 COW 使用。
     pub fn map_existing_private_page(
@@ -506,15 +501,15 @@ impl MemorySet {
         vpn: VirtPageNum,
         page: Arc<PrivatePage>,
         flags: PTEFlags,
-    ) -> bool {
+    ) -> Result<(), MmError> {
         if self.page_table.translate(vpn).is_some() {
-            return false;
+            return Err(MmError::Conflict);
         }
         let Some(area) = self.find_vma_containing_mut(vpn) else {
-            return false;
+            return Err(MmError::NoMapping);
         };
         area.data_frames.insert(vpn, Arc::clone(&page));
-        self.page_table.map(vpn, page.ppn(), flags);
+        self.page_table.map(vpn, page.ppn(), flags)?;
         // debug!(
         //     "[cow] install shared private page: vpn={:#x} ppn={:#x} writable={} cow={}",
         //     vpn.0,
@@ -522,7 +517,7 @@ impl MemorySet {
         //     flags.contains(PTEFlags::W),
         //     page.is_cow()
         // );
-        true
+        Ok(())
     }
     /// 把一张已有的 page cache 页直接接入指定虚拟页，供 `fork` 继承只读文件私有映射。
     pub fn map_existing_direct_cache_page(
@@ -530,23 +525,23 @@ impl MemorySet {
         vpn: VirtPageNum,
         page: Arc<SpinNoIrqLock<CachePage>>,
         flags: PTEFlags,
-    ) -> bool {
+    ) -> Result<(), MmError> {
         if self.page_table.translate(vpn).is_some() {
-            return false;
+            return Err(MmError::Conflict);
         }
         let Some(area) = self.find_vma_containing_mut(vpn) else {
-            return false;
+            return Err(MmError::NoMapping);
         };
         retain_mapped_page(&page);
         area.direct_cache_pages.insert(vpn, Arc::clone(&page));
-        self.page_table.map(vpn, page.lock().ppn(), flags);
+        self.page_table.map(vpn, page.lock().ppn(), flags)?;
         // debug!(
         //     "[cow] install inherited direct cache page: vpn={:#x} ppn={:#x} writable={}",
         //     vpn.0,
         //     page.lock().ppn().0,
         //     flags.contains(PTEFlags::W)
         // );
-        true
+        Ok(())
     }
     /// 在完成分裂、删除或追加后整理可合并的相邻区域。
     pub fn merge_adjacent_vmas(&mut self) {
@@ -615,11 +610,13 @@ impl MemorySet {
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
-        self.page_table.map(
+        self.page_table
+            .map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
             PTEFlags::R | PTEFlags::X,
-        );
+        )
+            .expect("failed to map trampoline");
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
@@ -635,7 +632,8 @@ impl MemorySet {
             sbss_with_stack as usize, ebss as usize
         );
         info!("mapping .text section");
-        let _ = memory_set.insert_vma(
+        memory_set
+            .insert_vma(
             Vma::new(
                 (stext as usize).into(),
                 (etext as usize).into(),
@@ -644,9 +642,11 @@ impl MemorySet {
                 VmaKind::Kernel,
             ),
             None,
-        );
+        )
+            .expect("failed to map kernel text");
         info!("mapping .rodata section");
-        let _ = memory_set.insert_vma(
+        memory_set
+            .insert_vma(
             Vma::new(
                 (srodata as usize).into(),
                 (erodata as usize).into(),
@@ -655,9 +655,11 @@ impl MemorySet {
                 VmaKind::Kernel,
             ),
             None,
-        );
+        )
+            .expect("failed to map kernel rodata");
         info!("mapping .data section");
-        let _ = memory_set.insert_vma(
+        memory_set
+            .insert_vma(
             Vma::new(
                 (sdata as usize).into(),
                 (edata as usize).into(),
@@ -666,9 +668,11 @@ impl MemorySet {
                 VmaKind::Kernel,
             ),
             None,
-        );
+        )
+            .expect("failed to map kernel data");
         info!("mapping .bss section");
-        let _ = memory_set.insert_vma(
+        memory_set
+            .insert_vma(
             Vma::new(
                 (sbss_with_stack as usize).into(),
                 (ebss as usize).into(),
@@ -677,9 +681,11 @@ impl MemorySet {
                 VmaKind::Kernel,
             ),
             None,
-        );
+        )
+            .expect("failed to map kernel bss");
         info!("mapping physical memory");
-        let _ = memory_set.insert_vma(
+        memory_set
+            .insert_vma(
             Vma::new(
                 (ekernel as usize).into(),
                 MEMORY_END.into(),
@@ -688,10 +694,12 @@ impl MemorySet {
                 VmaKind::Kernel,
             ),
             None,
-        );
+        )
+            .expect("failed to map physical memory window");
         info!("mapping memory-mapped registers");
         for pair in MMIO {
-            let _ = memory_set.insert_vma(
+            memory_set
+                .insert_vma(
                 Vma::new(
                     (*pair).0.into(),
                     ((*pair).0 + (*pair).1).into(),
@@ -700,19 +708,20 @@ impl MemorySet {
                     VmaKind::Kernel,
                 ),
                 None,
-            );
+            )
+                .expect("failed to map mmio window");
         }
         memory_set
     }
     /// Include ELF segments and trampoline, and compute initial process VM layout.
     /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo)
-    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), ERRNO> {
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
-        memory_set.map_user_vdso();
+        memory_set.map_user_vdso()?;
         // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| ERRNO::ENOEXEC)?;
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| MmError::InvalidElf)?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
@@ -725,8 +734,8 @@ impl MemorySet {
         let mut phdr_load_vaddr: Option<usize> = None; // 程序头表加载后的虚拟地址
 
         for i in 0..ph_count {
-            let ph = elf.program_header(i).map_err(|_| ERRNO::ENOEXEC)?;
-            let ph_type = ph.get_type().map_err(|_| ERRNO::ENOEXEC)?;
+            let ph = elf.program_header(i).map_err(|_| MmError::InvalidElf)?;
+            let ph_type = ph.get_type().map_err(|_| MmError::InvalidElf)?;
 
             // 检查 INTERP 段
             if ph_type == xmas_elf::program::Type::Interp {
@@ -789,7 +798,7 @@ impl MemorySet {
                 } else {
                     raw
                 };
-                let _ = memory_set.insert_vma(vma, Some(seg_data));
+                memory_set.insert_vma(vma, Some(seg_data))?;
             }
         }
         let max_end_va: VirtAddr = max_end_vpn.into();
@@ -812,7 +821,7 @@ impl MemorySet {
         Ok((memory_set, layout, load_info))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
-    pub fn from_existed_user(user_space: &mut Self) -> (Self, bool) {
+    pub fn from_existed_user(user_space: &mut Self) -> Result<(Self, bool), MmError> {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
@@ -839,9 +848,9 @@ impl MemorySet {
             //     area.direct_cache_pages.len()
             // );
             if share_private_pages {
-                let _ = memory_set.register_vma_metadata(new_area);
+                memory_set.register_vma_metadata(new_area)?;
             } else {
-                let _ = memory_set.insert_vma(new_area, None);
+                memory_set.insert_vma(new_area, None)?;
             }
             // 对于可共享的私有页，`fork` 时父子先共用同一张只读页，写时再复制。
             // 对于 trap context 之类内核内部页，仍然保持直接复制，避免把内核写路径卷入 COW。
@@ -877,13 +886,11 @@ impl MemorySet {
                     //     child_flags.contains(PTEFlags::W),
                     //     page.is_cow()
                     // );
-                    let _ = memory_set.map_existing_private_page(vpn, page, child_flags);
+                    memory_set.map_existing_private_page(vpn, page, child_flags)?;
                     continue;
                 }
                 if memory_set.translate(vpn).is_none() {
-                    if !memory_set.map_private_page_in_vma(vpn) {
-                        continue;
-                    }
+                    memory_set.map_private_page_in_vma(vpn)?;
                 }
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
@@ -916,7 +923,7 @@ impl MemorySet {
                         file_shared,
                         child_flags.contains(PTEFlags::W)
                     );
-                    let _ = memory_set.map_existing_direct_cache_page(vpn, page, child_flags);
+                    memory_set.map_existing_direct_cache_page(vpn, page, child_flags)?;
                 }
             }
         }
@@ -926,7 +933,7 @@ impl MemorySet {
             }
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
-        (memory_set, parent_tlb_needs_flush)
+        Ok((memory_set, parent_tlb_needs_flush))
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
@@ -1114,20 +1121,18 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) -> bool {
+    ) -> Result<(), MmError> {
         debug!(
             "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} eager=true",
             usize::from(start_va),
             usize::from(end_va),
             permission
         );
-        if !self.insert_vma(Vma::new_anonymous(start_va, end_va, permission), None) {
-            return false;
-        }
+        self.insert_vma(Vma::new_anonymous(start_va, end_va, permission), None)?;
         unsafe {
             asm!("sfence.vma");
         }
-        true
+        Ok(())
     }
 
     /// 登记一个 file-backed 映射区域；真正装页推迟到缺页异常时处理。
@@ -1139,7 +1144,7 @@ impl MemorySet {
         file: Arc<FileDescription>,
         pgoff: usize,
         shared: bool,
-    ) -> bool {
+    ) -> Result<(), MmError> {
         debug!(
             "[mmap] register file VMA: start={:#x} end={:#x} perm={:?} pgoff={} shared={} lazy=true path={:?}",
             usize::from(start_va),
@@ -1149,13 +1154,14 @@ impl MemorySet {
             shared,
             file.path()
         );
-        if !self.insert_vma(Vma::new_file(start_va, end_va, permission, file, pgoff, shared), None) {
-            return false;
-        }
+        self.insert_vma(
+            Vma::new_file(start_va, end_va, permission, file, pgoff, shared),
+            None,
+        )?;
         unsafe {
             asm!("sfence.vma");
         }
-        true
+        Ok(())
     }
 
     /// 按给定用户区间拆除映射，并返回需要在 shootdown 后释放的旧页对象。
@@ -1306,19 +1312,19 @@ impl MemorySet {
     }
 
     /// 在命中的 `Framed` 区域内为单个页分配私有页框并建立映射。
-    pub fn map_private_page_in_vma(&mut self, vpn: VirtPageNum) -> bool {
+    pub fn map_private_page_in_vma(&mut self, vpn: VirtPageNum) -> Result<(), MmError> {
         if self.page_table.translate(vpn).is_some() {
-            return true;
+            return Ok(());
         }
         let Some(area) = self.find_vma_containing_mut(vpn) else {
-            return false;
+            return Err(MmError::NoMapping);
         };
         let map_type = area.map_type;
         let map_perm = area.map_perm;
         let ppn: PhysPageNum = match map_type {
             MapType::Identical => PhysPageNum(vpn.0),
             MapType::Framed => {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
                 let page = Arc::new(PrivatePage::new(frame));
                 let ppn = page.ppn();
                 // debug!(
@@ -1331,32 +1337,34 @@ impl MemorySet {
             }
         };
         let pte_flags = PTEFlags::from_bits(map_perm.bits).unwrap();
-        self.page_table.map(vpn, ppn, pte_flags);
-        true
+        self.page_table.map(vpn, ppn, pte_flags)?;
+        Ok(())
     }
 
     /// 在 heap VMA 内按需分配并映射一个私有页。
-    pub fn handle_lazy_heap_fault(&mut self, fault_va: VirtAddr, access: PageFaultAccess) -> bool {
+    pub fn handle_lazy_heap_fault(
+        &mut self,
+        fault_va: VirtAddr,
+        access: PageFaultAccess,
+    ) -> Result<PageFaultHandled, MmError> {
         let vpn = fault_va.floor();
         if self.page_table.translate(vpn).is_some() {
-            return false;
+            return Ok(PageFaultHandled::NotHandled);
         }
         let Some(area) = self.find_vma_containing(vpn) else {
-            return false;
+            return Ok(PageFaultHandled::NotHandled);
         };
         if (!area.is_heap() && !area.is_user_stack())
             || !area.is_user_accessible()
             || !area.allows_fault_access(access)
         {
-            return false;
+            return Ok(PageFaultHandled::NotHandled);
         }
-        let committed = self.map_private_page_in_vma(vpn);
-        if committed {
-            unsafe {
-                asm!("sfence.vma");
-            }
+        self.map_private_page_in_vma(vpn)?;
+        unsafe {
+            asm!("sfence.vma");
         }
-        committed
+        Ok(PageFaultHandled::Handled)
     }
 
     /// 把一个 page cache 页直接映射进用户页表，供 `MAP_SHARED` 使用。
@@ -1364,12 +1372,12 @@ impl MemorySet {
         &mut self,
         plan: &FilePageFaultPlan,
         page: Arc<SpinNoIrqLock<CachePage>>,
-    ) -> bool {
+    ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
-            return true;
+            return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
-            return false;
+            return Ok(PageFaultHandled::NotHandled);
         }
         let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
         if plan.shared
@@ -1392,7 +1400,7 @@ impl MemorySet {
         if let Some(old_page) = area.direct_cache_pages.insert(plan.vpn, Arc::clone(&page)) {
             release_mapped_page(&old_page);
         }
-        self.page_table.map(plan.vpn, ppn, pte_flags);
+        self.page_table.map(plan.vpn, ppn, pte_flags)?;
         unsafe {
             asm!("sfence.vma");
         }
@@ -1404,7 +1412,7 @@ impl MemorySet {
             pte_flags.contains(PTEFlags::W),
             plan.file.path()
         );
-        true
+        Ok(PageFaultHandled::Handled)
     }
 
     /// 对当前地址空间内指定范围的 MAP_SHARED 文件映射执行同步。
@@ -1451,12 +1459,12 @@ impl MemorySet {
         &mut self,
         plan: &FilePageFaultPlan,
         page: Arc<SpinNoIrqLock<CachePage>>,
-    ) -> bool {
+    ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
-            return true;
+            return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
-            return false;
+            return Ok(PageFaultHandled::NotHandled);
         }
         let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
         pte_flags.remove(PTEFlags::W);
@@ -1469,7 +1477,7 @@ impl MemorySet {
         if let Some(old_page) = area.direct_cache_pages.insert(plan.vpn, Arc::clone(&page)) {
             release_mapped_page(&old_page);
         }
-        self.page_table.map(plan.vpn, ppn, pte_flags);
+        self.page_table.map(plan.vpn, ppn, pte_flags)?;
         unsafe {
             asm!("sfence.vma");
         }
@@ -1481,7 +1489,7 @@ impl MemorySet {
             plan.access,
             plan.file.path()
         );
-        true
+        Ok(PageFaultHandled::Handled)
     }
 
     /// 处理共享可写页的首次写入通知缺页。
@@ -1531,24 +1539,27 @@ impl MemorySet {
     }
 
     /// 处理私有页的写时复制缺页。
-    pub(crate) fn handle_private_cow_fault(&mut self, fault_va: VirtAddr) -> Option<UserReleaseBatch> {
+    pub(crate) fn handle_private_cow_fault(
+        &mut self,
+        fault_va: VirtAddr,
+    ) -> Result<(PageFaultHandled, Option<UserReleaseBatch>), MmError> {
         let mut batch = UserReleaseBatch::new();
         let vpn = fault_va.floor();
         let Some(pte) = self.page_table.translate(vpn) else {
-            return None;
+            return Ok((PageFaultHandled::NotHandled, None));
         };
         if pte.writable() {
             // 可能是其他 hart 已经把该页从 COW 只读状态放宽为可写，
             // 当前 hart 仍命中了陈旧的只读 TLB。刷新本地后让用户态重试。
             self.finish_deferred_page_table_edit();
-            return Some(batch);
+            return Ok((PageFaultHandled::Handled, Some(batch)));
         }
         let file_private_cache_page = {
             let Some(area) = self.find_vma_containing(vpn) else {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             };
             if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             }
             match area.file.as_ref() {
                 Some(file) if !file.shared => area.direct_cache_pages.get(&vpn).cloned(),
@@ -1559,7 +1570,9 @@ impl MemorySet {
             let path = self
                 .find_vma_containing(vpn)
                 .and_then(|area| area.file.as_ref().and_then(|file| file.file.path()));
-            let new_page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
+            let new_page = Arc::new(PrivatePage::new(
+                frame_alloc().ok_or(MmError::OutOfMemory)?,
+            ));
             new_page
                 .ppn()
                 .get_bytes_array()
@@ -1568,14 +1581,14 @@ impl MemorySet {
             writable_flags.insert(PTEFlags::W);
             writable_flags.remove(PTEFlags::D);
             let Some(area) = self.find_vma_containing_mut(vpn) else {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             };
             if let Some(old_page) = area.direct_cache_pages.remove(&vpn) {
                 batch.push_direct_cache(old_page);
             }
             area.data_frames.insert(vpn, Arc::clone(&new_page));
             if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             }
             self.finish_deferred_page_table_edit();
             debug!(
@@ -1585,20 +1598,20 @@ impl MemorySet {
                 new_page.ppn().0,
                 path
             );
-            return Some(batch);
+            return Ok((PageFaultHandled::Handled, Some(batch)));
         }
         let (page, path) = {
             let Some(area) = self.find_vma_containing(vpn) else {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             };
             if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             }
             let Some(page) = area.data_frames.get(&vpn).cloned() else {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             };
             if !page.is_cow() {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             }
             (page, area.file.as_ref().and_then(|file| file.file.path()))
         };
@@ -1620,7 +1633,7 @@ impl MemorySet {
         if Arc::strong_count(&page) <= 2 {
             page.set_cow(false);
             if !self.page_table.update_flags(vpn, writable_flags) {
-                return None;
+                return Ok((PageFaultHandled::NotHandled, None));
             }
             self.finish_deferred_page_table_edit();
             debug!(
@@ -1629,22 +1642,24 @@ impl MemorySet {
                 page.ppn().0,
                 path
             );
-            return Some(batch);
+            return Ok((PageFaultHandled::Handled, Some(batch)));
         }
 
-        let new_page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
+        let new_page = Arc::new(PrivatePage::new(
+            frame_alloc().ok_or(MmError::OutOfMemory)?,
+        ));
         new_page
             .ppn()
             .get_bytes_array()
             .copy_from_slice(page.ppn().get_bytes_array());
         let Some(area) = self.find_vma_containing_mut(vpn) else {
-            return None;
+            return Ok((PageFaultHandled::NotHandled, None));
         };
         if let Some(old_page) = area.data_frames.insert(vpn, Arc::clone(&new_page)) {
             batch.push_private(old_page);
         }
         if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
-            return None;
+            return Ok((PageFaultHandled::NotHandled, None));
         }
         self.finish_deferred_page_table_edit();
         debug!(
@@ -1654,7 +1669,7 @@ impl MemorySet {
             new_page.ppn().0,
             path
         );
-        Some(batch)
+        Ok((PageFaultHandled::Handled, Some(batch)))
     }
 
     /// 为 `MAP_PRIVATE` 缺页分配私有页框，并以 page cache 作为填充源。
@@ -1662,20 +1677,18 @@ impl MemorySet {
         &mut self,
         plan: &FilePageFaultPlan,
         page: Arc<SpinNoIrqLock<CachePage>>,
-    ) -> bool {
+    ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
-            return true;
+            return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
-            return false;
+            return Ok(PageFaultHandled::NotHandled);
         }
         if plan.access != PageFaultAccess::Write {
             // 首次读/执行缺页先共享只读 page cache 页，首次写再通过 COW 物化私有页。
             return self.map_private_file_cache_page(plan, page);
         }
-        if !self.map_private_page_in_vma(plan.vpn) {
-            return false;
-        }
+        self.map_private_page_in_vma(plan.vpn)?;
         let dst_ppn = self.page_table.translate(plan.vpn).unwrap().ppn();
         let dst = dst_ppn.get_bytes_array();
         let page_guard = page.lock();
@@ -1691,7 +1704,7 @@ impl MemorySet {
             dst_ppn.0,
             plan.file.path()
         );
-        true
+        Ok(PageFaultHandled::Handled)
     }
 
     /// Change permissions of a range in the address space.
@@ -2302,26 +2315,30 @@ impl Vma {
         frames
     }
     /// 为指定虚拟页建立单页映射，并在需要时分配新的物理页框。
-    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
+    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> Result<(), MmError> {
         let ppn: PhysPageNum;
         match self.map_type {
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
             }
             MapType::Framed => {
-                let page = Arc::new(PrivatePage::new(frame_alloc().unwrap()));
+                let page = Arc::new(PrivatePage::new(
+                    frame_alloc().ok_or(MmError::OutOfMemory)?,
+                ));
                 ppn = page.ppn();
                 self.data_frames.insert(vpn, page);
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
-        page_table.map(vpn, ppn, pte_flags);
+        page_table.map(vpn, ppn, pte_flags)?;
+        Ok(())
     }
     /// 为当前区域覆盖的全部虚拟页建立映射。
-    pub fn map(&mut self, page_table: &mut PageTable) {
+    pub fn map(&mut self, page_table: &mut PageTable) -> Result<(), MmError> {
         for vpn in self.vpn_range {
-            self.map_one(page_table, vpn);
+            self.map_one(page_table, vpn)?;
         }
+        Ok(())
     }
     /// 将当前区域收缩到新的上界，并把尾部页对象加入延迟释放批次。
     pub(crate) fn shrink_to_deferred(
@@ -2349,6 +2366,7 @@ impl Vma {
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
+                .expect("failed to append eagerly mapped VMA");
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
