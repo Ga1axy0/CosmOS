@@ -1,6 +1,7 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
+use core::fmt;
 use log::{debug, info};
 use spin::Mutex;
 
@@ -50,7 +51,7 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         let mut out = vec![0u8; len];
 
         let start_block = offset / BLOCK_SZ;
-        let end_block = (offset + len + BLOCK_SZ - 1) / BLOCK_SZ;
+        let end_block = (offset + len).div_ceil(BLOCK_SZ);
 
         for block_id in start_block..end_block {
             let block_start = block_id * BLOCK_SZ;
@@ -76,7 +77,7 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         }
 
         let start_block = offset / BLOCK_SZ;
-        let end_block = (offset + data.len() + BLOCK_SZ - 1) / BLOCK_SZ;
+        let end_block = (offset + data.len()).div_ceil(BLOCK_SZ);
 
         for block_id in start_block..end_block {
             let block_start = block_id * BLOCK_SZ;
@@ -384,6 +385,16 @@ impl Ext4Inode {
     }
 }
 
+impl fmt::Debug for Ext4Inode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ext4Inode")
+            .field("inode_num", &self.inode_num)
+            .field("file_type", &self.file_type)
+            .field("fs_ptr", &format_args!("{:p}", Arc::as_ptr(&self.fs)))
+            .finish()
+    }
+}
+
 impl VfsNode for Ext4Inode {
     fn as_any(&self) -> &dyn Any {
         self
@@ -476,7 +487,7 @@ impl VfsNode for Ext4Inode {
         let ext4 = self.fs.ext4.lock();
         let inode_ref = ext4.get_inode_ref(self.inode_num);
         let i = &inode_ref.inode;
-        let ret = VfsAttrs {
+        VfsAttrs {
             mode: Some(i.mode() as u32),
             ino: self.inode_num as u64,
             nlink: i.links_count() as u32,
@@ -487,8 +498,7 @@ impl VfsNode for Ext4Inode {
             atime: Some(decode_ext4_time(i.atime(), i.i_atime_extra())),
             mtime: Some(decode_ext4_time(i.mtime(), i.i_mtime_extra())),
             ctime: Some(decode_ext4_time(i.ctime(), i.i_ctime_extra())),
-        };
-        ret
+        }
     }
 
     fn statfs(&self) -> Result<VfsStatFs, FS_ERRNO> {

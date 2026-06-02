@@ -9,6 +9,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
@@ -86,6 +87,22 @@ impl TmpfsFileNode {
                 }),
             }),
         }
+    }
+}
+
+impl fmt::Debug for TmpfsFileNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.state.inner.lock();
+        f.debug_struct("TmpfsFileNode")
+            .field("ino", &self.state.ino)
+            .field("size", &inner.data.len())
+            .field("mode", &inner.meta.mode)
+            .field("uid", &inner.meta.uid)
+            .field("gid", &inner.meta.gid)
+            .field("atime", &inner.meta.atime)
+            .field("mtime", &inner.meta.mtime)
+            .field("ctime", &inner.meta.ctime)
+            .finish()
     }
 }
 
@@ -181,6 +198,25 @@ impl TmpfsDirNode {
             TmpfsNode::File(file) => Arc::new(file.clone()) as Arc<dyn VfsNode>,
             TmpfsNode::Dir(dir) => Arc::new(dir.clone()) as Arc<dyn VfsNode>,
         }
+    }
+}
+
+impl fmt::Debug for TmpfsDirNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.state.inner.lock();
+        let child_names: Vec<String> = inner.children.keys().cloned().collect();
+        f.debug_struct("TmpfsDirNode")
+            .field("ino", &self.state.ino)
+            .field("child_count", &child_names.len())
+            .field("children", &child_names)
+            .field("has_parent", &inner.parent.is_some())
+            .field("mode", &inner.meta.mode)
+            .field("uid", &inner.meta.uid)
+            .field("gid", &inner.meta.gid)
+            .field("atime", &inner.meta.atime)
+            .field("mtime", &inner.meta.mtime)
+            .field("ctime", &inner.meta.ctime)
+            .finish()
     }
 }
 

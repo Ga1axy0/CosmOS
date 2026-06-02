@@ -197,9 +197,11 @@ fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
     let (parent_path, name) = split_for_mount(abs_path);
     let parent_vdir = ensure_virtual_dir(parent_path)?;
 
-    // If the backing FS has a directory at this name, use it as the overlay of
-    // the new virtual dir so its contents remain visible.
-    let child_overlay: Option<Arc<dyn VfsNode>> = parent_vdir.overlay_child_dir(name);
+    // If the current namespace already has a directory at this name (whether
+    // from an explicit mount or from the backing overlay), preserve it as the
+    // overlay of the new virtual dir so mount wrappers do not hide existing
+    // mount points like `/tmp`.
+    let child_overlay: Option<Arc<dyn VfsNode>> = parent_vdir.namespace_child_dir(name);
 
     let new_vdir = VirtualDirNode::new();
     if let Some(ov) = child_overlay {
