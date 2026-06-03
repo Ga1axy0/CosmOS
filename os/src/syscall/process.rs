@@ -17,7 +17,7 @@ use crate::{
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -809,7 +809,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 }
 
 /// kill syscall
-pub fn sys_kill(pid: usize, signal: u32) -> isize {
+pub fn sys_kill(pid: isize, signal: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_kill pid:{} signal:{}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -817,11 +817,51 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         signal
     );
     syscall_body!({
-        let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
-        let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        let flag = if signal == 0 {
+            None
+        } else {
+            Some(SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?)
+        };
         let sender = current_process();
         let siginfo = SigInfo::for_kill(signal as i32, sender.getpid(), sender.getuid());
-        crate::task::add_signal_to_process_with_siginfo(&process, flag, siginfo);
+        let sender_pid = sender.getpid();
+        let sender_pgid = sender.getpgid() as usize;
+        let targets = match pid {
+            n if n > 0 => vec![pid2process(n as usize).or_errno(ERRNO::ESRCH)?],
+            0 => list_pids()
+                .into_iter()
+                .filter_map(pid2process)
+                .filter(|process| process.getpgid() as usize == sender_pgid)
+                .collect::<Vec<_>>(),
+            -1 => list_pids()
+                .into_iter()
+                .filter(|&target_pid| target_pid != 0)
+                .filter_map(pid2process)
+                .collect::<Vec<_>>(),
+            n => {
+                let target_pgid = n.unsigned_abs();
+                list_pids()
+                    .into_iter()
+                    .filter_map(pid2process)
+                    .filter(|process| process.getpgid() as usize == target_pgid)
+                    .collect::<Vec<_>>()
+            }
+        };
+        if targets.is_empty() {
+            return Err(ERRNO::ESRCH);
+        }
+        if let Some(flag) = flag {
+            for process in targets {
+                debug!(
+                    "sys_kill: sender_pid={} target_pid={} target_pgid={} pid_arg={}",
+                    sender_pid,
+                    process.getpid(),
+                    process.getpgid(),
+                    pid
+                );
+                crate::task::add_signal_to_process_with_siginfo(&process, flag, siginfo);
+            }
+        }
         Ok(0)
     })
 }
