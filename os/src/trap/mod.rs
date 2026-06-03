@@ -18,7 +18,7 @@ use crate::config::{PAGE_SIZE, TRAMPOLINE};
 use crate::hart::hartid;
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
 use crate::signal::{SignalBit, handle_signals};
-use crate::syscall::syscall;
+use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
@@ -186,6 +186,7 @@ pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
     current_process().enter_kernel(get_time());
     current_trap_cx().in_syscall = false;
+    current_trap_cx().restartable_syscall = false;
     let scause = scause::read();
     let stval = stval::read();
     // trace!("into {:?}", scause.cause());
@@ -196,6 +197,7 @@ pub fn trap_handler() -> ! {
             let syscall_id = cx.x[17];
             let syscall_args = [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]];
             cx.orig_a0 = cx.x[10];
+            cx.restartable_syscall = syscall_supports_sa_restart(syscall_id);
             cx.sepc += 4;
             // get system call return value
             let result = syscall(syscall_id, syscall_args);
@@ -392,8 +394,13 @@ pub fn trap_handler() -> ! {
         exit_current_and_run_next(ExitReason::Exit(0));
     }
     schedule_if_needed();
-    // Handle non-fatal signals before returning to user space
-    handle_signals();
+    // Handle user-installed signal handlers before returning to user space.
+    // If the kernel cannot build a signal frame (for example, because the user
+    // stack is already invalid), terminate the task instead of re-executing the
+    // same faulting instruction forever.
+    if let Some(signum) = handle_signals() {
+        exit_current_and_run_next(ExitReason::Signal(signum as u32));
+    }
     trap_return();
 }
 

@@ -208,7 +208,8 @@ fn has_unmasked_pending_signal() -> bool {
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
     let thread_pending = task_inner.pending_signals;
-    let pending = (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask;
+    let pending =
+        (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask.without_unblockable();
 
     for signum in 1..=crate::task::MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {

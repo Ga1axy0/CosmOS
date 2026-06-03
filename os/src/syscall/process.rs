@@ -606,8 +606,12 @@ pub fn sys_clone(
             let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
             let new_inner_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid;
             debug!(
-                "kernel: sys_clone thread: new_tid(thread_id)={} inner_tid={} parent_set_tid_addr={:#x}",
-                new_tid, new_inner_tid, parent_set_tid.unwrap_or(0)
+                "kernel: sys_clone thread: new_tid(thread_id)={} inner_tid={} parent_set_tid_addr={:#x} child_set_tid_addr={:#x} clear_child_tid_addr={:#x}",
+                new_tid,
+                new_inner_tid,
+                parent_set_tid.unwrap_or(0),
+                child_set_tid.unwrap_or(0),
+                if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) { child_tid } else { 0 }
             );
             {
                 let mut new_inner = new_task.inner_exclusive_access();
@@ -790,8 +794,8 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 let task = current_task().unwrap();
                 let inner = process.inner_exclusive_access();
                 let task_inner = task.inner_exclusive_access();
-                let pending_unmasked =
-                    (task_inner.pending_signals | inner.pending_signals) & !task_inner.signal_mask;
+                let pending_unmasked = (task_inner.pending_signals | inner.pending_signals)
+                    & !task_inner.signal_mask.without_unblockable();
                 let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
                     let Some(flag) = SignalBit::from_signum(signum as u32) else { return false; };
                     if !pending_unmasked.contains(flag) {

@@ -33,6 +33,9 @@ pub struct TrapContext {
     /// Original a0 value before the syscall overwrote it with the return value.
     /// Used to restore a0 when restarting a syscall after signal delivery.
     pub orig_a0: usize,
+    /// Whether the interrupted syscall is eligible for Linux-style SA_RESTART.
+    /// Default to false and only opt-in well-understood blocking syscalls.
+    pub restartable_syscall: bool,
 }
 
 impl TrapContext {
@@ -64,6 +67,7 @@ impl TrapContext {
             fcsr: 0,
             in_syscall: false,
             orig_a0: 0,
+            restartable_syscall: false,
         };
         cx.set_sp(sp); // app's user stack pointer
         cx // return initial Trap Context of app

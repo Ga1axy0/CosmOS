@@ -1,5 +1,6 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{write_bytes_to_user, write_pod_to_user, Pod};
+use crate::syscall::utils::read_bytes_from_user;
+use crate::syscall::{read_pod_from_user, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::{
     config::MAX_HARTS,
@@ -8,7 +9,7 @@ use crate::{
     sched::{
         enqueue_task_on, has_runnable_task_at_or_above, nice_to_weight, pid2process, remove_task,
         request_current_task_resched, resched_hart, suspend_current_and_run_next,
-        yield_current_and_run_next, MAX_NICE, MIN_NICE,
+        yield_current_and_run_next, MAX_NICE, MIN_NICE, NICE_0_LOAD,
     },
     task::{
         current_process, current_task, current_user_token, ReschedReason, SchedPolicy,
@@ -17,12 +18,16 @@ use crate::{
 };
 
 use alloc::{sync::Arc, vec::Vec};
-use core::mem::size_of;
+use core::mem::{size_of, MaybeUninit};
+use core::slice;
 
 const SCHED_RR: i32 = SchedPolicy::Rr as i32;
 const SCHED_FIFO: i32 = SchedPolicy::Fifo as i32;
 const SCHED_OTHER: i32 = SchedPolicy::Other as i32;
+const SCHED_DEADLINE: i32 = 6;
 const PRIO_PROCESS: i32 = 0;
+const SCHED_ATTR_SIZE_VER0: usize = 48;
+const SCHED_ATTR_SIZE_VER1: usize = 56;
 
 #[repr(C)]
 pub struct SchedParam {
@@ -30,6 +35,23 @@ pub struct SchedParam {
 }
 
 impl Pod for SchedParam {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxSchedAttr {
+    pub size: u32,
+    pub sched_policy: u32,
+    pub sched_flags: u64,
+    pub sched_nice: i32,
+    pub sched_priority: u32,
+    pub sched_runtime: u64,
+    pub sched_deadline: u64,
+    pub sched_period: u64,
+    pub sched_util_min: u32,
+    pub sched_util_max: u32,
+}
+
+impl Pod for LinuxSchedAttr {}
 
 fn task_by_pid_or_local_tid(pid: usize) -> Option<Arc<crate::task::TaskControlBlock>> {
     if let Some(process) = pid2process(pid) {
@@ -134,6 +156,166 @@ fn resched_task_if_running(task: &Arc<crate::task::TaskControlBlock>, is_current
     }
 }
 
+fn write_kernel_sched_attr_size(ptr: *mut LinuxSchedAttr) {
+    let kernel_size = size_of::<LinuxSchedAttr>() as u32;
+    let _ = write_pod_to_user(ptr as *mut u32, &kernel_size);
+}
+
+fn read_linux_sched_attr(ptr: *const LinuxSchedAttr) -> Result<LinuxSchedAttr, ERRNO> {
+    if ptr.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let user_size = read_pod_from_user(ptr as *const u32)? as usize;
+    if user_size < SCHED_ATTR_SIZE_VER0 {
+        return Err(ERRNO::EINVAL);
+    }
+    if user_size > 4096 {
+        write_kernel_sched_attr_size(ptr as *mut LinuxSchedAttr);
+        return Err(ERRNO::E2BIG);
+    }
+
+    let kernel_size = size_of::<LinuxSchedAttr>();
+    if user_size > kernel_size {
+        let extra = read_bytes_from_user(
+            (ptr as *const u8).wrapping_add(kernel_size),
+            user_size - kernel_size,
+        )?;
+        if extra.iter().any(|&byte| byte != 0) {
+            write_kernel_sched_attr_size(ptr as *mut LinuxSchedAttr);
+            return Err(ERRNO::E2BIG);
+        }
+    }
+
+    let copy_len = user_size.min(kernel_size);
+    let bytes = read_bytes_from_user(ptr as *const u8, copy_len)?;
+    let mut value = MaybeUninit::<LinuxSchedAttr>::zeroed();
+    let value_bytes =
+        unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, kernel_size) };
+    value_bytes[..copy_len].copy_from_slice(&bytes);
+    Ok(unsafe { value.assume_init() })
+}
+
+fn write_linux_sched_attr(
+    ptr: *mut LinuxSchedAttr,
+    user_size: usize,
+    value: &LinuxSchedAttr,
+) -> Result<(), ERRNO> {
+    if ptr.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    if user_size < SCHED_ATTR_SIZE_VER0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let value_bytes =
+        unsafe { slice::from_raw_parts(value as *const LinuxSchedAttr as *const u8, size_of::<LinuxSchedAttr>()) };
+    write_bytes_to_user(ptr as *mut u8, &value_bytes[..user_size.min(value_bytes.len())])
+}
+
+fn validate_sched_attr(attr: &LinuxSchedAttr) -> Result<(SchedPolicy, u8, i32, u64), ERRNO> {
+    if attr.sched_flags != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    match attr.sched_policy as i32 {
+        SCHED_OTHER => {
+            if attr.sched_priority != 0 || attr.sched_nice < MIN_NICE || attr.sched_nice > MAX_NICE {
+                return Err(ERRNO::EINVAL);
+            }
+            Ok((SchedPolicy::Other, 0, attr.sched_nice, nice_to_weight(attr.sched_nice)))
+        }
+        SCHED_FIFO | SCHED_RR => {
+            let priority = attr.sched_priority as i32;
+            if priority < SCHED_RT_PRIO_MIN as i32 || priority > SCHED_RT_PRIO_MAX as i32 {
+                return Err(ERRNO::EINVAL);
+            }
+            let policy = if attr.sched_policy as i32 == SCHED_FIFO {
+                SchedPolicy::Fifo
+            } else {
+                SchedPolicy::Rr
+            };
+            Ok((policy, priority as u8, 0, NICE_0_LOAD))
+        }
+        SCHED_DEADLINE => {
+            if attr.sched_priority != 0
+                || attr.sched_runtime == 0
+                || attr.sched_deadline == 0
+                || attr.sched_period == 0
+                || attr.sched_runtime > attr.sched_deadline
+                || attr.sched_deadline > attr.sched_period
+            {
+                return Err(ERRNO::EINVAL);
+            }
+            // Until a real EDF/CBS scheduler exists, keep execution under the
+            // fair class while preserving Linux-visible deadline attributes.
+            Ok((SchedPolicy::Other, 0, 0, NICE_0_LOAD))
+        }
+        _ => Err(ERRNO::EINVAL),
+    }
+}
+
+fn apply_sched_attr_to_task(
+    task: Arc<crate::task::TaskControlBlock>,
+    linux_attr: &LinuxSchedAttr,
+    is_current: bool,
+) -> Result<(), ERRNO> {
+    let (new_policy, new_priority, new_nice, new_weight) = validate_sched_attr(linux_attr)?;
+    let (was_on_rq, was_on_cpu, last_cpu, old_policy, old_priority) = {
+        let task_inner = task.inner_exclusive_access();
+        (
+            task_inner.sched.on_rq,
+            task_inner.sched.on_cpu,
+            task_inner.sched.last_cpu,
+            task_inner.sched.policy,
+            task_inner.sched.rt_priority,
+        )
+    };
+    let enqueue_at_head =
+        old_policy.is_rt() && new_policy.is_rt() && new_priority < old_priority;
+    if was_on_rq {
+        remove_task(task.clone());
+    }
+    {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.sched.policy = new_policy;
+        task_inner.sched.linux_policy = linux_attr.sched_policy as i32;
+        task_inner.sched.rt_priority = new_priority;
+        task_inner.sched.nice = new_nice;
+        task_inner.sched.weight = new_weight;
+        task_inner.sched.sched_flags = linux_attr.sched_flags;
+        task_inner.sched.sched_runtime = linux_attr.sched_runtime;
+        task_inner.sched.sched_deadline = linux_attr.sched_deadline;
+        task_inner.sched.sched_period = linux_attr.sched_period;
+        task_inner.sched.sched_util_min = linux_attr.sched_util_min;
+        task_inner.sched.sched_util_max = linux_attr.sched_util_max;
+        match new_policy {
+            SchedPolicy::Rr => {
+                task_inner.reset_time_slice();
+                task_inner.sched.cfs_rq_key = None;
+                task_inner.sched.rt_enqueue_head = enqueue_at_head;
+            }
+            SchedPolicy::Fifo => {
+                task_inner.sched.cfs_rq_key = None;
+                task_inner.sched.rt_enqueue_head = enqueue_at_head;
+            }
+            SchedPolicy::Other => {
+                task_inner.sched.cfs_initialized = false;
+                task_inner.sched.exec_start_ns = 0;
+                task_inner.sched.cfs_slice_start_ns = 0;
+                task_inner.sched.rt_enqueue_head = false;
+            }
+            SchedPolicy::Idle => unreachable!(),
+        }
+    }
+    if was_on_rq {
+        enqueue_task_on(task, last_cpu);
+    } else if was_on_cpu {
+        if enqueue_at_head {
+            task.inner_exclusive_access().sched.rt_enqueue_head = true;
+        }
+        resched_task_if_running(&task, is_current);
+    }
+    Ok(())
+}
+
 pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam) -> isize {
     syscall_body!({
         if pid < 0 || param.is_null() {
@@ -197,6 +379,7 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
             match new_policy {
                 SchedPolicy::Rr => {
                     task_inner.sched.policy = SchedPolicy::Rr;
+                    task_inner.sched.linux_policy = SCHED_RR;
                     task_inner.sched.rt_priority = new_priority;
                     task_inner.reset_time_slice();
                     task_inner.sched.cfs_rq_key = None;
@@ -204,12 +387,14 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
                 }
                 SchedPolicy::Fifo => {
                     task_inner.sched.policy = SchedPolicy::Fifo;
+                    task_inner.sched.linux_policy = SCHED_FIFO;
                     task_inner.sched.rt_priority = new_priority;
                     task_inner.sched.cfs_rq_key = None;
                     task_inner.sched.rt_enqueue_head = enqueue_at_head;
                 }
                 SchedPolicy::Other => {
                     task_inner.sched.policy = SchedPolicy::Other;
+                    task_inner.sched.linux_policy = SCHED_OTHER;
                     task_inner.sched.rt_priority = 0;
                     task_inner.sched.cfs_initialized = false;
                     task_inner.sched.exec_start_ns = 0;
@@ -218,6 +403,12 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
                 }
                 SchedPolicy::Idle => unreachable!(),
             }
+            task_inner.sched.sched_flags = 0;
+            task_inner.sched.sched_runtime = 0;
+            task_inner.sched.sched_deadline = 0;
+            task_inner.sched.sched_period = 0;
+            task_inner.sched.sched_util_min = 0;
+            task_inner.sched.sched_util_max = 0;
         }
         if was_on_rq {
             enqueue_task_on(task, last_cpu);
@@ -242,7 +433,7 @@ pub fn sys_sched_getscheduler(pid: isize) -> isize {
             task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
         };
         let task_inner = task.inner_exclusive_access();
-        Ok(task_inner.sched.policy as isize)
+        Ok(task_inner.sched.linux_policy as isize)
     })
 }
 
@@ -265,6 +456,72 @@ pub fn sys_sched_getparam(pid: isize, param: *mut SchedParam) -> isize {
             }
         };
         write_pod_to_user(param, &SchedParam { sched_priority }).or_errno(ERRNO::EFAULT)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_sched_setattr(
+    pid: isize,
+    attr: *const LinuxSchedAttr,
+    flags: u32,
+) -> isize {
+    syscall_body!({
+        if pid < 0 || flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let attr = read_linux_sched_attr(attr)?;
+        let task = if pid == 0 {
+            current_task().unwrap()
+        } else {
+            task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
+        };
+        apply_sched_attr_to_task(task, &attr, pid == 0)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_sched_getattr(
+    pid: isize,
+    attr: *mut LinuxSchedAttr,
+    size: u32,
+    flags: u32,
+) -> isize {
+    syscall_body!({
+        if pid < 0 || flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let user_size = size as usize;
+        if user_size < SCHED_ATTR_SIZE_VER0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let task = if pid == 0 {
+            current_task().unwrap()
+        } else {
+            task_by_pid_or_local_tid(pid as usize).ok_or(ERRNO::ESRCH)?
+        };
+        let value = {
+            let task_inner = task.inner_exclusive_access();
+            let sched = &task_inner.sched;
+            let linux_policy = sched.linux_policy;
+            let (sched_nice, sched_priority) = match linux_policy {
+                SCHED_FIFO | SCHED_RR => (0, sched.rt_priority as u32),
+                SCHED_DEADLINE => (0, 0),
+                _ => (sched.nice, 0),
+            };
+            LinuxSchedAttr {
+                size: SCHED_ATTR_SIZE_VER1 as u32,
+                sched_policy: linux_policy as u32,
+                sched_flags: sched.sched_flags,
+                sched_nice,
+                sched_priority,
+                sched_runtime: sched.sched_runtime,
+                sched_deadline: sched.sched_deadline,
+                sched_period: sched.sched_period,
+                sched_util_min: sched.sched_util_min,
+                sched_util_max: sched.sched_util_max,
+            }
+        };
+        write_linux_sched_attr(attr, user_size, &value)?;
         Ok(0)
     })
 }
