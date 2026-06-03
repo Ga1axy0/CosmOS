@@ -4,7 +4,7 @@
 //! supports regular files, directories, `rename`, `unlink`, `rmdir`, and
 //! basic `statfs` reporting.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, btree_map::Entry};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -18,7 +18,9 @@ use fs::vfs::{
     InodeTime, VfsAttrs, VfsFileType, VfsNode, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT,
 };
 
+use crate::config::PAGE_SIZE;
 use crate::fs::{empty_statfs, StatFs64};
+use crate::mm::{frame_alloc, FrameTracker};
 use crate::sync::SpinNoIrqLock;
 
 const TMPFS_FS_ID: u64 = STATFS_MAGIC_TMPFS;
@@ -35,6 +37,14 @@ fn tmpfs_statfs() -> StatFs64 {
         TMPFS_FS_ID,
         STATFS_NAMELEN_DEFAULT,
     )
+}
+
+fn tmpfs_page_index(offset: usize) -> u64 {
+    (offset / PAGE_SIZE) as u64
+}
+
+fn tmpfs_page_start(page_idx: u64) -> usize {
+    page_idx as usize * PAGE_SIZE
 }
 
 #[derive(Clone, Copy)]
@@ -66,11 +76,12 @@ struct TmpfsFileState {
 }
 
 struct TmpfsFileInner {
-    data: Vec<u8>,
+    size: usize,
+    pages: BTreeMap<u64, FrameTracker>,
     meta: TmpfsMeta,
 }
 
-/// Regular tmpfs file node backed by an in-memory byte vector.
+/// Regular tmpfs file node backed by sparse, page-sized slots.
 #[derive(Clone)]
 pub struct TmpfsFileNode {
     state: Arc<TmpfsFileState>,
@@ -82,7 +93,8 @@ impl TmpfsFileNode {
             state: Arc::new(TmpfsFileState {
                 ino: alloc_tmpfs_ino(),
                 inner: SpinNoIrqLock::new(TmpfsFileInner {
-                    data: Vec::new(),
+                    size: 0,
+                    pages: BTreeMap::new(),
                     meta: TmpfsMeta::new(0o100666),
                 }),
             }),
@@ -95,7 +107,8 @@ impl fmt::Debug for TmpfsFileNode {
         let inner = self.state.inner.lock();
         f.debug_struct("TmpfsFileNode")
             .field("ino", &self.state.ino)
-            .field("size", &inner.data.len())
+            .field("size", &inner.size)
+            .field("resident_pages", &inner.pages.len())
             .field("mode", &inner.meta.mode)
             .field("uid", &inner.meta.uid)
             .field("gid", &inner.meta.gid)
@@ -246,21 +259,76 @@ impl VfsNode for TmpfsFileNode {
     }
 
     fn clear(&self) {
-        self.state.inner.lock().data.clear();
+        let mut inner = self.state.inner.lock();
+        inner.size = 0;
+        inner.pages.clear();
     }
 
     fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
-        self.state.inner.lock().data.resize(new_size, 0);
+        let mut inner = self.state.inner.lock();
+        let old_size = inner.size;
+        if new_size >= old_size {
+            inner.size = new_size;
+            return Ok(());
+        }
+
+        if new_size == 0 {
+            inner.size = 0;
+            inner.pages.clear();
+            return Ok(());
+        }
+
+        let keep_tail_idx = tmpfs_page_index(new_size.saturating_sub(1));
+        let keep_tail_valid = new_size - tmpfs_page_start(keep_tail_idx);
+        if let Some(page) = inner.pages.get(&keep_tail_idx) {
+            page.ppn.get_bytes_array()[keep_tail_valid..].fill(0);
+        }
+
+        let first_removed_idx = keep_tail_idx.saturating_add(1);
+        let removed_indices: Vec<_> = inner
+            .pages
+            .range(first_removed_idx..)
+            .map(|(&idx, _)| idx)
+            .collect();
+        for page_idx in removed_indices {
+            inner.pages.remove(&page_idx);
+        }
+        inner.size = new_size;
+        Ok(())
+    }
+
+    fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), FS_ERRNO> {
+        if mode != 0 {
+            return Err(FS_ERRNO::EOPNOTSUPP);
+        }
+        let new_size = offset.checked_add(len).ok_or(FS_ERRNO::EINVAL)?;
+        let mut inner = self.state.inner.lock();
+        inner.size = inner.size.max(new_size);
         Ok(())
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let inner = self.state.inner.lock();
-        if offset >= inner.data.len() || buf.is_empty() {
+        if offset >= inner.size || buf.is_empty() {
             return 0;
         }
-        let len = core::cmp::min(buf.len(), inner.data.len() - offset);
-        buf[..len].copy_from_slice(&inner.data[offset..offset + len]);
+        let len = core::cmp::min(buf.len(), inner.size - offset);
+        let out = &mut buf[..len];
+        out.fill(0);
+
+        let end = offset + len;
+        let first_page = tmpfs_page_index(offset);
+        let last_page = tmpfs_page_index(end.saturating_sub(1));
+        for page_idx in first_page..=last_page {
+            let Some(page) = inner.pages.get(&page_idx) else {
+                continue;
+            };
+            let page_start = tmpfs_page_start(page_idx);
+            let copy_start = core::cmp::max(offset, page_start);
+            let copy_end = core::cmp::min(end, page_start + PAGE_SIZE);
+            let src = &page.ppn.get_bytes_array()[copy_start - page_start..copy_end - page_start];
+            out[copy_start - offset..copy_end - offset].copy_from_slice(src);
+        }
         len
     }
 
@@ -270,10 +338,25 @@ impl VfsNode for TmpfsFileNode {
         }
         let mut inner = self.state.inner.lock();
         let end = offset.saturating_add(buf.len());
-        if end > inner.data.len() {
-            inner.data.resize(end, 0);
+        inner.size = inner.size.max(end);
+
+        let mut written = 0usize;
+        while written < buf.len() {
+            let file_off = offset + written;
+            let page_idx = tmpfs_page_index(file_off);
+            let page_off = file_off % PAGE_SIZE;
+            let copy_len = core::cmp::min(PAGE_SIZE - page_off, buf.len() - written);
+            let page = match inner.pages.entry(page_idx) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(
+                    frame_alloc().expect("tmpfs page allocation failed while writing file"),
+                ),
+            };
+            let bytes = page.ppn.get_bytes_array();
+            bytes[page_off..page_off + copy_len]
+                .copy_from_slice(&buf[written..written + copy_len]);
+            written += copy_len;
         }
-        inner.data[offset..end].copy_from_slice(buf);
         buf.len()
     }
 
@@ -290,7 +373,7 @@ impl VfsNode for TmpfsFileNode {
     }
 
     fn size(&self) -> usize {
-        self.state.inner.lock().data.len()
+        self.state.inner.lock().size
     }
 
     fn mode(&self) -> Option<u32> {
@@ -348,7 +431,7 @@ impl VfsNode for TmpfsFileNode {
             mode: Some(inner.meta.mode),
             ino: self.state.ino,
             nlink: 1,
-            size: inner.data.len(),
+            size: inner.size,
             uid: Some(inner.meta.uid),
             gid: Some(inner.meta.gid),
             rdev: 0,
