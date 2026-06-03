@@ -162,10 +162,10 @@ pub const SYSCALL_SET_PRIORITY: usize = 140;
 pub const SYSCALL_GET_PRIORITY: usize = 141;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
-/// getpgid syscall
-pub const SYSCALL_GETPGID: usize = 154;
 /// setpgid syscall
-pub const SYSCALL_SETPGID: usize = 155;
+pub const SYSCALL_SETPGID: usize = 154;
+/// getpgid syscall
+pub const SYSCALL_GETPGID: usize = 155;
 /// getsid syscall
 pub const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
@@ -272,6 +272,10 @@ pub const SYSCALL_WAIT4: usize = 260;
 pub const SYSCALL_PRLIMIT64: usize = 261;
 /// syncfs syscall
 pub const SYSCALL_SYNCFS: usize = 267;
+/// sched_setattr syscall
+pub const SYSCALL_SCHED_SETATTR: usize = 274;
+/// sched_getattr syscall
+pub const SYSCALL_SCHED_GETATTR: usize = 275;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
@@ -310,6 +314,28 @@ pub const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 /// condvar_wait syscallca
 pub const SYSCALL_CONDVAR_WAIT: usize = 473;
 
+/// Conservative whitelist of syscalls that may be transparently restarted
+/// after a caught signal when the handler uses SA_RESTART.
+///
+/// Keep timeout-/signal-waiting syscalls out of this list; they must surface
+/// EINTR to userspace to preserve Linux semantics for pause/sigsuspend/ppoll.
+pub fn syscall_supports_sa_restart(syscall_id: usize) -> bool {
+    matches!(
+        syscall_id,
+        SYSCALL_READ
+            | SYSCALL_WRITE
+            | SYSCALL_READV
+            | SYSCALL_WRITEV
+            | SYSCALL_WAIT4
+            | SYSCALL_ACCEPT
+            | SYSCALL_ACCEPT4
+            | SYSCALL_RECVFROM
+            | SYSCALL_RECVMSG
+            | SYSCALL_SENDTO
+            | SYSCALL_SENDMSG
+    )
+}
+
 mod fs;
 mod net;
 mod sched;
@@ -339,7 +365,8 @@ use times::*;
 use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use utils::{
-    read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
+    read_cstring_from_user, read_pod_from_process_user, read_pod_from_user,
+    translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
 };
 pub use times::Timespec;
@@ -665,6 +692,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             sys_sched_setscheduler(args[0] as isize, args[1] as i32, args[2] as *const SchedParam)
         }
         SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0] as isize),
+        SYSCALL_SCHED_SETATTR => {
+            sys_sched_setattr(args[0] as isize, args[1] as *const LinuxSchedAttr, args[2] as u32)
+        }
+        SYSCALL_SCHED_GETATTR => sys_sched_getattr(
+            args[0] as isize,
+            args[1] as *mut LinuxSchedAttr,
+            args[2] as u32,
+            args[3] as u32,
+        ),
         SYSCALL_SCHED_SETAFFINITY => {
             sys_sched_setaffinity(args[0] as isize, args[1], args[2] as *const u8)
         }

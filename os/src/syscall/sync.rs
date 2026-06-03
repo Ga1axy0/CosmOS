@@ -51,6 +51,15 @@ pub fn sys_futex(
         match op & FUTEX_CMD_MASK {
             FUTEX_WAIT => {
                 let flags = op & !FUTEX_CMD_MASK;
+                let current = read_pod_from_user(uaddr);
+                debug!(
+                    "sys_futex WAIT: uaddr={:#x} expected={} current={:?} flags={:#x} timeout_ptr={:#x}",
+                    uaddr as usize,
+                    val,
+                    current,
+                    flags,
+                    timeout
+                );
                 if flags & !(FUTEX_PRIVATE_FLAG) != 0 {
                     warn!(
                         "Unsupported futex WAIT flags: op={:#x} flags={:#x}",
@@ -60,7 +69,14 @@ pub fn sys_futex(
                     return Err(ERRNO::EINVAL);
                 }
                 let timeout_ptr = (!timeout.eq(&0)).then_some(timeout as *const Timespec);
-                futex_wait_addr(uaddr, val, timeout_ptr)
+                let ret = futex_wait_addr(uaddr, val, timeout_ptr);
+                debug!(
+                    "sys_futex WAIT result: uaddr={:#x} expected={} ret={:?}",
+                    uaddr as usize,
+                    val,
+                    ret
+                );
+                ret
             }
             FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
             FUTEX_REQUEUE => {

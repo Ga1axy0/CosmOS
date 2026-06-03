@@ -25,7 +25,7 @@ use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
-use crate::syscall::write_pod_to_process_user;
+use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::remove_timer;
@@ -88,8 +88,36 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
     if clear_child_tid != 0 {
-        let _ = write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32);
-        let _ = futex_wake_addr(clear_child_tid, 1);
+        debug!(
+            "exit_current_and_run_next: pid={} tid={} thread_id={} clear_child_tid={:#x}",
+            process.getpid(),
+            tid,
+            thread_id,
+            clear_child_tid
+        );
+        match write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32) {
+            Ok(()) => {
+                let read_back = read_pod_from_process_user(&process, clear_child_tid as *const i32);
+                debug!(
+                    "exit_current_and_run_next: cleared child_tid at {:#x}, read_back={:?}",
+                    clear_child_tid,
+                    read_back
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "exit_current_and_run_next: failed to clear child_tid at {:#x}: {:?}",
+                    clear_child_tid,
+                    err
+                );
+            }
+        }
+        let woke = futex_wake_addr(clear_child_tid, 1);
+        debug!(
+            "exit_current_and_run_next: futex_wake_addr({:#x}, 1) -> {}",
+            clear_child_tid,
+            woke
+        );
     }
     cleanup_signal_wait_for_task(&task);
     cleanup_futex_wait_for_task(&task);
@@ -274,7 +302,8 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
-    let pending = (task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask;
+    let pending = (task_inner.pending_signals | process_inner.pending_signals)
+        & !task_inner.signal_mask.without_unblockable();
     for signum in 1..=MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {
             continue;
@@ -349,7 +378,7 @@ pub fn add_signal_to_process_with_siginfo(
         .into_iter()
         .filter(|task| {
             let task_inner = task.inner_exclusive_access();
-            !(newly_pending & !task_inner.signal_mask).is_empty()
+            !(newly_pending & !task_inner.signal_mask.without_unblockable()).is_empty()
         })
         .collect::<Vec<_>>();
 
@@ -390,7 +419,7 @@ pub fn add_signal_to_task_with_siginfo(
             task_inner.res.as_ref().unwrap().thread_id(),
             task_inner.res.as_ref().unwrap().tid,
             task_inner.signal_mask.bits(),
-            newly_pending & !task_inner.signal_mask,
+            newly_pending & !task_inner.signal_mask.without_unblockable(),
         )
     };
 

@@ -205,6 +205,20 @@ pub fn write_pod_to_process_user<T: Pod>(
     write_bytes_to_process_user(process, ptr as *mut u8, value_bytes)
 }
 
+/// 从指定进程的用户地址空间读取一段字节，允许跨越多个用户页。
+pub fn read_bytes_from_process_user(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<u8>, ERRNO> {
+    let buffers = translated_process_byte_buffer_with_access(process, ptr, len, PageFaultAccess::Read)?;
+    let mut bytes = Vec::with_capacity(len);
+    for buffer in buffers.iter() {
+        bytes.extend_from_slice(buffer);
+    }
+    Ok(bytes)
+}
+
 /// 从用户地址空间读取一段字节，允许跨越多个用户页。
 pub fn read_bytes_from_user(ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO> {
     let buffers = translated_byte_buffer_with_access(ptr, len, PageFaultAccess::Read)?;
@@ -241,6 +255,19 @@ pub fn read_pod_from_user<T: Pod>(ptr: *const T) -> Result<T, ERRNO> {
     let mut value = MaybeUninit::<T>::uninit();
     let value_bytes =
     unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
+    value_bytes.copy_from_slice(&bytes);
+    Ok(unsafe { value.assume_init() })
+}
+
+/// 从指定进程的用户地址空间读取一个 POD 结构，允许结构体跨越多个用户页。
+pub fn read_pod_from_process_user<T: Pod>(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *const T,
+) -> Result<T, ERRNO> {
+    let bytes = read_bytes_from_process_user(process, ptr as *const u8, size_of::<T>())?;
+    let mut value = MaybeUninit::<T>::uninit();
+    let value_bytes =
+        unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
     value_bytes.copy_from_slice(&bytes);
     Ok(unsafe { value.assume_init() })
 }
