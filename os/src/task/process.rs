@@ -24,6 +24,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -216,6 +217,33 @@ pub struct ItimerState {
     pub interval_ns: u64,
     /// 下一次到期绝对时间，单位：纳秒（所在时钟域）。
     pub deadline_ns: u64,
+}
+
+/// 系统范围内当前“已武装”的 interval timer 数量。
+///
+/// 时钟 tick 在没有任何 timer 武装时（绝大多数负载，例如 hackbench）可据此
+/// 完全跳过对全部进程的扫描，对应 Linux 在没有挂起 timer 时不做 per-tick 工作
+/// 的做法。该计数是**保守**的：武装时 +1、显式解除/单次到期时 -1，但进程在
+/// 仍持有已武装 timer 的情况下退出时不做 -1，因此只会“多算”（偶尔多扫一次，
+/// 无害），绝不会“少算”，从而保证 timer 投递不会被漏掉。
+static ARMED_ITIMERS: AtomicUsize = AtomicUsize::new(0);
+
+/// 读取当前已武装 interval timer 数量。
+pub fn armed_itimers_count() -> usize {
+    ARMED_ITIMERS.load(Ordering::Acquire)
+}
+
+#[inline]
+fn itimer_account_arm() {
+    ARMED_ITIMERS.fetch_add(1, Ordering::AcqRel);
+}
+
+#[inline]
+fn itimer_account_disarm() {
+    // saturating，避免任何意外下溢。
+    let _ = ARMED_ITIMERS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+        Some(v.saturating_sub(1))
+    });
 }
 
 #[inline]
@@ -1607,12 +1635,19 @@ impl ProcessControlBlock {
         );
 
         if let Some((new_value_ns, new_interval_ns)) = new_value {
+            let was_armed = timer.deadline_ns != 0;
             timer.interval_ns = new_interval_ns;
             timer.deadline_ns = if new_value_ns == 0 {
                 0
             } else {
                 now_ns.saturating_add(new_value_ns)
             };
+            let now_armed = timer.deadline_ns != 0;
+            if !was_armed && now_armed {
+                itimer_account_arm();
+            } else if was_armed && !now_armed {
+                itimer_account_disarm();
+            }
         }
 
         Ok(old)
@@ -1641,14 +1676,23 @@ impl ProcessControlBlock {
         if inner.itimer_real.deadline_ns != 0 && inner.itimer_real.deadline_ns <= now_realtime_ns {
             pending |= SignalBit::SIGALRM;
             rearm_itimer_after_expire(&mut inner.itimer_real, now_realtime_ns);
+            if inner.itimer_real.deadline_ns == 0 {
+                itimer_account_disarm();
+            }
         }
         if inner.itimer_virtual.deadline_ns != 0 && inner.itimer_virtual.deadline_ns <= user_ns {
             pending |= SignalBit::SIGVTALRM;
             rearm_itimer_after_expire(&mut inner.itimer_virtual, user_ns);
+            if inner.itimer_virtual.deadline_ns == 0 {
+                itimer_account_disarm();
+            }
         }
         if inner.itimer_prof.deadline_ns != 0 && inner.itimer_prof.deadline_ns <= prof_ns {
             pending |= SignalBit::SIGPROF;
             rearm_itimer_after_expire(&mut inner.itimer_prof, prof_ns);
+            if inner.itimer_prof.deadline_ns == 0 {
+                itimer_account_disarm();
+            }
         }
 
         pending

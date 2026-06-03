@@ -408,7 +408,24 @@ pub fn current_add_signal(signal: SignalBit) {
 }
 
 /// 扫描所有进程的 interval timer，到期则投递对应信号。
+///
+/// 该函数运行在时钟中断（硬 IRQ）上下文中。对齐 Linux 的两点做法以避免把
+/// 重活放进每个 hart 的每个 tick：
+///
+/// 1. **无 timer 时不做任何工作**：若系统范围内没有任何已武装的 interval
+///    timer（绝大多数负载，例如 hackbench），直接返回——不取锁、不分配内存。
+///    这消除了此前“每 tick 都在硬中断里持 `PID2PCB` 锁分配一个包含全部进程
+///    的 `Vec`”的反模式，正是该反模式 + 非中断安全的堆锁导致了 SMP 死锁。
+/// 2. **全局周期性工作只在单个 hart 上做**：类似 Linux 的 `tick_do_timer_cpu`，
+///    只让 0 号 hart 执行这次全进程扫描，避免 8 个 hart 在每个 tick 上对
+///    `PID2PCB` 的冗余争用与重复投递。
 pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
+    if process::armed_itimers_count() == 0 {
+        return;
+    }
+    if crate::hart::hartid() != 0 {
+        return;
+    }
     let processes: Vec<Arc<ProcessControlBlock>> = {
         let map = crate::sched::PID2PCB.lock();
         map.values().cloned().collect()
