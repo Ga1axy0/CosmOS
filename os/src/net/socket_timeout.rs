@@ -129,16 +129,11 @@ pub(crate) enum SocketWakeState {
     Canceled,
 }
 
-pub(crate) fn timeout_ns_to_ms(timeout_ns: u64) -> Result<Option<usize>, ERRNO> {
+pub(crate) fn timeout_ns_to_deadline_ns(timeout_ns: u64) -> Result<Option<u64>, ERRNO> {
     if timeout_ns == 0 {
         return Ok(None);
     }
-    let timeout_ms = timeout_ns.div_ceil(1_000_000);
-    let timeout_ms = timeout_ms.max(1);
-    if timeout_ms > (usize::MAX as u64) {
-        return Err(ERRNO::EINVAL);
-    }
-    Ok(Some(timeout_ms as usize))
+    Ok(Some(timeout_ns))
 }
 
 pub(crate) fn register_socket_wait(task: &Arc<TaskControlBlock>) -> Option<SocketWaitHandle> {

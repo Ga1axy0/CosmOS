@@ -26,7 +26,7 @@ use crate::task::{
     current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
 };
-use crate::timer::{check_timer, get_realtime_ns, get_time, set_next_trigger};
+use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
 use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
@@ -273,12 +273,12 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             // trace!("hart {} timer tick", hartid());
-            set_next_trigger();
-            check_timer();
-            let now_raw = get_time();
-            check_itimers_of_all_processes(now_raw, get_realtime_ns());
-            crate::net::poll();
-            on_timer_tick();
+            if handle_timer_interrupt() {
+                let now_raw = get_time();
+                check_itimers_of_all_processes(now_raw, get_realtime_ns());
+                crate::net::poll();
+                on_timer_tick();
+            }
         }
         Trap::Interrupt(Interrupt::SupervisorSoft) => {
             handle_reschedule_ipi();
@@ -356,16 +356,16 @@ pub fn trap_from_kernel() {
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             // trace!("hart {} timer tick", hartid());
-            set_next_trigger();
-            check_timer();
-            let now_raw = get_time();
-            check_itimers_of_all_processes(now_raw, get_realtime_ns());
-            crate::net::poll();
-            // Account CPU time spent while the current task executes in kernel
-            // context as part of its RR quantum as well. This matches Linux's
-            // "running on CPU" notion more closely than charging only
-            // user-mode ticks.
-            on_timer_tick();
+            if handle_timer_interrupt() {
+                let now_raw = get_time();
+                check_itimers_of_all_processes(now_raw, get_realtime_ns());
+                crate::net::poll();
+                // Account CPU time spent while the current task executes in kernel
+                // context as part of its RR quantum as well. This matches Linux's
+                // "running on CPU" notion more closely than charging only
+                // user-mode ticks.
+                on_timer_tick();
+            }
             // crate::net::poll();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => {
