@@ -858,6 +858,10 @@ impl File for OSInode {
         page_cache::truncate_inode(&self.inode, new_size).map_err(ERRNO::from)
     }
 
+    fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), ERRNO> {
+        page_cache::fallocate_inode(&self.inode, mode, offset, len).map_err(ERRNO::from)
+    }
+
     fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
         let vfs_node = self.inode.vfs_node();
         if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {

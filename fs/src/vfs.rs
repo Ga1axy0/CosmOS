@@ -156,6 +156,10 @@ pub trait VfsNode: Send + Sync + Any + Debug {
     fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
+    /// Reserve or deallocate file space without forcing eager data materialisation.
+    fn fallocate(&self, _mode: i32, _offset: usize, _len: usize) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
     /// Stable inode number for stat-like metadata.
@@ -427,6 +431,13 @@ impl Inode {
     /// 调整 inode 对应常规文件的逻辑长度。
     pub fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
         self.inner.truncate(new_size)?;
+        self.invalidate_stat_cache();
+        Ok(())
+    }
+
+    /// Reserve or deallocate file space.
+    pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), FS_ERRNO> {
+        self.inner.fallocate(mode, offset, len)?;
         self.invalidate_stat_cache();
         Ok(())
     }

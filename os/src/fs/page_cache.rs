@@ -148,6 +148,11 @@ impl PageMappingHandle {
         truncate_mapping(&self.inner, new_size);
     }
 
+    /// Reserve file space without forcing eager page creation.
+    pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), FS_ERRNO> {
+        fallocate_mapping(&self.inner, mode, offset, len)
+    }
+
     /// 获取指定文件页号对应的缓存页，供后续 `mmap` 缺页路径复用。
     #[allow(dead_code)]
     pub fn get_page(&self, page_idx: u64) -> Arc<SpinNoIrqLock<CachePage>> {
@@ -277,6 +282,33 @@ pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRN
         return Ok(());
     }
     inode.truncate(new_size)?;
+    Ok(())
+}
+
+/// Reserve file space without forcing eager data allocation, while keeping the
+/// page-cache view of the inode length in sync.
+pub fn fallocate_inode(
+    inode: &Arc<Inode>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), FS_ERRNO> {
+    let new_size = offset.checked_add(len).ok_or(FS_ERRNO::EINVAL)?;
+    debug!(
+        "[page_cache] fallocate inode: fs_id={} ino={} mode={:#x} offset={} len={} old_size={} new_size={}",
+        inode.fs_id(),
+        inode.ino(),
+        mode,
+        offset,
+        len,
+        cached_inode_size(inode),
+        new_size
+    );
+    if let Some(mapping) = mapping_for_inode(inode) {
+        mapping.fallocate(mode, offset, len)?;
+        return Ok(());
+    }
+    inode.fallocate(mode, offset, len)?;
     Ok(())
 }
 
@@ -593,6 +625,53 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
             }
         }
     }
+}
+
+fn fallocate_mapping(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), FS_ERRNO> {
+    if mode != 0 {
+        return Err(FS_ERRNO::EOPNOTSUPP);
+    }
+    let new_size = offset.checked_add(len).ok_or(FS_ERRNO::EINVAL)?;
+    let inode = {
+        let mapping_guard = mapping.lock();
+        mapping_guard
+            .inode
+            .upgrade()
+            .expect("page cache inode disappeared")
+    };
+    let old_size = mapping.lock().size;
+    inode.fallocate(mode, offset, len)?;
+
+    if new_size <= old_size {
+        return Ok(());
+    }
+
+    mapping.lock().size = new_size;
+
+    if old_size > 0 {
+        let old_tail_idx = file_page_index(old_size.saturating_sub(1));
+        let old_tail_valid = page_valid_bytes_for_size(old_size, old_tail_idx);
+        if old_tail_valid < PAGE_SIZE {
+            let tail_page = mapping.lock().pages.get(&old_tail_idx).cloned();
+            if let Some(tail_page) = tail_page {
+                let mut page_guard = tail_page.lock();
+                let new_valid = page_valid_bytes_for_size(new_size, old_tail_idx);
+                if new_valid > old_tail_valid {
+                    let bytes = page_guard.ppn().get_bytes_array();
+                    bytes[old_tail_valid..new_valid].fill(0);
+                    page_guard.valid_bytes = max(page_guard.valid_bytes, new_valid);
+                    page_guard.state.insert(CachePageState::UPTODATE);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// 获取并确保装入某个文件页对应的 cache page。
