@@ -12,8 +12,8 @@ use crate::{
         yield_current_and_run_next, MAX_NICE, MIN_NICE, NICE_0_LOAD,
     },
     task::{
-        current_process, current_task, current_user_token, ReschedReason, SchedPolicy,
-        SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+        current_process, current_task, current_user_token, thread_id2task, ReschedReason,
+        SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
     },
 };
 
@@ -61,6 +61,9 @@ fn task_by_pid_or_local_tid(pid: usize) -> Option<Arc<crate::task::TaskControlBl
             .first()
             .and_then(|task| task.as_ref())
             .cloned();
+    }
+    if let Some(task) = thread_id2task(pid) {
+        return Some(task);
     }
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
