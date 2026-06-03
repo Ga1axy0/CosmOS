@@ -7,7 +7,7 @@ use crate::{
     sched::block_current_and_run_next,
     task::{current_process, current_task, WaitReason},
     timer::{
-        add_timer, get_realtime_ns, get_time, get_time_ms, get_time_ns, get_time_ticks,
+        add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks,
         get_time_us, time_to_ticks,
     },
 };
@@ -132,8 +132,12 @@ fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
 fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC => {
-            let resolution_ns = 1_000_000_000u64.div_ceil(CLOCK_FREQ as u64);
-            Ok(timespec_from_ns(resolution_ns))
+            // Expose the timer ABI as high-resolution so Linux RT userland
+            // enables hrtimer paths such as cyclictest.
+            Ok(Timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            })
         }
         // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
         // CLOCK_REALTIME_COARSE 等其它 clock id。
@@ -357,11 +361,9 @@ pub fn sys_clock_nanosleep(
             return Ok(0);
         }
 
-        let now_ms = get_time_ms();
-        let sleep_ms = sleep_ns.div_ceil(1_000_000) as usize;
-        let expire_ms = now_ms.saturating_add(sleep_ms.max(1));
+        let expire_ns = now_ns.saturating_add(sleep_ns.max(1));
         let task = current_task().unwrap();
-        add_timer(expire_ms, task);
+        add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
 
         if !rem.is_null() {

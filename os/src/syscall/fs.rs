@@ -18,12 +18,11 @@ use crate::task::{
     FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
-use crate::timer::{get_realtime_ns, get_time_us};
+use crate::timer::{add_timer_ns, add_timer_with_poll_tag, get_realtime_ns, get_time_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec::Vec, vec};
 use core::{mem::{offset_of, size_of}, slice};
-use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
 use crate::task::SignalBit;
 use crate::syscall::OldTimespec32;
 
@@ -72,8 +71,8 @@ const POLLNVAL: u16 = 0x020;    // invalid fd
 const SELECT_READ_REVENTS: u16 = POLLIN | POLLERR | POLLHUP;
 const SELECT_WRITE_REVENTS: u16 = POLLOUT | POLLERR | POLLHUP;
 const SELECT_EXCEPT_REVENTS: u16 = POLLPRI;
-/// 事件注册表耗尽时，回退轮询的休眠步长（毫秒）。
-const PPOLL_FALLBACK_POLL_MS: usize = 10;
+/// 事件注册表耗尽时，回退轮询的休眠步长（纳秒）。
+const PPOLL_FALLBACK_POLL_NS: u64 = 10_000_000;
 /// 单次 `ppoll`/`poll` 调用允许的最大 fd 数量上限，用于防止恶意的大规模分配。
 const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
@@ -243,7 +242,7 @@ fn has_unmasked_pending_signal() -> bool {
     false
 }
 
-fn parse_timeout_ms(tmo_p: *const OldTimespec32) -> Result<Option<usize>, ERRNO> {
+fn parse_timeout_ns(tmo_p: *const OldTimespec32) -> Result<Option<u64>, ERRNO> {
     if tmo_p.is_null() {
         return Ok(None);
     }
@@ -251,21 +250,21 @@ fn parse_timeout_ms(tmo_p: *const OldTimespec32) -> Result<Option<usize>, ERRNO>
     if tmo.tv_sec < 0 || tmo.tv_nsec < 0 || tmo.tv_nsec >= 1_000_000_000 {
         return Err(ERRNO::EINVAL);
     }
-    let sec_ms = (tmo.tv_sec as u64)
-        .checked_mul(1_000)
+    let sec_ns = (tmo.tv_sec as u64)
+        .checked_mul(1_000_000_000)
         .ok_or(ERRNO::EINVAL)?;
     let nsec = tmo.tv_nsec as u64;
-    let nsec_ms = nsec / 1_000_000;
-    let timeout_ms = sec_ms
-        .checked_add(nsec_ms)
-        .ok_or(ERRNO::EINVAL)?;
-    Ok(Some(timeout_ms as usize))
+    let timeout_ns = sec_ns.checked_add(nsec).ok_or(ERRNO::EINVAL)?;
+    Ok(Some(timeout_ns))
 }
 
-fn timeout_ms_to_deadline(timeout_ms: Option<usize>) -> Result<Option<usize>, ERRNO> {
-    match timeout_ms {
+fn timeout_ns_to_deadline_ns(timeout_ns: Option<u64>) -> Result<Option<u64>, ERRNO> {
+    match timeout_ns {
         None => Ok(None),
-        Some(ms) => get_time_ms().checked_add(ms).map(Some).ok_or(ERRNO::EINVAL),
+        Some(timeout_ns) => get_time_ns()
+            .checked_add(timeout_ns)
+            .map(Some)
+            .ok_or(ERRNO::EINVAL),
     }
 }
 
@@ -308,7 +307,7 @@ fn restore_temp_signal_mask(old_mask: Option<SignalBit>) {
 fn poll_wait_loop_with_writeback<F>(
     pid: usize,
     pollfds: &mut [PollFd],
-    deadline: Option<usize>,
+    deadline_ns: Option<u64>,
     mut write_back: F,
 ) -> Result<isize, ERRNO>
 where
@@ -325,9 +324,9 @@ where
             return Err(ERRNO::EINTR);
         }
 
-        let now_ms = get_time_ms();
-        if let Some(dl) = deadline {
-            if now_ms >= dl {
+        let now_ns = get_time_ns();
+        if let Some(deadline_ns) = deadline_ns {
+            if now_ns >= deadline_ns {
                 return Ok(0);
             }
         }
@@ -354,21 +353,21 @@ where
             Err(ERRNO::ENOSPC) => {
                 // 回退路径：全局 poll 键/行耗尽时，短周期睡眠后重新扫描 fd 集，
                 // 避免直接失败，同时不引入忙等。
-                let sleep_until = if let Some(dl) = deadline {
-                    let remain = dl.saturating_sub(now_ms);
-                    let step = PPOLL_FALLBACK_POLL_MS.min(remain);
-                    now_ms.saturating_add(step)
+                let sleep_until_ns = if let Some(deadline_ns) = deadline_ns {
+                    let remain_ns = deadline_ns.saturating_sub(now_ns);
+                    let step_ns = PPOLL_FALLBACK_POLL_NS.min(remain_ns);
+                    now_ns.saturating_add(step_ns)
                 } else {
-                    now_ms.saturating_add(PPOLL_FALLBACK_POLL_MS)
+                    now_ns.saturating_add(PPOLL_FALLBACK_POLL_NS)
                 };
-                add_timer(sleep_until, Arc::clone(&task));
+                add_timer_ns(sleep_until_ns, Arc::clone(&task));
                 block_current_and_run_next(WaitReason::Poll);
                 continue;
             }
             Err(e) => return Err(e),
         };
-        if let Some(dl) = deadline {
-            add_timer_with_poll_tag(dl, Arc::clone(&task), Some(handle.timer_tag()));
+        if let Some(deadline_ns) = deadline_ns {
+            add_timer_with_poll_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
         }
         poll::wait_poll_key(handle);
 
@@ -2366,12 +2365,12 @@ pub fn sys_ppoll_time32(
     let token = current_user_token();
     syscall_body!({
         let mut pollfds = copy_user_pollfds(token, ufds, nfds as usize)?;
-        let timeout_ms = parse_timeout_ms(tmo_p)?;
-        let deadline = timeout_ms_to_deadline(timeout_ms)?;
+        let timeout_ns = parse_timeout_ns(tmo_p)?;
+        let deadline_ns = timeout_ns_to_deadline_ns(timeout_ns)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
 
         let old_mask = apply_temp_signal_mask(sigmask, sigsetsize, "sys_ppoll_time32")?;
-        let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline, |polled| {
+        let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline_ns, |polled| {
             write_back_pollfds(ufds, polled)
         });
         restore_temp_signal_mask(old_mask);
@@ -2424,17 +2423,17 @@ pub fn sys_pselect6_time32(
             except_set.as_deref(),
         )?;
         
-        let timeout_ms = parse_timeout_ms(tmo_p)?;
+        let timeout_ns = parse_timeout_ns(tmo_p)?;
         // debug!(
         //     "sys_pselect6_time32: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
         //     nfds, read_set, write_set, except_set, timeout_ms, sigmask
         // );
-        let deadline = timeout_ms_to_deadline(timeout_ms)?;
+        let deadline_ns = timeout_ns_to_deadline_ns(timeout_ns)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
         let (sigmask_ptr, sigsetsize) = parse_pselect_sigmask_arg(sigmask)?;
         let old_mask = apply_temp_signal_mask(sigmask_ptr, sigsetsize, "sys_pselect6_time32")?;
 
-        let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline, |polled| {
+        let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline_ns, |polled| {
             write_back_pselect_fdsets(
                 readfds,
                 writefds,
