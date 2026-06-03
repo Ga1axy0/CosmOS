@@ -57,6 +57,26 @@ bitflags! {
 const MS_ASYNC: i32 = 1;
 const MS_INVALIDATE: i32 = 2;
 const MS_SYNC: i32 = 4;
+
+/// Translate user-visible `PROT_*` bits into internal page permissions.
+///
+/// On RISC-V, a writable leaf PTE must also be readable; `W=1, R=0` is an
+/// invalid encoding and will keep faulting forever. Mirror Linux's effective
+/// behavior here by upgrading `PROT_WRITE` to `R|W` at the PTE level.
+fn prot_to_map_perm(prot: usize) -> MapPermission {
+    let mut perm = MapPermission::U;
+    if prot & MMapProt::PROT_READ.bits() != 0 || prot & MMapProt::PROT_WRITE.bits() != 0 {
+        perm |= MapPermission::R;
+    }
+    if prot & MMapProt::PROT_WRITE.bits() != 0 {
+        perm |= MapPermission::W;
+    }
+    if prot & MMapProt::PROT_EXEC.bits() != 0 {
+        perm |= MapPermission::X;
+    }
+    perm
+}
+
 /// mmap syscall
 pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
     trace!(
@@ -99,16 +119,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             }
         }
 
-        let mut perm = MapPermission::U;
-        if prot & 0x1 != 0 {
-            perm |= MapPermission::R;
-        }
-        if prot & 0x2 != 0 {
-            perm |= MapPermission::W;
-        }
-        if prot & 0x4 != 0 {
-            perm |= MapPermission::X;
-        }
+        let perm = prot_to_map_perm(prot);
 
 
         // if user did not specify addr.
@@ -450,17 +461,7 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
         {
             MapPermission::U
         } else {
-            let mut p = MapPermission::U;
-            if prot & MMapProt::PROT_READ.bits() != 0 {
-                p |= MapPermission::R;
-            }
-            if prot & MMapProt::PROT_WRITE.bits() != 0 {
-                p |= MapPermission::W;
-            }
-            if prot & MMapProt::PROT_EXEC.bits() != 0 {
-                p |= MapPermission::X;
-            }
-            p
+            prot_to_map_perm(prot)
         };
 
         if mprotect_current_process(VirtAddr::from(start), VirtAddr::from(end), perm) {

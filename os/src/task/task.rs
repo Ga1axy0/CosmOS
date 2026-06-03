@@ -32,6 +32,8 @@ pub struct TaskSchedState {
     pub on_rq: bool,
     /// Current scheduling policy.
     pub policy: SchedPolicy,
+    /// User-visible Linux scheduling policy value.
+    pub linux_policy: i32,
     /// Real-time priority. Larger value means higher priority.
     pub rt_priority: u8,
     /// Configured round-robin time slice, in timer ticks.
@@ -42,6 +44,18 @@ pub struct TaskSchedState {
     pub nice: i32,
     /// CFS load weight derived from nice.
     pub weight: u64,
+    /// Raw Linux `sched_attr.sched_flags`.
+    pub sched_flags: u64,
+    /// Linux `sched_attr.sched_runtime` for `SCHED_DEADLINE`.
+    pub sched_runtime: u64,
+    /// Linux `sched_attr.sched_deadline` for `SCHED_DEADLINE`.
+    pub sched_deadline: u64,
+    /// Linux `sched_attr.sched_period` for `SCHED_DEADLINE`.
+    pub sched_period: u64,
+    /// Linux util clamp minimum hint.
+    pub sched_util_min: u32,
+    /// Linux util clamp maximum hint.
+    pub sched_util_max: u32,
     /// Virtual runtime used as the CFS ordering key, in nanoseconds.
     pub vruntime_ns: u64,
     /// Last timestamp at which execution accounting was started, in nanoseconds.
@@ -70,11 +84,18 @@ impl TaskSchedState {
             on_cpu: false,
             on_rq: false,
             policy: sched_attr.policy,
+            linux_policy: sched_attr.linux_policy,
             rt_priority: sched_attr.rt_priority,
             time_slice_ticks: sched_attr.time_slice_ticks,
             remaining_slice_ticks: sched_attr.time_slice_ticks,
             nice: sched_attr.nice,
             weight: sched_attr.weight,
+            sched_flags: sched_attr.sched_flags,
+            sched_runtime: sched_attr.sched_runtime,
+            sched_deadline: sched_attr.sched_deadline,
+            sched_period: sched_attr.sched_period,
+            sched_util_min: sched_attr.sched_util_min,
+            sched_util_max: sched_attr.sched_util_max,
             vruntime_ns: 0,
             exec_start_ns: 0,
             sum_exec_runtime_ns: 0,
@@ -91,10 +112,17 @@ impl TaskSchedState {
     pub fn sched_attr(&self) -> SchedAttr {
         SchedAttr {
             policy: self.policy,
+            linux_policy: self.linux_policy,
             rt_priority: self.rt_priority,
             time_slice_ticks: self.time_slice_ticks,
             nice: self.nice,
             weight: self.weight,
+            sched_flags: self.sched_flags,
+            sched_runtime: self.sched_runtime,
+            sched_deadline: self.sched_deadline,
+            sched_period: self.sched_period,
+            sched_util_min: self.sched_util_min,
+            sched_util_max: self.sched_util_max,
         }
     }
 

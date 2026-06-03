@@ -281,7 +281,9 @@ pub(crate) fn has_unmasked_pending_signal() -> bool {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
-    !((task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask).is_empty()
+    !((task_inner.pending_signals | process_inner.pending_signals)
+        & !task_inner.signal_mask.without_unblockable())
+        .is_empty()
 }
 
 pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<(i32, SigInfo)> {

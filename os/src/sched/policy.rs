@@ -85,6 +85,8 @@ pub enum ReschedReason {
 pub struct SchedAttr {
     /// Scheduling policy.
     pub policy: SchedPolicy,
+    /// User-visible Linux scheduling policy value returned by `sched_get*()`.
+    pub linux_policy: i32,
     /// Real-time priority in the range `1..=99`.
     pub rt_priority: u8,
     /// Round-robin time slice length in timer ticks.
@@ -93,6 +95,18 @@ pub struct SchedAttr {
     pub nice: i32,
     /// CFS load weight derived from nice.
     pub weight: u64,
+    /// Raw Linux `sched_attr.sched_flags`.
+    pub sched_flags: u64,
+    /// Linux `sched_attr.sched_runtime` for `SCHED_DEADLINE`.
+    pub sched_runtime: u64,
+    /// Linux `sched_attr.sched_deadline` for `SCHED_DEADLINE`.
+    pub sched_deadline: u64,
+    /// Linux `sched_attr.sched_period` for `SCHED_DEADLINE`.
+    pub sched_period: u64,
+    /// Linux util clamp minimum hint.
+    pub sched_util_min: u32,
+    /// Linux util clamp maximum hint.
+    pub sched_util_max: u32,
 }
 
 impl SchedAttr {
@@ -100,10 +114,17 @@ impl SchedAttr {
     pub const fn other(nice: i32) -> Self {
         Self {
             policy: SchedPolicy::Other,
+            linux_policy: SchedPolicy::Other as i32,
             rt_priority: 0,
             time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
             nice: clamp_nice(nice),
             weight: nice_to_weight(nice),
+            sched_flags: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
         }
     }
 
@@ -111,10 +132,17 @@ impl SchedAttr {
     pub const fn rr(rt_priority: u8) -> Self {
         Self {
             policy: SchedPolicy::Rr,
+            linux_policy: SchedPolicy::Rr as i32,
             rt_priority,
             time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
             nice: 0,
             weight: NICE_0_LOAD,
+            sched_flags: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
         }
     }
 
@@ -122,10 +150,17 @@ impl SchedAttr {
     pub const fn fifo(rt_priority: u8) -> Self {
         Self {
             policy: SchedPolicy::Fifo,
+            linux_policy: SchedPolicy::Fifo as i32,
             rt_priority,
             time_slice_ticks: DEFAULT_TIME_SLICE_TICKS,
             nice: 0,
             weight: NICE_0_LOAD,
+            sched_flags: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
         }
     }
 }
