@@ -95,7 +95,7 @@ fn prefault_user_pages(
                     continue;
                 }
                 if process
-                    .handle_lazy_heap_fault(page_start, access)
+                    .handle_lazy_user_fault(page_start, access)
                     .map_err(|err| match err {
                         MmError::OutOfMemory => ERRNO::ENOMEM,
                         _ => ERRNO::EFAULT,

@@ -223,11 +223,11 @@ pub fn trap_handler() -> ! {
                 Err(_) => {}
             }
             if !handled {
-                match process.handle_lazy_heap_fault(stval, PageFaultAccess::Write) {
+                match process.handle_lazy_user_fault(stval, PageFaultAccess::Write) {
                     Ok(PageFaultHandled::Handled) => handled = true,
                     Ok(PageFaultHandled::NotHandled) => {}
                     Err(MmError::OutOfMemory) => {
-                        log_lazy_fault_oom("lazy_heap", "write", stval);
+                        log_lazy_fault_oom("lazy_user", "write", stval);
                         current_add_signal(SignalBit::SIGKILL);
                         handled = true;
                     }
@@ -276,11 +276,11 @@ pub fn trap_handler() -> ! {
             //     current_trap_cx().sepc
             // );
             let mut handled = false;
-            match current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Read) {
+            match current_process().handle_lazy_user_fault(stval, PageFaultAccess::Read) {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
-                    log_lazy_fault_oom("lazy_heap", "read", stval);
+                    log_lazy_fault_oom("lazy_user", "read", stval);
                     current_add_signal(SignalBit::SIGKILL);
                     handled = true;
                 }
@@ -314,23 +314,36 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            match current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
-                Ok(PageFaultHandled::Handled) => {}
-                Ok(PageFaultHandled::NotHandled) => {
-                    log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
-                    current_add_signal(SignalBit::SIGSEGV);
-                }
-                Err(MmError::BeyondFileEnd) => {
-                    log_user_fault("instruction page fault beyond file EOF", "exec", stval, "SIGBUS");
-                    current_add_signal(SignalBit::SIGBUS);
-                }
+            let mut handled = false;
+            match current_process().handle_lazy_user_fault(stval, PageFaultAccess::Exec) {
+                Ok(PageFaultHandled::Handled) => handled = true,
+                Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
-                    log_lazy_fault_oom("file_mmap", "exec", stval);
+                    log_lazy_fault_oom("lazy_user", "exec", stval);
                     current_add_signal(SignalBit::SIGKILL);
+                    handled = true;
                 }
-                Err(_) => {
-                    log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
-                    current_add_signal(SignalBit::SIGSEGV);
+                Err(_) => {}
+            }
+            if !handled {
+                match current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
+                    Ok(PageFaultHandled::Handled) => {}
+                    Ok(PageFaultHandled::NotHandled) => {
+                        log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
+                        current_add_signal(SignalBit::SIGSEGV);
+                    }
+                    Err(MmError::BeyondFileEnd) => {
+                        log_user_fault("instruction page fault beyond file EOF", "exec", stval, "SIGBUS");
+                        current_add_signal(SignalBit::SIGBUS);
+                    }
+                    Err(MmError::OutOfMemory) => {
+                        log_lazy_fault_oom("file_mmap", "exec", stval);
+                        current_add_signal(SignalBit::SIGKILL);
+                    }
+                    Err(_) => {
+                        log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
+                        current_add_signal(SignalBit::SIGSEGV);
+                    }
                 }
             }
         }

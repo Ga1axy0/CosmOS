@@ -1297,8 +1297,8 @@ impl ProcessControlBlock {
         }
         Ok(handled)
     }
-    /// 处理当前进程的 heap 懒分配缺页。
-    pub fn handle_lazy_heap_fault(
+    /// 处理当前进程的用户匿名/heap/user stack 懒分配缺页。
+    pub fn handle_lazy_user_fault(
         &self,
         fault_addr: usize,
         access: PageFaultAccess,
@@ -1306,7 +1306,7 @@ impl ProcessControlBlock {
         self.inner
             .lock()
             .memory_set
-            .handle_lazy_heap_fault(VirtAddr::from(fault_addr), access)
+            .handle_lazy_user_fault(VirtAddr::from(fault_addr), access)
     }
     /// 处理当前进程的 file-backed 缺页。
     pub fn handle_file_page_fault(
