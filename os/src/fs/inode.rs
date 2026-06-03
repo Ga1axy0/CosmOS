@@ -1,5 +1,5 @@
 use super::{page_cache, File, Stat, StatFs64, StatMode};
-use super::devfs::{NullDevNode, UrandomDevNode};
+use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
@@ -1028,6 +1028,10 @@ pub fn init_dev() {
     let null_node = Arc::new(NullDevNode::new());
     dev_dir.bind("null", null_node as Arc<dyn VfsNode>);
     info!("[kernel] /dev/null registered");
+
+    let cpu_dma_latency_node = Arc::new(CpuDmaLatencyNode::new());
+    dev_dir.bind("cpu_dma_latency", cpu_dma_latency_node as Arc<dyn VfsNode>);
+    info!("[kernel] /dev/cpu_dma_latency registered");
 
     // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
