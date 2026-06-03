@@ -3,7 +3,7 @@ use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
 use crate::task::{current_process, current_task, WaitReason};
-use crate::timer::{add_timer, get_time_ms};
+use crate::timer::{add_timer_ns, get_time_ns};
 use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
 
@@ -169,8 +169,7 @@ pub fn sys_futex(
     })
 }
 
-/// sleep syscall
-/// Though the syscall is named `nanosleep`, it actually takes milliseconds as input for simplicity.
+/// Linux-compatible relative `nanosleep(2)` syscall.
 pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
     trace!(
         "kernel:pid[{}] tid[{}] sys_nanosleep",
@@ -187,15 +186,18 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
     syscall_body!({
         let _ = rem;
         let timespec = read_pod_from_user(req)?;
-        let current_time = get_time_ms();
-        let expire_ms = current_time + timespec.tv_sec * 1_000 + timespec.tv_nsec / 1_000_000;
+        let current_time = get_time_ns();
+        let sleep_ns = (timespec.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(timespec.tv_nsec as u64);
+        let expire_ns = current_time.saturating_add(sleep_ns.max(1));
         debug!(
-            "nanosleep: current_time = {}, expire_time = {}",
+            "nanosleep: current_time_ns = {}, expire_time_ns = {}",
             current_time,
-            expire_ms,
+            expire_ns,
         );
         let task = current_task().unwrap();
-        add_timer(expire_ms, task);
+        add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
         Ok(0)
     })

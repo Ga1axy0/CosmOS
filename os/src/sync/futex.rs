@@ -2,7 +2,7 @@ use crate::sync::SpinNoIrqLock;
 use crate::{
     syscall::{read_pod_from_user, errno::ERRNO, Timespec},
     task::{current_task, wakeup_task, TaskControlBlock, WaitQueue, WaitReason},
-    timer::{add_timer_with_futex_tag, get_time_ms},
+    timer::{add_timer_with_futex_tag, get_time_ns},
 };
 use alloc::sync::Arc;
 use hashbrown::HashMap;
@@ -134,7 +134,7 @@ pub fn futex_queue(uaddr: usize) -> Arc<WaitQueue> {
         .clone()
 }
 
-fn futex_timeout_ms(timeout: *const Timespec) -> Result<Option<usize>, ERRNO> {
+fn futex_timeout_ns(timeout: *const Timespec) -> Result<Option<u64>, ERRNO> {
     if timeout.is_null() {
         return Ok(None);
     }
@@ -142,10 +142,13 @@ fn futex_timeout_ms(timeout: *const Timespec) -> Result<Option<usize>, ERRNO> {
     if timeout.tv_nsec >= 1_000_000_000 {
         return Err(ERRNO::EINVAL);
     }
-    let sec_ms = timeout.tv_sec.checked_mul(1_000).ok_or(ERRNO::EINVAL)?;
-    let nsec_ms = timeout.tv_nsec.div_ceil(1_000_000);
-    let timeout_ms = sec_ms.checked_add(nsec_ms).ok_or(ERRNO::EINVAL)?;
-    Ok(Some(timeout_ms))
+    let sec_ns = (timeout.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .ok_or(ERRNO::EINVAL)?;
+    let timeout_ns = sec_ns
+        .checked_add(timeout.tv_nsec as u64)
+        .ok_or(ERRNO::EINVAL)?;
+    Ok(Some(timeout_ns))
 }
 
 fn register_futex_wait(task: &Arc<TaskControlBlock>) -> Option<FutexWaitHandle> {
@@ -263,22 +266,24 @@ pub fn futex_wait_addr(
         return Err(ERRNO::EAGAIN);
     }
 
-    let timeout_ms = match timeout {
-        Some(timeout) => futex_timeout_ms(timeout)?,
+    let timeout_ns = match timeout {
+        Some(timeout) => futex_timeout_ns(timeout)?,
         None => None,
     };
-    if matches!(timeout_ms, Some(0)) {
+    if matches!(timeout_ns, Some(0)) {
         return Err(ERRNO::ETIMEDOUT);
     }
 
     let queue = futex_queue(uaddr as usize);
     let task = current_task().unwrap();
-    let handle = timeout_ms
+    let handle = timeout_ns
         .map(|_| register_futex_wait(&task).ok_or(ERRNO::EAGAIN))
         .transpose()?;
-    if let (Some(timeout_ms), Some(handle)) = (timeout_ms, handle) {
-        let deadline = get_time_ms().checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
-        add_timer_with_futex_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+    if let (Some(timeout_ns), Some(handle)) = (timeout_ns, handle) {
+        let deadline_ns = get_time_ns()
+            .checked_add(timeout_ns)
+            .ok_or(ERRNO::EINVAL)?;
+        add_timer_with_futex_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
     }
     queue.wait_with_reason_or_skip(WaitReason::Futex, || {
         read_pod_from_user(uaddr)
