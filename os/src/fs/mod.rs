@@ -166,7 +166,11 @@ impl FileDescription {
             inner.offset += read_size;
             return Ok(read_size);
         }
-        // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
+        if self.status_flags().contains(FileStatusFlags::NONBLOCK) {
+            if let Some(pipe) = self.as_any().downcast_ref::<pipe::Pipe>() {
+                return pipe.read_nonblocking(buf);
+            }
+        }
         self.file.read_at_result(0, buf)
     }
 
@@ -187,7 +191,11 @@ impl FileDescription {
             inner.offset += write_size;
             return Ok(write_size);
         }
-        // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
+        if self.status_flags().contains(FileStatusFlags::NONBLOCK) {
+            if let Some(pipe) = self.as_any().downcast_ref::<pipe::Pipe>() {
+                return pipe.write_nonblocking(buf);
+            }
+        }
         self.file.write_at_result(0, buf)
     }
 

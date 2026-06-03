@@ -708,7 +708,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CONDVAR_CREATE => sys_condvar_create(),
         SYSCALL_CONDVAR_SIGNAL => sys_condvar_signal(args[0]),
         SYSCALL_CONDVAR_WAIT => sys_condvar_wait(args[0], args[1]),
-        SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
+        SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as u32),
         SYSCALL_TKILL => sys_tkill(args[0], args[1] as u32),
         SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as u32),
         _ => sys_nisyscall(syscall_id, args),

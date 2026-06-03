@@ -42,6 +42,68 @@ impl Pipe {
     pub fn write_peer_closed(&self) -> bool {
         self.writable && self.buffer.lock().all_read_ends_closed()
     }
+
+    /// Perform one non-blocking read from the pipe.
+    pub fn read_nonblocking(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
+        assert!(self.readable());
+        let want_to_read = buf.len();
+        let mut buf_iter = buf.into_iter();
+        let mut ring_buffer = self.buffer.lock();
+        let loop_read = ring_buffer.available_read();
+        if loop_read == 0 {
+            if ring_buffer.all_write_ends_closed() {
+                return Ok(0);
+            }
+            return Err(ERRNO::EAGAIN);
+        }
+        let mut already_read = 0usize;
+        for _ in 0..loop_read {
+            if let Some(byte_ref) = buf_iter.next() {
+                unsafe {
+                    *byte_ref = ring_buffer.read_byte();
+                }
+                already_read += 1;
+                if already_read == want_to_read {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        ring_buffer.write_wait_queue.wake_one();
+        notify_poll_source(self.source_id(), POLLOUT);
+        Ok(already_read)
+    }
+
+    /// Perform one non-blocking write to the pipe.
+    pub fn write_nonblocking(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
+        assert!(self.writable());
+        let want_to_write = buf.len();
+        let mut buf_iter = buf.into_iter();
+        let mut ring_buffer = self.buffer.lock();
+        if ring_buffer.all_read_ends_closed() {
+            return Ok(0);
+        }
+        let loop_write = ring_buffer.available_write();
+        if loop_write == 0 {
+            return Err(ERRNO::EAGAIN);
+        }
+        let mut already_write = 0usize;
+        for _ in 0..loop_write {
+            if let Some(byte_ref) = buf_iter.next() {
+                ring_buffer.write_byte(unsafe { *byte_ref });
+                already_write += 1;
+                if already_write == want_to_write {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        ring_buffer.read_wait_queue.wake_one();
+        notify_poll_source(self.source_id(), POLLIN);
+        Ok(already_write)
+    }
 }
 
 const RING_BUFFER_SIZE: usize = 1024;
