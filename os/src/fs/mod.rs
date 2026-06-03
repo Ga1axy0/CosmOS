@@ -235,6 +235,11 @@ impl FileDescription {
         self.file.truncate(new_size)
     }
 
+    /// Reserve or deallocate file space on the underlying object.
+    pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), ERRNO> {
+        self.file.fallocate(mode, offset, len)
+    }
+
     /// 获取当前 `F_GETFL` 可见状态值。
     pub fn status_bits(&self) -> i32 {
         let inner = self.inner.lock();
@@ -405,6 +410,10 @@ pub trait File: Send + Sync + Any {
     }
     /// 调整文件逻辑长度。
     fn truncate(&self, _new_size: usize) -> Result<(), ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
+    }
+    /// Reserve or deallocate file space without forcing eager allocation.
+    fn fallocate(&self, _mode: i32, _offset: usize, _len: usize) -> Result<(), ERRNO> {
         Err(ERRNO::EOPNOTSUPP)
     }
     /// Query readiness for a subset of poll events.
