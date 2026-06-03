@@ -177,6 +177,23 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         Ok(())
     }
+    /// Ensure the level-1 (1GiB-granularity) intermediate table covering `vpn`
+    /// exists, creating it untracked if necessary, and return its physical page
+    /// number.
+    ///
+    /// Used to pre-build the kernel-heap window's level-1 table once at boot so
+    /// that subsequent heap growth can install leaf PTEs into a disjoint subtree
+    /// without re-walking (and re-locking) the global kernel page table.
+    pub fn ensure_l1_table_untracked(&mut self, vpn: VirtPageNum) -> PhysPageNum {
+        let idxs = vpn.indexes();
+        let pte = &mut self.root_ppn.get_pte_array()[idxs[0]];
+        if !pte.is_valid() {
+            let frame = frame_alloc().unwrap();
+            *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+            core::mem::forget(frame);
+        }
+        pte.ppn()
+    }
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
