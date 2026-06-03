@@ -1,6 +1,6 @@
 use crate::{
     config::{PAGE_SIZE, PAGE_SIZE_BITS},
-    mm::{MapPermission, VirtAddr},
+    mm::{MapPermission, USER_SPACE_END, VirtAddr},
     syscall::errno::ERRNO,
     syscall::{write_bytes_to_user, write_pod_to_user},
     syscall_body,
@@ -85,7 +85,6 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         if len == 0 {
             return Err(ERRNO::EINVAL);
         }
-        let end = addr.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
         let native_compat = flags == 0 && fd == 0 && offset == 0;
         if !native_compat {
             if offset & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
@@ -118,6 +117,10 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             .checked_add(PAGE_SIZE - 1)
             .ok_or(ERRNO::EOVERFLOW)?
             & !(PAGE_SIZE - 1);
+        let end = addr.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
+        if addr != 0 && (addr >= USER_SPACE_END || end > USER_SPACE_END) {
+            return Err(ERRNO::ENOMEM);
+        }
         let process = current_process();
         let native_compat = flags == 0 && fd == 0 && offset == 0;
         let mut file_desc = None;

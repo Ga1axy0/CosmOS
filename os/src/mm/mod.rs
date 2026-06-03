@@ -43,7 +43,7 @@ pub enum PageFaultHandled {
     NotHandled,
 }
 
-pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+pub use address::{PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END, VirtAddr, VirtPageNum};
 pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_allocator_stats, frame_dealloc,
     frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,

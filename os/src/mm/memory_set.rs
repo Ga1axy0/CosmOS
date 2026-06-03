@@ -3,11 +3,11 @@
 use super::{frame_alloc, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
 use super::page_table::PTEFlags;
 use super::{PageTable, PageTableEntry};
-use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
+use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_MMAP_BASE, USER_STACK_BASE,
-    USER_STACK_SIZE, USER_VDSO_BASE,
+    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
+    USER_VDSO_BASE,
 };
 use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
@@ -560,7 +560,7 @@ impl MemorySet {
     }
     /// Find a free user mmap range using a hint first, then wrap to the base.
     pub fn find_free_mmap_area(&self, hint: usize, base: usize, len: usize) -> Option<usize> {
-        let upper = TRAP_CONTEXT_BASE;
+        let upper = USER_SPACE_END;
         let start = align_up(hint.max(base), PAGE_SIZE)?;
         self.find_free_area_in_range(start, upper, len)
             .or_else(|| {
@@ -1123,12 +1123,12 @@ impl MemorySet {
         permission: MapPermission,
     ) -> Result<(), MmError> {
         debug!(
-            "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} eager=true",
+            "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} eager=false",
             usize::from(start_va),
             usize::from(end_va),
             permission
         );
-        self.insert_vma(Vma::new_anonymous(start_va, end_va, permission), None)?;
+        self.register_vma_metadata(Vma::new_anonymous(start_va, end_va, permission))?;
         unsafe {
             asm!("sfence.vma");
         }
@@ -1341,8 +1341,8 @@ impl MemorySet {
         Ok(())
     }
 
-    /// 在 heap VMA 内按需分配并映射一个私有页。
-    pub fn handle_lazy_heap_fault(
+    /// 在用户匿名/heap/user stack VMA 内按需分配并映射一个私有页。
+    pub fn handle_lazy_user_fault(
         &mut self,
         fault_va: VirtAddr,
         access: PageFaultAccess,
@@ -1354,8 +1354,7 @@ impl MemorySet {
         let Some(area) = self.find_vma_containing(vpn) else {
             return Ok(PageFaultHandled::NotHandled);
         };
-        if (!area.is_heap() && !area.is_user_stack())
-            || !area.is_user_accessible()
+        if !area.supports_lazy_user_fault()
             || !area.allows_fault_access(access)
         {
             return Ok(PageFaultHandled::NotHandled);
@@ -2177,9 +2176,18 @@ impl Vma {
             PageFaultAccess::Exec => self.map_perm.contains(MapPermission::X),
         }
     }
+    /// 判断当前区域是否适合通过用户态懒缺页来物化私有页。
+    pub fn supports_lazy_user_fault(&self) -> bool {
+        self.map_type == MapType::Framed
+            && self.is_user_accessible()
+            && matches!(
+                self.kind,
+                VmaKind::Anonymous | VmaKind::Heap | VmaKind::UserStack { .. }
+            )
+    }
     /// 判断当前区域是否需要在建 VMA 时立即分配并建立页表映射。
     pub fn should_eager_map(&self) -> bool {
-        self.file.is_none() && !matches!(self.kind, VmaKind::UserStack { .. })
+        self.file.is_none() && !self.supports_lazy_user_fault()
     }
     /// 计算某个虚拟页在底层文件中的页号。
     pub fn file_page_index(&self, vpn: VirtPageNum) -> Option<u64> {
@@ -2335,8 +2343,16 @@ impl Vma {
     }
     /// 为当前区域覆盖的全部虚拟页建立映射。
     pub fn map(&mut self, page_table: &mut PageTable) -> Result<(), MmError> {
-        for vpn in self.vpn_range {
-            self.map_one(page_table, vpn)?;
+        let start = self.vpn_range.get_start();
+        let mut current = start;
+        while current < self.vpn_range.get_end() {
+            if let Err(err) = self.map_one(page_table, current) {
+                for rollback_vpn in VPNRange::new(start, current) {
+                    self.unmap_present_one(page_table, rollback_vpn);
+                }
+                return Err(err);
+            }
+            current.step();
         }
         Ok(())
     }

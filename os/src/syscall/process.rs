@@ -1,4 +1,4 @@
-use crate::mm::{MapPermission, VirtAddr};
+use crate::mm::{MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
@@ -252,12 +252,12 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
             let seg = segment.lock();
             (seg.size, Arc::clone(&seg.desc))
         };
+        let len_aligned = size
+            .checked_add(crate::config::PAGE_SIZE - 1)
+            .ok_or(ERRNO::EOVERFLOW)?
+            & !(crate::config::PAGE_SIZE - 1);
         let process = current_process();
         let map_addr = if shmaddr == 0 {
-            let len_aligned = size
-                .checked_add(crate::config::PAGE_SIZE - 1)
-                .ok_or(ERRNO::EOVERFLOW)?
-                & !(crate::config::PAGE_SIZE - 1);
             let (chosen, chosen_end) = {
                 let mut inner = process.inner_exclusive_access();
                 inner.ensure_address_space_capacity(len_aligned)?;
@@ -290,9 +290,14 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
                 ipc::detach_segment(shmid);
                 return Err(ERRNO::EINVAL);
             }
+            let end = shmaddr.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
+            if shmaddr >= USER_SPACE_END || end > USER_SPACE_END {
+                ipc::detach_segment(shmid);
+                return Err(ERRNO::ENOMEM);
+            }
             let ok = process.mmap_file(
                 VirtAddr::from(shmaddr),
-                VirtAddr::from(shmaddr.checked_add(size).ok_or(ERRNO::EOVERFLOW)?),
+                VirtAddr::from(end),
                 MapPermission::R | MapPermission::W | MapPermission::U,
                 desc,
                 0,
