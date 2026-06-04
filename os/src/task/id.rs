@@ -49,8 +49,19 @@ impl RecycleAllocator {
 }
 
 lazy_static! {
-    /// Glocal allocator for pid
-    static ref PID_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
+    /// Global allocator for pid.
+    ///
+    /// pid 0 is reserved for the kernel idle/swapper context and is never handed
+    /// to a userspace process, so the first process (init) is pid 1 — matching
+    /// Linux. This matters because a process's `pgid`/`sid` default to its own
+    /// pid, and a `pgid`/`sid` of 0 is invalid in POSIX (it breaks tty job
+    /// control, e.g. busybox's `while (tcgetpgrp(fd) != getpgrp()) ...` loop).
+    static ref PID_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = {
+        let mut allocator = RecycleAllocator::new();
+        let reserved = allocator.alloc(); // burn pid 0
+        debug_assert_eq!(reserved, 0);
+        SpinNoIrqLock::new(allocator)
+    };
     /// Global allocator for kernel stack
     static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
 }
@@ -60,8 +71,10 @@ const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 128;
 /// deferred 物理页超过该水位时触发一次全局 flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
 
-/// The idle task's pid is 0
-pub const IDLE_PID: usize = 0;
+/// `pid` 0 is reserved for the kernel idle/swapper context, so the init
+/// process runs as `pid` 1 (Linux-style). The kernel shuts down when the
+/// process with this pid exits.
+pub const IDLE_PID: usize = 1;
 
 /// A handle to a pid
 pub struct PidHandle(pub usize);

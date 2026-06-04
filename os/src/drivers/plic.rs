@@ -154,6 +154,9 @@ pub fn handle_supervisor_external_hart(hart_id: usize) {
     match irq {
         UART0_IRQ => {
             UART.handle_irq();
+            // 把刚到达的输入立刻喂入控制台行规程：这样即便当前没有进程在 read，
+            // Ctrl+C 等信号字符也能在到达瞬间生成信号投递给前台进程组。
+            crate::fs::console_receive();
         }
         irq if (VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT))
             .contains(&irq) =>
