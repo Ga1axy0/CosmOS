@@ -212,6 +212,9 @@ impl File for Pipe {
         self.writable
     }
     fn read_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.read_at_result(0, buf).unwrap_or(0)
+    }
+    fn read_at_result(&self, _offset: usize, buf: UserBuffer) -> Result<usize, ERRNO> {
         trace!("kernel: Pipe::read");
         assert!(self.readable());
         let want_to_read = buf.len();
@@ -224,10 +227,10 @@ impl File for Pipe {
             if loop_read == 0 {
                 // 只要本次调用已经读到数据，就立即短读返回，避免阻塞等待凑满用户缓冲区。
                 if already_read > 0 {
-                    return already_read;
+                    return Ok(already_read);
                 }
                 if ring_buffer.all_write_ends_closed() {
-                    return already_read;
+                    return Ok(already_read);
                 }
                 let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
                 drop(ring_buffer);
@@ -235,6 +238,13 @@ impl File for Pipe {
                     let ring_buffer = self.buffer.lock();
                     ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
                 });
+                if crate::signal::has_unmasked_pending_signal() {
+                    return if already_read > 0 {
+                        Ok(already_read)
+                    } else {
+                        Err(ERRNO::EINTR)
+                    };
+                }
                 continue;
             }
             for _ in 0..loop_read {
@@ -246,12 +256,12 @@ impl File for Pipe {
                     if already_read == want_to_read {
                         ring_buffer.write_wait_queue.wake_one();
                         notify_poll_source(self.source_id(), POLLOUT);
-                        return want_to_read;
+                        return Ok(want_to_read);
                     }
                 } else {
                     ring_buffer.write_wait_queue.wake_one();
                     notify_poll_source(self.source_id(), POLLOUT);
-                    return already_read;
+                    return Ok(already_read);
                 }
             }
             ring_buffer.write_wait_queue.wake_one();
@@ -279,6 +289,13 @@ impl File for Pipe {
                     let ring_buffer = self.buffer.lock();
                     ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
                 });
+                if crate::signal::has_unmasked_pending_signal() {
+                    return if already_read > 0 {
+                        Ok(already_read)
+                    } else {
+                        Err(ERRNO::EINTR)
+                    };
+                }
                 continue;
             }
             for _ in 0..loop_read {
@@ -295,6 +312,9 @@ impl File for Pipe {
         }
     }
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.write_at_result(0, buf).unwrap_or(0)
+    }
+    fn write_at_result(&self, _offset: usize, buf: UserBuffer) -> Result<usize, ERRNO> {
         trace!("kernel: Pipe::write");
         assert!(self.writable());
         let want_to_write = buf.len();
@@ -303,7 +323,7 @@ impl File for Pipe {
         loop {
             let mut ring_buffer = self.buffer.lock();
             if ring_buffer.all_read_ends_closed() {
-                return already_write;
+                return Ok(already_write);
             }
             let loop_write = ring_buffer.available_write();
             // debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
@@ -314,6 +334,13 @@ impl File for Pipe {
                     let ring_buffer = self.buffer.lock();
                     ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
                 });
+                if crate::signal::has_unmasked_pending_signal() {
+                    return if already_write > 0 {
+                        Ok(already_write)
+                    } else {
+                        Err(ERRNO::EINTR)
+                    };
+                }
                 continue;
             }
             // write at most loop_write bytes
@@ -324,12 +351,12 @@ impl File for Pipe {
                     if already_write == want_to_write {
                         ring_buffer.read_wait_queue.wake_one();
                         notify_poll_source(self.source_id(), POLLIN);
-                        return want_to_write;
+                        return Ok(want_to_write);
                     }
                 } else {
                     ring_buffer.read_wait_queue.wake_one();
                     notify_poll_source(self.source_id(), POLLIN);
-                    return already_write;
+                    return Ok(already_write);
                 }
             }
             ring_buffer.read_wait_queue.wake_one();
@@ -348,8 +375,16 @@ impl File for Pipe {
                 let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);
                 write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
-                    self.buffer.lock().available_write() > 0
+                    let ring_buffer = self.buffer.lock();
+                    ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
                 });
+                if crate::signal::has_unmasked_pending_signal() {
+                    return if already_write > 0 {
+                        Ok(already_write)
+                    } else {
+                        Err(ERRNO::EINTR)
+                    };
+                }
                 continue;
             }
             for _ in 0..loop_write {

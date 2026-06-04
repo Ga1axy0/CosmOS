@@ -74,8 +74,16 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     let process = task.process.upgrade().unwrap();
     process.pause_cpu_accounting(get_time());
     let mut task_inner = task.inner_exclusive_access();
-    let tid = task_inner.res.as_ref().unwrap().tid;
-    let thread_id = task_inner.res.as_ref().unwrap().thread_id();
+    let (tid, thread_id) = match task_inner.res.as_ref() {
+        Some(res) => (Some(res.tid), Some(res.thread_id())),
+        None => {
+            warn!(
+                "exit_current_and_run_next: pid={} entered exit path after task user resources were reclaimed",
+                process.getpid()
+            );
+            (None, None)
+        }
+    };
     let clear_child_tid = task_inner.clear_child_tid;
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
@@ -91,8 +99,8 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         debug!(
             "exit_current_and_run_next: pid={} tid={} thread_id={} clear_child_tid={:#x}",
             process.getpid(),
-            tid,
-            thread_id,
+            tid.unwrap_or(usize::MAX),
+            thread_id.unwrap_or(usize::MAX),
             clear_child_tid
         );
         match write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32) {
@@ -122,17 +130,19 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     cleanup_signal_wait_for_task(&task);
     cleanup_futex_wait_for_task(&task);
     remove_timer(Arc::clone(&task));
-    remove_from_tid2task(thread_id);
+    if let Some(thread_id) = thread_id {
+        remove_from_tid2task(thread_id);
+    }
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
-    if tid == 0 {
+    if tid == Some(0) {
         add_stopping_task(task);
     } else {
         drop(task);
     }
     // however, if this is the main thread of current process
     // the process should terminate at once
-    if tid == 0 {
+    if tid == Some(0) {
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
@@ -168,13 +178,20 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let mut recycle_res = Vec::<TaskUserRes>::new();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
-            let thread_id = task
-                .inner_exclusive_access()
-                .res
-                .as_ref()
-                .unwrap()
-                .thread_id();
-            remove_from_tid2task(thread_id);
+            let thread_id = {
+                let mut task_inner = task.inner_exclusive_access();
+                task_inner.exit_code.get_or_insert(task_exit_code);
+                task_inner.task_status = TaskStatus::Zombie;
+                task_inner.wait_reason = None;
+                task_inner.sched.on_cpu = false;
+                task_inner.sched.on_rq = false;
+                task_inner.sched.resched_reason = None;
+                task_inner.current_wq_handle = None;
+                task_inner.res.as_ref().map(|res| res.thread_id())
+            };
+            if let Some(thread_id) = thread_id {
+                remove_from_tid2task(thread_id);
+            }
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
             // expired, we should remove them.
             //
@@ -224,8 +241,10 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         }
     } else {
         let mut process_inner = process.inner_exclusive_access();
-        process_inner.mutex_detector.clear_thread(tid);
-        process_inner.semaphore_detector.clear_thread(tid);
+        if let Some(tid) = tid {
+            process_inner.mutex_detector.clear_thread(tid);
+            process_inner.semaphore_detector.clear_thread(tid);
+        }
     }
     drop(process);
     // we do not have to save task context
