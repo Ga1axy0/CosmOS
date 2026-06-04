@@ -26,7 +26,7 @@ pub const IPC_RMID: i32 = 0;
 
 const SHM_HUGETLB_MASK: i32 = 0x7800;
 const IPC_PRIVATE: ShmKey = 0;
-const SHM_NAME_PREFIX: &str = "/.sysvshm.";
+const SHM_NAME_PREFIX: &str = "/dev/shm/.sysvshm.";
 
 /// Per-segment kernel metadata.
 pub struct ShmSegment {
@@ -40,7 +40,7 @@ pub struct ShmSegment {
     pub flags: i32,
     /// Hidden backing file description used by `MAP_SHARED`.
     pub desc: Arc<FileDescription>,
-    /// Hidden backing file path, used for deferred unlink on `IPC_RMID`.
+    /// Hidden backing file path under `/dev/shm`, used for deferred unlink on `IPC_RMID`.
     pub path: String,
     /// Number of active process attachments.
     pub nattch: usize,

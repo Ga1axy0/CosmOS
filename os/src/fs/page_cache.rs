@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use crate::config::{MEMORY_END, PAGE_SIZE};
 use crate::mm::{
     frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
-    InodeKey, PhysAddr, PhysPageNum,
+    InodeKey, MmError, PhysAddr, PhysPageNum,
 };
 use crate::syscall::errno::ERRNO;
 use crate::sync::SpinNoIrqLock;
@@ -148,9 +148,20 @@ impl PageMappingHandle {
         truncate_mapping(&self.inner, new_size);
     }
 
+    /// Reserve file space without forcing eager page creation.
+    pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), FS_ERRNO> {
+        fallocate_mapping(&self.inner, mode, offset, len)
+    }
+
     /// 获取指定文件页号对应的缓存页，供后续 `mmap` 缺页路径复用。
     #[allow(dead_code)]
     pub fn get_page(&self, page_idx: u64) -> Arc<SpinNoIrqLock<CachePage>> {
+        self.try_get_page(page_idx)
+            .expect("page cache OOM in non-fallible get_page path")
+    }
+
+    /// 获取指定文件页号对应的缓存页，必要时装入；OOM 时返回 `MmError`。
+    pub fn try_get_page(&self, page_idx: u64) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
         get_or_load_page(&self.inner, page_idx)
     }
 }
@@ -274,6 +285,33 @@ pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRN
     Ok(())
 }
 
+/// Reserve file space without forcing eager data allocation, while keeping the
+/// page-cache view of the inode length in sync.
+pub fn fallocate_inode(
+    inode: &Arc<Inode>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), FS_ERRNO> {
+    let new_size = offset.checked_add(len).ok_or(FS_ERRNO::EINVAL)?;
+    debug!(
+        "[page_cache] fallocate inode: fs_id={} ino={} mode={:#x} offset={} len={} old_size={} new_size={}",
+        inode.fs_id(),
+        inode.ino(),
+        mode,
+        offset,
+        len,
+        cached_inode_size(inode),
+        new_size
+    );
+    if let Some(mapping) = mapping_for_inode(inode) {
+        mapping.fallocate(mode, offset, len)?;
+        return Ok(());
+    }
+    inode.fallocate(mode, offset, len)?;
+    Ok(())
+}
+
 /// 将某个 inode 的脏页全部同步到底层文件。
 #[allow(dead_code)]
 pub fn sync_inode(inode: &Arc<Inode>) {
@@ -316,7 +354,7 @@ pub fn sync_inode_range(inode: &Arc<Inode>, offset: usize, len: usize) -> Result
 /// 返回指定页对应的 cache page；供后续 `mmap` 缺页路径复用。
 #[allow(dead_code)]
 pub fn get_cached_page(inode: &Arc<Inode>, page_idx: u64) -> Option<Arc<SpinNoIrqLock<CachePage>>> {
-    mapping_for_inode(inode).map(|mapping| mapping.get_page(page_idx))
+    mapping_for_inode(inode).and_then(|mapping| mapping.try_get_page(page_idx).ok())
 }
 
 /// 增加某个缓存页的共享映射计数，防止其在仍被用户页表引用时被回收。
@@ -405,7 +443,8 @@ fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &
         let file_off = offset + done;
         let page_idx = file_page_index(file_off);
         let page_off = file_page_offset(file_off);
-        let page = get_or_load_page(mapping, page_idx);
+        let page =
+            get_or_load_page(mapping, page_idx).expect("page cache OOM in buffered read path");
 
         let page_guard = page.lock();
         let readable = min(page_guard.valid_bytes.saturating_sub(page_off), end - file_off);
@@ -440,7 +479,8 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
         let page_idx = file_page_index(file_off);
         let page_off = file_page_offset(file_off);
         let writable = min(PAGE_SIZE - page_off, buf.len() - done);
-        let page = get_or_create_page(mapping, page_idx);
+        let page =
+            get_or_create_page(mapping, page_idx).expect("page cache OOM in buffered write path");
 
         let page_start = page_start(page_idx);
         let page_end_before = min(old_size, page_start + PAGE_SIZE);
@@ -587,27 +627,74 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
     }
 }
 
+fn fallocate_mapping(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), FS_ERRNO> {
+    if mode != 0 {
+        return Err(FS_ERRNO::EOPNOTSUPP);
+    }
+    let new_size = offset.checked_add(len).ok_or(FS_ERRNO::EINVAL)?;
+    let inode = {
+        let mapping_guard = mapping.lock();
+        mapping_guard
+            .inode
+            .upgrade()
+            .expect("page cache inode disappeared")
+    };
+    let old_size = mapping.lock().size;
+    inode.fallocate(mode, offset, len)?;
+
+    if new_size <= old_size {
+        return Ok(());
+    }
+
+    mapping.lock().size = new_size;
+
+    if old_size > 0 {
+        let old_tail_idx = file_page_index(old_size.saturating_sub(1));
+        let old_tail_valid = page_valid_bytes_for_size(old_size, old_tail_idx);
+        if old_tail_valid < PAGE_SIZE {
+            let tail_page = mapping.lock().pages.get(&old_tail_idx).cloned();
+            if let Some(tail_page) = tail_page {
+                let mut page_guard = tail_page.lock();
+                let new_valid = page_valid_bytes_for_size(new_size, old_tail_idx);
+                if new_valid > old_tail_valid {
+                    let bytes = page_guard.ppn().get_bytes_array();
+                    bytes[old_tail_valid..new_valid].fill(0);
+                    page_guard.valid_bytes = max(page_guard.valid_bytes, new_valid);
+                    page_guard.state.insert(CachePageState::UPTODATE);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 获取并确保装入某个文件页对应的 cache page。
 fn get_or_load_page(
     mapping: &Arc<SpinNoIrqLock<PageMapping>>,
     page_idx: u64,
-) -> Arc<SpinNoIrqLock<CachePage>> {
-    let page = get_or_create_page(mapping, page_idx);
+) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
+    let page = get_or_create_page(mapping, page_idx)?;
     ensure_page_uptodate(mapping, &page, page_idx);
-    page
+    Ok(page)
 }
 
 /// 获取或创建某个文件页对应的 cache page。
 fn get_or_create_page(
     mapping: &Arc<SpinNoIrqLock<PageMapping>>,
     page_idx: u64,
-) -> Arc<SpinNoIrqLock<CachePage>> {
+) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
     if let Some(page) = mapping.lock().pages.get(&page_idx).cloned() {
         trace!("[page_cache] page hit: page_idx={}", page_idx);
-        return page;
+        return Ok(page);
     }
 
-    let frame = alloc_cache_frame();
+    let frame = alloc_cache_frame().ok_or(MmError::OutOfMemory)?;
     let page = Arc::new(SpinNoIrqLock::new(CachePage::new(
         page_idx,
         Arc::downgrade(mapping),
@@ -618,7 +705,7 @@ fn get_or_create_page(
         let mut mapping_guard = mapping.lock();
         if let Some(existing) = mapping_guard.pages.get(&page_idx).cloned() {
             debug!("[page_cache] page hit-after-race: page_idx={}", page_idx);
-            return existing;
+            return Ok(existing);
         }
         mapping_guard.pages.insert(page_idx, Arc::clone(&page));
     }
@@ -632,7 +719,7 @@ fn get_or_create_page(
         manager.cached_pages
     );
     drop(manager);
-    page
+    Ok(page)
 }
 
 /// 保证某个页已装入缓存。
@@ -987,24 +1074,23 @@ fn default_watermarks() -> (usize, usize) {
 }
 
 /// 分配 page cache 使用的页框；内存紧张时先尝试回收一轮。
-fn alloc_cache_frame() -> FrameTracker {
+fn alloc_cache_frame() -> Option<FrameTracker> {
     if let Some(frame) = frame_alloc() {
-        return frame;
+        return Some(frame);
     }
     let _ = sync_all();
     reclaim_if_needed();
     if let Some(frame) = frame_alloc() {
-        return frame;
+        return Some(frame);
     }
     let _ = sync_all();
     // 分配失败时再主动推进回收，避免 cache 尚未超过高水位时错过可回收页。
     while reclaim_one() {
         if let Some(frame) = frame_alloc() {
-            return frame;
+            return Some(frame);
         }
     }
-    // TODO：后续可继续接入更积极的回收/等待策略；当前在无可回收页且彻底无页时直接报错。
-    frame_alloc().unwrap()
+    None
 }
 
 /// 计算文件偏移所属页号。

@@ -3,7 +3,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use lazy_static::lazy_static;
-use log::debug;
 use spin::Mutex;
 
 use crate::vfs::Inode;
@@ -18,8 +17,9 @@ struct DentryKey {
 
 /// A single dentry cache entry.
 struct DentryEntry {
-    /// Weak reference to the child inode — does not prevent inode-cache eviction.
-    child: alloc::sync::Weak<Inode>,
+    /// Strong reference to the child inode so hot dentries stay reusable even if
+    /// the standalone inode cache decides to reclaim its own copy.
+    child: Arc<Inode>,
     /// CLOCK second-chance bit.
     ref_bit: bool,
 }
@@ -47,7 +47,7 @@ impl DentryCache {
 
     /// Look up a child inode by `(fs_id, parent_ino, name)`.
     ///
-    /// Returns `None` on miss or if the cached weak reference has expired.
+    /// Returns `None` on miss.
     fn lookup(&mut self, fs_id: u64, parent_ino: u64, name: &str) -> Option<Arc<Inode>> {
         let key = DentryKey {
             fs_id,
@@ -55,12 +55,8 @@ impl DentryCache {
             name: String::from(name),
         };
         if let Some(entry) = self.table.get_mut(&key) {
-            if let Some(child) = entry.child.upgrade() {
-                entry.ref_bit = true;
-                return Some(child);
-            }
-            // Weak reference expired — drop the stale entry.
-            self.table.remove(&key);
+            entry.ref_bit = true;
+            return Some(Arc::clone(&entry.child));
         }
         None
     }
@@ -78,7 +74,7 @@ impl DentryCache {
         self.table.insert(
             key.clone(),
             DentryEntry {
-                child: Arc::downgrade(child),
+                child: Arc::clone(child),
                 ref_bit: true,
             },
         );

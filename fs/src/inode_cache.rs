@@ -112,16 +112,36 @@ pub(crate) fn remove_cached_node(node: &dyn VfsNode) {
 
 /// 当 inode cache 过大时，回收到低水位。
 fn reclaim_inode_cache_if_needed() {
+    let mut no_progress_rounds = 0usize;
     loop {
-        let need_reclaim = {
+        let (need_reclaim, len, scan_budget) = {
             let cache = INODE_CACHE.lock();
-            cache.table.len() > cache.high_watermark
+            (
+                cache.table.len() > cache.high_watermark,
+                cache.table.len(),
+                cache.inactive.len().max(cache.table.len()).max(1),
+            )
         };
         if !need_reclaim {
             break;
         }
+        // If every cached inode is still strongly referenced elsewhere (for
+        // example by the dentry cache), reclaim may be unable to make progress.
+        // Stop after a bounded scan instead of looping forever.
+        if no_progress_rounds >= scan_budget.saturating_mul(2) {
+            break;
+        }
         if !reclaim_one_inode() {
             break;
+        }
+        let shrunk = {
+            let cache = INODE_CACHE.lock();
+            cache.table.len() < len
+        };
+        if shrunk {
+            no_progress_rounds = 0;
+        } else {
+            no_progress_rounds += 1;
         }
     }
 }

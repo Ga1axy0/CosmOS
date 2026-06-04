@@ -122,7 +122,7 @@ fast-run: kernel
 
 run-inner:
 	@$(QEMU) \
-		-m 512M \
+		-m 2G \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \

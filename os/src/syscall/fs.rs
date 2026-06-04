@@ -1,7 +1,7 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, rename_at,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, mount_tmpfs, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode,
     open_file_at_with_status, symlinkat, unlinkat,
 };
@@ -21,7 +21,7 @@ use crate::sched::block_current_and_run_next;
 use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{vec::Vec, vec};
 use core::{mem::{offset_of, size_of}, slice};
 use crate::timer::{add_timer, add_timer_with_poll_tag, get_time_ms};
 use crate::task::SignalBit;
@@ -79,6 +79,8 @@ const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
 const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
+const SUSPICIOUS_STAT_BLKSIZE: u32 = 1 << 20;
+const SUSPICIOUS_RW_LEN: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -206,7 +208,8 @@ fn has_unmasked_pending_signal() -> bool {
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
     let thread_pending = task_inner.pending_signals;
-    let pending = (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask;
+    let pending =
+        (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask.without_unblockable();
 
     for signum in 1..=crate::task::MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {
@@ -1117,6 +1120,31 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
+        let stat = desc.stat();
+        let path = desc.path();
+        let inode = desc.backing_inode();
+        debug!(
+            "sys_write: fd={} len={} file_size={} st_blksize={} path={:?} inode={}",
+            fd,
+            len,
+            stat.size,
+            stat.blksize,
+            path,
+            inode
+                .as_ref()
+                .map(|inode| alloc::format!("{}:{}", inode.fs_id(), inode.ino()))
+                .unwrap_or_else(|| String::from("-")),
+        );
+        if len >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+            warn!(
+                "sys_write: suspicious request fd={} len={} file_size={} st_blksize={} path={:?}",
+                fd,
+                len,
+                stat.size,
+                stat.blksize,
+                path
+            );
+        }
         let written = desc.write_result(UserBuffer::new(
             translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?,
         ))?;
@@ -1161,6 +1189,28 @@ pub fn sys_pwrite64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
         let offset = parse_pos64(pos)?;
+        let stat = desc.stat();
+        let path = desc.path();
+        debug!(
+            "sys_pwrite64: fd={} offset={} len={} file_size={} st_blksize={} path={:?}",
+            fd,
+            offset,
+            len,
+            stat.size,
+            stat.blksize,
+            path
+        );
+        if len >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+            warn!(
+                "sys_pwrite64: suspicious request fd={} offset={} len={} file_size={} st_blksize={} path={:?}",
+                fd,
+                offset,
+                len,
+                stat.size,
+                stat.blksize,
+                path
+            );
+        }
         if !desc.is_seekable() {
             return Err(ERRNO::ESPIPE);
         }
@@ -1698,6 +1748,25 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
         let stat = desc.stat();
+        let path = desc.path();
+        debug!(
+            "sys_fstat: fd={} size={} blksize={} blocks={} mode={:#o} path={:?}",
+            fd,
+            stat.size,
+            stat.blksize,
+            stat.blocks,
+            stat.mode.bits(),
+            path
+        );
+        if stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+            warn!(
+                "sys_fstat: suspicious st_blksize fd={} blksize={} size={} path={:?}",
+                fd,
+                stat.blksize,
+                stat.size,
+                path
+            );
+        }
         write_pod_to_user(st, &stat)?;
         Ok(0)
     })
@@ -1732,11 +1801,31 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
             match resolve_at_target(dirfd, "", flags as i32)? {
                 ResolvedAtTarget::Inode(inode) => {
                     let stat = inode_stat(&inode);
+                    debug!(
+                        "sys_newfstatat: empty-path inode dirfd={} flags={:#x} size={} blksize={} blocks={} mode={:#o}",
+                        dirfd,
+                        flags,
+                        stat.size,
+                        stat.blksize,
+                        stat.blocks,
+                        stat.mode.bits()
+                    );
                     write_pod_to_user(st, &stat)?;
                     return Ok(0);
                 }
                 ResolvedAtTarget::FileDesc(desc) => {
                     let stat = desc.stat();
+                    let desc_path = desc.path();
+                    debug!(
+                        "sys_newfstatat: empty-path fd dirfd={} flags={:#x} size={} blksize={} blocks={} mode={:#o} path={:?}",
+                        dirfd,
+                        flags,
+                        stat.size,
+                        stat.blksize,
+                        stat.blocks,
+                        stat.mode.bits(),
+                        desc_path
+                    );
                     write_pod_to_user(st, &stat)?;
                     return Ok(0);
                 }
@@ -1749,6 +1838,25 @@ let time2 = get_time_us();
 let time3 = get_time_us();
         let stat = inode_stat(&inode);
 let time4 = get_time_us();
+        debug!(
+            "sys_newfstatat: dirfd={} path='{}' flags={:#x} size={} blksize={} blocks={} mode={:#o}",
+            dirfd,
+            path,
+            flags,
+            stat.size,
+            stat.blksize,
+            stat.blocks,
+            stat.mode.bits()
+        );
+        if stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+            warn!(
+                "sys_newfstatat: suspicious st_blksize dirfd={} path='{}' blksize={} size={}",
+                dirfd,
+                path,
+                stat.blksize,
+                stat.size
+            );
+        }
         write_pod_to_user(st, &stat)?;
 let time5 = get_time_us();
         debug!("sys_newfstatat: resolve_dirfd_base & canonicalize = {}us, lookup_inode = {}us, inode_stat = {}us, write_pod_to_user = {}us",
@@ -1999,9 +2107,11 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
         // Fill a kernel-side temporary buffer …
-        let mut tmp: Vec<u8> = Vec::with_capacity(count);
-        tmp.extend(core::iter::repeat(0u8).take(count));
+        let mut tmp: Vec<u8> = vec![0; count];
+let start = get_time_us();
         let bytes = desc.getdents64(&mut tmp);
+let end = get_time_us();
+debug!("sys_getdents64: fd={}, count={}, time_us={}", fd, count, end - start);
         if bytes == 0 {
             return Ok(0);
         }
@@ -2216,7 +2326,11 @@ pub fn sys_mount(
             fs_type,
             _data
         );
-        mount_device(&dev_name, &abs_mnt, &fs_type)?;
+        if fs_type == "tmpfs" {
+            mount_tmpfs(&abs_mnt)?;
+        } else {
+            mount_device(&dev_name, &abs_mnt, &fs_type)?;
+        }
         Ok(0)
     })
 }
@@ -2400,6 +2514,51 @@ pub fn sys_fstatfs64(fd: u32, buf: *mut u8) -> isize {
         drop(inner);
         let buf_ptr = buf as *mut StatFs64;
         write_pod_to_user(buf_ptr, &stat)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> isize {
+    syscall_body!({
+        if mode != 0 {
+            // Linux fallocate 仅支持 mode=0（标准空间预分配）
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        if offset < 0 || len <= 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let offset = offset as usize;
+        let len = len as usize;
+        let new_size = offset.checked_add(len).ok_or(ERRNO::EINVAL)?;
+        let desc = get_writable_file(fd as usize)?;
+        let stat = desc.stat();
+        let path = desc.path();
+        debug!(
+            "sys_fallocate: fd={} mode={:#x} offset={} len={} old_size={} new_size={} st_blksize={} path={:?}",
+            fd,
+            mode,
+            offset,
+            len,
+            stat.size,
+            new_size,
+            stat.blksize,
+            path
+        );
+        if new_size >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+            warn!(
+                "sys_fallocate: suspicious request fd={} mode={:#x} offset={} len={} old_size={} new_size={} st_blksize={} path={:?}",
+                fd,
+                mode,
+                offset,
+                len,
+                stat.size,
+                new_size,
+                stat.blksize,
+                path
+            );
+        }
+        desc.fallocate(mode, offset, len)?;
         Ok(0)
     })
 }

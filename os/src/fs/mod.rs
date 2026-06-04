@@ -8,6 +8,8 @@ mod tty;
 pub mod rootfs;
 pub mod devfs;
 pub mod procfs;
+/// In-memory tmpfs backend that can be mounted into the virtual namespace.
+pub mod tmpfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -164,7 +166,11 @@ impl FileDescription {
             inner.offset += read_size;
             return Ok(read_size);
         }
-        // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
+        if self.status_flags().contains(FileStatusFlags::NONBLOCK) {
+            if let Some(pipe) = self.as_any().downcast_ref::<pipe::Pipe>() {
+                return pipe.read_nonblocking(buf);
+            }
+        }
         self.file.read_at_result(0, buf)
     }
 
@@ -185,7 +191,11 @@ impl FileDescription {
             inner.offset += write_size;
             return Ok(write_size);
         }
-        // TODO: 非阻塞语义目前仍由具体后端决定，这里暂不根据 `O_NONBLOCK` 改写行为。
+        if self.status_flags().contains(FileStatusFlags::NONBLOCK) {
+            if let Some(pipe) = self.as_any().downcast_ref::<pipe::Pipe>() {
+                return pipe.write_nonblocking(buf);
+            }
+        }
         self.file.write_at_result(0, buf)
     }
 
@@ -231,6 +241,11 @@ impl FileDescription {
     /// 调整底层文件对象的逻辑长度。
     pub fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
         self.file.truncate(new_size)
+    }
+
+    /// Reserve or deallocate file space on the underlying object.
+    pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), ERRNO> {
+        self.file.fallocate(mode, offset, len)
     }
 
     /// 获取当前 `F_GETFL` 可见状态值。
@@ -405,6 +420,10 @@ pub trait File: Send + Sync + Any {
     fn truncate(&self, _new_size: usize) -> Result<(), ERRNO> {
         Err(ERRNO::EOPNOTSUPP)
     }
+    /// Reserve or deallocate file space without forcing eager allocation.
+    fn fallocate(&self, _mode: i32, _offset: usize, _len: usize) -> Result<(), ERRNO> {
+        Err(ERRNO::EOPNOTSUPP)
+    }
     /// Query readiness for a subset of poll events.
     ///
     /// Input `events` is a bitmask compatible with Linux `poll(2)` bits
@@ -573,7 +592,7 @@ bitflags! {
 pub use inode::{
     canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
     linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at,
-    mkdir_at_with_inode, mount_device, open_file, open_file_at, open_file_at_with_status,
+    mkdir_at_with_inode, mount_device, mount_tmpfs, open_file, open_file_at, open_file_at_with_status,
     rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,

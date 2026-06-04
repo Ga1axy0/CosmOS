@@ -1,5 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use core::fmt;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
@@ -79,6 +80,17 @@ impl EasyInode {
             v.push(fs.alloc_data());
         }
         disk_inode.increase_size(new_size, v, &self.block_device);
+    }
+}
+
+impl fmt::Debug for EasyInode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EasyInode")
+            .field("block_id", &self.block_id)
+            .field("block_offset", &self.block_offset)
+            .field("fs_ptr", &format_args!("{:p}", Arc::as_ptr(&self.fs)))
+            .field("block_device_ptr", &format_args!("{:p}", Arc::as_ptr(&self.block_device)))
+            .finish()
     }
 }
 

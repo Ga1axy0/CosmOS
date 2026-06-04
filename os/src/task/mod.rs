@@ -25,7 +25,7 @@ use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
-use crate::syscall::write_pod_to_process_user;
+use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::remove_timer;
@@ -74,8 +74,16 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     let process = task.process.upgrade().unwrap();
     process.pause_cpu_accounting(get_time());
     let mut task_inner = task.inner_exclusive_access();
-    let tid = task_inner.res.as_ref().unwrap().tid;
-    let thread_id = task_inner.res.as_ref().unwrap().thread_id();
+    let (tid, thread_id) = match task_inner.res.as_ref() {
+        Some(res) => (Some(res.tid), Some(res.thread_id())),
+        None => {
+            warn!(
+                "exit_current_and_run_next: pid={} entered exit path after task user resources were reclaimed",
+                process.getpid()
+            );
+            (None, None)
+        }
+    };
     let clear_child_tid = task_inner.clear_child_tid;
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
@@ -88,23 +96,53 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
     if clear_child_tid != 0 {
-        let _ = write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32);
-        let _ = futex_wake_addr(clear_child_tid, 1);
+        debug!(
+            "exit_current_and_run_next: pid={} tid={} thread_id={} clear_child_tid={:#x}",
+            process.getpid(),
+            tid.unwrap_or(usize::MAX),
+            thread_id.unwrap_or(usize::MAX),
+            clear_child_tid
+        );
+        match write_pod_to_process_user(&process, clear_child_tid as *mut i32, &0i32) {
+            Ok(()) => {
+                let read_back = read_pod_from_process_user(&process, clear_child_tid as *const i32);
+                debug!(
+                    "exit_current_and_run_next: cleared child_tid at {:#x}, read_back={:?}",
+                    clear_child_tid,
+                    read_back
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "exit_current_and_run_next: failed to clear child_tid at {:#x}: {:?}",
+                    clear_child_tid,
+                    err
+                );
+            }
+        }
+        let woke = futex_wake_addr(clear_child_tid, 1);
+        debug!(
+            "exit_current_and_run_next: futex_wake_addr({:#x}, 1) -> {}",
+            clear_child_tid,
+            woke
+        );
     }
     cleanup_signal_wait_for_task(&task);
     cleanup_futex_wait_for_task(&task);
     remove_timer(Arc::clone(&task));
-    remove_from_tid2task(thread_id);
+    if let Some(thread_id) = thread_id {
+        remove_from_tid2task(thread_id);
+    }
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
-    if tid == 0 {
+    if tid == Some(0) {
         add_stopping_task(task);
     } else {
         drop(task);
     }
     // however, if this is the main thread of current process
     // the process should terminate at once
-    if tid == 0 {
+    if tid == Some(0) {
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
@@ -140,13 +178,20 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         let mut recycle_res = Vec::<TaskUserRes>::new();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
-            let thread_id = task
-                .inner_exclusive_access()
-                .res
-                .as_ref()
-                .unwrap()
-                .thread_id();
-            remove_from_tid2task(thread_id);
+            let thread_id = {
+                let mut task_inner = task.inner_exclusive_access();
+                task_inner.exit_code.get_or_insert(task_exit_code);
+                task_inner.task_status = TaskStatus::Zombie;
+                task_inner.wait_reason = None;
+                task_inner.sched.on_cpu = false;
+                task_inner.sched.on_rq = false;
+                task_inner.sched.resched_reason = None;
+                task_inner.current_wq_handle = None;
+                task_inner.res.as_ref().map(|res| res.thread_id())
+            };
+            if let Some(thread_id) = thread_id {
+                remove_from_tid2task(thread_id);
+            }
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
             // expired, we should remove them.
             //
@@ -196,8 +241,10 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         }
     } else {
         let mut process_inner = process.inner_exclusive_access();
-        process_inner.mutex_detector.clear_thread(tid);
-        process_inner.semaphore_detector.clear_thread(tid);
+        if let Some(tid) = tid {
+            process_inner.mutex_detector.clear_thread(tid);
+            process_inner.semaphore_detector.clear_thread(tid);
+        }
     }
     drop(process);
     // we do not have to save task context
@@ -274,7 +321,8 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
-    let pending = (task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask;
+    let pending = (task_inner.pending_signals | process_inner.pending_signals)
+        & !task_inner.signal_mask.without_unblockable();
     for signum in 1..=MAX_SIG {
         let Some(flag) = SignalBit::from_signum(signum as u32) else {
             continue;
@@ -349,7 +397,7 @@ pub fn add_signal_to_process_with_siginfo(
         .into_iter()
         .filter(|task| {
             let task_inner = task.inner_exclusive_access();
-            !(newly_pending & !task_inner.signal_mask).is_empty()
+            !(newly_pending & !task_inner.signal_mask.without_unblockable()).is_empty()
         })
         .collect::<Vec<_>>();
 
@@ -390,7 +438,7 @@ pub fn add_signal_to_task_with_siginfo(
             task_inner.res.as_ref().unwrap().thread_id(),
             task_inner.res.as_ref().unwrap().tid,
             task_inner.signal_mask.bits(),
-            newly_pending & !task_inner.signal_mask,
+            newly_pending & !task_inner.signal_mask.without_unblockable(),
         )
     };
 
@@ -433,7 +481,11 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
 }
 
 /// Map an anonymous area in current process with given permission.
-pub fn mmap_current_process(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+pub fn mmap_current_process(
+    start: VirtAddr,
+    end: VirtAddr,
+    perm: MapPermission,
+) -> Result<(), crate::syscall::errno::ERRNO> {
     current_process().mmap(start, end, perm)
 }
 

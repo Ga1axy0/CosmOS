@@ -8,6 +8,8 @@ const PA_WIDTH_SV39: usize = 56;
 const VA_WIDTH_SV39: usize = 39;
 const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
 const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
+/// Exclusive end of the canonical low-half user virtual-address range under Sv39.
+pub const USER_SPACE_END: usize = 1usize << (VA_WIDTH_SV39 - 1);
 
 /// Physical Address
 #[repr(C)]

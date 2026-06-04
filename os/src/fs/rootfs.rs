@@ -32,6 +32,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
@@ -39,9 +40,7 @@ use fs::remove_dentry;
 use fs::vfs::{InodeTime, VfsFileType, VfsNode, VfsStatFs};
 use lazy_static::*;
 
-use crate::sync::{SpinNoIrqLock};
-
-const MEMFS_ID: u64 = u64::MAX - 1;
+use crate::sync::SpinNoIrqLock;
 
 // ---------------------------------------------------------------------------
 // Inode-number allocator for virtual nodes
@@ -85,13 +84,10 @@ unsafe impl Sync for VirtualDirNode {}
 impl VirtualDirNode {
     /// Create a new, empty virtual directory.
     pub fn new() -> Arc<Self> {
-        // SAFETY: single-processor guarantee documented above.
-        let inner = unsafe {
-            SpinNoIrqLock::new(VirtDirInner {
-                overlay: None,
-                mounts: BTreeMap::new(),
-            })
-        };
+        let inner = SpinNoIrqLock::new(VirtDirInner {
+            overlay: None,
+            mounts: BTreeMap::new(),
+        });
         Arc::new(Self {
             ino: alloc_virt_ino(),
             inner,
@@ -144,6 +140,24 @@ impl VirtualDirNode {
             .filter(|n| n.is_dir())
     }
 
+    /// Resolve an existing directory child from the current namespace view.
+    ///
+    /// This checks explicit mounts first, then falls back to the overlay.
+    /// It is used when creating a virtual wrapper for a mount path so that
+    /// pre-existing mount points like `/tmp` remain reachable via the wrapper.
+    pub(crate) fn namespace_child_dir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        {
+            let inner = self.inner.lock();
+            if let Some(node) = inner.mounts.get(name) {
+                if node.is_dir() {
+                    return Some(Arc::clone(node));
+                }
+                return None;
+            }
+        }
+        self.overlay_child_dir(name)
+    }
+
     fn has_mount(&self, name: &str) -> bool {
         self.inner.lock().mounts.contains_key(name)
     }
@@ -153,311 +167,19 @@ impl VirtualDirNode {
     }
 }
 
-struct MemFileInner {
-    data: Vec<u8>,
-    mode: u32,
-    atime: Option<InodeTime>,
-    mtime: Option<InodeTime>,
-    ctime: Option<InodeTime>,
-}
-
-/// Minimal in-memory regular file used by `/dev/shm`.
-pub struct MemFileNode {
-    ino: u64,
-    inner: SpinNoIrqLock<MemFileInner>,
-}
-
-impl MemFileNode {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            ino: alloc_virt_ino(),
-            inner: SpinNoIrqLock::new(MemFileInner {
-                data: Vec::new(),
-                mode: 0o100666,
-                atime: None,
-                mtime: None,
-                ctime: None,
-            }),
-        })
-    }
-}
-
-impl VfsNode for MemFileNode {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn file_type(&self) -> VfsFileType {
-        VfsFileType::Regular
-    }
-
-    fn ls(&self) -> Vec<(String, VfsFileType)> {
-        Vec::new()
-    }
-
-    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
-        None
-    }
-
-    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
-        None
-    }
-
-    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
-        None
-    }
-
-    fn is_dir(&self) -> bool {
-        false
-    }
-
-    fn clear(&self) {
-        self.inner.lock().data.clear();
-    }
-
-    fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
-        self.inner.lock().data.resize(new_size, 0);
-        Ok(())
-    }
-
-    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+impl fmt::Debug for VirtualDirNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.inner.lock();
-        if offset >= inner.data.len() || buf.is_empty() {
-            return 0;
-        }
-        let len = core::cmp::min(buf.len(), inner.data.len() - offset);
-        buf[..len].copy_from_slice(&inner.data[offset..offset + len]);
-        len
-    }
-
-    fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
-        let mut inner = self.inner.lock();
-        let end = offset.saturating_add(buf.len());
-        if end > inner.data.len() {
-            inner.data.resize(end, 0);
-        }
-        inner.data[offset..end].copy_from_slice(buf);
-        buf.len()
-    }
-
-    fn fs_id(&self) -> u64 {
-        MEMFS_ID
-    }
-
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-
-    fn nlink(&self) -> u32 {
-        1
-    }
-
-    fn size(&self) -> usize {
-        self.inner.lock().data.len()
-    }
-
-    fn mode(&self) -> Option<u32> {
-        Some(self.inner.lock().mode)
-    }
-
-    fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
-        self.inner.lock().mode = mode;
-        Ok(())
-    }
-
-    fn atime(&self) -> Option<InodeTime> {
-        self.inner.lock().atime
-    }
-
-    fn mtime(&self) -> Option<InodeTime> {
-        self.inner.lock().mtime
-    }
-
-    fn ctime(&self) -> Option<InodeTime> {
-        self.inner.lock().ctime
-    }
-
-    fn set_times(
-        &self,
-        atime: Option<InodeTime>,
-        mtime: Option<InodeTime>,
-        ctime: Option<InodeTime>,
-    ) -> Result<(), FS_ERRNO> {
-        let mut inner = self.inner.lock();
-        inner.atime = atime;
-        inner.mtime = mtime;
-        inner.ctime = ctime;
-        Ok(())
+        let mount_names: Vec<String> = inner.mounts.keys().cloned().collect();
+        f.debug_struct("VirtualDirNode")
+            .field("ino", &self.ino)
+            .field("overlay_present", &inner.overlay.is_some())
+            .field("mount_count", &mount_names.len())
+            .field("mounts", &mount_names)
+            .finish()
     }
 }
 
-struct MemDirInner {
-    children: BTreeMap<String, Arc<dyn VfsNode>>,
-    mode: u32,
-    atime: Option<InodeTime>,
-    mtime: Option<InodeTime>,
-    ctime: Option<InodeTime>,
-}
-
-/// Minimal in-memory directory used to back POSIX shared memory objects.
-pub struct MemDirNode {
-    ino: u64,
-    inner: SpinNoIrqLock<MemDirInner>,
-}
-
-impl MemDirNode {
-    /// Create a new empty in-memory directory for synthetic kernel-backed paths.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            ino: alloc_virt_ino(),
-            inner: SpinNoIrqLock::new(MemDirInner {
-                children: BTreeMap::new(),
-                mode: 0o040777,
-                atime: None,
-                mtime: None,
-                ctime: None,
-            }),
-        })
-    }
-}
-
-impl VfsNode for MemDirNode {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn file_type(&self) -> VfsFileType {
-        VfsFileType::Directory
-    }
-
-    fn ls(&self) -> Vec<(String, VfsFileType)> {
-        self.inner
-            .lock()
-            .children
-            .iter()
-            .map(|(name, node)| (name.clone(), node.file_type()))
-            .collect()
-    }
-
-    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        self.inner.lock().children.get(name).cloned()
-    }
-
-    fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        let mut inner = self.inner.lock();
-        if inner.children.contains_key(name) {
-            return None;
-        }
-        let node: Arc<dyn VfsNode> = MemFileNode::new();
-        inner.children.insert(String::from(name), Arc::clone(&node));
-        Some(node)
-    }
-
-    fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
-        let mut inner = self.inner.lock();
-        if inner.children.contains_key(name) {
-            return None;
-        }
-        let node: Arc<dyn VfsNode> = Self::new();
-        inner.children.insert(String::from(name), Arc::clone(&node));
-        Some(node)
-    }
-
-    fn is_dir(&self) -> bool {
-        true
-    }
-
-    fn clear(&self) {}
-
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
-        0
-    }
-
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
-        0
-    }
-
-    fn fs_id(&self) -> u64 {
-        MEMFS_ID
-    }
-
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-
-    fn nlink(&self) -> u32 {
-        2
-    }
-
-    fn mode(&self) -> Option<u32> {
-        Some(self.inner.lock().mode)
-    }
-
-    fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
-        self.inner.lock().mode = mode;
-        Ok(())
-    }
-
-    fn unlink(&self, name: &str) -> Result<(), FS_ERRNO> {
-        let mut inner = self.inner.lock();
-        match inner.children.get(name) {
-            Some(node) if node.is_dir() => Err(FS_ERRNO::EISDIR),
-            Some(_) => {
-                inner.children.remove(name);
-                remove_dentry(MEMFS_ID, self.ino, name);
-                Ok(())
-            }
-            None => Err(FS_ERRNO::ENOENT),
-        }
-    }
-
-    fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {
-        let mut inner = self.inner.lock();
-        let node = inner.children.get(name).cloned().ok_or(FS_ERRNO::ENOENT)?;
-        let child_dir = node
-            .as_any()
-            .downcast_ref::<Self>()
-            .ok_or(FS_ERRNO::ENOTDIR)?;
-        if !child_dir.inner.lock().children.is_empty() {
-            return Err(FS_ERRNO::ENOTEMPTY);
-        }
-        inner.children.remove(name);
-        remove_dentry(MEMFS_ID, self.ino, name);
-        Ok(())
-    }
-
-    fn atime(&self) -> Option<InodeTime> {
-        self.inner.lock().atime
-    }
-
-    fn mtime(&self) -> Option<InodeTime> {
-        self.inner.lock().mtime
-    }
-
-    fn ctime(&self) -> Option<InodeTime> {
-        self.inner.lock().ctime
-    }
-
-    fn set_times(
-        &self,
-        atime: Option<InodeTime>,
-        mtime: Option<InodeTime>,
-        ctime: Option<InodeTime>,
-    ) -> Result<(), FS_ERRNO> {
-        let mut inner = self.inner.lock();
-        inner.atime = atime;
-        inner.mtime = mtime;
-        inner.ctime = ctime;
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VfsNode implementation
-// ---------------------------------------------------------------------------
 
 impl VfsNode for VirtualDirNode {
     fn as_any(&self) -> &dyn Any {
@@ -702,6 +424,15 @@ impl VfsNode for VirtualDirNode {
             inner.overlay.clone()
         };
         overlay.ok_or(FS_ERRNO::ENOSYS)?.statfs()
+    }
+
+    fn set_mode(&self, _mode: u32) -> Result<(), FS_ERRNO> {
+        let overlay = {
+            let inner = self.inner.lock();
+            inner.overlay.clone()
+        };
+        warn!("overlay present: {}", overlay.is_some());
+        overlay.ok_or(FS_ERRNO::EPERM)?.set_mode(_mode)
     }
 }
 

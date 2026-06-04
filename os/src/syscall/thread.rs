@@ -41,7 +41,10 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         )
     };
     // create a new thread
-    let new_task = process.create_task(ustack_base, true, sched_attr);
+    let new_task = match process.create_task(ustack_base, true, sched_attr) {
+        Ok(task) => task,
+        Err(_) => return -(ERRNO::ENOMEM as isize),
+    };
     {
         let mut new_task_inner = new_task.inner_exclusive_access();
         new_task_inner.sched.cpu_affinity_mask = affinity_mask;

@@ -1,6 +1,6 @@
 use crate::{
     config::{PAGE_SIZE, PAGE_SIZE_BITS},
-    mm::{MapPermission, VirtAddr},
+    mm::{MapPermission, USER_SPACE_END, VirtAddr},
     syscall::errno::ERRNO,
     syscall::{write_bytes_to_user, write_pod_to_user},
     syscall_body,
@@ -57,6 +57,26 @@ bitflags! {
 const MS_ASYNC: i32 = 1;
 const MS_INVALIDATE: i32 = 2;
 const MS_SYNC: i32 = 4;
+
+/// Translate user-visible `PROT_*` bits into internal page permissions.
+///
+/// On RISC-V, a writable leaf PTE must also be readable; `W=1, R=0` is an
+/// invalid encoding and will keep faulting forever. Mirror Linux's effective
+/// behavior here by upgrading `PROT_WRITE` to `R|W` at the PTE level.
+fn prot_to_map_perm(prot: usize) -> MapPermission {
+    let mut perm = MapPermission::U;
+    if prot & MMapProt::PROT_READ.bits() != 0 || prot & MMapProt::PROT_WRITE.bits() != 0 {
+        perm |= MapPermission::R;
+    }
+    if prot & MMapProt::PROT_WRITE.bits() != 0 {
+        perm |= MapPermission::W;
+    }
+    if prot & MMapProt::PROT_EXEC.bits() != 0 {
+        perm |= MapPermission::X;
+    }
+    perm
+}
+
 /// mmap syscall
 pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
     trace!(
@@ -85,7 +105,6 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         if len == 0 {
             return Err(ERRNO::EINVAL);
         }
-        let end = addr.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
         let native_compat = flags == 0 && fd == 0 && offset == 0;
         if !native_compat {
             if offset & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
@@ -100,16 +119,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             }
         }
 
-        let mut perm = MapPermission::U;
-        if prot & 0x1 != 0 {
-            perm |= MapPermission::R;
-        }
-        if prot & 0x2 != 0 {
-            perm |= MapPermission::W;
-        }
-        if prot & 0x4 != 0 {
-            perm |= MapPermission::X;
-        }
+        let perm = prot_to_map_perm(prot);
 
 
         // if user did not specify addr.
@@ -118,6 +128,10 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             .checked_add(PAGE_SIZE - 1)
             .ok_or(ERRNO::EOVERFLOW)?
             & !(PAGE_SIZE - 1);
+        let end = addr.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
+        if addr != 0 && (addr >= USER_SPACE_END || end > USER_SPACE_END) {
+            return Err(ERRNO::ENOMEM);
+        }
         let process = current_process();
         let native_compat = flags == 0 && fd == 0 && offset == 0;
         let mut file_desc = None;
@@ -180,9 +194,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                         perm,
                     )
                 };
-                if !mapped {
-                    return Err(ERRNO::ENOMEM);
-                }
+                mapped.map_err(|_| ERRNO::ENOMEM)?;
                 inner.vm_layout.mmap_hint = chosen_end;
                 (chosen, chosen_end, hint)
             };
@@ -216,9 +228,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             } else {
                 process.mmap(VirtAddr::from(addr), VirtAddr::from(end), perm)
             };
-            if !mapped {
-                return Err(ERRNO::ENOMEM);
-            }
+            mapped?;
             debug!(
                 "[mmap] fixed range registered: pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
                 pid,
@@ -451,17 +461,7 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
         {
             MapPermission::U
         } else {
-            let mut p = MapPermission::U;
-            if prot & MMapProt::PROT_READ.bits() != 0 {
-                p |= MapPermission::R;
-            }
-            if prot & MMapProt::PROT_WRITE.bits() != 0 {
-                p |= MapPermission::W;
-            }
-            if prot & MMapProt::PROT_EXEC.bits() != 0 {
-                p |= MapPermission::X;
-            }
-            p
+            prot_to_map_perm(prot)
         };
 
         if mprotect_current_process(VirtAddr::from(start), VirtAddr::from(end), perm) {

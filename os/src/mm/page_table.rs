@@ -1,5 +1,7 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
-use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use super::{
+    frame_alloc, FrameTracker, MmError, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
+};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -74,15 +76,14 @@ pub struct PageTable {
     frames: Vec<FrameTracker>,
 }
 
-/// Assume that it won't oom when creating/mapping.
 impl PageTable {
     /// Create a new page table
-    pub fn new() -> Self {
-        let frame = frame_alloc().unwrap();
-        PageTable {
+    pub fn new() -> Result<Self, MmError> {
+        let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
+        Ok(PageTable {
             root_ppn: frame.ppn,
             frames: vec![frame],
-        }
+        })
     }
     /// Temporarily used to get arguments from user space.
     pub fn from_token(satp: usize) -> Self {
@@ -91,7 +92,7 @@ impl PageTable {
             frames: Vec::new(),
         }
     }
-    fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+    fn find_pte_create(&mut self, vpn: VirtPageNum) -> Result<Option<&mut PageTableEntry>, MmError> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
         let mut result: Option<&mut PageTableEntry> = None;
@@ -102,15 +103,18 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
         }
-        result
+        Ok(result)
     }
-    fn find_pte_create_untracked(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+    fn find_pte_create_untracked(
+        &mut self,
+        vpn: VirtPageNum,
+    ) -> Result<Option<&mut PageTableEntry>, MmError> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
         let mut result: Option<&mut PageTableEntry> = None;
@@ -121,13 +125,13 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 core::mem::forget(frame);
             }
             ppn = pte.ppn();
         }
-        result
+        Ok(result)
     }
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
@@ -148,16 +152,30 @@ impl PageTable {
     }
     /// set the map between virtual page number and physical page number
     #[allow(unused)]
-    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
-        let pte = self.find_pte_create(vpn).unwrap();
+    pub fn map(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+    ) -> Result<(), MmError> {
+        let pte = self.find_pte_create(vpn)?.ok_or(MmError::NoMapping)?;
         debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        Ok(())
     }
     /// Map a permanent kernel page without recording page-table frames in `frames`.
-    pub fn map_kernel_untracked(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
-        let pte = self.find_pte_create_untracked(vpn).unwrap();
+    pub fn map_kernel_untracked(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+    ) -> Result<(), MmError> {
+        let pte = self
+            .find_pte_create_untracked(vpn)?
+            .ok_or(MmError::NoMapping)?;
         debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        Ok(())
     }
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]
