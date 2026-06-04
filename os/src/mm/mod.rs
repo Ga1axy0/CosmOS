@@ -69,6 +69,9 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
+    // Build the kernel-heap window's page-table backbone before any virtual-window
+    // growth, so growth never recurses into the `KERNEL_SPACE` lock.
+    heap_allocator::init_kernel_heap_mapping();
     heap_allocator::init_heap_virtual_window();
 }
 

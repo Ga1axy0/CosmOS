@@ -12,7 +12,9 @@ const ECHILD: isize = -10;
 fn main() -> i32 {
     let pid = fork();
     if pid == 0 {
-        exec("sh\0", &[core::ptr::null::<u8>()]);
+        let ret = exec("setupsh\0", &[core::ptr::null::<u8>()]);
+        println!("[initproc] exec setupsh failed: {}", ret);
+        exit(127);
     } else if pid < 0 {
         println!("[initproc] fork failed: {}", pid);
         exit(1);
@@ -34,5 +36,4 @@ fn main() -> i32 {
             );
         }
     }
-    0
 }

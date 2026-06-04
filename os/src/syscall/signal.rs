@@ -9,7 +9,7 @@ use crate::{
         SignalAction, SignalBit, TaskStatus, WaitReason,
     },
 };
-use crate::timer::{add_timer_with_signal_tag, get_time_ms};
+use crate::timer::{add_timer_with_signal_tag, get_time_ns};
 
 use crate::syscall::OldTimespec32;
 
@@ -54,9 +54,9 @@ fn write_user_sigset(mask: *mut u64, sigsetsize: usize, signal_set: SignalBit) -
     }
 }
 
-fn parse_sigtimedwait_timeout_ms(
+fn parse_sigtimedwait_timeout_ns(
     uts: *const OldTimespec32,
-) -> Result<Option<usize>, ERRNO> {
+) -> Result<Option<u64>, ERRNO> {
     if uts.is_null() {
         return Ok(None);
     }
@@ -64,18 +64,22 @@ fn parse_sigtimedwait_timeout_ms(
     if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
         return Err(ERRNO::EINVAL);
     }
-    let sec_ms = (timeout.tv_sec as u64)
-        .checked_mul(1_000)
+    let sec_ns = (timeout.tv_sec as u64)
+        .checked_mul(1_000_000_000)
         .ok_or(ERRNO::EINVAL)?;
-    let nsec_ms = (timeout.tv_nsec as u64).div_ceil(1_000_000);
-    let timeout_ms = sec_ms.checked_add(nsec_ms).ok_or(ERRNO::EINVAL)?;
-    Ok(Some(timeout_ms as usize))
+    let timeout_ns = sec_ns
+        .checked_add(timeout.tv_nsec as u64)
+        .ok_or(ERRNO::EINVAL)?;
+    Ok(Some(timeout_ns))
 }
 
-fn timeout_ms_to_deadline(timeout_ms: Option<usize>) -> Result<Option<usize>, ERRNO> {
-    match timeout_ms {
+fn timeout_ns_to_deadline_ns(timeout_ns: Option<u64>) -> Result<Option<u64>, ERRNO> {
+    match timeout_ns {
         None => Ok(None),
-        Some(ms) => get_time_ms().checked_add(ms).map(Some).ok_or(ERRNO::EINVAL),
+        Some(timeout_ns) => get_time_ns()
+            .checked_add(timeout_ns)
+            .map(Some)
+            .ok_or(ERRNO::EINVAL),
     }
 }
 
@@ -490,8 +494,8 @@ pub fn sys_rt_sigtimedwait_time32(
         if signal_set.is_empty() {
             return Err(ERRNO::EINVAL);
         }
-        let timeout_ms = parse_sigtimedwait_timeout_ms(uts)?;
-        let deadline = timeout_ms_to_deadline(timeout_ms)?;
+        let timeout_ns = parse_sigtimedwait_timeout_ns(uts)?;
+        let deadline_ns = timeout_ns_to_deadline_ns(timeout_ns)?;
 
         loop {
             if let Some((signum, siginfo)) = crate::signal::take_pending_signal_in_set(signal_set)
@@ -506,9 +510,9 @@ pub fn sys_rt_sigtimedwait_time32(
                 return Err(ERRNO::EINTR);
             }
 
-            let now_ms = get_time_ms();
-            if let Some(dl) = deadline {
-                if now_ms >= dl {
+            let now_ns = get_time_ns();
+            if let Some(deadline_ns) = deadline_ns {
+                if now_ns >= deadline_ns {
                     return Err(ERRNO::EAGAIN);
                 }
             }
@@ -516,8 +520,8 @@ pub fn sys_rt_sigtimedwait_time32(
             let task = current_task().unwrap();
             let pid = task.process.upgrade().unwrap().getpid();
             let handle = register_signal_wait(pid, signal_set, &task).ok_or(ERRNO::ENOSPC)?;
-            if let Some(dl) = deadline {
-                add_timer_with_signal_tag(dl, task.clone(), Some(handle.timer_tag()));
+            if let Some(deadline_ns) = deadline_ns {
+                add_timer_with_signal_tag(deadline_ns, task.clone(), Some(handle.timer_tag()));
             }
             signal_wait_sleep(handle, signal_set);
 
