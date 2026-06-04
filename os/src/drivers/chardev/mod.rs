@@ -20,6 +20,15 @@ pub trait CharDevice: Sync + Send {
    fn write(&self, ch: u8);
    /// Read a ch to device.
    fn read(&self) -> u8;
+   /// Try to read one byte without blocking.
+   ///
+   /// Returns `Some(byte)` when input is immediately available — either already
+   /// buffered by the IRQ path or sitting in the hardware FIFO — otherwise
+   /// `None`. This is the entry point the tty line discipline uses to drain the
+   /// device from interrupt context, so it must never block.
+   fn read_nonblocking(&self) -> Option<u8> {
+      None
+   }
    /// Whether the device currently has readable input buffered.
    fn has_data(&self) -> bool {
       false
