@@ -3,7 +3,7 @@ use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
 use crate::task::{current_process, current_task, WaitReason};
-use crate::timer::{add_timer_ns, get_time_ns};
+use crate::timer::{add_timer_ns, get_realtime_ns, get_time_ns};
 use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
 
@@ -27,6 +27,50 @@ fn current_tid() -> usize {
         .as_ref()
         .unwrap()
         .tid
+}
+
+/// 把 futex 的超时参数归一化成一个绝对 **CLOCK_MONOTONIC** 截止时刻（纳秒）。
+///
+/// 内核定时器队列（`check_timer`）只按单调时钟判定到期，所以所有 futex 等待的
+/// 截止时刻都必须落在单调时间轴上：
+/// - `FUTEX_WAIT`：`timeout` 是相对时长 → `单调现值 + 时长`。
+/// - `FUTEX_WAIT_BITSET`：`timeout` 是绝对截止时刻。默认基于 CLOCK_MONOTONIC；
+///   若设置了 `FUTEX_CLOCK_REALTIME`，则它是一个绝对 realtime 时刻——这里换算成
+///   “还剩多久”再加到单调现值上，从而仍在正确的墙钟时刻到期。glibc 的
+///   `pthread_cond_timedwait` / `pthread_mutex_timedlock` 正是走这条绝对超时路径。
+///
+/// `timeout_ptr` 为空指针时返回 `Ok(None)`（永久等待）。
+fn futex_deadline_mono_ns(
+    timeout_ptr: *const Timespec,
+    absolute: bool,
+    realtime: bool,
+) -> Result<Option<u64>, ERRNO> {
+    if timeout_ptr.is_null() {
+        return Ok(None);
+    }
+    let ts = read_pod_from_user(timeout_ptr)?;
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let value_ns = (ts.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|sec_ns| sec_ns.checked_add(ts.tv_nsec as u64))
+        .ok_or(ERRNO::EINVAL)?;
+    let mono_now = get_time_ns();
+    let deadline = if absolute {
+        if realtime {
+            // value 是绝对 realtime 时刻：先求剩余时长，再换算到单调轴。
+            let remaining = value_ns.saturating_sub(get_realtime_ns());
+            mono_now.saturating_add(remaining)
+        } else {
+            // value 已经是绝对单调时刻。
+            value_ns
+        }
+    } else {
+        // 相对时长（始终相对单调时钟）。
+        mono_now.checked_add(value_ns).ok_or(ERRNO::EINVAL)?
+    };
+    Ok(Some(deadline))
 }
 
 
@@ -60,7 +104,12 @@ pub fn sys_futex(
                     return Err(ERRNO::EINVAL);
                 }
                 let timeout_ptr = (!timeout.eq(&0)).then_some(timeout as *const Timespec);
-                futex_wait_addr(uaddr, val, timeout_ptr)
+                // FUTEX_WAIT 的超时是相对时长，且只针对 CLOCK_MONOTONIC。
+                let deadline = match timeout_ptr {
+                    Some(ptr) => futex_deadline_mono_ns(ptr, false, false)?,
+                    None => None,
+                };
+                futex_wait_addr(uaddr, val, deadline)
             }
             FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
             FUTEX_REQUEUE => {
@@ -101,14 +150,6 @@ pub fn sys_futex(
                     );
                     return Err(ERRNO::EINVAL);
                 }
-                if timeout != 0 {
-                    warn!(
-                        "Unsupported futex WAIT_BITSET timeout: op={:#x} timeout={:#x}",
-                        op,
-                        timeout
-                    );
-                    return Err(ERRNO::EINVAL);
-                }
                 let supported_flags = FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME;
                 if flags & !supported_flags != 0 {
                     warn!(
@@ -118,7 +159,18 @@ pub fn sys_futex(
                     );
                     return Err(ERRNO::EINVAL);
                 }
-                futex_wait_addr(uaddr, val, None)
+                // WAIT_BITSET 的超时是**绝对**截止时刻；FUTEX_CLOCK_REALTIME 决定其
+                // 时钟基准。这条路径是 glibc `pthread_cond_timedwait` /
+                // `pthread_mutex_timedlock` 的依赖，之前一律按 EINVAL 拒绝。
+                let timeout_ptr = (!timeout.eq(&0)).then_some(timeout as *const Timespec);
+                let deadline = match timeout_ptr {
+                    Some(ptr) => {
+                        let realtime = flags & FUTEX_CLOCK_REALTIME != 0;
+                        futex_deadline_mono_ns(ptr, true, realtime)?
+                    }
+                    None => None,
+                };
+                futex_wait_addr(uaddr, val, deadline)
             }
             FUTEX_WAKE_BITSET => {
                 let flags = op & !FUTEX_CMD_MASK;
