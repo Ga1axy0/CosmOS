@@ -82,6 +82,8 @@ pub struct DeferredKernelRecycleState {
     deferred_va_range_count: usize,
     /// 记录尚未经过全局 flush 的页框。
     deferred_frames: Vec<FrameTracker>,
+    /// 记录 flush 完成后才能归还的 kernel stack id。
+    deferred_kstack_ids: Vec<usize>,
 }
 
 impl DeferredKernelRecycleState {
@@ -91,6 +93,7 @@ impl DeferredKernelRecycleState {
             deferred_va_ranges: Vec::new(),
             deferred_va_range_count: 0,
             deferred_frames: Vec::new(),
+            deferred_kstack_ids: Vec::new(),
         }
     }
 
@@ -104,6 +107,7 @@ impl DeferredKernelRecycleState {
         &mut self,
         mut range: DeferredVaRange,
         mut frames: Vec<FrameTracker>,
+        kstack_id: Option<usize>,
     ) {
         if range.start >= range.end {
             return;
@@ -133,6 +137,9 @@ impl DeferredKernelRecycleState {
         self.deferred_va_ranges.insert(idx, range);
         self.deferred_va_range_count += 1;
         self.deferred_frames.append(&mut frames);
+        if let Some(kstack_id) = kstack_id {
+            self.deferred_kstack_ids.push(kstack_id);
+        }
     }
 
     /// 判断给定虚拟地址区间是否仍然处于 deferred 状态。
@@ -151,7 +158,8 @@ impl DeferredKernelRecycleState {
         let ranges = self.deferred_va_ranges.drain(..).collect();
         self.deferred_va_range_count = 0;
         let frames = self.deferred_frames.drain(..).collect();
-        DeferredBatch { ranges, frames }
+        let kstack_ids = self.deferred_kstack_ids.drain(..).collect();
+        DeferredBatch { ranges, frames, kstack_ids }
     }
 }
 
@@ -161,12 +169,14 @@ pub struct DeferredBatch {
     pub ranges: Vec<DeferredVaRange>,
     /// 本批次可以真正归还 allocator 的页框。
     pub frames: Vec<FrameTracker>,
+    /// 本批次可以重新放回 kernel stack allocator 的 id。
+    pub kstack_ids: Vec<usize>,
 }
 
 impl DeferredBatch {
     /// 判断当前批次是否为空。
     pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty() && self.frames.is_empty()
+        self.ranges.is_empty() && self.frames.is_empty() && self.kstack_ids.is_empty()
     }
 }
 
@@ -188,13 +198,13 @@ const KIND_ADDRESS_SPACE: usize = 1;
 pub fn defer_release(
     start: usize,
     end: usize,
+    kstack_id: Option<usize>,
     frames: Vec<FrameTracker>,
 ) {
-    let _launch_guard = TLB_SHOOTDOWN_LAUNCH_LOCK.lock();
     let frame_count = frames.len();
     DEFERRED_KERNEL_RECYCLE_STATE
         .lock()
-        .mark_va_range_deferred(DeferredVaRange { start, end }, frames);
+        .mark_va_range_deferred(DeferredVaRange { start, end }, frames, kstack_id);
     debug!(
         "[tlb] defer kernel va range [{:#x}, {:#x}), frames={}",
         start, end, frame_count
@@ -220,10 +230,17 @@ pub fn deferred_frame_count() -> usize {
     DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_frames.len()
 }
 
+/// 返回当前等待 flush 后回收的 kernel stack id 数量。
+pub fn deferred_kstack_id_count() -> usize {
+    DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_kstack_ids.len()
+}
+
 /// 判断当前是否存在待后续全局 flush 处理的内核态延迟回收状态。
 pub fn has_deferred() -> bool {
     let state = DEFERRED_KERNEL_RECYCLE_STATE.lock();
-    state.deferred_va_range_count != 0 || !state.deferred_frames.is_empty()
+    state.deferred_va_range_count != 0
+        || !state.deferred_frames.is_empty()
+        || !state.deferred_kstack_ids.is_empty()
 }
 
 /// 提取并清空当前全部 deferred 回收状态。
@@ -326,26 +343,24 @@ pub fn shootdown_global() {
 
 /// 完成一次“刷新后提交 deferred 回收”的同步点。
 pub fn flush_deferred(hart_mask: usize) {
-    let _launch_guard = TLB_SHOOTDOWN_LAUNCH_LOCK.lock();
-    if !has_deferred() {
-        return;
-    }
     let deferred_ranges = deferred_range_count();
     let deferred_frames = deferred_frame_count();
+    let mut batch = take_deferred();
+    if batch.is_empty() {
+        return;
+    }
     debug!(
         "[tlb] flush deferred recycle on mask={:#b}, ranges={}, frames={}",
         hart_mask, deferred_ranges, deferred_frames
     );
-    shootdown_inner(hart_mask, ShootdownKind::Global);
-    let batch = DEFERRED_KERNEL_RECYCLE_STATE.lock().take_all();
-    if batch.is_empty() {
-        return;
-    }
+    shootdown(hart_mask, ShootdownKind::Global);
     debug!(
         "[tlb] reclaim deferred batch: ranges={}, frames={}",
         batch.ranges.len(),
         batch.frames.len()
     );
+    let kstack_ids = core::mem::take(&mut batch.kstack_ids);
+    crate::task::recycle_deferred_kstack_ids(kstack_ids);
     // 这里通过显式丢弃批次，让其中的 FrameTracker 在 flush 完成后统一回收。
     drop(batch);
 }

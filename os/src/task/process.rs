@@ -28,9 +28,10 @@ use alloc::vec::Vec;
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const MUSL_LIBC_FALLBACK: &str = "/musl/lib/libc.so";
-const MUSL_INTERP_PATHS: [&str; 2] = [
+const MUSL_INTERP_PATHS: [&str; 3] = [
     "/lib/ld-musl-riscv64-sf.so.1",
     "/lib/ld-musl-riscv64.so.1",
+    "/lib/ld-linux-riscv64-lp64d.so.1"
 ];
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
