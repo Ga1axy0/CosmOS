@@ -1,5 +1,5 @@
 use crate::config::PAGE_SIZE;
-use crate::mm::{translated_byte_buffer, PageFaultAccess, PageTable, VirtAddr};
+use crate::mm::{translated_byte_buffer, MmError, PageFaultAccess, PageFaultHandled, PageTable, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::task::{current_process, current_user_token, ProcessControlBlock};
 
@@ -63,31 +63,54 @@ fn prefault_user_pages(
             Some(pte) => {
                 // 映射已存在但不可写：可能是 COW 或 MAP_SHARED 写通知页。
                 if access == PageFaultAccess::Write && !pte.writable() {
-                    if !process.handle_private_cow_fault(page_start) {
+                    if process
+                        .handle_private_cow_fault(page_start)
+                        .map_err(|err| match err {
+                            MmError::OutOfMemory => ERRNO::ENOMEM,
+                            _ => ERRNO::EFAULT,
+                        })?
+                        != PageFaultHandled::Handled
+                    {
                         match process.handle_file_page_fault(page_start, PageFaultAccess::Write) {
-                            Ok(()) => {}
-                            // 用户态缺页此场景会被视为 SIGBUS，这里按 copyin/copyout 语义返回 EFAULT。
-                            Err(ERRNO::ENXIO) => return Err(ERRNO::EFAULT),
-                            Err(e) => return Err(e),
+                            Ok(PageFaultHandled::Handled) => {}
+                            Ok(PageFaultHandled::NotHandled) => return Err(ERRNO::EFAULT),
+                            Err(MmError::BeyondFileEnd) => return Err(ERRNO::EFAULT),
+                            Err(MmError::OutOfMemory) => return Err(ERRNO::ENOMEM),
+                            Err(_) => return Err(ERRNO::EFAULT),
                         }
                     }
                 }
             }
             None => {
-                if access == PageFaultAccess::Write && process.handle_private_cow_fault(page_start)
+                if access == PageFaultAccess::Write
+                    && process
+                        .handle_private_cow_fault(page_start)
+                        .map_err(|err| match err {
+                            MmError::OutOfMemory => ERRNO::ENOMEM,
+                            _ => ERRNO::EFAULT,
+                        })?
+                        == PageFaultHandled::Handled
                 {
                     page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
                     continue;
                 }
-                if process.handle_lazy_heap_fault(page_start, access) {
+                if process
+                    .handle_lazy_user_fault(page_start, access)
+                    .map_err(|err| match err {
+                        MmError::OutOfMemory => ERRNO::ENOMEM,
+                        _ => ERRNO::EFAULT,
+                    })?
+                    == PageFaultHandled::Handled
+                {
                     page_start = page_start.checked_add(PAGE_SIZE).ok_or(ERRNO::EFAULT)?;
                     continue;
                 }
                 match process.handle_file_page_fault(page_start, access) {
-                    Ok(()) => {}
-                    // 用户态缺页此场景会被视为 SIGBUS，这里按 copyin/copyout 语义返回 EFAULT。
-                    Err(ERRNO::ENXIO) => return Err(ERRNO::EFAULT),
-                    Err(e) => return Err(e),
+                    Ok(PageFaultHandled::Handled) => {}
+                    Ok(PageFaultHandled::NotHandled) => return Err(ERRNO::EFAULT),
+                    Err(MmError::BeyondFileEnd) => return Err(ERRNO::EFAULT),
+                    Err(MmError::OutOfMemory) => return Err(ERRNO::ENOMEM),
+                    Err(_) => return Err(ERRNO::EFAULT),
                 }
             }
         }
@@ -182,6 +205,20 @@ pub fn write_pod_to_process_user<T: Pod>(
     write_bytes_to_process_user(process, ptr as *mut u8, value_bytes)
 }
 
+/// 从指定进程的用户地址空间读取一段字节，允许跨越多个用户页。
+pub fn read_bytes_from_process_user(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<u8>, ERRNO> {
+    let buffers = translated_process_byte_buffer_with_access(process, ptr, len, PageFaultAccess::Read)?;
+    let mut bytes = Vec::with_capacity(len);
+    for buffer in buffers.iter() {
+        bytes.extend_from_slice(buffer);
+    }
+    Ok(bytes)
+}
+
 /// 从用户地址空间读取一段字节，允许跨越多个用户页。
 pub fn read_bytes_from_user(ptr: *const u8, len: usize) -> Result<Vec<u8>, ERRNO> {
     let buffers = translated_byte_buffer_with_access(ptr, len, PageFaultAccess::Read)?;
@@ -218,6 +255,19 @@ pub fn read_pod_from_user<T: Pod>(ptr: *const T) -> Result<T, ERRNO> {
     let mut value = MaybeUninit::<T>::uninit();
     let value_bytes =
     unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
+    value_bytes.copy_from_slice(&bytes);
+    Ok(unsafe { value.assume_init() })
+}
+
+/// 从指定进程的用户地址空间读取一个 POD 结构，允许结构体跨越多个用户页。
+pub fn read_pod_from_process_user<T: Pod>(
+    process: &Arc<ProcessControlBlock>,
+    ptr: *const T,
+) -> Result<T, ERRNO> {
+    let bytes = read_bytes_from_process_user(process, ptr as *const u8, size_of::<T>())?;
+    let mut value = MaybeUninit::<T>::uninit();
+    let value_bytes =
+        unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
     value_bytes.copy_from_slice(&bytes);
     Ok(unsafe { value.assume_init() })
 }

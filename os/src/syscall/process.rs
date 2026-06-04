@@ -1,4 +1,4 @@
-use crate::mm::{MapPermission, VirtAddr};
+use crate::mm::{MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
@@ -17,7 +17,7 @@ use crate::{
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -252,12 +252,12 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
             let seg = segment.lock();
             (seg.size, Arc::clone(&seg.desc))
         };
+        let len_aligned = size
+            .checked_add(crate::config::PAGE_SIZE - 1)
+            .ok_or(ERRNO::EOVERFLOW)?
+            & !(crate::config::PAGE_SIZE - 1);
         let process = current_process();
         let map_addr = if shmaddr == 0 {
-            let len_aligned = size
-                .checked_add(crate::config::PAGE_SIZE - 1)
-                .ok_or(ERRNO::EOVERFLOW)?
-                & !(crate::config::PAGE_SIZE - 1);
             let (chosen, chosen_end) = {
                 let mut inner = process.inner_exclusive_access();
                 inner.ensure_address_space_capacity(len_aligned)?;
@@ -276,9 +276,7 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
                     0,
                     true,
                 );
-                if !mapped {
-                    return Err(ERRNO::ENOMEM);
-                }
+                mapped.map_err(|_| ERRNO::ENOMEM)?;
                 inner.vm_layout.mmap_hint = chosen_end;
                 (chosen, chosen_end)
             };
@@ -292,17 +290,22 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
                 ipc::detach_segment(shmid);
                 return Err(ERRNO::EINVAL);
             }
+            let end = shmaddr.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
+            if shmaddr >= USER_SPACE_END || end > USER_SPACE_END {
+                ipc::detach_segment(shmid);
+                return Err(ERRNO::ENOMEM);
+            }
             let ok = process.mmap_file(
                 VirtAddr::from(shmaddr),
-                VirtAddr::from(shmaddr.checked_add(size).ok_or(ERRNO::EOVERFLOW)?),
+                VirtAddr::from(end),
                 MapPermission::R | MapPermission::W | MapPermission::U,
                 desc,
                 0,
                 true,
             );
-            if !ok {
+            if let Err(err) = ok {
                 ipc::detach_segment(shmid);
-                return Err(ERRNO::ENOMEM);
+                return Err(err);
             }
             shmaddr
         };
@@ -597,12 +600,18 @@ pub fn sys_clone(
                 )
             };
             let inherited_cx = *current_trap_cx();
-            let new_task = current_process.create_task(ustack_base, true, sched_attr);
+            let new_task = current_process
+                .create_task(ustack_base, true, sched_attr)
+                .map_err(|_| ERRNO::ENOMEM)?;
             let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
             let new_inner_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid;
             debug!(
-                "kernel: sys_clone thread: new_tid(thread_id)={} inner_tid={} parent_set_tid_addr={:#x}",
-                new_tid, new_inner_tid, parent_set_tid.unwrap_or(0)
+                "kernel: sys_clone thread: new_tid(thread_id)={} inner_tid={} parent_set_tid_addr={:#x} child_set_tid_addr={:#x} clear_child_tid_addr={:#x}",
+                new_tid,
+                new_inner_tid,
+                parent_set_tid.unwrap_or(0),
+                child_set_tid.unwrap_or(0),
+                if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) { child_tid } else { 0 }
             );
             {
                 let mut new_inner = new_task.inner_exclusive_access();
@@ -632,7 +641,7 @@ pub fn sys_clone(
             add_task(new_task);
             Ok(new_tid as isize)
         } else {
-            let new_process = current_process.clone_process(stack, child_tls, child_set_tid);
+            let new_process = current_process.clone_process(stack, child_tls, child_set_tid)?;
             let child_pid = new_process.getpid() as i32;
             debug!(
                 "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
@@ -785,8 +794,8 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 let task = current_task().unwrap();
                 let inner = process.inner_exclusive_access();
                 let task_inner = task.inner_exclusive_access();
-                let pending_unmasked =
-                    (task_inner.pending_signals | inner.pending_signals) & !task_inner.signal_mask;
+                let pending_unmasked = (task_inner.pending_signals | inner.pending_signals)
+                    & !task_inner.signal_mask.without_unblockable();
                 let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
                     let Some(flag) = SignalBit::from_signum(signum as u32) else { return false; };
                     if !pending_unmasked.contains(flag) {
@@ -804,7 +813,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 }
 
 /// kill syscall
-pub fn sys_kill(pid: usize, signal: u32) -> isize {
+pub fn sys_kill(pid: isize, signal: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_kill pid:{} signal:{}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -812,11 +821,51 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         signal
     );
     syscall_body!({
-        let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
-        let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        let flag = if signal == 0 {
+            None
+        } else {
+            Some(SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?)
+        };
         let sender = current_process();
         let siginfo = SigInfo::for_kill(signal as i32, sender.getpid(), sender.getuid());
-        crate::task::add_signal_to_process_with_siginfo(&process, flag, siginfo);
+        let sender_pid = sender.getpid();
+        let sender_pgid = sender.getpgid() as usize;
+        let targets = match pid {
+            n if n > 0 => vec![pid2process(n as usize).or_errno(ERRNO::ESRCH)?],
+            0 => list_pids()
+                .into_iter()
+                .filter_map(pid2process)
+                .filter(|process| process.getpgid() as usize == sender_pgid)
+                .collect::<Vec<_>>(),
+            -1 => list_pids()
+                .into_iter()
+                .filter(|&target_pid| target_pid != 0)
+                .filter_map(pid2process)
+                .collect::<Vec<_>>(),
+            n => {
+                let target_pgid = n.unsigned_abs();
+                list_pids()
+                    .into_iter()
+                    .filter_map(pid2process)
+                    .filter(|process| process.getpgid() as usize == target_pgid)
+                    .collect::<Vec<_>>()
+            }
+        };
+        if targets.is_empty() {
+            return Err(ERRNO::ESRCH);
+        }
+        if let Some(flag) = flag {
+            for process in targets {
+                debug!(
+                    "sys_kill: sender_pid={} target_pid={} target_pgid={} pid_arg={}",
+                    sender_pid,
+                    process.getpid(),
+                    process.getpgid(),
+                    pid
+                );
+                crate::task::add_signal_to_process_with_siginfo(&process, flag, siginfo);
+            }
+        }
         Ok(0)
     })
 }

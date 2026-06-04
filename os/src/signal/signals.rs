@@ -138,6 +138,11 @@ impl SignalNum {
 pub struct SignalBit(u64);
 
 impl SignalBit {
+    /// Signals that POSIX/Linux never allow user masks to block.
+    pub const fn unblockable() -> Self {
+        Self(Self::SIGKILL.bits() | Self::SIGSTOP.bits())
+    }
+
     /// 空信号集。
     pub const fn empty() -> Self {
         Self(0)
@@ -169,7 +174,7 @@ impl SignalBit {
     /// 从 Linux `sigset_t` 低 64 位构造集合，暂时忽略未支持的高位信号。
     pub fn from_user_bits(bits: u64) -> Self {
         // TODO: 当前只支持 1..=31 号信号，未来扩展实时信号后需要保留更多位。
-        Self(bits & SUPPORTED_SIGNAL_BITS)
+        Self(bits & SUPPORTED_SIGNAL_BITS).without_unblockable()
     }
 
     /// 返回 Linux `sigset_t` 低 64 位布局。
@@ -200,6 +205,11 @@ impl SignalBit {
     /// 移除指定集合。
     pub fn remove(&mut self, other: Self) {
         self.0 &= !other.0;
+    }
+
+    /// Strip SIGKILL/SIGSTOP from a user-provided signal mask.
+    pub const fn without_unblockable(self) -> Self {
+        Self(self.0 & !Self::unblockable().0)
     }
 
     /// Map currently pending fatal signals to a signal number and log string.

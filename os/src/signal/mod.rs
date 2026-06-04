@@ -55,7 +55,8 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction, SigInfo)> {
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
     let thread_pending = task_inner.pending_signals;
-    let pending = (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask;
+    let pending =
+        (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask.without_unblockable();
 
     // Find the first pending signal
     for signum in 1..=MAX_SIG {
@@ -132,15 +133,20 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction, SigInfo)> {
 /// This modifies the trap context to call the signal handler when returning to user space.
 /// Constructs a Linux-style sigframe with ucontext_t and siginfo_t.
 ///
+/// Returns `Some(signum)` when signal delivery cannot be completed and the
+/// current thread should be terminated with that signal instead of returning to
+/// the faulting instruction. This mirrors Linux's behavior for cases like a
+/// corrupted user stack where the kernel cannot build a signal frame.
+///
 /// Stack layout (from high to low address):
 ///   [original sp]
 ///   ... (grows down)
 ///   [siginfo_t] (if SA_SIGINFO)
 ///   [ucontext_t] <- aligned sp (this is what sp points to on entry to handler)
-pub fn handle_signals() {
+pub fn handle_signals() -> Option<i32> {
     let (signum, action, siginfo) = match check_signals_of_current() {
         Some(signal_info) => signal_info,
-        None => return,
+        None => return None,
     };
 
     let trap_cx = current_trap_cx();
@@ -177,6 +183,7 @@ pub fn handle_signals() {
             .signal_mask_backup
             .take()
             .unwrap_or(inner.signal_mask)
+            .without_unblockable()
             .bits()
     };
 
@@ -196,7 +203,7 @@ pub fn handle_signals() {
     if trap_cx.in_syscall {
         let result = trap_cx.x[10] as isize;
         if result == -(crate::syscall::errno::ERRNO::EINTR as isize) {
-            if action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
+            if trap_cx.restartable_syscall && action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
                 debug!(
                     "handle_signals: syscall restart: backing up PC from {:#x} to {:#x}, restoring a0 from {:#x} to {:#x}",
                     mcontext.gregs[0], trap_cx.sepc.wrapping_sub(4),
@@ -204,6 +211,10 @@ pub fn handle_signals() {
                 );
                 mcontext.gregs[0] = trap_cx.sepc.wrapping_sub(4);
                 mcontext.gregs[10] = trap_cx.orig_a0;
+            } else if action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
+                debug!(
+                    "handle_signals: syscall returned EINTR but syscall is not restartable, preserving EINTR"
+                );
             }
         } else {
             debug!(
@@ -236,7 +247,7 @@ pub fn handle_signals() {
             "[kernel] handle_signals: failed to write ucontext for signal {}: {:?}",
             signum, err
         );
-        return;
+        return Some(signum);
     }
 
     // Write siginfo if SA_SIGINFO is set
@@ -246,7 +257,7 @@ pub fn handle_signals() {
                 "[kernel] handle_signals: failed to write siginfo for signal {}: {:?}",
                 signum, err
             );
-            return;
+            return Some(signum);
         }
     }
 
@@ -306,4 +317,5 @@ pub fn handle_signals() {
         "handle_signals: setup complete, jumping to handler={:#x}, ra={:#x}, sp={:#x}",
         trap_cx.sepc, trap_cx.x[1], trap_cx.x[2]
     );
+    None
 }

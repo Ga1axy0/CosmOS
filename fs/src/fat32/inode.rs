@@ -1,5 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use core::fmt;
 use spin::Mutex;
 
 use crate::{
@@ -474,6 +475,16 @@ impl FatInode {
             last = newc;
             have_clusters += 1;
         }
+    }
+}
+
+impl fmt::Debug for FatInode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.inner.lock();
+        f.debug_struct("FatInode")
+            .field("fs_ptr", &format_args!("{:p}", Arc::as_ptr(&self.fs)))
+            .field("inner", &*inner)
+            .finish()
     }
 }
 

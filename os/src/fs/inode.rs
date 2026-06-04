@@ -1,6 +1,7 @@
 use super::{page_cache, File, Stat, StatFs64, StatMode};
 use super::devfs::{NullDevNode, UrandomDevNode};
-use super::rootfs::{MemDirNode, VirtualDirNode, VIRT_ROOT};
+use super::rootfs::{VirtualDirNode, VIRT_ROOT};
+use super::tmpfs::new_tmpfs_root;
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -196,9 +197,11 @@ fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
     let (parent_path, name) = split_for_mount(abs_path);
     let parent_vdir = ensure_virtual_dir(parent_path)?;
 
-    // If the backing FS has a directory at this name, use it as the overlay of
-    // the new virtual dir so its contents remain visible.
-    let child_overlay: Option<Arc<dyn VfsNode>> = parent_vdir.overlay_child_dir(name);
+    // If the current namespace already has a directory at this name (whether
+    // from an explicit mount or from the backing overlay), preserve it as the
+    // overlay of the new virtual dir so mount wrappers do not hide existing
+    // mount points like `/tmp`.
+    let child_overlay: Option<Arc<dyn VfsNode>> = parent_vdir.namespace_child_dir(name);
 
     let new_vdir = VirtualDirNode::new();
     if let Some(ov) = child_overlay {
@@ -318,13 +321,10 @@ pub fn init_rootfs() {
         // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
     }
 
-    // Automatically make a /tmp directory if it doesn't exist, since many apps expect it.
-    if lookup_inode_follow("/", "/tmp", true).is_err() {
-        match mkdir_at("/", "/tmp") {
-            Ok(()) => info!("[kernel] created missing /tmp"),
-            Err(e) => warn!("[kernel] failed to create /tmp, errno={}", e as isize),
-        }
-    }
+    let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
+    do_mount("/tmp", tmpfs_root)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount tmpfs at /tmp"));
+    record_mount("/tmp", "tmpfs", "tmpfs", "rw");
 
     info!("[kernel] rootfs initialised");
 }
@@ -858,6 +858,10 @@ impl File for OSInode {
         page_cache::truncate_inode(&self.inode, new_size).map_err(ERRNO::from)
     }
 
+    fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), ERRNO> {
+        page_cache::fallocate_inode(&self.inode, mode, offset, len).map_err(ERRNO::from)
+    }
+
     fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
         let vfs_node = self.inode.vfs_node();
         if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
@@ -865,62 +869,11 @@ impl File for OSInode {
         }
         Err(ERRNO::ENOTTY)
     }
-    /// Fill `buf` with `linux_dirent64` records from the directory.
-    ///
-    /// `offset` is used as an **entry index** (not a byte offset) so that
-    /// callers can place the shared directory position in `FileDescription`.
-    ///
-    /// Each record layout (`linux_dirent64`):
-    /// ```text
-    ///   +0   d_ino    u64  (entry index)
-    ///   +8   d_off    i64  (index of next entry, −1 for last)
-    ///   +16  d_reclen u16  (total length of this record, aligned to 8 B)
-    ///   +18  d_type   u8   (DT_DIR=4, DT_REG=8, DT_UNKNOWN=0)
-    ///   +19  d_name[] null-terminated name, padded to make reclen a multiple of 8
-    /// ```
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
         if !self.inode.is_dir() {
             return 0;
         }
-        let entries = self.inode.ls();
-        let start_idx = offset; // entry index, not byte offset
-        let mut written = 0usize;
-
-        for (i, (name, file_type)) in entries.iter().enumerate().skip(start_idx) {
-            let name_bytes = name.as_bytes();
-            // reclen must be a multiple of 8
-            let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
-            if written + reclen > buf.len() {
-                break;
-            }
-            // d_ino (u64)
-            buf[written..written + 8].copy_from_slice(&(i as u64).to_le_bytes());
-            // d_off (i64): offset of *next* entry
-            let next_off = (i + 1) as i64;
-            buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
-            // d_reclen (u16)
-            buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            // d_type (u8): DT_DIR=4, DT_LNK=10, DT_REG=8
-            let dtype: u8 = match file_type {
-                VfsFileType::Directory => 4,
-                VfsFileType::Symlink => 10,
-                VfsFileType::Char => 2,
-                VfsFileType::Block => 6,
-                VfsFileType::Fifo => 1,
-                VfsFileType::Socket => 12,
-                VfsFileType::Regular => 8,
-                VfsFileType::Unknown => 0,
-            };
-            buf[written + 18] = dtype;
-            // d_name: null-terminated, zero-padded to reclen
-            buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
-            buf[written + 19 + name_bytes.len()] = 0;
-            for b in &mut buf[written + 19 + name_bytes.len() + 1..written + reclen] {
-                *b = 0;
-            }
-            written += reclen;
-        }
-        written
+        self.inode.getdents64(offset, buf)
     }
 
     fn is_seekable(&self) -> bool {
@@ -1023,7 +976,10 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 pub fn init_dev() {
     let dev_dir = ensure_virtual_dir("/dev")
         .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
-    dev_dir.bind("shm", MemDirNode::new() as Arc<dyn VfsNode>);
+    let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
+    do_mount("/dev/shm", tmpfs_root)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount tmpfs at /dev/shm"));
+    record_mount("/dev/shm", "tmpfs", "tmpfs", "rw");
     // Register special character devices under /dev
     let null_node = Arc::new(NullDevNode::new());
     dev_dir.bind("null", null_node as Arc<dyn VfsNode>);
@@ -1109,5 +1065,13 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
 
     do_mount(abs_mnt, fs_root)?;
     record_mount(abs_mnt, &canonicalize("/", dev_path), fs_type, "rw");
+    Ok(())
+}
+
+/// Mount a fresh tmpfs instance at `abs_mnt`.
+pub fn mount_tmpfs(abs_mnt: &str) -> Result<(), ERRNO> {
+    let fs_root = Inode::from_vfs_node(new_tmpfs_root());
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, "tmpfs", "tmpfs", "rw");
     Ok(())
 }

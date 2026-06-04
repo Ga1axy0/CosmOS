@@ -16,10 +16,9 @@ mod context;
 
 use crate::config::{PAGE_SIZE, TRAMPOLINE};
 use crate::hart::hartid;
-use crate::mm::{handle_ipi, PageFaultAccess};
+use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
 use crate::signal::{SignalBit, handle_signals};
-use crate::syscall::syscall;
-use crate::syscall::errno::ERRNO;
+use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
@@ -76,6 +75,24 @@ fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
         cx.x[29],
         cx.x[30],
         cx.x[31],
+    );
+}
+
+fn log_lazy_fault_oom(path: &str, access: &str, fault_addr: usize) {
+    let cx = current_trap_cx();
+    error!(
+        "[kernel] fatal lazy-fault OOM: path={}, access={}, pid={}, fault_addr={:#x}, user_pc={:#x}, ra={:#x}, sp={:#x}, tp={:#x}, a0={:#x}, a1={:#x}, a7={:#x}",
+        path,
+        access,
+        current_process().getpid(),
+        fault_addr,
+        cx.sepc,
+        cx.x[1],
+        cx.x[2],
+        cx.x[4],
+        cx.x[10],
+        cx.x[11],
+        cx.x[17],
     );
 }
 
@@ -169,6 +186,7 @@ pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
     current_process().enter_kernel(get_time());
     current_trap_cx().in_syscall = false;
+    current_trap_cx().restartable_syscall = false;
     let scause = scause::read();
     let stval = stval::read();
     // trace!("into {:?}", scause.cause());
@@ -179,6 +197,7 @@ pub fn trap_handler() -> ! {
             let syscall_id = cx.x[17];
             let syscall_args = [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]];
             cx.orig_a0 = cx.x[10];
+            cx.restartable_syscall = syscall_supports_sa_restart(syscall_id);
             cx.sepc += 4;
             // get system call return value
             let result = syscall(syscall_id, syscall_args);
@@ -194,14 +213,43 @@ pub fn trap_handler() -> ! {
                 current_trap_cx().sepc
             );
             let process = current_process();
-            let handled = process.handle_private_cow_fault(stval)
-                || process.handle_lazy_heap_fault(stval, PageFaultAccess::Write);
+            let mut handled = false;
+            match process.handle_private_cow_fault(stval) {
+                Ok(PageFaultHandled::Handled) => handled = true,
+                Ok(PageFaultHandled::NotHandled) => {}
+                Err(MmError::OutOfMemory) => {
+                    log_lazy_fault_oom("private_cow", "write", stval);
+                    current_add_signal(SignalBit::SIGKILL);
+                    handled = true;
+                }
+                Err(_) => {}
+            }
+            if !handled {
+                match process.handle_lazy_user_fault(stval, PageFaultAccess::Write) {
+                    Ok(PageFaultHandled::Handled) => handled = true,
+                    Ok(PageFaultHandled::NotHandled) => {}
+                    Err(MmError::OutOfMemory) => {
+                        log_lazy_fault_oom("lazy_user", "write", stval);
+                        current_add_signal(SignalBit::SIGKILL);
+                        handled = true;
+                    }
+                    Err(_) => {}
+                }
+            }
             if !handled {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Write) {
-                    Ok(()) => {}
-                    Err(ERRNO::ENXIO) => {
+                    Ok(PageFaultHandled::Handled) => {}
+                    Ok(PageFaultHandled::NotHandled) => {
+                        log_user_fault("store page fault", "write", stval, "SIGSEGV");
+                        current_add_signal(SignalBit::SIGSEGV);
+                    }
+                    Err(MmError::BeyondFileEnd) => {
                         log_user_fault("store page fault beyond file EOF", "write", stval, "SIGBUS");
                         current_add_signal(SignalBit::SIGBUS);
+                    }
+                    Err(MmError::OutOfMemory) => {
+                        log_lazy_fault_oom("file_mmap", "write", stval);
+                        current_add_signal(SignalBit::SIGKILL);
                     }
                     Err(_) => {
                         log_user_fault("store page fault", "write", stval, "SIGSEGV");
@@ -229,12 +277,31 @@ pub fn trap_handler() -> ! {
             //     stval,
             //     current_trap_cx().sepc
             // );
-            if !current_process().handle_lazy_heap_fault(stval, PageFaultAccess::Read) {
+            let mut handled = false;
+            match current_process().handle_lazy_user_fault(stval, PageFaultAccess::Read) {
+                Ok(PageFaultHandled::Handled) => handled = true,
+                Ok(PageFaultHandled::NotHandled) => {}
+                Err(MmError::OutOfMemory) => {
+                    log_lazy_fault_oom("lazy_user", "read", stval);
+                    current_add_signal(SignalBit::SIGKILL);
+                    handled = true;
+                }
+                Err(_) => {}
+            }
+            if !handled {
                 match current_process().handle_file_page_fault(stval, PageFaultAccess::Read) {
-                    Ok(()) => {}
-                    Err(ERRNO::ENXIO) => {
+                    Ok(PageFaultHandled::Handled) => {}
+                    Ok(PageFaultHandled::NotHandled) => {
+                        log_user_fault("load page fault", "read", stval, "SIGSEGV");
+                        current_add_signal(SignalBit::SIGSEGV);
+                    }
+                    Err(MmError::BeyondFileEnd) => {
                         log_user_fault("load page fault beyond file EOF", "read", stval, "SIGBUS");
                         current_add_signal(SignalBit::SIGBUS);
+                    }
+                    Err(MmError::OutOfMemory) => {
+                        log_lazy_fault_oom("file_mmap", "read", stval);
+                        current_add_signal(SignalBit::SIGKILL);
                     }
                     Err(_) => {
                         log_user_fault("load page fault", "read", stval, "SIGSEGV");
@@ -249,15 +316,36 @@ pub fn trap_handler() -> ! {
                 stval,
                 current_trap_cx().sepc
             );
-            match current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
-                Ok(()) => {}
-                Err(ERRNO::ENXIO) => {
-                    log_user_fault("instruction page fault beyond file EOF", "exec", stval, "SIGBUS");
-                    current_add_signal(SignalBit::SIGBUS);
+            let mut handled = false;
+            match current_process().handle_lazy_user_fault(stval, PageFaultAccess::Exec) {
+                Ok(PageFaultHandled::Handled) => handled = true,
+                Ok(PageFaultHandled::NotHandled) => {}
+                Err(MmError::OutOfMemory) => {
+                    log_lazy_fault_oom("lazy_user", "exec", stval);
+                    current_add_signal(SignalBit::SIGKILL);
+                    handled = true;
                 }
-                Err(_) => {
-                    log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
-                    current_add_signal(SignalBit::SIGSEGV);
+                Err(_) => {}
+            }
+            if !handled {
+                match current_process().handle_file_page_fault(stval, PageFaultAccess::Exec) {
+                    Ok(PageFaultHandled::Handled) => {}
+                    Ok(PageFaultHandled::NotHandled) => {
+                        log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
+                        current_add_signal(SignalBit::SIGSEGV);
+                    }
+                    Err(MmError::BeyondFileEnd) => {
+                        log_user_fault("instruction page fault beyond file EOF", "exec", stval, "SIGBUS");
+                        current_add_signal(SignalBit::SIGBUS);
+                    }
+                    Err(MmError::OutOfMemory) => {
+                        log_lazy_fault_oom("file_mmap", "exec", stval);
+                        current_add_signal(SignalBit::SIGKILL);
+                    }
+                    Err(_) => {
+                        log_user_fault("instruction page fault", "exec", stval, "SIGSEGV");
+                        current_add_signal(SignalBit::SIGSEGV);
+                    }
                 }
             }
         }
@@ -306,8 +394,13 @@ pub fn trap_handler() -> ! {
         exit_current_and_run_next(ExitReason::Exit(0));
     }
     schedule_if_needed();
-    // Handle non-fatal signals before returning to user space
-    handle_signals();
+    // Handle user-installed signal handlers before returning to user space.
+    // If the kernel cannot build a signal frame (for example, because the user
+    // stack is already invalid), terminate the task instead of re-executing the
+    // same faulting instruction forever.
+    if let Some(signum) = handle_signals() {
+        exit_current_and_run_next(ExitReason::Signal(signum as u32));
+    }
     trap_return();
 }
 

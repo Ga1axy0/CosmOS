@@ -1,4 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt::Debug;
+use log::warn;
 use core::any::Any;
 use spin::Mutex;
 
@@ -85,10 +87,51 @@ pub enum VfsFileType {
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
 /// Implementations can be backed by different on-disk filesystems (EasyFS, FAT32, ext4, ...).
-pub trait VfsNode: Send + Sync + Any {
+pub trait VfsNode: Send + Sync + Any + Debug {
     fn as_any(&self) -> &dyn Any;
     /// List directory entries as `(name, file_type)` pairs.
     fn ls(&self) -> Vec<(String, VfsFileType)>;
+    /// Fill `buf` with `linux_dirent64` records starting from the backend-defined
+    /// directory position `offset`.
+    ///
+    /// The default implementation preserves the historical behavior used by the
+    /// in-tree backends: `offset` is treated as an entry index and the method
+    /// is implemented on top of `ls()`.
+    fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let entries = self.ls();
+        let mut written = 0usize;
+
+        for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
+            let name_bytes = name.as_bytes();
+            let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
+            if written + reclen > buf.len() {
+                break;
+            }
+
+            buf[written..written + 8].copy_from_slice(&(i as u64).to_le_bytes());
+            let next_off = (i + 1) as i64;
+            buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
+            buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            buf[written + 18] = match file_type {
+                VfsFileType::Directory => 4,
+                VfsFileType::Symlink => 10,
+                VfsFileType::Char => 2,
+                VfsFileType::Block => 6,
+                VfsFileType::Fifo => 1,
+                VfsFileType::Socket => 12,
+                VfsFileType::Regular => 8,
+                VfsFileType::Unknown => 0,
+            };
+            buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+            buf[written + 19 + name_bytes.len()] = 0;
+            for b in &mut buf[written + 19 + name_bytes.len() + 1..written + reclen] {
+                *b = 0;
+            }
+            written += reclen;
+        }
+
+        written
+    }
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     /// Create a sub-directory named `name` inside this directory.
@@ -111,6 +154,10 @@ pub trait VfsNode: Send + Sync + Any {
     fn clear(&self);
     /// 调整常规文件逻辑长度。
     fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Err(FS_ERRNO::EOPNOTSUPP)
+    }
+    /// Reserve or deallocate file space without forcing eager data materialisation.
+    fn fallocate(&self, _mode: i32, _offset: usize, _len: usize) -> Result<(), FS_ERRNO> {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
@@ -263,6 +310,8 @@ pub struct Inode {
 struct InodeState {
     /// 由 OS 层按需挂载的 page cache 宿主对象。
     page_cache: Option<Arc<dyn Any + Send + Sync>>,
+    /// 最近一次读取到的 stat 元数据快照。
+    stat_attrs: Option<VfsAttrs>,
 }
 
 impl Inode {
@@ -270,7 +319,10 @@ impl Inode {
     fn new(inner: Arc<dyn VfsNode>) -> Self {
         Self {
             inner,
-            state: Mutex::new(InodeState { page_cache: None }),
+            state: Mutex::new(InodeState {
+                page_cache: None,
+                stat_attrs: None,
+            }),
         }
     }
 
@@ -291,6 +343,10 @@ impl Inode {
 
     pub fn ls(&self) -> Vec<(String, VfsFileType)> {
         self.inner.ls()
+    }
+
+    pub fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.inner.getdents64(offset, buf)
     }
 
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
@@ -374,7 +430,16 @@ impl Inode {
 
     /// 调整 inode 对应常规文件的逻辑长度。
     pub fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
-        self.inner.truncate(new_size)
+        self.inner.truncate(new_size)?;
+        self.invalidate_stat_cache();
+        Ok(())
+    }
+
+    /// Reserve or deallocate file space.
+    pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), FS_ERRNO> {
+        self.inner.fallocate(mode, offset, len)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -382,7 +447,11 @@ impl Inode {
     }
 
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        self.inner.write_at(offset, buf)
+        let written = self.inner.write_at(offset, buf);
+        if written != 0 {
+            self.invalidate_stat_cache();
+        }
+        written
     }
 
     pub fn ino(&self) -> u64 {
@@ -396,7 +465,12 @@ impl Inode {
 
     /// Read all stat-relevant attributes in one call.
     pub fn stat_attrs(&self) -> VfsAttrs {
-        self.inner.stat_attrs()
+        if let Some(attrs) = self.state.lock().stat_attrs.clone() {
+            return attrs;
+        }
+        let attrs = self.inner.stat_attrs();
+        self.state.lock().stat_attrs = Some(attrs.clone());
+        attrs
     }
 
     /// Read filesystem-wide statistics.
@@ -426,12 +500,16 @@ impl Inode {
 
     /// Set file mode bits on the underlying node.
     pub fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
-        self.inner.set_mode(mode)
+        self.inner.set_mode(mode)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     /// Set file owner uid/gid on the underlying node.
     pub fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
-        self.inner.set_owner(uid, gid)
+        self.inner.set_owner(uid, gid)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     pub fn check_access(&self, uid: u32, gid: u32, mode: u32) -> bool {
@@ -444,6 +522,8 @@ impl Inode {
 
     pub fn link_inode(&self, child: &Arc<Inode>, new_name: &str) -> Result<(), FS_ERRNO> {
         self.inner.link_inode(&child.inner, new_name)?;
+        self.invalidate_stat_cache();
+        child.invalidate_stat_cache();
         let fs_id = self.fs_id();
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), new_name, child);
@@ -469,6 +549,7 @@ impl Inode {
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
         }
+        self.invalidate_stat_cache();
         Ok(())
     }
 
@@ -487,6 +568,7 @@ impl Inode {
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
         }
+        self.invalidate_stat_cache();
         Ok(())
     }
 
@@ -508,12 +590,16 @@ impl Inode {
         mtime: Option<InodeTime>,
         ctime: Option<InodeTime>,
     ) -> Result<(), FS_ERRNO> {
-        self.inner.set_times(atime, mtime, ctime)
+        self.inner.set_times(atime, mtime, ctime)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     /// Update `atime`/`mtime`/`ctime` to the same timestamp.
     pub fn set_times_now(&self, now: InodeTime) -> Result<(), FS_ERRNO> {
-        self.inner.set_times_now(now)
+        self.inner.set_times_now(now)?;
+        self.invalidate_stat_cache();
+        Ok(())
     }
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
@@ -537,7 +623,14 @@ impl Inode {
         if let Some((child_fs, child_ino)) = replaced_child {
             remove_cached_inode(child_fs, child_ino);
         }
+        self.invalidate_stat_cache();
+        new_parent.invalidate_stat_cache();
         Ok(())
+    }
+
+    /// Drop the cached stat snapshot for this inode.
+    pub fn invalidate_stat_cache(&self) {
+        self.state.lock().stat_attrs = None;
     }
 
     /// 获取当前 inode 挂载的 page cache 宿主对象。
