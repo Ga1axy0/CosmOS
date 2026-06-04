@@ -11,8 +11,8 @@ use crate::{
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, thread_id2task, ExitReason, ShmAttachment, SigInfo,
-        SignalBit, WaitReason,
+        exit_current_and_run_next, thread_id2task, ExitReason, ProcessControlBlock, ShmAttachment,
+        SigInfo, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -697,7 +697,18 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
     })
 }
 
+/// `wait4`/`waitpid` 选项位（Linux 语义）。
 const WNOHANG: isize = 1;
+/// 同时报告已停止的子进程（作业控制）。
+const WUNTRACED: isize = 2;
+/// 同时报告已继续运行的子进程（作业控制）。
+const WCONTINUED: isize = 8;
+/// 取走子进程状态但不回收（保留为可再次 wait 的状态）。
+const WNOWAIT: isize = 0x0100_0000;
+/// Linux 内核内部 clone/线程相关 wait 标志：`__WNOTHREAD | __WALL | __WCLONE`。
+const W_INTERNAL_FLAGS: isize = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+/// `wait4` 可识别的全部选项位。
+const WAIT_RECOGNIZED: isize = WNOHANG | WUNTRACED | WCONTINUED | WNOWAIT | W_INTERNAL_FLAGS;
 
 /// waitpid syscall
 ///
@@ -707,7 +718,11 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
     trace!("kernel: sys_wait4");
     let process = current_process();
     syscall_body!({
-        if options & !WNOHANG != 0 {
+        // 只在低 32 位上校验选项，避免符号扩展把 `__WCLONE`(0x80000000) 误判为非法位。
+        // `WUNTRACED`/`WCONTINUED` 当前没有额外的停止/继续状态可上报（本内核不实现
+        // 作业控制停止），按 Linux 语义安全地忽略即可——这正是 shell 前台等待
+        // `waitpid(pid, &status, WUNTRACED)` 所需要的。
+        if (options & 0xffff_ffff) & !WAIT_RECOGNIZED != 0 {
             return Err(ERRNO::EINVAL);
         }
 
@@ -803,8 +818,17 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
     })
 }
 
-/// kill syscall
-pub fn sys_kill(pid: usize, signal: u32) -> isize {
+/// kill syscall.
+///
+/// Implements the full `kill(2)` target selection:
+/// - `pid > 0`  : the process with that pid.
+/// - `pid == 0` : every process in the caller's process group.
+/// - `pid == -1`: every process except the caller (broadcast).
+/// - `pid < -1` : every process in process group `-pid`.
+///
+/// A `signal` of `0` performs only an existence/permission check (no signal is
+/// delivered), returning `ESRCH` when no target matches.
+pub fn sys_kill(pid: isize, signal: u32) -> isize {
     trace!(
         "kernel:pid[{}] sys_kill pid:{} signal:{}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -812,11 +836,45 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         signal
     );
     syscall_body!({
-        let process = pid2process(pid).or_errno(ERRNO::ESRCH)?;
-        let flag = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
         let sender = current_process();
+        // signal 0 仅做存在性检查；非 0 时校验信号编号合法。
+        let flag = if signal == 0 {
+            None
+        } else {
+            Some(SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?)
+        };
         let siginfo = SigInfo::for_kill(signal as i32, sender.getpid(), sender.getuid());
-        crate::task::add_signal_to_process_with_siginfo(&process, flag, siginfo);
+
+        let collect_pgrp = |pgrp: u32| -> Vec<Arc<ProcessControlBlock>> {
+            list_pids()
+                .into_iter()
+                .filter_map(pid2process)
+                .filter(|process| process.getpgid() == pgrp)
+                .collect()
+        };
+
+        let targets: Vec<Arc<ProcessControlBlock>> = if pid > 0 {
+            alloc::vec![pid2process(pid as usize).or_errno(ERRNO::ESRCH)?]
+        } else if pid == 0 {
+            collect_pgrp(sender.getpgid())
+        } else if pid == -1 {
+            list_pids()
+                .into_iter()
+                .filter_map(pid2process)
+                .filter(|process| process.getpid() != sender.getpid())
+                .collect()
+        } else {
+            collect_pgrp((-pid) as u32)
+        };
+
+        if targets.is_empty() {
+            return Err(ERRNO::ESRCH);
+        }
+        if let Some(flag) = flag {
+            for process in &targets {
+                crate::task::add_signal_to_process_with_siginfo(process, flag, siginfo);
+            }
+        }
         Ok(0)
     })
 }

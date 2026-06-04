@@ -558,6 +558,9 @@ impl ProcessControlBlock {
         // allocate a pid
         let pid_handle = pid_alloc();
         let mut cred = Credentials::root();
+        // init 是自身会话与进程组的首领（sid == pgid == pid），与 Linux 一致；
+        // 这些值会被 fork 继承，避免出现非法的 pgid/sid 0。
+        cred.sid = pid_handle.0 as u32;
         cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,

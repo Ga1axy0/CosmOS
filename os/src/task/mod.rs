@@ -17,8 +17,8 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::sched::{
-    add_stopping_task, remove_from_pid2process, remove_task, schedule, take_current_task,
-    TaskContext,
+    add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
+    take_current_task, TaskContext,
 };
 use crate::fs::{open_file, OpenFlags};
 use crate::ipc;
@@ -399,6 +399,34 @@ pub fn add_signal_to_task_with_siginfo(
         crate::poll::notify_poll_signal_pid(pid);
         wake_signal_waiters(vec![Arc::clone(task)]);
     }
+}
+
+/// Broadcast a signal to every process belonging to process group `pgrp`.
+///
+/// This mirrors Linux `kill_pgrp()` / the `kill(2)` "negative pid" path and is
+/// the mechanism the tty line discipline uses to deliver terminal-generated
+/// signals (SIGINT/SIGQUIT/SIGTSTP from Ctrl+C / Ctrl+\\ / Ctrl+Z) to the
+/// foreground process group of the controlling terminal.
+///
+/// Returns the number of processes that were signalled, so callers can map an
+/// empty group to `ESRCH` the way Linux does.
+pub fn send_signal_to_pgrp(pgrp: u32, signal: SignalBit, siginfo: SigInfo) -> usize {
+    if pgrp == 0 {
+        return 0;
+    }
+    // Snapshot the matching processes first; `add_signal_to_process_*` takes the
+    // per-process lock and wakes waiters, so we must not hold the global pid
+    // table lock (acquired inside `list_pids`/`pid2process`) across delivery.
+    let targets: Vec<Arc<ProcessControlBlock>> = list_pids()
+        .into_iter()
+        .filter_map(pid2process)
+        .filter(|process| process.getpgid() == pgrp)
+        .collect();
+    let count = targets.len();
+    for process in targets {
+        add_signal_to_process_with_siginfo(&process, signal, siginfo);
+    }
+    count
 }
 
 /// Add signal to the current task

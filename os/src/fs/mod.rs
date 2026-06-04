@@ -580,7 +580,7 @@ pub use inode::{
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::new_stdio_files;
-pub use tty::{Termios, TtyCore, TtyFile, WinSize};
+pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyFile, WinSize, CONSOLE_TTY};
 
 /// Initialize the filesystem, including rootfs and devfs.
 pub fn init() {

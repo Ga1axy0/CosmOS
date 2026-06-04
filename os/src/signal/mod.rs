@@ -46,6 +46,54 @@ pub const SIG_DFL: usize = 0;
 /// Ignore signal
 pub const SIG_IGN: usize = 1;
 
+/// Returns whether the current task has an unmasked pending signal that should
+/// interrupt a blocking syscall with `EINTR`.
+///
+/// A blocking read/wait is only interrupted by a signal that is actually going
+/// to be acted upon: one delivered to a user handler, or one whose default
+/// action terminates/stops the process. Signals whose default action is to be
+/// ignored (`SIGCHLD`, `SIGURG`, `SIGCONT`, `SIGWINCH`) — or that are explicitly
+/// `SIG_IGN` — do not interrupt, matching Linux `signal_pending()` semantics for
+/// restartable syscalls. This is the predicate the tty line discipline uses to
+/// turn a Ctrl+C-induced wakeup into an `EINTR` return.
+pub fn has_interrupting_signal() -> bool {
+    let task = current_task().unwrap();
+    let process = crate::task::current_process();
+    let process_inner = process.inner_exclusive_access();
+    let task_inner = task.inner_exclusive_access();
+    let pending =
+        (task_inner.pending_signals | process_inner.pending_signals) & !task_inner.signal_mask;
+    if pending.is_empty() {
+        return false;
+    }
+    for signum in 1..=MAX_SIG {
+        let Some(flag) = SignalBit::from_signum(signum as u32) else {
+            continue;
+        };
+        if !pending.contains(flag) {
+            continue;
+        }
+        let handler = process_inner.signal_actions.table[signum].handler;
+        if handler == SIG_IGN {
+            continue;
+        }
+        if handler == SIG_DFL {
+            // Default action: everything interrupts except the signals whose
+            // default disposition is "ignore".
+            match SignalNum::from_number(signum as u32) {
+                Some(SignalNum::SIGCHLD)
+                | Some(SignalNum::SIGURG)
+                | Some(SignalNum::SIGCONT)
+                | Some(SignalNum::SIGWINCH) => continue,
+                _ => return true,
+            }
+        }
+        // A user handler is installed.
+        return true;
+    }
+    false
+}
+
 /// Check and handle non-fatal signals for the current process.
 /// Returns Some((signum, action, siginfo)) if a signal needs to be handled by user handler.
 /// Handles SIG_IGN by clearing the signal, and SIG_DFL by default behavior.
