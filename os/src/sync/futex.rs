@@ -1,6 +1,6 @@
 use crate::sync::SpinNoIrqLock;
 use crate::{
-    syscall::{read_pod_from_user, errno::ERRNO, Timespec},
+    syscall::{read_pod_from_user, errno::ERRNO},
     task::{current_task, wakeup_task, TaskControlBlock, WaitQueue, WaitReason},
     timer::{add_timer_with_futex_tag, get_time_ns},
 };
@@ -134,23 +134,6 @@ pub fn futex_queue(uaddr: usize) -> Arc<WaitQueue> {
         .clone()
 }
 
-fn futex_timeout_ns(timeout: *const Timespec) -> Result<Option<u64>, ERRNO> {
-    if timeout.is_null() {
-        return Ok(None);
-    }
-    let timeout = read_pod_from_user(timeout)?;
-    if timeout.tv_nsec >= 1_000_000_000 {
-        return Err(ERRNO::EINVAL);
-    }
-    let sec_ns = (timeout.tv_sec as u64)
-        .checked_mul(1_000_000_000)
-        .ok_or(ERRNO::EINVAL)?;
-    let timeout_ns = sec_ns
-        .checked_add(timeout.tv_nsec as u64)
-        .ok_or(ERRNO::EINVAL)?;
-    Ok(Some(timeout_ns))
-}
-
 fn register_futex_wait(task: &Arc<TaskControlBlock>) -> Option<FutexWaitHandle> {
     FUTEX_WAIT_REGISTRY.lock().alloc(task)
 }
@@ -255,34 +238,35 @@ pub fn futex_wake_addr(uaddr: usize, max_count: usize) -> isize {
         .unwrap_or(0)
 }
 
-/// Wait on the futex at the given user-space address if its current value equals the expected value, with an optional timeout.
+/// Wait on the futex at `uaddr` while its value still equals `expected`.
+///
+/// `deadline_ns`, when present, is an **absolute CLOCK_MONOTONIC** deadline in
+/// nanoseconds (already normalized by the caller — see
+/// `futex_deadline_mono_ns`), because the kernel timer queue only fires against
+/// the monotonic clock. `None` means wait indefinitely.
 pub fn futex_wait_addr(
     uaddr: *const i32,
     expected: i32,
-    timeout: Option<*const Timespec>,
+    deadline_ns: Option<u64>,
 ) -> Result<isize, ERRNO> {
     let current = read_pod_from_user(uaddr)?;
     if current != expected {
         return Err(ERRNO::EAGAIN);
     }
 
-    let timeout_ns = match timeout {
-        Some(timeout) => futex_timeout_ns(timeout)?,
-        None => None,
-    };
-    if matches!(timeout_ns, Some(0)) {
-        return Err(ERRNO::ETIMEDOUT);
+    // 截止时刻已过：立即超时，不进入等待（也避免后续错过唤醒）。
+    if let Some(deadline) = deadline_ns {
+        if deadline <= get_time_ns() {
+            return Err(ERRNO::ETIMEDOUT);
+        }
     }
 
     let queue = futex_queue(uaddr as usize);
     let task = current_task().unwrap();
-    let handle = timeout_ns
+    let handle = deadline_ns
         .map(|_| register_futex_wait(&task).ok_or(ERRNO::EAGAIN))
         .transpose()?;
-    if let (Some(timeout_ns), Some(handle)) = (timeout_ns, handle) {
-        let deadline_ns = get_time_ns()
-            .checked_add(timeout_ns)
-            .ok_or(ERRNO::EINVAL)?;
+    if let (Some(deadline_ns), Some(handle)) = (deadline_ns, handle) {
         add_timer_with_futex_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
     }
     queue.wait_with_reason_or_skip(WaitReason::Futex, || {
