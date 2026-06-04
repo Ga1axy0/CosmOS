@@ -3,8 +3,8 @@
 use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{
-    defer_release, flush_deferred, needs_flush, online_mask, DeferredUserReclaim,
-    MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
+    defer_release, deferred_frame_count, deferred_kstack_id_count, flush_deferred, online_mask,
+    DeferredUserReclaim, MapPermission, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{SpinNoIrqLock};
 use alloc::{
@@ -55,6 +55,11 @@ lazy_static! {
     static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
 }
 
+/// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
+const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 128;
+/// deferred 物理页超过该水位时触发一次全局 flush 回收。
+const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
+
 /// The idle task's pid is 0
 pub const IDLE_PID: usize = 0;
 
@@ -99,17 +104,13 @@ pub struct KernelStack(pub usize);
 
 /// Allocate a kernel stack for a task
 pub fn kstack_alloc() -> KernelStack {
-    let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
-    let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    if needs_flush(kstack_bottom, kstack_top) {
-        // 复用已 deferred 的 kernel stack VA 前，先做一次全局 shootdown，
-        // 再统一提交此前暂缓归还的页框。
-        debug!(
-            "[tlb] kstack alloc hits deferred range: id={}, bottom={:#x}, top={:#x}",
-            kstack_id, kstack_bottom, kstack_top
-        );
+    if deferred_kstack_id_count() > KSTACK_DEFERRED_RECYCLE_WATERMARK
+        || deferred_frame_count() > DEFERRED_FRAME_RECYCLE_WATERMARK
+    {
         flush_deferred(online_mask());
     }
+    let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
+    let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
     KERNEL_SPACE.lock().insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
@@ -136,9 +137,20 @@ impl Drop for KernelStack {
         defer_release(
             kernel_stack_bottom,
             kernel_stack_bottom + KERNEL_STACK_SIZE,
+            Some(self.0),
             deferred_frames,
         );
-        KSTACK_ALLOCATOR.lock().dealloc(self.0);
+    }
+}
+
+/// 将完成 TLB flush 的 kernel stack id 重新放回分配器。
+pub(crate) fn recycle_deferred_kstack_ids(mut kstack_ids: Vec<usize>) {
+    if kstack_ids.is_empty() {
+        return;
+    }
+    let mut allocator = KSTACK_ALLOCATOR.lock();
+    for id in kstack_ids.drain(..) {
+        allocator.dealloc(id);
     }
 }
 
