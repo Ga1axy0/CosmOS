@@ -362,7 +362,7 @@ impl VfsNode for ZeroDevNode {
 ///
 /// Linux RT tools write a 32-bit latency target here and keep the fd open for
 /// the duration of the benchmark. We only need a minimal in-memory sink.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CpuDmaLatencyNode;
 
 impl CpuDmaLatencyNode {
