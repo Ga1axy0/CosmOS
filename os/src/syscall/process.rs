@@ -953,6 +953,7 @@ pub fn sys_kill(pid: isize, signal: u32) -> isize {
         };
         let siginfo = SigInfo::for_kill(signal as i32, sender.getpid(), sender.getuid());
         let sender_pid = sender.getpid();
+        let sender_pgid = sender.getpgid();
 
         let collect_pgrp = |pgrp: u32| -> Vec<Arc<ProcessControlBlock>> {
             list_pids()
