@@ -548,9 +548,21 @@ pub fn sys_clone(
             );
             return Err(ERRNO::EINVAL);
         }
-        let thread_clone = flags.contains(CloneFlags::CLONE_VM);
-        if thread_clone && !flags.contains(CloneFlags::CLONE_THREAD) {
+        let vfork_clone = flags.contains(CloneFlags::CLONE_VFORK);
+        let thread_clone = flags.contains(CloneFlags::CLONE_VM) && !vfork_clone;
+        if flags.contains(CloneFlags::CLONE_VM)
+            && !flags.contains(CloneFlags::CLONE_THREAD)
+            && !vfork_clone
+        {
             warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
+            return Err(ERRNO::EINVAL);
+        }
+        if vfork_clone && !flags.contains(CloneFlags::CLONE_VM) {
+            warn!("kernel: sys_clone CLONE_VFORK without CLONE_VM is unsupported");
+            return Err(ERRNO::EINVAL);
+        }
+        if vfork_clone && flags.contains(CloneFlags::CLONE_THREAD) {
+            warn!("kernel: sys_clone CLONE_VFORK with CLONE_THREAD is unsupported");
             return Err(ERRNO::EINVAL);
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
@@ -567,10 +579,6 @@ pub fn sys_clone(
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
             warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
-            return Err(ERRNO::EINVAL);
-        }
-        if flags.contains(CloneFlags::CLONE_VFORK) {
-            warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
             return Err(ERRNO::EINVAL);
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
@@ -656,6 +664,11 @@ pub fn sys_clone(
             add_task(new_task);
             Ok(new_tid as isize)
         } else {
+            if vfork_clone {
+                debug!(
+                    "kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone"
+                );
+            }
             let new_process = current_process.clone_process(stack, child_tls, child_set_tid)?;
             let child_pid = new_process.getpid() as i32;
             debug!(
