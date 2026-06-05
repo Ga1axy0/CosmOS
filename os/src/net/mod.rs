@@ -36,8 +36,10 @@ pub(crate) use socket_timeout::{
     socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketTimerTag,
     SocketWakeState,
 };
+pub(crate) use unix_socket::create_unix_stream_socket_file;
 pub use unix_socket::{
-    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SocketLevel
+    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS,
+    SocketLevel,
 };
 
 const RX_BUF_LEN: usize = 32 * 1024;
