@@ -553,7 +553,7 @@ fn accept_common(
     let fd = fd as usize;
     let (accepted, peer) = match socket_kind(fd)? {
         SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.accept())?,
-        SocketKind::Udp | SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+        SocketKind::Udp | SocketKind::Unix => return Err(ERRNO::EOPNOTSUPP),
     };
 
     let status_flags = if (flags & SOCK_NONBLOCK) != 0 {
