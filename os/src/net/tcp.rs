@@ -242,6 +242,11 @@ pub(crate) struct TcpSocketFile {
     listener: SpinNoIrqLock<Option<Arc<TcpListenerShared>>>,
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
+    /// IPv4 multicast groups this socket has joined (per-socket membership).
+    /// Tracked here, not in the shared `TcpSocketState`, so that an accepted
+    /// socket starts with an empty list rather than inheriting the listener's
+    /// memberships (CVE-2017-8890).
+    mcast_groups: SpinNoIrqLock<Vec<Ipv4Address>>,
 }
 
 impl TcpSocketFile {
@@ -253,6 +258,30 @@ impl TcpSocketFile {
             listener: SpinNoIrqLock::new(None),
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
+            mcast_groups: SpinNoIrqLock::new(Vec::new()),
+        }
+    }
+
+    /// Join an IPv4 multicast group. Returns `false` if the socket was already
+    /// a member of `addr` (caller maps this to `EADDRINUSE`).
+    pub(crate) fn join_mcast_group(&self, addr: Ipv4Address) -> bool {
+        let mut groups = self.mcast_groups.lock();
+        if groups.contains(&addr) {
+            return false;
+        }
+        groups.push(addr);
+        true
+    }
+
+    /// Leave an IPv4 multicast group. Returns `false` if the socket was not a
+    /// member of `addr` (caller maps this to `EADDRNOTAVAIL`).
+    pub(crate) fn leave_mcast_group(&self, addr: Ipv4Address) -> bool {
+        let mut groups = self.mcast_groups.lock();
+        if let Some(pos) = groups.iter().position(|g| *g == addr) {
+            groups.remove(pos);
+            true
+        } else {
+            false
         }
     }
 
@@ -473,6 +502,9 @@ impl TcpSocketFile {
                     listener: SpinNoIrqLock::new(None),
                     recv_timeout_ns: AtomicU64::new(self.recv_timeout_ns()),
                     send_timeout_ns: AtomicU64::new(self.send_timeout_ns()),
+                    // A freshly accepted socket must NOT inherit the listening
+                    // socket's multicast memberships (CVE-2017-8890).
+                    mcast_groups: SpinNoIrqLock::new(Vec::new()),
                 });
 
                 NEED_POLL.store(true, Ordering::Release);
