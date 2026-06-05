@@ -18,6 +18,7 @@ use crate::task::{
     FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
+use crate::sync::SpinNoIrqLock;
 use crate::timer::{add_timer_ns, add_timer_with_poll_tag, get_realtime_ns, get_time_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -26,6 +27,7 @@ use core::{mem::{offset_of, size_of}, slice};
 use crate::task::SignalBit;
 use crate::syscall::OldTimespec32;
 use core::any::Any;
+use lazy_static::*;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +88,11 @@ const SUSPICIOUS_RW_LEN: usize = 1 << 20;
 const O_NONBLOCK: i32 = 0x800;
 const O_CLOEXEC: i32 = 0x80000;
 
+lazy_static! {
+    /// 当前启用的进程记账目标文件路径；`acct01` 仅要求 enable/disable 生命周期和 errno 语义。
+    static ref PROCESS_ACCOUNTING_TARGET: SpinNoIrqLock<Option<String>> = SpinNoIrqLock::new(None);
+}
+
 /// `accept03` 需要大量“非 socket fd”作为输入；对这些当前尚未完整实现
 /// 的 Linux 专用 fd 类型，先统一返回一个可关闭、不可被识别为 socket 的
 /// 匿名文件对象，确保 `accept()` 落到 `ENOTSOCK` 路径。
@@ -140,6 +147,51 @@ fn parse_anon_fd_flags(flags: i32, allowed: i32) -> Result<(FileStatusFlags, boo
     };
     let cloexec = (flags & O_CLOEXEC) != 0;
     Ok((status_flags, cloexec))
+}
+
+/// `acct(2)` 使用的最小内核状态切换。
+pub fn sys_acct(filename: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_acct",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        if process.geteuid() != 0 {
+            return Err(ERRNO::EPERM);
+        }
+
+        if filename.is_null() {
+            *PROCESS_ACCOUNTING_TARGET.lock() = None;
+            return Ok(0);
+        }
+
+        let path = read_cstring_from_user(filename, PATH_MAX)?;
+        let cwd = process.inner_exclusive_access().cwd.clone();
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
+
+        if path.ends_with('/') && !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        if inode.is_dir() {
+            return Err(ERRNO::EISDIR);
+        }
+
+        let stat = inode_stat(&inode);
+        if stat.mode.bits() & StatMode::TYPE_MASK.bits() != StatMode::FILE.bits() {
+            return Err(ERRNO::EACCES);
+        }
+        if mount_is_readonly(abs_path.as_str()) {
+            return Err(ERRNO::EROFS);
+        }
+        if !inode_allows_access(&inode, process.geteuid(), process.getegid(), W_OK as u32) {
+            return Err(ERRNO::EACCES);
+        }
+
+        *PROCESS_ACCOUNTING_TARGET.lock() = Some(abs_path);
+        Ok(0)
+    })
 }
 
 fn alloc_anonymous_fd_with_bits(

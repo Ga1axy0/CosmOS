@@ -347,8 +347,10 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
         ppid,
         uid,
         euid,
+        suid,
         gid,
         egid,
+        sgid,
         pgrp,
         session,
         proc_pending,
@@ -375,8 +377,10 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
             .unwrap_or(0);
         let uid = inner.cred.uid;
         let euid = inner.cred.euid;
+        let suid = inner.cred.suid;
         let gid = inner.cred.gid;
         let egid = inner.cred.egid;
+        let sgid = inner.cred.sgid;
         let pgrp = inner.cred.pgid;
         let session = inner.cred.sid;
         let proc_pending = inner.pending_signals.bits();
@@ -417,8 +421,10 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
             ppid,
             uid,
             euid,
+            suid,
             gid,
             egid,
+            sgid,
             pgrp,
             session,
             proc_pending,
@@ -458,8 +464,8 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     let _ = writeln!(&mut out, "Pid:\t{}", pid);
     let _ = writeln!(&mut out, "PPid:\t{}", ppid);
     let _ = writeln!(&mut out, "TracerPid:\t0");
-    let _ = writeln!(&mut out, "Uid:\t{}\t{}\t{}\t{}", uid, euid, euid, euid);
-    let _ = writeln!(&mut out, "Gid:\t{}\t{}\t{}\t{}", gid, egid, egid, egid);
+    let _ = writeln!(&mut out, "Uid:\t{}\t{}\t{}\t{}", uid, euid, suid, euid);
+    let _ = writeln!(&mut out, "Gid:\t{}\t{}\t{}\t{}", gid, egid, sgid, egid);
     let _ = writeln!(&mut out, "FDSize:\t{}", fd_size);
     let _ = writeln!(&mut out, "Groups:\t");
     let _ = writeln!(&mut out, "NStgid:\t{}", tgid);

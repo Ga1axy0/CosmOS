@@ -106,8 +106,10 @@ pub struct ProcessControlBlock {
 pub struct Credentials {
     pub uid: u32,
     pub euid: u32,
+    pub suid: u32,
     pub gid: u32,
     pub egid: u32,
+    pub sgid: u32,
     pub sid: u32,
     pub pgid: u32,
 }
@@ -117,8 +119,10 @@ impl Credentials {
         Self {
             uid: 0,
             euid: 0,
+            suid: 0,
             gid: 0,
             egid: 0,
+            sgid: 0,
             sid: 0,
             pgid: 0,
         }
@@ -1144,6 +1148,10 @@ impl ProcessControlBlock {
     pub fn geteuid(&self) -> u32 {
         self.inner.lock().cred.euid
     }
+    /// get suid
+    pub fn getsuid(&self) -> u32 {
+        self.inner.lock().cred.suid
+    }
     /// get gid
     pub fn getgid(&self) -> u32 {
         self.inner.lock().cred.gid
@@ -1157,6 +1165,7 @@ impl ProcessControlBlock {
         let mut inner = self.inner.lock();
         inner.cred.uid = uid;
         inner.cred.euid = uid;
+        inner.cred.suid = uid;
     }
 
     pub fn setegid(&self, egid: u32) {
