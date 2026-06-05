@@ -981,12 +981,21 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     const O_LARGEFILE: i32 = 0x8000;
     const O_DIRECTORY: i32 = OpenFlags::DIRECTORY.bits();
     const O_NOFOLLOW: i32 = 0x20000;
+    const O_PATH: i32 = 0x200000;
 
-    let access_mode = AccessMode::from_open_bits(flags)?;
+    // O_PATH 仅获取一个指向文件位置的描述符；访问模式位被忽略，文件本身
+    // 不会被真正打开（read/write 等需返回 EBADF）。这里识别该标志并将其
+    // 透传到 `status_fixed_bits`，供 `F_GETFL` 及套接字系统调用据此判定。
+    let path_flag = flags & O_PATH;
+    let access_mode = if path_flag != 0 {
+        AccessMode::ReadOnly
+    } else {
+        AccessMode::from_open_bits(flags)?
+    };
     let ignored_flags = flags & (O_LARGEFILE | O_NOFOLLOW);
     let unsupported_flags = flags & O_NOCTTY;
     let status_flags = FileStatusFlags::from_bits_truncate(flags & (O_APPEND | O_NONBLOCK));
-    let effective_flags = flags & !(ignored_flags | O_APPEND | O_NONBLOCK);
+    let effective_flags = flags & !(ignored_flags | path_flag | O_APPEND | O_NONBLOCK);
 
     if unsupported_flags != 0 {
         // TODO: 后续若补齐 tty 控制终端语义，应在进程/会话层实现真实行为。
@@ -1007,7 +1016,7 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     Ok(OpenFileState {
         access_mode,
         status_flags,
-        status_fixed_bits: effective_flags & O_DIRECTORY,
+        status_fixed_bits: (effective_flags & O_DIRECTORY) | path_flag,
         open_flags,
     })
 }

@@ -594,6 +594,11 @@ fn accept_common(
     }
 
     let fd = fd as usize;
+    // O_PATH 描述符不关联可操作的文件对象；套接字系统调用通过
+    // `fdget(FMODE_PATH)` 将其视为不存在，故以 EBADF 拒绝（accept03）。
+    if get_file_description(fd)?.is_path() {
+        return Err(ERRNO::EBADF);
+    }
     let (accepted, peer) = match socket_kind(fd)? {
         SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.accept())?,
         SocketKind::Udp | SocketKind::Unix => return Err(ERRNO::EOPNOTSUPP),
