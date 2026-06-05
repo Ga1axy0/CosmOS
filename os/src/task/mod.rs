@@ -17,8 +17,8 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::sched::{
-    add_stopping_task, remove_from_pid2process, remove_task, schedule, take_current_task,
-    TaskContext,
+    add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
+    take_current_task, TaskContext,
 };
 use crate::fs::{open_file, OpenFlags};
 use crate::ipc;
@@ -450,6 +450,34 @@ pub fn add_signal_to_task_with_siginfo(
     }
 }
 
+/// Broadcast a signal to every process belonging to process group `pgrp`.
+///
+/// This mirrors Linux `kill_pgrp()` / the `kill(2)` "negative pid" path and is
+/// the mechanism the tty line discipline uses to deliver terminal-generated
+/// signals (SIGINT/SIGQUIT/SIGTSTP from Ctrl+C / Ctrl+\\ / Ctrl+Z) to the
+/// foreground process group of the controlling terminal.
+///
+/// Returns the number of processes that were signalled, so callers can map an
+/// empty group to `ESRCH` the way Linux does.
+pub fn send_signal_to_pgrp(pgrp: u32, signal: SignalBit, siginfo: SigInfo) -> usize {
+    if pgrp == 0 {
+        return 0;
+    }
+    // Snapshot the matching processes first; `add_signal_to_process_*` takes the
+    // per-process lock and wakes waiters, so we must not hold the global pid
+    // table lock (acquired inside `list_pids`/`pid2process`) across delivery.
+    let targets: Vec<Arc<ProcessControlBlock>> = list_pids()
+        .into_iter()
+        .filter_map(pid2process)
+        .filter(|process| process.getpgid() == pgrp)
+        .collect();
+    let count = targets.len();
+    for process in targets {
+        add_signal_to_process_with_siginfo(&process, signal, siginfo);
+    }
+    count
+}
+
 /// Add signal to the current task
 pub fn current_add_signal(signal: SignalBit) {
     let task = current_task().unwrap();
@@ -457,7 +485,24 @@ pub fn current_add_signal(signal: SignalBit) {
 }
 
 /// 扫描所有进程的 interval timer，到期则投递对应信号。
+///
+/// 该函数运行在时钟中断（硬 IRQ）上下文中。对齐 Linux 的两点做法以避免把
+/// 重活放进每个 hart 的每个 tick：
+///
+/// 1. **无 timer 时不做任何工作**：若系统范围内没有任何已武装的 interval
+///    timer（绝大多数负载，例如 hackbench），直接返回——不取锁、不分配内存。
+///    这消除了此前“每 tick 都在硬中断里持 `PID2PCB` 锁分配一个包含全部进程
+///    的 `Vec`”的反模式，正是该反模式 + 非中断安全的堆锁导致了 SMP 死锁。
+/// 2. **全局周期性工作只在单个 hart 上做**：类似 Linux 的 `tick_do_timer_cpu`，
+///    只让 0 号 hart 执行这次全进程扫描，避免 8 个 hart 在每个 tick 上对
+///    `PID2PCB` 的冗余争用与重复投递。
 pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
+    if process::armed_itimers_count() == 0 {
+        return;
+    }
+    if crate::hart::hartid() != 0 {
+        return;
+    }
     let processes: Vec<Arc<ProcessControlBlock>> = {
         let map = crate::sched::PID2PCB.lock();
         map.values().cloned().collect()

@@ -15,13 +15,13 @@ use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
 use crate::net::{
     cleanup_socket_wait, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
-    socket_wait_state, timeout_ns_to_ms, SocketWakeState, NEED_POLL, NET_STACK,
+    socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState, NEED_POLL, NET_STACK,
 };
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::task::{current_task, WaitQueue, WaitReason};
-use crate::timer::{add_timer_with_socket_tag, get_time_ms};
+use crate::timer::{add_timer_with_socket_tag, get_time_ns};
 
 const SOMAXCONN: usize = 128;
 
@@ -590,9 +590,9 @@ impl TcpSocketFile {
         if buf.len() == 0 {
             return Ok(0);
         }
-        let timeout_ms = timeout_ns_to_ms(self.recv_timeout_ns())?;
+        let timeout_ns = timeout_ns_to_deadline_ns(self.recv_timeout_ns())?;
         let mut timeout_handle = None;
-        let mut deadline_ms = None;
+        let mut deadline_ns = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
                 if let Some(handle) = timeout_handle.take() {
@@ -641,18 +641,18 @@ impl TcpSocketFile {
                     socket.may_recv()
                 );
             }
-            if let Some(timeout_ms) = timeout_ms {
+            if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
-                    let now_ms = get_time_ms();
-                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    let now_ns = get_time_ns();
+                    let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
                     add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
                     timeout_handle = Some(handle);
-                    deadline_ms = Some(deadline);
+                    deadline_ns = Some(deadline);
                 }
-                if let Some(deadline) = deadline_ms {
-                    if get_time_ms() >= deadline {
+                if let Some(deadline) = deadline_ns {
+                    if get_time_ns() >= deadline {
                         if let Some(handle) = timeout_handle.take() {
                             cleanup_socket_wait(handle);
                         }
@@ -675,7 +675,7 @@ impl TcpSocketFile {
                             if let Some(handle) = timeout_handle.take() {
                                 cleanup_socket_wait(handle);
                             }
-                            deadline_ms = None;
+                            deadline_ns = None;
                             continue;
                         }
                         if let Some(handle) = timeout_handle.take() {
@@ -703,9 +703,9 @@ impl TcpSocketFile {
         if buf.len() == 0 {
             return Ok(0);
         }
-        let timeout_ms = timeout_ns_to_ms(self.send_timeout_ns())?;
+        let timeout_ns = timeout_ns_to_deadline_ns(self.send_timeout_ns())?;
         let mut timeout_handle = None;
-        let mut deadline_ms = None;
+        let mut deadline_ns = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
                 if let Some(handle) = timeout_handle.take() {
@@ -757,18 +757,18 @@ impl TcpSocketFile {
                     return Ok(0);
                 }
             }
-            if let Some(timeout_ms) = timeout_ms {
+            if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
-                    let now_ms = get_time_ms();
-                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    let now_ns = get_time_ns();
+                    let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
                     add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
                     timeout_handle = Some(handle);
-                    deadline_ms = Some(deadline);
+                    deadline_ns = Some(deadline);
                 }
-                if let Some(deadline) = deadline_ms {
-                    if get_time_ms() >= deadline {
+                if let Some(deadline) = deadline_ns {
+                    if get_time_ns() >= deadline {
                         if let Some(handle) = timeout_handle.take() {
                             cleanup_socket_wait(handle);
                         }
@@ -791,7 +791,7 @@ impl TcpSocketFile {
                             if let Some(handle) = timeout_handle.take() {
                                 cleanup_socket_wait(handle);
                             }
-                            deadline_ms = None;
+                            deadline_ns = None;
                             continue;
                         }
                         if let Some(handle) = timeout_handle.take() {
@@ -881,9 +881,9 @@ impl File for TcpSocketFile {
         if buf.is_empty() {
             return Ok(0);
         }
-        let timeout_ms = timeout_ns_to_ms(self.recv_timeout_ns())?;
+        let timeout_ns = timeout_ns_to_deadline_ns(self.recv_timeout_ns())?;
         let mut timeout_handle = None;
-        let mut deadline_ms = None;
+        let mut deadline_ns = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
                 if let Some(handle) = timeout_handle.take() {
@@ -911,18 +911,18 @@ impl File for TcpSocketFile {
                     return Ok(0);
                 }
             }
-            if let Some(timeout_ms) = timeout_ms {
+            if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
-                    let now_ms = get_time_ms();
-                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    let now_ns = get_time_ns();
+                    let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
                     add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
                     timeout_handle = Some(handle);
-                    deadline_ms = Some(deadline);
+                    deadline_ns = Some(deadline);
                 }
-                if let Some(deadline) = deadline_ms {
-                    if get_time_ms() >= deadline {
+                if let Some(deadline) = deadline_ns {
+                    if get_time_ns() >= deadline {
                         if let Some(handle) = timeout_handle.take() {
                             cleanup_socket_wait(handle);
                         }
@@ -945,7 +945,7 @@ impl File for TcpSocketFile {
                             if let Some(handle) = timeout_handle.take() {
                                 cleanup_socket_wait(handle);
                             }
-                            deadline_ms = None;
+                            deadline_ns = None;
                             continue;
                         }
                         if let Some(handle) = timeout_handle.take() {
@@ -985,9 +985,9 @@ impl File for TcpSocketFile {
         if buf.is_empty() {
             return Ok(0);
         }
-        let timeout_ms = timeout_ns_to_ms(self.send_timeout_ns())?;
+        let timeout_ns = timeout_ns_to_deadline_ns(self.send_timeout_ns())?;
         let mut timeout_handle = None;
-        let mut deadline_ms = None;
+        let mut deadline_ns = None;
         loop {
             if crate::signal::has_unmasked_pending_signal() {
                 if let Some(handle) = timeout_handle.take() {
@@ -1017,18 +1017,18 @@ impl File for TcpSocketFile {
                     return Ok(n);
                 }
             }
-            if let Some(timeout_ms) = timeout_ms {
+            if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
-                    let now_ms = get_time_ms();
-                    let deadline = now_ms.checked_add(timeout_ms).ok_or(ERRNO::EINVAL)?;
+                    let now_ns = get_time_ns();
+                    let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
                     add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
                     timeout_handle = Some(handle);
-                    deadline_ms = Some(deadline);
+                    deadline_ns = Some(deadline);
                 }
-                if let Some(deadline) = deadline_ms {
-                    if get_time_ms() >= deadline {
+                if let Some(deadline) = deadline_ns {
+                    if get_time_ns() >= deadline {
                         if let Some(handle) = timeout_handle.take() {
                             cleanup_socket_wait(handle);
                         }
@@ -1051,7 +1051,7 @@ impl File for TcpSocketFile {
                             if let Some(handle) = timeout_handle.take() {
                                 cleanup_socket_wait(handle);
                             }
-                            deadline_ms = None;
+                            deadline_ns = None;
                             continue;
                         }
                         if let Some(handle) = timeout_handle.take() {

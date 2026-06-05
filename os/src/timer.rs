@@ -27,6 +27,8 @@ const MSEC_PER_SEC: usize = 1000;
 const MICRO_PER_SEC: usize = 1_000_000;
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+/// Periodic scheduler/accounting tick interval expressed in raw timer ticks.
+const PERIODIC_TICK_INTERVAL: u64 = (CLOCK_FREQ / TICKS_PER_SEC) as u64;
 
 /// `CLOCK_REALTIME` 相对单调时钟的偏移，单位为纳秒。
 /// 全局唯一
@@ -95,7 +97,7 @@ pub fn time_to_ticks(time: usize) -> usize {
 
 /// Set the next timer interrupt
 pub fn set_next_trigger() {
-    set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
+    program_next_trigger_for_hart(hartid(), get_time());
 }
 
 /// 初始化当前 hart 的时钟中断状态。
@@ -104,14 +106,17 @@ pub fn set_next_trigger() {
 /// 再设置当前 hart 的下一次 timer 触发时间。
 pub fn init_hart() {
     crate::trap::enable_timer_interrupt();
+    let hart = normalize_hart(hartid());
+    let now = get_time() as u64;
+    *PER_CPU_NEXT_PERIODIC_TICK[hart].lock() = now.saturating_add(PERIODIC_TICK_INTERVAL.max(1));
     set_next_trigger();
     info!("hart {} timer init done", hartid());
 }
 
 /// condvar for timer
 pub struct TimerCondVar {
-    /// The time when the timer expires, in milliseconds
-    pub expire_ms: usize,
+    /// The absolute monotonic deadline when the timer expires, in nanoseconds.
+    pub expire_ns: u64,
     /// The task to be woken up when the timer expires
     pub task: Arc<TaskControlBlock>,
     /// Optional timeout identity for specialized timer wakeup paths.
@@ -129,15 +134,13 @@ pub(crate) enum TimerTagKind {
 
 impl PartialEq for TimerCondVar {
     fn eq(&self, other: &Self) -> bool {
-        self.expire_ms == other.expire_ms
+        self.expire_ns == other.expire_ns
     }
 }
 impl Eq for TimerCondVar {}
 impl PartialOrd for TimerCondVar {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let a = -(self.expire_ms as isize);
-        let b = -(other.expire_ms as isize);
-        Some(a.cmp(&b))
+        Some(other.expire_ns.cmp(&self.expire_ns))
     }
 }
 
@@ -151,6 +154,9 @@ lazy_static! {
     /// Per-hart timer bases. Each hart scans only its own heap on timer tick.
     static ref PER_CPU_TIMERS: [SpinNoIrqLock<BinaryHeap<TimerCondVar>>; MAX_HARTS] =
         array::from_fn(|_| SpinNoIrqLock::new(BinaryHeap::<TimerCondVar>::new()));
+    /// Per-hart next periodic scheduler/accounting tick, in raw timer ticks.
+    static ref PER_CPU_NEXT_PERIODIC_TICK: [SpinNoIrqLock<u64>; MAX_HARTS] =
+        array::from_fn(|_| SpinNoIrqLock::new(0));
 }
 
 fn normalize_hart(hart: usize) -> usize {
@@ -162,49 +168,49 @@ fn timer_hart_for_task(task: &Arc<TaskControlBlock>) -> usize {
     normalize_hart(task_inner.sched.last_cpu)
 }
 
-/// Add a timer
-pub fn add_timer(expire_ms: usize, task: Arc<TaskControlBlock>) {
-    add_timer_with_tag(expire_ms, task, None);
+/// Add a timer with an absolute monotonic deadline in nanoseconds.
+pub fn add_timer_ns(expire_ns: u64, task: Arc<TaskControlBlock>) {
+    add_timer_with_tag(expire_ns, task, None);
 }
 
 /// Add a timer with an optional poll timeout identity.
 pub(crate) fn add_timer_with_poll_tag(
-    expire_ms: usize,
+    expire_ns: u64,
     task: Arc<TaskControlBlock>,
     poll_tag: Option<PollTimerTag>,
 ) {
-    add_timer_with_tag(expire_ms, task, poll_tag.map(TimerTagKind::Poll));
+    add_timer_with_tag(expire_ns, task, poll_tag.map(TimerTagKind::Poll));
 }
 
 /// Add a timer with an optional sigtimedwait timeout identity.
 pub(crate) fn add_timer_with_signal_tag(
-    expire_ms: usize,
+    expire_ns: u64,
     task: Arc<TaskControlBlock>,
     signal_tag: Option<SignalTimerTag>,
 ) {
-    add_timer_with_tag(expire_ms, task, signal_tag.map(TimerTagKind::Signal));
+    add_timer_with_tag(expire_ns, task, signal_tag.map(TimerTagKind::Signal));
 }
 
 /// Add a timer with an optional futex wait timeout identity.
 pub(crate) fn add_timer_with_futex_tag(
-    expire_ms: usize,
+    expire_ns: u64,
     task: Arc<TaskControlBlock>,
     futex_tag: Option<FutexTimerTag>,
 ) {
-    add_timer_with_tag(expire_ms, task, futex_tag.map(TimerTagKind::Futex));
+    add_timer_with_tag(expire_ns, task, futex_tag.map(TimerTagKind::Futex));
 }
 
 /// Add a timer with an optional socket wait timeout identity.
 pub(crate) fn add_timer_with_socket_tag(
-    expire_ms: usize,
+    expire_ns: u64,
     task: Arc<TaskControlBlock>,
     socket_tag: Option<SocketTimerTag>,
 ) {
-    add_timer_with_tag(expire_ms, task, socket_tag.map(TimerTagKind::Socket));
+    add_timer_with_tag(expire_ns, task, socket_tag.map(TimerTagKind::Socket));
 }
 
 fn add_timer_with_tag(
-    expire_ms: usize,
+    expire_ns: u64,
     task: Arc<TaskControlBlock>,
     timer_tag: Option<TimerTagKind>,
 ) {
@@ -215,10 +221,14 @@ fn add_timer_with_tag(
     let target_hart = timer_hart_for_task(&task);
     let mut timers = PER_CPU_TIMERS[target_hart].lock();
     timers.push(TimerCondVar {
-        expire_ms,
+        expire_ns,
         task,
         timer_tag,
     });
+    drop(timers);
+    if target_hart == normalize_hart(hartid()) {
+        program_next_trigger_for_hart(target_hart, get_time());
+    }
 }
 
 /// Remove a timer
@@ -239,13 +249,41 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
     trace!("kernel: remove_timer END");
 }
 
-/// Check if the timer has expired
+fn next_timer_deadline_ns_for_hart(hart: usize) -> Option<u64> {
+    let timers = PER_CPU_TIMERS[hart].lock();
+    timers.peek().map(|timer| timer.expire_ns)
+}
+
+fn ns_to_raw_ticks_ceil(ns: u64) -> u64 {
+    if ns == 0 {
+        return 0;
+    }
+    ((ns as u128)
+        .saturating_mul(CLOCK_FREQ as u128)
+        .saturating_add((NSEC_PER_SEC - 1) as u128)
+        / (NSEC_PER_SEC as u128)) as u64
+}
+
+fn program_next_trigger_for_hart(hart: usize, now_raw: usize) {
+    let periodic_raw = *PER_CPU_NEXT_PERIODIC_TICK[hart].lock();
+    let timer_raw = next_timer_deadline_ns_for_hart(hart).map(ns_to_raw_ticks_ceil);
+    let next_raw = match timer_raw {
+        Some(timer_raw) => periodic_raw.min(timer_raw),
+        None => periodic_raw,
+    };
+    let now_raw = now_raw as u64;
+    set_timer(next_raw.max(now_raw.saturating_add(1)) as usize);
+}
+
+/// Check if the timer has expired for the current hart.
 pub fn check_timer() {
-    // trace!("kernel: check_timer");
-    let current_ms = get_time_ms();
+    check_timer_expired(get_time_ns());
+}
+
+fn check_timer_expired(current_ns: u64) {
     let mut timers = PER_CPU_TIMERS[normalize_hart(hartid())].lock();
     while let Some(timer) = timers.peek() {
-        if timer.expire_ms <= current_ms {
+        if timer.expire_ns <= current_ns {
             if let Some(tag) = timer.timer_tag {
                 match tag {
                     TimerTagKind::Poll(poll_tag) => {
@@ -281,4 +319,31 @@ pub fn check_timer() {
             break;
         }
     }
+}
+
+/// Handle one supervisor timer interrupt on the current hart.
+///
+/// Returns whether the periodic scheduler/accounting tick fired as part of
+/// this interrupt.
+pub fn handle_timer_interrupt() -> bool {
+    let hart = normalize_hart(hartid());
+    let now_raw = get_time() as u64;
+    let current_ns = get_time_ns();
+    check_timer_expired(current_ns);
+
+    let periodic_fired = {
+        let mut next_periodic = PER_CPU_NEXT_PERIODIC_TICK[hart].lock();
+        if now_raw < *next_periodic {
+            false
+        } else {
+            let interval = PERIODIC_TICK_INTERVAL.max(1);
+            while now_raw >= *next_periodic {
+                *next_periodic = next_periodic.saturating_add(interval);
+            }
+            true
+        }
+    };
+
+    program_next_trigger_for_hart(hart, now_raw as usize);
+    periodic_fired
 }

@@ -8,7 +8,6 @@ USER_MODE := release
 FS_IMG = ../user/target/$(TARGET)/$(USER_MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
-LOG ?= INFO
 SMP ?= 1
 # Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
 # image and injects user apps into it.

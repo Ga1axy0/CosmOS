@@ -26,14 +26,15 @@ use crate::{
     drivers,
     poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT},
     sync::SpinNoIrqLock,
-    timer::get_time_ms,
+    timer::get_time_us,
 };
 
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
 pub(crate) use socket_timeout::{
     cleanup_socket_wait, handle_socket_wait_timeout, register_socket_wait, socket_wait_mark_ready,
-    socket_wait_should_skip, socket_wait_state, timeout_ns_to_ms, SocketTimerTag, SocketWakeState,
+    socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketTimerTag,
+    SocketWakeState,
 };
 pub use unix_socket::{
     UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SocketLevel
@@ -51,7 +52,7 @@ const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
 const MAX_IMMEDIATE_POLLS: usize = 4;
 
-const NO_POLL_DEADLINE_MS: u64 = u64::MAX;
+const NO_POLL_DEADLINE_US: u64 = u64::MAX;
 
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
@@ -64,9 +65,9 @@ lazy_static! {
 
 /// Whether one immediate poll is needed due to IRQ or recent TX activity.
 pub(crate) static NEED_POLL: AtomicBool = AtomicBool::new(false);
-/// Next soft deadline (ms since boot) for calling into smoltcp.
+/// Next soft deadline (us since boot) for calling into smoltcp.
 /// `u64::MAX` means no timer-driven deadline currently exists.
-pub(crate) static NEXT_POLL_DEADLINE_MS: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_MS);
+pub(crate) static NEXT_POLL_DEADLINE_US: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_US);
 
 /// Userspace-visible IPv4 socket address layout.
 ///
@@ -95,14 +96,14 @@ pub fn init() {
     let stack = NetStack::new(dev);
     *NET_STACK.lock() = Some(stack);
     NEED_POLL.store(true, Ordering::Release);
-    NEXT_POLL_DEADLINE_MS.store(0, Ordering::Release);
+    NEXT_POLL_DEADLINE_US.store(0, Ordering::Release);
     info!("[kernel] net: smoltcp stack initialized");
 }
 
 /// Notify the net stack that one NIC IRQ has arrived.
 pub fn notify_irq() {
     NEED_POLL.store(true, Ordering::Release);
-    NEXT_POLL_DEADLINE_MS.store(0, Ordering::Release);
+    NEXT_POLL_DEADLINE_US.store(0, Ordering::Release);
 }
 
 /// Poll network stack once.
@@ -110,10 +111,10 @@ pub fn notify_irq() {
 /// Call this from a safe context (e.g. timer interrupt path or scheduler tick).
 pub fn poll() {
     // print!("p");
-    let now_ms = get_time_ms() as u64;
+    let now_us = get_time_us() as u64;
     let need_immediate = NEED_POLL.swap(false, Ordering::AcqRel);
-    let deadline_ms = NEXT_POLL_DEADLINE_MS.load(Ordering::Acquire);
-    let deadline_due = deadline_ms != NO_POLL_DEADLINE_MS && now_ms >= deadline_ms;
+    let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
+    let deadline_due = deadline_us != NO_POLL_DEADLINE_US && now_us >= deadline_us;
 
     if !need_immediate && !deadline_due {
         return;
@@ -331,13 +332,13 @@ impl NetStack {
         let next = self
             .iface
             .poll_at(ts, &self.sockets)
-            .map(|t| t.total_millis().max(0) as u64)
-            .unwrap_or(NO_POLL_DEADLINE_MS);
-        NEXT_POLL_DEADLINE_MS.store(next, Ordering::Release);
+            .map(|t| t.total_micros().max(0) as u64)
+            .unwrap_or(NO_POLL_DEADLINE_US);
+        NEXT_POLL_DEADLINE_US.store(next, Ordering::Release);
 
         // Keep liveness for immediate work units (e.g. handshake progress)
         // even when there's no external IRQ.
-        if next != NO_POLL_DEADLINE_MS && (get_time_ms() as u64) >= next {
+        if next != NO_POLL_DEADLINE_US && (get_time_us() as u64) >= next {
             NEED_POLL.store(true, Ordering::Release);
         }
     }
@@ -390,7 +391,7 @@ impl NetStack {
 
 #[inline]
 fn now() -> Instant {
-    Instant::from_millis(get_time_ms() as i64)
+    Instant::from_micros(get_time_us() as i64)
 }
 
 /// Multi-device that routes packets between VirtIO (external) and Loopback (local).
