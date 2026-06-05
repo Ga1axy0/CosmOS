@@ -8,7 +8,9 @@ use crate::fs::{
 };
 use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
 use crate::net::{
-    SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file, create_udp_socket_file
+    SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SocketLevel, TcpSocketFile, UdpSocketFile,
+    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, create_tcp_socket_file,
+    create_udp_socket_file, create_unix_stream_socket_file,
 };
 use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall::errno::{ERRNO, OrErrno};
@@ -642,21 +644,29 @@ fn accept_common(
     Ok(new_fd as isize)
 }
 
-pub fn sys_socket(domain: i32, socket_type: i32, _protocol: i32) -> isize {
+pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
     syscall_body!({
-        if domain != AF_INET as i32 {
-            return Err(ERRNO::EAFNOSUPPORT);
-        }
-
         let (base_type, status_flags, cloexec) = parse_socket_type_flags(socket_type)?;
-        let file: Arc<dyn File + Send + Sync> = match base_type {
-            SOCK_DGRAM => create_udp_socket_file()
-                .map(|f| f as Arc<dyn File + Send + Sync>)
-                .ok_or(ERRNO::ENETDOWN)?,
-            SOCK_STREAM => create_tcp_socket_file()
-                .map(|f| f as Arc<dyn File + Send + Sync>)
-                .ok_or(ERRNO::ENETDOWN)?,
-            _ => return Err(ERRNO::ESOCKTNOSUPPORT),
+        let file: Arc<dyn File + Send + Sync> = match domain {
+            x if x == AF_INET as i32 => match base_type {
+                SOCK_DGRAM => create_udp_socket_file()
+                    .map(|f| f as Arc<dyn File + Send + Sync>)
+                    .ok_or(ERRNO::ENETDOWN)?,
+                SOCK_STREAM => create_tcp_socket_file()
+                    .map(|f| f as Arc<dyn File + Send + Sync>)
+                    .ok_or(ERRNO::ENETDOWN)?,
+                _ => return Err(ERRNO::ESOCKTNOSUPPORT),
+            },
+            AF_UNIX => {
+                if protocol != 0 {
+                    return Err(ERRNO::EPROTONOSUPPORT);
+                }
+                match base_type {
+                    SOCK_STREAM => create_unix_stream_socket_file() as Arc<dyn File + Send + Sync>,
+                    _ => return Err(ERRNO::ESOCKTNOSUPPORT),
+                }
+            }
+            _ => return Err(ERRNO::EAFNOSUPPORT),
         };
 
         let desc = Arc::new(FileDescription::new(

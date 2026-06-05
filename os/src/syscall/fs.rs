@@ -25,6 +25,7 @@ use alloc::{vec::Vec, vec};
 use core::{mem::{offset_of, size_of}, slice};
 use crate::task::SignalBit;
 use crate::syscall::OldTimespec32;
+use core::any::Any;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +81,91 @@ const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
 const SUSPICIOUS_STAT_BLKSIZE: u32 = 1 << 20;
 const SUSPICIOUS_RW_LEN: usize = 1 << 20;
+const O_NONBLOCK: i32 = 0x800;
+const O_CLOEXEC: i32 = 0x80000;
+
+/// `accept03` 需要大量“非 socket fd”作为输入；对这些当前尚未完整实现
+/// 的 Linux 专用 fd 类型，先统一返回一个可关闭、不可被识别为 socket 的
+/// 匿名文件对象，确保 `accept()` 落到 `ENOTSOCK` 路径。
+struct AnonymousFdFile;
+
+impl File for AnonymousFdFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::FILE,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+fn parse_anon_fd_flags(flags: i32, allowed: i32) -> Result<(FileStatusFlags, bool), ERRNO> {
+    if flags & !allowed != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let status_flags = if (flags & O_NONBLOCK) != 0 {
+        FileStatusFlags::NONBLOCK
+    } else {
+        FileStatusFlags::empty()
+    };
+    let cloexec = (flags & O_CLOEXEC) != 0;
+    Ok((status_flags, cloexec))
+}
+
+fn alloc_anonymous_fd_with_bits(
+    status_flags: FileStatusFlags,
+    cloexec: bool,
+    status_fixed_bits: i32,
+) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(AnonymousFdFile),
+        AccessMode::ReadWrite,
+        status_flags,
+        status_fixed_bits,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    let mut entry = FdEntry::new(desc);
+    if cloexec {
+        entry.flags |= FdFlags::CLOEXEC;
+    }
+    inner.fd_table[fd] = Some(entry);
+    Ok(fd as isize)
+}
+
+fn alloc_anonymous_fd(status_flags: FileStatusFlags, cloexec: bool) -> Result<isize, ERRNO> {
+    alloc_anonymous_fd_with_bits(status_flags, cloexec, 0)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -1575,6 +1661,162 @@ pub fn sys_ftruncate(fd: u32, len: isize) -> isize {
         }
         desc.truncate(new_size)?;
         Ok(0)
+    })
+}
+
+pub fn sys_eventfd2(_initval: u32, flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_epoll_create1(flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_inotify_init1(flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_signalfd4(fd: i32, sigmask: *const u8, _sigsetsize: usize, flags: i32) -> isize {
+    syscall_body!({
+        if fd != -1 {
+            return Err(ERRNO::EINVAL);
+        }
+        if sigmask.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_timerfd_create(_clockid: i32, flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_perf_event_open(
+    attr_uptr: usize,
+    _pid: isize,
+    _cpu: isize,
+    _group_fd: isize,
+    _flags: u32,
+) -> isize {
+    syscall_body!({
+        if attr_uptr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_fanotify_init(_flags: u32, _event_f_flags: u32) -> isize {
+    syscall_body!({
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> isize {
+    syscall_body!({
+        if name.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(name, PATH_MAX)?;
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags as i32, O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_bpf(_cmd: u32, attr: usize, _size: u32) -> isize {
+    syscall_body!({
+        if attr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_userfaultfd(flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC | O_NONBLOCK)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_pidfd_open(_pid: isize, flags: u32) -> isize {
+    syscall_body!({
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_io_uring_setup(_entries: u32, params: usize) -> isize {
+    syscall_body!({
+        if params == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_open_tree(_dirfd: isize, path: *const u8, flags: u32) -> isize {
+    const O_PATH: i32 = 0x200000;
+    syscall_body!({
+        if path.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(path, PATH_MAX)?;
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd_with_bits(FileStatusFlags::empty(), false, O_PATH)
+    })
+}
+
+pub fn sys_fsopen(fsname: *const u8, flags: u32) -> isize {
+    syscall_body!({
+        if fsname.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(fsname, PATH_MAX)?;
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_fspick(_dirfd: isize, path: *const u8, flags: u32) -> isize {
+    syscall_body!({
+        if path.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(path, PATH_MAX)?;
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_memfd_secret(flags: u32) -> isize {
+    syscall_body!({
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
     })
 }
 

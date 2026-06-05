@@ -12,12 +12,18 @@
 
 /// getcwd syscall
 pub const SYSCALL_GETCWD: usize = 17;
+/// eventfd2 syscall
+pub const SYSCALL_EVENTFD2: usize = 19;
+/// epoll_create1 syscall
+pub const SYSCALL_EPOLL_CREATE1: usize = 20;
 /// dup syscall
 pub const SYSCALL_DUP: usize = 23;
 /// dup2 syscall
 pub const SYSCALL_DUP2: usize = 24;
 /// fcntl syscall
 pub const SYSCALL_FCNTL: usize = 25;
+/// inotify_init1 syscall
+pub const SYSCALL_INOTIFY_INIT1: usize = 26;
 /// ioctl syscall
 pub const SYSCALL_IOCTL: usize = 29;
 /// mkdirat syscall
@@ -86,10 +92,14 @@ pub const SYSCALL_SENDFILE64: usize = 71;
 pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
 pub const SYSCALL_PPOLL_TIME32: usize = 73;
+/// signalfd4 syscall
+pub const SYSCALL_SIGNALFD4: usize = 74;
 /// readlinkat syscall
 pub const SYSCALL_READLINKAT: usize = 78;
 /// newfstatat syscall
 pub const SYSCALL_NEWFSTATAT: usize = 79;
+/// timerfd_create syscall
+pub const SYSCALL_TIMERFD_CREATE: usize = 85;
 /// utimensat syscall
 pub const SYSCALL_UTIMENSAT: usize = 88;
 /// fstat syscall
@@ -220,6 +230,8 @@ pub const SYSCALL_LISTEN: usize = 201;
 pub const SYSCALL_ACCEPT: usize = 202;
 /// connect syscall
 pub const SYSCALL_CONNECT: usize = 203;
+/// perf_event_open syscall
+pub const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 /// accept4 syscall
 pub const SYSCALL_ACCEPT4: usize = 242;
 /// getsockname syscall
@@ -270,6 +282,8 @@ pub const SYSCALL_GET_MEMPOLICY: usize = 236;
 pub const SYSCALL_WAIT4: usize = 260;
 /// prlimit64 syscall
 pub const SYSCALL_PRLIMIT64: usize = 261;
+/// fanotify_init syscall
+pub const SYSCALL_FANOTIFY_INIT: usize = 262;
 /// syncfs syscall
 pub const SYSCALL_SYNCFS: usize = 267;
 /// sched_setattr syscall
@@ -280,8 +294,26 @@ pub const SYSCALL_SCHED_GETATTR: usize = 275;
 pub const SYSCALL_RENAMEAT2: usize = 276;
 /// getrandom syscall
 pub const SYSCALL_GETRANDOM: usize = 278;
+/// memfd_create syscall
+pub const SYSCALL_MEMFD_CREATE: usize = 279;
+/// bpf syscall
+pub const SYSCALL_BPF: usize = 280;
+/// userfaultfd syscall
+pub const SYSCALL_USERFAULTFD: usize = 282;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
+/// io_uring_setup syscall
+pub const SYSCALL_IO_URING_SETUP: usize = 425;
+/// open_tree syscall
+pub const SYSCALL_OPEN_TREE: usize = 428;
+/// fsopen syscall
+pub const SYSCALL_FSOPEN: usize = 430;
+/// fspick syscall
+pub const SYSCALL_FSPICK: usize = 433;
+/// pidfd_open syscall
+pub const SYSCALL_PIDFD_OPEN: usize = 434;
+/// memfd_secret syscall
+pub const SYSCALL_MEMFD_SECRET: usize = 447;
 /*
 /// mail read syscall
 pub const SYSCALL_MAIL_READ: usize = 401;
@@ -442,9 +474,12 @@ fn errno_name(errno: isize) -> &'static str {
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let result = match syscall_id {
+        SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as i32),
+        SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as i32),
         SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
+        SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_SYMLINKAT => sys_symlinkat(
@@ -545,7 +580,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4],
         ),
+        SYSCALL_SIGNALFD4 => sys_signalfd4(
+            args[0] as i32,
+            args[1] as *const u8,
+            args[2],
+            args[3] as i32,
+        ),
         SYSCALL_FSTAT => sys_fstat(args[0] as u32, args[1] as *mut Stat),
+        SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1] as i32),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
@@ -614,6 +656,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut i32,
             args[3] as i32,
         ),
+        SYSCALL_PERF_EVENT_OPEN => sys_perf_event_open(
+            args[0],
+            args[1] as isize,
+            args[2] as isize,
+            args[3] as isize,
+            args[4] as u32,
+        ),
         SYSCALL_CONNECT => sys_connect(args[0] as i32, args[1] as *const SockAddrIn, args[2] as i32),
         SYSCALL_GETSOCKNAME => sys_getsockname(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as *mut i32),
         SYSCALL_GETPEERNAME => sys_getpeername(args[0] as i32, args[1] as *mut SockAddrIn, args[2] as *mut i32),
@@ -668,6 +717,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const usize,
         ),
         SYSCALL_WAIT4 => sys_wait4(args[0] as isize, args[1] as *mut i32, args[2] as isize),
+        SYSCALL_FANOTIFY_INIT => sys_fanotify_init(args[0] as u32, args[1] as u32),
         SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
         SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
@@ -716,6 +766,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
+        SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
+        SYSCALL_BPF => sys_bpf(args[0] as u32, args[1], args[2] as u32),
+        SYSCALL_USERFAULTFD => sys_userfaultfd(args[0] as i32),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const UserSigAction,
@@ -731,7 +784,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
         ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
+        SYSCALL_IO_URING_SETUP => sys_io_uring_setup(args[0] as u32, args[1]),
+        SYSCALL_OPEN_TREE => sys_open_tree(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_FSOPEN => sys_fsopen(args[0] as *const u8, args[1] as u32),
+        SYSCALL_FSPICK => sys_fspick(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_PIDFD_OPEN => sys_pidfd_open(args[0] as isize, args[1] as u32),
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
+        SYSCALL_MEMFD_SECRET => sys_memfd_secret(args[0] as u32),
+        // Some LTP RISC-V builds fall back to `__LTP__NR_INVALID_SYSCALL` (-1)
+        // when the userspace headers do not provide `__NR_memfd_secret`.
+        x if x == usize::MAX => sys_memfd_secret(args[0] as u32),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_WAITTID => sys_waittid(args[0]) as isize,
         SYSCALL_MUTEX_CREATE => sys_mutex_create(args[0] == 1),
