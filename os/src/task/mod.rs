@@ -60,6 +60,15 @@ use alloc::string::String;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(reason: ExitReason) {
+    exit_current_and_run_next_inner(reason, false);
+}
+
+/// Terminate the whole thread group from the current task.
+pub fn exit_group_current_and_run_next(reason: ExitReason) {
+    exit_current_and_run_next_inner(reason, true);
+}
+
+fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool) {
     let exit_reason = reason;
     let task_exit_code = match exit_reason {
         ExitReason::Exit(code) => code,
@@ -134,15 +143,17 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         remove_from_tid2task(thread_id);
     }
 
-    // Move the task to stop-wait status, to avoid kernel stack from being freed
-    if tid == Some(0) {
+    let exiting_task = Arc::clone(&task);
+    // Move the task to stop-wait status when it owns process teardown, to avoid
+    // freeing the kernel stack while still switching away on it.
+    if tid == Some(0) || force_process_exit {
         add_stopping_task(task);
     } else {
         drop(task);
     }
-    // however, if this is the main thread of current process
-    // the process should terminate at once
-    if tid == Some(0) {
+    // However, if this is the main thread or exit_group was requested, the
+    // process should terminate at once.
+    if tid == Some(0) || force_process_exit {
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
@@ -158,17 +169,37 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             }
         }
         let mut process_inner = process.inner_exclusive_access();
+        let cleanup_already_started = process_inner.is_zombie;
+        if cleanup_already_started {
+            drop(process_inner);
+            let mut process_inner = process.inner_exclusive_access();
+            if let Some(tid) = tid {
+                process_inner.mutex_detector.clear_thread(tid);
+                process_inner.semaphore_detector.clear_thread(tid);
+            }
+            drop(process_inner);
+            drop(process);
+            debug!("exit_current_and_run_next: after drop(process)");
+            let mut _unused = TaskContext::zero_init();
+            debug!("exit_current_and_run_next: before schedule");
+            schedule(&mut _unused as *mut _);
+            return;
+        }
         // mark this process as a zombie process
         process_inner.is_zombie = true;
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
 
+        // Move all child processes under init process. Keep the init lock
+        // separate from child locks to avoid child->init / init->child cycles.
+        let children_to_reparent = process_inner.children.clone();
+        for child in children_to_reparent.iter() {
+            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+        }
         {
-            // move all child processes under init process
             let mut initproc_inner = INITPROC.inner_exclusive_access();
-            for child in process_inner.children.iter() {
-                child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-                initproc_inner.children.push(child.clone());
+            for child in children_to_reparent {
+                initproc_inner.children.push(child);
             }
         }
 
@@ -176,21 +207,31 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         // it has to be done before we dealloc the whole memory_set
         // otherwise they will be deallocated twice
         let mut recycle_res = Vec::<TaskUserRes>::new();
+        let mut running_tasks = Vec::new();
+        let mut running_harts = Vec::new();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
-            let thread_id = {
+            let (thread_id, was_on_cpu, last_cpu) = {
                 let mut task_inner = task.inner_exclusive_access();
                 task_inner.exit_code.get_or_insert(task_exit_code);
                 task_inner.task_status = TaskStatus::Zombie;
                 task_inner.wait_reason = None;
-                task_inner.sched.on_cpu = false;
                 task_inner.sched.on_rq = false;
-                task_inner.sched.resched_reason = None;
+                task_inner.sched.resched_reason = Some(ReschedReason::HigherRtPriority);
                 task_inner.current_wq_handle = None;
-                task_inner.res.as_ref().map(|res| res.thread_id())
+                (
+                    task_inner.res.as_ref().map(|res| res.thread_id()),
+                    task_inner.sched.on_cpu,
+                    task_inner.sched.last_cpu,
+                )
             };
             if let Some(thread_id) = thread_id {
                 remove_from_tid2task(thread_id);
+            }
+            if was_on_cpu && !Arc::ptr_eq(task, &exiting_task) {
+                running_harts.push(last_cpu);
+                running_tasks.push(Arc::clone(task));
+                continue;
             }
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
             // expired, we should remove them.
@@ -201,6 +242,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             trace!("kernel: exit_current_and_run_next .. remove_inactive_task");
             remove_inactive_task(Arc::clone(&task));
             let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.on_cpu = false;
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
@@ -209,6 +251,24 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         // need to collect those user res first, then release process_inner
         // for now to avoid deadlock/double borrow problem.
         drop(process_inner);
+        for hart in running_harts {
+            crate::sched::resched_hart(hart);
+        }
+        while running_tasks.iter().any(|task| task.inner_exclusive_access().sched.on_cpu) {
+            core::hint::spin_loop();
+        }
+        {
+            let process_inner = process.inner_exclusive_access();
+            for task in running_tasks {
+                let mut task_inner = task.inner_exclusive_access();
+                if let Some(res) = task_inner.res.take() {
+                    recycle_res.push(res);
+                }
+                task_inner.sched.on_cpu = false;
+                task_inner.sched.on_rq = false;
+            }
+            drop(process_inner);
+        }
         recycle_res.clear();
 
         let (closed_fds, parent_weak, reclaim, shm_attachments) = {
@@ -218,7 +278,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             let token = process_inner.memory_set.token();
             let mask = process_inner.memory_set.loaded_user_harts();
             let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
-            let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
+            let reclaim = DeferredUserReclaim::new(token, mask, "exit_process_memory", release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
             let closed_fds = process_inner.take_all_fds();
             process_inner.fd_table.clear();
@@ -376,19 +436,22 @@ pub fn add_signal_to_process_with_siginfo(
     signal: SignalBit,
     siginfo: SigInfo,
 ) {
-    let (pid, newly_pending, tasks) = {
+    let pid = process.getpid();
+    let (newly_pending, tasks, pending_before, pending_after) = {
         let mut process_inner = process.inner_exclusive_access();
         let tasks = process_inner
             .tasks
             .iter()
             .filter_map(|slot| slot.as_ref().map(Arc::clone))
             .collect::<Vec<_>>();
+        let pending_before = process_inner.pending_signals;
         let newly_pending = signal & !process_inner.pending_signals;
         process_inner.pending_signals |= signal;
         if let Some(signum) = first_signum_in_set(signal) {
             process_inner.pending_siginfo[signum] = siginfo;
         }
-        (process.getpid(), newly_pending, tasks)
+        let pending_after = process_inner.pending_signals;
+        (newly_pending, tasks, pending_before, pending_after)
     };
 
     crate::signal::notify_signal_wait_pid(pid, signal.bits());

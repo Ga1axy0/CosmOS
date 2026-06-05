@@ -11,8 +11,8 @@ use crate::{
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, thread_id2task, ExitReason, ProcessControlBlock, ShmAttachment,
-        SigInfo, SignalBit, WaitReason,
+        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
+        ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -156,7 +156,13 @@ pub fn sys_exit(exit_code: i32) -> ! {
 
 /// 临时实现
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    sys_exit(exit_code);
+    trace!(
+        "kernel:pid[{}] sys_exit_group - time {}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        get_time_ns()
+    );
+    exit_group_current_and_run_next(ExitReason::Exit(exit_code));
+    panic!("Unreachable in sys_exit_group!");
 }
 
 /// getpid syscall
@@ -719,6 +725,31 @@ const W_INTERNAL_FLAGS: isize = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
 /// `wait4` 可识别的全部选项位。
 const WAIT_RECOGNIZED: isize = WNOHANG | WUNTRACED | WCONTINUED | WNOWAIT | W_INTERNAL_FLAGS;
 
+fn snapshot_children_for_wait4(
+    process: &Arc<ProcessControlBlock>,
+    self_pid: usize,
+    label: &'static str,
+) -> Vec<Arc<ProcessControlBlock>> {
+    loop {
+        let child_count = {
+            let inner = process.inner_exclusive_access();
+            let child_count = inner.children.len();
+            child_count
+        };
+
+        let mut children = Vec::with_capacity(child_count);
+        let inner = process.inner_exclusive_access();
+    
+        if inner.children.len() > children.capacity() {
+            continue;
+        }
+        for child in inner.children.iter() {
+            children.push(Arc::clone(child));
+        }
+        return children;
+    }
+}
+
 /// waitpid syscall
 ///
 /// If there is not a child process whose pid is same as given, return -ECHILD.
@@ -726,6 +757,7 @@ const WAIT_RECOGNIZED: isize = WNOHANG | WUNTRACED | WCONTINUED | WNOWAIT | W_IN
 pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize {
     trace!("kernel: sys_wait4");
     let process = current_process();
+    let self_pid = process.getpid();
     syscall_body!({
         // 只在低 32 位上校验选项，避免符号扩展把 `__WCLONE`(0x80000000) 误判为非法位。
         // `WUNTRACED`/`WCONTINUED` 当前没有额外的停止/继续状态可上报（本内核不实现
@@ -736,11 +768,11 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
         }
 
         loop {
-            let mut inner = process.inner_exclusive_access();
+            let children_snapshot =
+                snapshot_children_for_wait4(&process, self_pid, "pid1_wait4");
 
             // 1) 没有任何匹配的子进程
-            let has_target_child = inner
-                .children
+            let has_target_child = children_snapshot
                 .iter()
                 .any(|p| pid == -1 || pid as usize == p.getpid());
             if !has_target_child {
@@ -748,30 +780,49 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             }
 
             // 2) 查找已经退出的目标子进程
-            let zombie_idx = inner.children.iter().position(|p| {
+            let zombie_pid = children_snapshot.iter().find_map(|p| {
                 let p_inner = p.inner_exclusive_access();
-                p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+                if p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid()) {
+                    Some(p.getpid())
+                } else {
+                    None
+                }
             });
 
-            if let Some(idx) = zombie_idx {
-                let child = inner.children.remove(idx);
-                let found_pid = child.getpid();
-                let child_inner = child.inner_exclusive_access();
-                // 编码为wstatus
-               let exit_status = match child_inner.exit_reason {
-                    ExitReason::Exit(code) => (code & 0xff) << 8,
-                    ExitReason::Signal(signum) => (signum & 0x7f) as i32,
+            if let Some(found_pid) = zombie_pid {
+                let child = {
+                    let mut inner = process.inner_exclusive_access();
+                    let Some(idx) = inner.children.iter().position(|p| p.getpid() == found_pid) else {
+                        continue;
+                    };
+                    inner.children.remove(idx)
                 };
-                inner.child_user_time = inner
-                    .child_user_time
-                    .saturating_add(child_inner.user_time)
-                    .saturating_add(child_inner.child_user_time);
-                inner.child_kernel_time = inner
-                    .child_kernel_time
-                    .saturating_add(child_inner.kernel_time)
-                    .saturating_add(child_inner.child_kernel_time);
-                drop(child_inner);
-                drop(inner);
+                debug!(
+                    "sys_wait4: found zombie child self_pid={} child_pid={} hart={}",
+                    self_pid,
+                    found_pid,
+                    hartid()
+                );
+                let (exit_status, add_user_time, add_kernel_time) = {
+                    let child_inner = child.inner_exclusive_access();
+                    let exit_status = match child_inner.exit_reason {
+                        ExitReason::Exit(code) => (code & 0xff) << 8,
+                        ExitReason::Signal(signum) => (signum & 0x7f) as i32,
+                    };
+                    let add_user_time = child_inner
+                        .user_time
+                        .saturating_add(child_inner.child_user_time);
+                    let add_kernel_time = child_inner
+                        .kernel_time
+                        .saturating_add(child_inner.child_kernel_time);
+                    (exit_status, add_user_time, add_kernel_time)
+                };
+                {
+                    let mut inner = process.inner_exclusive_access();
+                    inner.child_user_time = inner.child_user_time.saturating_add(add_user_time);
+                    inner.child_kernel_time =
+                        inner.child_kernel_time.saturating_add(add_kernel_time);
+                }
                 remove_from_pid2process(found_pid);
 
                 if !exit_status_ptr.is_null() {
@@ -786,18 +837,46 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 return Ok(0);
             }
 
-            // 4) 阻塞等待；这里必须先释放 inner，再睡眠
-            drop(inner);
+            if self_pid == 1 {
+                let child_states = children_snapshot
+                    .iter()
+                    .map(|child| {
+                        let child_inner = child.inner_exclusive_access();
+                        (
+                            child.getpid(),
+                            child_inner.is_zombie,
+                            child_inner.pending_signals.bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                warn!(
+                    "sys_wait4: no zombie yet self_pid={} target_pid={} child_states={:?} hart={}",
+                    self_pid,
+                    pid,
+                    child_states,
+                    hartid()
+                );
+            }
+
+            // 4) 阻塞等待
+            if self_pid == 1 {
+                warn!(
+                    "sys_wait4: dropped process lock before wait self_pid={} target_pid={} hart={}",
+                    self_pid,
+                    pid,
+                    hartid()
+                );
+            }
 
             process
                 .wait_exit_queue
                 .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
-                    let inner = process.inner_exclusive_access();
-                    let has_target_child = inner
-                        .children
+                    let children_snapshot =
+                        snapshot_children_for_wait4(&process, self_pid, "pid1_wait4_predicate");
+                    let has_target_child = children_snapshot
                         .iter()
                         .any(|p| pid == -1 || pid as usize == p.getpid());
-                    let has_target_zombie = inner.children.iter().any(|p| {
+                    let has_target_zombie = children_snapshot.iter().any(|p| {
                         let p_inner = p.inner_exclusive_access();
                         p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
                     });
@@ -807,7 +886,19 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             // If woken by a deliverable user-handled signal, return EINTR so the trap handler can dispatch it.
             {
                 let task = current_task().unwrap();
+                debug!(
+                    "sys_wait4: before EINTR check process lock self_pid={} target_pid={} hart={}",
+                    self_pid,
+                    pid,
+                    hartid()
+                );
                 let inner = process.inner_exclusive_access();
+                debug!(
+                    "sys_wait4: acquired process lock for EINTR check self_pid={} target_pid={} hart={}",
+                    self_pid,
+                    pid,
+                    hartid()
+                );
                 let task_inner = task.inner_exclusive_access();
                 let pending_unmasked = (task_inner.pending_signals | inner.pending_signals)
                     & !task_inner.signal_mask.without_unblockable();
@@ -819,6 +910,14 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     let handler = inner.signal_actions.table[signum].handler;
                     handler != crate::task::SIG_DFL && handler != crate::task::SIG_IGN
                 });
+                debug!(
+                    "sys_wait4: EINTR check self_pid={} target_pid={} pending_unmasked={:#x} has_user_handler={} hart={}",
+                    self_pid,
+                    pid,
+                    pending_unmasked.bits(),
+                    has_user_handler,
+                    hartid()
+                );
                 if has_user_handler {
                     return Err(ERRNO::EINTR);
                 }
@@ -881,14 +980,31 @@ pub fn sys_kill(pid: isize, signal: u32) -> isize {
         if targets.is_empty() {
             return Err(ERRNO::ESRCH);
         }
+        if pid <= 0 {
+            debug!(
+                "sys_kill: sender_pid={} sender_pgid={} pid_arg={} signal={} matched_targets={}",
+                sender_pid,
+                sender_pgid,
+                pid,
+                signal,
+                targets.len()
+            );
+        }
         if let Some(flag) = flag {
             for process in &targets {
+                let (is_zombie, task_count) = {
+                    let inner = process.inner_exclusive_access();
+                    (inner.is_zombie, inner.tasks.len())
+                };
                 debug!(
-                    "sys_kill: sender_pid={} target_pid={} target_pgid={} pid_arg={}",
+                    "sys_kill: sender_pid={} target_pid={} target_pgid={} pid_arg={} signal={} target_is_zombie={} target_tasks={}",
                     sender_pid,
                     process.getpid(),
                     process.getpgid(),
-                    pid
+                    pid,
+                    signal,
+                    is_zombie,
+                    task_count
                 );
                 crate::task::add_signal_to_process_with_siginfo(process, flag, siginfo);
             }

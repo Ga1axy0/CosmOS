@@ -13,9 +13,12 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use riscv::register::sstatus;
+
+const LOCK_OWNER_NONE: usize = usize::MAX;
+const LOCK_LABEL_UNLABELED: usize = 0;  
 
 // ---------------------------------------------------------------------------
 // SpinLock – plain spinlock (no interrupt masking)
@@ -100,6 +103,8 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 /// Semantically equivalent to Linux's `spin_lock_irqsave`.
 pub struct SpinNoIrqLock<T> {
     locked: AtomicBool,
+    owner_hart: AtomicUsize,
+    owner_label: AtomicUsize,
     data: UnsafeCell<T>,
 }
 
@@ -111,6 +116,8 @@ impl<T> SpinNoIrqLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            owner_hart: AtomicUsize::new(LOCK_OWNER_NONE),
+            owner_label: AtomicUsize::new(LOCK_OWNER_NONE),
             data: UnsafeCell::new(value),
         }
     }
@@ -131,6 +138,10 @@ impl<T> SpinNoIrqLock<T> {
             // might take the same or nested locks.
             core::hint::spin_loop();
         }
+        self.owner_hart
+            .store(crate::hart::hartid(), Ordering::Release);
+        self.owner_label
+            .store(LOCK_LABEL_UNLABELED, Ordering::Release);
 
         SpinNoIrqLockGuard {
             lock: self,
@@ -170,6 +181,8 @@ impl<T> DerefMut for SpinNoIrqLockGuard<'_, T> {
 
 impl<T> Drop for SpinNoIrqLockGuard<'_, T> {
     fn drop(&mut self) {
+        self.lock.owner_label.store(LOCK_OWNER_NONE, Ordering::Release);
+        self.lock.owner_hart.store(LOCK_OWNER_NONE, Ordering::Release);
         self.lock.locked.store(false, Ordering::Release);
         if self.sie_was_enabled {
             unsafe { sstatus::set_sie() };

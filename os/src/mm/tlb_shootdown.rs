@@ -388,10 +388,18 @@ pub fn handle_ipi() {
     );
     perform_local_tlb_shootdown(kind);
     // 远端完成本地 flush 后再置 ack bit。
-    TLB_SHOOTDOWN_STATE
+    let ack_mask = TLB_SHOOTDOWN_STATE
         .ack_mask
-        .fetch_or(self_bit, Ordering::AcqRel);
-    trace!("[tlb] hart {} ack shootdown seq={}", hartid(), seq);
+        .fetch_or(self_bit, Ordering::AcqRel)
+        | self_bit;
+    debug!(
+        "[tlb] hart {} ack shootdown seq={} kind={} target={:#b} ack={:#b}",
+        hartid(),
+        seq,
+        shootdown_kind_name(kind),
+        target_mask,
+        ack_mask
+    );
 }
 
 /// 将枚举语义编码到全局请求槽。

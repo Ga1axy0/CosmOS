@@ -795,7 +795,8 @@ impl ProcessControlBlock {
         };
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
-        DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
+        DeferredUserReclaim::new(old_token, old_mask, "exec_replace_memory", old_batch)
+            .flush_then_release();
         drop(cloexec_entries);
         for attachment in old_shm_attachments {
             ipc::detach_segment(attachment.shmid);
@@ -1222,7 +1223,7 @@ impl ProcessControlBlock {
             let batch = inner
                 .memory_set
                 .invalidate_file_mappings_after_truncate_deferred(inode, new_size);
-            DeferredUserReclaim::new(token, mask, batch)
+            DeferredUserReclaim::new(token, mask, "truncate_file_mapping", batch)
         };
         reclaim.flush_then_release();
     }
@@ -1252,7 +1253,7 @@ impl ProcessControlBlock {
             inner
                 .memory_set
                 .munmap_deferred(start, end)
-                .map(|batch| DeferredUserReclaim::new(token, mask, batch))
+                .map(|batch| DeferredUserReclaim::new(token, mask, "munmap", batch))
         }) else {
             return false;
         };
@@ -1298,7 +1299,7 @@ impl ProcessControlBlock {
                 .handle_private_cow_fault(VirtAddr::from(fault_addr))?;
             (
                 handled,
-                batch.map(|batch| DeferredUserReclaim::new(token, mask, batch)),
+                batch.map(|batch| DeferredUserReclaim::new(token, mask, "private_cow_fault", batch)),
             )
         };
         if let Some(reclaim) = reclaim {
@@ -1514,6 +1515,7 @@ impl ProcessControlBlock {
                 DeferredUserReclaim::new(
                     inner.memory_set.token(),
                     inner.memory_set.loaded_user_harts(),
+                    "brk_shrink",
                     batch,
                 )
             });

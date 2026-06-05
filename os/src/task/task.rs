@@ -304,7 +304,7 @@ pub enum WaitReason {
     SignalTimedWait,
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 /// Linux-like task lifecycle states.
 pub enum TaskStatus {
     /// Running

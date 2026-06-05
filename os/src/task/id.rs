@@ -282,7 +282,7 @@ impl TaskUserRes {
                 .memory_set
                 .remove_vma_with_start_vpn_user_deferred(trap_cx_bottom_va.into());
             release_batch.append(&mut trap_cx_batch);
-            DeferredUserReclaim::new(token, mask, release_batch)
+            DeferredUserReclaim::new(token, mask, "drop_task_user_res", release_batch)
         };
         if !reclaim.is_empty() {
             debug!(
