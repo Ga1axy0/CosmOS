@@ -26,6 +26,16 @@ const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
 
+// IP-level (SOL_IP) multicast group membership options. These use a
+// `struct group_req { __u32 gr_interface; struct sockaddr_storage gr_group; }`
+// payload; on a 64-bit ABI `gr_group` is 8-byte aligned, so it begins at
+// offset 8 and the embedded `sockaddr_in` puts the group address at offset 12.
+const MCAST_JOIN_GROUP: i32 = 42;
+const MCAST_LEAVE_GROUP: i32 = 45;
+const GROUP_REQ_FAMILY_OFFSET: usize = 8;
+const GROUP_REQ_ADDR_OFFSET: usize = 12;
+const GROUP_REQ_MIN_LEN: usize = GROUP_REQ_ADDR_OFFSET + 4;
+
 
 #[repr(i32)]
 #[derive(FromRepr)]
@@ -463,6 +473,39 @@ fn read_sockopt_i32(token: usize, optval: *const u8, optlen: i32) -> Result<i32,
     }
     let raw = copy_user_bytes(token, optval, size_of::<i32>())?;
     Ok(i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+/// Parse a `struct group_req` from userspace and return the IPv4 multicast
+/// group address it carries. Validates the length, the address family and that
+/// the address is actually a multicast (224.0.0.0/4) address, mirroring the
+/// checks Linux performs in `ip_mc_join_group`.
+fn parse_group_req(token: usize, optval: *const u8, optlen: i32) -> Result<Ipv4Address, ERRNO> {
+    if optlen < GROUP_REQ_MIN_LEN as i32 {
+        return Err(ERRNO::EINVAL);
+    }
+    if optval.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let raw = copy_user_bytes(token, optval, GROUP_REQ_MIN_LEN)?;
+    let family = u16::from_ne_bytes([
+        raw[GROUP_REQ_FAMILY_OFFSET],
+        raw[GROUP_REQ_FAMILY_OFFSET + 1],
+    ]);
+    if family != AF_INET {
+        return Err(ERRNO::EINVAL);
+    }
+    // sin_addr is stored in network byte order.
+    let addr = Ipv4Address::new(
+        raw[GROUP_REQ_ADDR_OFFSET],
+        raw[GROUP_REQ_ADDR_OFFSET + 1],
+        raw[GROUP_REQ_ADDR_OFFSET + 2],
+        raw[GROUP_REQ_ADDR_OFFSET + 3],
+    );
+    // 224.0.0.0/4: the top four bits are 1110.
+    if !(224..=239).contains(&addr.octets()[0]) {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok(addr)
 }
 
 fn read_sockopt_timeval(optval: *const u8, optlen: i32) -> Result<TimeVal, ERRNO> {
@@ -1010,6 +1053,40 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                 }
                 _ => {
                     warn!("setsockopt(fd={}, level={}, optname={}) not implemented for SOL_SOCKET, ignored", fd, level, optname);
+                    Ok(0)
+                }
+            },
+            Some(SocketLevel::IpProtoIp) => match optname {
+                MCAST_JOIN_GROUP => {
+                    if kind != SocketKind::Tcp {
+                        // Multicast membership is only modelled for TCP sockets;
+                        // accept silently elsewhere to preserve prior behaviour.
+                        return Ok(0);
+                    }
+                    let token = current_user_token();
+                    let group = parse_group_req(token, optval, optlen)?;
+                    let joined = with_tcp_socket(fd, |tcp| Ok(tcp.join_mcast_group(group)))?;
+                    if joined {
+                        Ok(0)
+                    } else {
+                        Err(ERRNO::EADDRINUSE)
+                    }
+                }
+                MCAST_LEAVE_GROUP => {
+                    if kind != SocketKind::Tcp {
+                        return Err(ERRNO::EADDRNOTAVAIL);
+                    }
+                    let token = current_user_token();
+                    let group = parse_group_req(token, optval, optlen)?;
+                    let left = with_tcp_socket(fd, |tcp| Ok(tcp.leave_mcast_group(group)))?;
+                    if left {
+                        Ok(0)
+                    } else {
+                        Err(ERRNO::EADDRNOTAVAIL)
+                    }
+                }
+                _ => {
+                    warn!("setsockopt(fd={}, level={}, optname={}) not implemented for SOL_IP, ignored", fd, level, optname);
                     Ok(0)
                 }
             },
