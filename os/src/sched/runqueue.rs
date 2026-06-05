@@ -1,6 +1,6 @@
 //! Per-hart runqueue management for RT and CFS scheduling classes.
 
-use super::current_task;
+use super::{current_task, processor::processor_for_hart};
 use crate::config::MAX_HARTS;
 use crate::hart::hartid;
 use crate::mm::online_mask as online_hart_mask;
@@ -423,16 +423,36 @@ fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool 
     let incoming = {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
+        let pid = task
+            .process
+            .upgrade()
+            .map(|process| process.getpid())
+            .unwrap_or(usize::MAX);
         match task_inner.task_status {
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {}
             TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return true,
         }
         if task_inner.sched.on_rq || task_inner.sched.on_cpu {
+            debug!(
+                "enqueue_wakeup_task: pid={} target_hart={} already on_cpu={} on_rq={}, mark runnable only",
+                pid,
+                target_hart,
+                task_inner.sched.on_cpu,
+                task_inner.sched.on_rq
+            );
             task_inner.task_status = TaskStatus::Runnable;
             task_inner.wait_reason = None;
             task_inner.current_wq_handle = None;
             return true;
         }
+        debug!(
+            "enqueue_wakeup_task: pid={} target_hart={} enqueue from status={:?} last_cpu={} wait_reason={:?}",
+            pid,
+            target_hart,
+            task_inner.task_status,
+            task_inner.sched.last_cpu,
+            task_inner.wait_reason
+        );
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
         task_inner.current_wq_handle = None;
@@ -525,6 +545,20 @@ pub(crate) fn pick_next_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
 pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
     let wake_target = {
         let mut task_inner = task.inner_exclusive_access();
+        let pid = task
+            .process
+            .upgrade()
+            .map(|process| process.getpid())
+            .unwrap_or(usize::MAX);
+        debug!(
+            "wakeup_task: pid={} status={:?} wait_reason={:?} on_cpu={} on_rq={} last_cpu={}",
+            pid,
+            task_inner.task_status,
+            task_inner.wait_reason,
+            task_inner.sched.on_cpu,
+            task_inner.sched.on_rq,
+            task_inner.sched.last_cpu
+        );
         match task_inner.task_status {
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {
                 if task_inner.sched.on_rq {
@@ -537,8 +571,21 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     return true;
                 }
                 if task_inner.sched.on_cpu {
-                    drop(task_inner);
-                    return wake_running_or_queued_task(&task);
+                    let last_cpu = normalize_hart(task_inner.sched.last_cpu);
+                    let is_still_current = processor_for_hart(last_cpu)
+                        .lock()
+                        .current()
+                        .is_some_and(|current| Arc::ptr_eq(&current, &task));
+                    if is_still_current {
+                        drop(task_inner);
+                        return wake_running_or_queued_task(&task);
+                    }
+                    task_inner.sched.on_cpu = false;
+                    Some((
+                        last_cpu,
+                        task_inner.sched.cpu_affinity_mask,
+                        task_inner.sched.policy,
+                    ))
                 } else {
                     Some((
                         task_inner.sched.last_cpu,

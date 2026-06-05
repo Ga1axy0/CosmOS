@@ -3,6 +3,7 @@ use crate::mm::UserBuffer;
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
+use crate::task::current_task;
 use alloc::sync::{Arc, Weak};
 use crate::fs::{Stat,StatMode}; 
 use crate::task::{WaitQueue, WaitReason};
@@ -85,11 +86,19 @@ impl Pipe {
             return Ok(0);
         }
         let loop_write = ring_buffer.available_write();
+        if want_to_write <= PIPE_BUF && loop_write < want_to_write {
+            return Err(ERRNO::EAGAIN);
+        }
         if loop_write == 0 {
             return Err(ERRNO::EAGAIN);
         }
         let mut already_write = 0usize;
-        for _ in 0..loop_write {
+        let write_limit = if want_to_write <= PIPE_BUF {
+            want_to_write
+        } else {
+            loop_write
+        };
+        for _ in 0..write_limit {
             if let Some(byte_ref) = buf_iter.next() {
                 ring_buffer.write_byte(unsafe { *byte_ref });
                 already_write += 1;
@@ -107,6 +116,11 @@ impl Pipe {
 }
 
 const RING_BUFFER_SIZE: usize = 1024;
+/// POSIX requires pipe writes up to PIPE_BUF to be atomic.
+///
+/// Our ring buffer is 1024 bytes, so use that as the maximum atomic size that
+/// the implementation can actually guarantee.
+const PIPE_BUF: usize = RING_BUFFER_SIZE;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -320,6 +334,7 @@ impl File for Pipe {
         let want_to_write = buf.len();
         let mut buf_iter = buf.into_iter();
         let mut already_write = 0usize;
+        let atomic_write = want_to_write <= PIPE_BUF;
         loop {
             let mut ring_buffer = self.buffer.lock();
             if ring_buffer.all_read_ends_closed() {
@@ -327,13 +342,44 @@ impl File for Pipe {
             }
             let loop_write = ring_buffer.available_write();
             // debug!("Pipe::write: want_to_write {}, already_write {}, loop_write {}", want_to_write, already_write, loop_write);
-            if loop_write == 0 {
+            if loop_write == 0 || (atomic_write && already_write == 0 && loop_write < want_to_write)
+            {
+                let wait_pid = current_task()
+                    .map(|task| task.process.upgrade().map_or(usize::MAX, |process| process.getpid()))
+                    .unwrap_or(usize::MAX);
+                debug!(
+                    "Pipe::write wait: pid={} want={} written={} available={} atomic={} read_closed={}",
+                    wait_pid,
+                    want_to_write,
+                    already_write,
+                    loop_write,
+                    atomic_write,
+                    ring_buffer.all_read_ends_closed()
+                );
                 let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);
                 write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
                     let ring_buffer = self.buffer.lock();
-                    ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
+                    let available = ring_buffer.available_write();
+                    if ring_buffer.all_read_ends_closed() {
+                        return true;
+                    }
+                    if atomic_write && already_write == 0 {
+                        available >= want_to_write
+                    } else {
+                        available > 0
+                    }
                 });
+                let wake_pid = current_task()
+                    .map(|task| task.process.upgrade().map_or(usize::MAX, |process| process.getpid()))
+                    .unwrap_or(usize::MAX);
+                debug!(
+                    "Pipe::write wake: pid={} want={} written={} pending_signal={}",
+                    wake_pid,
+                    want_to_write,
+                    already_write,
+                    crate::signal::has_unmasked_pending_signal()
+                );
                 if crate::signal::has_unmasked_pending_signal() {
                     return if already_write > 0 {
                         Ok(already_write)
@@ -343,8 +389,12 @@ impl File for Pipe {
                 }
                 continue;
             }
-            // write at most loop_write bytes
-            for _ in 0..loop_write {
+            let write_limit = if atomic_write && already_write == 0 {
+                want_to_write
+            } else {
+                loop_write
+            };
+            for _ in 0..write_limit {
                 if let Some(byte_ref) = buf_iter.next() {
                     ring_buffer.write_byte(unsafe { *byte_ref });
                     already_write += 1;
@@ -368,15 +418,28 @@ impl File for Pipe {
         assert!(self.writable());
         let want_to_write = buf.len();
         let mut already_write = 0usize;
+        let atomic_write = want_to_write <= PIPE_BUF;
         loop {
             let mut ring_buffer = self.buffer.lock();
+            if ring_buffer.all_read_ends_closed() {
+                return Ok(already_write);
+            }
             let loop_write = ring_buffer.available_write();
-            if loop_write == 0 {
+            if loop_write == 0 || (atomic_write && already_write == 0 && loop_write < want_to_write)
+            {
                 let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
                 drop(ring_buffer);
                 write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
                     let ring_buffer = self.buffer.lock();
-                    ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
+                    let available = ring_buffer.available_write();
+                    if ring_buffer.all_read_ends_closed() {
+                        return true;
+                    }
+                    if atomic_write && already_write == 0 {
+                        available >= want_to_write
+                    } else {
+                        available > 0
+                    }
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     return if already_write > 0 {
@@ -387,7 +450,12 @@ impl File for Pipe {
                 }
                 continue;
             }
-            for _ in 0..loop_write {
+            let write_limit = if atomic_write && already_write == 0 {
+                want_to_write
+            } else {
+                loop_write
+            };
+            for _ in 0..write_limit {
                 if already_write == want_to_write {
                     ring_buffer.read_wait_queue.wake_one();
                     notify_poll_source(self.source_id(), POLLIN);
