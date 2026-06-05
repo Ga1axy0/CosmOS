@@ -22,7 +22,6 @@ use crate::sched::{
 };
 use crate::fs::{open_file, OpenFlags};
 use crate::ipc;
-use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
@@ -353,9 +352,6 @@ pub fn remove_from_tid2task(thread_id: usize) {
 
 fn wake_signal_waiters(tasks: Vec<Arc<TaskControlBlock>>) {
     for task in tasks {
-        if task_has_inflight_keyed_poll_wait(&task) {
-            continue;
-        }
         let handle = {
             let task_inner = task.inner_exclusive_access();
             task_inner.current_wq_handle.clone()
