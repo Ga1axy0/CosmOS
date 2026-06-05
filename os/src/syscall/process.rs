@@ -18,6 +18,12 @@ use crate::{
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
+
+const UID_NO_CHANGE: u32 = u32::MAX;
+
+fn unprivileged_uid_change_allowed(current_uid: u32, current_euid: u32, current_suid: u32, new_uid: u32) -> bool {
+    new_uid == current_uid || new_uid == current_euid || new_uid == current_suid
+}
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -218,10 +224,89 @@ pub fn sys_setuid(uid: u32) -> isize {
     syscall_body!({
         let current_uid = process.getuid();
         let current_euid = process.geteuid();
-        if current_euid != 0 && uid != current_uid && uid != current_euid {
+        let current_suid = process.getsuid();
+        if current_euid != 0 && !unprivileged_uid_change_allowed(current_uid, current_euid, current_suid, uid) {
             return Err(ERRNO::EPERM);
         }
         process.setuid_cred(uid);
+        Ok(0)
+    })
+}
+
+/// setreuid syscall
+pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setreuid pid:{} ruid={} euid={}", process.getpid(), ruid, euid);
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_ruid = cred.uid;
+        let old_euid = cred.euid;
+        let old_suid = cred.suid;
+        let privileged = old_euid == 0;
+
+        if !privileged {
+            if ruid != UID_NO_CHANGE
+                && !unprivileged_uid_change_allowed(old_ruid, old_euid, old_suid, ruid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+            if euid != UID_NO_CHANGE
+                && !unprivileged_uid_change_allowed(old_ruid, old_euid, old_suid, euid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+        }
+
+        let new_ruid = if ruid == UID_NO_CHANGE { old_ruid } else { ruid };
+        let new_euid = if euid == UID_NO_CHANGE { old_euid } else { euid };
+        cred.uid = new_ruid;
+        cred.euid = new_euid;
+        if ruid != UID_NO_CHANGE || (euid != UID_NO_CHANGE && new_euid != old_ruid) {
+            cred.suid = new_euid;
+        }
+        Ok(0)
+    })
+}
+
+/// setresuid syscall
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
+    let process = current_process();
+    trace!(
+        "kernel: sys_setresuid pid:{} ruid={} euid={} suid={}",
+        process.getpid(),
+        ruid,
+        euid,
+        suid
+    );
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_ruid = cred.uid;
+        let old_euid = cred.euid;
+        let old_suid = cred.suid;
+        let privileged = old_euid == 0;
+
+        if !privileged {
+            for new_uid in [ruid, euid, suid] {
+                if new_uid == UID_NO_CHANGE {
+                    continue;
+                }
+                if !unprivileged_uid_change_allowed(old_ruid, old_euid, old_suid, new_uid) {
+                    return Err(ERRNO::EPERM);
+                }
+            }
+        }
+
+        if ruid != UID_NO_CHANGE {
+            cred.uid = ruid;
+        }
+        if euid != UID_NO_CHANGE {
+            cred.euid = euid;
+        }
+        if suid != UID_NO_CHANGE {
+            cred.suid = suid;
+        }
         Ok(0)
     })
 }

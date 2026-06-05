@@ -102,6 +102,8 @@ pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_TIMERFD_CREATE: usize = 85;
 /// utimensat syscall
 pub const SYSCALL_UTIMENSAT: usize = 88;
+/// acct syscall
+pub const SYSCALL_ACCT: usize = 89;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// sync syscall
@@ -170,8 +172,12 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// get priority syscall
 pub const SYSCALL_GET_PRIORITY: usize = 141;
+/// setreuid syscall
+pub const SYSCALL_SETREUID: usize = 145;
 /// setuid syscall
 pub const SYSCALL_SETUID: usize = 146;
+/// setresuid syscall
+pub const SYSCALL_SETRESUID: usize = 147;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -567,6 +573,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const Timespec,
             args[3] as i32,
         ),
+        SYSCALL_ACCT => sys_acct(args[0] as *const u8),
         SYSCALL_PSELECT6_TIME32 => sys_pselect6_time32(
             args[0] as i32,
             args[1] as *mut usize,
@@ -703,7 +710,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_SETREUID => sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
+        SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
