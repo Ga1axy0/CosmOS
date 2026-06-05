@@ -1153,6 +1153,12 @@ impl ProcessControlBlock {
         self.inner.lock().cred.egid
     }
 
+    pub fn setuid_cred(&self, uid: u32) {
+        let mut inner = self.inner.lock();
+        inner.cred.uid = uid;
+        inner.cred.euid = uid;
+    }
+
     pub fn setegid(&self, egid: u32) {
         self.inner.lock().cred.egid = egid;
     }

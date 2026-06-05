@@ -170,6 +170,8 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// get priority syscall
 pub const SYSCALL_GET_PRIORITY: usize = 141;
+/// setuid syscall
+pub const SYSCALL_SETUID: usize = 146;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -701,6 +703,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),

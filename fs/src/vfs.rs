@@ -108,7 +108,7 @@ pub trait VfsNode: Send + Sync + Any + Debug {
                 break;
             }
 
-            buf[written..written + 8].copy_from_slice(&(i as u64).to_le_bytes());
+            buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
             let next_off = (i + 1) as i64;
             buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
             buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());

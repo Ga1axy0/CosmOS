@@ -452,6 +452,15 @@ fn socket_kind(fd: usize) -> Result<SocketKind, ERRNO> {
     Err(ERRNO::ENOTSOCK)
 }
 
+fn read_sockaddr_family(addr: *const u8, addrlen: usize) -> Result<u16, ERRNO> {
+    if addr.is_null() || addrlen < size_of::<u16>() {
+        return Err(ERRNO::EINVAL);
+    }
+    let token = current_user_token();
+    let family_bytes = copy_user_bytes(token, addr, size_of::<u16>())?;
+    Ok(u16::from_ne_bytes([family_bytes[0], family_bytes[1]]))
+}
+
 fn parse_socket_type_flags(socket_type: i32) -> Result<(i32, FileStatusFlags, bool), ERRNO> {
     let extra_flags = socket_type & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC);
     if extra_flags != 0 {
@@ -770,18 +779,33 @@ pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
 
 pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
     syscall_body!({
-        if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
+        let addrlen = addrlen as usize;
+        if addr.is_null() || addrlen < size_of::<u16>() {
             return Err(ERRNO::EINVAL);
         }
-        let token = current_user_token();
-        let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
-        let ep = sockaddr_to_endpoint(uaddr)?;
 
         let fd = fd as usize;
         match socket_kind(fd)? {
-            SocketKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
-            SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
-            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+            SocketKind::Udp | SocketKind::Tcp => {
+                if addrlen < size_of::<SockAddrIn>() {
+                    return Err(ERRNO::EINVAL);
+                }
+                let token = current_user_token();
+                let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
+                let ep = sockaddr_to_endpoint(uaddr)?;
+                match socket_kind(fd)? {
+                    SocketKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
+                    SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
+                    SocketKind::Unix => unreachable!(),
+                }
+            }
+            SocketKind::Unix => {
+                let family = read_sockaddr_family(addr as *const u8, addrlen)?;
+                if family != AF_UNIX as u16 {
+                    return Err(ERRNO::EAFNOSUPPORT);
+                }
+                return Err(ERRNO::ENOENT);
+            }
         }
         Ok(0)
     })

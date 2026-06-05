@@ -23,6 +23,8 @@ const BIN_BUSYBOX: &str = "/bin/busybox";
 const BIN_BUSYBOX_CSTR: &str = "/bin/busybox\0";
 const LIB_DIR: &str = "/lib";
 const ETC_DIR: &str = "/etc";
+const ETC_PASSWD_PATH: &str = "/etc/passwd";
+const ETC_GROUP_PATH: &str = "/etc/group";
 const HOME_DIR: &str = "/home";
 const ROOT_HOME_DIR: &str = "/root";
 const TMP_DIR: &str = "/tmp";
@@ -55,6 +57,8 @@ const GLIBC_LD_PATH: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
 const INSTALL_ARG_CSTR: &str = "--install\0";
 const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
+const PASSWD_CONTENT: &[u8] = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/sh\n";
+const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
 
 fn path_exists(path: &str) -> bool {
     let mut st = Stat::new();
@@ -396,6 +400,10 @@ fn install_busybox_entries() -> bool {
     true
 }
 
+fn install_account_files() -> bool {
+    write_file(ETC_PASSWD_PATH, PASSWD_CONTENT) && write_file(ETC_GROUP_PATH, GROUP_CONTENT)
+}
+
 fn install_busybox_applets() -> bool {
     if !path_exists("/bin/sh") {
         let musl_install_argv = [
@@ -429,7 +437,7 @@ fn install_busybox_applets() -> bool {
 
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 8;
+    const TOTAL_STEPS: usize = 9;
     if let Some(arg) = argv.get(1) {
         println!(
             "[setupsh] ignoring legacy libc selector '{}'; installing musl and glibc",
@@ -481,7 +489,12 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(8, TOTAL_STEPS, "launch /bin/sh");
+    print_step(8, TOTAL_STEPS, "install minimal account database");
+    if !install_account_files() {
+        return 1;
+    }
+
+    print_step(9, TOTAL_STEPS, "launch /bin/sh");
     let chdir_ret = chdir(ROOT_HOME_DIR);
     if chdir_ret < 0 {
         println!(

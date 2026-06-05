@@ -13,18 +13,54 @@ pub mod tmpfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use fs::{Inode, errno::FS_ERRNO};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use core::any::Any;
-pub use fs::vfs::InodeTime;
+pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
     mapping_for_inode, sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
     sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
     retain_mapped_page, PAGE_CACHE_MANAGER
 };
+
+fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {
+    let mut written = 0usize;
+
+    for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
+        let name_bytes = name.as_bytes();
+        let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
+        if written + reclen > buf.len() {
+            break;
+        }
+
+        buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+        let next_off = (i + 1) as i64;
+        buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
+        buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        buf[written + 18] = match file_type {
+            VfsFileType::Directory => 4,
+            VfsFileType::Symlink => 10,
+            VfsFileType::Char => 2,
+            VfsFileType::Block => 6,
+            VfsFileType::Fifo => 1,
+            VfsFileType::Socket => 12,
+            VfsFileType::Regular => 8,
+            VfsFileType::Unknown => 0,
+        };
+        buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+        buf[written + 19 + name_bytes.len()] = 0;
+        for b in &mut buf[written + 19 + name_bytes.len() + 1..written + reclen] {
+            *b = 0;
+        }
+        written += reclen;
+    }
+
+    written
+}
 
 /// Kernel-side alias for the shared filesystem statistics snapshot.
 pub type StatFs64 = fs::VfsStatFs;
@@ -110,6 +146,8 @@ struct FileDescriptionInner {
     offset: usize,
     /// 当前文件状态位。
     status_flags: FileStatusFlags,
+    /// 目录项快照，避免遍历期间删除目录项导致位置漂移漏读。
+    dirent_snapshot: Option<Vec<(String, VfsFileType)>>,
 }
 
 /// 打开文件描述，对应 Linux 的 open file description。
@@ -139,6 +177,7 @@ impl FileDescription {
             inner: SpinNoIrqLock::new(FileDescriptionInner {
                     offset: 0,
                     status_flags,
+                    dirent_snapshot: None,
                 }),
         }
     }
@@ -315,7 +354,22 @@ impl FileDescription {
     /// 读取目录项并推进共享目录位置。
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
-        let read_size = self.file.getdents64(inner.offset, buf);
+        let read_size = if self.file.is_dir() {
+            if let Some(inode) = self.as_inode() {
+                if inner.offset == 0 || inner.dirent_snapshot.is_none() {
+                    inner.dirent_snapshot = Some(inode.ls());
+                }
+                encode_dirent64_records(
+                    inner.dirent_snapshot.as_ref().unwrap().as_slice(),
+                    inner.offset,
+                    buf,
+                )
+            } else {
+                self.file.getdents64(inner.offset, buf)
+            }
+        } else {
+            self.file.getdents64(inner.offset, buf)
+        };
         if read_size == 0 {
             return 0;
         }
@@ -387,6 +441,7 @@ impl FileDescription {
             return Err(ERRNO::EINVAL);
         }
         inner.offset = new_offset as usize;
+        inner.dirent_snapshot = None;
         Ok(new_offset as u64)
     }
 }

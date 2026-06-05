@@ -211,6 +211,21 @@ pub fn sys_getegid() -> isize {
     process.getegid() as isize
 }
 
+/// setuid syscall
+pub fn sys_setuid(uid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setuid pid:{} uid={}", process.getpid(), uid);
+    syscall_body!({
+        let current_uid = process.getuid();
+        let current_euid = process.geteuid();
+        if current_euid != 0 && uid != current_uid && uid != current_euid {
+            return Err(ERRNO::EPERM);
+        }
+        process.setuid_cred(uid);
+        Ok(0)
+    })
+}
+
 /// umask syscall
 pub fn sys_umask(mask: i32) -> isize {
     trace!(
