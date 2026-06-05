@@ -40,6 +40,7 @@ const MUSL_LEGACY_LIB_DIR: &str = "/musl/lib";
 const MUSL_LIB_DIR: &str = "/usr/lib/riscv64-linux-musl";
 const MUSL_LIBC_PATH: &str = "/usr/lib/riscv64-linux-musl/libc.so";
 const MUSL_LD_PATH: &str = "/lib/ld-musl-riscv64-sf.so.1";
+const MUSL_LD_COMPAT_PATH: &str = "/lib/ld-musl-riscv64.so.1";
 const MUSL_LD_CONFIG_PATH: &str = "/etc/ld-musl-riscv64-sf.path";
 const MUSL_LD_CONFIG_CONTENT: &[u8] = b"/usr/lib/riscv64-linux-musl\n/lib\n";
 const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
@@ -266,6 +267,7 @@ fn keep_top_level_lib_entry(name: &str, dtype: u8) -> bool {
         || name == "."
         || name == ".."
         || name == MUSL_LD_PATH.trim_start_matches('/')
+        || name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
         || name == GLIBC_LD_PATH.trim_start_matches('/')
 }
 
@@ -367,6 +369,9 @@ fn write_file(path: &str, content: &[u8]) -> bool {
 
 fn install_loader_links() -> bool {
     if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
+        return false;
+    }
+    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_COMPAT_PATH) {
         return false;
     }
     if !ensure_hard_link(GLIBC_LD_TARGET, GLIBC_LD_PATH) {
