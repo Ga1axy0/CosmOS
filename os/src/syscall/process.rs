@@ -760,7 +760,18 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 // 编码为wstatus
                let exit_status = match child_inner.exit_reason {
                     ExitReason::Exit(code) => (code & 0xff) << 8,
-                    ExitReason::Signal(signum) => (signum & 0x7f) as i32,
+                    ExitReason::Signal(signum) => {
+                        // 低 7 位为终止信号；若该信号默认动作会转储核心，
+                        // 置上 0x80（WCOREDUMP）以满足 `WCOREDUMP(status)`。
+                        let mut status = (signum & 0x7f) as i32;
+                        let dumps_core = crate::signal::SignalNum::from_number(signum)
+                            .map(|sig| sig.dumps_core())
+                            .unwrap_or(false);
+                        if dumps_core {
+                            status |= 0x80;
+                        }
+                        status
+                    }
                 };
                 inner.child_user_time = inner
                     .child_user_time

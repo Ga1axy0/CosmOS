@@ -34,6 +34,8 @@ impl rlimit {
 enum Resource {
     /// Max stack size
     Stack = 3,
+    /// Max core file size (`RLIMIT_CORE`)
+    Core = 4,
     /// Number of open files
     Nofile = 7,
     /// Address space limit
@@ -44,6 +46,7 @@ impl Resource {
     fn from_raw(raw: usize) -> Option<Self> {
         match raw {
             3 => Some(Self::Stack),
+            4 => Some(Self::Core),
             7 => Some(Self::Nofile),
             9 => Some(Self::As),
             _ => {
@@ -58,6 +61,8 @@ impl Resource {
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceLimits {
     pub stack: rlimit,
+    /// `RLIMIT_CORE`
+    pub core: rlimit,
     /// `RLIMIT_NOFILE`
     pub nofile: rlimit,
     /// `RLIMIT_AS`
@@ -71,6 +76,9 @@ impl Default for ResourceLimits {
                 rlim_cur: USER_STACK_SIZE as u64,
                 rlim_max: USER_STACK_SIZE as u64,
             },
+            // Core dumps are not produced, but the limit is reported as
+            // unlimited so userspace (e.g. LTP) can raise/lower it freely.
+            core: rlimit::unlimited(),
             nofile: rlimit {
                 rlim_cur: 1024,
                 rlim_max: 1024,
@@ -84,6 +92,7 @@ impl ResourceLimits {
     fn get(&self, resource: Resource) -> rlimit {
         match resource {
             Resource::Stack => self.stack,
+            Resource::Core => self.core,
             Resource::Nofile => self.nofile,
             Resource::As => self.address_space,
         }
@@ -92,6 +101,7 @@ impl ResourceLimits {
     fn get_mut(&mut self, resource: Resource) -> &mut rlimit {
         match resource {
             Resource::Stack => &mut self.stack,
+            Resource::Core => &mut self.core,
             Resource::Nofile => &mut self.nofile,
             Resource::As => &mut self.address_space,
         }

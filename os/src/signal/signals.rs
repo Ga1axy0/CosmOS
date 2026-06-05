@@ -129,6 +129,26 @@ impl SignalNum {
     pub const fn number(self) -> i32 {
         self as i32
     }
+
+    /// 该信号的默认动作是否会产生 core dump。
+    ///
+    /// 与 Linux `sig_kernel_coredump()` 对齐：这些信号在默认处置下终止进程
+    /// 并转储核心，因此 `wait` 状态需要置上 `WCOREDUMP` 标志位。
+    pub const fn dumps_core(self) -> bool {
+        matches!(
+            self,
+            Self::SIGQUIT
+                | Self::SIGILL
+                | Self::SIGTRAP
+                | Self::SIGABRT
+                | Self::SIGBUS
+                | Self::SIGFPE
+                | Self::SIGSEGV
+                | Self::SIGXCPU
+                | Self::SIGXFSZ
+                | Self::SIGSYS
+        )
+    }
 }
 
 /// Linux 布局的信号编码集合。
