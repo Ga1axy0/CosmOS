@@ -1,9 +1,9 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, mount_tmpfs, rename_at,
-    sync_page_cache_all, sync_page_cache_fs, truncate_inode,
-    open_file_at_with_status, symlinkat, unlinkat,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device,
+    mount_is_readonly, mount_tmpfs, open_file_at_with_status, remount_path, rename_at,
+    sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::fs::Pipe;
@@ -79,6 +79,8 @@ const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
 const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
+const MS_RDONLY: usize = 1;
+const MS_REMOUNT: usize = 32;
 const SUSPICIOUS_STAT_BLKSIZE: u32 = 1 << 20;
 const SUSPICIOUS_RW_LEN: usize = 1 << 20;
 const O_NONBLOCK: i32 = 0x800;
@@ -2188,13 +2190,12 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         "kernel:pid[{}] sys_faccessat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if mode & !(R_OK | W_OK | X_OK) != 0 {
             return Err(ERRNO::EINVAL);
         }
 
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -2207,6 +2208,10 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
         if mode == F_OK {
             return Ok(0);
+        }
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        if mode & W_OK != 0 && mount_is_readonly(abs_path.as_str()) {
+            return Err(ERRNO::EROFS);
         }
 
         if inode_allows_access(&inode, uid, gid, mode as u32) {
@@ -2622,32 +2627,41 @@ pub fn sys_mount(
         "kernel:pid[{}] sys_mount",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let dev_name = translated_str(token, dev_name).or_errno(ERRNO::EFAULT)?;
-        let dir_name = translated_str(token, dir_name).or_errno(ERRNO::EFAULT)?;
-        let fs_type  = translated_str(token, fs_type).or_errno(ERRNO::EFAULT)?;
+        let dev_name = if dev_name.is_null() {
+            String::new()
+        } else {
+            read_cstring_from_user(dev_name, PATH_MAX)?
+        };
+        let dir_name = read_cstring_from_user(dir_name, PATH_MAX)?;
+        let fs_type  = read_cstring_from_user(fs_type, PATH_MAX)?;
         // `data` is typically NULL (e.g. mount(…, NULL)); skip translation if so.
         let _data: String = if data.is_null() {
             String::new()
         } else {
-            translated_str(token, data).or_errno(ERRNO::EFAULT)?
+            read_cstring_from_user(data, PATH_MAX)?
         };
 
         let cwd     = current_process().inner_exclusive_access().cwd.clone();
         let abs_mnt = canonicalize(&cwd, &dir_name);
+        let readonly = _flags & MS_RDONLY != 0;
+        let remount = _flags & MS_REMOUNT != 0;
         debug!(
-            "sys_mount: dev_name = {}, dir_name = {}, abs_mnt = {}, fs_type = {}, data = {}",
+            "sys_mount: dev_name = {}, dir_name = {}, abs_mnt = {}, fs_type = {}, flags = {:#x}, data = {}",
             dev_name,
             dir_name,
             abs_mnt,
             fs_type,
+            _flags,
             _data
         );
-        if fs_type == "tmpfs" {
-            mount_tmpfs(&abs_mnt)?;
+        if remount {
+            let source = if dev_name.is_empty() { "tmpfs" } else { dev_name.as_str() };
+            remount_path(&abs_mnt, source, fs_type.as_str(), readonly)?;
+        } else if fs_type == "tmpfs" {
+            mount_tmpfs(&abs_mnt, readonly)?;
         } else {
-            mount_device(&dev_name, &abs_mnt, &fs_type)?;
+            mount_device(&dev_name, &abs_mnt, &fs_type, readonly)?;
         }
         Ok(0)
     })
