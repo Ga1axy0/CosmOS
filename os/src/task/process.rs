@@ -19,6 +19,7 @@ use crate::mm::{
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
+use crate::timer::get_realtime_ns;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -173,6 +174,8 @@ pub struct ProcessControlBlockInner {
     pub cwd: String,
     /// absolute path of the last executed image (for /proc/<pid>/exe)
     pub exec_path: String,
+    /// process environment seen by future `execve` inheritance/fallback
+    pub environment: Vec<String>,
     /// process file creation mask (`umask`)
     pub umask: u32,
     /// process credentials
@@ -189,6 +192,8 @@ pub struct ProcessControlBlockInner {
     pub accounting_state: CpuAccountingState,
     /// Timestamp of the last accounting state transition.
     pub accounting_timestamp: usize,
+    /// Process birth time on the realtime clock, used for BSD process accounting.
+    pub accounting_start_time_ns: u64,
     /// `ITIMER_REAL`：基于 `CLOCK_REALTIME`（墙钟时间）。
     pub itimer_real: ItimerState,
     /// `ITIMER_VIRTUAL`：基于进程用户态 CPU 时间。
@@ -603,6 +608,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from("/"),
                     exec_path,
+                    environment: Vec::new(),
                     umask: DEFAULT_UMASK,
                     cred,
                     user_time: 0,
@@ -611,6 +617,7 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    accounting_start_time_ns: get_realtime_ns(),
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -782,6 +789,7 @@ impl ProcessControlBlock {
             let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
             inner.exec_path = exec_path;
+            inner.environment = envs.clone();
             // POSIX: on exec, reset all user-defined signal handlers to SIG_DFL.
             // SIG_IGN dispositions are preserved across exec.
             for action in inner.signal_actions.table.iter_mut() {
@@ -933,6 +941,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent_cwd,
                     exec_path: parent_exec_path,
+                    environment: parent.environment.clone(),
                     umask: parent_umask,
                     cred,
                     user_time: 0,
@@ -941,6 +950,7 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    accounting_start_time_ns: get_realtime_ns(),
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -1076,6 +1086,7 @@ impl ProcessControlBlock {
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
                     exec_path,
+                    environment: parent.environment.clone(),
                     umask: parent.umask,
                     cred,
                     user_time: 0,
@@ -1084,6 +1095,7 @@ impl ProcessControlBlock {
                     child_kernel_time: 0,
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
+                    accounting_start_time_ns: get_realtime_ns(),
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),

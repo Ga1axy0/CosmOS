@@ -2,7 +2,7 @@ use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
     inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device,
-    mount_is_readonly, mount_tmpfs, open_file_at_with_status, remount_path, rename_at,
+    mount_is_readonly, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
@@ -14,7 +14,7 @@ use crate::syscall::{read_cstring_from_user, read_pod_from_user, translated_byte
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
-    current_process, current_task, current_user_token, FdEntry,
+    current_process, current_task, current_user_token, ExitReason, FdEntry, ProcessControlBlock,
     FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
@@ -24,6 +24,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec::Vec, vec};
 use core::{mem::{offset_of, size_of}, slice};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::task::SignalBit;
 use crate::syscall::OldTimespec32;
 use core::any::Any;
@@ -91,6 +92,248 @@ const O_CLOEXEC: i32 = 0x80000;
 lazy_static! {
     /// 当前启用的进程记账目标文件路径；`acct01` 仅要求 enable/disable 生命周期和 errno 语义。
     static ref PROCESS_ACCOUNTING_TARGET: SpinNoIrqLock<Option<String>> = SpinNoIrqLock::new(None);
+    /// 串行化记账文件的追加写，避免多个退出并发时互相覆盖文件尾。
+    static ref PROCESS_ACCOUNTING_APPEND_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
+}
+static PROCESS_ACCOUNTING_EVENT_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+const ACCT_COMM_LEN: usize = 16;
+const ACCT_BYTEORDER_NATIVE: u8 = if cfg!(target_endian = "big") { 0x80 } else { 0x00 };
+const ACCT_FLAG_CORE: u8 = 0x08;
+const ACCT_FLAG_SIGNAL: u8 = 0x10;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AcctV3Record {
+    ac_flag: u8,
+    ac_version: u8,
+    ac_tty: u16,
+    ac_exitcode: u32,
+    ac_uid: u32,
+    ac_gid: u32,
+    ac_pid: u32,
+    ac_ppid: u32,
+    ac_btime: u32,
+    ac_etime: f32,
+    ac_utime: u16,
+    ac_stime: u16,
+    ac_mem: u16,
+    ac_io: u16,
+    ac_rw: u16,
+    ac_minflt: u16,
+    ac_majflt: u16,
+    ac_swaps: u16,
+    ac_comm: [u8; ACCT_COMM_LEN],
+}
+
+fn encode_wait_status(reason: ExitReason) -> u32 {
+    match reason {
+        ExitReason::Exit(code) => ((code & 0xff) << 8) as u32,
+        ExitReason::Signal(signum) => {
+            let mut status = (signum & 0x7f) as u32;
+            if crate::signal::SignalNum::from_number(signum)
+                .map(|sig| sig.dumps_core())
+                .unwrap_or(false)
+            {
+                status |= 0x80;
+            }
+            status
+        }
+    }
+}
+
+fn encode_acct_flag(reason: ExitReason) -> u8 {
+    match reason {
+        ExitReason::Exit(_) => 0,
+        ExitReason::Signal(signum) => {
+            let mut flag = ACCT_FLAG_SIGNAL;
+            if crate::signal::SignalNum::from_number(signum)
+                .map(|sig| sig.dumps_core())
+                .unwrap_or(false)
+            {
+                flag |= ACCT_FLAG_CORE;
+            }
+            flag
+        }
+    }
+}
+
+fn encode_comp_t(mut value: u64) -> u16 {
+    let mut exp = 0u16;
+    let mut rnd = 0u64;
+
+    while value > 0x1fff {
+        rnd = value & 0x7;
+        value >>= 3;
+        exp = exp.saturating_add(1);
+        if exp >= 7 {
+            return 0xffff;
+        }
+    }
+    if rnd != 0 {
+        value += 1;
+        if value > 0x1fff {
+            value >>= 3;
+            exp = exp.saturating_add(1);
+            if exp >= 8 {
+                return 0xffff;
+            }
+        }
+    }
+    ((exp << 13) | (value as u16 & 0x1fff)) as u16
+}
+
+fn process_name_for_acct(exec_path: &str) -> [u8; ACCT_COMM_LEN] {
+    let mut comm = [0u8; ACCT_COMM_LEN];
+    let name = exec_path
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(exec_path);
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(ACCT_COMM_LEN);
+    comm[..len].copy_from_slice(&bytes[..len]);
+    comm
+}
+
+fn acct_v3_record_bytes(record: &AcctV3Record) -> &[u8] {
+    // SAFETY: `AcctV3Record` is `#[repr(C)]` and contains only plain integer/float fields.
+    unsafe { slice::from_raw_parts(record as *const AcctV3Record as *const u8, size_of::<AcctV3Record>()) }
+}
+
+fn next_acct_event_seq() -> usize {
+    PROCESS_ACCOUNTING_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn read_accounting_target_with_log(context: &str, pid: usize) -> Option<String> {
+    let seq = next_acct_event_seq();
+    let target = PROCESS_ACCOUNTING_TARGET.lock().clone();
+    debug!(
+        "[acct][{}] read context={} pid={} target={:?}",
+        seq,
+        context,
+        pid,
+        target
+    );
+    target
+}
+
+fn replace_accounting_target_with_log(
+    context: &str,
+    pid: usize,
+    new_target: Option<String>,
+) -> Option<String> {
+    let seq = next_acct_event_seq();
+    let mut guard = PROCESS_ACCOUNTING_TARGET.lock();
+    let old_target = guard.clone();
+    *guard = new_target.clone();
+    debug!(
+        "[acct][{}] write context={} pid={} old_target={:?} new_target={:?}",
+        seq,
+        context,
+        pid,
+        old_target,
+        new_target
+    );
+    old_target
+}
+
+pub fn write_process_accounting_on_exit(process: &Arc<ProcessControlBlock>, reason: ExitReason) {
+    let Some(target_path) = read_accounting_target_with_log("exit-read", process.getpid()) else {
+        debug!(
+            "[acct] skip exit record pid={} reason={:?}: accounting disabled",
+            process.getpid(),
+            reason
+        );
+        return;
+    };
+
+    let now_realtime_ns = get_realtime_ns();
+    let record = {
+        let inner = process.inner_exclusive_access();
+        let elapsed_ns = now_realtime_ns.saturating_sub(inner.accounting_start_time_ns);
+        let utime_ticks = crate::timer::time_to_ticks(inner.user_time);
+        let stime_ticks = crate::timer::time_to_ticks(inner.kernel_time);
+        let btime = (inner.accounting_start_time_ns / 1_000_000_000).min(u32::MAX as u64) as u32;
+        let ppid = inner
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+            .map(|parent| parent.getpid() as u32)
+            .unwrap_or(0);
+        AcctV3Record {
+            ac_flag: encode_acct_flag(reason),
+            ac_version: 3 | ACCT_BYTEORDER_NATIVE,
+            ac_tty: 0,
+            ac_exitcode: encode_wait_status(reason),
+            ac_uid: inner.cred.uid,
+            ac_gid: inner.cred.gid,
+            ac_pid: process.getpid() as u32,
+            ac_ppid: ppid,
+            ac_btime: btime,
+            ac_etime: (elapsed_ns as f64 / 1_000_000_000f64) as f32,
+            ac_utime: encode_comp_t(utime_ticks as u64),
+            ac_stime: encode_comp_t(stime_ticks as u64),
+            ac_mem: 0,
+            ac_io: 0,
+            ac_rw: 0,
+            ac_minflt: 0,
+            ac_majflt: 0,
+            ac_swaps: 0,
+            ac_comm: process_name_for_acct(inner.exec_path.as_str()),
+        }
+    };
+    debug!(
+        "[acct] exit record pid={} reason={:?} target='{}' comm='{}' bytes={}",
+        process.getpid(),
+        reason,
+        target_path,
+        core::str::from_utf8(
+            &record.ac_comm[..record
+                .ac_comm
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(record.ac_comm.len())]
+        )
+        .unwrap_or("<invalid>"),
+        size_of::<AcctV3Record>()
+    );
+    let _append_guard = PROCESS_ACCOUNTING_APPEND_LOCK.lock();
+    let inode = match open_file_at("/", target_path.as_str(), OpenFlags::WRONLY) {
+        Ok(inode) => inode,
+        Err(errno) => {
+            debug!(
+                "[acct] reopen failed pid={} target='{}': {:?}",
+                process.getpid(),
+                target_path,
+                errno
+            );
+            return;
+        }
+    };
+    let desc = Arc::new(FileDescription::new(
+        inode,
+        AccessMode::WriteOnly,
+        FileStatusFlags::APPEND,
+        0,
+    ));
+    let size_before = desc.stat().size;
+    if let Err(errno) = desc.write_bytes(acct_v3_record_bytes(&record)) {
+        debug!(
+            "[acct] append failed pid={} target='{}': {:?}",
+            process.getpid(),
+            target_path,
+            errno
+        );
+        return;
+    }
+    let size_after = desc.stat().size;
+    debug!(
+        "[acct] append ok pid={} target='{}' size_before={} size_after={}",
+        process.getpid(),
+        target_path,
+        size_before,
+        size_after
+    );
 }
 
 /// `accept03` 需要大量“非 socket fd”作为输入；对这些当前尚未完整实现
@@ -162,7 +405,12 @@ pub fn sys_acct(filename: *const u8) -> isize {
         }
 
         if filename.is_null() {
-            *PROCESS_ACCOUNTING_TARGET.lock() = None;
+            debug!(
+                "[acct] disable pid={} cwd='{}'",
+                process.getpid(),
+                process.inner_exclusive_access().cwd
+            );
+            replace_accounting_target_with_log("disable", process.getpid(), None);
             return Ok(0);
         }
 
@@ -189,7 +437,14 @@ pub fn sys_acct(filename: *const u8) -> isize {
             return Err(ERRNO::EACCES);
         }
 
-        *PROCESS_ACCOUNTING_TARGET.lock() = Some(abs_path);
+        debug!(
+            "[acct] enable pid={} cwd='{}' req='{}' abs='{}'",
+            process.getpid(),
+            cwd,
+            path,
+            abs_path
+        );
+        replace_accounting_target_with_log("enable", process.getpid(), Some(abs_path));
         Ok(0)
     })
 }

@@ -7,8 +7,7 @@ use crate::{
     sched::block_current_and_run_next,
     task::{current_process, current_task, WaitReason},
     timer::{
-        add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks,
-        get_time_us, time_to_ticks,
+        add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks, time_to_ticks,
     },
 };
 
@@ -19,6 +18,10 @@ pub type ClockId = i32;
 pub const CLOCK_REALTIME: ClockId = 0;
 /// Linux 兼容的单调时钟 ID。
 pub const CLOCK_MONOTONIC: ClockId = 1;
+/// Linux 兼容的 `CLOCK_REALTIME_COARSE`。
+pub const CLOCK_REALTIME_COARSE: ClockId = 5;
+/// Linux 兼容的 `CLOCK_MONOTONIC_COARSE`。
+pub const CLOCK_MONOTONIC_COARSE: ClockId = 6;
 /// `clock_nanosleep(2)` absolute-deadline flag.
 pub const TIMER_ABSTIME: i32 = 1;
 
@@ -131,7 +134,7 @@ fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
 /// 返回当前内核可提供的时钟分辨率。
 fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC => {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => {
             // Expose the timer ABI as high-resolution so Linux RT userland
             // enables hrtimer paths such as cyclictest.
             Ok(Timespec {
@@ -188,7 +191,7 @@ pub fn sys_get_time_of_day(ts: *mut TimeVal, _tz: usize) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        let time_us = get_time_us();
+        let time_us = (get_realtime_ns() / 1_000) as usize;
         let timeval = TimeVal {
             sec: time_us / 1_000_000,
             usec: time_us % 1_000_000,
@@ -290,8 +293,9 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
         let timespec = match clockid {
             CLOCK_REALTIME => timespec_from_ns(get_realtime_ns()),
             CLOCK_MONOTONIC => timespec_from_ns(get_time_ns()),
-            // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
-            // CLOCK_REALTIME_COARSE 等其它 clock id。
+            CLOCK_REALTIME_COARSE => timespec_from_ns(get_realtime_ns()),
+            CLOCK_MONOTONIC_COARSE => timespec_from_ns(get_time_ns()),
+            // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW 等其它 clock id。
             _ => return Err(ERRNO::EINVAL),
         };
         // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);

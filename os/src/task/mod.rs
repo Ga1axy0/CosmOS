@@ -21,6 +21,7 @@ use crate::sched::{
     take_current_task, TaskContext,
 };
 use crate::fs::{open_file, OpenFlags};
+use crate::syscall::write_process_accounting_on_exit;
 use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
@@ -162,8 +163,11 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         process_inner.is_zombie = true;
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
+        drop(process_inner);
+        write_process_accounting_on_exit(&process, exit_reason);
 
         {
+            let process_inner = process.inner_exclusive_access();
             // move all child processes under init process
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {
@@ -176,6 +180,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         // it has to be done before we dealloc the whole memory_set
         // otherwise they will be deallocated twice
         let mut recycle_res = Vec::<TaskUserRes>::new();
+        let process_inner = process.inner_exclusive_access();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
             let thread_id = {
