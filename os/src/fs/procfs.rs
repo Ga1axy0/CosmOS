@@ -5,6 +5,7 @@
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.
+//! - `/proc/<pid>/maps` — virtual memory regions of the process.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -18,7 +19,7 @@ use fs::vfs::{VfsFileType, VfsNode};
 use crate::config::{MAX_HARTS, PAGE_SIZE};
 use crate::fs::inode::snapshot_mount_table;
 use crate::fs::PAGE_CACHE_MANAGER;
-use crate::mm::{frame_allocator_stats, VmaKind};
+use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
 use crate::task::{current_process, TaskStatus};
@@ -504,6 +505,56 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     Ok(out)
 }
 
+/// Render the permission column (`rwxp`) for a `/proc/<pid>/maps` line.
+/// xxOS has no per-VMA shared/private bit on anonymous regions, so file
+/// mappings report `s` when shared and everything else reports `p`.
+fn maps_perm_string(perm: MapPermission, shared: bool) -> [u8; 4] {
+    [
+        if perm.contains(MapPermission::R) { b'r' } else { b'-' },
+        if perm.contains(MapPermission::W) { b'w' } else { b'-' },
+        if perm.contains(MapPermission::X) { b'x' } else { b'-' },
+        if shared { b's' } else { b'p' },
+    ]
+}
+
+/// Build the contents of `/proc/<pid>/maps`: one line per user VMA, formatted
+/// like Linux (`start-end perms offset dev inode path`).
+fn build_pid_maps(pid: usize) -> Result<String, FS_ERRNO> {
+    let process = pid2process(pid).ok_or(FS_ERRNO::ENOENT)?;
+    let inner = process.inner_exclusive_access();
+    let mut out = String::new();
+    for vma in inner.memory_set.vmas.values() {
+        // Kernel-only regions are not part of the user address space view.
+        if matches!(vma.kind, VmaKind::Kernel) {
+            continue;
+        }
+        let start = usize::from(vma.start_vpn()) * PAGE_SIZE;
+        let end = usize::from(vma.end_vpn()) * PAGE_SIZE;
+        let shared = vma.file.as_ref().map(|f| f.shared).unwrap_or(false);
+        let pgoff = vma.file.as_ref().map(|f| f.pgoff * PAGE_SIZE).unwrap_or(0);
+        let perms = maps_perm_string(vma.map_perm, shared);
+        let perms = core::str::from_utf8(&perms).unwrap_or("----");
+        let label = match vma.kind {
+            VmaKind::Heap => "[heap]",
+            VmaKind::UserStack { .. } => "[stack]",
+            VmaKind::Vdso => "[vdso]",
+            _ => "",
+        };
+        let _ = write!(
+            &mut out,
+            "{:08x}-{:08x} {} {:08x} 00:00 0 ",
+            start, end, perms, pgoff
+        );
+        if !label.is_empty() {
+            let _ = writeln!(&mut out, "                  {}", label);
+        } else {
+            let _ = writeln!(&mut out);
+        }
+    }
+    Ok(out)
+}
+
+
 /// `/proc` root directory node.
 #[derive(Default, Debug)]
 pub struct ProcRootNode;
@@ -796,6 +847,7 @@ impl VfsNode for ProcPidDirNode {
         }
         alloc::vec![
             (String::from("exe"), VfsFileType::Symlink),
+            (String::from("maps"), VfsFileType::Regular),
             (String::from("mounts"), VfsFileType::Regular),
             (String::from("stat"), VfsFileType::Regular),
             (String::from("status"), VfsFileType::Regular),
@@ -806,6 +858,7 @@ impl VfsNode for ProcPidDirNode {
         pid2process(self.pid)?;
         match name {
             "exe" => Some(Arc::new(ProcPidExeLinkNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "maps" => Some(Arc::new(ProcPidMapsNode::new(self.pid)) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
@@ -900,6 +953,71 @@ impl VfsNode for ProcPidExeLinkNode {
 
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/maps` node.
+#[derive(Debug)]
+pub struct ProcPidMapsNode {
+    pid: usize,
+}
+
+impl ProcPidMapsNode {
+    /// Create a new `/proc/<pid>/maps` node.
+    pub fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+}
+
+impl VfsNode for ProcPidMapsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_pid_maps(self.pid).map(|data| data.len()).unwrap_or(0)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        match build_pid_maps(self.pid) {
+            Ok(data) => read_string_at(data, offset, buf),
+            Err(_) => 0,
+        }
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {

@@ -254,6 +254,14 @@ impl FileDescription {
         self.access_mode.bits() | self.status_fixed_bits | inner.status_flags.bits()
     }
 
+    /// 是否为 `O_PATH` 打开的描述符。这类描述符仅引用文件在树中的位置，
+    /// 不关联可操作的文件对象，套接字相关系统调用需以 `EBADF` 拒绝
+    /// （对应 Linux `fdget(FMODE_PATH)` 的行为）。
+    pub fn is_path(&self) -> bool {
+        const O_PATH: i32 = 0x200000;
+        self.status_fixed_bits & O_PATH != 0
+    }
+
     /// 覆盖当前可变文件状态位。
     pub fn set_status_flags(&self, status_flags: FileStatusFlags) {
         self.inner.lock().status_flags = status_flags;
