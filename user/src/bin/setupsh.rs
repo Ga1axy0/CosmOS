@@ -9,7 +9,7 @@ use alloc::string::String;
 use core::ptr;
 
 use user_lib::{
-    chdir, close, exec, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
+    chdir, close, exec, execve, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
     OpenFlags, Stat,
 };
 
@@ -21,6 +21,8 @@ const BIN_DIR_CSTR: &str = "/bin\0";
 const BIN_BASH: &str = "/bin/bash";
 const BIN_BUSYBOX: &str = "/bin/busybox";
 const BIN_BUSYBOX_CSTR: &str = "/bin/busybox\0";
+const BOOT_DIR: &str = "/boot";
+const BOOT_CONFIG_PATH: &str = "/boot/config-6.6.0";
 const LIB_DIR: &str = "/lib";
 const ETC_DIR: &str = "/etc";
 const ETC_PASSWD_PATH: &str = "/etc/passwd";
@@ -59,6 +61,9 @@ const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
 const PASSWD_CONTENT: &[u8] = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/sh\n";
 const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
+const KERNEL_CONFIG_CONTENT: &[u8] = b"CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\nCONFIG_BSD_PROCESS_ACCT=y\nCONFIG_BSD_PROCESS_ACCT_V3=y\n";
+const SHELL_PATH_ENV_CSTR: &str =
+    "PATH=/sbin:/usr/sbin:/bin:/usr/bin:/glibc/ltp/testcases/bin:/musl/ltp/testcases/bin\0";
 
 fn path_exists(path: &str) -> bool {
     let mut st = Stat::new();
@@ -75,6 +80,31 @@ fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
     if pid == 0 {
         let ret = exec(path, argv);
         println!("[setupsh] exec {} failed: {}", path, ret);
+        exit(127);
+    }
+
+    let mut exit_code = 0i32;
+    let waited = waitpid(pid as usize, &mut exit_code);
+    if waited != pid {
+        println!(
+            "[setupsh] waitpid mismatch: expected {}, got {}",
+            pid, waited
+        );
+        return -1;
+    }
+    exit_code
+}
+
+/// 运行一个外部程序并显式传入环境变量，然后等待其退出。
+fn spawn_and_wait_with_env(path: &str, argv: &[*const u8], envp: &[*const u8]) -> i32 {
+    let pid = fork();
+    if pid < 0 {
+        println!("[setupsh] fork failed for {}", path);
+        return -1;
+    }
+    if pid == 0 {
+        let ret = execve(path, argv, envp);
+        println!("[setupsh] execve {} failed: {}", path, ret);
         exit(127);
     }
 
@@ -329,6 +359,7 @@ fn clean_top_level_lib() -> bool {
 fn ensure_dirs() -> bool {
     for dir in [
         BIN_DIR,
+        BOOT_DIR,
         LIB_DIR,
         ETC_DIR,
         HOME_DIR,
@@ -404,6 +435,10 @@ fn install_account_files() -> bool {
     write_file(ETC_PASSWD_PATH, PASSWD_CONTENT) && write_file(ETC_GROUP_PATH, GROUP_CONTENT)
 }
 
+fn install_kernel_config_file() -> bool {
+    write_file(BOOT_CONFIG_PATH, KERNEL_CONFIG_CONTENT)
+}
+
 fn install_busybox_applets() -> bool {
     if !path_exists("/bin/sh") {
         let musl_install_argv = [
@@ -437,7 +472,7 @@ fn install_busybox_applets() -> bool {
 
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 9;
+    const TOTAL_STEPS: usize = 10;
     if let Some(arg) = argv.get(1) {
         println!(
             "[setupsh] ignoring legacy libc selector '{}'; installing musl and glibc",
@@ -494,7 +529,12 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(9, TOTAL_STEPS, "launch /bin/sh");
+    print_step(9, TOTAL_STEPS, "write kernel config fallback");
+    if !install_kernel_config_file() {
+        return 1;
+    }
+
+    print_step(10, TOTAL_STEPS, "launch /bin/sh");
     let chdir_ret = chdir(ROOT_HOME_DIR);
     if chdir_ret < 0 {
         println!(
@@ -503,7 +543,8 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         );
     }
     let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
-    let shell_exit = spawn_and_wait(BIN_SH_CSTR, &shell_argv);
+    let shell_envp = [SHELL_PATH_ENV_CSTR.as_ptr(), ptr::null()];
+    let shell_exit = spawn_and_wait_with_env(BIN_SH_CSTR, &shell_argv, &shell_envp);
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
     shell_exit
 }

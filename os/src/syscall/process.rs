@@ -48,6 +48,17 @@ const EXEC_INTERPRETER_MAX_DEPTH: usize = 4;
 const EXEC_PROBE_SIZE: usize = 256;
 /// ELF 文件头魔数。
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+fn should_trace_exec(path: &str, argv: &[String]) -> bool {
+    path.contains("acct02")
+        || argv.iter().any(|arg| arg.contains("acct02"))
+}
+
+fn path_env_from_envs(envs: &[String]) -> Option<&str> {
+    envs.iter()
+        .find_map(|env| env.strip_prefix("PATH="))
+}
+
 /// 判断当前文件是否为 ELF 映像。
 fn is_elf_image(file_data: &[u8]) -> bool {
     file_data.starts_with(ELF_MAGIC)
@@ -801,17 +812,61 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
                 envp = envp.add(1);
             }
         }
-
         let process = current_process();
+        if envs_vec.is_empty() {
+            let inherited_envs = process.inner_exclusive_access().environment.clone();
+            if !inherited_envs.is_empty() {
+                if should_trace_exec(path.as_str(), args_vec.as_slice()) {
+                    debug!(
+                        "[execve] pid={} inherited empty envp from current environment PATH={:?}",
+                        process.getpid(),
+                        path_env_from_envs(inherited_envs.as_slice())
+                    );
+                }
+                envs_vec = inherited_envs;
+            }
+        }
+        if should_trace_exec(path.as_str(), args_vec.as_slice()) {
+            debug!(
+                "[execve] pid={} path='{}' argv={:?} PATH={:?}",
+                process.getpid(),
+                path,
+                args_vec,
+                path_env_from_envs(envs_vec.as_slice())
+            );
+        }
+
         let cwd = process.inner_exclusive_access().cwd.clone();
         debug!(" ------------------- Resolve -----------------------");
-        let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
+        let resolved = match resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0) {
+            Ok(resolved) => resolved,
+            Err(errno) => {
+                if path.contains("acct02") {
+                    debug!(
+                        "[execve] resolve failed pid={} cwd='{}' path='{}': {:?}",
+                        process.getpid(),
+                        cwd,
+                        path,
+                        errno
+                    );
+                }
+                return Err(errno);
+            }
+        };
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage {
             elf_data,
             argv,
             exec_path,
         } = resolved;
+        if exec_path.contains("acct02") || argv.iter().any(|arg| arg.contains("acct02")) {
+            debug!(
+                "[execve] resolved pid={} exec_path='{}' argv={:?}",
+                process.getpid(),
+                exec_path,
+                argv
+            );
+        }
         process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
