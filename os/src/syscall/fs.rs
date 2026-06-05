@@ -1039,6 +1039,73 @@ const UTIME_NOW: usize = 0x3fff_ffff;
 const UTIME_OMIT: usize = 0x3fff_fffe;
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
 
+fn inode_allows_access(inode: &Arc<fs::Inode>, uid: u32, gid: u32, mode: u32) -> bool {
+    if mode == F_OK as u32 {
+        return true;
+    }
+
+    let Some(raw_mode) = inode.mode() else {
+        return inode.check_access(uid, gid, mode);
+    };
+    let perm_bits = raw_mode & 0o777;
+
+    if uid == 0 {
+        if mode & X_OK as u32 != 0 && perm_bits & 0o111 == 0 {
+            return false;
+        }
+        return true;
+    }
+
+    let file_uid = inode.uid().unwrap_or(0);
+    let file_gid = inode.gid().unwrap_or(0);
+    let perm = if uid == file_uid {
+        (perm_bits >> 6) & 0o7
+    } else if gid == file_gid {
+        (perm_bits >> 3) & 0o7
+    } else {
+        perm_bits & 0o7
+    };
+
+    if mode & R_OK as u32 != 0 && perm & 0o4 == 0 {
+        return false;
+    }
+    if mode & W_OK as u32 != 0 && perm & 0o2 == 0 {
+        return false;
+    }
+    if mode & X_OK as u32 != 0 && perm & 0o1 == 0 {
+        return false;
+    }
+    true
+}
+
+fn check_path_search_permissions(cwd: &str, path: &str, uid: u32, gid: u32) -> Result<(), ERRNO> {
+    if uid == 0 {
+        return Ok(());
+    }
+
+    let abs = canonicalize(cwd, path);
+    let components: Vec<&str> = abs.split('/').filter(|s| !s.is_empty()).collect();
+    if components.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut prefix = String::from("/");
+    for component in &components[..components.len() - 1] {
+        if prefix.len() > 1 {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        let inode = lookup_inode_follow("/", prefix.as_str(), true)?;
+        if !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        if !inode_allows_access(&inode, uid, gid, X_OK as u32) {
+            return Err(ERRNO::EACCES);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum UtimeArg {
     Now,
@@ -2133,15 +2200,16 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         }
 
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let process = current_process();
+        let uid = process.getuid();
+        let gid = process.getgid();
+        check_path_search_permissions(cwd.as_str(), path.as_str(), uid, gid)?;
         let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
         if mode == F_OK {
             return Ok(0);
         }
 
-        let process = current_process();
-        let uid = process.getuid();
-        let gid = process.getgid();
-        if inode.check_access(uid, gid, mode as u32) {
+        if inode_allows_access(&inode, uid, gid, mode as u32) {
             Ok(0)
         } else {
             Err(ERRNO::EACCES)
