@@ -239,7 +239,9 @@ impl Drop for UserReleaseBatch {
     fn drop(&mut self) {
         for page in self.pages.drain(..) {
             match page {
-                DeferredUserPage::Private(_page) => {}
+                DeferredUserPage::Private(page) => {
+                    drop(page);
+                }
                 DeferredUserPage::DirectCache(page) => release_mapped_page(&page),
             }
         }
@@ -252,14 +254,26 @@ pub struct DeferredUserReclaim {
     token: usize,
     /// 需要接收 shootdown 的 hart 掩码。
     mask: usize,
+    /// 调用方提供的回收来源标签，便于定位是哪条路径触发了 shootdown。
+    reason: &'static str,
     /// shootdown 完成后才能释放的旧页对象。
     batch: UserReleaseBatch,
 }
 
 impl DeferredUserReclaim {
     /// 基于锁内快照创建一次用户页表延迟回收动作。
-    pub(crate) fn new(token: usize, mask: usize, batch: UserReleaseBatch) -> Self {
-        Self { token, mask, batch }
+    pub(crate) fn new(
+        token: usize,
+        mask: usize,
+        reason: &'static str,
+        batch: UserReleaseBatch,
+    ) -> Self {
+        Self {
+            token,
+            mask,
+            reason,
+            batch,
+        }
     }
 
     /// 判断本次回收是否实际持有旧页对象。
@@ -269,12 +283,16 @@ impl DeferredUserReclaim {
 
     /// 在目标 hart 完成 TLB shootdown 后释放旧页对象。
     pub fn flush_then_release(self) {
-        if self.mask != 0 && !self.batch.is_empty() {
+        if !self.batch.is_empty() {
             debug!(
-                "[tlb] deferred user reclaim shootdown: token={:#x} mask={:#b}",
+                "[tlb] deferred user reclaim: reason={} token={:#x} mask={:#b} pages={}",
+                self.reason,
                 self.token,
-                self.mask
+                self.mask,
+                self.batch.pages.len()
             );
+        }
+        if self.mask != 0 && !self.batch.is_empty() {
             shootdown(self.mask, ShootdownKind::AddressSpace { satp: self.token });
         }
         // self 在函数返回时析构，batch 的 Drop 会真正释放旧页引用。
