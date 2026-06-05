@@ -7,7 +7,7 @@ use crate::{
     sched::block_current_and_run_next,
     task::{current_process, current_task, WaitReason},
     timer::{
-        add_timer, get_realtime_ns, get_time, get_time_ms, get_time_ns, get_time_ticks,
+        add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks,
         get_time_us, time_to_ticks,
     },
 };
@@ -132,8 +132,12 @@ fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
 fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC => {
-            let resolution_ns = 1_000_000_000u64.div_ceil(CLOCK_FREQ as u64);
-            Ok(timespec_from_ns(resolution_ns))
+            // Expose the timer ABI as high-resolution so Linux RT userland
+            // enables hrtimer paths such as cyclictest.
+            Ok(Timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            })
         }
         // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
         // CLOCK_REALTIME_COARSE 等其它 clock id。
@@ -339,11 +343,18 @@ pub fn sys_clock_nanosleep(
 
         let req = read_pod_from_user(req)?;
         let req_ns = timespec_to_ns(&req)?;
+        // 单调时钟现值：定时器队列（`add_timer_ns` / `check_timer`）只按
+        // CLOCK_MONOTONIC 的 `get_time_ns()` 判定到期，因此最终的到期时刻必须
+        // 落在单调时间轴上。我们这里把它取一次并复用，避免读两次时钟产生缝隙。
+        let monotonic_now_ns = get_time_ns();
         let now_ns = match clockid {
             CLOCK_REALTIME => get_realtime_ns(),
-            CLOCK_MONOTONIC => get_time_ns(),
+            CLOCK_MONOTONIC => monotonic_now_ns,
             _ => unreachable!(),
         };
+        // 先把请求归一化成“还需睡多久”的相对时长：绝对超时按各自时钟基准做差，
+        // 相对超时直接采用。这样无论传入的是 realtime 还是 monotonic，得到的都是
+        // 一个与时钟无关的纯时长。
         let sleep_ns = if flags & TIMER_ABSTIME != 0 {
             req_ns.saturating_sub(now_ns)
         } else {
@@ -357,11 +368,14 @@ pub fn sys_clock_nanosleep(
             return Ok(0);
         }
 
-        let now_ms = get_time_ms();
-        let sleep_ms = sleep_ns.div_ceil(1_000_000) as usize;
-        let expire_ms = now_ms.saturating_add(sleep_ms.max(1));
+        // 关键修复：到期时刻一律换算到单调时间轴。此前对 CLOCK_REALTIME 用
+        // `now_ns`(=单调+RTC墙钟偏移) 作为基准，得到的 `expire_ns` 大约领先单调时钟
+        // 数十年，定时器永远不会触发——glibc 的 `usleep` 走
+        // `clock_nanosleep(CLOCK_REALTIME, 0, …)`，于是阻塞至天荒地老（musl 的
+        // `usleep` 走 `nanosleep` 用单调时钟，故不受影响）。
+        let expire_ns = monotonic_now_ns.saturating_add(sleep_ns.max(1));
         let task = current_task().unwrap();
-        add_timer(expire_ms, task);
+        add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
 
         if !rem.is_null() {

@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use fs::vfs::{VfsFileType, VfsNode};
 use fs::{BlockDevice, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT};
@@ -29,6 +30,7 @@ use crate::random as kernel_random;
 
 const RTC_RD_TIME: usize = 0xFFFF_FFFF_8024_7009;
 const RTC_SET_TIME: usize = 0x4024_700A;
+static CPU_DMA_LATENCY_US: AtomicI32 = AtomicI32::new(0);
 
 fn devfs_statfs() -> StatFs64 {
     empty_statfs(
@@ -356,6 +358,84 @@ impl VfsNode for ZeroDevNode {
     }
 }
 
+/// VFS node representing `/dev/cpu_dma_latency`.
+///
+/// Linux RT tools write a 32-bit latency target here and keep the fd open for
+/// the duration of the benchmark. We only need a minimal in-memory sink.
+#[derive(Default, Debug)]
+pub struct CpuDmaLatencyNode;
+
+impl CpuDmaLatencyNode {
+    /// Create a new `/dev/cpu_dma_latency` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+unsafe impl Send for CpuDmaLatencyNode {}
+unsafe impl Sync for CpuDmaLatencyNode {}
+
+impl VfsNode for CpuDmaLatencyNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
+    }
+
+    fn rdev(&self) -> u64 {
+        makedev(10, 63)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if buf.is_empty() || offset >= core::mem::size_of::<i32>() {
+            return 0;
+        }
+        let bytes = CPU_DMA_LATENCY_US.load(Ordering::Relaxed).to_ne_bytes();
+        let end = (offset + buf.len()).min(bytes.len());
+        let len = end - offset;
+        buf[..len].copy_from_slice(&bytes[offset..end]);
+        len
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        if offset != 0 || buf.len() < core::mem::size_of::<i32>() {
+            return 0;
+        }
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&buf[..4]);
+        CPU_DMA_LATENCY_US.store(i32::from_ne_bytes(bytes), Ordering::Relaxed);
+        buf.len()
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), fs::errno::FS_ERRNO> {
+        Ok(())
+    }
+
+    fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
+        Ok(devfs_statfs())
+    }
+}
+
 // SAFETY: single-processor kernel; `BlockDevice` is already `Send + Sync`.
 unsafe impl Send for BlockDevNode {}
 unsafe impl Sync for BlockDevNode {}
@@ -462,6 +542,7 @@ impl VfsNode for DevRootNode {
         let mut entries = alloc::vec![
             (String::from("null"), VfsFileType::Char),
             (String::from("zero"), VfsFileType::Char),
+            (String::from("cpu_dma_latency"), VfsFileType::Char),
             (String::from("rtc"), VfsFileType::Char),
             (String::from("rtc0"), VfsFileType::Char),
             (String::from("urandom"), VfsFileType::Char),
@@ -479,6 +560,7 @@ impl VfsNode for DevRootNode {
         match name {
             "null" => Some(Arc::new(NullDevNode::new()) as Arc<dyn VfsNode>),
             "zero" => Some(Arc::new(ZeroDevNode::new()) as Arc<dyn VfsNode>),
+            "cpu_dma_latency" => Some(Arc::new(CpuDmaLatencyNode::new()) as Arc<dyn VfsNode>),
             "rtc" | "rtc0" => Some(Arc::new(RtcDevNode::new()) as Arc<dyn VfsNode>),
             "urandom" | "random" => Some(Arc::new(UrandomDevNode::new()) as Arc<dyn VfsNode>),
             "misc" => Some(Arc::new(DevMiscNode::new()) as Arc<dyn VfsNode>),

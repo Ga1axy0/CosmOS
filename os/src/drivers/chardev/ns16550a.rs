@@ -247,6 +247,14 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
       }
    }
 
+   fn read_nonblocking(&self) -> Option<u8> {
+      let mut inner = self.inner.lock();
+      if let Some(ch) = inner.read_buffer.pop_front() {
+         return Some(ch);
+      }
+      inner.ns16550a.try_read()
+   }
+
    fn has_data(&self) -> bool {
       let inner = self.inner.lock();
       !inner.read_buffer.is_empty() || inner.ns16550a.has_data()
