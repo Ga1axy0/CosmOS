@@ -56,6 +56,9 @@ const GLIBC_USR_LIB_DIR: &str = "/usr/lib/riscv64-linux-gnu";
 const GLIBC_LD_NAME: &str = "ld-linux-riscv64-lp64d.so.1";
 const GLIBC_LD_TARGET: &str = "/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1";
 const GLIBC_LD_PATH: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
+const ROOT_GROUPDEL: &str = "/root/groupdel";
+const ROOT_USERADD: &str = "/root/useradd";
+const ROOT_USERDEL: &str = "/root/userdel";
 const INSTALL_ARG_CSTR: &str = "--install\0";
 const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
@@ -64,6 +67,9 @@ const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
 const KERNEL_CONFIG_CONTENT: &[u8] = b"CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\nCONFIG_BSD_PROCESS_ACCT=y\nCONFIG_BSD_PROCESS_ACCT_V3=y\n";
 const SHELL_PATH_ENV_CSTR: &str =
     "PATH=/sbin:/usr/sbin:/bin:/usr/bin:/glibc/ltp/testcases/bin:/musl/ltp/testcases/bin\0";
+const USR_BIN_GROUPDEL: &str = "/usr/bin/groupdel";
+const USR_BIN_USERADD: &str = "/usr/bin/useradd";
+const USR_BIN_USERDEL: &str = "/usr/bin/userdel";
 
 fn path_exists(path: &str) -> bool {
     let mut st = Stat::new();
@@ -470,9 +476,26 @@ fn install_busybox_applets() -> bool {
     true
 }
 
+fn install_ltp_helper_commands() -> bool {
+    for (src, dst) in [
+        (ROOT_USERADD, USR_BIN_USERADD),
+        (ROOT_USERDEL, USR_BIN_USERDEL),
+        (ROOT_GROUPDEL, USR_BIN_GROUPDEL),
+    ] {
+        if !path_exists(src) {
+            println!("[setupsh] helper command missing: {}", src);
+            return false;
+        }
+        if !ensure_hard_link(src, dst) {
+            return false;
+        }
+    }
+    true
+}
+
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 10;
+    const TOTAL_STEPS: usize = 11;
     if let Some(arg) = argv.get(1) {
         println!(
             "[setupsh] ignoring legacy libc selector '{}'; installing musl and glibc",
@@ -524,17 +547,22 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(8, TOTAL_STEPS, "install minimal account database");
+    print_step(8, TOTAL_STEPS, "install ltp helper commands");
+    if !install_ltp_helper_commands() {
+        return 1;
+    }
+
+    print_step(9, TOTAL_STEPS, "install minimal account database");
     if !install_account_files() {
         return 1;
     }
 
-    print_step(9, TOTAL_STEPS, "write kernel config fallback");
+    print_step(10, TOTAL_STEPS, "write kernel config fallback");
     if !install_kernel_config_file() {
         return 1;
     }
 
-    print_step(10, TOTAL_STEPS, "launch /bin/sh");
+    print_step(11, TOTAL_STEPS, "launch /bin/sh");
     let chdir_ret = chdir(ROOT_HOME_DIR);
     if chdir_ret < 0 {
         println!(

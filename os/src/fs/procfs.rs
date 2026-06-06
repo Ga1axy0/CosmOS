@@ -19,6 +19,7 @@ use fs::vfs::{VfsFileType, VfsNode};
 use crate::config::{MAX_HARTS, PAGE_SIZE};
 use crate::fs::inode::snapshot_mount_table;
 use crate::fs::PAGE_CACHE_MANAGER;
+use crate::keys;
 use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
@@ -76,6 +77,16 @@ fn build_mounts() -> String {
         );
     }
     out
+}
+
+fn parse_proc_u32(buf: &[u8]) -> Result<u32, FS_ERRNO> {
+    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    text.parse::<u32>().map_err(|_| FS_ERRNO::EINVAL)
+}
+
+fn parse_proc_usize(buf: &[u8]) -> Result<usize, FS_ERRNO> {
+    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    text.parse::<usize>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
 fn read_string_at(data: String, offset: usize, buf: &mut [u8]) -> usize {
@@ -586,6 +597,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("self"), VfsFileType::Symlink));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
+        entries.push((String::from("key-users"), VfsFileType::Regular));
+        entries.push((String::from("sys"), VfsFileType::Directory));
         for pid in list_pids() {
             entries.push((alloc::format!("{}", pid), VfsFileType::Directory));
         }
@@ -597,6 +610,8 @@ impl VfsNode for ProcRootNode {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
+            "sys" => Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>),
             _ => {
                 let pid = parse_pid(name)?;
                 if pid2process(pid).is_some() {
@@ -624,6 +639,240 @@ impl VfsNode for ProcRootNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcStaticDirKind {
+    Sys,
+    Kernel,
+    Keys,
+}
+
+#[derive(Debug)]
+struct ProcStaticDirNode {
+    kind: ProcStaticDirKind,
+}
+
+impl ProcStaticDirNode {
+    fn new(kind: ProcStaticDirKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl VfsNode for ProcStaticDirNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        match self.kind {
+            ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
+            ProcStaticDirKind::Kernel => alloc::vec![(String::from("keys"), VfsFileType::Directory)],
+            ProcStaticDirKind::Keys => alloc::vec![
+                (String::from("gc_delay"), VfsFileType::Regular),
+                (String::from("maxkeys"), VfsFileType::Regular),
+                (String::from("maxbytes"), VfsFileType::Regular),
+            ],
+        }
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        match (self.kind, name) {
+            (ProcStaticDirKind::Sys, "kernel") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Kernel)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Kernel, "keys") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Keys, "gc_delay") => {
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::GcDelay)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Keys, "maxkeys") => {
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxKeys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Keys, "maxbytes") => {
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxBytes)) as Arc<dyn VfsNode>)
+            }
+            _ => None,
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Default, Debug)]
+struct ProcKeyUsersNode;
+
+impl ProcKeyUsersNode {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcKeyUsersNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        keys::render_key_users().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(keys::render_key_users(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcKeySysctlKind {
+    GcDelay,
+    MaxKeys,
+    MaxBytes,
+}
+
+#[derive(Debug)]
+struct ProcKeySysctlNode {
+    kind: ProcKeySysctlKind,
+}
+
+impl ProcKeySysctlNode {
+    fn new(kind: ProcKeySysctlKind) -> Self {
+        Self { kind }
+    }
+
+    fn render(&self) -> String {
+        match self.kind {
+            ProcKeySysctlKind::GcDelay => alloc::format!("{}\n", keys::gc_delay()),
+            ProcKeySysctlKind::MaxKeys => alloc::format!("{}\n", keys::max_keys()),
+            ProcKeySysctlKind::MaxBytes => alloc::format!("{}\n", keys::max_bytes()),
+        }
+    }
+}
+
+impl VfsNode for ProcKeySysctlNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let result = match self.kind {
+            ProcKeySysctlKind::GcDelay => parse_proc_u32(buf).map(keys::set_gc_delay),
+            ProcKeySysctlKind::MaxKeys => parse_proc_u32(buf).map(keys::set_max_keys),
+            ProcKeySysctlKind::MaxBytes => parse_proc_usize(buf).map(keys::set_max_bytes),
+        };
+        if result.is_ok() {
+            buf.len()
+        } else {
+            0
+        }
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {

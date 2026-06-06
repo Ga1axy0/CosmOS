@@ -262,6 +262,10 @@ pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
 /// brk syscall
 pub const SYSCALL_BRK: usize = 214;
+/// add_key syscall
+pub const SYSCALL_ADD_KEY: usize = 217;
+/// keyctl syscall
+pub const SYSCALL_KEYCTL: usize = 219;
 /// munmap syscall
 pub const SYSCALL_MUNMAP: usize = 215;
 /// clone syscall
@@ -377,6 +381,7 @@ pub fn syscall_supports_sa_restart(syscall_id: usize) -> bool {
 }
 
 mod fs;
+mod key;
 mod net;
 mod sched;
 mod process;
@@ -393,6 +398,7 @@ mod resource;
 pub mod errno;
 
 use fs::*;
+use key::*;
 use net::*;
 use sched::*;
 use process::*;
@@ -708,6 +714,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SHUTDOWN => sys_shutdown(args[0] as i32, args[1] as i32),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2] as i32),
+        SYSCALL_ADD_KEY => sys_add_key(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as i32,
+        ),
+        SYSCALL_KEYCTL => sys_keyctl(
+            args[0] as i32,
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+        ),
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),

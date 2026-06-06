@@ -115,6 +115,17 @@ pub struct Credentials {
     pub pgid: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+/// Lazily created special keyrings attached to a process context.
+pub struct ProcessKeyrings {
+    /// Backing serial for `KEY_SPEC_THREAD_KEYRING`.
+    pub thread: Option<i32>,
+    /// Backing serial for `KEY_SPEC_PROCESS_KEYRING`.
+    pub process: Option<i32>,
+    /// Backing serial for `KEY_SPEC_SESSION_KEYRING`.
+    pub session: Option<i32>,
+}
+
 impl Credentials {
     pub const fn root() -> Self {
         Self {
@@ -180,6 +191,8 @@ pub struct ProcessControlBlockInner {
     pub umask: u32,
     /// process credentials
     pub cred: Credentials,
+    /// lazily created special keyrings visible through `add_key/keyctl`
+    pub keyrings: ProcessKeyrings,
     /// CPU time spent in user mode for this process (raw timer counter units)
     pub user_time: usize,
     /// CPU time spent in kernel mode for this process (raw timer counter units)
@@ -611,6 +624,7 @@ impl ProcessControlBlock {
                     environment: Vec::new(),
                     umask: DEFAULT_UMASK,
                     cred,
+                    keyrings: ProcessKeyrings::default(),
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -904,6 +918,7 @@ impl ProcessControlBlock {
         let parent_cwd = parent.cwd.clone();
         let parent_exec_path = parent.exec_path.clone();
         let parent_umask = parent.umask;
+        let parent_keyrings = parent.keyrings;
         let parent_shm_attachments = parent.shm_attachments.clone();
         // alloc a pid
         let pid = pid_alloc();
@@ -944,6 +959,7 @@ impl ProcessControlBlock {
                     environment: parent.environment.clone(),
                     umask: parent_umask,
                     cred,
+                    keyrings: parent_keyrings,
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
@@ -1053,6 +1069,7 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         let mut parent = self.inner_exclusive_access();
         let cred = parent.cred;
+        let parent_keyrings = parent.keyrings;
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
@@ -1089,6 +1106,7 @@ impl ProcessControlBlock {
                     environment: parent.environment.clone(),
                     umask: parent.umask,
                     cred,
+                    keyrings: parent_keyrings,
                     user_time: 0,
                     kernel_time: 0,
                     child_user_time: 0,
