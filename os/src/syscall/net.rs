@@ -4,19 +4,23 @@ use core::{mem::size_of, slice};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::syscall::times::TimeVal;
 use crate::fs::{
-    make_pipe, AccessMode, File, FileDescription, FileStatusFlags,
+    make_pipe, AccessMode, File, FileDescription, FileStatusFlags, SocketSpec,
 };
 use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
 use crate::net::{
     create_alg_socket_file, create_compat_ifreq_socket_file, create_netlink_route_socket_file,
-    create_packet_socket_file,
+    create_packet_socket_file, create_raw_ipv6_socket_file,
     create_tcp_socket_file, create_udp_socket_file, create_unix_stream_socket_file,
     AlgRequestFile, AlgSendMsgParams, AlgSocketFile, CompatIfreqSocketFile,
-    NetlinkRouteSocketFile, PacketSocketFile, SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn,
-    SockAddrLl,
-    SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd,
-    UnixUcred, AF_ALG, ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV,
-    ALG_SET_OP, SOCK_SEQPACKET, SOL_ALG,
+    In6PktInfo, NetlinkRouteSocketFile, PacketSocketFile, RawIpv6ControlMessage,
+    RawIpv6SendMeta, RawIpv6SocketFile, SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn, SockAddrIn6,
+    SockAddrLl, SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData,
+    UnixSocketPairEnd, UnixUcred, AF_ALG, AF_INET6, ALG_OP_DECRYPT, ALG_OP_ENCRYPT,
+    ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV, ALG_SET_OP, ICMP6_FILTER, IPPROTO_ICMPV6,
+    IPV6_2292DSTOPTS, IPV6_2292HOPOPTS, IPV6_2292HOPLIMIT, IPV6_2292PKTINFO,
+    IPV6_2292RTHDR, IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS,
+    IPV6_RECVHOPOPTS, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_RECVRTHDR,
+    IPV6_RECVTCLASS, IPV6_TCLASS, SOCK_SEQPACKET, SOL_ALG, SOL_IPV6,
 };
 use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall::errno::{ERRNO, OrErrno};
@@ -134,6 +138,7 @@ impl Pod for MsgHdr {}
 
 // 允许 socket syscall 将 IPv4 地址结构整体写回用户空间。
 impl Pod for SockAddrIn {}
+impl Pod for SockAddrIn6 {}
 
 // 允许 socket syscall 解析 `struct sockaddr_alg`。
 impl Pod for SockAddrAlg {}
@@ -439,6 +444,39 @@ fn parse_send_ancillary(control_bytes: &[u8]) -> Result<UnixSocketAncillaryData,
     Ok(ancillary)
 }
 
+fn parse_raw_ipv6_send_meta(control_bytes: &[u8]) -> Result<RawIpv6SendMeta, ERRNO> {
+    if control_bytes.len() > MAX_MSG_CONTROL {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let mut meta = RawIpv6SendMeta::default();
+    let mut off = 0usize;
+    while off + size_of::<CmsgHdr>() <= control_bytes.len() {
+        let hdr = unsafe {
+            core::ptr::read_unaligned(control_bytes[off..].as_ptr() as *const CmsgHdr)
+        };
+        if hdr.cmsg_len < size_of::<CmsgHdr>() {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = off.checked_add(hdr.cmsg_len).ok_or(ERRNO::EINVAL)?;
+        if end > control_bytes.len() {
+            return Err(ERRNO::EINVAL);
+        }
+        let payload = &control_bytes[off + size_of::<CmsgHdr>()..end];
+        if hdr.cmsg_level != SOL_IPV6 || payload.len() < size_of::<i32>() {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        let value = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        match hdr.cmsg_type {
+            IPV6_HOPLIMIT => meta.hoplimit = Some(value),
+            IPV6_TCLASS => meta.tclass = Some(value),
+            _ => return Err(ERRNO::EOPNOTSUPP),
+        }
+        off = off.checked_add(cmsg_align(hdr.cmsg_len)).ok_or(ERRNO::EINVAL)?;
+    }
+    Ok(meta)
+}
+
 fn install_received_rights(rights: Vec<Arc<FileDescription>>, cloexec: bool) -> Result<Vec<i32>, ERRNO> {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -499,8 +537,20 @@ fn with_packet_socket<R>(
     f(packet)
 }
 
+fn with_raw_ipv6_socket<R>(
+    fd: usize,
+    f: impl FnOnce(&RawIpv6SocketFile) -> Result<R, ERRNO>,
+) -> Result<R, ERRNO> {
+    let desc = get_file_description(fd)?;
+    let raw = desc
+        .as_any()
+        .downcast_ref::<RawIpv6SocketFile>()
+        .ok_or(ERRNO::ENOTSOCK)?;
+    f(raw)
+}
+
 fn sockaddr_to_endpoint(addr: &SockAddrIn) -> Result<IpEndpoint, ERRNO> {
-    if addr.sin_family != AF_INET {
+    if addr.sin_family != AF_INET && addr.sin_family != 0 {
         return Err(ERRNO::EAFNOSUPPORT);
     }
     let port = u16::from_be(addr.sin_port);
@@ -532,10 +582,11 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SocketKind {
+enum SocketBackendKind {
     Udp,
     Tcp,
-    Unix,
+    RawIpv6,
+    UnixStream,
     CompatIfreq,
     Packet,
     NetlinkRoute,
@@ -543,33 +594,42 @@ enum SocketKind {
     AlgRequest,
 }
 
-fn socket_kind(fd: usize) -> Result<SocketKind, ERRNO> {
+fn socket_backend(fd: usize) -> Result<SocketBackendKind, ERRNO> {
     let desc = get_file_description(fd)?;
     if desc.as_any().downcast_ref::<UdpSocketFile>().is_some() {
-        return Ok(SocketKind::Udp);
+        return Ok(SocketBackendKind::Udp);
     }
     if desc.as_any().downcast_ref::<TcpSocketFile>().is_some() {
-        return Ok(SocketKind::Tcp);
+        return Ok(SocketBackendKind::Tcp);
+    }
+    if desc.as_any().downcast_ref::<RawIpv6SocketFile>().is_some() {
+        return Ok(SocketBackendKind::RawIpv6);
     }
     if desc.as_any().downcast_ref::<UnixSocketPairEnd>().is_some() {
-        return Ok(SocketKind::Unix);
+        return Ok(SocketBackendKind::UnixStream);
     }
     if desc.as_any().downcast_ref::<CompatIfreqSocketFile>().is_some() {
-        return Ok(SocketKind::CompatIfreq);
+        return Ok(SocketBackendKind::CompatIfreq);
     }
     if desc.as_any().downcast_ref::<PacketSocketFile>().is_some() {
-        return Ok(SocketKind::Packet);
+        return Ok(SocketBackendKind::Packet);
     }
     if desc.as_any().downcast_ref::<NetlinkRouteSocketFile>().is_some() {
-        return Ok(SocketKind::NetlinkRoute);
+        return Ok(SocketBackendKind::NetlinkRoute);
     }
     if desc.as_any().downcast_ref::<AlgSocketFile>().is_some() {
-        return Ok(SocketKind::AlgSocket);
+        return Ok(SocketBackendKind::AlgSocket);
     }
     if desc.as_any().downcast_ref::<AlgRequestFile>().is_some() {
-        return Ok(SocketKind::AlgRequest);
+        return Ok(SocketBackendKind::AlgRequest);
     }
     Err(ERRNO::ENOTSOCK)
+}
+
+fn socket_spec(fd: usize) -> Result<SocketSpec, ERRNO> {
+    get_file_description(fd)?
+        .socket_spec()
+        .ok_or(ERRNO::ENOTSOCK)
 }
 
 fn parse_sockaddr_alg_field(bytes: &[u8]) -> Result<&str, ERRNO> {
@@ -650,6 +710,13 @@ fn read_sockaddr_family(addr: *const u8, addrlen: usize) -> Result<u16, ERRNO> {
     let token = current_user_token();
     let family_bytes = copy_user_bytes(token, addr, size_of::<u16>())?;
     Ok(u16::from_ne_bytes([family_bytes[0], family_bytes[1]]))
+}
+
+fn read_sockaddr_in6(addr: *const u8, addrlen: usize) -> Result<SockAddrIn6, ERRNO> {
+    if addr.is_null() || addrlen < size_of::<SockAddrIn6>() {
+        return Err(ERRNO::EINVAL);
+    }
+    read_pod_from_user(addr as *const SockAddrIn6)
 }
 
 fn parse_socket_type_flags(socket_type: i32) -> Result<(i32, FileStatusFlags, bool), ERRNO> {
@@ -784,6 +851,20 @@ fn copy_sockaddr_to_user(addr: *mut SockAddrIn, addrlen: *mut i32, sockaddr: &So
     Ok(())
 }
 
+fn copy_sockaddr_in6_to_user(
+    addr: *mut u8,
+    addrlen: *mut i32,
+    sockaddr: &SockAddrIn6,
+) -> Result<(), ERRNO> {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (sockaddr as *const SockAddrIn6) as *const u8,
+            size_of::<SockAddrIn6>(),
+        )
+    };
+    copy_raw_sockaddr_to_user(addr, addrlen, bytes)
+}
+
 fn copy_raw_sockaddr_to_user(addr: *mut u8, addrlen: *mut i32, sockaddr: &[u8]) -> Result<(), ERRNO> {
     if addr.is_null() || addrlen.is_null() {
         return Err(ERRNO::EFAULT);
@@ -818,16 +899,23 @@ fn accept_common(
     if get_file_description(fd)?.is_path() {
         return Err(ERRNO::EBADF);
     }
-    let (accepted_file, peer): (Arc<dyn File + Send + Sync>, _) = match socket_kind(fd)? {
-        SocketKind::Tcp => {
+    let parent_spec = socket_spec(fd)?;
+    let (accepted_file, peer): (Arc<dyn File + Send + Sync>, _) = match socket_backend(fd)? {
+        SocketBackendKind::Tcp => {
             let (accepted, peer) = with_tcp_socket(fd, |tcp| tcp.accept())?;
             (accepted as Arc<dyn File + Send + Sync>, peer)
         }
-        SocketKind::AlgSocket => (
+        SocketBackendKind::AlgSocket => (
             with_alg_socket(fd, |alg| Ok(alg.accept()? as Arc<dyn File + Send + Sync>))?,
             None,
         ),
-        SocketKind::Udp | SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+        SocketBackendKind::Udp
+        | SocketBackendKind::RawIpv6
+        | SocketBackendKind::UnixStream
+        | SocketBackendKind::CompatIfreq
+        | SocketBackendKind::Packet
+        | SocketBackendKind::NetlinkRoute
+        | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
     };
 
     let status_flags = if (flags & SOCK_NONBLOCK) != 0 {
@@ -837,11 +925,12 @@ fn accept_common(
     };
     let cloexec = (flags & SOCK_CLOEXEC) != 0;
 
-    let accepted_desc = Arc::new(FileDescription::new(
+    let accepted_desc = Arc::new(FileDescription::new_socket(
         accepted_file,
         AccessMode::ReadWrite,
         status_flags,
         0,
+        parent_spec,
     ));
 
     let process = current_process();
@@ -870,23 +959,67 @@ fn accept_common(
 pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
     syscall_body!({
         let (base_type, status_flags, cloexec) = parse_socket_type_flags(socket_type)?;
-        let file: Arc<dyn File + Send + Sync> = match domain {
+        let (file, spec): (Arc<dyn File + Send + Sync>, SocketSpec) = match domain {
             x if x == AF_INET as i32 => match base_type {
-                SOCK_DGRAM => create_udp_socket_file()
-                    .map(|f| f as Arc<dyn File + Send + Sync>)
-                    .ok_or(ERRNO::ENETDOWN)?,
-                SOCK_STREAM => create_tcp_socket_file()
-                    .map(|f| f as Arc<dyn File + Send + Sync>)
-                    .ok_or(ERRNO::ENETDOWN)?,
+                SOCK_DGRAM => (
+                    create_udp_socket_file()
+                        .map(|f| f as Arc<dyn File + Send + Sync>)
+                        .ok_or(ERRNO::ENETDOWN)?,
+                    SocketSpec {
+                        family: domain,
+                        socket_type: SOCK_DGRAM,
+                        protocol: 0,
+                    },
+                ),
+                SOCK_STREAM => (
+                    create_tcp_socket_file()
+                        .map(|f| f as Arc<dyn File + Send + Sync>)
+                        .ok_or(ERRNO::ENETDOWN)?,
+                    SocketSpec {
+                        family: domain,
+                        socket_type: SOCK_STREAM,
+                        protocol: 0,
+                    },
+                ),
                 _ => return Err(ERRNO::ESOCKTNOSUPPORT),
             },
+            x if x == AF_INET6 as i32 => {
+                if base_type != SOCK_RAW {
+                    return Err(ERRNO::ESOCKTNOSUPPORT);
+                }
+                if !(0..=255).contains(&protocol) {
+                    return Err(ERRNO::EPROTONOSUPPORT);
+                }
+                (
+                    create_raw_ipv6_socket_file(protocol) as Arc<dyn File + Send + Sync>,
+                    SocketSpec {
+                        family: domain,
+                        socket_type: SOCK_RAW,
+                        protocol,
+                    },
+                )
+            }
             AF_UNIX => {
                 if protocol != 0 {
                     return Err(ERRNO::EPROTONOSUPPORT);
                 }
                 match base_type {
-                    SOCK_STREAM => create_unix_stream_socket_file() as Arc<dyn File + Send + Sync>,
-                    SOCK_DGRAM => create_compat_ifreq_socket_file() as Arc<dyn File + Send + Sync>,
+                    SOCK_STREAM => (
+                        create_unix_stream_socket_file() as Arc<dyn File + Send + Sync>,
+                        SocketSpec {
+                            family: domain,
+                            socket_type: SOCK_STREAM,
+                            protocol: 0,
+                        },
+                    ),
+                    SOCK_DGRAM => (
+                        create_compat_ifreq_socket_file() as Arc<dyn File + Send + Sync>,
+                        SocketSpec {
+                            family: domain,
+                            socket_type: SOCK_DGRAM,
+                            protocol: 0,
+                        },
+                    ),
                     _ => return Err(ERRNO::ESOCKTNOSUPPORT),
                 }
             }
@@ -897,13 +1030,27 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                 if base_type != SOCK_SEQPACKET {
                     return Err(ERRNO::ESOCKTNOSUPPORT);
                 }
-                create_alg_socket_file() as Arc<dyn File + Send + Sync>
+                (
+                    create_alg_socket_file() as Arc<dyn File + Send + Sync>,
+                    SocketSpec {
+                        family: domain,
+                        socket_type: SOCK_SEQPACKET,
+                        protocol: 0,
+                    },
+                )
             }
             AF_PACKET => {
                 if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
                     return Err(ERRNO::ESOCKTNOSUPPORT);
                 }
-                create_packet_socket_file(base_type) as Arc<dyn File + Send + Sync>
+                (
+                    create_packet_socket_file(base_type) as Arc<dyn File + Send + Sync>,
+                    SocketSpec {
+                        family: domain,
+                        socket_type: base_type,
+                        protocol,
+                    },
+                )
             }
             AF_NETLINK => {
                 if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
@@ -912,16 +1059,24 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                 if protocol != NETLINK_ROUTE {
                     return Err(ERRNO::EPROTONOSUPPORT);
                 }
-                create_netlink_route_socket_file() as Arc<dyn File + Send + Sync>
+                (
+                    create_netlink_route_socket_file() as Arc<dyn File + Send + Sync>,
+                    SocketSpec {
+                        family: domain,
+                        socket_type: base_type,
+                        protocol,
+                    },
+                )
             }
             _ => return Err(ERRNO::EAFNOSUPPORT),
         };
 
-        let desc = Arc::new(FileDescription::new(
+        let desc = Arc::new(FileDescription::new_socket(
             file,
             AccessMode::ReadWrite,
             status_flags,
             0,
+            spec,
         ));
 
         let process = current_process();
@@ -959,18 +1114,25 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         let (end0_raw, end1_raw) = UnixSocketPairEnd::new_pair(ba_read, ab_write, ab_read, ba_write);
         let end0: Arc<dyn File + Send + Sync> = end0_raw;
         let end1: Arc<dyn File + Send + Sync> = end1_raw;
+        let spec = SocketSpec {
+            family: domain,
+            socket_type: SOCK_STREAM,
+            protocol: 0,
+        };
 
-        let desc0 = Arc::new(FileDescription::new(
+        let desc0 = Arc::new(FileDescription::new_socket(
             end0,
             AccessMode::ReadWrite,
             status_flags,
             0,
+            spec,
         ));
-        let desc1 = Arc::new(FileDescription::new(
+        let desc1 = Arc::new(FileDescription::new_socket(
             end1,
             AccessMode::ReadWrite,
             status_flags,
             0,
+            spec,
         ));
 
         let process = current_process();
@@ -1000,21 +1162,25 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
 pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
-        match socket_kind(fd)? {
-            SocketKind::Udp | SocketKind::Tcp => {
+        match socket_backend(fd)? {
+            SocketBackendKind::Udp | SocketBackendKind::Tcp => {
                 if addr.is_null() || (addrlen as usize) < core::mem::size_of::<SockAddrIn>() {
                     return Err(ERRNO::EINVAL);
                 }
                 let token = current_user_token();
                 let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
                 let ep = sockaddr_to_endpoint(uaddr)?;
-                match socket_kind(fd)? {
-                    SocketKind::Udp => with_udp_socket(fd, |udp| udp.bind(ep))?,
-                    SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.bind(ep))?,
+                match socket_backend(fd)? {
+                    SocketBackendKind::Udp => with_udp_socket(fd, |udp| udp.bind(ep))?,
+                    SocketBackendKind::Tcp => with_tcp_socket(fd, |tcp| tcp.bind(ep))?,
                     _ => unreachable!(),
                 }
             }
-            SocketKind::AlgSocket => {
+            SocketBackendKind::RawIpv6 => {
+                let raw = read_sockaddr_in6(addr as *const u8, addrlen as usize)?;
+                with_raw_ipv6_socket(fd, |socket| socket.bind(&raw))?;
+            }
+            SocketBackendKind::AlgSocket => {
                 let raw = read_sockaddr_alg(addr as *const u8, addrlen as usize)?;
                 if raw.salg_family as i32 != AF_ALG {
                     return Err(ERRNO::EAFNOSUPPORT);
@@ -1023,17 +1189,17 @@ pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
                 let algname = parse_sockaddr_alg_field(raw.salg_name.as_slice())?;
                 with_alg_socket(fd, |alg| alg.bind(algtype, algname))?;
             }
-            SocketKind::NetlinkRoute | SocketKind::Packet => {
+            SocketBackendKind::NetlinkRoute | SocketBackendKind::Packet => {
                 if addr.is_null() || addrlen < 0 {
                     return Err(ERRNO::EINVAL);
                 }
-                if matches!(socket_kind(fd)?, SocketKind::Packet) {
+                if matches!(socket_backend(fd)?, SocketBackendKind::Packet) {
                     let token = current_user_token();
                     let raw = copy_user_bytes(token, addr as *const u8, addrlen as usize)?;
                     with_packet_socket(fd, |packet| packet.bind_raw(raw.as_slice()))?;
                 }
             }
-            SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::AlgRequest => return Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq | SocketBackendKind::AlgRequest => return Err(ERRNO::ENOTSOCK),
         }
         Ok(0)
     })
@@ -1047,28 +1213,28 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         }
 
         let fd = fd as usize;
-        match socket_kind(fd)? {
-            SocketKind::Udp | SocketKind::Tcp => {
+        match socket_backend(fd)? {
+            SocketBackendKind::Udp | SocketBackendKind::Tcp => {
                 if addrlen < size_of::<SockAddrIn>() {
                     return Err(ERRNO::EINVAL);
                 }
                 let token = current_user_token();
                 let uaddr = translated_ref(token, addr).or_errno(ERRNO::EFAULT)?;
                 let ep = sockaddr_to_endpoint(uaddr)?;
-                match socket_kind(fd)? {
-                    SocketKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
-                    SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
-                    SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => unreachable!(),
+                match socket_backend(fd)? {
+                    SocketBackendKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
+                    SocketBackendKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
+                    SocketBackendKind::RawIpv6 | SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => unreachable!(),
                 }
             }
-            SocketKind::Unix => {
+            SocketBackendKind::UnixStream => {
                 let family = read_sockaddr_family(addr as *const u8, addrlen)?;
                 if family != AF_UNIX as u16 {
                     return Err(ERRNO::EAFNOSUPPORT);
                 }
                 return Err(ERRNO::ENOENT);
             }
-            SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::RawIpv6 | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         }
         Ok(0)
     })
@@ -1077,13 +1243,13 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
 pub fn sys_listen(fd: i32, backlog: i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
-        match socket_kind(fd)? {
-            SocketKind::Tcp => {
+        match socket_backend(fd)? {
+            SocketBackendKind::Tcp => {
                 with_tcp_socket(fd, |tcp| tcp.listen(backlog as usize))?;
                 Ok(0)
             }
-            SocketKind::Udp | SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute => Err(ERRNO::ENOTSOCK),
-            SocketKind::AlgSocket | SocketKind::AlgRequest => Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::Udp | SocketBackendKind::RawIpv6 | SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute => Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => Err(ERRNO::EOPNOTSUPP),
         }
     })
 }
@@ -1104,8 +1270,8 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
     syscall_body!({
         let fd = fd as usize;
 
-        match socket_kind(fd)? {
-            SocketKind::Udp => {
+        match socket_backend(fd)? {
+            SocketBackendKind::Udp => {
                 with_udp_socket(fd, |udp| {
                     let ep = udp
                         .local_endpoint()
@@ -1114,7 +1280,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                     Ok(())
                 })?;
             }
-            SocketKind::Tcp => {
+            SocketBackendKind::Tcp => {
                 with_tcp_socket(fd, |tcp| {
                     let ep = tcp
                         .local_endpoint()
@@ -1123,7 +1289,11 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                     Ok(())
                 })?;
             }
-            SocketKind::Packet => {
+            SocketBackendKind::RawIpv6 => {
+                let sockaddr = with_raw_ipv6_socket(fd, |raw| Ok(raw.local_addr()))?;
+                copy_sockaddr_in6_to_user(addr as *mut u8, addrlen, &sockaddr)?;
+            }
+            SocketBackendKind::Packet => {
                 let sockaddr = with_packet_socket(fd, |packet| packet.getsockname_raw())?;
                 let bytes = unsafe {
                     core::slice::from_raw_parts(
@@ -1133,7 +1303,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                 };
                 copy_raw_sockaddr_to_user(addr as *mut u8, addrlen, bytes)?;
             }
-            SocketKind::NetlinkRoute => {
+            SocketBackendKind::NetlinkRoute => {
                 let sockaddr = SockAddrNl {
                     nl_family: AF_NETLINK as u16,
                     nl_pad: 0,
@@ -1148,8 +1318,8 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                 };
                 copy_raw_sockaddr_to_user(addr as *mut u8, addrlen, bytes)?;
             }
-            SocketKind::Unix | SocketKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
-            SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         }
 
         Ok(0)
@@ -1160,15 +1330,15 @@ pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
     syscall_body!({
         let fd = fd as usize;
 
-        match socket_kind(fd)? {
-            SocketKind::Udp => {
+        match socket_backend(fd)? {
+            SocketBackendKind::Udp => {
                 with_udp_socket(fd, |udp| {
                     let ep = udp.peer_endpoint().ok_or(ERRNO::ENOTCONN)?;
                     copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
                     Ok(())
                 })?;
             }
-            SocketKind::Tcp => {
+            SocketBackendKind::Tcp => {
                 with_tcp_socket(fd, |tcp| {
                     if let Some(ep) = tcp.remote_endpoint() {
                         copy_sockaddr_to_user(addr, addrlen, &endpoint_to_sockaddr(ep))?;
@@ -1178,8 +1348,8 @@ pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                     }
                 })?;
             }
-            SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute => return Err(ERRNO::ENOTSOCK),
-            SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::RawIpv6 | SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute => return Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         }
 
         Ok(0)
@@ -1211,8 +1381,8 @@ pub fn sys_sendto(
         );
 
         let fd = fd as usize;
-        let n = match socket_kind(fd)? {
-            SocketKind::Udp => {
+        let n = match socket_backend(fd)? {
+            SocketBackendKind::Udp => {
                 if addr.is_null() {
                     with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
                 } else {
@@ -1224,20 +1394,29 @@ pub fn sys_sendto(
                     with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
                 }
             }
-            SocketKind::Tcp => {
+            SocketBackendKind::Tcp => {
                 if addr.is_null() {
                     with_tcp_socket(fd, |tcp| tcp.send_from_user_buffer(&ubuf))?
                 } else {
                     return Err(ERRNO::ENOTSOCK);
                 }
             }
-            SocketKind::NetlinkRoute => {
+            SocketBackendKind::RawIpv6 => {
+                if addr.is_null() {
+                    return Err(ERRNO::EDESTADDRREQ);
+                }
+                let sockaddr = read_sockaddr_in6(addr as *const u8, addrlen as usize)?;
+                with_raw_ipv6_socket(fd, |raw| {
+                    raw.send_user_buffer_to(&ubuf, &sockaddr, &RawIpv6SendMeta::default())
+                })?
+            }
+            SocketBackendKind::NetlinkRoute => {
                 if !addr.is_null() {
                     return Err(ERRNO::EOPNOTSUPP);
                 }
                 with_netlink_route_socket(fd, |netlink| netlink.send_user_buffer(&ubuf))?
             }
-            SocketKind::Packet => {
+            SocketBackendKind::Packet => {
                 if addrlen < 0 {
                     return Err(ERRNO::EINVAL);
                 }
@@ -1250,8 +1429,8 @@ pub fn sys_sendto(
                     packet.send_user_buffer_to(&ubuf, raw_addr.as_deref())
                 })?
             }
-            SocketKind::Unix | SocketKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
-            SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         };
 
         Ok(n as isize)
@@ -1282,18 +1461,18 @@ pub fn sys_recvfrom(
         );
 
         let fd = fd as usize;
-        let kind = socket_kind(fd)?;
-        let allowed_flags = match kind {
-            SocketKind::NetlinkRoute => MSG_PEEK | MSG_DONTWAIT,
+        let backend = socket_backend(fd)?;
+        let allowed_flags = match backend {
+            SocketBackendKind::NetlinkRoute => MSG_PEEK | MSG_DONTWAIT,
             _ => 0,
         };
         if flags & !allowed_flags != 0 {
             return Err(ERRNO::EOPNOTSUPP);
         }
 
-        let (n, ep) = match kind {
-            SocketKind::Udp => with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?,
-            SocketKind::Tcp => {
+        let (n, ep) = match backend {
+            SocketBackendKind::Udp => with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?,
+            SocketBackendKind::Tcp => {
                 let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
                 let ep = if addr.is_null() {
                     IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0)
@@ -1303,13 +1482,13 @@ pub fn sys_recvfrom(
                 };
                 (n, ep)
             }
-            SocketKind::NetlinkRoute => (
+            SocketBackendKind::NetlinkRoute => (
                 with_netlink_route_socket(fd, |netlink| {
                     netlink.recv_into_user_buffer(&mut ubuf, (flags & MSG_PEEK) != 0)
                 })?,
                 IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0),
             ),
-            SocketKind::Packet => {
+            SocketBackendKind::Packet => {
                 let (n, sockaddr) =
                     with_packet_socket(fd, |packet| packet.recv_into_user_buffer(&mut ubuf))?;
                 if !addr.is_null() {
@@ -1323,8 +1502,33 @@ pub fn sys_recvfrom(
                 }
                 return Ok(n as isize);
             }
-            SocketKind::Unix | SocketKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
-            SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::RawIpv6 => {
+                let packet = with_raw_ipv6_socket(fd, |raw| raw.recv_into_user_buffer(&mut ubuf))?;
+                if !addr.is_null() {
+                    let sockaddr = SockAddrIn6 {
+                        sin6_family: AF_INET6,
+                        sin6_addr: packet
+                            .control
+                            .iter()
+                            .find(|cmsg| cmsg.cmsg_type == IPV6_PKTINFO || cmsg.cmsg_type == IPV6_2292PKTINFO)
+                            .and_then(|cmsg| {
+                                if cmsg.data.len() < size_of::<In6PktInfo>() {
+                                    return None;
+                                }
+                                let pktinfo = unsafe {
+                                    core::ptr::read_unaligned(cmsg.data.as_ptr() as *const In6PktInfo)
+                                };
+                                Some(pktinfo.ipi6_addr)
+                            })
+                            .unwrap_or([0; 16]),
+                        ..Default::default()
+                    };
+                    copy_sockaddr_in6_to_user(addr as *mut u8, addrlen, &sockaddr)?;
+                }
+                return Ok(packet.data.len() as isize);
+            }
+            SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         };
 
         if !addr.is_null() {
@@ -1341,20 +1545,20 @@ pub fn sys_shutdown(fd: i32, how: i32) -> isize {
             return Err(ERRNO::EINVAL);
         }
         let fd = fd as usize;
-        match socket_kind(fd)? {
-            SocketKind::Unix => {
+        match socket_backend(fd)? {
+            SocketBackendKind::UnixStream => {
                 with_unix_socket(fd, |unix| {
                     unix.shutdown(how)?;
                     Ok(())
                 })?;
                 Ok(0)
             }
-            SocketKind::Tcp => {
+            SocketBackendKind::Tcp => {
                 with_tcp_socket(fd, |tcp| tcp.shutdown(how))?;
                 Ok(0)
             }
-            SocketKind::Udp | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute => Err(ERRNO::ENOTSOCK),
-            SocketKind::AlgSocket | SocketKind::AlgRequest => Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::Udp | SocketBackendKind::RawIpv6 | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute => Err(ERRNO::ENOTSOCK),
+            SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => Err(ERRNO::EOPNOTSUPP),
         }
     })
 }
@@ -1363,7 +1567,8 @@ pub fn sys_shutdown(fd: i32, how: i32) -> isize {
 pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optlen: i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
-        let kind = socket_kind(fd)?;
+        let backend = socket_backend(fd)?;
+        let spec = socket_spec(fd)?;
 
         if level == SOL_ALG {
             if optval.is_null() || optlen < 0 {
@@ -1371,12 +1576,30 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
             }
             let token = current_user_token();
             let payload = copy_user_bytes(token, optval, optlen as usize)?;
-            return match kind {
-                SocketKind::AlgSocket => {
+            return match backend {
+                SocketBackendKind::AlgSocket => {
                     with_alg_socket(fd, |alg| alg.set_key(optname, payload.as_slice()))?;
                     Ok(0)
                 }
-                SocketKind::AlgRequest => Err(ERRNO::EINVAL),
+                SocketBackendKind::AlgRequest => Err(ERRNO::EINVAL),
+                _ => Err(ERRNO::ENOPROTOOPT),
+            };
+        }
+
+        if level == IPPROTO_ICMPV6 {
+            if spec.family != AF_INET6 as i32 || spec.socket_type != SOCK_RAW || spec.protocol != IPPROTO_ICMPV6 {
+                return Err(ERRNO::ENOPROTOOPT);
+            }
+            if optval.is_null() || optlen < 0 {
+                return Err(ERRNO::EINVAL);
+            }
+            let token = current_user_token();
+            let payload = copy_user_bytes(token, optval, optlen as usize)?;
+            return match optname {
+                ICMP6_FILTER => {
+                    with_raw_ipv6_socket(fd, |raw| raw.set_icmp6_filter(payload.as_slice()))?;
+                    Ok(0)
+                }
                 _ => Err(ERRNO::ENOPROTOOPT),
             };
         }
@@ -1384,7 +1607,7 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
         match SocketLevel::from_repr(level) {
             Some(SocketLevel::SolSocket) => match PosixSocketOption::from_repr(optname) {
                 Some(PosixSocketOption::SoPassCred) => {
-                    if kind != SocketKind::Unix {
+                    if spec.family != AF_UNIX {
                         warn!(
                             "setsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
                             fd, level, optname
@@ -1402,16 +1625,16 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                 Some(PosixSocketOption::SoRecvTimeo) => {
                     let timeval = read_sockopt_timeval(optval, optlen)?;
                     let timeout_ns = timeval_to_ns(&timeval)?;
-                    match kind {
-                        SocketKind::Udp => with_udp_socket(fd, |udp| {
+                    match backend {
+                        SocketBackendKind::Udp => with_udp_socket(fd, |udp| {
                             udp.set_recv_timeout_ns(timeout_ns);
                             Ok(())
                         })?,
-                        SocketKind::Tcp => with_tcp_socket(fd, |tcp| {
+                        SocketBackendKind::Tcp => with_tcp_socket(fd, |tcp| {
                             tcp.set_recv_timeout_ns(timeout_ns);
                             Ok(())
                         })?,
-                        SocketKind::Unix => {
+                        SocketBackendKind::UnixStream => {
                             warn!(
                                 "setsockopt(fd={}, level={}, optname={}) unsupported on UNIX socket, ignored",
                                 fd,
@@ -1419,23 +1642,23 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                                 optname
                             );
                         }
-                        SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+                        SocketBackendKind::RawIpv6 | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
                     }
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoSndTimeo) => {
                     let timeval = read_sockopt_timeval(optval, optlen)?;
                     let timeout_ns = timeval_to_ns(&timeval)?;
-                    match kind {
-                        SocketKind::Udp => with_udp_socket(fd, |udp| {
+                    match backend {
+                        SocketBackendKind::Udp => with_udp_socket(fd, |udp| {
                             udp.set_send_timeout_ns(timeout_ns);
                             Ok(())
                         })?,
-                        SocketKind::Tcp => with_tcp_socket(fd, |tcp| {
+                        SocketBackendKind::Tcp => with_tcp_socket(fd, |tcp| {
                             tcp.set_send_timeout_ns(timeout_ns);
                             Ok(())
                         })?,
-                        SocketKind::Unix => {
+                        SocketBackendKind::UnixStream => {
                             warn!(
                                 "setsockopt(fd={}, level={}, optname={}) unsupported on UNIX socket, ignored",
                                 fd,
@@ -1443,7 +1666,7 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                                 optname
                             );
                         }
-                        SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+                        SocketBackendKind::RawIpv6 | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
                     }
                     Ok(0)
                 }
@@ -1454,7 +1677,7 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
             },
             Some(SocketLevel::IpProtoIp) => match optname {
                 MCAST_JOIN_GROUP => {
-                    if kind != SocketKind::Tcp {
+                    if backend != SocketBackendKind::Tcp {
                         // Multicast membership is only modelled for TCP sockets;
                         // accept silently elsewhere to preserve prior behaviour.
                         return Ok(0);
@@ -1469,7 +1692,7 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                     }
                 }
                 MCAST_LEAVE_GROUP => {
-                    if kind != SocketKind::Tcp {
+                    if backend != SocketBackendKind::Tcp {
                         return Err(ERRNO::EADDRNOTAVAIL);
                     }
                     let token = current_user_token();
@@ -1486,6 +1709,29 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                     Ok(0)
                 }
             },
+            Some(SocketLevel::IpProtoIpv6) => {
+                if spec.family != AF_INET6 as i32 || spec.socket_type != SOCK_RAW {
+                    return Err(ERRNO::ENOPROTOOPT);
+                }
+                match optname {
+                    IPV6_CHECKSUM => {
+                        let token = current_user_token();
+                        let offset = read_sockopt_i32(token, optval, optlen)?;
+                        with_raw_ipv6_socket(fd, |raw| raw.set_checksum_offset(offset))?;
+                        Ok(0)
+                    }
+                    IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_RECVRTHDR | IPV6_RECVHOPOPTS
+                    | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO
+                    | IPV6_2292HOPLIMIT | IPV6_2292RTHDR | IPV6_2292HOPOPTS
+                    | IPV6_2292DSTOPTS => {
+                        let token = current_user_token();
+                        let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
+                        with_raw_ipv6_socket(fd, |raw| raw.set_bool_option(optname, enabled))?;
+                        Ok(0)
+                    }
+                    _ => Err(ERRNO::ENOPROTOOPT),
+                }
+            }
             _ => {
                 warn!("setsockopt(fd={}, level={}, optname={}) not implemented, ignored", fd, level, optname);
                 Ok(0)
@@ -1497,25 +1743,33 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> isize {
     syscall_body!({
         let fd = fd as usize;
-        let kind = socket_kind(fd)?;
+        let backend = socket_backend(fd)?;
+        let spec = socket_spec(fd)?;
         let token = current_user_token();
+
+        if level == IPPROTO_ICMPV6 {
+            if spec.family != AF_INET6 as i32 || spec.socket_type != SOCK_RAW || spec.protocol != IPPROTO_ICMPV6 {
+                return Err(ERRNO::ENOPROTOOPT);
+            }
+            return match optname {
+                ICMP6_FILTER => {
+                    let bytes = with_raw_ipv6_socket(fd, |raw| Ok(raw.icmp6_filter_bytes()))?;
+                    write_getsockopt_value(token, optval, optlen, bytes.as_slice())?;
+                    Ok(0)
+                }
+                _ => Err(ERRNO::ENOPROTOOPT),
+            };
+        }
 
         match SocketLevel::from_repr(level) {
             Some(SocketLevel::SolSocket) => match PosixSocketOption::from_repr(optname) {
                 Some(PosixSocketOption::SoType) => {
-                    let socket_type = match kind {
-                        SocketKind::Udp => SOCK_DGRAM,
-                        SocketKind::Tcp | SocketKind::Unix => SOCK_STREAM,
-                        SocketKind::CompatIfreq => SOCK_DGRAM,
-                        SocketKind::Packet => with_packet_socket(fd, |packet| Ok(packet.socket_type()))?,
-                        SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => SOCK_SEQPACKET,
-                    };
-                    write_getsockopt_i32(token, optval, optlen, socket_type)?;
+                    write_getsockopt_i32(token, optval, optlen, spec.socket_type)?;
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoAcceptConn) => {
                     let mut acceptconn = 0i32;
-                    if kind == SocketKind::Tcp {
+                    if backend == SocketBackendKind::Tcp {
                         with_tcp_socket(fd, |tcp| {
                             acceptconn = if tcp.is_listening() { 1 } else { 0 };
                             Ok(())
@@ -1526,12 +1780,12 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 }
                 Some(PosixSocketOption::SoRcvBuf) => {
                     let mut size = 0i32;
-                    if kind == SocketKind::Udp {
+                    if backend == SocketBackendKind::Udp {
                         with_udp_socket(fd, |udp| {
                             size = udp.recv_buffer_size() as i32;
                             Ok(())
                         })?;
-                    } else if kind == SocketKind::Tcp {
+                    } else if backend == SocketBackendKind::Tcp {
                         with_tcp_socket(fd, |tcp| {
                             size = tcp.recv_buffer_size() as i32;
                             Ok(())
@@ -1553,12 +1807,12 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 }
                 Some(PosixSocketOption::SoSndBuf) => {
                     let mut size = 0i32;
-                    if kind == SocketKind::Udp {
+                    if backend == SocketBackendKind::Udp {
                         with_udp_socket(fd, |udp| {
                             size = udp.send_buffer_size() as i32;
                             Ok(())
                         })?;
-                    } else if kind == SocketKind::Tcp {
+                    } else if backend == SocketBackendKind::Tcp {
                         with_tcp_socket(fd, |tcp| {
                             size = tcp.send_buffer_size() as i32;
                             Ok(())
@@ -1578,18 +1832,18 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoRecvTimeo) => {
-                    let timeout_ns = match kind {
-                        SocketKind::Udp => {
+                    let timeout_ns = match backend {
+                        SocketBackendKind::Udp => {
                             let mut ns = 0u64;
                             with_udp_socket(fd, |udp| { ns = udp.recv_timeout_ns(); Ok(()) })?;
                             ns
                         }
-                        SocketKind::Tcp => {
+                        SocketBackendKind::Tcp => {
                             let mut ns = 0u64;
                             with_tcp_socket(fd, |tcp| { ns = tcp.recv_timeout_ns(); Ok(()) })?;
                             ns
                         }
-                        SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => 0,
+                        SocketBackendKind::RawIpv6 | SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => 0,
                     };
                     let timeval = timeval_from_ns(timeout_ns);
                     let bytes = unsafe {
@@ -1602,18 +1856,18 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoSndTimeo) => {
-                    let timeout_ns = match kind {
-                        SocketKind::Udp => {
+                    let timeout_ns = match backend {
+                        SocketBackendKind::Udp => {
                             let mut ns = 0u64;
                             with_udp_socket(fd, |udp| { ns = udp.send_timeout_ns(); Ok(())})?;
                             ns
                         }
-                        SocketKind::Tcp => {
+                        SocketBackendKind::Tcp => {
                             let mut ns = 0u64;
                             with_tcp_socket(fd, |tcp| { ns = tcp.send_timeout_ns(); Ok(())})?;
                             ns
                         }
-                        SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => 0,
+                        SocketBackendKind::RawIpv6 | SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::NetlinkRoute | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => 0,
                     };
                     let timeval = timeval_from_ns(timeout_ns);
                     let bytes = unsafe {
@@ -1629,7 +1883,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoPassCred) => {
-                    if kind != SocketKind::Unix {
+                    if spec.family != AF_UNIX {
                         warn!(
                             "getsockopt(fd={}, level={}, optname={}) unsupported on non-UNIX socket, ignored",
                             fd,
@@ -1696,6 +1950,27 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     Ok(0)
                 }
             },
+            Some(SocketLevel::IpProtoIpv6) => {
+                if spec.family != AF_INET6 as i32 || spec.socket_type != SOCK_RAW {
+                    return Err(ERRNO::ENOPROTOOPT);
+                }
+                match optname {
+                    IPV6_CHECKSUM => {
+                        let value = with_raw_ipv6_socket(fd, |raw| Ok(raw.checksum_offset()))?;
+                        write_getsockopt_i32(token, optval, optlen, value)?;
+                        Ok(0)
+                    }
+                    IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_RECVRTHDR | IPV6_RECVHOPOPTS
+                    | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO
+                    | IPV6_2292HOPLIMIT | IPV6_2292RTHDR | IPV6_2292HOPOPTS
+                    | IPV6_2292DSTOPTS => {
+                        let value = with_raw_ipv6_socket(fd, |raw| raw.get_bool_option(optname))?;
+                        write_getsockopt_i32(token, optval, optlen, value)?;
+                        Ok(0)
+                    }
+                    _ => Err(ERRNO::ENOPROTOOPT),
+                }
+            }
             _ => {
                 warn!(
                     "getsockopt(fd={}, level={}, optname={}) not implemented, ignored",
@@ -1735,8 +2010,8 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
         let ubuf = iovecs_to_user_buffer(token, &iovecs, PageFaultAccess::Read)?;
 
         let fd = fd as usize;
-        let n = match socket_kind(fd)? {
-            SocketKind::Unix => {
+        let n = match socket_backend(fd)? {
+            SocketBackendKind::UnixStream => {
                 let ancillary = if msghdr.msg_controllen == 0 {
                     UnixSocketAncillaryData::default()
                 } else {
@@ -1757,7 +2032,7 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
 
                 with_unix_socket(fd, |unix| unix.sendmsg(ubuf, ancillary))?
             }
-            SocketKind::AlgRequest => {
+            SocketBackendKind::AlgRequest => {
                 let params = if msghdr.msg_controllen == 0 {
                     AlgSendMsgParams::default()
                 } else {
@@ -1773,13 +2048,34 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
                 };
                 with_alg_request(fd, |alg| alg.sendmsg(total_len, params))?
             }
-            SocketKind::NetlinkRoute => {
+            SocketBackendKind::RawIpv6 => {
+                let dst = if msghdr.msg_name == 0 {
+                    return Err(ERRNO::EDESTADDRREQ);
+                } else {
+                    read_sockaddr_in6(msghdr.msg_name as *const u8, msghdr.msg_namelen)?
+                };
+                let meta = if msghdr.msg_controllen == 0 {
+                    RawIpv6SendMeta::default()
+                } else {
+                    if msghdr.msg_control == 0 {
+                        return Err(ERRNO::EFAULT);
+                    }
+                    let control_bytes = copy_user_bytes(
+                        token,
+                        msghdr.msg_control as *const u8,
+                        msghdr.msg_controllen,
+                    )?;
+                    parse_raw_ipv6_send_meta(control_bytes.as_slice())?
+                };
+                with_raw_ipv6_socket(fd, |raw| raw.send_user_buffer_to(&ubuf, &dst, &meta))?
+            }
+            SocketBackendKind::NetlinkRoute => {
                 if msghdr.msg_controllen != 0 {
                     return Err(ERRNO::EOPNOTSUPP);
                 }
                 with_netlink_route_socket(fd, |netlink| netlink.send_user_buffer(&ubuf))?
             }
-            SocketKind::Udp | SocketKind::Tcp | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::AlgSocket => return Err(ERRNO::EOPNOTSUPP),
+            SocketBackendKind::Udp | SocketBackendKind::Tcp | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::AlgSocket => return Err(ERRNO::EOPNOTSUPP),
         };
         Ok(n as isize)
     })
@@ -1811,23 +2107,29 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         let ubuf = iovecs_to_user_buffer(token, &iovecs, PageFaultAccess::Write)?;
 
         let fd = fd as usize;
-        let kind = socket_kind(fd)?;
-        let (n, ancillary) = match kind {
-            SocketKind::Unix => with_unix_socket(fd, |unix| {
+        let backend = socket_backend(fd)?;
+        let (n, ancillary, raw_control): (usize, UnixSocketAncillaryData, Vec<RawIpv6ControlMessage>) = match backend {
+            SocketBackendKind::UnixStream => with_unix_socket(fd, |unix| {
                 let (n, mut ancillary) = unix.recvmsg(ubuf)?;
                 if !unix.passcred_enabled() {
                     ancillary.credentials = None;
                 }
-                Ok((n, ancillary))
+                Ok((n, ancillary, Vec::new()))
             })?,
-            SocketKind::NetlinkRoute => (
+            SocketBackendKind::NetlinkRoute => (
                 with_netlink_route_socket(fd, |netlink| {
                     let mut ubuf = ubuf;
                     netlink.recv_into_user_buffer(&mut ubuf, false)
                 })?,
                 UnixSocketAncillaryData::default(),
+                Vec::new(),
             ),
-            SocketKind::Udp | SocketKind::Tcp | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::AlgSocket | SocketKind::AlgRequest => {
+            SocketBackendKind::RawIpv6 => {
+                let mut ubuf = ubuf;
+                let packet = with_raw_ipv6_socket(fd, |raw| raw.recv_into_user_buffer(&mut ubuf))?;
+                (packet.data.len(), UnixSocketAncillaryData::default(), packet.control)
+            }
+            SocketBackendKind::Udp | SocketBackendKind::Tcp | SocketBackendKind::CompatIfreq | SocketBackendKind::Packet | SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => {
                 return Err(ERRNO::EOPNOTSUPP)
             }
         };
@@ -1869,12 +2171,22 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
             }
         }
 
+        for cmsg in raw_control {
+            let need = cmsg_align(size_of::<CmsgHdr>() + cmsg.data.len());
+            if used + need <= control_cap {
+                append_cmsg(&mut control_out, cmsg.level, cmsg.cmsg_type, cmsg.data.as_slice());
+                used += need;
+            } else {
+                msghdr.msg_flags |= MSG_CTRUNC;
+            }
+        }
+
         if !control_out.is_empty() {
             write_bytes_to_user(msghdr.msg_control as *mut u8, control_out.as_slice())?;
         }
 
         msghdr.msg_controllen = control_out.len();
-        if kind == SocketKind::NetlinkRoute && msghdr.msg_name != 0 {
+        if backend == SocketBackendKind::NetlinkRoute && msghdr.msg_name != 0 {
             let sockaddr = SockAddrNl {
                 nl_family: AF_NETLINK as u16,
                 nl_pad: 0,

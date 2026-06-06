@@ -151,6 +151,17 @@ struct FileDescriptionInner {
     dirent_snapshot: Option<Vec<(String, VfsFileType)>>,
 }
 
+/// 套接字的不可变元信息。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketSpec {
+    /// `socket(2)` 的 `domain` 参数，也就是协议族/地址族。
+    pub family: i32,
+    /// `socket(2)` 的基础 `type`，不包含 `SOCK_CLOEXEC`/`SOCK_NONBLOCK` 标志。
+    pub socket_type: i32,
+    /// `socket(2)` 的 `protocol` 参数。
+    pub protocol: i32,
+}
+
 /// 打开文件描述，对应 Linux 的 open file description。
 pub struct FileDescription {
     /// 底层具体文件对象。
@@ -159,6 +170,8 @@ pub struct FileDescription {
     access_mode: AccessMode,
     /// `F_GETFL` 需要保留返回、但 `F_SETFL` 不可修改的状态位。
     status_fixed_bits: i32,
+    /// 套接字 fd 的固定元信息；非套接字为 `None`。
+    socket_spec: Option<SocketSpec>,
     /// 共享的偏移与状态位。
     inner: SpinNoIrqLock<FileDescriptionInner>,
 }
@@ -175,11 +188,34 @@ impl FileDescription {
             file,
             access_mode,
             status_fixed_bits,
+            socket_spec: None,
             inner: SpinNoIrqLock::new(FileDescriptionInner {
                     offset: 0,
                     status_flags,
                     dirent_snapshot: None,
                 }),
+        }
+    }
+
+    /// 基于底层套接字对象创建一个打开文件描述，并附带固定的
+    /// `family/type/protocol` 元信息。
+    pub fn new_socket(
+        file: Arc<dyn File + Send + Sync>,
+        access_mode: AccessMode,
+        status_flags: FileStatusFlags,
+        status_fixed_bits: i32,
+        socket_spec: SocketSpec,
+    ) -> Self {
+        Self {
+            file,
+            access_mode,
+            status_fixed_bits,
+            socket_spec: Some(socket_spec),
+            inner: SpinNoIrqLock::new(FileDescriptionInner {
+                offset: 0,
+                status_flags,
+                dirent_snapshot: None,
+            }),
         }
     }
 
@@ -300,6 +336,11 @@ impl FileDescription {
     pub fn is_path(&self) -> bool {
         const O_PATH: i32 = 0x200000;
         self.status_fixed_bits & O_PATH != 0
+    }
+
+    /// 返回套接字的固定元信息；非套接字描述符返回 `None`。
+    pub fn socket_spec(&self) -> Option<SocketSpec> {
+        self.socket_spec
     }
 
     /// 覆盖当前可变文件状态位。
