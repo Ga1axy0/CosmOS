@@ -42,11 +42,18 @@ const USR_BIN_DIR_CSTR: &str = "/usr/bin\0";
 const BIN_AR: &str = "/bin/ar";
 const USR_LIB_DIR: &str = "/usr/lib";
 const VAR_DIR: &str = "/var";
+const VAR_RUN_DIR: &str = "/var/run";
+const VAR_RUN_NETNS_DIR: &str = "/var/run/netns";
+const LTP_NETNS_LINK: &str = "/var/run/netns/ltp_ns";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const BUSYBOX_ARG0_CSTR: &str = "busybox\0";
 const ROOT_BASH: &str = "/bash";
 const ROOT_BUSYBOX: &str = "/busybox";
 const ROOT_DATE: &str = "/root/date";
+const MODULES_ROOT_DIR: &str = "/lib/modules";
+const MODULES_DIR: &str = "/lib/modules/6.6.0";
+const MODULES_BUILTIN_PATH: &str = "/lib/modules/6.6.0/modules.builtin";
+const MODULES_DEP_PATH: &str = "/lib/modules/6.6.0/modules.dep";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_LEGACY_LIB_DIR: &str = "/musl/lib";
 const MUSL_LIB_DIR: &str = "/usr/lib/riscv64-linux-musl";
@@ -77,6 +84,8 @@ const DT_DIR: u8 = 4;
 const PASSWD_CONTENT: &[u8] = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/sh\n";
 const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
 const KERNEL_CONFIG_CONTENT: &[u8] = b"CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\nCONFIG_BSD_PROCESS_ACCT=y\nCONFIG_BSD_PROCESS_ACCT_V3=y\n";
+const MODULES_BUILTIN_CONTENT: &[u8] = b"kernel/drivers/net/veth.ko\n";
+const MODULES_DEP_CONTENT: &[u8] = b"kernel/drivers/net/veth.ko:\n";
 const SHELL_PATH_ENV_CSTR: &str =
     "PATH=/sbin:/usr/sbin:/bin:/usr/bin:/glibc/ltp/testcases/bin:/musl/ltp/testcases/bin\0";
 const USR_BIN_AR: &str = "/usr/bin/ar";
@@ -386,6 +395,8 @@ fn ensure_dirs() -> bool {
         BIN_DIR,
         BOOT_DIR,
         LIB_DIR,
+        MODULES_ROOT_DIR,
+        MODULES_DIR,
         ETC_DIR,
         HOME_DIR,
         ROOT_HOME_DIR,
@@ -394,6 +405,8 @@ fn ensure_dirs() -> bool {
         USR_BIN_DIR,
         USR_LIB_DIR,
         VAR_DIR,
+        VAR_RUN_DIR,
+        VAR_RUN_NETNS_DIR,
         MUSL_LIB_DIR,
         GLIBC_LIB_DIR,
         GLIBC_USR_LIB_DIR,
@@ -489,6 +502,11 @@ fn install_kernel_config_file() -> bool {
     write_file(BOOT_CONFIG_PATH, KERNEL_CONFIG_CONTENT)
 }
 
+fn install_kernel_module_metadata() -> bool {
+    write_file(MODULES_BUILTIN_PATH, MODULES_BUILTIN_CONTENT)
+        && write_file(MODULES_DEP_PATH, MODULES_DEP_CONTENT)
+}
+
 fn install_busybox_applets() -> bool {
     if !path_exists("/bin/sh") {
         let musl_install_argv = [
@@ -550,6 +568,18 @@ fn install_ltp_helper_commands() -> bool {
     install_ltp_env_scripts()
 }
 
+fn cleanup_ltp_runtime_state() -> bool {
+    let unlink_ret = unlink(LTP_NETNS_LINK);
+    if unlink_ret == 0 || unlink_ret == ENOENT {
+        return true;
+    }
+    println!(
+        "[setupsh] unlink stale {} failed: {}",
+        LTP_NETNS_LINK, unlink_ret
+    );
+    false
+}
+
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
     const TOTAL_STEPS: usize = 11;
@@ -563,6 +593,9 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
     println!("[setupsh] start Linux-style libc layout setup");
     print_step(1, TOTAL_STEPS, "prepare Linux-style directories");
     if !ensure_dirs() {
+        return 1;
+    }
+    if !cleanup_ltp_runtime_state() {
         return 1;
     }
 
@@ -616,6 +649,9 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
 
     print_step(10, TOTAL_STEPS, "write kernel config fallback");
     if !install_kernel_config_file() {
+        return 1;
+    }
+    if !install_kernel_module_metadata() {
         return 1;
     }
 

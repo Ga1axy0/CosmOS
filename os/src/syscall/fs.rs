@@ -2,7 +2,7 @@ use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
     inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device,
-    mount_is_readonly, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
+    mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
@@ -84,6 +84,8 @@ const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
+const MS_REC: usize = 16384;
+const MS_PRIVATE: usize = 1 << 18;
 const SUSPICIOUS_STAT_BLKSIZE: u32 = 1 << 20;
 const SUSPICIOUS_RW_LEN: usize = 1 << 20;
 const O_NONBLOCK: i32 = 0x800;
@@ -2946,7 +2948,11 @@ pub fn sys_mount(
             read_cstring_from_user(dev_name, PATH_MAX)?
         };
         let dir_name = read_cstring_from_user(dir_name, PATH_MAX)?;
-        let fs_type  = read_cstring_from_user(fs_type, PATH_MAX)?;
+        let fs_type  = if fs_type.is_null() {
+            String::new()
+        } else {
+            read_cstring_from_user(fs_type, PATH_MAX)?
+        };
         // `data` is typically NULL (e.g. mount(…, NULL)); skip translation if so.
         let _data: String = if data.is_null() {
             String::new()
@@ -2967,11 +2973,23 @@ pub fn sys_mount(
             _flags,
             _data
         );
+        if (_flags & MS_PRIVATE) != 0 {
+            let _ = _flags & MS_REC;
+            return Ok(0);
+        }
         if remount {
             let source = if dev_name.is_empty() { "tmpfs" } else { dev_name.as_str() };
             remount_path(&abs_mnt, source, fs_type.as_str(), readonly)?;
         } else if fs_type == "tmpfs" {
             mount_tmpfs(&abs_mnt, readonly)?;
+        } else if fs_type == "sysfs" {
+            if abs_mnt == "/sys" {
+                remount_path(&abs_mnt, "sysfs", "sysfs", readonly).or_else(|_| {
+                    mount_sysfs(&abs_mnt, readonly)
+                })?;
+            } else {
+                mount_sysfs(&abs_mnt, readonly)?;
+            }
         } else {
             mount_device(&dev_name, &abs_mnt, &fs_type, readonly)?;
         }

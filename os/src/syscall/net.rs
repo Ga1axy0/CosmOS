@@ -8,8 +8,12 @@ use crate::fs::{
 };
 use crate::mm::{translated_ref, PageFaultAccess, UserBuffer};
 use crate::net::{
-    create_alg_socket_file, create_tcp_socket_file, create_udp_socket_file, create_unix_stream_socket_file,
-    AlgRequestFile, AlgSendMsgParams, AlgSocketFile, SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn,
+    create_alg_socket_file, create_compat_ifreq_socket_file, create_netlink_route_socket_file,
+    create_packet_socket_file,
+    create_tcp_socket_file, create_udp_socket_file, create_unix_stream_socket_file,
+    AlgRequestFile, AlgSendMsgParams, AlgSocketFile, CompatIfreqSocketFile,
+    NetlinkRouteSocketFile, PacketSocketFile, SCM_CREDENTIALS, SCM_RIGHTS, SockAddrIn,
+    SockAddrLl,
     SocketLevel, TcpSocketFile, UdpSocketFile, UnixSocketAncillaryData, UnixSocketPairEnd,
     UnixUcred, AF_ALG, ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV,
     ALG_SET_OP, SOCK_SEQPACKET, SOL_ALG,
@@ -21,14 +25,20 @@ use crate::task::{current_process, current_user_token, FdEntry, FdFlags};
 
 const AF_UNIX: i32 = 1;
 const AF_INET: u16 = 2;
+const AF_NETLINK: i32 = 16;
+const AF_PACKET: i32 = 17;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const SOCK_RAW: i32 = 3;
 const SOCK_TYPE_MASK: i32 = 0x0f;
 const SOCK_NONBLOCK: i32 = 0x800;
 const SOCK_CLOEXEC: i32 = 0x80000;
 const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
+const NETLINK_ROUTE: i32 = 0;
+const MSG_PEEK: u32 = 0x0002;
+const MSG_DONTWAIT: u32 = 0x0040;
 
 // IP-level (SOL_IP) multicast group membership options. These use a
 // `struct group_req { __u32 gr_interface; struct sockaddr_storage gr_group; }`
@@ -151,6 +161,15 @@ struct SockAddrAlg {
     salg_feat: u32,
     salg_mask: u32,
     salg_name: [u8; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SockAddrNl {
+    nl_family: u16,
+    nl_pad: u16,
+    nl_pid: u32,
+    nl_groups: u32,
 }
 
 fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
@@ -456,6 +475,30 @@ fn with_tcp_socket<R>(fd: usize, f: impl FnOnce(&TcpSocketFile) -> Result<R, ERR
     f(tcp)
 }
 
+fn with_netlink_route_socket<R>(
+    fd: usize,
+    f: impl FnOnce(&NetlinkRouteSocketFile) -> Result<R, ERRNO>,
+) -> Result<R, ERRNO> {
+    let desc = get_file_description(fd)?;
+    let netlink = desc
+        .as_any()
+        .downcast_ref::<NetlinkRouteSocketFile>()
+        .ok_or(ERRNO::ENOTSOCK)?;
+    f(netlink)
+}
+
+fn with_packet_socket<R>(
+    fd: usize,
+    f: impl FnOnce(&PacketSocketFile) -> Result<R, ERRNO>,
+) -> Result<R, ERRNO> {
+    let desc = get_file_description(fd)?;
+    let packet = desc
+        .as_any()
+        .downcast_ref::<PacketSocketFile>()
+        .ok_or(ERRNO::ENOTSOCK)?;
+    f(packet)
+}
+
 fn sockaddr_to_endpoint(addr: &SockAddrIn) -> Result<IpEndpoint, ERRNO> {
     if addr.sin_family != AF_INET {
         return Err(ERRNO::EAFNOSUPPORT);
@@ -493,6 +536,9 @@ enum SocketKind {
     Udp,
     Tcp,
     Unix,
+    CompatIfreq,
+    Packet,
+    NetlinkRoute,
     AlgSocket,
     AlgRequest,
 }
@@ -507,6 +553,15 @@ fn socket_kind(fd: usize) -> Result<SocketKind, ERRNO> {
     }
     if desc.as_any().downcast_ref::<UnixSocketPairEnd>().is_some() {
         return Ok(SocketKind::Unix);
+    }
+    if desc.as_any().downcast_ref::<CompatIfreqSocketFile>().is_some() {
+        return Ok(SocketKind::CompatIfreq);
+    }
+    if desc.as_any().downcast_ref::<PacketSocketFile>().is_some() {
+        return Ok(SocketKind::Packet);
+    }
+    if desc.as_any().downcast_ref::<NetlinkRouteSocketFile>().is_some() {
+        return Ok(SocketKind::NetlinkRoute);
     }
     if desc.as_any().downcast_ref::<AlgSocketFile>().is_some() {
         return Ok(SocketKind::AlgSocket);
@@ -729,6 +784,23 @@ fn copy_sockaddr_to_user(addr: *mut SockAddrIn, addrlen: *mut i32, sockaddr: &So
     Ok(())
 }
 
+fn copy_raw_sockaddr_to_user(addr: *mut u8, addrlen: *mut i32, sockaddr: &[u8]) -> Result<(), ERRNO> {
+    if addr.is_null() || addrlen.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let cap = read_pod_from_user(addrlen as *const i32)?;
+    if cap < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let copy_len = (cap as usize).min(sockaddr.len());
+    if copy_len > 0 {
+        write_bytes_to_user(addr, &sockaddr[..copy_len])?;
+    }
+    write_pod_to_user(addrlen, &(sockaddr.len() as i32))?;
+    Ok(())
+}
+
 fn accept_common(
     fd: i32,
     addr: *mut SockAddrIn,
@@ -755,7 +827,7 @@ fn accept_common(
             with_alg_socket(fd, |alg| Ok(alg.accept()? as Arc<dyn File + Send + Sync>))?,
             None,
         ),
-        SocketKind::Udp | SocketKind::Unix | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+        SocketKind::Udp | SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
     };
 
     let status_flags = if (flags & SOCK_NONBLOCK) != 0 {
@@ -814,6 +886,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                 }
                 match base_type {
                     SOCK_STREAM => create_unix_stream_socket_file() as Arc<dyn File + Send + Sync>,
+                    SOCK_DGRAM => create_compat_ifreq_socket_file() as Arc<dyn File + Send + Sync>,
                     _ => return Err(ERRNO::ESOCKTNOSUPPORT),
                 }
             }
@@ -825,6 +898,21 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                     return Err(ERRNO::ESOCKTNOSUPPORT);
                 }
                 create_alg_socket_file() as Arc<dyn File + Send + Sync>
+            }
+            AF_PACKET => {
+                if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
+                    return Err(ERRNO::ESOCKTNOSUPPORT);
+                }
+                create_packet_socket_file(base_type) as Arc<dyn File + Send + Sync>
+            }
+            AF_NETLINK => {
+                if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
+                    return Err(ERRNO::ESOCKTNOSUPPORT);
+                }
+                if protocol != NETLINK_ROUTE {
+                    return Err(ERRNO::EPROTONOSUPPORT);
+                }
+                create_netlink_route_socket_file() as Arc<dyn File + Send + Sync>
             }
             _ => return Err(ERRNO::EAFNOSUPPORT),
         };
@@ -935,7 +1023,17 @@ pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
                 let algname = parse_sockaddr_alg_field(raw.salg_name.as_slice())?;
                 with_alg_socket(fd, |alg| alg.bind(algtype, algname))?;
             }
-            SocketKind::Unix | SocketKind::AlgRequest => return Err(ERRNO::ENOTSOCK),
+            SocketKind::NetlinkRoute | SocketKind::Packet => {
+                if addr.is_null() || addrlen < 0 {
+                    return Err(ERRNO::EINVAL);
+                }
+                if matches!(socket_kind(fd)?, SocketKind::Packet) {
+                    let token = current_user_token();
+                    let raw = copy_user_bytes(token, addr as *const u8, addrlen as usize)?;
+                    with_packet_socket(fd, |packet| packet.bind_raw(raw.as_slice()))?;
+                }
+            }
+            SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::AlgRequest => return Err(ERRNO::ENOTSOCK),
         }
         Ok(0)
     })
@@ -960,7 +1058,7 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
                 match socket_kind(fd)? {
                     SocketKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
                     SocketKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
-                    SocketKind::Unix | SocketKind::AlgSocket | SocketKind::AlgRequest => unreachable!(),
+                    SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => unreachable!(),
                 }
             }
             SocketKind::Unix => {
@@ -970,7 +1068,7 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
                 }
                 return Err(ERRNO::ENOENT);
             }
-            SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+            SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         }
         Ok(0)
     })
@@ -984,7 +1082,7 @@ pub fn sys_listen(fd: i32, backlog: i32) -> isize {
                 with_tcp_socket(fd, |tcp| tcp.listen(backlog as usize))?;
                 Ok(0)
             }
-            SocketKind::Udp | SocketKind::Unix => Err(ERRNO::ENOTSOCK),
+            SocketKind::Udp | SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute => Err(ERRNO::ENOTSOCK),
             SocketKind::AlgSocket | SocketKind::AlgRequest => Err(ERRNO::EOPNOTSUPP),
         }
     })
@@ -1025,7 +1123,32 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                     Ok(())
                 })?;
             }
-            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+            SocketKind::Packet => {
+                let sockaddr = with_packet_socket(fd, |packet| packet.getsockname_raw())?;
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&sockaddr as *const SockAddrLl) as *const u8,
+                        size_of::<SockAddrLl>(),
+                    )
+                };
+                copy_raw_sockaddr_to_user(addr as *mut u8, addrlen, bytes)?;
+            }
+            SocketKind::NetlinkRoute => {
+                let sockaddr = SockAddrNl {
+                    nl_family: AF_NETLINK as u16,
+                    nl_pad: 0,
+                    nl_pid: 0,
+                    nl_groups: 0,
+                };
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&sockaddr as *const SockAddrNl) as *const u8,
+                        size_of::<SockAddrNl>(),
+                    )
+                };
+                copy_raw_sockaddr_to_user(addr as *mut u8, addrlen, bytes)?;
+            }
+            SocketKind::Unix | SocketKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
             SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         }
 
@@ -1055,7 +1178,7 @@ pub fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                     }
                 })?;
             }
-            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+            SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute => return Err(ERRNO::ENOTSOCK),
             SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         }
 
@@ -1108,7 +1231,26 @@ pub fn sys_sendto(
                     return Err(ERRNO::ENOTSOCK);
                 }
             }
-            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+            SocketKind::NetlinkRoute => {
+                if !addr.is_null() {
+                    return Err(ERRNO::EOPNOTSUPP);
+                }
+                with_netlink_route_socket(fd, |netlink| netlink.send_user_buffer(&ubuf))?
+            }
+            SocketKind::Packet => {
+                if addrlen < 0 {
+                    return Err(ERRNO::EINVAL);
+                }
+                let raw_addr = if addr.is_null() {
+                    None
+                } else {
+                    Some(copy_user_bytes(token, addr as *const u8, addrlen as usize)?)
+                };
+                with_packet_socket(fd, |packet| {
+                    packet.send_user_buffer_to(&ubuf, raw_addr.as_deref())
+                })?
+            }
+            SocketKind::Unix | SocketKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
             SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         };
 
@@ -1125,9 +1267,6 @@ pub fn sys_recvfrom(
     addrlen: *mut i32,
 ) -> isize {
     syscall_body!({
-        if flags != 0 {
-            return Err(ERRNO::EOPNOTSUPP);
-        }
         if len == 0 {
             return Ok(0);
         }
@@ -1143,7 +1282,16 @@ pub fn sys_recvfrom(
         );
 
         let fd = fd as usize;
-        let (n, ep) = match socket_kind(fd)? {
+        let kind = socket_kind(fd)?;
+        let allowed_flags = match kind {
+            SocketKind::NetlinkRoute => MSG_PEEK | MSG_DONTWAIT,
+            _ => 0,
+        };
+        if flags & !allowed_flags != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+
+        let (n, ep) = match kind {
             SocketKind::Udp => with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?,
             SocketKind::Tcp => {
                 let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
@@ -1155,7 +1303,27 @@ pub fn sys_recvfrom(
                 };
                 (n, ep)
             }
-            SocketKind::Unix => return Err(ERRNO::ENOTSOCK),
+            SocketKind::NetlinkRoute => (
+                with_netlink_route_socket(fd, |netlink| {
+                    netlink.recv_into_user_buffer(&mut ubuf, (flags & MSG_PEEK) != 0)
+                })?,
+                IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0),
+            ),
+            SocketKind::Packet => {
+                let (n, sockaddr) =
+                    with_packet_socket(fd, |packet| packet.recv_into_user_buffer(&mut ubuf))?;
+                if !addr.is_null() {
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            (&sockaddr as *const SockAddrLl) as *const u8,
+                            size_of::<SockAddrLl>(),
+                        )
+                    };
+                    copy_raw_sockaddr_to_user(addr as *mut u8, addrlen, bytes)?;
+                }
+                return Ok(n as isize);
+            }
+            SocketKind::Unix | SocketKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
             SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
         };
 
@@ -1185,7 +1353,7 @@ pub fn sys_shutdown(fd: i32, how: i32) -> isize {
                 with_tcp_socket(fd, |tcp| tcp.shutdown(how))?;
                 Ok(0)
             }
-            SocketKind::Udp => Err(ERRNO::ENOTSOCK),
+            SocketKind::Udp | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute => Err(ERRNO::ENOTSOCK),
             SocketKind::AlgSocket | SocketKind::AlgRequest => Err(ERRNO::EOPNOTSUPP),
         }
     })
@@ -1251,7 +1419,7 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                                 optname
                             );
                         }
-                        SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+                        SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
                     }
                     Ok(0)
                 }
@@ -1275,7 +1443,7 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                                 optname
                             );
                         }
-                        SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
+                        SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => return Err(ERRNO::EOPNOTSUPP),
                     }
                     Ok(0)
                 }
@@ -1338,7 +1506,9 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     let socket_type = match kind {
                         SocketKind::Udp => SOCK_DGRAM,
                         SocketKind::Tcp | SocketKind::Unix => SOCK_STREAM,
-                        SocketKind::AlgSocket | SocketKind::AlgRequest => SOCK_SEQPACKET,
+                        SocketKind::CompatIfreq => SOCK_DGRAM,
+                        SocketKind::Packet => with_packet_socket(fd, |packet| Ok(packet.socket_type()))?,
+                        SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => SOCK_SEQPACKET,
                     };
                     write_getsockopt_i32(token, optval, optlen, socket_type)?;
                     Ok(0)
@@ -1419,7 +1589,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                             with_tcp_socket(fd, |tcp| { ns = tcp.recv_timeout_ns(); Ok(()) })?;
                             ns
                         }
-                        SocketKind::Unix | SocketKind::AlgSocket | SocketKind::AlgRequest => 0,
+                        SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => 0,
                     };
                     let timeval = timeval_from_ns(timeout_ns);
                     let bytes = unsafe {
@@ -1443,7 +1613,7 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                             with_tcp_socket(fd, |tcp| { ns = tcp.send_timeout_ns(); Ok(())})?;
                             ns
                         }
-                        SocketKind::Unix | SocketKind::AlgSocket | SocketKind::AlgRequest => 0,
+                        SocketKind::Unix | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::NetlinkRoute | SocketKind::AlgSocket | SocketKind::AlgRequest => 0,
                     };
                     let timeval = timeval_from_ns(timeout_ns);
                     let bytes = unsafe {
@@ -1553,9 +1723,6 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
 
         let token = current_user_token();
         let msghdr = *translated_ref(token, msg).or_errno(ERRNO::EFAULT)?;
-        if msghdr.msg_name != 0 || msghdr.msg_namelen != 0 {
-            return Err(ERRNO::EOPNOTSUPP);
-        }
         if msghdr.msg_iovlen > MAX_MSG_IOV {
             return Err(ERRNO::EINVAL);
         }
@@ -1606,7 +1773,13 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
                 };
                 with_alg_request(fd, |alg| alg.sendmsg(total_len, params))?
             }
-            SocketKind::Udp | SocketKind::Tcp | SocketKind::AlgSocket => return Err(ERRNO::EOPNOTSUPP),
+            SocketKind::NetlinkRoute => {
+                if msghdr.msg_controllen != 0 {
+                    return Err(ERRNO::EOPNOTSUPP);
+                }
+                with_netlink_route_socket(fd, |netlink| netlink.send_user_buffer(&ubuf))?
+            }
+            SocketKind::Udp | SocketKind::Tcp | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::AlgSocket => return Err(ERRNO::EOPNOTSUPP),
         };
         Ok(n as isize)
     })
@@ -1623,9 +1796,6 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
 
         let token = current_user_token();
         let mut msghdr = *translated_ref(token, msg as *const MsgHdr).or_errno(ERRNO::EFAULT)?;
-        if msghdr.msg_name != 0 || msghdr.msg_namelen != 0 {
-            return Err(ERRNO::EOPNOTSUPP);
-        }
         if msghdr.msg_iovlen > MAX_MSG_IOV {
             return Err(ERRNO::EINVAL);
         }
@@ -1641,7 +1811,8 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         let ubuf = iovecs_to_user_buffer(token, &iovecs, PageFaultAccess::Write)?;
 
         let fd = fd as usize;
-        let (n, ancillary) = match socket_kind(fd)? {
+        let kind = socket_kind(fd)?;
+        let (n, ancillary) = match kind {
             SocketKind::Unix => with_unix_socket(fd, |unix| {
                 let (n, mut ancillary) = unix.recvmsg(ubuf)?;
                 if !unix.passcred_enabled() {
@@ -1649,7 +1820,14 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
                 }
                 Ok((n, ancillary))
             })?,
-            SocketKind::Udp | SocketKind::Tcp | SocketKind::AlgSocket | SocketKind::AlgRequest => {
+            SocketKind::NetlinkRoute => (
+                with_netlink_route_socket(fd, |netlink| {
+                    let mut ubuf = ubuf;
+                    netlink.recv_into_user_buffer(&mut ubuf, false)
+                })?,
+                UnixSocketAncillaryData::default(),
+            ),
+            SocketKind::Udp | SocketKind::Tcp | SocketKind::CompatIfreq | SocketKind::Packet | SocketKind::AlgSocket | SocketKind::AlgRequest => {
                 return Err(ERRNO::EOPNOTSUPP)
             }
         };
@@ -1696,7 +1874,27 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         }
 
         msghdr.msg_controllen = control_out.len();
-        msghdr.msg_namelen = 0;
+        if kind == SocketKind::NetlinkRoute && msghdr.msg_name != 0 {
+            let sockaddr = SockAddrNl {
+                nl_family: AF_NETLINK as u16,
+                nl_pad: 0,
+                nl_pid: 0,
+                nl_groups: 0,
+            };
+            let name_len = core::mem::size_of::<SockAddrNl>().min(msghdr.msg_namelen);
+            write_bytes_to_user(
+                msghdr.msg_name as *mut u8,
+                &unsafe {
+                    core::slice::from_raw_parts(
+                        (&sockaddr as *const SockAddrNl) as *const u8,
+                        name_len,
+                    )
+                },
+            )?;
+            msghdr.msg_namelen = core::mem::size_of::<SockAddrNl>();
+        } else {
+            msghdr.msg_namelen = 0;
+        }
         write_pod_to_user(msg, &msghdr)?;
 
         Ok(n as isize)

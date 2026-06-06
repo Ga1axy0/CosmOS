@@ -230,6 +230,8 @@ pub const SYSCALL_SHMAT: usize = 196;
 pub const SYSCALL_SHMDT: usize = 197;
 /// socket syscall
 pub const SYSCALL_SOCKET: usize = 198;
+/// setns syscall
+pub const SYSCALL_SETNS: usize = 268;
 /// socketpair syscall
 pub const SYSCALL_SOCKETPAIR: usize = 199;
 /// bind syscall
@@ -752,6 +754,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_SETNS => sys_setns(args[0] as i32, args[1] as i32),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
             args[1] as *const usize,

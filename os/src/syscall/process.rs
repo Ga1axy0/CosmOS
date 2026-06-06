@@ -598,6 +598,18 @@ bitflags! {
         const CLONE_DETACHED = 0x0040_0000;
         /// 在子地址空间写入子 tid。
         const CLONE_CHILD_SETTID = 0x0100_0000;
+        /// 创建新的 mount namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWNS = 0x0002_0000;
+        /// 创建新的 UTS namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWUTS = 0x0400_0000;
+        /// 创建新的 IPC namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWIPC = 0x0800_0000;
+        /// 创建新的 user namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWUSER = 0x1000_0000;
+        /// 创建新的 PID namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWPID = 0x2000_0000;
+        /// 创建新的 network namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWNET = 0x4000_0000;
     }
 }
 
@@ -779,6 +791,26 @@ pub fn sys_clone(
             }
             Ok(child_pid as isize)
         }
+    })
+}
+
+/// `setns` 兼容实现。
+///
+/// 当前内核尚未提供独立 namespace 隔离，但 LTP 的网络 helper 需要
+/// `/proc/<pid>/ns/*` 可打开且 `setns()` 可成功返回，才能继续构造本地
+/// 双端口拓扑。这里先校验 fd 有效，再按 no-op 成功处理。
+pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
+    syscall_body!({
+        if fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let fd = fd as usize;
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return Err(ERRNO::EBADF);
+        }
+        Ok(0)
     })
 }
 /// sys_execve

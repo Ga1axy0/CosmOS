@@ -8,6 +8,7 @@ mod tty;
 pub mod rootfs;
 pub mod devfs;
 pub mod procfs;
+pub mod sysfs;
 /// In-memory tmpfs backend that can be mounted into the virtual namespace.
 pub mod tmpfs;
 
@@ -653,9 +654,9 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
+    canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, init_sysfs, inode_stat, linkat,
     linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at,
-    mkdir_at_with_inode, mount_device, mount_is_readonly, mount_tmpfs, open_file, open_file_at,
+    mkdir_at_with_inode, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
     open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,
@@ -668,5 +669,6 @@ pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyFile, WinSize, 
 pub fn init() {
     init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
     init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+    init_sysfs();  // Initialize sysfs for /sys/class/net entries.
     init_procfs();  // Initialize procfs for /proc entries.
 }
