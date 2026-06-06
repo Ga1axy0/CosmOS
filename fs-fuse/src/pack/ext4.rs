@@ -11,6 +11,12 @@ const LINUX_DIRS: &[&str] = &[
     "/bin", "/etc", "/home", "/root", "/tmp", "/usr", "/usr/bin", "/usr/lib", "/var",
 ];
 
+const RUNTIME_DIRS: &[&str] = &["/musl", "/musl/lib", "/glibc", "/glibc/lib"];
+const LTP_DATA_DIRS: &[&str] = &[
+    "/musl/ltp/testcases/bin/datafiles",
+    "/glibc/ltp/testcases/bin/datafiles",
+];
+
 const ROOT_SEED_APPS: &[&str] = &["initproc", "setupsh", "sh", "bash", "busybox"];
 
 fn run_checked(cmd: &mut Command, what: &str) -> io::Result<()> {
@@ -86,6 +92,61 @@ fn image_target_path(app: &AppFile) -> String {
     }
 }
 
+fn repo_root_from_source(src_path: &Path) -> io::Result<PathBuf> {
+    let src_path = fs::canonicalize(src_path)?;
+    src_path
+        .ancestors()
+        .nth(4)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other(format!("cannot infer repo root from {}", src_path.display())))
+}
+
+fn extra_runtime_files(src_path: &Path) -> io::Result<Vec<(PathBuf, &'static str)>> {
+    let repo_root = repo_root_from_source(src_path)?;
+    let candidates = [
+        (repo_root.join("lib/musl/ar"), "/musl/lib/ar"),
+        (repo_root.join("lib/glibc/ar"), "/glibc/lib/ar"),
+    ];
+
+    Ok(candidates
+        .iter()
+        .cloned()
+        .filter(|(host_path, _)| host_path.is_file())
+        .collect())
+}
+
+fn extra_ltp_datafiles(src_path: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+    let repo_root = repo_root_from_source(src_path)?;
+    let host_dir = repo_root
+        .parent()
+        .ok_or_else(|| io::Error::other(format!("cannot infer sibling test suite from {}", repo_root.display())))?
+        .join("testsuits-for-oskernel/ltp-full-20240524/testcases/commands/ar/datafiles");
+
+    if !host_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(host_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".in") {
+            continue;
+        }
+        files.push((path.clone(), format!("/musl/ltp/testcases/data/ar01/{name}")));
+        files.push((path.clone(), format!("/glibc/ltp/testcases/data/ar01/{name}")));
+        files.push((path.clone(), format!("/musl/ltp/testcases/bin/datafiles/{name}")));
+        files.push((path.clone(), format!("/glibc/ltp/testcases/bin/datafiles/{name}")));
+    }
+    Ok(files)
+}
+
 /// Pack files into a raw ext4 image.
 ///
 /// This implementation uses host tools from e2fsprogs:
@@ -151,6 +212,12 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
     for dir in LINUX_DIRS {
         run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("mkdir {}", dir));
     }
+    for dir in RUNTIME_DIRS {
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("mkdir {}", dir));
+    }
+    for dir in LTP_DATA_DIRS {
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("mkdir {}", dir));
+    }
 
     for app in apps {
         let target_path = image_target_path(app);
@@ -161,6 +228,28 @@ pub fn pack(cfg: &PackConfig, apps: &[AppFile]) -> io::Result<()> {
             &debugfs,
             &cfg.img_path,
             format!("write {} {}", app.host_path.display(), target_path),
+            &format!("debugfs write {}", target_path),
+        )?;
+    }
+
+    for (host_path, target_path) in extra_runtime_files(&cfg.src_path)? {
+        println!("Adding runtime file: {} -> {}", host_path.display(), target_path);
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("rm {}", target_path));
+        run_debugfs_checked(
+            &debugfs,
+            &cfg.img_path,
+            format!("write {} {}", host_path.display(), target_path),
+            &format!("debugfs write {}", target_path),
+        )?;
+    }
+
+    for (host_path, target_path) in extra_ltp_datafiles(&cfg.src_path)? {
+        println!("Adding LTP datafile: {} -> {}", host_path.display(), target_path);
+        run_debugfs_ignore_error(&debugfs, &cfg.img_path, format!("rm {}", target_path));
+        run_debugfs_checked(
+            &debugfs,
+            &cfg.img_path,
+            format!("write {} {}", host_path.display(), target_path),
             &format!("debugfs write {}", target_path),
         )?;
     }

@@ -21,6 +21,7 @@ const BIN_DIR_CSTR: &str = "/bin\0";
 const BIN_BASH: &str = "/bin/bash";
 const BIN_BUSYBOX: &str = "/bin/busybox";
 const BIN_BUSYBOX_CSTR: &str = "/bin/busybox\0";
+const BIN_DATE: &str = "/bin/date";
 const BOOT_DIR: &str = "/boot";
 const BOOT_CONFIG_PATH: &str = "/boot/config-6.6.0";
 const LIB_DIR: &str = "/lib";
@@ -30,15 +31,22 @@ const ETC_GROUP_PATH: &str = "/etc/group";
 const HOME_DIR: &str = "/home";
 const ROOT_HOME_DIR: &str = "/root";
 const TMP_DIR: &str = "/tmp";
+const LIB_AR: &str = "/lib/ar";
+const MUSL_AR: &str = "/usr/lib/riscv64-linux-musl/ar";
+const GLIBC_AR: &str = "/lib/riscv64-linux-gnu/ar";
+const MUSL_LEGACY_AR: &str = "/musl/lib/ar";
+const GLIBC_LEGACY_AR: &str = "/glibc/lib/ar";
 const USR_DIR: &str = "/usr";
 const USR_BIN_DIR: &str = "/usr/bin";
 const USR_BIN_DIR_CSTR: &str = "/usr/bin\0";
+const BIN_AR: &str = "/bin/ar";
 const USR_LIB_DIR: &str = "/usr/lib";
 const VAR_DIR: &str = "/var";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const BUSYBOX_ARG0_CSTR: &str = "busybox\0";
 const ROOT_BASH: &str = "/bash";
 const ROOT_BUSYBOX: &str = "/busybox";
+const ROOT_DATE: &str = "/root/date";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_LEGACY_LIB_DIR: &str = "/musl/lib";
 const MUSL_LIB_DIR: &str = "/usr/lib/riscv64-linux-musl";
@@ -59,6 +67,10 @@ const GLIBC_LD_PATH: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
 const ROOT_GROUPDEL: &str = "/root/groupdel";
 const ROOT_USERADD: &str = "/root/useradd";
 const ROOT_USERDEL: &str = "/root/userdel";
+const MUSL_LTPROOT: &str = "/musl/ltp";
+const GLIBC_LTPROOT: &str = "/glibc/ltp";
+const MUSL_LTP_ENV_SH: &str = "/musl/ltp_env.sh";
+const GLIBC_LTP_ENV_SH: &str = "/glibc/ltp_env.sh";
 const INSTALL_ARG_CSTR: &str = "--install\0";
 const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
@@ -67,6 +79,8 @@ const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
 const KERNEL_CONFIG_CONTENT: &[u8] = b"CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\nCONFIG_BSD_PROCESS_ACCT=y\nCONFIG_BSD_PROCESS_ACCT_V3=y\n";
 const SHELL_PATH_ENV_CSTR: &str =
     "PATH=/sbin:/usr/sbin:/bin:/usr/bin:/glibc/ltp/testcases/bin:/musl/ltp/testcases/bin\0";
+const USR_BIN_AR: &str = "/usr/bin/ar";
+const USR_BIN_DATE: &str = "/usr/bin/date";
 const USR_BIN_GROUPDEL: &str = "/usr/bin/groupdel";
 const USR_BIN_USERADD: &str = "/usr/bin/useradd";
 const USR_BIN_USERDEL: &str = "/usr/bin/userdel";
@@ -191,6 +205,10 @@ fn remove_if_exists(path: &str) -> bool {
     true
 }
 
+fn first_existing_path<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|path| path_exists(path))
+}
+
 /// 拼接目录与文件名，返回完整路径。
 fn join_path(dir: &str, name: &str) -> String {
     let mut path = String::from(dir);
@@ -306,6 +324,7 @@ fn keep_top_level_lib_entry(name: &str, dtype: u8) -> bool {
     dtype == DT_DIR
         || name == "."
         || name == ".."
+        || name == "ar"
         || name == MUSL_LD_PATH.trim_start_matches('/')
         || name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
         || name == GLIBC_LD_PATH.trim_start_matches('/')
@@ -408,6 +427,31 @@ fn write_file(path: &str, content: &[u8]) -> bool {
     true
 }
 
+fn ltp_env_script(ltproot: &str) -> String {
+    let mut script = String::new();
+    script.push_str("#!/bin/sh\n\n");
+    script.push_str("export LTPROOT=\"");
+    script.push_str(ltproot);
+    script.push_str("\"\n");
+    script.push_str("export PATH=\"$LTPROOT/testcases/bin:$LTPROOT/bin:$PATH\"\n");
+    script
+}
+
+fn install_ltp_env_scripts() -> bool {
+    let scripts = [
+        (MUSL_LTP_ENV_SH, MUSL_LTPROOT),
+        (GLIBC_LTP_ENV_SH, GLIBC_LTPROOT),
+    ];
+
+    for (path, ltproot) in scripts {
+        let script = ltp_env_script(ltproot);
+        if !write_file(path, script.as_bytes()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn install_loader_links() -> bool {
     if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
         return false;
@@ -477,7 +521,20 @@ fn install_busybox_applets() -> bool {
 }
 
 fn install_ltp_helper_commands() -> bool {
+    let musl_ar = first_existing_path(&[LIB_AR, MUSL_AR, MUSL_LEGACY_AR]);
+    let glibc_ar = first_existing_path(&[LIB_AR, GLIBC_AR, GLIBC_LEGACY_AR]);
+
     for (src, dst) in [
+        (
+            musl_ar.unwrap_or(LIB_AR),
+            BIN_AR,
+        ),
+        (
+            glibc_ar.or(musl_ar).unwrap_or(LIB_AR),
+            USR_BIN_AR,
+        ),
+        (ROOT_DATE, BIN_DATE),
+        (ROOT_DATE, USR_BIN_DATE),
         (ROOT_USERADD, USR_BIN_USERADD),
         (ROOT_USERDEL, USR_BIN_USERDEL),
         (ROOT_GROUPDEL, USR_BIN_GROUPDEL),
@@ -490,7 +547,7 @@ fn install_ltp_helper_commands() -> bool {
             return false;
         }
     }
-    true
+    install_ltp_env_scripts()
 }
 
 #[no_mangle]
