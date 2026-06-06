@@ -8,6 +8,7 @@ use crate::{
     task::{current_process, current_task, WaitReason},
     timer::{
         add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks, time_to_ticks,
+        TICKS_PER_SEC,
     },
 };
 
@@ -38,6 +39,34 @@ pub const ITIMER_REAL: i32 = 0;
 pub const ITIMER_VIRTUAL: i32 = 1;
 /// Linux `getitimer(2)/setitimer(2)` 的 `which`：用户态 + 内核态 CPU 时间。
 pub const ITIMER_PROF: i32 = 2;
+
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_TAI: u32 = 0x0080;
+const ADJ_SETOFFSET: u32 = 0x0100;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+
+const TIME_OK: isize = 0;
+
+const ADJTIMEX_ALLOWED_MODES: u32 = ADJ_OFFSET
+    | ADJ_FREQUENCY
+    | ADJ_MAXERROR
+    | ADJ_ESTERROR
+    | ADJ_STATUS
+    | ADJ_TIMECONST
+    | ADJ_TAI
+    | ADJ_SETOFFSET
+    | ADJ_MICRO
+    | ADJ_NANO
+    | ADJ_TICK;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -93,6 +122,43 @@ pub struct Timespec {
 }
 
 impl Pod for Timespec {}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TimexTimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+impl Pod for TimexTimeVal {}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Timex {
+    pub modes: u32,
+    pub offset: i64,
+    pub freq: i64,
+    pub maxerror: i64,
+    pub esterror: i64,
+    pub status: i32,
+    pub constant: i64,
+    pub precision: i64,
+    pub tolerance: i64,
+    pub time: TimexTimeVal,
+    pub tick: i64,
+    pub ppsfreq: i64,
+    pub jitter: i64,
+    pub shift: i32,
+    pub stabil: i64,
+    pub jitcnt: i64,
+    pub calcnt: i64,
+    pub errcnt: i64,
+    pub stbcnt: i64,
+    pub tai: i32,
+    pub reserved: [i32; 11],
+}
+
+impl Pod for Timex {}
 
 /// 32-bit timespec used by legacy *_time32 syscalls (tv_sec/tv_nsec are signed 32-bit)
 #[repr(C)]
@@ -184,6 +250,54 @@ fn timespec_to_ns(ts: &Timespec) -> Result<u64, ERRNO> {
     Ok(total as u64)
 }
 
+fn adjtimex_modes_are_valid(modes: u32) -> bool {
+    matches!(modes, ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ)
+        || (modes & !ADJTIMEX_ALLOWED_MODES) == 0
+}
+
+fn adjtimex_tick_bounds() -> (i64, i64) {
+    (
+        (900_000usize / TICKS_PER_SEC) as i64,
+        (1_100_000usize / TICKS_PER_SEC) as i64,
+    )
+}
+
+fn current_adjtimex_snapshot() -> Timex {
+    let realtime_us = get_realtime_ns() / 1_000;
+    Timex {
+        precision: 1,
+        time: TimexTimeVal {
+            tv_sec: (realtime_us / 1_000_000) as i64,
+            tv_usec: (realtime_us % 1_000_000) as i64,
+        },
+        tick: (1_000_000usize / TICKS_PER_SEC) as i64,
+        ..Default::default()
+    }
+}
+
+fn do_adjtimex(buf: *mut Timex) -> Result<isize, ERRNO> {
+    let timex = read_pod_from_user(buf)?;
+    if !adjtimex_modes_are_valid(timex.modes) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    // 与 Linux 一致地允许 modes=0 的“只读查询”给非特权进程使用。
+    if timex.modes != 0 && timex.modes != ADJ_OFFSET_SS_READ && current_process().geteuid() != 0 {
+        return Err(ERRNO::EPERM);
+    }
+
+    if timex.modes & ADJ_TICK != 0 {
+        let (tick_min, tick_max) = adjtimex_tick_bounds();
+        if timex.tick < tick_min || timex.tick > tick_max {
+            return Err(ERRNO::EINVAL);
+        }
+    }
+
+    let snapshot = current_adjtimex_snapshot();
+    write_pod_to_user(buf, &snapshot)?;
+    Ok(TIME_OK)
+}
+
 /// get_time syscall
 pub fn sys_get_time_of_day(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
@@ -211,6 +325,30 @@ pub fn sys_set_time_of_day(tv: *const TimeVal, _tz: usize) -> isize {
         let time_us = timeval.sec * 1_000_000 + timeval.usec;
         set_realtime_offset_from_time_ns((time_us * 1_000) as u64);
         Ok(0)
+    })
+}
+
+/// `adjtimex(2)` 系统调用。
+pub fn sys_adjtimex(buf: *mut Timex) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_adjtimex",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({ do_adjtimex(buf) })
+}
+
+/// `clock_adjtime(2)` 系统调用。
+pub fn sys_clock_adjtime(clockid: ClockId, buf: *mut Timex) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_clock_adjtime clockid={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid
+    );
+    syscall_body!({
+        if clockid != CLOCK_REALTIME {
+            return Err(ERRNO::EINVAL);
+        }
+        do_adjtimex(buf)
     })
 }
 
