@@ -204,6 +204,8 @@ pub const SYSCALL_GETCPU: usize = 168;
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 /// settimeofday syscall
 pub const SYSCALL_SETTIMEOFDAY: usize = 170;
+/// adjtimex syscall
+pub const SYSCALL_ADJTIMEX: usize = 171;
 /// getpid syscall
 pub const SYSCALL_GETPID: usize = 172;
 /// getppid syscall
@@ -298,6 +300,8 @@ pub const SYSCALL_PRLIMIT64: usize = 261;
 pub const SYSCALL_FANOTIFY_INIT: usize = 262;
 /// syncfs syscall
 pub const SYSCALL_SYNCFS: usize = 267;
+/// clock_adjtime syscall
+pub const SYSCALL_CLOCK_ADJTIME: usize = 266;
 /// sched_setattr syscall
 pub const SYSCALL_SCHED_SETATTR: usize = 274;
 /// sched_getattr syscall
@@ -314,6 +318,8 @@ pub const SYSCALL_BPF: usize = 280;
 pub const SYSCALL_USERFAULTFD: usize = 282;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
+/// clock_adjtime64 syscall
+pub const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 /// io_uring_setup syscall
 pub const SYSCALL_IO_URING_SETUP: usize = 425;
 /// open_tree syscall
@@ -653,6 +659,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const rlimit),
         SYSCALL_UMASK => sys_umask(args[0] as i32),
         SYSCALL_PRLIMIT64 => sys_prlimit64(args[0] as i32, args[1], args[2] as *const rlimit, args[3] as *mut rlimit),
+        SYSCALL_CLOCK_ADJTIME | SYSCALL_CLOCK_ADJTIME64 =>
+            sys_clock_adjtime(args[0] as ClockId, args[1] as *mut Timex),
         SYSCALL_SYNCFS => sys_syncfs(args[0] as u32),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
         SYSCALL_GETPID => sys_getpid(),
@@ -753,6 +761,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FANOTIFY_INIT => sys_fanotify_init(args[0] as u32, args[1] as u32),
         SYSCALL_GETTIMEOFDAY => sys_get_time_of_day(args[0] as *mut TimeVal, args[1]),
         SYSCALL_SETTIMEOFDAY => sys_set_time_of_day(args[0] as *const TimeVal, args[1]),
+        SYSCALL_ADJTIMEX => sys_adjtimex(args[0] as *mut Timex),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
