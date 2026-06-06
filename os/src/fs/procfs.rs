@@ -1159,6 +1159,7 @@ impl VfsNode for ProcPidDirNode {
             (String::from("exe"), VfsFileType::Symlink),
             (String::from("maps"), VfsFileType::Regular),
             (String::from("mounts"), VfsFileType::Regular),
+            (String::from("ns"), VfsFileType::Directory),
             (String::from("stat"), VfsFileType::Regular),
             (String::from("status"), VfsFileType::Regular),
         ]
@@ -1170,6 +1171,7 @@ impl VfsNode for ProcPidDirNode {
             "exe" => Some(Arc::new(ProcPidExeLinkNode::new(self.pid)) as Arc<dyn VfsNode>),
             "maps" => Some(Arc::new(ProcPidMapsNode::new(self.pid)) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            "ns" => Some(Arc::new(ProcPidNsDirNode::new(self.pid)) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
             _ => None,
@@ -1188,6 +1190,145 @@ impl VfsNode for ProcPidDirNode {
 
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/ns` directory node.
+#[derive(Debug)]
+pub struct ProcPidNsDirNode {
+    pid: usize,
+}
+
+impl ProcPidNsDirNode {
+    /// Create a new `/proc/<pid>/ns` directory node.
+    pub fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+}
+
+impl VfsNode for ProcPidNsDirNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        if pid2process(self.pid).is_none() {
+            return Vec::new();
+        }
+        alloc::vec![
+            (String::from("mnt"), VfsFileType::Regular),
+            (String::from("net"), VfsFileType::Regular),
+        ]
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        pid2process(self.pid)?;
+        match name {
+            "mnt" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "mnt")) as Arc<dyn VfsNode>),
+            "net" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "net")) as Arc<dyn VfsNode>),
+            _ => None,
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/ns/<kind>` placeholder node.
+#[derive(Debug)]
+pub struct ProcPidNsEntryNode {
+    pid: usize,
+    kind: &'static str,
+}
+
+impl ProcPidNsEntryNode {
+    /// Create a new `/proc/<pid>/ns/<kind>` placeholder node.
+    pub fn new(pid: usize, kind: &'static str) -> Self {
+        Self { pid, kind }
+    }
+
+    fn content(&self) -> Result<String, FS_ERRNO> {
+        pid2process(self.pid).ok_or(FS_ERRNO::ENOENT)?;
+        Ok(alloc::format!("{}:[{}]\n", self.kind, self.pid))
+    }
+}
+
+impl VfsNode for ProcPidNsEntryNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.content().map(|data| data.len()).unwrap_or(0)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.content()
+            .map(|data| read_string_at(data, offset, buf))
+            .unwrap_or(0)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {

@@ -8,6 +8,7 @@ use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
 use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
 use crate::fs::procfs::ProcRootNode;
+use crate::fs::sysfs::SysRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -1114,6 +1115,16 @@ pub fn init_procfs() {
     info!("[kernel] /proc initialized");
 }
 
+/// Mount sysfs at `/sys`.
+pub fn init_sysfs() {
+    let sys_root: Arc<dyn VfsNode> = Arc::new(SysRootNode::new());
+    let sys_inode = Inode::from_vfs_node(sys_root);
+    do_mount("/sys", sys_inode)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount sysfs at /sys"));
+    record_mount("/sys", "sysfs", "sysfs", "rw");
+    info!("[kernel] /sys initialized");
+}
+
 /// Mount the filesystem on `dev_path` at the absolute path `abs_mnt`.
 ///
 /// `dev_path` must resolve to a [`BlockDevNode`] in the VFS (e.g. `/dev/vda`).
@@ -1165,6 +1176,14 @@ pub fn mount_tmpfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
     let fs_root = Inode::from_vfs_node(new_tmpfs_root());
     do_mount(abs_mnt, fs_root)?;
     record_mount(abs_mnt, "tmpfs", "tmpfs", if readonly { "ro" } else { "rw" });
+    Ok(())
+}
+
+/// Mount a sysfs view rooted at `abs_mnt`.
+pub fn mount_sysfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
+    let fs_root = Inode::from_vfs_node(Arc::new(SysRootNode::new()) as Arc<dyn VfsNode>);
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, "sysfs", "sysfs", if readonly { "ro" } else { "rw" });
     Ok(())
 }
 

@@ -5,6 +5,8 @@
 //! - Socket side uses per-socket wait queues + poll source notifications.
 
 mod af_alg;
+pub(crate) mod compat;
+mod compat_socket;
 mod loopback;
 mod socket_timeout;
 mod tcp;
@@ -34,6 +36,11 @@ pub(crate) use af_alg::{
     create_alg_socket_file, AlgRequestFile, AlgSendMsgParams, AlgSocketFile, AF_ALG,
     ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV, ALG_SET_KEY,
     ALG_SET_OP, SOCK_SEQPACKET, SOL_ALG,
+};
+pub(crate) use compat_socket::{
+    compat_ifreq_ioctl, create_compat_ifreq_socket_file, create_netlink_route_socket_file,
+    create_packet_socket_file, CompatIfreqSocketFile, NetlinkRouteSocketFile, PacketSocketFile,
+    SockAddrLl,
 };
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
@@ -149,6 +156,7 @@ pub(crate) struct NetStack {
 impl NetStack {
     fn new(dev: Arc<drivers::net::VirtIONetDevice>) -> Self {
         let mac = dev.mac_address();
+        compat::set_eth0_mac(mac);
         let eth = EthernetAddress(mac);
 
         let mut device = MultiDevice::new(dev);
