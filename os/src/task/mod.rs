@@ -45,7 +45,7 @@ pub use crate::signal::{
     SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
-pub use process::{ExitReason, FdEntry, FdFlags, ShmAttachment};
+pub use process::{ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
     clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
