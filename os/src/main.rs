@@ -36,6 +36,10 @@ extern crate bitflags;
 #[path = "boards/qemu.rs"]
 mod board;
 
+pub mod arch;
+pub mod hal;
+pub mod platform;
+
 #[macro_use]
 mod console;
 pub mod config;

@@ -4,9 +4,7 @@ use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
-const PA_WIDTH_SV39: usize = 56;
-const VA_WIDTH_SV39: usize = 39;
-const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
+use crate::arch::riscv::address::{PA_WIDTH_SV39, PPN_WIDTH_SV39, VA_WIDTH_SV39};
 const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
 /// Exclusive end of the canonical low-half user virtual-address range under Sv39.
 pub const USER_SPACE_END: usize = 1usize << (VA_WIDTH_SV39 - 1);

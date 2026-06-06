@@ -31,4 +31,5 @@ strum_macros = "0.28.0"
 fat32 = []
 easyfs = []
 ext4 = []
-default = ["ext4"]
+platform-qemu-virt = []
+default = ["ext4", "platform-qemu-virt"]

@@ -1,4 +1,5 @@
 //! SBI call wrappers
+//! Low-level implementation kept here; platform/qemu_virt/sbi.rs wraps HAL traits on top.
 
 #![allow(unused)]
 

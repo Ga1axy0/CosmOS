@@ -12,11 +12,14 @@ pub const MMIO: &[(usize, usize)] = &[
     (0x1000_1000, 0x8000),  // Virtio MMIO devices, 8 slots, each slot occupies 0x1000 bytes
 ];
 
+/// UART0 MMIO base address.
 pub const VIRT_UART: usize = 0x1000_0000;
 /// QEMU virt 机型上的 Goldfish RTC MMIO 基址。
 pub const VIRT_RTC: usize = 0x0010_1000;
 
+/// Block device implementation for QEMU virt.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
+/// Char device implementation for QEMU virt.
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 
 //ref:: https://github.com/andre-richter/qemu-exit
@@ -28,6 +31,7 @@ const EXIT_FAILURE_FLAG: u32 = 0x3333;
 const EXIT_FAILURE: u32 = exit_code_encode(1); // Equals `exit(1)`. qemu failed exit
 const EXIT_RESET: u32 = 0x7777; // qemu reset
 
+/// QEMU exit interface.
 pub trait QEMUExit {
     /// Exit with specified return code.
     ///
@@ -97,4 +101,5 @@ impl QEMUExit for RISCV64 {
 
 const VIRT_TEST: u64 = 0x100000;
 
+/// Global QEMU exit handle using the sifive_test device.
 pub const QEMU_EXIT_HANDLE: RISCV64 = RISCV64::new(VIRT_TEST);
