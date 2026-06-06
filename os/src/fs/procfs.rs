@@ -681,7 +681,10 @@ impl VfsNode for ProcStaticDirNode {
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         match self.kind {
             ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
-            ProcStaticDirKind::Kernel => alloc::vec![(String::from("keys"), VfsFileType::Directory)],
+            ProcStaticDirKind::Kernel => alloc::vec![
+                (String::from("keys"), VfsFileType::Directory),
+                (String::from("tainted"), VfsFileType::Regular),
+            ],
             ProcStaticDirKind::Keys => alloc::vec![
                 (String::from("gc_delay"), VfsFileType::Regular),
                 (String::from("maxkeys"), VfsFileType::Regular),
@@ -697,6 +700,9 @@ impl VfsNode for ProcStaticDirNode {
             }
             (ProcStaticDirKind::Kernel, "keys") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Kernel, "tainted") => {
+                Some(Arc::new(ProcKernelTaintedNode::new()) as Arc<dyn VfsNode>)
             }
             (ProcStaticDirKind::Keys, "gc_delay") => {
                 Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::GcDelay)) as Arc<dyn VfsNode>)
@@ -736,6 +742,55 @@ impl VfsNode for ProcStaticDirNode {
             0x9fa0,
             255,
         ))
+    }
+}
+
+#[derive(Default, Debug)]
+struct ProcKernelTaintedNode;
+
+impl ProcKernelTaintedNode {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcKernelTaintedNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        2
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(String::from("0\n"), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
     }
 }
 

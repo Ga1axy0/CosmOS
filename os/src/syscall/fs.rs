@@ -2861,7 +2861,12 @@ pub fn sys_fchownat(dirfd: isize, pathname: *const u8, user: u32, group: u32, fl
         let target = resolve_at_target(dirfd, path.as_str(), flags)?;
         let inode = match target {
             ResolvedAtTarget::Inode(i) => i,
-            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
+            ResolvedAtTarget::FileDesc(desc) => {
+                if desc.stat().mode.bits() & StatMode::TYPE_MASK.bits() == StatMode::SOCK.bits() {
+                    return Err(ERRNO::ENOENT);
+                }
+                return Err(ERRNO::EBADF);
+            }
         };
 
         if user == UID_GID_NO_CHANGE && group == UID_GID_NO_CHANGE {
