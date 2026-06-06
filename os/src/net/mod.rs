@@ -4,6 +4,7 @@
 //! - Driver side uses VirtIO token-based completion.
 //! - Socket side uses per-socket wait queues + poll source notifications.
 
+mod af_alg;
 mod loopback;
 mod socket_timeout;
 mod tcp;
@@ -29,6 +30,11 @@ use crate::{
     timer::get_time_us,
 };
 
+pub(crate) use af_alg::{
+    create_alg_socket_file, AlgRequestFile, AlgSendMsgParams, AlgSocketFile, AF_ALG,
+    ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV, ALG_SET_KEY,
+    ALG_SET_OP, SOCK_SEQPACKET, SOL_ALG,
+};
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
 pub(crate) use socket_timeout::{
