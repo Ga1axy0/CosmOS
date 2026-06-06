@@ -532,7 +532,11 @@ impl ProcessControlBlockInner {
     }
     /// the count of tasks(threads) in this process
     pub fn thread_count(&self) -> usize {
-        self.tasks.iter().filter(|task| task.is_some()).count()
+        self.tasks
+            .iter()
+            .filter_map(|task| task.as_ref())
+            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
+            .count()
     }
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {

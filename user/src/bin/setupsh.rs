@@ -28,6 +28,7 @@ const LIB_DIR: &str = "/lib";
 const ETC_DIR: &str = "/etc";
 const ETC_PASSWD_PATH: &str = "/etc/passwd";
 const ETC_GROUP_PATH: &str = "/etc/group";
+const ETC_PROTOCOLS_PATH: &str = "/etc/protocols";
 const HOME_DIR: &str = "/home";
 const ROOT_HOME_DIR: &str = "/root";
 const TMP_DIR: &str = "/tmp";
@@ -83,6 +84,20 @@ const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
 const PASSWD_CONTENT: &[u8] = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/sh\n";
 const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
+const PROTOCOLS_CONTENT: &[u8] = concat!(
+    "hopopt\t0\tHOPOPT\tip\tIP\n",
+    "icmp\t1\tICMP\n",
+    "tcp\t6\tTCP\n",
+    "udp\t17\tUDP\n",
+    "ipv6\t41\tIPv6\n",
+    "ipv6-route\t43\tIPv6-Route\n",
+    "ipv6-frag\t44\tIPv6-Frag\n",
+    "esp\t50\tESP\n",
+    "ah\t51\tAH\n",
+    "ipv6-icmp\t58\tIPv6-ICMP\tICMPV6\n",
+    "ipv6-nonxt\t59\tIPv6-NoNxt\n",
+    "ipv6-opts\t60\tIPv6-Opts\n",
+).as_bytes();
 const KERNEL_CONFIG_CONTENT: &[u8] = b"CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\nCONFIG_BSD_PROCESS_ACCT=y\nCONFIG_BSD_PROCESS_ACCT_V3=y\n";
 const MODULES_BUILTIN_CONTENT: &[u8] = b"kernel/drivers/net/veth.ko\n";
 const MODULES_DEP_CONTENT: &[u8] = b"kernel/drivers/net/veth.ko:\n";
@@ -495,7 +510,9 @@ fn install_busybox_entries() -> bool {
 }
 
 fn install_account_files() -> bool {
-    write_file(ETC_PASSWD_PATH, PASSWD_CONTENT) && write_file(ETC_GROUP_PATH, GROUP_CONTENT)
+    write_file(ETC_PASSWD_PATH, PASSWD_CONTENT)
+        && write_file(ETC_GROUP_PATH, GROUP_CONTENT)
+        && write_file(ETC_PROTOCOLS_PATH, PROTOCOLS_CONTENT)
 }
 
 fn install_kernel_config_file() -> bool {

@@ -8,6 +8,7 @@ mod af_alg;
 pub(crate) mod compat;
 mod compat_socket;
 mod loopback;
+mod raw_ipv6;
 mod socket_timeout;
 mod tcp;
 mod udp;
@@ -41,6 +42,14 @@ pub(crate) use compat_socket::{
     compat_ifreq_ioctl, create_compat_ifreq_socket_file, create_netlink_route_socket_file,
     create_packet_socket_file, CompatIfreqSocketFile, NetlinkRouteSocketFile, PacketSocketFile,
     SockAddrLl,
+};
+pub(crate) use raw_ipv6::{
+    create_raw_ipv6_socket_file, In6PktInfo, RawIpv6ControlMessage, RawIpv6SendMeta,
+    RawIpv6SocketFile, SockAddrIn6, AF_INET6, ICMP6_FILTER, IPPROTO_ICMPV6,
+    IPV6_2292DSTOPTS, IPV6_2292HOPOPTS, IPV6_2292HOPLIMIT, IPV6_2292PKTINFO, IPV6_2292RTHDR,
+    IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPOPTS,
+    IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS,
+    SOL_IPV6,
 };
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
