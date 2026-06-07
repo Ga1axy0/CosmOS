@@ -13,6 +13,8 @@ use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
     FileDescription,
 };
+use crate::hal::{ArchTrapMachine};
+use crate::hal::traits::TrapMachine;
 use crate::sync::SpinNoIrqLock;
 use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
@@ -39,15 +41,6 @@ extern "C" {
     fn ekernel();
     fn strampoline();
 }
-
-/// 用户态 rt_sigreturn trampoline 机器码。
-///
-/// RISC-V Linux 不依赖用户提供 `SA_RESTORER`，handler 返回后跳到这里执行
-/// `rt_sigreturn` 系统调用。
-const USER_VDSO_CODE: [u8; 8] = [
-    0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 139
-    0x73, 0x00, 0x00, 0x00, // ecall
-];
 
 /// ELF 加载结果，包含动态链接所需的额外信息
 pub struct ElfLoadInfo {
@@ -558,7 +551,7 @@ impl MemorySet {
         let start_va = VirtAddr::from(USER_VDSO_BASE);
         let end_va = VirtAddr::from(USER_VDSO_BASE + PAGE_SIZE);
         let vma = Vma::new_vdso(start_va, end_va);
-        self.insert_vma(vma, Some(&USER_VDSO_CODE))
+        self.insert_vma(vma, Some(ArchTrapMachine::rt_sigreturn_trampoline()))
     }
     /// 根据起始虚拟页号删除一段用户区域，并延迟释放拆下的旧页对象。
     pub(crate) fn remove_vma_with_start_vpn_user_deferred(

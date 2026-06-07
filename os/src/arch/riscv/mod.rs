@@ -8,4 +8,4 @@ pub mod trap;
 
 pub use hart::RiscvHartId;
 pub use paging::Sv39Paging;
-pub use trap::RiscvInterruptControl;
+pub use trap::{RiscvInterruptControl, RiscvTrapMachine};

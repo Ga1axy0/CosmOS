@@ -4,7 +4,10 @@
 pub mod traits;
 
 #[cfg(target_arch = "riscv64")]
-pub use crate::arch::riscv::{RiscvHartId as ArchHart, RiscvInterruptControl as ArchInterrupt};
+pub use crate::arch::riscv::{
+    RiscvHartId as ArchHart, RiscvInterruptControl as ArchInterrupt,
+    RiscvTrapMachine as ArchTrapMachine,
+};
 
 #[cfg(feature = "platform-qemu-virt")]
 pub use crate::platform::qemu_virt::SbiPlatform as Plat;

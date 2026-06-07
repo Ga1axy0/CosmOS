@@ -39,10 +39,135 @@ pub struct TrapContext {
 }
 
 impl TrapContext {
+    /// Return the raw general-purpose register value at `index`.
+    pub fn reg(&self, index: usize) -> usize {
+        self.x[index]
+    }
+
+    /// Update the raw general-purpose register value at `index`.
+    pub fn set_reg(&mut self, index: usize, value: usize) {
+        if index != 0 {
+            self.x[index] = value;
+        }
+    }
+
+    /// Return the saved user-mode PC.
+    pub fn user_pc(&self) -> usize {
+        self.sepc
+    }
+
+    /// Overwrite the saved user-mode PC.
+    pub fn set_user_pc(&mut self, pc: usize) {
+        self.sepc = pc;
+    }
+
+    /// Advance the saved user-mode PC by `delta` bytes.
+    pub fn advance_user_pc(&mut self, delta: usize) {
+        self.sepc = self.sepc.wrapping_add(delta);
+    }
+
+    /// Return the saved user stack pointer.
+    pub fn user_sp(&self) -> usize {
+        self.x[2]
+    }
+
     /// put the sp(stack pointer) into x\[2\] field of TrapContext
     pub fn set_sp(&mut self, sp: usize) {
         self.x[2] = sp;
     }
+
+    /// Set the saved user stack pointer.
+    pub fn set_user_sp(&mut self, sp: usize) {
+        self.set_sp(sp);
+    }
+
+    /// Return the saved return address register.
+    pub fn ra(&self) -> usize {
+        self.x[1]
+    }
+
+    /// Set the saved return address register.
+    pub fn set_ra(&mut self, ra: usize) {
+        self.x[1] = ra;
+    }
+
+    /// Return the saved user TLS/thread-pointer register.
+    pub fn tls(&self) -> usize {
+        self.x[4]
+    }
+
+    /// Set the saved user TLS/thread-pointer register.
+    pub fn set_tls(&mut self, tls: usize) {
+        self.x[4] = tls;
+    }
+
+    /// Return the architecture syscall number register.
+    pub fn syscall_nr(&self) -> usize {
+        self.x[17]
+    }
+
+    /// Return the six syscall arguments from the saved user context.
+    pub fn syscall_args(&self) -> [usize; 6] {
+        [self.x[10], self.x[11], self.x[12], self.x[13], self.x[14], self.x[15]]
+    }
+
+    /// Return the saved syscall return register.
+    pub fn syscall_ret(&self) -> usize {
+        self.x[10]
+    }
+
+    /// Set the saved syscall return register.
+    pub fn set_syscall_ret(&mut self, ret: usize) {
+        self.x[10] = ret;
+    }
+
+    /// Set one user-call argument register.
+    pub fn set_user_arg(&mut self, index: usize, value: usize) {
+        self.x[10 + index] = value;
+    }
+
+    /// Save the original first syscall argument for possible restart.
+    pub fn save_syscall_arg0_for_restart(&mut self) {
+        self.orig_a0 = self.x[10];
+    }
+
+    /// Set the kernel hart id restored by the trap trampoline.
+    pub fn set_kernel_hartid(&mut self, hartid: usize) {
+        self.kernel_hartid = hartid;
+    }
+
+    /// Set the kernel stack pointer restored on the next trap entry.
+    pub fn set_kernel_sp(&mut self, kernel_sp: usize) {
+        self.kernel_sp = kernel_sp;
+    }
+
+    /// Export the saved register file using the riscv64 Linux signal ABI layout.
+    pub fn export_signal_gprs(&self) -> [usize; 32] {
+        let mut gregs = [0usize; 32];
+        gregs[0] = self.sepc;
+        gregs[1..].copy_from_slice(&self.x[1..]);
+        gregs
+    }
+
+    /// Restore the saved register file using the riscv64 Linux signal ABI layout.
+    pub fn import_signal_gprs(&mut self, gregs: &[usize; 32]) {
+        self.x[0] = 0;
+        self.x[1..].copy_from_slice(&gregs[1..]);
+        self.sepc = gregs[0];
+    }
+
+    /// Copy floating-point state into an external signal frame.
+    pub fn copy_fp_state_to(&self, fpregs: &mut [u64; 32], fcsr: &mut u32) {
+        fpregs.copy_from_slice(&self.f);
+        *fcsr = self.fcsr as u32;
+    }
+
+    /// Restore floating-point state from an external signal frame.
+    pub fn restore_fp_state(&mut self, fpregs: &[u64; 32], fcsr: u32) {
+        self.f.copy_from_slice(fpregs);
+        self.fcsr = fcsr as usize;
+    }
+
     /// init the trap context of an application
     pub fn app_init_context(
         entry: usize,
@@ -69,7 +194,7 @@ impl TrapContext {
             orig_a0: 0,
             restartable_syscall: false,
         };
-        cx.set_sp(sp); // app's user stack pointer
+        cx.set_user_sp(sp); // app's user stack pointer
         cx // return initial Trap Context of app
     }
 }

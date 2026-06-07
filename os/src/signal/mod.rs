@@ -2,6 +2,8 @@
 
 use crate::{
     config::USER_VDSO_RT_SIGRETURN,
+    hal::ArchTrapMachine,
+    hal::traits::TrapMachine,
     syscall::write_pod_to_user,
     task::{current_task, current_trap_cx},
 };
@@ -199,7 +201,7 @@ pub fn handle_signals() -> Option<i32> {
 
     let trap_cx = current_trap_cx();
     // Save the current user stack pointer
-    let mut user_sp = trap_cx.x[2]; // sp register
+    let mut user_sp = trap_cx.user_sp();
 
     // Construct sigframe on user stack
     // Layout: sp points to ucontext, siginfo is above it if SA_SIGINFO
@@ -236,28 +238,29 @@ pub fn handle_signals() -> Option<i32> {
     };
 
     let mut mcontext = MContext {
-        gregs: [0; 32],
+        gregs: trap_cx.export_signal_gprs(),
         fpstate: FpState::default(),
     };
-    // riscv64 glibc expects the saved PC in gregs[0], followed by x1..x31.
-    mcontext.gregs[0] = trap_cx.sepc;
-    mcontext.gregs[1..].copy_from_slice(&trap_cx.x[1..]);
-    mcontext.fpstate.fpregs.copy_from_slice(&trap_cx.f);
-    mcontext.fpstate.fcsr = trap_cx.fcsr as u32;
+    trap_cx.copy_fp_state_to(&mut mcontext.fpstate.fpregs, &mut mcontext.fpstate.fcsr);
 
     // Syscall restart: if the signal interrupted a syscall that returned -EINTR
     // and SA_RESTART is set, back up PC to the ecall instruction and restore
     // original a0 so the syscall can be restarted after sigreturn.
     if trap_cx.in_syscall {
-        let result = trap_cx.x[10] as isize;
+        let result = trap_cx.syscall_ret() as isize;
         if result == -(crate::syscall::errno::ERRNO::EINTR as isize) {
             if trap_cx.restartable_syscall && action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
                 debug!(
                     "handle_signals: syscall restart: backing up PC from {:#x} to {:#x}, restoring a0 from {:#x} to {:#x}",
-                    mcontext.gregs[0], trap_cx.sepc.wrapping_sub(4),
+                    mcontext.gregs[0],
+                    trap_cx
+                        .user_pc()
+                        .wrapping_sub(ArchTrapMachine::syscall_instruction_len()),
                     mcontext.gregs[10], trap_cx.orig_a0
                 );
-                mcontext.gregs[0] = trap_cx.sepc.wrapping_sub(4);
+                mcontext.gregs[0] = trap_cx
+                    .user_pc()
+                    .wrapping_sub(ArchTrapMachine::syscall_instruction_len());
                 mcontext.gregs[10] = trap_cx.orig_a0;
             } else if action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
                 debug!(
@@ -329,29 +332,29 @@ pub fn handle_signals() -> Option<i32> {
 
     // Set up trap context to call signal handler
     // sp points to ucontext (aligned)
-    trap_cx.x[2] = user_sp;
+    trap_cx.set_user_sp(user_sp);
 
     // Set up arguments based on SA_SIGINFO
     if action.sa_flags & SaFlags::SA_SIGINFO.bits() != 0 {
         // SA_SIGINFO: handler(signum, siginfo*, ucontext*)
-        trap_cx.x[10] = signum as usize; // a0 = signum
-        trap_cx.x[11] = siginfo_ptr; // a1 = siginfo*
-        trap_cx.x[12] = ucontext_ptr; // a2 = ucontext*
+        trap_cx.set_user_arg(0, signum as usize); // a0 = signum
+        trap_cx.set_user_arg(1, siginfo_ptr); // a1 = siginfo*
+        trap_cx.set_user_arg(2, ucontext_ptr); // a2 = ucontext*
     } else {
         // Traditional: handler(signum)
-        trap_cx.x[10] = signum as usize; // a0 = signum
+        trap_cx.set_user_arg(0, signum as usize); // a0 = signum
     }
 
     // Set return address (ra) to restorer or kernel fallback
     if action.sa_flags & SaFlags::SA_RESTORER.bits() != 0 && action.sa_restorer != 0 {
-        trap_cx.x[1] = action.sa_restorer; // ra = sa_restorer
+        trap_cx.set_ra(action.sa_restorer); // ra = sa_restorer
         debug!(
             "handle_signals: using user restorer at {:#x}",
             action.sa_restorer
         );
     } else {
         // RISC-V Linux 不要求用户态提供 SA_RESTORER，统一回到内核提供的 trampoline。
-        trap_cx.x[1] = USER_VDSO_RT_SIGRETURN;
+        trap_cx.set_ra(USER_VDSO_RT_SIGRETURN);
         debug!(
             "handle_signals: using kernel vdso rt_sigreturn at {:#x}",
             USER_VDSO_RT_SIGRETURN
@@ -359,11 +362,13 @@ pub fn handle_signals() -> Option<i32> {
     }
 
     // Jump to signal handler
-    trap_cx.sepc = action.handler;
+    trap_cx.set_user_pc(action.handler);
 
     debug!(
         "handle_signals: setup complete, jumping to handler={:#x}, ra={:#x}, sp={:#x}",
-        trap_cx.sepc, trap_cx.x[1], trap_cx.x[2]
+        trap_cx.user_pc(),
+        trap_cx.ra(),
+        trap_cx.user_sp()
     );
     None
 }

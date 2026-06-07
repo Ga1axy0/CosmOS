@@ -983,14 +983,14 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
         // RISC-V glibc _start treats a0 as rtld_fini and reads argc/argv from the stack.
-        trap_cx.x[10] = 0;
-        trap_cx.x[11] = 0;
+        trap_cx.set_user_arg(0, 0);
+        trap_cx.set_user_arg(1, 0);
         debug!(
             "kernel: exec trap init entry={:#x} sp={:#x} a0={:#x} a1={:#x}",
             final_entry,
             user_sp,
-            trap_cx.x[10],
-            trap_cx.x[11]
+            trap_cx.reg(10),
+            trap_cx.reg(11)
         );
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
@@ -1141,15 +1141,15 @@ impl ProcessControlBlock {
         // patches the inherited return register, breaking fork semantics.
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
-        trap_cx.kernel_sp = task.kstack.get_top();
-        trap_cx.x[10] = 0;
+        trap_cx.set_kernel_sp(task.kstack.get_top());
+        trap_cx.set_syscall_ret(0);
         if child_stack != 0 {
             // Linux clone ABI 要求子进程从指定用户栈继续执行。
-            trap_cx.x[2] = child_stack;
+            trap_cx.set_user_sp(child_stack);
         }
         if let Some(tls) = child_tls {
             // RISC-V 用户态 TLS 指针使用 tp，也就是 x4。
-            trap_cx.x[4] = tls;
+            trap_cx.set_tls(tls);
         }
         drop(task_inner);
         if let Some(child_tid_ptr) = child_set_tid {
