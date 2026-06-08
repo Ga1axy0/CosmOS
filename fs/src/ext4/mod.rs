@@ -475,9 +475,22 @@ impl VfsNode for Ext4Inode {
         if self.file_type != VfsFileType::Symlink {
             return Err(FS_ERRNO::EINVAL);
         }
-        let size = self.size();
-        let mut buf = vec![0u8; size];
         let ext4 = self.fs.ext4.lock();
+        let inode_ref = ext4.get_inode_ref(self.inode_num);
+        let size = inode_ref.inode.size() as usize;
+
+        // ext4 fast symlink stores the link target inline in inode.i_block.
+        // Treating it as regular file data would wrongly parse extents and panic.
+        if size <= core::mem::size_of_val(&inode_ref.inode.block) && inode_ref.inode.blocks_count() == 0 {
+            let mut buf = Vec::with_capacity(core::mem::size_of_val(&inode_ref.inode.block));
+            for word in inode_ref.inode.block() {
+                buf.extend_from_slice(&word.to_le_bytes());
+            }
+            buf.truncate(size);
+            return String::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL);
+        }
+
+        let mut buf = vec![0u8; size];
         let read = ext4.read_at(self.inode_num, 0, &mut buf).map_err(FS_ERRNO::from)?;
         buf.truncate(read);
         String::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)

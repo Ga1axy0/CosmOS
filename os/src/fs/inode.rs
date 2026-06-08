@@ -7,6 +7,7 @@ use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
 use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
+use crate::fs::tty::TtyDeviceNode;
 use crate::fs::procfs::ProcRootNode;
 use crate::fs::sysfs::SysRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
@@ -377,32 +378,50 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
 /// and filesystem initialisation) and before any file-system operations.
 /// Invoked from `rust_main` in `main.rs`.
 pub fn init_rootfs() {
-    use crate::drivers::BLOCK_DEVICE;
+    let (root_dev_name, root_dev, extra_dev) = {
+        let map = BLOCK_DEVICES.lock();
+        if let Some(dev) = map.get("vdb").cloned() {
+            ("/dev/vdb", dev, map.get("vda").cloned().map(|dev| ("/dev/vda", dev)))
+        } else {
+            let dev = map
+                .get("vda")
+                .cloned()
+                .expect("[kernel] rootfs device vda not found");
+            ("/dev/vda", dev, None)
+        }
+    };
 
     #[cfg(feature = "fat32")]
     {
         use fs::Fat32FileSystem;
-        let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
+        let vfs = Fat32FileSystem::open(root_dev.clone());
         let root = Fat32FileSystem::root_inode(&vfs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
-        record_mount("/", "rootfs", "fat32", "rw");
+        record_mount("/", root_dev_name, "fat32", "rw");
     }
     #[cfg(feature = "easyfs")]
     {
         use fs::EasyFileSystem;
-        let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
+        let efs = EasyFileSystem::open(root_dev.clone());
         let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
-        record_mount("/", "rootfs", "easyfs", "rw");
+        record_mount("/", root_dev_name, "easyfs", "rw");
     }
     #[cfg(feature = "ext4")]
     {
         use fs::Ext4FileSystem;
-        let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
+        let efs = Ext4FileSystem::open(root_dev.clone());
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
-        record_mount("/", "/dev/vda", "ext4", "rw");
-        // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
+        record_mount("/", root_dev_name, "ext4", "rw");
+        if let Some((extra_dev_name, extra_dev)) = extra_dev {
+            let extra_fs = Ext4FileSystem::open(extra_dev);
+            let extra_root = Ext4FileSystem::root_inode(&extra_fs);
+            do_mount("/mnt", extra_root)
+                .unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt"));
+            record_mount("/mnt", extra_dev_name, "ext4", "rw");
+            info!("[kernel] mounted extra ext4 at /mnt from {}", extra_dev_name);
+        }
     }
 
     let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
@@ -951,6 +970,9 @@ impl File for OSInode {
         if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
             return rtc.ioctl(req, arg);
         }
+        if let Some(tty) = vfs_node.as_any().downcast_ref::<TtyDeviceNode>() {
+            return tty.ioctl(req, arg);
+        }
         Err(ERRNO::ENOTTY)
     }
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -1073,6 +1095,12 @@ pub fn init_dev() {
     dev_dir.bind("cpu_dma_latency", cpu_dma_latency_node as Arc<dyn VfsNode>);
     info!("[kernel] /dev/cpu_dma_latency registered");
 
+    let console_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(crate::fs::TtyDeviceKind::Console, 0x0501));
+    dev_dir.bind("console", Arc::clone(&console_node));
+    let tty_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(crate::fs::TtyDeviceKind::Tty, 0x0500));
+    dev_dir.bind("tty", tty_node);
+    info!("[kernel] /dev/console and /dev/tty registered");
+
     // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
@@ -1189,7 +1217,7 @@ pub fn mount_sysfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
 
 /// Update an existing mount record in place, preserving the mounted tree.
 ///
-/// xxOS currently tracks remount state in mount metadata so path-based checks
+/// CosmOS currently tracks remount state in mount metadata so path-based checks
 /// can observe `ro` versus `rw` without rebuilding the mounted filesystem.
 pub fn remount_path(abs_mnt: &str, dev_path: &str, fs_type: &str, readonly: bool) -> Result<(), ERRNO> {
     update_mount_record(

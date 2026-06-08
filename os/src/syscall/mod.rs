@@ -218,6 +218,8 @@ pub const SYSCALL_GETEUID: usize = 175;
 pub const SYSCALL_GETGID: usize = 176;
 /// getegid syscall
 pub const SYSCALL_GETEGID: usize = 177;
+/// sysinfo syscall
+pub const SYSCALL_SYSINFO: usize = 179;
 /// gettid syscall
 pub const SYSCALL_GETTID: usize = 178;
 /// shmget syscall
@@ -748,6 +750,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut SysInfo),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),
         SYSCALL_SHMCTL => sys_shmctl(args[0], args[1] as i32, args[2]),

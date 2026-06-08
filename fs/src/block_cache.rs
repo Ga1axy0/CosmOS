@@ -99,24 +99,30 @@ const BLOCK_CACHE_SIZE: usize = 2048;
 
 /// BlockCacheManager is a manager for BlockCache.
 pub struct BlockCacheManager {
-    /// (block_id, block_cache)
-    queue: VecDeque<(usize, Arc<Mutex<BlockCache>>)>,
+    /// ((device_id, block_id), block_cache)
+    queue: VecDeque<((usize, usize), Arc<Mutex<BlockCache>>)>,
 }
 
 impl BlockCacheManager {
-    /// Create a new BlockCacheManager with an empty queue (block_id, block_cache)
+    /// Create a new BlockCacheManager with an empty queue.
     pub fn new() -> Self {
         Self {
             queue: VecDeque::new(),
         }
     }
+
+    fn device_id(block_device: &Arc<dyn BlockDevice>) -> usize {
+        Arc::as_ptr(block_device) as *const () as usize
+    }
+
     /// Get a block cache from the queue. according to the block_id.
     pub fn get_block_cache(
         &mut self,
         block_id: usize,
         block_device: Arc<dyn BlockDevice>,
     ) -> Arc<Mutex<BlockCache>> {
-        if let Some(pair) = self.queue.iter().find(|pair| pair.0 == block_id) {
+        let key = (Self::device_id(&block_device), block_id);
+        if let Some(pair) = self.queue.iter().find(|pair| pair.0 == key) {
             Arc::clone(&pair.1)
         } else {
             // substitute
@@ -138,7 +144,7 @@ impl BlockCacheManager {
                 block_id,
                 Arc::clone(&block_device),
             )));
-            self.queue.push_back((block_id, Arc::clone(&block_cache)));
+            self.queue.push_back((key, Arc::clone(&block_cache)));
             block_cache
         }
     }

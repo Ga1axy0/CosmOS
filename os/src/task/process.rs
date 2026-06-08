@@ -9,7 +9,7 @@ use crate::sched::insert_into_pid2process;
 use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
-use crate::fs::{mapping_for_inode, new_stdio_files, File, FileDescription};
+use crate::fs::{canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription, OpenFlags};
 use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
@@ -31,6 +31,21 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
+
+const INIT_CWD: &str = "/root";
+const INIT_INTERPRETER_MAX_DEPTH: usize = 4;
+const INIT_PROBE_SIZE: usize = 256;
+const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+const INIT_ENV: &[&str] = &[
+    "HOME=/root",
+    "INPUTRC=/etc/inputrc",
+    "TERM=xterm-256color",
+    "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/root",
+    "USER=root",
+    "LOGNAME=root",
+    "SHELL=/bin/bash",
+    "PWD=/root",
+];
 
 fn mm_error_to_errno(err: MmError) -> ERRNO {
     match err {
@@ -423,9 +438,209 @@ fn init_user_stack_from_strings(
     user_sp
 }
 
+struct ResolvedInitImage {
+    elf_data: Vec<u8>,
+    argv: Vec<String>,
+}
+
+struct ShebangInfo {
+    interpreter: String,
+    optional_arg: Option<String>,
+}
+
+fn is_elf_image(file_data: &[u8]) -> bool {
+    file_data.starts_with(ELF_MAGIC)
+}
+
+fn parse_shebang_line(file_data: &[u8]) -> Result<Option<ShebangInfo>, ERRNO> {
+    if !file_data.starts_with(b"#!") {
+        return Ok(None);
+    }
+
+    let line_end = file_data
+        .iter()
+        .position(|&ch| ch == b'\n')
+        .unwrap_or(file_data.len());
+    let line = core::str::from_utf8(&file_data[2..line_end]).map_err(|_| ERRNO::ENOEXEC)?;
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let line = line.trim_matches(|ch| ch == ' ' || ch == '\t');
+    if line.is_empty() {
+        return Err(ERRNO::ENOEXEC);
+    }
+
+    let mut parts = line.splitn(2, |ch: char| ch == ' ' || ch == '\t');
+    let interpreter = parts.next().unwrap();
+    if interpreter.is_empty() {
+        return Err(ERRNO::ENOEXEC);
+    }
+    let optional_arg = parts
+        .next()
+        .map(|rest| rest.trim_matches(|ch| ch == ' ' || ch == '\t'))
+        .filter(|rest| !rest.is_empty())
+        .map(String::from);
+
+    Ok(Some(ShebangInfo {
+        interpreter: String::from(interpreter),
+        optional_arg,
+    }))
+}
+
+fn resolve_init_image(cwd: &str, path: &str, argv: Vec<String>, depth: usize) -> Result<ResolvedInitImage, ERRNO> {
+    if depth >= INIT_INTERPRETER_MAX_DEPTH {
+        return Err(ERRNO::ELOOP);
+    }
+
+    let abs_path = canonicalize(cwd, path);
+    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).map_err(|_| ERRNO::ENOENT)?;
+    if inode.is_dir() {
+        return Err(ERRNO::EISDIR);
+    }
+
+    let (first_line, first_line_complete) = inode.read_first_line_limited(INIT_PROBE_SIZE);
+    if is_elf_image(&first_line) {
+        return Ok(ResolvedInitImage {
+            elf_data: inode.read_all(),
+            argv,
+        });
+    }
+
+    if !first_line_complete {
+        return Err(ERRNO::ENOEXEC);
+    }
+
+    if let Some(shebang) = parse_shebang_line(&first_line)? {
+        if !shebang.interpreter.starts_with('/') {
+            return Err(ERRNO::ENOEXEC);
+        }
+
+        let mut next_argv = Vec::with_capacity(argv.len() + 2);
+        next_argv.push(shebang.interpreter.clone());
+        if let Some(optional_arg) = shebang.optional_arg {
+            next_argv.push(optional_arg);
+        }
+        next_argv.push(abs_path);
+        next_argv.extend(argv.into_iter().skip(1));
+        return resolve_init_image(cwd, shebang.interpreter.as_str(), next_argv, depth + 1);
+    }
+
+    Err(ERRNO::ENOEXEC)
+}
+
 fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
     let args: Vec<String> = args.iter().map(|arg| String::from(*arg)).collect();
     init_user_stack_from_strings(token, stack_top, args.as_slice(), &[], &[])
+}
+
+fn load_process_image(
+    elf_data: &[u8],
+    cwd: &str,
+) -> Result<(MemorySet, UserSpaceLayout, usize, Vec<(Auxv, usize)>), ERRNO> {
+    let (mut memory_set, user_layout, app_load_info) =
+        MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
+
+    let (final_entry, auxv_extra) = if let Some(interp_path) = &app_load_info.interp_path {
+        debug!("Dynamic linking required, loading interpreter: {}", interp_path);
+        let interp_inode = match open_file_at(cwd, interp_path.as_str(), OpenFlags::RDONLY) {
+            Ok(inode) => inode,
+            Err(_) => {
+                error!("Failed to open interpreter {}", interp_path);
+                return Err(ERRNO::ENOENT);
+            }
+        };
+
+        if interp_inode.is_dir() {
+            error!("Dynamic linker path is a directory: {}", interp_path);
+            return Err(ERRNO::EISDIR);
+        }
+
+        let interp_data = interp_inode.read_all();
+        let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ERRNO::ENOEXEC)?;
+        let interp_entry = interp_elf.header.pt2.entry_point() as usize;
+        let ph_count = interp_elf.header.pt2.ph_count();
+        let interp_base = crate::config::INTERP_BASE;
+        debug!("Loading interpreter at base address: {:#x}", interp_base);
+        debug!("Interpreter original entry: {:#x}", interp_entry);
+
+        for i in 0..ph_count {
+            let ph = interp_elf.program_header(i).map_err(|_| ERRNO::ELIBBAD)?;
+            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (interp_base + ph.virtual_addr() as usize).into();
+                let end_va: VirtAddr =
+                    (interp_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+
+                debug!(
+                    "mapping interpreter segment: [{:#x}, {:#x}) with flags {:?}",
+                    usize::from(start_va),
+                    usize::from(end_va),
+                    map_perm
+                );
+
+                let vma = Vma::new_elf(start_va, end_va, map_perm);
+                let page_off = start_va.page_offset();
+                let raw = &interp_data[ph.offset() as usize
+                    ..(ph.offset() + ph.file_size()) as usize];
+                let padded: Vec<u8>;
+                let seg_data: &[u8] = if page_off != 0 {
+                    let mut buf = alloc::vec![0u8; page_off + raw.len()];
+                    buf[page_off..].copy_from_slice(raw);
+                    padded = buf;
+                    &padded
+                } else {
+                    raw
+                };
+                memory_set
+                    .insert_vma(vma, Some(seg_data))
+                    .map_err(mm_error_to_errno)?;
+            }
+        }
+
+        let relocated_entry = interp_base + interp_entry;
+        debug!("Interpreter relocated entry: {:#x}", relocated_entry);
+        debug!(
+            "App PHDR vaddr: {:#x}, phnum: {}",
+            app_load_info.phdr_vaddr,
+            app_load_info.phnum
+        );
+
+        let auxv_extra = vec![
+            (Auxv::Phdr, app_load_info.phdr_vaddr),
+            (Auxv::Phent, app_load_info.phent_size),
+            (Auxv::Phnum, app_load_info.phnum),
+            (Auxv::Pagesz, crate::config::PAGE_SIZE),
+            (Auxv::Base, interp_base),
+            (Auxv::Entry, app_load_info.entry_point),
+        ];
+
+        (relocated_entry, auxv_extra)
+    } else {
+        debug!("Static linking, using application entry directly");
+        debug!(
+            "App PHDR vaddr: {:#x}, phnum: {}",
+            app_load_info.phdr_vaddr,
+            app_load_info.phnum
+        );
+        let auxv_extra = vec![
+            (Auxv::Phdr, app_load_info.phdr_vaddr),
+            (Auxv::Phent, app_load_info.phent_size),
+            (Auxv::Phnum, app_load_info.phnum),
+            (Auxv::Pagesz, crate::config::PAGE_SIZE),
+            (Auxv::Entry, app_load_info.entry_point),
+        ];
+        (app_load_info.entry_point, auxv_extra)
+    };
+
+    Ok((memory_set, user_layout, final_entry, auxv_extra))
 }
 
 impl ProcessControlBlockInner {
@@ -543,7 +758,7 @@ impl ProcessControlBlockInner {
         self.tasks[tid].as_ref().unwrap().clone()
     }
 
-    pub fn is_zombie(&self) -> bool {   
+    pub fn is_zombie(&self) -> bool {
         self.is_zombie
     }
 }
@@ -585,13 +800,14 @@ impl ProcessControlBlock {
     }
 
     /// new process from elf file
-    pub fn new(elf_data: &[u8], exec_path: String) -> Arc<Self> {
+    pub fn new(exec_path: String) -> Arc<Self> {
         trace!("kernel: ProcessControlBlock::new");
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        // assert that initproc is always valid elf
-        let (memory_set, user_layout, load_info) =
-            MemorySet::from_elf(elf_data).expect("failed to build init process address space");
-        let entry_point = load_info.entry_point;
+        let init_envs: Vec<String> = INIT_ENV.iter().map(|entry| String::from(*entry)).collect();
+        let init_argv = vec![String::from(exec_path.as_str())];
+        let resolved = resolve_init_image("/", exec_path.as_str(), init_argv, 0)
+            .expect("failed to resolve init image");
+        let (memory_set, user_layout, entry_point, auxv_extra) =
+            load_process_image(resolved.elf_data.as_slice(), "/").expect("failed to build init process address space");
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // allocate a pid
@@ -623,9 +839,9 @@ impl ProcessControlBlock {
                     deadlock_enabled: false,
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
-                    cwd: String::from("/"),
+                    cwd: String::from(INIT_CWD),
                     exec_path,
-                    environment: Vec::new(),
+                    environment: init_envs.clone(),
                     umask: DEFAULT_UMASK,
                     cred,
                     keyrings: ProcessKeyrings::default(),
@@ -654,7 +870,13 @@ impl ProcessControlBlock {
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
-        let user_sp = init_user_stack(process.inner_exclusive_access().get_user_token(), ustack_top, &["initproc"]);
+        let user_sp = init_user_stack_from_strings(
+            process.inner_exclusive_access().get_user_token(),
+            ustack_top,
+            resolved.argv.as_slice(),
+            init_envs.as_slice(),
+            auxv_extra.as_slice(),
+        );
         *trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
@@ -681,119 +903,10 @@ impl ProcessControlBlock {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
 
-        // 首先加载原始程序
-        trace!("kernel: exec .. MemorySet::from_elf for application");
-        let (mut memory_set, user_layout, app_load_info) =
-            MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
-
-        // 获取当前进程的cwd，用于打开动态链接器
+        trace!("kernel: exec .. load process image");
         let cwd = self.inner_exclusive_access().cwd.clone();
-
-        // 决定最终入口点和auxv
-        let (final_entry, auxv_extra) = if let Some(interp_path) = &app_load_info.interp_path {
-            debug!("Dynamic linking required, loading interpreter: {}", interp_path);
-
-            // 加载动态链接器到同一地址空间
-            // 使用 open_file_at 以支持相对路径（虽然INTERP通常是绝对路径）
-            let interp_inode = match crate::fs::open_file_at(
-                cwd.as_str(),
-                interp_path.as_str(),
-                crate::fs::OpenFlags::RDONLY,
-            ) {
-                Ok(inode) => inode,
-                Err(_) => {
-                    error!("Failed to open interpreter {}", interp_path);
-                    return Err(ERRNO::ENOENT);
-                }
-            };
-
-            if interp_inode.is_dir() {
-                error!("Dynamic linker path is a directory: {}", interp_path);
-                return Err(ERRNO::EISDIR);
-            }
-
-            let interp_data = interp_inode.read_all();
-
-            // 解析动态链接器ELF
-            let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ERRNO::ENOEXEC)?;
-            let interp_entry = interp_elf.header.pt2.entry_point() as usize;
-            let ph_count = interp_elf.header.pt2.ph_count();
-
-            // 动态链接器通常是位置无关的（PIE），需要重定位到不冲突的基地址
-            // 使用 INTERP_BASE 作为加载基地址
-            let interp_base = crate::config::INTERP_BASE;
-            debug!("Loading interpreter at base address: {:#x}", interp_base);
-            debug!("Interpreter original entry: {:#x}", interp_entry);
-
-            // 将动态链接器的LOAD段加载到内存，所有地址加上 interp_base
-            for i in 0..ph_count {
-                let ph = interp_elf.program_header(i).map_err(|_| ERRNO::ELIBBAD)?;
-                if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                    // 原始虚拟地址 + 基地址 = 实际加载地址
-                    let start_va: VirtAddr = (interp_base + ph.virtual_addr() as usize).into();
-                    let end_va: VirtAddr = (interp_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
-                    let mut map_perm = MapPermission::U;
-                    let ph_flags = ph.flags();
-                    if ph_flags.is_read() {
-                        map_perm |= MapPermission::R;
-                    }
-                    if ph_flags.is_write() {
-                        map_perm |= MapPermission::W;
-                    }
-                    if ph_flags.is_execute() {
-                        map_perm |= MapPermission::X;
-                    }
-
-                    debug!("mapping interpreter segment: [{:#x}, {:#x}) with flags {:?}",
-                        usize::from(start_va), usize::from(end_va), map_perm);
-
-                    let vma = Vma::new_elf(start_va, end_va, map_perm);
-                    let page_off = start_va.page_offset();
-                    let raw = &interp_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
-                    let padded: Vec<u8>;
-                    let seg_data: &[u8] = if page_off != 0 {
-                        let mut buf = alloc::vec![0u8; page_off + raw.len()];
-                        buf[page_off..].copy_from_slice(raw);
-                        padded = buf;
-                        &padded
-                    } else {
-                        raw
-                    };
-                    memory_set
-                        .insert_vma(vma, Some(seg_data))
-                        .map_err(mm_error_to_errno)?;
-                }
-            }
-
-            // 入口点也需要重定位
-            let relocated_entry = interp_base + interp_entry;
-            debug!("Interpreter relocated entry: {:#x}", relocated_entry);
-            debug!("App PHDR vaddr: {:#x}, phnum: {}", app_load_info.phdr_vaddr, app_load_info.phnum);
-
-            // 构造auxv：告诉动态链接器原程序的信息
-            let auxv_extra = vec![
-                (Auxv::Phdr, app_load_info.phdr_vaddr),  // AT_PHDR
-                (Auxv::Phent, app_load_info.phent_size),  // AT_PHENT
-                (Auxv::Phnum, app_load_info.phnum),       // AT_PHNUM
-                (Auxv::Pagesz, crate::config::PAGE_SIZE),     // AT_PAGESZ
-                (Auxv::Base, interp_base),               // AT_BASE - 动态链接器实际加载的基地址
-                (Auxv::Entry, app_load_info.entry_point), // AT_ENTRY
-            ];
-
-            (relocated_entry, auxv_extra)
-        } else {
-            // 静态链接程序
-            debug!("Static linking, using application entry directly");
-            debug!("App PHDR vaddr: {:#x}, phnum: {}", app_load_info.phdr_vaddr, app_load_info.phnum);
-            let auxv_extra = vec![
-                (Auxv::Phdr, app_load_info.phdr_vaddr),  // AT_PHDR
-                (Auxv::Phent, app_load_info.phent_size),  // AT_PHENT
-                (Auxv::Phnum, app_load_info.phnum),       // AT_PHNUM
-                (Auxv::Pagesz, crate::config::PAGE_SIZE),     // AT_PAGESZ
-                (Auxv::Entry, app_load_info.entry_point), // AT_ENTRY
-            ];
-            (app_load_info.entry_point, auxv_extra)
-        };
+        let (memory_set, user_layout, final_entry, auxv_extra) =
+            load_process_image(elf_data, cwd.as_str())?;
 
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();

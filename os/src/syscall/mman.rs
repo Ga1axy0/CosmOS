@@ -311,7 +311,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
 /// Linux `mlock(2)` compatibility stub.
 ///
 /// `cyclictest` and similar RT benchmarks use this to reduce paging jitter.
-/// xxOS currently has no swap or pageable user memory, so treating it as a
+/// CosmOS currently has no swap or pageable user memory, so treating it as a
 /// validated no-op is sufficient for userland compatibility.
 pub fn sys_mlock(addr: usize, len: usize) -> isize {
     trace!(

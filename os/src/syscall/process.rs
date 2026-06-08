@@ -1,10 +1,11 @@
-use crate::mm::{MapPermission, USER_SPACE_END, VirtAddr};
+use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::task::yield_current_and_run_next;
 use crate::timer::get_time_ns;
 use crate::{
+    config::PAGE_SIZE,
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
     ipc::{self, IPC_RMID},
@@ -1186,6 +1187,27 @@ pub struct UtsName {
 
 impl Pod for UtsName {}
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SysInfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+    pub _f: [u8; 0],
+}
+
+impl Pod for SysInfo {}
+
 impl UtsName {
     pub fn new() -> Self {
         // 按照 Linux 标准填充字段，可以根据实际情况修改
@@ -1213,6 +1235,36 @@ impl UtsName {
         uname.domainname[..domainname.len()].copy_from_slice(domainname);
         uname
     }
+}
+
+/// sysinfo syscall
+pub fn sys_sysinfo(info_ptr: *mut SysInfo) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sysinfo",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let stats = frame_allocator_stats();
+        let page_bytes = PAGE_SIZE as u64;
+        let info = SysInfo {
+            uptime: (get_time_ns() / 1_000_000_000).min(i64::MAX as u64) as i64,
+            loads: [0; 3],
+            totalram: stats.total_pages as u64 * page_bytes,
+            freeram: stats.free_pages as u64 * page_bytes,
+            sharedram: 0,
+            bufferram: 0,
+            totalswap: 0,
+            freeswap: 0,
+            procs: list_pids().len().min(u16::MAX as usize) as u16,
+            pad: 0,
+            totalhigh: 0,
+            freehigh: 0,
+            mem_unit: 1,
+            _f: [],
+        };
+        write_pod_to_user(info_ptr, &info)?;
+        Ok(0)
+    })
 }
 
 /// uname syscall

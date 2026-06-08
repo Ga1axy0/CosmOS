@@ -27,6 +27,9 @@ os/vendor/
 .VSCodeCounter
 notes
 base.img
+disk.img
+kernel-rv
+kernel-la
 sdcard-rv.img
 second-easyfs.img
 second-fat32.img
