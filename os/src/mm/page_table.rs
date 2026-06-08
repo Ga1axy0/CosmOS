@@ -5,25 +5,10 @@ use super::{
 };
 use crate::config::PAGE_SIZE;
 use crate::arch::riscv::Sv39Paging;
-use crate::hal::traits::{AddressSpaceToken, PagingArch};
+use crate::hal::traits::{AddressSpaceToken, PagingArch, PTEFlags};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use bitflags::*;
-
-bitflags! {
-    /// page table entry flags
-    pub struct PTEFlags: u8 {
-        const V = 1 << 0;
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-        const G = 1 << 5;
-        const A = 1 << 6;
-        const D = 1 << 7;
-    }
-}
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -37,7 +22,7 @@ impl PageTableEntry {
     /// Create a new page table entry
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: crate::hal::make_pte(ppn.0, flags),
         }
     }
     /// Create an empty page table entry
@@ -46,11 +31,11 @@ impl PageTableEntry {
     }
     /// Get the physical page number from the page table entry
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        crate::hal::pte_ppn(self.bits).into()
     }
     /// Get the flags from the page table entry
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap()
+        crate::hal::pte_flags(self.bits)
     }
     /// The page pointered by page table entry is valid?
     pub fn is_valid(&self) -> bool {
@@ -97,14 +82,13 @@ impl PageTable {
         }
     }
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Result<Option<&mut PageTableEntry>, MmError> {
-        let idxs = vpn.indexes();
+        let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+        for level in 0..levels {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &mut ppn.get_pte_array()[idx];
+            if level + 1 == levels {
+                return Ok(Some(pte));
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
@@ -113,20 +97,19 @@ impl PageTable {
             }
             ppn = pte.ppn();
         }
-        Ok(result)
+        Ok(None)
     }
     fn find_pte_create_untracked(
         &mut self,
         vpn: VirtPageNum,
     ) -> Result<Option<&mut PageTableEntry>, MmError> {
-        let idxs = vpn.indexes();
+        let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+        for level in 0..levels {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &mut ppn.get_pte_array()[idx];
+            if level + 1 == levels {
+                return Ok(Some(pte));
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
@@ -135,24 +118,23 @@ impl PageTable {
             }
             ppn = pte.ppn();
         }
-        Ok(result)
+        Ok(None)
     }
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
-        let idxs = vpn.indexes();
+        let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+        for level in 0..levels {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &mut ppn.get_pte_array()[idx];
+            if level + 1 == levels {
+                return Some(pte);
             }
             if !pte.is_valid() {
                 return None;
             }
             ppn = pte.ppn();
         }
-        result
+        None
     }
     /// set the map between virtual page number and physical page number
     #[allow(unused)]
@@ -181,16 +163,21 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         Ok(())
     }
-    /// Ensure the level-1 (1GiB-granularity) intermediate table covering `vpn`
+    /// Ensure the first-level subtree table under the root covering `vpn`
     /// exists, creating it untracked if necessary, and return its physical page
     /// number.
     ///
-    /// Used to pre-build the kernel-heap window's level-1 table once at boot so
-    /// that subsequent heap growth can install leaf PTEs into a disjoint subtree
-    /// without re-walking (and re-locking) the global kernel page table.
-    pub fn ensure_l1_table_untracked(&mut self, vpn: VirtPageNum) -> PhysPageNum {
-        let idxs = vpn.indexes();
-        let pte = &mut self.root_ppn.get_pte_array()[idxs[0]];
+    /// Used to pre-build the kernel-heap window's root-entry subtree once at
+    /// boot so that subsequent heap growth can install leaf PTEs into a
+    /// disjoint subtree without re-walking (and re-locking) the global kernel
+    /// page table.
+    pub fn ensure_subtree_root_untracked(&mut self, vpn: VirtPageNum) -> PhysPageNum {
+        debug_assert!(
+            crate::hal::page_table_levels() >= 2,
+            "kernel heap subtree caching requires a multi-level page table"
+        );
+        let idx = crate::hal::vpn_index(vpn.0, 0);
+        let pte = &mut self.root_ppn.get_pte_array()[idx];
         if !pte.is_valid() {
             let frame = frame_alloc().unwrap();
             *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);

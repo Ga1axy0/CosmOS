@@ -3,7 +3,7 @@
 
 pub mod traits;
 
-use crate::hal::traits::{AddressSpaceToken, HartId, PagingArch};
+use crate::hal::traits::{AddressSpaceToken, HartId, PTEFlags, PagingArch};
 
 #[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv::{
@@ -93,4 +93,70 @@ pub unsafe fn current_address_space_token() -> AddressSpaceToken {
 #[inline]
 pub unsafe fn flush_tlb() {
     ArchPaging::flush_tlb();
+}
+
+/// Encode one architecture-specific PTE from a physical page number and semantic flags.
+#[inline]
+pub fn make_pte(ppn: usize, flags: PTEFlags) -> usize {
+    ArchPaging::make_pte(ppn, flags)
+}
+
+/// Extract the pointed-to physical page number from one architecture-specific PTE.
+#[inline]
+pub fn pte_ppn(entry_bits: usize) -> usize {
+    ArchPaging::pte_ppn(entry_bits)
+}
+
+/// Extract the semantic flags from one architecture-specific PTE.
+#[inline]
+pub fn pte_flags(entry_bits: usize) -> PTEFlags {
+    ArchPaging::pte_flags(entry_bits)
+}
+
+/// Return the architecture's physical address width in bits.
+#[inline]
+pub const fn phys_addr_bits() -> usize {
+    ArchPaging::PA_BITS
+}
+
+/// Return the architecture's virtual address width in bits.
+#[inline]
+pub const fn virt_addr_bits() -> usize {
+    ArchPaging::VA_BITS
+}
+
+/// Return the architecture's physical page-number width in bits.
+#[inline]
+pub const fn phys_page_num_bits() -> usize {
+    ArchPaging::PPN_BITS
+}
+
+/// Return the architecture's page-table level count.
+#[inline]
+pub const fn page_table_levels() -> usize {
+    ArchPaging::LEVELS
+}
+
+/// Return the bit-width of one page-table index.
+#[inline]
+pub const fn page_table_index_bits() -> usize {
+    ArchPaging::INDEX_BITS
+}
+
+/// Return the exclusive end of the user address space.
+#[inline]
+pub fn user_space_end() -> usize {
+    ArchPaging::user_space_end()
+}
+
+/// Canonicalize one virtual address according to the current architecture.
+#[inline]
+pub fn canonicalize_vaddr(bits: usize) -> usize {
+    ArchPaging::canonicalize_vaddr(bits)
+}
+
+/// Return the page-table index at one level for the given virtual page number.
+#[inline]
+pub fn vpn_index(vpn: usize, level: usize) -> usize {
+    ArchPaging::vpn_index(vpn, level)
 }

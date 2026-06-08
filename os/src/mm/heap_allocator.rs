@@ -1,9 +1,10 @@
 //! The heap allocator.
 
 use super::frame_allocator::{frame_alloc, frame_alloc_contiguous, frame_dealloc};
-use super::page_table::PTEFlags;
-use super::{PageTableEntry, PhysPageNum, VirtAddr, KERNEL_SPACE};
-use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, MEMORY_END, PAGE_SIZE};
+use super::{PageTableEntry, PhysPageNum, PTEFlags, VirtAddr, KERNEL_SPACE};
+use crate::config::{
+    KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, MEMORY_END, PAGE_SIZE, PAGE_SIZE_BITS,
+};
 use crate::sync::SpinNoIrqLock;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
@@ -60,24 +61,33 @@ pub static KERNEL_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_HEAP_VIRTUAL_BYTES: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_HEAP_VIRTUAL_READY: AtomicBool = AtomicBool::new(false);
 
-// The dedicated heap page-table machinery below relies on the whole virtual
-// heap window living under a single Sv39 1GiB (VPN[2]) entry, i.e. one shared
-// level-1 table, so that runtime heap growth never has to touch the kernel root
-// page table (which other code mutates under `KERNEL_SPACE`).
+const ROOT_ENTRY_SPAN: usize = 1usize
+    << (PAGE_SIZE_BITS
+        + (crate::hal::page_table_levels() - 1) * crate::hal::page_table_index_bits());
+
 const _: () = assert!(
-    KERNEL_HEAP_BASE & ((1usize << 30) - 1) == 0,
-    "KERNEL_HEAP_BASE must be 1GiB-aligned"
-);
-const _: () = assert!(
-    MAX_KERNEL_HEAP_SIZE <= (1usize << 30),
-    "kernel heap window must fit within a single Sv39 1GiB (VPN[2]) entry"
+    crate::hal::page_table_levels() >= 2,
+    "kernel heap virtual window requires a multi-level page table"
 );
 
-/// Physical page number of the level-1 page table that backs the entire virtual
-/// kernel-heap window. Built once at boot (single-threaded) and cached here so
-/// that runtime [`map_heap_pages`] can install leaf PTEs without re-walking from
-/// — and re-locking — the global `KERNEL_SPACE` page table.
-static KERNEL_HEAP_L1_PPN: AtomicUsize = AtomicUsize::new(0);
+// The dedicated heap page-table machinery below relies on the whole virtual
+// heap window living under a single root page-table entry, i.e. one shared
+// first-level subtree, so that runtime heap growth never has to touch the
+// kernel root page table (which other code mutates under `KERNEL_SPACE`).
+const _: () = assert!(
+    KERNEL_HEAP_BASE & (ROOT_ENTRY_SPAN - 1) == 0,
+    "KERNEL_HEAP_BASE must be aligned to one root page-table entry span"
+);
+const _: () = assert!(
+    MAX_KERNEL_HEAP_SIZE <= ROOT_ENTRY_SPAN,
+    "kernel heap window must fit within a single root page-table entry span"
+);
+
+/// Physical page number of the first-level subtree table that backs the entire
+/// virtual kernel-heap window. Built once at boot (single-threaded) and cached
+/// here so that runtime [`map_heap_pages`] can install leaf PTEs without
+/// re-walking from — and re-locking — the global `KERNEL_SPACE` page table.
+static KERNEL_HEAP_SUBTREE_ROOT_PPN: AtomicUsize = AtomicUsize::new(0);
 
 /// Serializes page-table edits within the kernel-heap subtree.
 ///
@@ -88,20 +98,23 @@ static KERNEL_HEAP_L1_PPN: AtomicUsize = AtomicUsize::new(0);
 /// then recurse into `grow` → `map_heap_pages` → `KERNEL_SPACE.lock()` and
 /// self-deadlock on the non-reentrant lock — wedging every hart, with
 /// interrupts disabled so nothing (not even an RT task) could preempt. Because
-/// the heap window is a disjoint VPN[2] subtree, edits to it never alias the
+/// the heap window is a disjoint root-entry subtree, edits to it never alias the
 /// page-table memory `KERNEL_SPACE` touches, so a separate lock is sufficient
 /// and correct. `SpinNoIrqLock` keeps interrupts masked while held so a timer
 /// IRQ cannot re-enter the allocator on the same hart.
 static HEAP_PT_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
 
-/// Build the kernel-heap window's level-1 page table and cache its PPN.
+/// Build the kernel-heap window's first-level subtree table and cache its PPN.
 ///
 /// Must run once, single-threaded, after `KERNEL_SPACE` is active and before the
 /// first virtual-window heap growth (see [`init_heap_virtual_window`]).
 pub fn init_kernel_heap_mapping() {
     let base_vpn = VirtAddr::from(KERNEL_HEAP_BASE).floor();
-    let l1_ppn = KERNEL_SPACE.lock().page_table.ensure_l1_table_untracked(base_vpn);
-    KERNEL_HEAP_L1_PPN.store(l1_ppn.0, Ordering::Release);
+    let subtree_root_ppn = KERNEL_SPACE
+        .lock()
+        .page_table
+        .ensure_subtree_root_untracked(base_vpn);
+    KERNEL_HEAP_SUBTREE_ROOT_PPN.store(subtree_root_ppn.0, Ordering::Release);
 }
 
 struct KernelHeapAllocator {
@@ -273,36 +286,49 @@ fn alloc_bootstrap_heap_pages(pages: usize) -> Option<usize> {
     Some(start_pa.into())
 }
 
-/// Index the level-0 leaf PTE slot for a kernel-heap VA, given the (pre-built,
-/// cached) level-1 table. Allocates the level-2 leaf table on demand. Returns
-/// `None` only on frame exhaustion. The heap window is a single VPN[2] subtree,
-/// so VPN[2] is constant and we walk straight from the cached level-1 table —
-/// never touching the kernel root page table that `KERNEL_SPACE` guards.
+/// Index the leaf PTE slot for a kernel-heap VA, given the pre-built cached
+/// subtree root table. Allocates lower-level page tables on demand. Returns
+/// `None` only on frame exhaustion. The heap window is a single root-entry
+/// subtree, so we walk straight from that cached subtree root — never touching
+/// the kernel root page table that `KERNEL_SPACE` guards.
 ///
 /// Caller must hold [`HEAP_PT_LOCK`].
-fn heap_leaf_pte(l1_ppn: PhysPageNum, vpn: super::VirtPageNum) -> Option<*mut PageTableEntry> {
-    let idxs = vpn.indexes();
-    let l1 = &mut l1_ppn.get_pte_array()[idxs[1]];
-    if !l1.is_valid() {
-        let frame = frame_alloc()?;
-        *l1 = PageTableEntry::new(frame.ppn, PTEFlags::V);
-        // The leaf table is a permanent kernel mapping; never reclaimed.
-        core::mem::forget(frame);
+fn heap_leaf_pte(
+    subtree_root_ppn: PhysPageNum,
+    vpn: super::VirtPageNum,
+) -> Option<*mut PageTableEntry> {
+    let levels = crate::hal::page_table_levels();
+    let mut ppn = subtree_root_ppn;
+    for level in 1..levels {
+        let idx = crate::hal::vpn_index(vpn.0, level);
+        let pte = &mut ppn.get_pte_array()[idx];
+        if level + 1 == levels {
+            return Some(pte as *mut PageTableEntry);
+        }
+        if !pte.is_valid() {
+            let frame = frame_alloc()?;
+            *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+            // Lower-level heap page tables are permanent kernel mappings.
+            core::mem::forget(frame);
+        }
+        ppn = pte.ppn();
     }
-    let l0_ppn = l1.ppn();
-    Some(&mut l0_ppn.get_pte_array()[idxs[2]] as *mut PageTableEntry)
+    None
 }
 
 fn map_heap_pages(start_va: usize, pages: usize) -> bool {
-    let l1_ppn = PhysPageNum(KERNEL_HEAP_L1_PPN.load(Ordering::Acquire));
-    debug_assert!(l1_ppn.0 != 0, "kernel heap mapping used before init");
+    let subtree_root_ppn = PhysPageNum(KERNEL_HEAP_SUBTREE_ROOT_PPN.load(Ordering::Acquire));
+    debug_assert!(
+        subtree_root_ppn.0 != 0,
+        "kernel heap mapping used before init"
+    );
 
     let _guard = HEAP_PT_LOCK.lock();
     for page in 0..pages {
         let va = start_va + page * PAGE_SIZE;
         let vpn = VirtAddr::from(va).floor();
-        let Some(pte) = heap_leaf_pte(l1_ppn, vpn) else {
-            rollback_heap_pages(l1_ppn, start_va, page);
+        let Some(pte) = heap_leaf_pte(subtree_root_ppn, vpn) else {
+            rollback_heap_pages(subtree_root_ppn, start_va, page);
             return false;
         };
         // SAFETY: `pte` points into a leaf table reachable only through
@@ -310,11 +336,11 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         // `reserve_virtual_heap_bytes`, so no two writers target the same slot.
         let entry = unsafe { &mut *pte };
         if entry.is_valid() {
-            rollback_heap_pages(l1_ppn, start_va, page);
+            rollback_heap_pages(subtree_root_ppn, start_va, page);
             return false;
         }
         let Some(frame) = frame_alloc() else {
-            rollback_heap_pages(l1_ppn, start_va, page);
+            rollback_heap_pages(subtree_root_ppn, start_va, page);
             return false;
         };
         *entry = PageTableEntry::new(frame.ppn, PTEFlags::R | PTEFlags::W | PTEFlags::V);

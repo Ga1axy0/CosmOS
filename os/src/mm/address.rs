@@ -4,10 +4,12 @@ use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
-use crate::arch::riscv::address::{PA_WIDTH_SV39, PPN_WIDTH_SV39, VA_WIDTH_SV39};
-const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
-/// Exclusive end of the canonical low-half user virtual-address range under Sv39.
-pub const USER_SPACE_END: usize = 1usize << (VA_WIDTH_SV39 - 1);
+const VPN_WIDTH_BITS: usize = crate::hal::virt_addr_bits() - PAGE_SIZE_BITS;
+/// Exclusive end of the canonical low-half user virtual-address range.
+pub const USER_SPACE_END: usize = {
+    let _ = crate::hal::page_table_levels();
+    1usize << (crate::hal::virt_addr_bits() - 1)
+};
 
 /// Physical Address
 #[repr(C)]
@@ -58,22 +60,22 @@ impl Debug for PhysPageNum {
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+        Self(v & ((1 << crate::hal::phys_addr_bits()) - 1))
     }
 }
 impl From<usize> for PhysPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << crate::hal::phys_page_num_bits()) - 1))
     }
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VA_WIDTH_SV39) - 1))
+        Self(v & ((1 << crate::hal::virt_addr_bits()) - 1))
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << VPN_WIDTH_BITS) - 1))
     }
 }
 impl From<PhysAddr> for usize {
@@ -88,11 +90,7 @@ impl From<PhysPageNum> for usize {
 }
 impl From<VirtAddr> for usize {
     fn from(v: VirtAddr) -> Self {
-        if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
-            v.0 | (!((1 << VA_WIDTH_SV39) - 1))
-        } else {
-            v.0
-        }
+        crate::hal::canonicalize_vaddr(v.0)
     }
 }
 impl From<VirtPageNum> for usize {
@@ -163,19 +161,6 @@ impl From<PhysPageNum> for PhysAddr {
     }
 }
 
-impl VirtPageNum {
-    /// Get the indexes of the page table entry
-    pub fn indexes(&self) -> [usize; 3] {
-        let mut vpn = self.0;
-        let mut idx = [0usize; 3];
-        for i in (0..3).rev() {
-            idx[i] = vpn & 511;
-            vpn >>= 9;
-        }
-        idx
-    }
-}
-
 impl PhysAddr {
     /// Get the immutable reference of physical address
     pub fn get_ref<T>(&self) -> &'static T {
@@ -190,7 +175,8 @@ impl PhysPageNum {
     /// Get the reference of page table(array of ptes)
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512) }
+        let entry_count = 1usize << crate::hal::page_table_index_bits();
+        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, entry_count) }
     }
     /// Get the reference of page(array of bytes)
     pub fn get_bytes_array(&self) -> &'static mut [u8] {

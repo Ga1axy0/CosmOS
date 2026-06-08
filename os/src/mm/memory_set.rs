@@ -1,8 +1,7 @@
 //! Address Space [`MemorySet`] management of Process
 
 use super::{frame_alloc, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
-use super::page_table::PTEFlags;
-use super::{PageTable, PageTableEntry};
+use super::{PageTable, PageTableEntry, PTEFlags};
 use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
@@ -455,6 +454,23 @@ impl DeferredUserReclaim {
 }
 
 impl MemorySet {
+    fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {
+        let mut flags = PTEFlags::empty();
+        if map_perm.contains(MapPermission::R) {
+            flags.insert(PTEFlags::R);
+        }
+        if map_perm.contains(MapPermission::W) {
+            flags.insert(PTEFlags::W);
+        }
+        if map_perm.contains(MapPermission::X) {
+            flags.insert(PTEFlags::X);
+        }
+        if map_perm.contains(MapPermission::U) {
+            flags.insert(PTEFlags::U);
+        }
+        flags
+    }
+
     /// 完成一次会返回延迟回收 batch 的本地页表修改。
     fn finish_deferred_page_table_edit(&self) {
         // 本地 hart 可能刚刚使用过被拆除的翻译，必须先清掉本地 TLB；
@@ -1518,7 +1534,7 @@ impl MemorySet {
                 ppn
             }
         };
-        let pte_flags = PTEFlags::from_bits(map_perm.bits).unwrap();
+        let pte_flags = Self::map_perm_to_pte_flags(map_perm);
         self.page_table.map(vpn, ppn, pte_flags)?;
         Ok(())
     }
@@ -1560,7 +1576,7 @@ impl MemorySet {
         if !self.can_commit_file_page_fault(plan) {
             return Ok(PageFaultHandled::NotHandled);
         }
-        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
         if plan.shared
             && plan.map_perm.contains(MapPermission::W)
             && plan.access != PageFaultAccess::Write
@@ -1647,7 +1663,7 @@ impl MemorySet {
         if !self.can_commit_file_page_fault(plan) {
             return Ok(PageFaultHandled::NotHandled);
         }
-        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
         pte_flags.remove(PTEFlags::W);
         pte_flags.remove(PTEFlags::D);
         let ppn = page.lock().ppn();
@@ -2025,7 +2041,7 @@ impl MemorySet {
                 };
 
                 // update middle pages' PTE flags
-                let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
+                let pte_flags = Self::map_perm_to_pte_flags(permission);
                 for vpn in VPNRange::new(overlap_start, overlap_end) {
                     if self.page_table.translate(vpn).is_some() {
                         self.page_table.update_flags(vpn, pte_flags);
@@ -2038,7 +2054,7 @@ impl MemorySet {
                 new_areas.push(right_area);
             } else {
                 // no right split, area becomes the middle area
-                let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
+                let pte_flags = Self::map_perm_to_pte_flags(permission);
                 for vpn in VPNRange::new(overlap_start, overlap_end) {
                     if self.page_table.translate(vpn).is_some() {
                         self.page_table.update_flags(vpn, pte_flags);
@@ -2524,7 +2540,7 @@ impl Vma {
                 self.data_frames.insert(vpn, page);
             }
         }
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        let pte_flags = MemorySet::map_perm_to_pte_flags(self.map_perm);
         page_table.map(vpn, ppn, pte_flags)?;
         Ok(())
     }

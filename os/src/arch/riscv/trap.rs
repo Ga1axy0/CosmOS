@@ -2,6 +2,7 @@
 
 use core::arch::{asm, global_asm};
 use riscv::register::{
+    sstatus::{self, Sstatus, SPP},
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
     sie, stval, stvec,
@@ -9,7 +10,7 @@ use riscv::register::{
 use crate::config::TRAMPOLINE;
 use crate::hal::traits::{InterruptControl, TrapCause, TrapContextAbi, TrapInfo, TrapMachine};
 
-global_asm!(include_str!("../../trap/trap.S"));
+global_asm!(include_str!("trap.S"));
 
 /// RISC-V implementation of [`InterruptControl`](crate::hal::traits::InterruptControl).
 pub struct RiscvInterruptControl;
@@ -19,6 +20,30 @@ pub struct RiscvTrapMachine;
 
 /// RISC-V register-layout helpers for the common [`TrapContext`](crate::trap::TrapContext).
 pub struct RiscvTrapContextAbi;
+
+/// RISC-V trap frame layout shared with `trap.S`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RiscvTrapContextFrame {
+    /// General-purpose registers x0..x31.
+    pub x: [usize; 32],
+    /// Saved supervisor status register.
+    pub sstatus: Sstatus,
+    /// Saved exception PC.
+    pub sepc: usize,
+    /// Kernel hart id restored into `tp` on trap entry.
+    pub kernel_hartid: usize,
+    /// Kernel address-space token installed on trap entry.
+    pub kernel_satp: usize,
+    /// Kernel stack pointer used on trap entry.
+    pub kernel_sp: usize,
+    /// Common Rust trap handler entry.
+    pub trap_handler: usize,
+    /// Floating-point registers f0..f31.
+    pub f: [u64; 32],
+    /// Floating-point CSR.
+    pub fcsr: usize,
+}
 
 /// 用户态 `rt_sigreturn` trampoline 机器码。
 const USER_VDSO_CODE: [u8; 8] = [
@@ -95,81 +120,122 @@ impl TrapMachine for RiscvTrapMachine {
 }
 
 impl TrapContextAbi for RiscvTrapContextAbi {
-    type Status = riscv::register::sstatus::Sstatus;
+    type Frame = RiscvTrapContextFrame;
 
-    fn initial_user_status() -> Self::Status {
-        let mut status = riscv::register::sstatus::read();
-        status.set_spp(riscv::register::sstatus::SPP::User);
-        status
+    fn new_user_frame(
+        entry: usize,
+        sp: usize,
+        kernel_token: usize,
+        kernel_sp: usize,
+        trap_handler: usize,
+    ) -> Self::Frame {
+        let mut status = sstatus::read();
+        status.set_spp(SPP::User);
+        let mut frame = RiscvTrapContextFrame {
+            x: [0; 32],
+            sstatus: status,
+            sepc: entry,
+            kernel_hartid: 0,
+            kernel_satp: kernel_token,
+            kernel_sp,
+            trap_handler,
+            f: [0; 32],
+            fcsr: 0,
+        };
+        frame.x[2] = sp;
+        frame
     }
 
-    fn user_pc(_gprs: &[usize; 32], _status: Self::Status, pc: usize) -> usize {
-        pc
+    fn reg(frame: &Self::Frame, index: usize) -> usize {
+        frame.x[index]
     }
 
-    fn set_user_pc(
-        _gprs: &mut [usize; 32],
-        _status: &mut Self::Status,
-        pc_slot: &mut usize,
-        pc: usize,
-    ) {
-        *pc_slot = pc;
+    fn set_reg(frame: &mut Self::Frame, index: usize, value: usize) {
+        if index != 0 {
+            frame.x[index] = value;
+        }
     }
 
-    fn user_sp(gprs: &[usize; 32]) -> usize {
-        gprs[2]
+    fn user_pc(frame: &Self::Frame) -> usize {
+        frame.sepc
     }
 
-    fn set_user_sp(gprs: &mut [usize; 32], sp: usize) {
-        gprs[2] = sp;
+    fn set_user_pc(frame: &mut Self::Frame, pc: usize) {
+        frame.sepc = pc;
     }
 
-    fn ra(gprs: &[usize; 32]) -> usize {
-        gprs[1]
+    fn user_sp(frame: &Self::Frame) -> usize {
+        frame.x[2]
     }
 
-    fn set_ra(gprs: &mut [usize; 32], ra: usize) {
-        gprs[1] = ra;
+    fn set_user_sp(frame: &mut Self::Frame, sp: usize) {
+        frame.x[2] = sp;
     }
 
-    fn tls(gprs: &[usize; 32]) -> usize {
-        gprs[4]
+    fn ra(frame: &Self::Frame) -> usize {
+        frame.x[1]
     }
 
-    fn set_tls(gprs: &mut [usize; 32], tls: usize) {
-        gprs[4] = tls;
+    fn set_ra(frame: &mut Self::Frame, ra: usize) {
+        frame.x[1] = ra;
     }
 
-    fn syscall_nr(gprs: &[usize; 32]) -> usize {
-        gprs[17]
+    fn tls(frame: &Self::Frame) -> usize {
+        frame.x[4]
     }
 
-    fn syscall_args(gprs: &[usize; 32]) -> [usize; 6] {
-        [gprs[10], gprs[11], gprs[12], gprs[13], gprs[14], gprs[15]]
+    fn set_tls(frame: &mut Self::Frame, tls: usize) {
+        frame.x[4] = tls;
     }
 
-    fn syscall_ret(gprs: &[usize; 32]) -> usize {
-        gprs[10]
+    fn syscall_nr(frame: &Self::Frame) -> usize {
+        frame.x[17]
     }
 
-    fn set_syscall_ret(gprs: &mut [usize; 32], ret: usize) {
-        gprs[10] = ret;
+    fn syscall_args(frame: &Self::Frame) -> [usize; 6] {
+        [frame.x[10], frame.x[11], frame.x[12], frame.x[13], frame.x[14], frame.x[15]]
     }
 
-    fn set_user_arg(gprs: &mut [usize; 32], index: usize, value: usize) {
-        gprs[10 + index] = value;
+    fn syscall_ret(frame: &Self::Frame) -> usize {
+        frame.x[10]
     }
 
-    fn export_signal_gprs(gprs: &[usize; 32], pc: usize) -> [usize; 32] {
+    fn set_syscall_ret(frame: &mut Self::Frame, ret: usize) {
+        frame.x[10] = ret;
+    }
+
+    fn set_user_arg(frame: &mut Self::Frame, index: usize, value: usize) {
+        frame.x[10 + index] = value;
+    }
+
+    fn set_kernel_hartid(frame: &mut Self::Frame, hartid: usize) {
+        frame.kernel_hartid = hartid;
+    }
+
+    fn set_kernel_sp(frame: &mut Self::Frame, kernel_sp: usize) {
+        frame.kernel_sp = kernel_sp;
+    }
+
+    fn export_signal_gprs(frame: &Self::Frame) -> [usize; 32] {
         let mut exported = [0usize; 32];
-        exported[0] = pc;
-        exported[1..].copy_from_slice(&gprs[1..]);
+        exported[0] = frame.sepc;
+        exported[1..].copy_from_slice(&frame.x[1..]);
         exported
     }
 
-    fn import_signal_gprs(gprs: &mut [usize; 32], pc_slot: &mut usize, signal_gprs: &[usize; 32]) {
-        gprs[0] = 0;
-        gprs[1..].copy_from_slice(&signal_gprs[1..]);
-        *pc_slot = signal_gprs[0];
+    fn import_signal_gprs(frame: &mut Self::Frame, signal_gprs: &[usize; 32]) {
+        frame.x[0] = 0;
+        frame.x[1..].copy_from_slice(&signal_gprs[1..]);
+        frame.sepc = signal_gprs[0];
+    }
+
+    fn copy_fp_state_to(frame: &Self::Frame, fpregs: &mut [u64; 32], fcsr: &mut u32) {
+        fpregs.copy_from_slice(&frame.f);
+        *fcsr = frame.fcsr as u32;
+    }
+
+    fn restore_fp_state(frame: &mut Self::Frame, fpregs: &[u64; 32], fcsr: u32) {
+        frame.f.copy_from_slice(fpregs);
+        frame.fcsr = fcsr as usize;
     }
 }
