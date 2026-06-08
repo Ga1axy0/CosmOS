@@ -339,6 +339,7 @@ pub fn trap_handler() -> ! {
             handle_reschedule_ipi();
         }
         TrapCause::ExternalInterrupt => {
+            #[cfg(target_arch = "riscv64")]
             crate::drivers::plic::handle_supervisor_external();
             crate::net::poll();
         }
@@ -388,6 +389,7 @@ pub fn trap_from_kernel() {
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::ExternalInterrupt => {
+            #[cfg(target_arch = "riscv64")]
             crate::drivers::plic::handle_supervisor_external();
             crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }

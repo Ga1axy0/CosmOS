@@ -9,7 +9,12 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 32;
 /// kernel heap size
 pub const MAX_KERNEL_HEAP_SIZE: usize = 0x4000_0000;
 /// base address of the dynamically mapped kernel heap window
+#[cfg(target_arch = "riscv64")]
 pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
+/// LoongArch64: heap window in the low-half (bit 38 = 0) so PGDL is used by
+/// the hardware TLB walker. Placed far above user VAs (USER_SPACE_END=2^38).
+#[cfg(target_arch = "loongarch64")]
+pub const KERNEL_HEAP_BASE: usize = 0x0000_0038_0000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
 /// QEMU virt 1GiB 内存的物理结束地址，起始地址为 0x8000_0000。

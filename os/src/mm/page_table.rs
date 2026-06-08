@@ -92,7 +92,7 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
@@ -113,7 +113,7 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 core::mem::forget(frame);
             }
             ppn = pte.ppn();
@@ -180,7 +180,7 @@ impl PageTable {
         let pte = &mut self.root_ppn.get_pte_array()[idx];
         if !pte.is_valid() {
             let frame = frame_alloc().unwrap();
-            *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+            pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
         }
         pte.ppn()

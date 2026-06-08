@@ -22,6 +22,7 @@ fn virtio_blk_name(idx: usize) -> String {
 pub fn init() {
     chardev::init();
     rtc::init();
+    #[cfg(target_arch = "riscv64")]
     plic::init();
     probe_virtio_devices();
 }

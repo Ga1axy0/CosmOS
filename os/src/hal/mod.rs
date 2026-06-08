@@ -12,8 +12,18 @@ pub use crate::arch::riscv::{
     RiscvTrapMachine as ArchTrapMachine, Sv39Paging as ArchPaging,
 };
 
-#[cfg(feature = "platform-qemu-virt")]
+#[cfg(target_arch = "loongarch64")]
+pub use crate::arch::loongarch64::{
+    LoongArchHartId as ArchHart, LoongArchInterruptControl as ArchInterrupt,
+    LoongArchTrapContextAbi as ArchTrapContextAbi,
+    LoongArchTrapMachine as ArchTrapMachine, LoongArchPaging as ArchPaging,
+};
+
+#[cfg(target_arch = "riscv64")]
 pub use crate::platform::qemu_virt::SbiPlatform as Plat;
+
+#[cfg(target_arch = "loongarch64")]
+pub use crate::platform::loongarch_virt::LoongArchPlatform as Plat;
 
 /// Return the current hart id.
 #[inline]
@@ -93,6 +103,12 @@ pub unsafe fn current_address_space_token() -> AddressSpaceToken {
 #[inline]
 pub unsafe fn flush_tlb() {
     ArchPaging::flush_tlb();
+}
+
+/// Encode a non-leaf directory PTE (must not set GNR/GNX on LoongArch).
+#[inline]
+pub fn make_dir_entry(ppn: usize) -> usize {
+    ArchPaging::make_dir_entry(ppn)
 }
 
 /// Encode one architecture-specific PTE from a physical page number and semantic flags.

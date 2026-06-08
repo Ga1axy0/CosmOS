@@ -799,6 +799,9 @@ impl MemorySet {
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
+        // On LoongArch the trampoline lives in the DMW1 kernel window and is
+        // accessible without a page-table entry.
+        #[cfg(not(target_arch = "loongarch64"))]
         self.page_table
             .map(
             VirtAddr::from(TRAMPOLINE).into(),
@@ -812,6 +815,10 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
+        // On LoongArch, kernel sections / physical memory / MMIO are all covered by
+        // DMW windows and do not need software page-table entries.
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
         // map kernel sections
         info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
         info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
@@ -900,6 +907,7 @@ impl MemorySet {
             )
                 .expect("failed to map mmio window");
         }
+        } // end #[cfg(not(loongarch64))]
         memory_set
     }
     /// Include ELF segments and trampoline, and compute initial process VM layout.

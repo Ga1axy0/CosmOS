@@ -7,17 +7,17 @@ use crate::config::CLOCK_FREQ;
 use crate::config::MAX_HARTS;
 use crate::drivers::rtc;
 use crate::hal::hartid;
+use crate::hal::Plat;
+use crate::hal::traits::Timer as _;
 use crate::poll::{self, PollTimerTag};
 use crate::net::{handle_socket_wait_timeout, SocketTimerTag};
 use crate::signal::{handle_signal_wait_timeout, SignalTimerTag};
-use crate::sbi::set_timer;
 use crate::sync::{FutexTimerTag, SpinNoIrqLock, handle_futex_wait_timeout};
 use crate::task::{current_task, wakeup_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use core::array;
 use lazy_static::*;
-use riscv::register::time;
 /// The number of ticks per second
 pub const TICKS_PER_SEC: usize = 100;
 /// The number of milliseconds per second
@@ -36,22 +36,22 @@ static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 
 /// Get the current time in ticks
 pub fn get_time() -> usize {
-    time::read()
+    Plat::read_time()
 }
 
 /// Get the current time in milliseconds
 pub fn get_time_ms() -> usize {
-    time::read() * MSEC_PER_SEC / CLOCK_FREQ
+    get_time() * MSEC_PER_SEC / CLOCK_FREQ
 }
 
 /// get current time in microseconds
 pub fn get_time_us() -> usize {
-    time::read() * MICRO_PER_SEC / CLOCK_FREQ
+    get_time() * MICRO_PER_SEC / CLOCK_FREQ
 }
 
 /// 获取当前单调时间，单位为纳秒。
 pub fn get_time_ns() -> u64 {
-    ((time::read() as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+    ((get_time() as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
 }
 
 /// 使用“当前单调时间 + 实时时钟偏移”得到 `CLOCK_REALTIME`，单位为纳秒。
@@ -87,7 +87,7 @@ pub fn init_realtime_offset_from_rtc() {
 
 /// Get current time in clock ticks used by times(2).
 pub fn get_time_ticks() -> usize {
-    time::read() * TICKS_PER_SEC / CLOCK_FREQ
+    get_time() * TICKS_PER_SEC / CLOCK_FREQ
 }
 
 /// Convert a raw timer counter delta into clock ticks used by times(2).
@@ -272,7 +272,7 @@ fn program_next_trigger_for_hart(hart: usize, now_raw: usize) {
         None => periodic_raw,
     };
     let now_raw = now_raw as u64;
-    set_timer(next_raw.max(now_raw.saturating_add(1)) as usize);
+    Plat::set_next(next_raw.max(now_raw.saturating_add(1)) as usize);
 }
 
 /// Check if the timer has expired for the current hart.

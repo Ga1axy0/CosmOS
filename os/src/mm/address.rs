@@ -5,6 +5,22 @@ use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
 const VPN_WIDTH_BITS: usize = crate::hal::virt_addr_bits() - PAGE_SIZE_BITS;
+
+/// Convert a physical address to a kernel virtual address for direct access.
+///
+/// On RiscV the kernel is linked at its physical address so this is a no-op.
+/// On LoongArch the kernel lives in the DMW1 cached window, so physical
+/// addresses need the 0x9000_0000_0000_0000 prefix to be accessible.
+#[inline(always)]
+pub fn phys_to_virt(pa: usize) -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        use crate::board::KERNEL_ADDR_OFFSET;
+        pa | KERNEL_ADDR_OFFSET
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    pa
+}
 /// Exclusive end of the canonical low-half user virtual-address range.
 pub const USER_SPACE_END: usize = {
     let _ = crate::hal::page_table_levels();
@@ -70,12 +86,18 @@ impl From<usize> for PhysPageNum {
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << crate::hal::virt_addr_bits()) - 1))
+        #[cfg(target_arch = "loongarch64")]
+        return Self(v);
+        #[cfg(not(target_arch = "loongarch64"))]
+        return Self(v & ((1 << crate::hal::virt_addr_bits()) - 1));
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VPN_WIDTH_BITS) - 1))
+        #[cfg(target_arch = "loongarch64")]
+        return Self(v >> PAGE_SIZE_BITS);
+        #[cfg(not(target_arch = "loongarch64"))]
+        return Self(v & ((1 << VPN_WIDTH_BITS) - 1));
     }
 }
 impl From<PhysAddr> for usize {
@@ -164,11 +186,11 @@ impl From<PhysPageNum> for PhysAddr {
 impl PhysAddr {
     /// Get the immutable reference of physical address
     pub fn get_ref<T>(&self) -> &'static T {
-        unsafe { (self.0 as *const T).as_ref().unwrap() }
+        unsafe { (phys_to_virt(self.0) as *const T).as_ref().unwrap() }
     }
     /// Get the mutable reference of physical address
     pub fn get_mut<T>(&self) -> &'static mut T {
-        unsafe { (self.0 as *mut T).as_mut().unwrap() }
+        unsafe { (phys_to_virt(self.0) as *mut T).as_mut().unwrap() }
     }
 }
 impl PhysPageNum {
@@ -176,12 +198,12 @@ impl PhysPageNum {
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
         let entry_count = 1usize << crate::hal::page_table_index_bits();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, entry_count) }
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa.0) as *mut PageTableEntry, entry_count) }
     }
     /// Get the reference of page(array of bytes)
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa.0) as *mut u8, 4096) }
     }
     /// Get the mutable reference of physical address
     pub fn get_mut<T>(&self) -> &'static mut T {

@@ -47,6 +47,7 @@ fn clear_bss() {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 global_asm!(
     r#"
     .section .text.entry
@@ -54,6 +55,17 @@ global_asm!(
 _start:
     mv a0, sp
     call __user_start
+"#
+);
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+_start:
+    move $a0, $sp
+    bl __user_start
 "#
 );
 

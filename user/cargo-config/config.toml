@@ -4,4 +4,10 @@ target = "riscv64gc-unknown-none-elf"
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-Clink-args=-Tsrc/linker.ld",
+    "-Ctarget-feature=+f,+d",
+]
+
+[target.loongarch64-unknown-none]
+rustflags = [
+    "-Clink-args=-Tsrc/linker-loongarch64.ld",
 ]

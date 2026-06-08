@@ -192,6 +192,13 @@ pub trait PagingArch {
     unsafe fn flush_tlb();
     /// Encode one leaf/intermediate PTE for this architecture.
     fn make_pte(ppn: usize, flags: PTEFlags) -> usize;
+    /// Encode a non-leaf directory entry pointing to the next page-table level.
+    /// Architectures where leaf and directory entries have different encodings
+    /// (e.g. LoongArch, which must NOT set GNR/GNX in directory entries) should
+    /// override this. Default: delegates to make_pte with V only.
+    fn make_dir_entry(ppn: usize) -> usize {
+        Self::make_pte(ppn, PTEFlags::V)
+    }
     /// Extract the pointed-to physical page number from one raw PTE.
     fn pte_ppn(entry_bits: usize) -> usize;
     /// Extract the semantic flags from one raw PTE.

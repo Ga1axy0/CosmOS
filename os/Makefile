@@ -1,5 +1,19 @@
 # Building
-TARGET := riscv64gc-unknown-none-elf
+ARCH ?= riscv64
+ifeq ($(ARCH),loongarch64)
+	TARGET := loongarch64-unknown-none
+	QEMU ?= qemu-system-loongarch64
+	OBJDUMP := rust-objdump --arch-name=loongarch64
+	OBJCOPY := rust-objcopy --binary-architecture=loongarch64
+	LOONGARCH_BIOS ?= /usr/local/share/qemu/edk2-loongarch64-code.fd
+	LOONGARCH_BOOT_MODE ?= direct
+	LOONGARCH_BOOTLOADER := ../bootloader/loongarch64-direct/target/loongarch64-unknown-none/release/loongarch64-direct-boot
+else
+	TARGET := riscv64gc-unknown-none-elf
+	QEMU ?= qemu-system-riscv64
+	OBJDUMP := rust-objdump --arch-name=riscv64
+	OBJCOPY := rust-objcopy --binary-architecture=riscv64
+endif
 MODE ?= release
 KERNEL_ELF = target/$(TARGET)/$(MODE)/os
 KERNEL_BIN = $(KERNEL_ELF).bin
@@ -19,9 +33,6 @@ OFFLINE :=
 # BOARD
 BOARD := qemu
 SBI ?= rustsbi
-
-# QEMU
-QEMU ?= qemu-system-riscv64
 QEMU_VERSION := $(shell $(QEMU) --version 2>/dev/null | head -n1 | sed -E 's/.*version ([0-9.]+).*/\1/')
 QEMU_MAJOR := $(shell echo "$(QEMU_VERSION)" | cut -d. -f1)
 
@@ -42,11 +53,7 @@ QEMU_EXTRA_ARGS ?=
 MODE_ARG = $(if $(filter release,$(MODE)),--release)
 
 # KERNEL ENTRY
-KERNEL_ENTRY_PA := 0x80200000
-
-# Binutils
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
+KERNEL_ENTRY_PA := $(if $(filter $(ARCH),loongarch64),0x90000000,0x80200000)
 
 # Disassembly
 DISASM ?= -x
@@ -54,13 +61,20 @@ DISASM ?= -x
 build: env kernel fs-img
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
+ifeq ($(ARCH),loongarch64)
+bootloader:
+	@cd ../bootloader/loongarch64-direct && cargo build --release
+else
+bootloader:
+	@true
+endif
+
 env:
 ifeq ($(OFFLINE),)
-	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
-	# 评测镜像已预装 cargo-binutils；缺失时才尝试安装。
-	command -v rust-objcopy >/dev/null || cargo install cargo-binutils
-	# rust-objcopy/rust-objdump 依赖 llvm-tools-preview。
-	rustup component list --installed | grep -q "llvm-tools-preview" || rustup component add llvm-tools-preview
+	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
+	cargo install cargo-binutils
+	rustup component add rust-src
+	rustup component add llvm-tools-preview
 endif
 
 fs-img:
@@ -80,20 +94,20 @@ fs-img:
 				exit 2; \
 			fi; \
 			echo "Injecting user apps into base ext4 image: $(BASE_IMG)"; \
-			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/$(USER_MODE)/ -t $(FS_IMG) -f $(MAIN_FS) --ext4-base $(BASE_IMG); \
+			cd ../fs-fuse && cargo run --release -- -s ../user/target/$(TARGET)/$(USER_MODE)/ -t $(FS_IMG) -f $(MAIN_FS) --ext4-base $(BASE_IMG); \
 		else \
 			rm -f $(FS_IMG); \
 			echo "Packing fresh $(MAIN_FS) image from user apps."; \
-			cd ../fs-fuse && cargo run --release -- -s ../user/target/riscv64gc-unknown-none-elf/$(USER_MODE)/ -t $(FS_IMG) -f $(MAIN_FS); \
+			cd ../fs-fuse && cargo run --release -- -s ../user/target/$(TARGET)/$(USER_MODE)/ -t $(FS_IMG) -f $(MAIN_FS); \
 		fi; \
 	fi
 
 kernel:
 	@echo Platform: $(BOARD)
 ifeq ($(QEMU7_CFG),--cfg qemu7)
-	@LOG=$(LOG) cargo rustc $(MODE_ARG) --no-default-features --features $(MAIN_FS) -- --cfg qemu7
+	@LOG=$(LOG) cargo rustc $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) -- --cfg qemu7
 else
-	@LOG=$(LOG) cargo build $(MODE_ARG) --no-default-features --features $(MAIN_FS)
+	@LOG=$(LOG) cargo build $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS)
 endif
 
 clean:
@@ -108,7 +122,7 @@ disasm-vim: kernel
 	@vim $(DISASM_TMP)
 	@rm $(DISASM_TMP)
 
-run: build run-inner
+run: build bootloader run-inner
 
 run-trace: build run-inner-trace
 
@@ -117,6 +131,27 @@ fast-run: kernel
 	@$(MAKE) run-inner
 
 run-inner:
+ifeq ($(ARCH),loongarch64)
+ifeq ($(LOONGARCH_BOOT_MODE),direct)
+	@$(QEMU) \
+		-m 4G \
+		-machine virt \
+		-cpu la464 \
+		-smp $(SMP) \
+		-nographic \
+		-kernel $(LOONGARCH_BOOTLOADER) \
+		-device loader,file=$(KERNEL_ELF),addr=$(KERNEL_ENTRY_PA)
+else
+	@$(QEMU) \
+		-m 4G \
+		-machine virt \
+		-cpu la464 \
+		-smp $(SMP) \
+		-nographic \
+		-bios $(LOONGARCH_BIOS) \
+		-device loader,file=$(KERNEL_ELF),addr=$(KERNEL_ENTRY_PA)
+endif
+else
 	@$(QEMU) \
 		-m $(MEM) \
 		-machine virt \
@@ -127,9 +162,10 @@ run-inner:
 		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778,hostfwd=udp::7778-:7778 \
         -device virtio-net-device,netdev=net0,id=net0 \
 		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
-        # -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
+		# -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
 		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
 		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+endif
 #	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
 
 run-inner-trace:

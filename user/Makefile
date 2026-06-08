@@ -1,4 +1,13 @@
-TARGET := riscv64gc-unknown-none-elf
+ARCH ?= riscv64
+ifeq ($(ARCH),loongarch64)
+	TARGET := loongarch64-unknown-none
+	OBJDUMP := rust-objdump --arch-name=loongarch64
+	OBJCOPY := rust-objcopy --binary-architecture=loongarch64
+else
+	TARGET := riscv64gc-unknown-none-elf
+	OBJDUMP := rust-objdump --arch-name=riscv64
+	OBJCOPY := rust-objcopy --binary-architecture=riscv64
+endif
 MODE := release
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)

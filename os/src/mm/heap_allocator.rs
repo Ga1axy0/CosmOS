@@ -1,7 +1,7 @@
 //! The heap allocator.
 
 use super::frame_allocator::{frame_alloc, frame_alloc_contiguous, frame_dealloc};
-use super::{PageTableEntry, PhysPageNum, PTEFlags, VirtAddr, KERNEL_SPACE};
+use super::{phys_to_virt, PageTableEntry, PhysPageNum, PTEFlags, VirtAddr, KERNEL_SPACE};
 use crate::config::{
     KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, MEMORY_END, PAGE_SIZE, PAGE_SIZE_BITS,
 };
@@ -114,6 +114,9 @@ pub fn init_kernel_heap_mapping() {
         .lock()
         .page_table
         .ensure_subtree_root_untracked(base_vpn);
+    if subtree_root_ppn.0 == 0 {
+        panic!("ensure_subtree_root_untracked returned PPN 0");
+    }
     KERNEL_HEAP_SUBTREE_ROOT_PPN.store(subtree_root_ppn.0, Ordering::Release);
 }
 
@@ -213,10 +216,19 @@ pub fn init_heap() {
 
 pub fn init_heap_virtual_window() {
     KERNEL_HEAP_VIRTUAL_READY.store(true, Ordering::Release);
+    #[cfg(target_arch = "loongarch64")]
+    crate::early_puts("[heap] grow start\r\n");
     assert!(
         HEAP_ALLOCATOR.grow(KERNEL_HEAP_GROW_SIZE),
         "failed to initialize virtual kernel heap"
     );
+    #[cfg(target_arch = "loongarch64")]
+    crate::early_puts("[heap] grow done\r\n");
+}
+
+/// Map a single heap VA page. Called from trap_from_kernel on LoongArch.
+pub fn map_one_heap_page(va: usize) -> bool {
+    map_heap_pages(va, 1)
 }
 
 fn layout_required_bytes(layout: Layout) -> Option<usize> {
@@ -283,7 +295,7 @@ fn alloc_bootstrap_heap_pages(pages: usize) -> Option<usize> {
     let first = frames.start_ppn();
     core::mem::forget(frames);
     let start_pa: super::PhysAddr = first.into();
-    Some(start_pa.into())
+    Some(phys_to_virt(start_pa.into()))
 }
 
 /// Index the leaf PTE slot for a kernel-heap VA, given the pre-built cached
@@ -293,22 +305,29 @@ fn alloc_bootstrap_heap_pages(pages: usize) -> Option<usize> {
 /// the kernel root page table that `KERNEL_SPACE` guards.
 ///
 /// Caller must hold [`HEAP_PT_LOCK`].
+/// Walk from `subtree_root_ppn` (which PGDL's root[0] already points to) down
+/// to the leaf PTE slot for `vpn`.  `subtree_root_ppn` is at depth 1, so we
+/// walk exactly `levels - 2` more directory hops before reaching the leaf table.
+///
+/// Caller must hold [`HEAP_PT_LOCK`].
 fn heap_leaf_pte(
     subtree_root_ppn: PhysPageNum,
     vpn: super::VirtPageNum,
 ) -> Option<*mut PageTableEntry> {
     let levels = crate::hal::page_table_levels();
     let mut ppn = subtree_root_ppn;
+    // Walk levels 1 .. levels-1 (directories), then return the leaf slot at level levels-1.
     for level in 1..levels {
         let idx = crate::hal::vpn_index(vpn.0, level);
         let pte = &mut ppn.get_pte_array()[idx];
         if level + 1 == levels {
+            // This pte slot IS the leaf PTE (will be filled by map_heap_pages).
             return Some(pte as *mut PageTableEntry);
         }
         if !pte.is_valid() {
             let frame = frame_alloc()?;
-            *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
-            // Lower-level heap page tables are permanent kernel mappings.
+            frame.ppn.get_bytes_array().fill(0);
+            pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
         }
         ppn = pte.ppn();
@@ -317,13 +336,17 @@ fn heap_leaf_pte(
 }
 
 fn map_heap_pages(start_va: usize, pages: usize) -> bool {
+    #[cfg(target_arch = "loongarch64")]
+    crate::early_puts("[heap] map_heap_pages\r\n");
     let subtree_root_ppn = PhysPageNum(KERNEL_HEAP_SUBTREE_ROOT_PPN.load(Ordering::Acquire));
-    debug_assert!(
-        subtree_root_ppn.0 != 0,
-        "kernel heap mapping used before init"
-    );
-
+    if subtree_root_ppn.0 == 0 {
+        panic!("map_heap_pages: subtree root ppn is 0");
+    }
+    #[cfg(target_arch = "loongarch64")]
+    crate::early_puts("[heap] locking HEAP_PT_LOCK\r\n");
     let _guard = HEAP_PT_LOCK.lock();
+    #[cfg(target_arch = "loongarch64")]
+    crate::early_puts("[heap] HEAP_PT_LOCK locked\r\n");
     for page in 0..pages {
         let va = start_va + page * PAGE_SIZE;
         let vpn = VirtAddr::from(va).floor();
@@ -347,6 +370,8 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         core::mem::forget(frame);
     }
     unsafe { crate::hal::flush_tlb() };
+    #[cfg(target_arch = "loongarch64")]
+    crate::early_puts("[heap] pages mapped, flush done\r\n");
     true
 }
 

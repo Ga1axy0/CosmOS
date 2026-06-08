@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 use crate::hal::traits::HartId;
-use riscv::{asm::wfi, register::{mstatus::FS, sstatus}};
+use riscv::{asm::wfi, register::{mstatus::{set_fs, FS}, sstatus}};
 
 /// RISC-V implementation of [`HartId`](crate::hal::traits::HartId) via the `tp` register.
 pub struct RiscvHartId;
@@ -22,7 +22,7 @@ impl HartId for RiscvHartId {
 
     #[inline]
     unsafe fn enable_fp() {
-        sstatus::set_fs(FS::Initial);
+        set_fs(FS::Initial);
     }
 
     #[inline]

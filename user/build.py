@@ -3,6 +3,7 @@ import os
 base_address = 0x80400000
 step = 0x20000
 linker = "src/linker.ld"
+target = os.getenv("TARGET", "riscv64gc-unknown-none-elf")
 
 app_id = 0
 apps = os.listdir("build/app")
@@ -17,8 +18,8 @@ else :
 for app in apps:
     app = app[: app.find(".")]
     os.system(
-        "cargo rustc --bin %s %s -- -Clink-args=-Ttext=%x"
-        % (app, mode_arg, base_address + step * app_id)
+        "cargo rustc --target %s --bin %s %s -- -Clink-args=-Ttext=%x"
+        % (target, app, mode_arg, base_address + step * app_id)
     )
     print(
         "[build.py] application %s start with address %s"

@@ -33,7 +33,12 @@ extern crate alloc;
 #[macro_use]
 extern crate bitflags;
 
+#[cfg(target_arch = "riscv64")]
 #[path = "boards/qemu.rs"]
+mod board;
+
+#[cfg(target_arch = "loongarch64")]
+#[path = "boards/loongarch_virt.rs"]
 mod board;
 
 pub mod arch;
@@ -173,6 +178,7 @@ fn print_boot_stage(stage: &str, detail: &str) {
 fn init_local_hart(hart_id: usize) {
     trap::init_hart();
     timer::init_hart();
+    #[cfg(target_arch = "riscv64")]
     drivers::plic::init_hart(hart_id);
     mm::mark_online(hart_id);
     debug!("hart {} local init done", hart_id);
@@ -195,6 +201,7 @@ fn detect_hart_count() -> usize {
     hart_count.max(1)
 }
 
+#[cfg(target_arch = "riscv64")]
 /// 记录当前环境下各 hart 的 HSM 状态，并尝试拉起处于 stopped 状态的 hart。
 ///
 /// 这里的目标不是“盲目对所有 hart 重复 `hart_start`”，而是先看清固件报告的
@@ -284,11 +291,29 @@ fn wait_for_bootstrap() {
     }
 }
 
+/// Bootstrap-phase bare UART write (DMW0 window, before drivers::init).
+#[cfg(target_arch = "loongarch64")]
+pub fn early_puts(s: &str) {
+    const UART: usize = 0x8000_0000_1fe0_01e0;
+    for b in s.bytes() {
+        unsafe {
+            while core::ptr::read_volatile((UART + 5) as *const u8) & 0x20 == 0 {}
+            core::ptr::write_volatile(UART as *mut u8, b);
+        }
+    }
+}
+
 /// bootstrap hart 的主入口
 fn first_hart_main(hart_id: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
+    #[cfg(target_arch = "loongarch64")] early_puts("[K] trap::init\r\n");
+    // Install TLB refill handler and page-walker CSRs before activating page tables.
+    trap::init();
+    #[cfg(target_arch = "loongarch64")] early_puts("[K] mm::init\r\n");
     mm::init();
+    #[cfg(target_arch = "loongarch64")] early_puts("[K] klog::init\r\n");
+    #[cfg(not(target_arch = "loongarch64"))]
     mm::remap_test();
     klog::init();
     let hart_count = detect_hart_count();
@@ -339,9 +364,23 @@ pub fn rust_main(hart_id: usize) -> ! {
     unsafe {
         riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
     }
-    if !try_claim_bootstrap_hart(hart_id) {
-        secondary_hart_main(hart_id);
-    } else {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // LoongArch64 bring-up currently follows a single-bootstrap-hart path.
+        if !try_claim_bootstrap_hart(hart_id) {
+            secondary_hart_main(hart_id);
+        }
         first_hart_main(hart_id);
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        unsafe {
+            riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
+        }
+        if !try_claim_bootstrap_hart(hart_id) {
+            secondary_hart_main(hart_id);
+        } else {
+            first_hart_main(hart_id);
+        }
     }
 }
