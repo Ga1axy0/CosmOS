@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use crate::config::CLOCK_FREQ;
 use crate::config::MAX_HARTS;
 use crate::drivers::rtc;
-use crate::hart::hartid;
+use crate::hal::hartid;
 use crate::poll::{self, PollTimerTag};
 use crate::net::{handle_socket_wait_timeout, SocketTimerTag};
 use crate::signal::{handle_signal_wait_timeout, SignalTimerTag};

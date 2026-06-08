@@ -15,7 +15,7 @@
 mod context;
 
 use crate::config::{PAGE_SIZE, TRAMPOLINE};
-use crate::hart::hartid;
+use crate::hal::hartid;
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
 use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::{syscall, syscall_supports_sa_restart};

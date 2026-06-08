@@ -3,6 +3,8 @@
 
 pub mod traits;
 
+use crate::hal::traits::HartId;
+
 #[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv::{
     RiscvHartId as ArchHart, RiscvInterruptControl as ArchInterrupt,
@@ -11,3 +13,9 @@ pub use crate::arch::riscv::{
 
 #[cfg(feature = "platform-qemu-virt")]
 pub use crate::platform::qemu_virt::SbiPlatform as Plat;
+
+/// Return the current hart id.
+#[inline]
+pub fn hartid() -> usize {
+    ArchHart::current()
+}

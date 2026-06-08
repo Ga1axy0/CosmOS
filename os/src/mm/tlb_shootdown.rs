@@ -1,7 +1,9 @@
 //! TLB shootdown state and deferred recycle helpers.
 
 use super::{kernel_token, FrameTracker};
-use crate::hart::hartid;
+use crate::arch::riscv::Sv39Paging;
+use crate::hal::hartid;
+use crate::hal::traits::{AddressSpaceToken, PagingArch};
 use crate::sbi::send_ipi_mask;
 use crate::sync::{SpinLock, SpinNoIrqLock};
 use alloc::vec::Vec;
@@ -9,7 +11,6 @@ use core::arch::asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::*;
-use riscv::register::satp;
 
 /// 一个处于 deferred 状态的内核虚拟地址区间。
 #[derive(Copy, Clone)]
@@ -31,8 +32,8 @@ pub enum ShootdownKind {
     /// 时可能已经从用户态切入内核，但仍需要完成本地 flush 并 ack。
     /// TODO：引入 ASID 后，应把这里改成按 ASID 或地址范围精确刷新。
     AddressSpace {
-        /// 目标地址空间的 satp token。
-        satp: usize,
+        /// 目标地址空间的架构 token。
+        token: AddressSpaceToken,
     },
 }
 
@@ -52,8 +53,8 @@ struct TlbShootdownState {
     online_hart_mask: AtomicUsize,
     /// 当前请求类型编码。
     kind_bits: AtomicUsize,
-    /// 当前请求附带的 satp 参数。
-    arg_satp: AtomicUsize,
+    /// 当前请求附带的地址空间 token 参数。
+    arg_token: AtomicUsize,
 }
 
 impl TlbShootdownState {
@@ -66,7 +67,7 @@ impl TlbShootdownState {
             ack_mask: AtomicUsize::new(0),
             online_hart_mask: AtomicUsize::new(0),
             kind_bits: AtomicUsize::new(0),
-            arg_satp: AtomicUsize::new(0),
+            arg_token: AtomicUsize::new(0),
         }
     }
 }
@@ -287,13 +288,13 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind) {
     let target_mask = hart_mask & online_mask & !self_bit;
     let seq = TLB_SHOOTDOWN_STATE.seq.load(Ordering::Acquire) + 1;
 
-    let (kind_bits, arg_satp) = encode_shootdown_kind(kind);
+    let (kind_bits, arg_token) = encode_shootdown_kind(kind);
     TLB_SHOOTDOWN_STATE
         .kind_bits
         .store(kind_bits, Ordering::Release);
     TLB_SHOOTDOWN_STATE
-        .arg_satp
-        .store(arg_satp, Ordering::Release);
+        .arg_token
+        .store(arg_token, Ordering::Release);
     TLB_SHOOTDOWN_STATE
         .target_mask
         .store(target_mask, Ordering::Release);
@@ -377,7 +378,7 @@ pub fn handle_ipi() {
     }
     let kind = decode_shootdown_kind(
         TLB_SHOOTDOWN_STATE.kind_bits.load(Ordering::Acquire),
-        TLB_SHOOTDOWN_STATE.arg_satp.load(Ordering::Acquire),
+        TLB_SHOOTDOWN_STATE.arg_token.load(Ordering::Acquire),
     );
     let seq = TLB_SHOOTDOWN_STATE.seq.load(Ordering::Acquire);
     trace!(
@@ -398,14 +399,14 @@ pub fn handle_ipi() {
 fn encode_shootdown_kind(kind: ShootdownKind) -> (usize, usize) {
     match kind {
         ShootdownKind::Global => (KIND_GLOBAL, 0),
-        ShootdownKind::AddressSpace { satp } => (KIND_ADDRESS_SPACE, satp),
+        ShootdownKind::AddressSpace { token } => (KIND_ADDRESS_SPACE, token),
     }
 }
 
 /// 从全局请求槽解码出当前请求语义。
-fn decode_shootdown_kind(kind_bits: usize, arg_satp: usize) -> ShootdownKind {
+fn decode_shootdown_kind(kind_bits: usize, arg_token: usize) -> ShootdownKind {
     match kind_bits {
-        KIND_ADDRESS_SPACE => ShootdownKind::AddressSpace { satp: arg_satp },
+        KIND_ADDRESS_SPACE => ShootdownKind::AddressSpace { token: arg_token },
         _ => ShootdownKind::Global,
     }
 }
@@ -414,12 +415,12 @@ fn decode_shootdown_kind(kind_bits: usize, arg_satp: usize) -> ShootdownKind {
 fn perform_local_tlb_shootdown(kind: ShootdownKind) {
     match kind {
         ShootdownKind::Global => local_sfence_vma_all(),
-        ShootdownKind::AddressSpace { satp: target_satp } => {
+        ShootdownKind::AddressSpace { token: target_token } => {
             // 目标 hart 可能是在用户态收到 IPI 后刚切入内核，因此当前 satp
             // 可能已经是 kernel_token；此时仍然要完成本地 flush 并回 ack。
             // TODO：引入 ASID 后，应避免把 kernel_token 情况退化成全量 flush。
-            let current_satp = satp::read().bits();
-            if current_satp == target_satp || current_satp == kernel_token() {
+            let current_token = unsafe { Sv39Paging::current_token() };
+            if current_token == target_token || current_token == kernel_token() {
                 local_sfence_vma_all();
             }
         }

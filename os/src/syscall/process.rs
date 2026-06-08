@@ -7,7 +7,7 @@ use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
-    hart::hartid,
+    hal::hartid,
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{

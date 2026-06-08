@@ -405,16 +405,13 @@ pub fn sys_sigreturn() -> isize {
 
         // Restore registers from mcontext
         let mcontext = &ucontext.uc_mcontext;
-        trap_cx.import_signal_gprs(&mcontext.gregs);
+        mcontext.apply_to_trap_context(trap_cx);
 
         debug!(
             "sys_sigreturn: restored sepc={:#x}, a0={:#x}",
             trap_cx.user_pc(),
             trap_cx.syscall_ret()
         );
-
-        // Restore floating-point registers
-        trap_cx.restore_fp_state(&mcontext.fpstate.fpregs, mcontext.fpstate.fcsr);
 
         // Return the original a0 value (which was saved in the trap context)
         Ok(trap_cx.syscall_ret() as isize)

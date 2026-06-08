@@ -7,7 +7,8 @@
 use super::__switch;
 use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
-use crate::hart::hartid;
+use crate::hal::hartid;
+use crate::hal::traits::AddressSpaceToken;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
 use crate::timer::{get_time, get_time_ns};
@@ -174,8 +175,8 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
     current_task().unwrap().process.upgrade().unwrap()
 }
 
-/// Get the current user token(addr of page table)
-pub fn current_user_token() -> usize {
+/// Get the current user address-space token.
+pub fn current_user_token() -> AddressSpaceToken {
     let task = current_task().unwrap();
     task.get_user_token()
 }

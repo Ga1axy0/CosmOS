@@ -2,7 +2,7 @@
 
 use super::current_task;
 use crate::config::MAX_HARTS;
-use crate::hart::hartid;
+use crate::hal::hartid;
 use crate::mm::online_mask as online_hart_mask;
 use crate::sbi::send_ipi_mask;
 use crate::sched::{request_current_task_resched, CFS_WAKEUP_GRANULARITY_NS};

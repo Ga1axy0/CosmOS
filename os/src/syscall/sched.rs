@@ -4,7 +4,7 @@ use crate::syscall::{read_pod_from_user, write_bytes_to_user, write_pod_to_user,
 use crate::syscall_body;
 use crate::{
     config::MAX_HARTS,
-    hart::hartid,
+    hal::hartid,
     mm::{online_mask as online_hart_mask, translated_byte_buffer, translated_ref},
     sched::{
         enqueue_task_on, has_runnable_task_at_or_above, nice_to_weight, pid2process, remove_task,

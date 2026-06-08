@@ -66,18 +66,25 @@ pub trait HartId {
     unsafe fn init(id: usize);
 }
 
-/// Arch-level paging operations (SV39 on RISC-V).
+/// Opaque address-space activation token used by the current architecture.
+pub type AddressSpaceToken = usize;
+
+/// Arch-level paging operations.
 pub trait PagingArch {
     /// Page-table entry type.
     type Entry: Copy;
-    /// Value written to satp MODE field.
-    const SATP_MODE: usize;
+    /// Architecture-specific mode bits embedded in the root token.
+    const ROOT_TOKEN_MODE: usize;
     /// Number of page-table levels.
     const LEVELS: usize;
-    /// Activate the given root PPN and flush TLB.
-    unsafe fn activate(root_ppn: usize);
-    /// Read current satp token.
-    unsafe fn current_token() -> usize;
+    /// Build an architecture token from a root page-table physical page number.
+    fn make_token(root_ppn: usize) -> AddressSpaceToken;
+    /// Extract the root page-table physical page number from an architecture token.
+    fn root_ppn(token: AddressSpaceToken) -> usize;
+    /// Activate the given address-space token and flush the local TLB.
+    unsafe fn activate_token(token: AddressSpaceToken);
+    /// Read current address-space token.
+    unsafe fn current_token() -> AddressSpaceToken;
     /// Flush entire TLB.
     unsafe fn flush_tlb();
 }

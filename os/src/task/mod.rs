@@ -504,7 +504,7 @@ pub fn check_itimers_of_all_processes(now_raw: usize, now_realtime_ns: u64) {
     if process::armed_itimers_count() == 0 {
         return;
     }
-    if crate::hart::hartid() != 0 {
+    if crate::hal::hartid() != 0 {
         return;
     }
     let processes: Vec<Arc<ProcessControlBlock>> = {

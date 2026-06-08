@@ -13,8 +13,9 @@ use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
     FileDescription,
 };
-use crate::hal::{ArchTrapMachine};
-use crate::hal::traits::TrapMachine;
+use crate::hal::ArchTrapMachine;
+use crate::hal::traits::{AddressSpaceToken, PagingArch, TrapMachine};
+use crate::arch::riscv::Sv39Paging;
 use crate::sync::SpinNoIrqLock;
 use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
@@ -27,7 +28,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::Inode;
 use lazy_static::*;
-use riscv::register::satp;
 
 extern "C" {
     fn stext();
@@ -69,7 +69,7 @@ lazy_static! {
 }
 
 /// the kernel token
-pub fn kernel_token() -> usize {
+pub fn kernel_token() -> AddressSpaceToken {
     KERNEL_SPACE.lock().token()
 }
 /// 用于稳定标识一个底层 inode。
@@ -450,7 +450,7 @@ impl DeferredUserReclaim {
                 self.token,
                 self.mask
             );
-            shootdown(self.mask, ShootdownKind::AddressSpace { satp: self.token });
+            shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
         }
         // self 在函数返回时析构，batch 的 Drop 会真正释放旧页引用。
     }
@@ -475,7 +475,7 @@ impl MemorySet {
         }
     }
     /// Get he page table token
-    pub fn token(&self) -> usize {
+    pub fn token(&self) -> AddressSpaceToken {
         self.page_table.token()
     }
     /// 标记某个 hart 即将返回用户态并装载该地址空间。
@@ -532,7 +532,7 @@ impl MemorySet {
             self.token(),
             mask
         );
-        shootdown(mask, ShootdownKind::AddressSpace { satp: self.token() });
+        shootdown(mask, ShootdownKind::AddressSpace { token: self.token() });
     }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
@@ -1121,12 +1121,10 @@ impl MemorySet {
         }
         Ok((memory_set, parent_tlb_needs_flush))
     }
-    /// Change page table by writing satp CSR Register.
+    /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
-        let satp = self.page_table.token();
         unsafe {
-            satp::write(satp);
-            asm!("sfence.vma");
+            Sv39Paging::activate_token(self.page_table.token());
         }
     }
     /// Translate a virtual page number to a page table entry

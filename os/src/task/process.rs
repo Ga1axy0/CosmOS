@@ -16,6 +16,7 @@ use crate::mm::{
     MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
     UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
+use crate::hal::traits::AddressSpaceToken;
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
@@ -645,8 +646,8 @@ fn load_process_image(
 
 impl ProcessControlBlockInner {
     #[allow(unused)]
-    /// get the address of app's page table
-    pub fn get_user_token(&self) -> usize {
+/// get the current user address-space token
+    pub fn get_user_token(&self) -> AddressSpaceToken {
         self.memory_set.token()
     }
     fn nofile_limit(&self) -> usize {
@@ -1109,7 +1110,7 @@ impl ProcessControlBlock {
                 parent_token,
                 parent_mask
             );
-            shootdown(parent_mask, ShootdownKind::AddressSpace { satp: parent_token });
+            shootdown(parent_mask, ShootdownKind::AddressSpace { token: parent_token });
         }
         debug!(
             "[cow] clone_process created child process: parent_pid={} child_pid={}",
@@ -1593,7 +1594,7 @@ impl ProcessControlBlock {
                 token,
                 mask
             );
-            shootdown(mask, ShootdownKind::AddressSpace { satp: token });
+            shootdown(mask, ShootdownKind::AddressSpace { token });
         }
         ok
     }
@@ -1698,7 +1699,7 @@ impl ProcessControlBlock {
     pub fn enter_kernel(&self, now: usize) {
         let mut inner = self.inner.lock();
         // trap 入口已经切到内核页表并做过本地 sfence.vma，此 hart 不再持有该用户 mm。
-        inner.memory_set.mark_user_unloaded(crate::hart::hartid());
+        inner.memory_set.mark_user_unloaded(crate::hal::hartid());
         match inner.accounting_state {
             CpuAccountingState::User => {
                 inner.user_time = inner
@@ -1725,7 +1726,7 @@ impl ProcessControlBlock {
         inner.accounting_state = CpuAccountingState::User;
         inner.accounting_timestamp = now;
         // 即将跳回用户态，后续其他 hart 修改该 mm 时需要把当前 hart 作为 shootdown 目标。
-        inner.memory_set.mark_user_loaded(crate::hart::hartid());
+        inner.memory_set.mark_user_loaded(crate::hal::hartid());
     }
 
     /// Flush the current running slice into the corresponding accumulator.

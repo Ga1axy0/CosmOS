@@ -19,20 +19,3 @@ impl HartId for RiscvHartId {
         asm!("mv tp, {}", in(reg) id);
     }
 }
-
-/// Read current hart id from `tp`.
-#[inline]
-pub fn hartid() -> usize {
-    RiscvHartId::current()
-}
-
-/// Write hart id to `tp` and return it.
-pub fn init_with_hartid(hart_id: usize) -> usize {
-    unsafe { RiscvHartId::init(hart_id) };
-    hart_id
-}
-
-/// Compatibility shim: return hart id without modifying `tp`.
-pub fn init() -> usize {
-    hartid()
-}

@@ -45,7 +45,6 @@ mod console;
 pub mod config;
 pub mod drivers;
 pub mod fs;
-pub mod hart;
 pub mod ipc;
 pub mod keys;
 pub mod lang_items;
@@ -66,6 +65,8 @@ pub mod trap;
 use core::arch::global_asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::hal::traits::HartId;
+use crate::hal::ArchHart;
 
 global_asm!(include_str!("entry.asm"));
 
@@ -339,7 +340,7 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 /// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
 pub fn rust_main(hart_id: usize) -> ! {
-    let _hart_id = hart::init_with_hartid(hart_id);
+    unsafe { ArchHart::init(hart_id) };
     unsafe {
         riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
     }

@@ -5,7 +5,7 @@ use super::{
     defer_task_release_after_switch, has_runnable_task_at_or_above, schedule, take_current_task,
     TaskContext,
 };
-use crate::hart::hartid;
+use crate::hal::hartid;
 use crate::sched::CFS_YIELD_PENALTY_NS;
 use crate::task::{ReschedReason, SchedPolicy, TaskStatus, WaitReason};
 use crate::timer::{get_time, get_time_ns};

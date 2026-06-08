@@ -4,6 +4,8 @@ use super::{
     VirtAddr, VirtPageNum,
 };
 use crate::config::PAGE_SIZE;
+use crate::arch::riscv::Sv39Paging;
+use crate::hal::traits::{AddressSpaceToken, PagingArch};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -88,9 +90,9 @@ impl PageTable {
         })
     }
     /// Temporarily used to get arguments from user space.
-    pub fn from_token(satp: usize) -> Self {
+    pub fn from_token(token: AddressSpaceToken) -> Self {
         Self {
-            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
+            root_ppn: PhysPageNum::from(Sv39Paging::root_ppn(token)),
             frames: Vec::new(),
         }
     }
@@ -247,8 +249,8 @@ impl PageTable {
         })
     }
     /// get the token from the page table
-    pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0
+    pub fn token(&self) -> AddressSpaceToken {
+        Sv39Paging::make_token(self.root_ppn.0)
     }
 }
 
@@ -268,10 +270,7 @@ fn checked_user_range(start: usize, len: usize) -> Option<usize> {
 }
 
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
-    if len == 0 {
-        return Some(Vec::new());
-    }
+pub fn translated_byte_buffer(token: AddressSpaceToken, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = checked_user_range(start, len)?;
@@ -296,7 +295,7 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Optio
 }
 
 /// Create String in kernel address space from u8 Array(end with 0) in other address space
-pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
+pub fn translated_str(token: AddressSpaceToken, ptr: *const u8) -> Option<String> {
     let page_table = PageTable::from_token(token);
     let mut string = String::new();
     let mut va = ptr as usize;
@@ -319,7 +318,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
 }
 
 /// translate a pointer `ptr` in other address space to a immutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
-pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
+pub fn translated_ref<T>(token: AddressSpaceToken, ptr: *const T) -> Option<&'static T> {
     let page_table = PageTable::from_token(token);
     checked_user_range(ptr as usize, core::mem::size_of::<T>().max(1))?;
     page_table
@@ -328,7 +327,7 @@ pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
 }
 
 /// translate a pointer `ptr` in other address space to a mutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {
+pub fn translated_refmut<T>(token: AddressSpaceToken, ptr: *mut T) -> Option<&'static mut T> {
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
     checked_user_range(va, core::mem::size_of::<T>().max(1))?;

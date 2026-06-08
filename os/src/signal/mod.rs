@@ -237,11 +237,7 @@ pub fn handle_signals() -> Option<i32> {
             .bits()
     };
 
-    let mut mcontext = MContext {
-        gregs: trap_cx.export_signal_gprs(),
-        fpstate: FpState::default(),
-    };
-    trap_cx.copy_fp_state_to(&mut mcontext.fpstate.fpregs, &mut mcontext.fpstate.fcsr);
+    let mut mcontext = MContext::from_trap_context(trap_cx);
 
     // Syscall restart: if the signal interrupted a syscall that returned -EINTR
     // and SA_RESTART is set, back up PC to the ecall instruction and restore
