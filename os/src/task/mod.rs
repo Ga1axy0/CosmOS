@@ -20,7 +20,7 @@ use crate::sched::{
     add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
     take_current_task, TaskContext,
 };
-use crate::fs::{open_file, OpenFlags};
+use crate::fs::{open_file_at, OpenFlags};
 use crate::syscall::write_process_accounting_on_exit;
 use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
@@ -263,9 +263,8 @@ lazy_static! {
     /// the name "initproc" may be changed to any other app name like "usertests",
     /// but we have user_shell, so we don't need to change it.
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("initproc", OpenFlags::RDONLY).expect("Initproc not found! Rebuild image to include initproc.");
-        let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice(), String::from("/initproc"))
+        open_file_at("/", "/sbin/init", OpenFlags::RDONLY).expect("Init binary not found at /sbin/init! Rebuild image to include rootfs init.");
+        ProcessControlBlock::new(String::from("/sbin/init"))
     };
     static ref TID2TASK: crate::sync::SpinNoIrqLock<BTreeMap<usize, alloc::sync::Weak<TaskControlBlock>>> =
         crate::sync::SpinNoIrqLock::new(BTreeMap::new());

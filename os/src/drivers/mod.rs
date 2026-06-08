@@ -14,6 +14,10 @@ use virtio_drivers::transport::{DeviceType, mmio::{MmioTransport, VirtIOHeader}}
 
 use crate::drivers::{block::{BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ, VirtIOBlock}, net::VirtIONetDevice};
 
+fn virtio_blk_name(idx: usize) -> String {
+    alloc::format!("vd{}", (b'a' + idx as u8) as char)
+}
+
 /// Initialize all drivers (block, char, PLIC, …).
 pub fn init() {
     chardev::init();
@@ -73,11 +77,7 @@ pub fn probe_virtio_devices() {
 
                 if let Some(dev) = VirtIOBlock::try_new(transport) {
                     let dev = Arc::new(dev);
-                    let name: String = if idx > 0 {
-                        alloc::format!("vda{}", (idx + 1))
-                    } else {
-                        "vda".into()
-                    };
+                    let name: String = virtio_blk_name(idx);
                     debug!("[kernel] block device {} idx {} at {:#x}", name, idx, addr);
                     map.insert(name, dev.clone());
                     irq_map.insert(VIRTIO_MMIO_IRQ_BASE + slot as u32, dev);

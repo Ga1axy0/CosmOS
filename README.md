@@ -1,2 +1,2 @@
-## xxOS
+## CosmOS
 Does noe have name yet...

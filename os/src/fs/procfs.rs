@@ -523,7 +523,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
 }
 
 /// Render the permission column (`rwxp`) for a `/proc/<pid>/maps` line.
-/// xxOS has no per-VMA shared/private bit on anonymous regions, so file
+/// CosmOS has no per-VMA shared/private bit on anonymous regions, so file
 /// mappings report `s` when shared and everything else reports `p`.
 fn maps_perm_string(perm: MapPermission, shared: bool) -> [u8; 4] {
     [

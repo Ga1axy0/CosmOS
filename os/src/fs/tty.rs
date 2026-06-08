@@ -1,4 +1,5 @@
 use super::{File, Stat, StatMode};
+use fs::vfs::{VfsFileType, VfsNode};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::{translated_ref, translated_refmut, UserBuffer};
 use crate::poll::{notify_poll_source, POLLIN};
@@ -51,8 +52,19 @@ const IFLAG_INLCR: u32 = 0x0000_0040;
 /// termios input flag: map CR -> NL on input.
 const IFLAG_ICRNL: u32 = 0x0000_0100;
 /// termios input flag: enable XON/XOFF output flow control (defined, not yet honored).
-#[allow(dead_code)]
 const IFLAG_IXON: u32 = 0x0000_0400;
+
+/// termios output flag: perform implementation-defined output processing.
+const OFLAG_OPOST: u32 = 0x0000_0001;
+/// termios output flag: map NL to CR-NL on output.
+const OFLAG_ONLCR: u32 = 0x0000_0004;
+
+/// termios control flag: 8-bit characters.
+const CFLAG_CS8: u32 = 0x0000_0030;
+/// termios control flag: enable receiver.
+const CFLAG_CREAD: u32 = 0x0000_0080;
+/// termios control flag: default console baud selector (B38400 in asm-generic/termbits.h).
+const CFLAG_B38400: u32 = 0x0000_000f;
 
 /// termios local flag: enable signal-generating characters (INTR/QUIT/SUSP).
 const LFLAG_ISIG: u32 = 0x0000_0001;
@@ -184,11 +196,12 @@ impl Default for Termios {
     /// 返回与 Linux N_TTY 初始值一致的终端配置。
     fn default() -> Self {
         Self {
-            // ICRNL: 将回车映射为换行，贴近交互式终端默认输入处理。
-            iflag: IFLAG_ICRNL,
-            // 输出后处理暂未实现，保持透传以免破坏既有输出行为。
-            oflag: 0,
-            cflag: 0,
+            // 贴近 Linux N_TTY 默认值：回车映射为换行，并允许软件流控字符被识别。
+            iflag: IFLAG_ICRNL | IFLAG_IXON,
+            // 贴近控制台默认输出：将单个 newline 映射为 CRLF。
+            oflag: OFLAG_OPOST | OFLAG_ONLCR,
+            // 给用户态一个正常“8-bit + receiver enabled”的串口配置，避免出现 cs5/-cread。
+            cflag: CFLAG_B38400 | CFLAG_CS8 | CFLAG_CREAD,
             // 行规程默认开启信号字符、规范模式与回显。
             lflag: LFLAG_ISIG
                 | LFLAG_ICANON
@@ -888,5 +901,116 @@ impl File for TtyFile {
 
     fn stat(&self) -> Stat {
         Self::stat_impl()
+    }
+}
+
+
+/// tty device node flavor exported under `/dev`.
+#[derive(Clone, Copy, Debug)]
+pub enum TtyDeviceKind {
+    /// `/dev/console` bound to the global console tty.
+    Console,
+    /// `/dev/tty` bound to the current controlling console tty.
+    Tty,
+}
+
+/// VFS node exposing the global console tty through a device path in `/dev`.
+#[derive(Debug)]
+pub struct TtyDeviceNode {
+    kind: TtyDeviceKind,
+    rdev: u64,
+}
+
+impl TtyDeviceNode {
+    /// Create a tty device node with the given visible kind and device number.
+    pub fn new(kind: TtyDeviceKind, rdev: u64) -> Self {
+        Self { kind, rdev }
+    }
+
+    fn core(&self) -> Arc<TtyCore> {
+        console_tty()
+    }
+
+    /// Handle tty-related ioctls through the shared console backend.
+    pub fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        let file = TtyFile::new(self.core(), true, true);
+        file.ioctl(req, arg)
+    }
+}
+
+impl VfsNode for TtyDeviceNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn ls(&self) -> alloc::vec::Vec<(alloc::string::String, VfsFileType)> {
+        alloc::vec::Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Char
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> usize {
+        let core = self.core();
+        core.adopt_controlling_if_unset();
+        let mut n = 0usize;
+        for byte in buf.iter_mut() {
+            match core.read_blocking() {
+                Ok(Some(ch)) => {
+                    *byte = ch;
+                    n += 1;
+                    if !core.has_ready_input() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        n
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let core = self.core();
+        let _tx_guard = core.tx_lock.lock();
+        for &ch in buf {
+            core.write_byte(ch);
+        }
+        buf.len()
+    }
+
+    fn rdev(&self) -> u64 {
+        self.rdev
+    }
+
+    fn mode(&self) -> Option<u32> {
+        Some(StatMode::CHAR.bits())
+    }
+
+    fn uid(&self) -> Option<u32> {
+        Some(0)
+    }
+
+    fn gid(&self) -> Option<u32> {
+        Some(0)
+    }
+
+    fn size(&self) -> usize {
+        0
     }
 }

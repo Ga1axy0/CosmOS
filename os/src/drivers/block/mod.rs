@@ -14,6 +14,10 @@ use lazy_static::*;
 use core::ptr::NonNull;
 use virtio_drivers::transport::{DeviceType, mmio::{MmioTransport, VirtIOHeader}};
 
+fn virtio_blk_name(idx: usize) -> String {
+    alloc::format!("vd{}", (b'a' + idx as u8) as char)
+}
+
 #[inline]
 fn mmio_slot_device_type(header: NonNull<VirtIOHeader>) -> Option<DeviceType> {
     // VirtIO MMIO register layout: magic(0x00), version(0x04), device_id(0x08).
@@ -87,11 +91,7 @@ pub fn probe_block_devices() {
         if let Some(dev) = VirtIOBlock::try_new(transport) {
             let dev = Arc::new(dev);
             // let name = alloc::format!("vd{}", (b'a' + idx as u8) as char);
-            let name = if idx > 0 {
-                alloc::format!("vda{}", (idx + 1))
-            } else {
-                "vda".into()
-            };
+            let name = virtio_blk_name(idx);
             debug!("[kernel] block device {} idx {} at {:#x}", name, idx, addr);
             map.insert(name, dev.clone());
             irq_map.insert(VIRTIO_MMIO_IRQ_BASE + slot as u32, dev);
