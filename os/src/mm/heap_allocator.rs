@@ -9,7 +9,6 @@ use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use riscv::register::sstatus;
 
 #[global_allocator]
 static HEAP_ALLOCATOR: KernelHeapAllocator = KernelHeapAllocator::new();
@@ -38,8 +37,8 @@ struct HeapIrqGuard {
 impl HeapIrqGuard {
     #[inline]
     fn new() -> Self {
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
+        let sie_was_enabled = crate::hal::local_irqs_enabled();
+        unsafe { crate::hal::disable_local_irqs() };
         Self { sie_was_enabled }
     }
 }
@@ -48,7 +47,7 @@ impl Drop for HeapIrqGuard {
     #[inline]
     fn drop(&mut self) {
         if self.sie_was_enabled {
-            unsafe { sstatus::set_sie() };
+            unsafe { crate::hal::enable_local_irqs() };
         }
     }
 }
@@ -321,9 +320,7 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         *entry = PageTableEntry::new(frame.ppn, PTEFlags::R | PTEFlags::W | PTEFlags::V);
         core::mem::forget(frame);
     }
-    unsafe {
-        core::arch::asm!("sfence.vma");
-    }
+    unsafe { crate::hal::flush_tlb() };
     true
 }
 
@@ -340,9 +337,7 @@ fn rollback_heap_pages(l1_ppn: PhysPageNum, start_va: usize, pages: usize) {
             }
         }
     }
-    unsafe {
-        core::arch::asm!("sfence.vma");
-    }
+    unsafe { crate::hal::flush_tlb() };
 }
 
 #[allow(unused)]

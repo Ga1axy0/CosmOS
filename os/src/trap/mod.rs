@@ -3,10 +3,9 @@
 //! For rCore, we have a single trap entry point, namely `__alltraps`. At
 //! initialization in [`init()`], we set the `stvec` CSR to point to it.
 //!
-//! All traps go through `__alltraps`, which is defined in `trap.S`. The
-//! assembly language code does just enough work restore the kernel space
-//! context, ensuring that Rust code safely runs, and transfers control to
-//! [`trap_handler()`].
+//! All traps go through an architecture-defined trampoline. The assembly code
+//! does just enough work restore the kernel space context, ensuring that Rust
+//! code safely runs, and transfers control to [`trap_handler()`].
 //!
 //! It then calls different functionality based on what exactly the exception
 //! was. For example, timer interrupts trigger task preemption, and syscalls go
@@ -14,7 +13,7 @@
 
 mod context;
 
-use crate::config::{PAGE_SIZE, TRAMPOLINE};
+use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
 use crate::signal::{SignalBit, handle_signals};
@@ -26,11 +25,8 @@ use crate::task::{
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
-use core::arch::global_asm;
 use crate::hal::{ArchInterrupt, ArchTrapMachine};
 use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine};
-
-global_asm!(include_str!("trap.S"));
 
 /// 输出用户态致命异常现场，区分 fault 地址、用户 PC 与关键寄存器。
 fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {

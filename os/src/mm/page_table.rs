@@ -92,7 +92,7 @@ impl PageTable {
     /// Temporarily used to get arguments from user space.
     pub fn from_token(token: AddressSpaceToken) -> Self {
         Self {
-            root_ppn: PhysPageNum::from(Sv39Paging::root_ppn(token)),
+            root_ppn: PhysPageNum::from(crate::hal::root_ppn_from_token(token)),
             frames: Vec::new(),
         }
     }
@@ -250,7 +250,7 @@ impl PageTable {
     }
     /// get the token from the page table
     pub fn token(&self) -> AddressSpaceToken {
-        Sv39Paging::make_token(self.root_ppn.0)
+        crate::hal::make_address_space_token(self.root_ppn.0)
     }
 }
 

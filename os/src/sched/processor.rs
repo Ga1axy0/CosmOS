@@ -7,7 +7,7 @@
 use super::__switch;
 use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
-use crate::hal::hartid;
+use crate::hal::{enable_irqs_and_wait, hartid};
 use crate::hal::traits::AddressSpaceToken;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
@@ -132,9 +132,7 @@ pub(crate) fn run_tasks() {
 
             crate::trap::set_kernel_trap_entry();
 
-            unsafe { riscv::register::sstatus::set_sie() };
-            unsafe { riscv::asm::wfi() };
-            unsafe { riscv::register::sstatus::clear_sie() };
+            unsafe { enable_irqs_and_wait() };
         }
     }
 }

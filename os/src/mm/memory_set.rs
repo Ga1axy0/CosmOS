@@ -14,8 +14,7 @@ use crate::fs::{
     FileDescription,
 };
 use crate::hal::ArchTrapMachine;
-use crate::hal::traits::{AddressSpaceToken, PagingArch, TrapMachine};
-use crate::arch::riscv::Sv39Paging;
+use crate::hal::traits::{AddressSpaceToken, TrapMachine};
 use crate::sync::SpinNoIrqLock;
 use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
@@ -24,7 +23,6 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::Inode;
 use lazy_static::*;
@@ -462,7 +460,7 @@ impl MemorySet {
         // 本地 hart 可能刚刚使用过被拆除的翻译，必须先清掉本地 TLB；
         // 远端 hart 的同步由调用方构造 `DeferredUserReclaim` 后在锁外完成。
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
     }
 
@@ -1115,7 +1113,7 @@ impl MemorySet {
         }
         if parent_tlb_needs_flush {
             unsafe {
-                asm!("sfence.vma");
+                crate::hal::flush_tlb();
             }
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
@@ -1124,7 +1122,7 @@ impl MemorySet {
     /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
         unsafe {
-            Sv39Paging::activate_token(self.page_table.token());
+            crate::hal::activate_address_space(self.page_table.token());
         }
     }
     /// Translate a virtual page number to a page table entry
@@ -1150,7 +1148,7 @@ impl MemorySet {
         }
         self.vmas.clear();
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
     }
 
@@ -1249,7 +1247,7 @@ impl MemorySet {
         if let Some(area) = self.vmas.get_mut(&start.floor()) {
             area.shrink_present_to(&mut self.page_table, new_end.ceil());
             unsafe {
-                asm!("sfence.vma");
+                crate::hal::flush_tlb();
             }
             true
         } else {
@@ -1314,7 +1312,7 @@ impl MemorySet {
         );
         self.register_vma_metadata(Vma::new_anonymous(start_va, end_va, permission))?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         Ok(())
     }
@@ -1343,7 +1341,7 @@ impl MemorySet {
             None,
         )?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         Ok(())
     }
@@ -1545,7 +1543,7 @@ impl MemorySet {
         }
         self.map_private_page_in_vma(vpn)?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         Ok(PageFaultHandled::Handled)
     }
@@ -1585,7 +1583,7 @@ impl MemorySet {
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} writable={} path={:?}",
@@ -1662,7 +1660,7 @@ impl MemorySet {
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[cow] install MAP_PRIVATE readonly cache page: vpn={:#x} page_idx={} ppn={:#x} access={:?} path={:?}",
@@ -1710,7 +1708,7 @@ impl MemorySet {
         // 首次写 fault 时立即把 page cache 页记脏，避免等待 teardown 才传播脏状态。
         mark_cached_page_dirty(&page);
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[mmap] shared write-notify fault: vpn={:#x} ppn={:#x} path={:?}",
@@ -1883,7 +1881,7 @@ impl MemorySet {
         let src = page_guard.ppn().get_bytes_array();
         dst.copy_from_slice(src);
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[cow] materialize MAP_PRIVATE page on first write fault: vpn={:#x} page_idx={} dst_ppn={:#x} path={:?}",
@@ -2055,7 +2053,7 @@ impl MemorySet {
         self.rebuild_vmas_from_vec(new_areas);
         self.merge_adjacent_vmas();
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         true
     }

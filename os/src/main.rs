@@ -11,7 +11,7 @@
 //! - [`fs`]: Separate user from file system with some structures
 //!
 //! The operating system also starts in this module. Kernel code starts
-//! executing from `entry.asm`, after which [`rust_main()`] is called to
+//! executing from the architecture entry assembly, after which [`rust_main()`] is called to
 //! initialize various pieces of functionality. (See its source code for
 //! details.)
 //!
@@ -62,13 +62,8 @@ pub mod task;
 pub mod timer;
 pub mod trap;
 
-use core::arch::global_asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::hal::traits::HartId;
-use crate::hal::ArchHart;
-
-global_asm!(include_str!("entry.asm"));
 
 const ANSI_RESET: &str = "\u{1b}[0m";
 const ANSI_FRAME: &str = "\u{1b}[38;5;45m";
@@ -340,7 +335,7 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 /// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
 pub fn rust_main(hart_id: usize) -> ! {
-    unsafe { ArchHart::init(hart_id) };
+    unsafe { crate::hal::init_with_hartid(hart_id) };
     unsafe {
         riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
     }

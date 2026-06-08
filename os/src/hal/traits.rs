@@ -64,6 +64,61 @@ pub trait HartId {
     fn current() -> usize;
     /// Write hart id to arch register at boot.
     unsafe fn init(id: usize);
+    /// Enable the local floating-point unit for subsequent kernel/user execution.
+    unsafe fn enable_fp();
+    /// Return whether local interrupts are currently enabled on this hart.
+    fn irqs_enabled() -> bool;
+    /// Disable local interrupts on this hart.
+    unsafe fn disable_irqs();
+    /// Enable local interrupts on this hart.
+    unsafe fn enable_irqs();
+    /// Wait for the next interrupt/event while keeping the current interrupt state.
+    unsafe fn wait_for_interrupt();
+    /// Enter the architecture-specific idle wait sequence used by the scheduler.
+    unsafe fn enable_irqs_and_wait() {
+        Self::enable_irqs();
+        Self::wait_for_interrupt();
+        Self::disable_irqs();
+    }
+}
+
+/// Architecture-specific user trap-context ABI helpers.
+pub trait TrapContextAbi {
+    /// Saved status-register representation carried inside the trap context.
+    type Status: Copy;
+
+    /// Return a status value prepared for first return to user mode.
+    fn initial_user_status() -> Self::Status;
+    /// Return the saved user PC from the trap context.
+    fn user_pc(gprs: &[usize; 32], status: Self::Status, pc: usize) -> usize;
+    /// Set the saved user PC in the trap context.
+    fn set_user_pc(gprs: &mut [usize; 32], status: &mut Self::Status, pc_slot: &mut usize, pc: usize);
+    /// Return the saved user SP from the trap context.
+    fn user_sp(gprs: &[usize; 32]) -> usize;
+    /// Set the saved user SP in the trap context.
+    fn set_user_sp(gprs: &mut [usize; 32], sp: usize);
+    /// Return the saved return-address register.
+    fn ra(gprs: &[usize; 32]) -> usize;
+    /// Set the saved return-address register.
+    fn set_ra(gprs: &mut [usize; 32], ra: usize);
+    /// Return the saved TLS/thread-pointer register.
+    fn tls(gprs: &[usize; 32]) -> usize;
+    /// Set the saved TLS/thread-pointer register.
+    fn set_tls(gprs: &mut [usize; 32], tls: usize);
+    /// Return the saved syscall number.
+    fn syscall_nr(gprs: &[usize; 32]) -> usize;
+    /// Return the saved syscall arguments.
+    fn syscall_args(gprs: &[usize; 32]) -> [usize; 6];
+    /// Return the saved syscall return value.
+    fn syscall_ret(gprs: &[usize; 32]) -> usize;
+    /// Set the saved syscall return value.
+    fn set_syscall_ret(gprs: &mut [usize; 32], ret: usize);
+    /// Set one syscall/user argument register.
+    fn set_user_arg(gprs: &mut [usize; 32], index: usize, value: usize);
+    /// Export the Linux-compatible signal GPR layout.
+    fn export_signal_gprs(gprs: &[usize; 32], pc: usize) -> [usize; 32];
+    /// Import the Linux-compatible signal GPR layout back into the trap context.
+    fn import_signal_gprs(gprs: &mut [usize; 32], pc_slot: &mut usize, signal_gprs: &[usize; 32]);
 }
 
 /// Opaque address-space activation token used by the current architecture.

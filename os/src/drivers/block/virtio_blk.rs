@@ -2,7 +2,6 @@ use super::BlockDevice;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueueKeyed, WaitReason};
 use core::hint::spin_loop;
-use riscv::register::sstatus;
 use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk},
     transport::mmio::MmioTransport,
@@ -146,7 +145,7 @@ impl VirtIOBlock {
 
     fn wait_token(&self, token: u16) {
         // TODO Enable kernel interrupt in more cases.
-        let irq_disabled = !sstatus::read().sie();
+        let irq_disabled = !crate::hal::local_irqs_enabled();
         if current_task().is_none() || irq_disabled {
             while !self.token_ready(token) {
                 spin_loop();

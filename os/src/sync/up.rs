@@ -9,8 +9,6 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use riscv::register::sstatus;
-
 /// Wrap a static data structure inside a spinlock with interrupt masking.
 ///
 /// `exclusive_access()` returns a guard that holds the lock and disables
@@ -41,8 +39,8 @@ impl<T> UPSafeCell<T> {
     ///
     /// Disables supervisor interrupts and spins until the lock is acquired.
     pub fn exclusive_access(&self) -> UPSafeCellGuard<'_, T> {
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
+        let sie_was_enabled = crate::hal::local_irqs_enabled();
+        unsafe { crate::hal::disable_local_irqs() };
 
         while self
             .locked
@@ -50,10 +48,10 @@ impl<T> UPSafeCell<T> {
             .is_err()
         {
             if sie_was_enabled {
-                unsafe { sstatus::set_sie() };
+                unsafe { crate::hal::enable_local_irqs() };
             }
             core::hint::spin_loop();
-            unsafe { sstatus::clear_sie() };
+            unsafe { crate::hal::disable_local_irqs() };
         }
 
         UPSafeCellGuard {
@@ -86,7 +84,7 @@ impl<T> Drop for UPSafeCellGuard<'_, T> {
     fn drop(&mut self) {
         self.cell.locked.store(false, Ordering::Release);
         if self.sie_was_enabled {
-            unsafe { sstatus::set_sie() };
+            unsafe { crate::hal::enable_local_irqs() };
         }
     }
 }
@@ -115,8 +113,8 @@ impl<T> UPIntrFreeCell<T> {
 
     /// Get exclusive access with interrupts disabled + spinlock.
     pub fn exclusive_access(&self) -> UPIntrFreeCellRefMut<'_, T> {
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
+        let sie_was_enabled = crate::hal::local_irqs_enabled();
+        unsafe { crate::hal::disable_local_irqs() };
 
         while self
             .locked
@@ -124,10 +122,10 @@ impl<T> UPIntrFreeCell<T> {
             .is_err()
         {
             if sie_was_enabled {
-                unsafe { sstatus::set_sie() };
+                unsafe { crate::hal::enable_local_irqs() };
             }
             core::hint::spin_loop();
-            unsafe { sstatus::clear_sie() };
+            unsafe { crate::hal::disable_local_irqs() };
         }
 
         UPIntrFreeCellRefMut {
@@ -162,7 +160,7 @@ impl<T> Drop for UPIntrFreeCellRefMut<'_, T> {
     fn drop(&mut self) {
         self.cell.locked.store(false, Ordering::Release);
         if self.sie_was_enabled {
-            unsafe { sstatus::set_sie() };
+            unsafe { crate::hal::enable_local_irqs() };
         }
     }
 }

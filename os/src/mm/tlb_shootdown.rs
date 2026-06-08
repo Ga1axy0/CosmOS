@@ -1,13 +1,11 @@
 //! TLB shootdown state and deferred recycle helpers.
 
 use super::{kernel_token, FrameTracker};
-use crate::arch::riscv::Sv39Paging;
 use crate::hal::hartid;
-use crate::hal::traits::{AddressSpaceToken, PagingArch};
+use crate::hal::traits::AddressSpaceToken;
 use crate::sbi::send_ipi_mask;
 use crate::sync::{SpinLock, SpinNoIrqLock};
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::*;
@@ -419,7 +417,7 @@ fn perform_local_tlb_shootdown(kind: ShootdownKind) {
             // 目标 hart 可能是在用户态收到 IPI 后刚切入内核，因此当前 satp
             // 可能已经是 kernel_token；此时仍然要完成本地 flush 并回 ack。
             // TODO：引入 ASID 后，应避免把 kernel_token 情况退化成全量 flush。
-            let current_token = unsafe { Sv39Paging::current_token() };
+            let current_token = unsafe { crate::hal::current_address_space_token() };
             if current_token == target_token || current_token == kernel_token() {
                 local_sfence_vma_all();
             }
@@ -437,7 +435,5 @@ fn shootdown_kind_name(kind: ShootdownKind) -> &'static str {
 
 /// 在当前 hart 上执行一次全量 `sfence.vma`。
 fn local_sfence_vma_all() {
-    unsafe {
-        asm!("sfence.vma");
-    }
+    unsafe { crate::hal::flush_tlb() }
 }

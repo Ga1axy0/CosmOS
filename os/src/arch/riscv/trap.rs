@@ -1,19 +1,24 @@
 //! RISC-V interrupt control, implementing [`InterruptControl`](crate::hal::traits::InterruptControl).
 
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
     sie, stval, stvec,
 };
 use crate::config::TRAMPOLINE;
-use crate::hal::traits::{InterruptControl, TrapCause, TrapInfo, TrapMachine};
+use crate::hal::traits::{InterruptControl, TrapCause, TrapContextAbi, TrapInfo, TrapMachine};
+
+global_asm!(include_str!("../../trap/trap.S"));
 
 /// RISC-V implementation of [`InterruptControl`](crate::hal::traits::InterruptControl).
 pub struct RiscvInterruptControl;
 
 /// RISC-V implementation of trap decoding and user-return operations.
 pub struct RiscvTrapMachine;
+
+/// RISC-V register-layout helpers for the common [`TrapContext`](crate::trap::TrapContext).
+pub struct RiscvTrapContextAbi;
 
 /// 用户态 `rt_sigreturn` trampoline 机器码。
 const USER_VDSO_CODE: [u8; 8] = [
@@ -86,5 +91,85 @@ impl TrapMachine for RiscvTrapMachine {
 
     fn rt_sigreturn_trampoline() -> &'static [u8] {
         &USER_VDSO_CODE
+    }
+}
+
+impl TrapContextAbi for RiscvTrapContextAbi {
+    type Status = riscv::register::sstatus::Sstatus;
+
+    fn initial_user_status() -> Self::Status {
+        let mut status = riscv::register::sstatus::read();
+        status.set_spp(riscv::register::sstatus::SPP::User);
+        status
+    }
+
+    fn user_pc(_gprs: &[usize; 32], _status: Self::Status, pc: usize) -> usize {
+        pc
+    }
+
+    fn set_user_pc(
+        _gprs: &mut [usize; 32],
+        _status: &mut Self::Status,
+        pc_slot: &mut usize,
+        pc: usize,
+    ) {
+        *pc_slot = pc;
+    }
+
+    fn user_sp(gprs: &[usize; 32]) -> usize {
+        gprs[2]
+    }
+
+    fn set_user_sp(gprs: &mut [usize; 32], sp: usize) {
+        gprs[2] = sp;
+    }
+
+    fn ra(gprs: &[usize; 32]) -> usize {
+        gprs[1]
+    }
+
+    fn set_ra(gprs: &mut [usize; 32], ra: usize) {
+        gprs[1] = ra;
+    }
+
+    fn tls(gprs: &[usize; 32]) -> usize {
+        gprs[4]
+    }
+
+    fn set_tls(gprs: &mut [usize; 32], tls: usize) {
+        gprs[4] = tls;
+    }
+
+    fn syscall_nr(gprs: &[usize; 32]) -> usize {
+        gprs[17]
+    }
+
+    fn syscall_args(gprs: &[usize; 32]) -> [usize; 6] {
+        [gprs[10], gprs[11], gprs[12], gprs[13], gprs[14], gprs[15]]
+    }
+
+    fn syscall_ret(gprs: &[usize; 32]) -> usize {
+        gprs[10]
+    }
+
+    fn set_syscall_ret(gprs: &mut [usize; 32], ret: usize) {
+        gprs[10] = ret;
+    }
+
+    fn set_user_arg(gprs: &mut [usize; 32], index: usize, value: usize) {
+        gprs[10 + index] = value;
+    }
+
+    fn export_signal_gprs(gprs: &[usize; 32], pc: usize) -> [usize; 32] {
+        let mut exported = [0usize; 32];
+        exported[0] = pc;
+        exported[1..].copy_from_slice(&gprs[1..]);
+        exported
+    }
+
+    fn import_signal_gprs(gprs: &mut [usize; 32], pc_slot: &mut usize, signal_gprs: &[usize; 32]) {
+        gprs[0] = 0;
+        gprs[1..].copy_from_slice(&signal_gprs[1..]);
+        *pc_slot = signal_gprs[0];
     }
 }

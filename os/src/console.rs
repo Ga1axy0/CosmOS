@@ -3,7 +3,6 @@ use crate::{drivers::chardev::{CharDevice, UART}};
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
-use riscv::register::sstatus;
 
 /// 串行化所有 hart 的控制台输出，避免多个 hart 同时逐字符写 UART 时互相穿插。
 static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
@@ -34,8 +33,8 @@ struct ConsoleGuard {
 impl ConsoleGuard {
     /// 获取控制台输出锁。
     fn lock() -> Self {
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
+        let sie_was_enabled = crate::hal::local_irqs_enabled();
+        unsafe { crate::hal::disable_local_irqs() };
         while CONSOLE_LOCK
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
@@ -50,7 +49,7 @@ impl Drop for ConsoleGuard {
     fn drop(&mut self) {
         CONSOLE_LOCK.store(false, Ordering::Release);
         if self.sie_was_enabled {
-            unsafe { sstatus::set_sie() };
+            unsafe { crate::hal::enable_local_irqs() };
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Implementation of [`TrapContext`]
-use riscv::register::sstatus::{self, Sstatus, SPP};
+use crate::hal::ArchTrapContextAbi;
+use crate::hal::traits::TrapContextAbi;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -8,7 +9,7 @@ pub struct TrapContext {
     /// General-Purpose Register x0-31
     pub x: [usize; 32],
     /// Supervisor Status Register
-    pub sstatus: Sstatus,
+    pub sstatus: <ArchTrapContextAbi as TrapContextAbi>::Status,
     /// Supervisor Exception Program Counter
     pub sepc: usize,
     /// 当前任务上次返回用户态前所在的 hart id。
@@ -53,12 +54,12 @@ impl TrapContext {
 
     /// Return the saved user-mode PC.
     pub fn user_pc(&self) -> usize {
-        self.sepc
+        ArchTrapContextAbi::user_pc(&self.x, self.sstatus, self.sepc)
     }
 
     /// Overwrite the saved user-mode PC.
     pub fn set_user_pc(&mut self, pc: usize) {
-        self.sepc = pc;
+        ArchTrapContextAbi::set_user_pc(&mut self.x, &mut self.sstatus, &mut self.sepc, pc);
     }
 
     /// Advance the saved user-mode PC by `delta` bytes.
@@ -68,12 +69,12 @@ impl TrapContext {
 
     /// Return the saved user stack pointer.
     pub fn user_sp(&self) -> usize {
-        self.x[2]
+        ArchTrapContextAbi::user_sp(&self.x)
     }
 
     /// put the sp(stack pointer) into x\[2\] field of TrapContext
     pub fn set_sp(&mut self, sp: usize) {
-        self.x[2] = sp;
+        ArchTrapContextAbi::set_user_sp(&mut self.x, sp);
     }
 
     /// Set the saved user stack pointer.
@@ -83,52 +84,52 @@ impl TrapContext {
 
     /// Return the saved return address register.
     pub fn ra(&self) -> usize {
-        self.x[1]
+        ArchTrapContextAbi::ra(&self.x)
     }
 
     /// Set the saved return address register.
     pub fn set_ra(&mut self, ra: usize) {
-        self.x[1] = ra;
+        ArchTrapContextAbi::set_ra(&mut self.x, ra);
     }
 
     /// Return the saved user TLS/thread-pointer register.
     pub fn tls(&self) -> usize {
-        self.x[4]
+        ArchTrapContextAbi::tls(&self.x)
     }
 
     /// Set the saved user TLS/thread-pointer register.
     pub fn set_tls(&mut self, tls: usize) {
-        self.x[4] = tls;
+        ArchTrapContextAbi::set_tls(&mut self.x, tls);
     }
 
     /// Return the architecture syscall number register.
     pub fn syscall_nr(&self) -> usize {
-        self.x[17]
+        ArchTrapContextAbi::syscall_nr(&self.x)
     }
 
     /// Return the six syscall arguments from the saved user context.
     pub fn syscall_args(&self) -> [usize; 6] {
-        [self.x[10], self.x[11], self.x[12], self.x[13], self.x[14], self.x[15]]
+        ArchTrapContextAbi::syscall_args(&self.x)
     }
 
     /// Return the saved syscall return register.
     pub fn syscall_ret(&self) -> usize {
-        self.x[10]
+        ArchTrapContextAbi::syscall_ret(&self.x)
     }
 
     /// Set the saved syscall return register.
     pub fn set_syscall_ret(&mut self, ret: usize) {
-        self.x[10] = ret;
+        ArchTrapContextAbi::set_syscall_ret(&mut self.x, ret);
     }
 
     /// Set one user-call argument register.
     pub fn set_user_arg(&mut self, index: usize, value: usize) {
-        self.x[10 + index] = value;
+        ArchTrapContextAbi::set_user_arg(&mut self.x, index, value);
     }
 
     /// Save the original first syscall argument for possible restart.
     pub fn save_syscall_arg0_for_restart(&mut self) {
-        self.orig_a0 = self.x[10];
+        self.orig_a0 = self.syscall_ret();
     }
 
     /// Set the kernel hart id restored by the trap trampoline.
@@ -143,17 +144,12 @@ impl TrapContext {
 
     /// Export the saved register file using the riscv64 Linux signal ABI layout.
     pub fn export_signal_gprs(&self) -> [usize; 32] {
-        let mut gregs = [0usize; 32];
-        gregs[0] = self.sepc;
-        gregs[1..].copy_from_slice(&self.x[1..]);
-        gregs
+        ArchTrapContextAbi::export_signal_gprs(&self.x, self.user_pc())
     }
 
     /// Restore the saved register file using the riscv64 Linux signal ABI layout.
     pub fn import_signal_gprs(&mut self, gregs: &[usize; 32]) {
-        self.x[0] = 0;
-        self.x[1..].copy_from_slice(&gregs[1..]);
-        self.sepc = gregs[0];
+        ArchTrapContextAbi::import_signal_gprs(&mut self.x, &mut self.sepc, gregs);
     }
 
     /// Copy floating-point state into an external signal frame.
@@ -176,10 +172,8 @@ impl TrapContext {
         kernel_sp: usize,
         trap_handler: usize,
     ) -> Self {
-        let mut sstatus = sstatus::read();
-        // set CPU privilege to User after trapping back
-        sstatus.set_spp(SPP::User);
-        unsafe { riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial) };
+        let sstatus = ArchTrapContextAbi::initial_user_status();
+        unsafe { crate::hal::enable_fp() };
         let mut cx = Self {
             x: [0; 32],
             sstatus,
