@@ -113,6 +113,18 @@ pub fn syscall(id: usize, args: [usize; 3]) -> isize {
             in("$a1") args[1],
             in("$a2") args[2],
             in("$a7") id,
+            // A kernel syscall may freely clobber LA64 caller-saved temporaries.
+            // Mark them explicitly so LLVM won't keep live values such as execve
+            // path pointers in t0 across a syscall boundary.
+            lateout("$t0") _,
+            lateout("$t1") _,
+            lateout("$t2") _,
+            lateout("$t3") _,
+            lateout("$t4") _,
+            lateout("$t5") _,
+            lateout("$t6") _,
+            lateout("$t7") _,
+            lateout("$t8") _,
         );
     }
     ret
@@ -148,6 +160,15 @@ pub fn syscall6(id: usize, args: [usize; 6]) -> isize {
             in("$a4") args[4],
             in("$a5") args[5],
             in("$a7") id,
+            lateout("$t0") _,
+            lateout("$t1") _,
+            lateout("$t2") _,
+            lateout("$t3") _,
+            lateout("$t4") _,
+            lateout("$t5") _,
+            lateout("$t6") _,
+            lateout("$t7") _,
+            lateout("$t8") _,
         );
     }
     ret
@@ -478,6 +499,13 @@ pub fn sys_execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
     syscall(
         SYSCALL_EXECVE,
         [path.as_ptr() as usize, args.as_ptr() as usize, envp.as_ptr() as usize],
+    )
+}
+
+pub fn sys_execve_ptr(path: *const u8, args: &[*const u8], envp: &[*const u8]) -> isize {
+    syscall(
+        SYSCALL_EXECVE,
+        [path as usize, args.as_ptr() as usize, envp.as_ptr() as usize],
     )
 }
 

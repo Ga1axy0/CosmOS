@@ -9,7 +9,8 @@ use alloc::string::String;
 use core::ptr;
 
 use user_lib::{
-    chdir, close, exec, execve, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
+    chdir, close, exec_ptr, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid,
+    write,
     OpenFlags, Stat,
 };
 
@@ -148,15 +149,15 @@ fn path_exists(path: &str) -> bool {
 }
 
 /// 运行一个外部程序并等待其退出。
-fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
+fn spawn_and_wait(child_exec: fn() -> isize, path_display: &str) -> i32 {
     let pid = fork();
     if pid < 0 {
-        println!("[setupsh] fork failed for {}", path);
+        println!("[setupsh] fork failed for {}", path_display);
         return -1;
     }
     if pid == 0 {
-        let ret = exec(path, argv);
-        println!("[setupsh] exec {} failed: {}", path, ret);
+        let ret = child_exec();
+        println!("[setupsh] exec {} failed: {}", path_display, ret);
         exit(127);
     }
 
@@ -172,29 +173,29 @@ fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
     exit_code
 }
 
-/// 运行一个外部程序并显式传入环境变量，然后等待其退出。
-fn spawn_and_wait_with_env(path: &str, argv: &[*const u8], envp: &[*const u8]) -> i32 {
-    let pid = fork();
-    if pid < 0 {
-        println!("[setupsh] fork failed for {}", path);
-        return -1;
-    }
-    if pid == 0 {
-        let ret = execve(path, argv, envp);
-        println!("[setupsh] execve {} failed: {}", path, ret);
-        exit(127);
-    }
+fn exec_bin_busybox_install() -> isize {
+    let argv = [
+        BUSYBOX_ARG0_CSTR.as_ptr(),
+        INSTALL_ARG_CSTR.as_ptr(),
+        BIN_DIR_CSTR.as_ptr(),
+        ptr::null(),
+    ];
+    exec_ptr(BIN_BUSYBOX_CSTR.as_ptr(), &argv)
+}
 
-    let mut exit_code = 0i32;
-    let waited = waitpid(pid as usize, &mut exit_code);
-    if waited != pid {
-        println!(
-            "[setupsh] waitpid mismatch: expected {}, got {}",
-            pid, waited
-        );
-        return -1;
-    }
-    exit_code
+fn exec_glibc_busybox_install() -> isize {
+    let argv = [
+        BUSYBOX_ARG0_CSTR.as_ptr(),
+        INSTALL_ARG_CSTR.as_ptr(),
+        USR_BIN_DIR_CSTR.as_ptr(),
+        ptr::null(),
+    ];
+    exec_ptr(GLIBC_BUSYBOX_TARGET_CSTR.as_ptr(), &argv)
+}
+
+fn exec_bin_sh() -> isize {
+    let argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
+    exec_ptr(BIN_SH_CSTR.as_ptr(), &argv)
 }
 
 /// 打印阶段进度，便于观察 `setupsh` 当前执行到哪一步。
@@ -563,13 +564,7 @@ fn install_kernel_module_metadata() -> bool {
 
 fn install_busybox_applets() -> bool {
     if !path_exists("/bin/sh") {
-        let musl_install_argv = [
-            BUSYBOX_ARG0_CSTR.as_ptr(),
-            INSTALL_ARG_CSTR.as_ptr(),
-            BIN_DIR_CSTR.as_ptr(),
-            ptr::null(),
-        ];
-        let install_exit = spawn_and_wait(BIN_BUSYBOX_CSTR, &musl_install_argv);
+        let install_exit = spawn_and_wait(exec_bin_busybox_install, BIN_BUSYBOX);
         if install_exit != 0 {
             println!("[setupsh] musl busybox --install failed: {}", install_exit);
             return false;
@@ -577,13 +572,7 @@ fn install_busybox_applets() -> bool {
     }
 
     if !path_exists("/usr/bin/sh") {
-        let glibc_install_argv = [
-            BUSYBOX_ARG0_CSTR.as_ptr(),
-            INSTALL_ARG_CSTR.as_ptr(),
-            USR_BIN_DIR_CSTR.as_ptr(),
-            ptr::null(),
-        ];
-        let install_exit = spawn_and_wait(GLIBC_BUSYBOX_TARGET_CSTR, &glibc_install_argv);
+        let install_exit = spawn_and_wait(exec_glibc_busybox_install, GLIBC_BUSYBOX_TARGET);
         if install_exit != 0 {
             println!("[setupsh] glibc busybox --install failed: {}", install_exit);
             return false;
@@ -717,9 +706,7 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
             ROOT_HOME_DIR, chdir_ret
         );
     }
-    let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
-    let shell_envp = [SHELL_PATH_ENV_CSTR.as_ptr(), ptr::null()];
-    let shell_exit = spawn_and_wait_with_env(BIN_SH_CSTR, &shell_argv, &shell_envp);
+    let shell_exit = spawn_and_wait(exec_bin_sh, "/bin/sh");
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
     shell_exit
 }

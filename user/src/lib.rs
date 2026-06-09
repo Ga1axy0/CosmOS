@@ -592,6 +592,17 @@ pub fn execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
     sys_execve(path, args, envp)
 }
 
+/// 显式使用 NUL 结尾 C 字符串路径的 `execve` 变体。
+pub fn exec_ptr(path: *const u8, args: &[*const u8]) -> isize {
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    sys_execve_ptr(path, args, &envp)
+}
+
+/// 显式使用 NUL 结尾 C 字符串路径的 `execve` 变体。
+pub fn execve_ptr(path: *const u8, args: &[*const u8], envp: &[*const u8]) -> isize {
+    sys_execve_ptr(path, args, envp)
+}
+
 pub fn set_priority(prio: isize) -> isize {
     sys_set_priority(prio)
 }
