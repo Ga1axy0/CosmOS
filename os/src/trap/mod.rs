@@ -197,24 +197,6 @@ pub fn trap_handler() -> ! {
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
     let trap_info = ArchTrapMachine::read_trap_info();
-    #[cfg(target_arch = "loongarch64")]
-    {
-        static mut FIRST_USER_TRAP_LOGGED: bool = false;
-        unsafe {
-            if !FIRST_USER_TRAP_LOGGED {
-                FIRST_USER_TRAP_LOGGED = true;
-                let cx = current_trap_cx();
-                early_put_hex("[user_trap] cause=", trap_info.cause as usize);
-                early_put_hex("[user_trap] fault_addr=", trap_info.fault_addr);
-                early_put_hex("[user_trap] user_pc=", cx.user_pc());
-                early_put_hex("[user_trap] sp=", cx.user_sp());
-                early_put_hex("[user_trap] ra=", cx.ra());
-                early_put_hex("[user_trap] tp=", cx.tls());
-                early_put_hex("[user_trap] a0=", cx.reg(4));
-                early_put_hex("[user_trap] a7=", cx.syscall_nr());
-            }
-        }
-    }
     match trap_info.cause {
         TrapCause::UserSyscall => {
             // jump to next instruction anyway
@@ -395,30 +377,10 @@ pub fn trap_handler() -> ! {
             handle_reschedule_ipi();
         }
         TrapCause::ExternalInterrupt => {
-            #[cfg(target_arch = "riscv64")]
-            crate::drivers::plic::handle_supervisor_external();
+            crate::platform::handle_external_irq();
             crate::net::poll();
         }
         _ => {
-            #[cfg(target_arch = "loongarch64")]
-            {
-                let estat = crate::hal::ArchTrapMachine::read_trap_info();
-                let raw_estat = {
-                    let value: usize;
-                    unsafe { core::arch::asm!("csrrd {}, {}", out(reg) value, const 0x5usize) };
-                    value
-                };
-                let badi = {
-                    let value: usize;
-                    unsafe { core::arch::asm!("csrrd {}, {}", out(reg) value, const 0x8usize) };
-                    value
-                };
-                early_put_hex("[user_trap] raw_estat=", raw_estat);
-                early_put_hex("[user_trap] ecode=", (raw_estat >> 16) & 0x3f);
-                early_put_hex("[user_trap] esubcode=", (raw_estat >> 22) & 0x1ff);
-                early_put_hex("[user_trap] badi=", badi);
-                early_put_hex("[user_trap] fault_addr_dup=", estat.fault_addr);
-            }
             panic!(
                 "Unsupported trap {:?}, fault_addr = {:#x}!",
                 trap_info.cause,
@@ -454,50 +416,6 @@ pub fn trap_return() -> ! {
     let trap_cx_user_va = current_trap_cx_user_va();
     current_trap_cx().set_kernel_hartid(hartid());
     let user_token = current_user_token();
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let current_token = unsafe { crate::hal::current_address_space_token() };
-        let cx = current_trap_cx();
-        let sp: usize;
-        unsafe {
-            core::arch::asm!("move {}, $sp", out(reg) sp);
-        }
-        let sp_vpn = crate::mm::VirtAddr::from(sp & !(PAGE_SIZE - 1)).floor();
-        let trap_cx_vpn = crate::mm::VirtAddr::from(trap_cx_user_va).floor();
-        let trampoline_vpn = crate::mm::VirtAddr::from(crate::config::TRAMPOLINE).floor();
-        let kernel_space = crate::mm::KERNEL_SPACE.lock();
-        let user_page_table = crate::mm::PageTable::from_token(user_token);
-        // early_put_hex("[trap_return] current_pgdl=", current_token);
-        // early_put_hex("[trap_return] user_pgdl=", user_token);
-        // early_put_hex("[trap_return] trap_cx_user_va=", trap_cx_user_va);
-        // early_put_hex("[trap_return] user_prmd=", cx.arch.prmd);
-        // early_put_hex("[trap_return] user_era=", cx.arch.era);
-        // early_put_hex("[trap_return] user_ra=", cx.arch.r[1]);
-        // early_put_hex("[trap_return] user_sp_saved=", cx.arch.r[3]);
-        // early_put_hex("[trap_return] user_a0=", cx.arch.r[4]);
-        // early_put_hex("[trap_return] user_a7=", cx.arch.r[11]);
-        // early_put_hex("[trap_return] sp=", sp);
-        if let Some(pte) = kernel_space.translate(sp_vpn) {
-            // early_put_hex("[trap_return] kstack_pte=", pte.bits);
-        } else {
-            // crate::early_puts("[trap_return] kstack_pte=NONE\r\n");
-        }
-        if let Some(pte) = kernel_space.translate(trampoline_vpn) {
-            // early_put_hex("[trap_return] tramp_pte=", pte.bits);
-        } else {
-            // crate::early_puts("[trap_return] tramp_pte=NONE\r\n");
-        }
-        if let Some(pte) = user_page_table.translate(trap_cx_vpn) {
-            // early_put_hex("[trap_return] user_trap_cx_pte=", pte.bits);
-        } else {
-            // crate::early_puts("[trap_return] user_trap_cx_pte=NONE\r\n");
-        }
-        if let Some(pte) = user_page_table.translate(trampoline_vpn) {
-            // early_put_hex("[trap_return] user_tramp_pte=", pte.bits);
-        } else {
-            // crate::early_puts("[trap_return] user_tramp_pte=NONE\r\n");
-        }
-    }
     current_process().enter_user(get_time());
     unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
 }
@@ -507,23 +425,8 @@ pub fn trap_return() -> ! {
 pub fn trap_from_kernel() {
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
-        #[cfg(target_arch = "loongarch64")]
-        TrapCause::StorePageFault | TrapCause::LoadPageFault => {
-            dump_kernel_trap_state();
-            let page_base = trap_info.fault_addr & !(PAGE_SIZE - 1);
-            let heap_end = KERNEL_HEAP_BASE + MAX_KERNEL_HEAP_SIZE;
-            if (KERNEL_HEAP_BASE..heap_end).contains(&page_base) && map_one_heap_page(page_base) {
-                return;
-            }
-            panic!(
-                "Kernel trap: {:?}, fault_addr = {:#x}",
-                trap_info.cause,
-                trap_info.fault_addr
-            );
-        }
         TrapCause::ExternalInterrupt => {
-            #[cfg(target_arch = "riscv64")]
-            crate::drivers::plic::handle_supervisor_external();
+            crate::platform::handle_external_irq();
             crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         TrapCause::TimerInterrupt => {
@@ -538,14 +441,11 @@ pub fn trap_from_kernel() {
                 // user-mode ticks.
                 on_timer_tick();
             }
-            // crate::net::poll();
         }
         TrapCause::SoftwareInterrupt => {
             handle_reschedule_ipi();
         }
         _ => {
-            #[cfg(target_arch = "loongarch64")]
-            dump_kernel_trap_state();
             panic!(
                 "Kernel trap: {:?}, fault_addr = {:#x}",
                 trap_info.cause,

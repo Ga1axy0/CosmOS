@@ -1,7 +1,7 @@
 //! SBI platform for QEMU virt — implements Timer and HartCtrl HAL traits.
 
 pub use crate::sbi::{
-    console_getchar, console_putchar, hart_get_status, hart_start, hart_state, send_ipi_mask,
+    hart_get_status, hart_start, hart_state, send_ipi_mask,
     set_timer, shutdown, HartState, SbiRet,
 };
 

@@ -1,10 +1,6 @@
-//! LoongArch64 PCI/ECAM probing for VirtIO PCI devices.
+//! LoongArch64 QEMU `virt` PCI/ECAM probing for VirtIO PCI devices.
 
-#[cfg(target_arch = "loongarch64")]
 use alloc::{string::String, sync::Arc};
-#[cfg(target_arch = "loongarch64")]
-use core::convert::TryFrom;
-#[cfg(target_arch = "loongarch64")]
 use virtio_drivers::transport::{
     pci::{
         bus::{
@@ -16,30 +12,21 @@ use virtio_drivers::transport::{
     DeviceType, SomeTransport, Transport,
 };
 
-#[cfg(target_arch = "loongarch64")]
 use crate::board::IO_ADDR_OFFSET;
-#[cfg(target_arch = "loongarch64")]
 use crate::drivers::{
     block::{BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ, VirtIOBlock},
     net::{self, VirtIONetDevice},
 };
 
-#[cfg(target_arch = "loongarch64")]
 const PCI_ECAM_BASE: usize = 0x2000_0000;
-#[cfg(target_arch = "loongarch64")]
 const PCI_ECAM_SIZE: usize = 0x1000_0000;
-#[cfg(target_arch = "loongarch64")]
 const PCI_RANGE_BASE: usize = 0x4000_0000;
-#[cfg(target_arch = "loongarch64")]
 const PCI_RANGE_SIZE: usize = 0x4000_0000;
-#[cfg(target_arch = "loongarch64")]
 const PCI_BUS_END: u8 = 0x7f;
-#[cfg(target_arch = "loongarch64")]
 const LEGACY_VIRTIO_NET_IRQ: u32 = 1;
 
-#[cfg(target_arch = "loongarch64")]
 /// Probe the LA64 PCIe ECAM bus and register VirtIO PCI devices.
-pub fn probe_virtio_pci_devices() {
+pub fn probe_platform_devices() {
     let ecam_vaddr = PCI_ECAM_BASE | IO_ADDR_OFFSET;
     let ecam_end = ecam_vaddr + PCI_ECAM_SIZE;
     if ecam_end < ecam_vaddr {
@@ -66,7 +53,7 @@ pub fn probe_virtio_pci_devices() {
                 continue;
             }
 
-            let Some(mut transport) = probe_virtio_pci_device(&mut root, bdf, &dev_info) else {
+            let Some(transport) = probe_virtio_pci_device(&mut root, bdf, &dev_info) else {
                 continue;
             };
 
@@ -121,18 +108,12 @@ pub fn probe_virtio_pci_devices() {
     }
 }
 
-#[cfg(not(target_arch = "loongarch64"))]
-/// No-op stub so non-LA64 builds do not pull in PCI probing logic.
-pub fn probe_virtio_pci_devices() {}
-
-#[cfg(target_arch = "loongarch64")]
 #[derive(Debug)]
 struct PciRangeAllocator {
     end: u64,
     current: u64,
 }
 
-#[cfg(target_arch = "loongarch64")]
 impl PciRangeAllocator {
     const fn new(base: u64, size: u64) -> Self {
         Self {
@@ -154,12 +135,10 @@ impl PciRangeAllocator {
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
 const fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
-#[cfg(target_arch = "loongarch64")]
 fn configure_pci_device(
     root: &mut PciRoot<MmioCam<'static>>,
     bdf: DeviceFunction,
@@ -198,7 +177,6 @@ fn configure_pci_device(
     Ok(())
 }
 
-#[cfg(target_arch = "loongarch64")]
 fn probe_virtio_pci_device(
     root: &mut PciRoot<MmioCam<'static>>,
     bdf: DeviceFunction,

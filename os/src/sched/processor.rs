@@ -129,12 +129,9 @@ pub(crate) fn run_tasks() {
             }
 
             // debug!("No task to run, idle...");
-            #[cfg(target_arch = "loongarch64")]
-            {
-                // LA64 bring-up does not have a working UART RX interrupt path
-                // yet, so drain the console UART opportunistically from the
-                // idle loop. This preserves echo/canonical processing and wakes
-                // blocked tty readers once a full line arrives.
+            if !crate::platform::console_rx_irq_ready() {
+                // Keep the old cooperative polling path only as a pre-init
+                // fallback before the EXTIOI/PCH-PIC chain is configured.
                 crate::fs::console_receive();
             }
 

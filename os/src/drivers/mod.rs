@@ -3,7 +3,6 @@
 pub mod block;
 pub mod chardev;
 pub mod net;
-pub mod pci;
 pub mod plic;
 pub mod rtc;
 pub mod virtio;
@@ -17,14 +16,11 @@ fn virtio_blk_name(idx: usize) -> String {
 pub fn init() {
     chardev::init();
     rtc::init();
+    crate::platform::init_external_irq();
     #[cfg(target_arch = "riscv64")]
     {
-        plic::init();
         block::probe_block_devices();
         net::probe_net_devices();
     }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        pci::probe_virtio_pci_devices();
-    }
+    crate::platform::probe_platform_devices();
 }

@@ -180,6 +180,8 @@ fn init_local_hart(hart_id: usize) {
     timer::init_hart();
     #[cfg(target_arch = "riscv64")]
     drivers::plic::init_hart(hart_id);
+    #[cfg(target_arch = "loongarch64")]
+    drivers::loongarch_irq::init_hart(hart_id);
     mm::mark_online(hart_id);
     debug!("hart {} local init done", hart_id);
 }
@@ -307,15 +309,12 @@ pub fn early_puts(s: &str) {
 fn first_hart_main(hart_id: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
-    #[cfg(target_arch = "loongarch64")] early_puts("[K] trap::init\r\n");
     // Install TLB refill handler and page-walker CSRs before activating page tables.
     trap::init();
-    #[cfg(target_arch = "loongarch64")] early_puts("[K] mm::init\r\n");
     mm::init();
-    #[cfg(target_arch = "loongarch64")] early_puts("[K] klog::init\r\n");
-    #[cfg(not(target_arch = "loongarch64"))]
-    mm::remap_test();
+    // mm::remap_test();
     klog::init();
+<<<<<<< HEAD
     let hart_count = detect_hart_count();
     print_boot_splash(hart_id, hart_count);
     print_boot_stage("memory", "SV39 mappings online");

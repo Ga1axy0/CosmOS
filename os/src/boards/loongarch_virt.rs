@@ -37,8 +37,7 @@ pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 use core::arch::asm;
 
 const EXIT_SUCCESS: u32 = 0x5555;
-const EXIT_FAILURE_FLAG: u32 = 0x3333;
-const EXIT_FAILURE: u32 = exit_code_encode(1);
+const EXIT_FAILURE: u32 = 0x0001_3333;
 
 /// QEMU exit interface.
 pub trait QEMUExit {
@@ -52,34 +51,37 @@ pub trait QEMUExit {
     fn exit_failure(&self) -> !;
 }
 
-/// LoongArch64 QEMU exit device wrapper.
+/// LoongArch64 QEMU power-management wrapper.
 pub struct LOONGARCH64 {
-    addr: u64,
+    sleep_ctl_addr: u64,
 }
 
-const fn exit_code_encode(code: u32) -> u32 {
-    (code << 16) | EXIT_FAILURE_FLAG
-}
+// QEMU `virt` exposes ACPI GED power-management registers at:
+//   VIRT_GED_EVT_ADDR = 0x100e0000
+//   VIRT_GED_REG_ADDR = VIRT_GED_EVT_ADDR + ACPI_GED_EVT_SEL_LEN(0x4)
+//                     + MEMORY_HOTPLUG_IO_LEN(24)
+//                     = 0x100e001c
+// `ACPI_GED_REG_SLEEP_CTL` is offset 0 and powers off the VM when written
+// with SLP_EN | (S5 << SLP_TYP_POS) = 0x34.
+const GED_SLEEP_CTL_VALUE: u8 = 0x34;
+const GED_REG_BASE: u64 = (IO_ADDR_OFFSET | 0x100e_001c) as u64;
 
 impl LOONGARCH64 {
     /// Create an instance.
     pub const fn new(addr: u64) -> Self {
-        Self { addr }
+        Self {
+            sleep_ctl_addr: addr,
+        }
     }
 }
 
 impl QEMUExit for LOONGARCH64 {
-    fn exit(&self, code: u32) -> ! {
-        let code_new = match code {
-            EXIT_SUCCESS | EXIT_FAILURE => code,
-            _ => exit_code_encode(code),
-        };
-
+    fn exit(&self, _code: u32) -> ! {
         unsafe {
             asm!(
-                "st.w {0}, {1}, 0",
-                in(reg) code_new,
-                in(reg) self.addr,
+                "st.b {value}, {addr}, 0",
+                value = in(reg) GED_SLEEP_CTL_VALUE,
+                addr = in(reg) self.sleep_ctl_addr,
             );
             loop {
                 asm!("idle 0", options(nomem, nostack));
@@ -96,7 +98,7 @@ impl QEMUExit for LOONGARCH64 {
     }
 }
 
-const VIRT_TEST: u64 = (IO_ADDR_OFFSET | 0x1fe0_01e0) as u64;
+const VIRT_TEST: u64 = GED_REG_BASE;
 
-/// Global QEMU exit handle using the virt test device.
+/// Global QEMU exit handle using the ACPI GED poweroff register.
 pub const QEMU_EXIT_HANDLE: LOONGARCH64 = LOONGARCH64::new(VIRT_TEST);

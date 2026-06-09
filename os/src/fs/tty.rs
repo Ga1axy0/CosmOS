@@ -543,24 +543,18 @@ impl TtyCore {
             if let Some(byte) = self.take_ready_byte() {
                 return byte;
             }
-            #[cfg(target_arch = "loongarch64")]
-            {
-                // LA64 bring-up still lacks a working UART RX interrupt path,
-                // so sleeping on `read_wq` would park the shell and send the
-                // scheduler into the idle loop forever. Poll cooperatively
-                // until the platform IRQ controller is wired up.
+            if !crate::platform::console_rx_irq_ready() {
+                // Fall back to cooperative polling only before the platform
+                // external IRQ path has finished setup.
                 crate::task::yield_current_and_run_next();
                 continue;
             }
-            #[cfg(not(target_arch = "loongarch64"))]
-            {
             // 3. 阻塞，直到中断路径补满输入或有信号到来。
             self.read_wq
                 .wait_with_reason_or_skip(WaitReason::UartRx, || self.read_ready());
             // 4. 被唤醒：数据优先于信号；否则上报 EINTR。
             if !self.read_ready() && has_interrupting_signal() {
                 return Err(ERRNO::EINTR);
-            }
             }
         }
     }

@@ -25,8 +25,12 @@ const CSR_STLBPS: usize = 0x1e;
 const CRMD_IE: usize = 1 << 2;
 const EUEN_FPEN: usize = 1 << 0;
 const ECFG_SIP: usize = 1 << 1;
+const ECFG_HWI0: usize = 1 << 2;
 const ECFG_TIMER: usize = 1 << 11;
 const ECFG_IPI: usize = 1 << 12;
+// QEMU `virt` routes EXTIOI sources to CPU IP3, which is exposed in
+// ESTAT/ECFG as HWI3 (interrupt number 5, bit 5).
+const ECFG_EXTERNAL: usize = ECFG_HWI0 << 3;
 
 const ECODE_INT: usize = 0x0;
 const ECODE_PIL: usize = 0x1;
@@ -81,11 +85,11 @@ impl InterruptControl for LoongArchInterruptControl {
     }
 
     unsafe fn enable_external() {
-        update_ecfg(ECFG_IPI, true);
+        update_ecfg(ECFG_EXTERNAL, true);
     }
 
     unsafe fn disable_external() {
-        update_ecfg(ECFG_IPI, false);
+        update_ecfg(ECFG_EXTERNAL, false);
     }
 
     unsafe fn enable_software() {
@@ -153,6 +157,7 @@ impl InterruptControl for LoongArchInterruptControl {
 impl TrapMachine for LoongArchTrapMachine {
     fn read_trap_info() -> TrapInfo {
         let estat = read_estat();
+        let ecfg = read_ecfg();
         let badv = read_badv();
         let ecode = (estat >> 16) & 0x3f;
         let cause = match ecode {
@@ -163,16 +168,7 @@ impl TrapMachine for LoongArchTrapMachine {
             ECODE_INE => TrapCause::IllegalInstruction,
             ECODE_ADE => TrapCause::InstructionFault,
             ECODE_INT => {
-                let is = estat & 0x1fff;
-                if is & (1 << 11) != 0 {
-                    TrapCause::TimerInterrupt
-                } else if is & (1 << 1) != 0 {
-                    TrapCause::SoftwareInterrupt
-                } else if is & (1 << 12) != 0 {
-                    TrapCause::ExternalInterrupt
-                } else {
-                    TrapCause::Unknown
-                }
+                decode_interrupt_cause(estat, ecfg)
             }
             _ => TrapCause::Unknown,
         };
@@ -332,6 +328,13 @@ fn read_estat() -> usize {
 }
 
 #[inline]
+fn read_ecfg() -> usize {
+    let value: usize;
+    unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_ECFG) };
+    value
+}
+
+#[inline]
 fn read_badv() -> usize {
     let value: usize;
     unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_BADV) };
@@ -343,6 +346,21 @@ fn read_badi() -> usize {
     let value: usize;
     unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_BADI) };
     value
+}
+
+#[inline]
+fn decode_interrupt_cause(estat: usize, ecfg: usize) -> TrapCause {
+    let int_vec = (estat & ecfg) & 0x1fff;
+    let highest = (0..=12).rev().find(|bit| int_vec & (1usize << bit) != 0);
+    match highest {
+        Some(12) => TrapCause::Unknown,
+        Some(11) => TrapCause::TimerInterrupt,
+        Some(1) | Some(0) => TrapCause::SoftwareInterrupt,
+        Some(2..=9) => TrapCause::ExternalInterrupt,
+        Some(10) => TrapCause::Unknown,
+        None => TrapCause::Unknown,
+        Some(_) => TrapCause::Unknown,
+    }
 }
 
 #[inline]

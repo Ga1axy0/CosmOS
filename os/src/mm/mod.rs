@@ -68,17 +68,11 @@ pub use crate::hal::traits::PTEFlags;
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
-    #[cfg(target_arch = "loongarch64")] crate::early_puts("[mm] frame_allocator\r\n");
     frame_allocator::init_frame_allocator();
-    #[cfg(target_arch = "loongarch64")] crate::early_puts("[mm] init_heap\r\n");
     heap_allocator::init_heap();
-    #[cfg(target_arch = "loongarch64")] crate::early_puts("[mm] activate\r\n");
     KERNEL_SPACE.lock().activate();
-    #[cfg(target_arch = "loongarch64")] crate::early_puts("[mm] heap_mapping\r\n");
     heap_allocator::init_kernel_heap_mapping();
-    #[cfg(target_arch = "loongarch64")] crate::early_puts("[mm] heap_virtual_window\r\n");
     heap_allocator::init_heap_virtual_window();
-    #[cfg(target_arch = "loongarch64")] crate::early_puts("[mm] done\r\n");
 }
 
 /// 在当前 hart 上激活内核地址空间（写入 satp + sfence.vma）。

@@ -1,9 +1,16 @@
 //! LoongArch64 QEMU virt platform hooks.
 
+mod irq;
+mod pci;
+
 pub use crate::board::{
     BlockDeviceImpl, CharDeviceImpl, QEMUExit, QEMU_EXIT_HANDLE, CLOCK_FREQ, MMIO, VIRT_RTC,
     VIRT_UART,
 };
+pub use irq::{
+    console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
+};
+pub use pci::probe_platform_devices;
 
 use crate::hal::traits::{HartCtrl, Timer};
 
