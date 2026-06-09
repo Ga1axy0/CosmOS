@@ -12,7 +12,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
 use crate::net::{
-    cleanup_socket_wait, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
+    cleanup_socket_wait, compat_ifreq_ioctl, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
     socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState, NEED_POLL, NET_STACK,
 };
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
@@ -423,6 +423,10 @@ impl File for UdpSocketFile {
 
     fn writable(&self) -> bool {
         true
+    }
+
+    fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        compat_ifreq_ioctl(req, arg)
     }
 
     fn read_at(&self, _offset: usize, buf: UserBuffer) -> usize {

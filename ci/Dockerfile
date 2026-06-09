@@ -13,6 +13,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y \
     curl \
+    e2fsprogs \
     git \
     git-lfs \
     python3 \
@@ -89,10 +90,14 @@ RUN rustup default $RUST_VERSION; \
 # Set working directory
 WORKDIR /root
 
-# Bundle prebuilt base image into CI container and decompress during image build.
+# Bundle the competition image into CI under the new sdcard-rv naming while
+# keeping the legacy base.img path available for older workflows.
 RUN mkdir -p /opt/xxos
-COPY base.img.xz /opt/xxos/base.img.xz
-RUN xz -d -k -f /opt/xxos/base.img.xz && ls -lh /opt/xxos/base.img*
+COPY base.img.xz /opt/xxos/sdcard-rv.img.xz
+RUN xz -d -k -f /opt/xxos/sdcard-rv.img.xz && \
+    ln -sf /opt/xxos/sdcard-rv.img /opt/xxos/base.img && \
+    ln -sf /opt/xxos/sdcard-rv.img.xz /opt/xxos/base.img.xz && \
+    ls -lh /opt/xxos
 
 # Default command
 CMD ["/bin/bash"]

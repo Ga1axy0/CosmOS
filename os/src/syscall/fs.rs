@@ -1,9 +1,9 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device, mount_tmpfs, rename_at,
-    sync_page_cache_all, sync_page_cache_fs, truncate_inode,
-    open_file_at_with_status, symlinkat, unlinkat,
+    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device,
+    mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
+    sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::fs::Pipe;
@@ -14,17 +14,21 @@ use crate::syscall::{read_cstring_from_user, read_pod_from_user, translated_byte
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
-    current_process, current_task, current_user_token, FdEntry,
+    current_process, current_task, current_user_token, ExitReason, FdEntry, ProcessControlBlock,
     FdFlags, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
+use crate::sync::SpinNoIrqLock;
 use crate::timer::{add_timer_ns, add_timer_with_poll_tag, get_realtime_ns, get_time_ns, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec::Vec, vec};
 use core::{mem::{offset_of, size_of}, slice};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::task::SignalBit;
 use crate::syscall::OldTimespec32;
+use core::any::Any;
+use lazy_static::*;
 
 /// `writev` 使用的用户态向量缓冲区描述符。
 #[derive(Clone, Copy, Debug)]
@@ -78,8 +82,401 @@ const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
 const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
+const MS_RDONLY: usize = 1;
+const MS_REMOUNT: usize = 32;
+const MS_REC: usize = 16384;
+const MS_PRIVATE: usize = 1 << 18;
 const SUSPICIOUS_STAT_BLKSIZE: u32 = 1 << 20;
 const SUSPICIOUS_RW_LEN: usize = 1 << 20;
+const O_NONBLOCK: i32 = 0x800;
+const O_CLOEXEC: i32 = 0x80000;
+
+lazy_static! {
+    /// 当前启用的进程记账目标文件路径；`acct01` 仅要求 enable/disable 生命周期和 errno 语义。
+    static ref PROCESS_ACCOUNTING_TARGET: SpinNoIrqLock<Option<String>> = SpinNoIrqLock::new(None);
+    /// 串行化记账文件的追加写，避免多个退出并发时互相覆盖文件尾。
+    static ref PROCESS_ACCOUNTING_APPEND_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
+}
+static PROCESS_ACCOUNTING_EVENT_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+const ACCT_COMM_LEN: usize = 16;
+const ACCT_BYTEORDER_NATIVE: u8 = if cfg!(target_endian = "big") { 0x80 } else { 0x00 };
+const ACCT_FLAG_CORE: u8 = 0x08;
+const ACCT_FLAG_SIGNAL: u8 = 0x10;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AcctV3Record {
+    ac_flag: u8,
+    ac_version: u8,
+    ac_tty: u16,
+    ac_exitcode: u32,
+    ac_uid: u32,
+    ac_gid: u32,
+    ac_pid: u32,
+    ac_ppid: u32,
+    ac_btime: u32,
+    ac_etime: f32,
+    ac_utime: u16,
+    ac_stime: u16,
+    ac_mem: u16,
+    ac_io: u16,
+    ac_rw: u16,
+    ac_minflt: u16,
+    ac_majflt: u16,
+    ac_swaps: u16,
+    ac_comm: [u8; ACCT_COMM_LEN],
+}
+
+fn encode_wait_status(reason: ExitReason) -> u32 {
+    match reason {
+        ExitReason::Exit(code) => ((code & 0xff) << 8) as u32,
+        ExitReason::Signal(signum) => {
+            let mut status = (signum & 0x7f) as u32;
+            if crate::signal::SignalNum::from_number(signum)
+                .map(|sig| sig.dumps_core())
+                .unwrap_or(false)
+            {
+                status |= 0x80;
+            }
+            status
+        }
+    }
+}
+
+fn encode_acct_flag(reason: ExitReason) -> u8 {
+    match reason {
+        ExitReason::Exit(_) => 0,
+        ExitReason::Signal(signum) => {
+            let mut flag = ACCT_FLAG_SIGNAL;
+            if crate::signal::SignalNum::from_number(signum)
+                .map(|sig| sig.dumps_core())
+                .unwrap_or(false)
+            {
+                flag |= ACCT_FLAG_CORE;
+            }
+            flag
+        }
+    }
+}
+
+fn encode_comp_t(mut value: u64) -> u16 {
+    let mut exp = 0u16;
+    let mut rnd = 0u64;
+
+    while value > 0x1fff {
+        rnd = value & 0x7;
+        value >>= 3;
+        exp = exp.saturating_add(1);
+        if exp >= 7 {
+            return 0xffff;
+        }
+    }
+    if rnd != 0 {
+        value += 1;
+        if value > 0x1fff {
+            value >>= 3;
+            exp = exp.saturating_add(1);
+            if exp >= 8 {
+                return 0xffff;
+            }
+        }
+    }
+    ((exp << 13) | (value as u16 & 0x1fff)) as u16
+}
+
+fn process_name_for_acct(exec_path: &str) -> [u8; ACCT_COMM_LEN] {
+    let mut comm = [0u8; ACCT_COMM_LEN];
+    let name = exec_path
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(exec_path);
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(ACCT_COMM_LEN);
+    comm[..len].copy_from_slice(&bytes[..len]);
+    comm
+}
+
+fn acct_v3_record_bytes(record: &AcctV3Record) -> &[u8] {
+    // SAFETY: `AcctV3Record` is `#[repr(C)]` and contains only plain integer/float fields.
+    unsafe { slice::from_raw_parts(record as *const AcctV3Record as *const u8, size_of::<AcctV3Record>()) }
+}
+
+fn next_acct_event_seq() -> usize {
+    PROCESS_ACCOUNTING_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn read_accounting_target_with_log(context: &str, pid: usize) -> Option<String> {
+    let seq = next_acct_event_seq();
+    let target = PROCESS_ACCOUNTING_TARGET.lock().clone();
+    debug!(
+        "[acct][{}] read context={} pid={} target={:?}",
+        seq,
+        context,
+        pid,
+        target
+    );
+    target
+}
+
+fn replace_accounting_target_with_log(
+    context: &str,
+    pid: usize,
+    new_target: Option<String>,
+) -> Option<String> {
+    let seq = next_acct_event_seq();
+    let mut guard = PROCESS_ACCOUNTING_TARGET.lock();
+    let old_target = guard.clone();
+    *guard = new_target.clone();
+    debug!(
+        "[acct][{}] write context={} pid={} old_target={:?} new_target={:?}",
+        seq,
+        context,
+        pid,
+        old_target,
+        new_target
+    );
+    old_target
+}
+
+pub fn write_process_accounting_on_exit(process: &Arc<ProcessControlBlock>, reason: ExitReason) {
+    let Some(target_path) = read_accounting_target_with_log("exit-read", process.getpid()) else {
+        debug!(
+            "[acct] skip exit record pid={} reason={:?}: accounting disabled",
+            process.getpid(),
+            reason
+        );
+        return;
+    };
+
+    let now_realtime_ns = get_realtime_ns();
+    let record = {
+        let inner = process.inner_exclusive_access();
+        let elapsed_ns = now_realtime_ns.saturating_sub(inner.accounting_start_time_ns);
+        let utime_ticks = crate::timer::time_to_ticks(inner.user_time);
+        let stime_ticks = crate::timer::time_to_ticks(inner.kernel_time);
+        let btime = (inner.accounting_start_time_ns / 1_000_000_000).min(u32::MAX as u64) as u32;
+        let ppid = inner
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.upgrade())
+            .map(|parent| parent.getpid() as u32)
+            .unwrap_or(0);
+        AcctV3Record {
+            ac_flag: encode_acct_flag(reason),
+            ac_version: 3 | ACCT_BYTEORDER_NATIVE,
+            ac_tty: 0,
+            ac_exitcode: encode_wait_status(reason),
+            ac_uid: inner.cred.uid,
+            ac_gid: inner.cred.gid,
+            ac_pid: process.getpid() as u32,
+            ac_ppid: ppid,
+            ac_btime: btime,
+            ac_etime: (elapsed_ns as f64 / 1_000_000_000f64) as f32,
+            ac_utime: encode_comp_t(utime_ticks as u64),
+            ac_stime: encode_comp_t(stime_ticks as u64),
+            ac_mem: 0,
+            ac_io: 0,
+            ac_rw: 0,
+            ac_minflt: 0,
+            ac_majflt: 0,
+            ac_swaps: 0,
+            ac_comm: process_name_for_acct(inner.exec_path.as_str()),
+        }
+    };
+    debug!(
+        "[acct] exit record pid={} reason={:?} target='{}' comm='{}' bytes={}",
+        process.getpid(),
+        reason,
+        target_path,
+        core::str::from_utf8(
+            &record.ac_comm[..record
+                .ac_comm
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(record.ac_comm.len())]
+        )
+        .unwrap_or("<invalid>"),
+        size_of::<AcctV3Record>()
+    );
+    let _append_guard = PROCESS_ACCOUNTING_APPEND_LOCK.lock();
+    let inode = match open_file_at("/", target_path.as_str(), OpenFlags::WRONLY) {
+        Ok(inode) => inode,
+        Err(errno) => {
+            debug!(
+                "[acct] reopen failed pid={} target='{}': {:?}",
+                process.getpid(),
+                target_path,
+                errno
+            );
+            return;
+        }
+    };
+    let desc = Arc::new(FileDescription::new(
+        inode,
+        AccessMode::WriteOnly,
+        FileStatusFlags::APPEND,
+        0,
+    ));
+    let size_before = desc.stat().size;
+    if let Err(errno) = desc.write_bytes(acct_v3_record_bytes(&record)) {
+        debug!(
+            "[acct] append failed pid={} target='{}': {:?}",
+            process.getpid(),
+            target_path,
+            errno
+        );
+        return;
+    }
+    let size_after = desc.stat().size;
+    debug!(
+        "[acct] append ok pid={} target='{}' size_before={} size_after={}",
+        process.getpid(),
+        target_path,
+        size_before,
+        size_after
+    );
+}
+
+/// `accept03` 需要大量“非 socket fd”作为输入；对这些当前尚未完整实现
+/// 的 Linux 专用 fd 类型，先统一返回一个可关闭、不可被识别为 socket 的
+/// 匿名文件对象，确保 `accept()` 落到 `ENOTSOCK` 路径。
+struct AnonymousFdFile;
+
+impl File for AnonymousFdFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::FILE,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+fn parse_anon_fd_flags(flags: i32, allowed: i32) -> Result<(FileStatusFlags, bool), ERRNO> {
+    if flags & !allowed != 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let status_flags = if (flags & O_NONBLOCK) != 0 {
+        FileStatusFlags::NONBLOCK
+    } else {
+        FileStatusFlags::empty()
+    };
+    let cloexec = (flags & O_CLOEXEC) != 0;
+    Ok((status_flags, cloexec))
+}
+
+/// `acct(2)` 使用的最小内核状态切换。
+pub fn sys_acct(filename: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_acct",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let process = current_process();
+        if process.geteuid() != 0 {
+            return Err(ERRNO::EPERM);
+        }
+
+        if filename.is_null() {
+            debug!(
+                "[acct] disable pid={} cwd='{}'",
+                process.getpid(),
+                process.inner_exclusive_access().cwd
+            );
+            replace_accounting_target_with_log("disable", process.getpid(), None);
+            return Ok(0);
+        }
+
+        let path = read_cstring_from_user(filename, PATH_MAX)?;
+        let cwd = process.inner_exclusive_access().cwd.clone();
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
+
+        if path.ends_with('/') && !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        if inode.is_dir() {
+            return Err(ERRNO::EISDIR);
+        }
+
+        let stat = inode_stat(&inode);
+        if stat.mode.bits() & StatMode::TYPE_MASK.bits() != StatMode::FILE.bits() {
+            return Err(ERRNO::EACCES);
+        }
+        if mount_is_readonly(abs_path.as_str()) {
+            return Err(ERRNO::EROFS);
+        }
+        if !inode_allows_access(&inode, process.geteuid(), process.getegid(), W_OK as u32) {
+            return Err(ERRNO::EACCES);
+        }
+
+        debug!(
+            "[acct] enable pid={} cwd='{}' req='{}' abs='{}'",
+            process.getpid(),
+            cwd,
+            path,
+            abs_path
+        );
+        replace_accounting_target_with_log("enable", process.getpid(), Some(abs_path));
+        Ok(0)
+    })
+}
+
+fn alloc_anonymous_fd_with_bits(
+    status_flags: FileStatusFlags,
+    cloexec: bool,
+    status_fixed_bits: i32,
+) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(AnonymousFdFile),
+        AccessMode::ReadWrite,
+        status_flags,
+        status_fixed_bits,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    let mut entry = FdEntry::new(desc);
+    if cloexec {
+        entry.flags |= FdFlags::CLOEXEC;
+    }
+    inner.fd_table[fd] = Some(entry);
+    Ok(fd as isize)
+}
+
+fn alloc_anonymous_fd(status_flags: FileStatusFlags, cloexec: bool) -> Result<isize, ERRNO> {
+    alloc_anonymous_fd_with_bits(status_flags, cloexec, 0)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -953,6 +1350,73 @@ const UTIME_NOW: usize = 0x3fff_ffff;
 const UTIME_OMIT: usize = 0x3fff_fffe;
 const UID_GID_NO_CHANGE: u32 = u32::MAX;
 
+fn inode_allows_access(inode: &Arc<fs::Inode>, uid: u32, gid: u32, mode: u32) -> bool {
+    if mode == F_OK as u32 {
+        return true;
+    }
+
+    let Some(raw_mode) = inode.mode() else {
+        return inode.check_access(uid, gid, mode);
+    };
+    let perm_bits = raw_mode & 0o777;
+
+    if uid == 0 {
+        if mode & X_OK as u32 != 0 && perm_bits & 0o111 == 0 {
+            return false;
+        }
+        return true;
+    }
+
+    let file_uid = inode.uid().unwrap_or(0);
+    let file_gid = inode.gid().unwrap_or(0);
+    let perm = if uid == file_uid {
+        (perm_bits >> 6) & 0o7
+    } else if gid == file_gid {
+        (perm_bits >> 3) & 0o7
+    } else {
+        perm_bits & 0o7
+    };
+
+    if mode & R_OK as u32 != 0 && perm & 0o4 == 0 {
+        return false;
+    }
+    if mode & W_OK as u32 != 0 && perm & 0o2 == 0 {
+        return false;
+    }
+    if mode & X_OK as u32 != 0 && perm & 0o1 == 0 {
+        return false;
+    }
+    true
+}
+
+fn check_path_search_permissions(cwd: &str, path: &str, uid: u32, gid: u32) -> Result<(), ERRNO> {
+    if uid == 0 {
+        return Ok(());
+    }
+
+    let abs = canonicalize(cwd, path);
+    let components: Vec<&str> = abs.split('/').filter(|s| !s.is_empty()).collect();
+    if components.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut prefix = String::from("/");
+    for component in &components[..components.len() - 1] {
+        if prefix.len() > 1 {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        let inode = lookup_inode_follow("/", prefix.as_str(), true)?;
+        if !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        if !inode_allows_access(&inode, uid, gid, X_OK as u32) {
+            return Err(ERRNO::EACCES);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum UtimeArg {
     Now,
@@ -981,12 +1445,21 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     const O_LARGEFILE: i32 = 0x8000;
     const O_DIRECTORY: i32 = OpenFlags::DIRECTORY.bits();
     const O_NOFOLLOW: i32 = 0x20000;
+    const O_PATH: i32 = 0x200000;
 
-    let access_mode = AccessMode::from_open_bits(flags)?;
+    // O_PATH 仅获取一个指向文件位置的描述符；访问模式位被忽略，文件本身
+    // 不会被真正打开（read/write 等需返回 EBADF）。这里识别该标志并将其
+    // 透传到 `status_fixed_bits`，供 `F_GETFL` 及套接字系统调用据此判定。
+    let path_flag = flags & O_PATH;
+    let access_mode = if path_flag != 0 {
+        AccessMode::ReadOnly
+    } else {
+        AccessMode::from_open_bits(flags)?
+    };
     let ignored_flags = flags & (O_LARGEFILE | O_NOFOLLOW);
     let unsupported_flags = flags & O_NOCTTY;
     let status_flags = FileStatusFlags::from_bits_truncate(flags & (O_APPEND | O_NONBLOCK));
-    let effective_flags = flags & !(ignored_flags | O_APPEND | O_NONBLOCK);
+    let effective_flags = flags & !(ignored_flags | path_flag | O_APPEND | O_NONBLOCK);
 
     if unsupported_flags != 0 {
         // TODO: 后续若补齐 tty 控制终端语义，应在进程/会话层实现真实行为。
@@ -1007,7 +1480,7 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     Ok(OpenFileState {
         access_mode,
         status_flags,
-        status_fixed_bits: effective_flags & O_DIRECTORY,
+        status_fixed_bits: (effective_flags & O_DIRECTORY) | path_flag,
         open_flags,
     })
 }
@@ -1569,6 +2042,162 @@ pub fn sys_ftruncate(fd: u32, len: isize) -> isize {
     })
 }
 
+pub fn sys_eventfd2(_initval: u32, flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_epoll_create1(flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_inotify_init1(flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_signalfd4(fd: i32, sigmask: *const u8, _sigsetsize: usize, flags: i32) -> isize {
+    syscall_body!({
+        if fd != -1 {
+            return Err(ERRNO::EINVAL);
+        }
+        if sigmask.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_timerfd_create(_clockid: i32, flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_perf_event_open(
+    attr_uptr: usize,
+    _pid: isize,
+    _cpu: isize,
+    _group_fd: isize,
+    _flags: u32,
+) -> isize {
+    syscall_body!({
+        if attr_uptr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_fanotify_init(_flags: u32, _event_f_flags: u32) -> isize {
+    syscall_body!({
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_memfd_create(name: *const u8, flags: u32) -> isize {
+    syscall_body!({
+        if name.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(name, PATH_MAX)?;
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags as i32, O_CLOEXEC)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_bpf(_cmd: u32, attr: usize, _size: u32) -> isize {
+    syscall_body!({
+        if attr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_userfaultfd(flags: i32) -> isize {
+    syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC | O_NONBLOCK)?;
+        alloc_anonymous_fd(status_flags, cloexec)
+    })
+}
+
+pub fn sys_pidfd_open(_pid: isize, flags: u32) -> isize {
+    syscall_body!({
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_io_uring_setup(_entries: u32, params: usize) -> isize {
+    syscall_body!({
+        if params == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_open_tree(_dirfd: isize, path: *const u8, flags: u32) -> isize {
+    const O_PATH: i32 = 0x200000;
+    syscall_body!({
+        if path.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(path, PATH_MAX)?;
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd_with_bits(FileStatusFlags::empty(), false, O_PATH)
+    })
+}
+
+pub fn sys_fsopen(fsname: *const u8, flags: u32) -> isize {
+    syscall_body!({
+        if fsname.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(fsname, PATH_MAX)?;
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_fspick(_dirfd: isize, path: *const u8, flags: u32) -> isize {
+    syscall_body!({
+        if path.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let _ = read_cstring_from_user(path, PATH_MAX)?;
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
+pub fn sys_memfd_secret(flags: u32) -> isize {
+    syscall_body!({
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+    })
+}
+
 /// close syscall
 pub fn sys_close(fd: u32) -> isize {
     trace!(
@@ -1870,27 +2499,31 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         "kernel:pid[{}] sys_faccessat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if mode & !(R_OK | W_OK | X_OK) != 0 {
             return Err(ERRNO::EINVAL);
         }
 
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
 
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let process = current_process();
+        let uid = process.getuid();
+        let gid = process.getgid();
+        check_path_search_permissions(cwd.as_str(), path.as_str(), uid, gid)?;
         let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
         if mode == F_OK {
             return Ok(0);
         }
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        if mode & W_OK != 0 && mount_is_readonly(abs_path.as_str()) {
+            return Err(ERRNO::EROFS);
+        }
 
-        let process = current_process();
-        let uid = process.getuid();
-        let gid = process.getgid();
-        if inode.check_access(uid, gid, mode as u32) {
+        if inode_allows_access(&inode, uid, gid, mode as u32) {
             Ok(0)
         } else {
             Err(ERRNO::EACCES)
@@ -2230,7 +2863,12 @@ pub fn sys_fchownat(dirfd: isize, pathname: *const u8, user: u32, group: u32, fl
         let target = resolve_at_target(dirfd, path.as_str(), flags)?;
         let inode = match target {
             ResolvedAtTarget::Inode(i) => i,
-            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
+            ResolvedAtTarget::FileDesc(desc) => {
+                if desc.stat().mode.bits() & StatMode::TYPE_MASK.bits() == StatMode::SOCK.bits() {
+                    return Err(ERRNO::ENOENT);
+                }
+                return Err(ERRNO::EBADF);
+            }
         };
 
         if user == UID_GID_NO_CHANGE && group == UID_GID_NO_CHANGE {
@@ -2303,32 +2941,57 @@ pub fn sys_mount(
         "kernel:pid[{}] sys_mount",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let dev_name = translated_str(token, dev_name).or_errno(ERRNO::EFAULT)?;
-        let dir_name = translated_str(token, dir_name).or_errno(ERRNO::EFAULT)?;
-        let fs_type  = translated_str(token, fs_type).or_errno(ERRNO::EFAULT)?;
+        let dev_name = if dev_name.is_null() {
+            String::new()
+        } else {
+            read_cstring_from_user(dev_name, PATH_MAX)?
+        };
+        let dir_name = read_cstring_from_user(dir_name, PATH_MAX)?;
+        let fs_type  = if fs_type.is_null() {
+            String::new()
+        } else {
+            read_cstring_from_user(fs_type, PATH_MAX)?
+        };
         // `data` is typically NULL (e.g. mount(…, NULL)); skip translation if so.
         let _data: String = if data.is_null() {
             String::new()
         } else {
-            translated_str(token, data).or_errno(ERRNO::EFAULT)?
+            read_cstring_from_user(data, PATH_MAX)?
         };
 
         let cwd     = current_process().inner_exclusive_access().cwd.clone();
         let abs_mnt = canonicalize(&cwd, &dir_name);
+        let readonly = _flags & MS_RDONLY != 0;
+        let remount = _flags & MS_REMOUNT != 0;
         debug!(
-            "sys_mount: dev_name = {}, dir_name = {}, abs_mnt = {}, fs_type = {}, data = {}",
+            "sys_mount: dev_name = {}, dir_name = {}, abs_mnt = {}, fs_type = {}, flags = {:#x}, data = {}",
             dev_name,
             dir_name,
             abs_mnt,
             fs_type,
+            _flags,
             _data
         );
-        if fs_type == "tmpfs" {
-            mount_tmpfs(&abs_mnt)?;
+        if (_flags & MS_PRIVATE) != 0 {
+            let _ = _flags & MS_REC;
+            return Ok(0);
+        }
+        if remount {
+            let source = if dev_name.is_empty() { "tmpfs" } else { dev_name.as_str() };
+            remount_path(&abs_mnt, source, fs_type.as_str(), readonly)?;
+        } else if fs_type == "tmpfs" {
+            mount_tmpfs(&abs_mnt, readonly)?;
+        } else if fs_type == "sysfs" {
+            if abs_mnt == "/sys" {
+                remount_path(&abs_mnt, "sysfs", "sysfs", readonly).or_else(|_| {
+                    mount_sysfs(&abs_mnt, readonly)
+                })?;
+            } else {
+                mount_sysfs(&abs_mnt, readonly)?;
+            }
         } else {
-            mount_device(&dev_name, &abs_mnt, &fs_type)?;
+            mount_device(&dev_name, &abs_mnt, &fs_type, readonly)?;
         }
         Ok(0)
     })

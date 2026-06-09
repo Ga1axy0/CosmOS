@@ -20,7 +20,8 @@ use crate::sched::{
     add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
     take_current_task, TaskContext,
 };
-use crate::fs::{open_file, OpenFlags};
+use crate::fs::{open_file_at, OpenFlags};
+use crate::syscall::write_process_accounting_on_exit;
 use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
@@ -44,7 +45,7 @@ pub use crate::signal::{
     SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
-pub use process::{ExitReason, FdEntry, FdFlags, ShmAttachment};
+pub use process::{ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
     clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
@@ -162,8 +163,11 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         process_inner.is_zombie = true;
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
+        drop(process_inner);
+        write_process_accounting_on_exit(&process, exit_reason);
 
         {
+            let process_inner = process.inner_exclusive_access();
             // move all child processes under init process
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {
@@ -176,6 +180,7 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
         // it has to be done before we dealloc the whole memory_set
         // otherwise they will be deallocated twice
         let mut recycle_res = Vec::<TaskUserRes>::new();
+        let process_inner = process.inner_exclusive_access();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
             let thread_id = {
@@ -258,9 +263,8 @@ lazy_static! {
     /// the name "initproc" may be changed to any other app name like "usertests",
     /// but we have user_shell, so we don't need to change it.
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("initproc", OpenFlags::RDONLY).expect("Initproc not found! Rebuild image to include initproc.");
-        let v = inode.read_all();
-        ProcessControlBlock::new(v.as_slice(), String::from("/initproc"))
+        open_file_at("/", "/sbin/init", OpenFlags::RDONLY).expect("Init binary not found at /sbin/init! Rebuild image to include rootfs init.");
+        ProcessControlBlock::new(String::from("/sbin/init"))
     };
     static ref TID2TASK: crate::sync::SpinNoIrqLock<BTreeMap<usize, alloc::sync::Weak<TaskControlBlock>>> =
         crate::sync::SpinNoIrqLock::new(BTreeMap::new());

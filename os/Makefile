@@ -5,7 +5,7 @@ KERNEL_ELF = target/$(TARGET)/$(MODE)/os
 KERNEL_BIN = $(KERNEL_ELF).bin
 DISASM_TMP = target/$(TARGET)/$(MODE)/asm
 USER_MODE := release
-FS_IMG = ../user/target/$(TARGET)/$(USER_MODE)/fs.img
+FS_IMG ?= ../user/target/$(TARGET)/$(USER_MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
 SMP ?= 1
@@ -34,6 +34,9 @@ BOOTLOADER := ../bootloader/$(SBI)-$(BOARD)-$(BOOTLOADER_TAG).bin
 # Enable cfg(qemu7) only for QEMU 7 or older.
 QEMU7_CFG := $(shell echo "$(QEMU_MAJOR)" | awk '/^[0-9]+$$/ { if ($$1 <= 7) print "--cfg qemu7" }')
 
+QEMU_PRIMARY_BLK_ARGS = -drive file=$(FS_IMG),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+QEMU_EXTRA_ARGS ?=
+
 # Building mode argument
 MODE_ARG = $(if $(filter release,$(MODE)),--release)
 
@@ -44,16 +47,8 @@ KERNEL_ENTRY_PA := 0x80200000
 OBJDUMP := rust-objdump --arch-name=riscv64
 OBJCOPY := rust-objcopy --binary-architecture=riscv64
 
-# CHAPTER ?= $(shell git rev-parse --abbrev-ref HEAD | sed -E 's/ch([0-9])/\1/')
-CHAPTER = 8
-TEST ?= $(CHAPTER)
-BASE ?= 1
-
 # Disassembly
 DISASM ?= -x
-
-# Run usertests or usershell
-TEST ?=
 
 build: env kernel fs-img
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
@@ -72,7 +67,7 @@ fs-img:
 	else \
 		echo "Image not found: $(FS_IMG). Building user apps first."; \
 		make -C ../user clean; \
-		make -C ../user build TEST=$(TEST) CHAPTER=$(CHAPTER) BASE=$(BASE); \
+		make -C ../user build; \
 		if [ -n "$(strip $(BASE_IMG))" ]; then \
 			if [ ! -f "$(BASE_IMG)" ]; then \
 				echo "Base image not found: $(BASE_IMG)"; \
@@ -129,8 +124,7 @@ run-inner:
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778,hostfwd=udp::7778-:7778 \
         -device virtio-net-device,netdev=net0,id=net0 \
-		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
         # -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
 		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
 		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
@@ -147,8 +141,7 @@ run-inner-trace:
 		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777 \
         -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
         -device virtio-net-device,netdev=net0,id=net0 \
-		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
 		-d int,in_asm \
 		-D qemu.log \
 		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
@@ -166,8 +159,7 @@ debug: build
 gdbserver: MODE=debug
 gdbserver: build
 	@$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-	        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
 		-s -S
 
 gdbclient: MODE=debug

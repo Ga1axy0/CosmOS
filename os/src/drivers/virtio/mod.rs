@@ -1,4 +1,4 @@
-//! Shared VirtIO HAL glue for xxOS.
+//! Shared VirtIO HAL glue for CosmOS.
 //!
 //! This module provides the `virtio-drivers` [`Hal`] implementation used by
 //! both block and network drivers.
@@ -103,7 +103,7 @@ unsafe fn copy_from_bounce(src: usize, dst: usize, len: usize) {
     }
 }
 
-/// The HAL implementation used by `virtio-drivers` in xxOS.
+/// The HAL implementation used by `virtio-drivers` in CosmOS.
 pub struct VirtioHal;
 
 unsafe impl Hal for VirtioHal {

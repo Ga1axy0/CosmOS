@@ -345,6 +345,18 @@ impl UnixSocketPairEnd {
     }
 }
 
+/// 创建一个未连接的 UNIX stream socket 端点。
+///
+/// 当前仅需要一个可被 socket syscall 返回、并能被识别为 `AF_UNIX`
+/// socket 的文件对象；其对端立即丢弃，后续对该端点的收发会表现为
+/// 未连接/对端关闭状态。
+pub(crate) fn create_unix_stream_socket_file() -> Arc<UnixSocketPairEnd> {
+    let (ab_read, ab_write) = crate::fs::make_pipe();
+    let (ba_read, ba_write) = crate::fs::make_pipe();
+    let (socket, _peer) = UnixSocketPairEnd::new_pair(ba_read, ab_write, ab_read, ba_write);
+    socket
+}
+
 impl File for UnixSocketPairEnd {
     fn as_any(&self) -> &dyn Any {
         self

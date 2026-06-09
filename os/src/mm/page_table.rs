@@ -1,7 +1,9 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{
-    frame_alloc, FrameTracker, MmError, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
+    frame_alloc, FrameTracker, MmError, PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END,
+    VirtAddr, VirtPageNum,
 };
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -250,25 +252,42 @@ impl PageTable {
     }
 }
 
+fn checked_user_va(va: usize) -> Option<VirtAddr> {
+    (va < USER_SPACE_END).then_some(VirtAddr(va))
+}
+
+fn checked_user_range(start: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return Some(start);
+    }
+    if start >= USER_SPACE_END {
+        return None;
+    }
+    let end = start.checked_add(len)?;
+    (end <= USER_SPACE_END).then_some(end)
+}
+
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
-    let end = start + len;
+    let end = checked_user_range(start, len)?;
     let mut v = Vec::new();
     while start < end {
-        let start_va = VirtAddr::from(start);
+        let start_va = checked_user_va(start)?;
         let mut vpn = start_va.floor();
         if let Some(ppn) = page_table.translate(vpn).map(|pte| pte.ppn()) {
             vpn.step();
-            let mut end_va: VirtAddr = vpn.into();
-            end_va = end_va.min(VirtAddr::from(end));
-            if end_va.page_offset() == 0 {
+            let chunk_end = VirtAddr::from(vpn).0.min(end);
+            if chunk_end % PAGE_SIZE == 0 {
                 v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
             } else {
-                v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+                v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..(chunk_end % PAGE_SIZE)]);
             }
-            start = end_va.into();
+            start = chunk_end;
         } else {
             return None;
         }
@@ -282,7 +301,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
     let mut string = String::new();
     let mut va = ptr as usize;
     loop {
-        let pa = match page_table.translate_va(VirtAddr::from(va)) {
+        let pa = match checked_user_va(va).and_then(|va| page_table.translate_va(va)) {
             Some(pa) => pa,
             None => return None,
         };
@@ -291,7 +310,10 @@ pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
             break;
         }
         string.push(ch as char);
-        va += 1;
+        va = va.checked_add(1)?;
+        if va >= USER_SPACE_END {
+            return None;
+        }
     }
     Some(string)
 }
@@ -299,8 +321,9 @@ pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
 /// translate a pointer `ptr` in other address space to a immutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
 pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
     let page_table = PageTable::from_token(token);
+    checked_user_range(ptr as usize, core::mem::size_of::<T>().max(1))?;
     page_table
-        .translate_va(VirtAddr::from(ptr as usize))
+        .translate_va(VirtAddr(ptr as usize))
         .map(|pa| pa.get_ref())
 }
 
@@ -308,8 +331,9 @@ pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
 pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
+    checked_user_range(va, core::mem::size_of::<T>().max(1))?;
     page_table
-        .translate_va(VirtAddr::from(va))
+        .translate_va(VirtAddr(va))
         .map(|pa| pa.get_mut())
 }
 

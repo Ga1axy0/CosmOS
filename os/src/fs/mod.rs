@@ -8,23 +8,60 @@ mod tty;
 pub mod rootfs;
 pub mod devfs;
 pub mod procfs;
+pub mod sysfs;
 /// In-memory tmpfs backend that can be mounted into the virtual namespace.
 pub mod tmpfs;
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use fs::{Inode, errno::FS_ERRNO};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use core::any::Any;
-pub use fs::vfs::InodeTime;
+pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
     mapping_for_inode, sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
     sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
     retain_mapped_page, PAGE_CACHE_MANAGER
 };
+
+fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {
+    let mut written = 0usize;
+
+    for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
+        let name_bytes = name.as_bytes();
+        let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
+        if written + reclen > buf.len() {
+            break;
+        }
+
+        buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+        let next_off = (i + 1) as i64;
+        buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
+        buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        buf[written + 18] = match file_type {
+            VfsFileType::Directory => 4,
+            VfsFileType::Symlink => 10,
+            VfsFileType::Char => 2,
+            VfsFileType::Block => 6,
+            VfsFileType::Fifo => 1,
+            VfsFileType::Socket => 12,
+            VfsFileType::Regular => 8,
+            VfsFileType::Unknown => 0,
+        };
+        buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+        buf[written + 19 + name_bytes.len()] = 0;
+        for b in &mut buf[written + 19 + name_bytes.len() + 1..written + reclen] {
+            *b = 0;
+        }
+        written += reclen;
+    }
+
+    written
+}
 
 /// Kernel-side alias for the shared filesystem statistics snapshot.
 pub type StatFs64 = fs::VfsStatFs;
@@ -110,6 +147,19 @@ struct FileDescriptionInner {
     offset: usize,
     /// 当前文件状态位。
     status_flags: FileStatusFlags,
+    /// 目录项快照，避免遍历期间删除目录项导致位置漂移漏读。
+    dirent_snapshot: Option<Vec<(String, VfsFileType)>>,
+}
+
+/// 套接字的不可变元信息。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketSpec {
+    /// `socket(2)` 的 `domain` 参数，也就是协议族/地址族。
+    pub family: i32,
+    /// `socket(2)` 的基础 `type`，不包含 `SOCK_CLOEXEC`/`SOCK_NONBLOCK` 标志。
+    pub socket_type: i32,
+    /// `socket(2)` 的 `protocol` 参数。
+    pub protocol: i32,
 }
 
 /// 打开文件描述，对应 Linux 的 open file description。
@@ -120,6 +170,8 @@ pub struct FileDescription {
     access_mode: AccessMode,
     /// `F_GETFL` 需要保留返回、但 `F_SETFL` 不可修改的状态位。
     status_fixed_bits: i32,
+    /// 套接字 fd 的固定元信息；非套接字为 `None`。
+    socket_spec: Option<SocketSpec>,
     /// 共享的偏移与状态位。
     inner: SpinNoIrqLock<FileDescriptionInner>,
 }
@@ -136,10 +188,34 @@ impl FileDescription {
             file,
             access_mode,
             status_fixed_bits,
+            socket_spec: None,
             inner: SpinNoIrqLock::new(FileDescriptionInner {
                     offset: 0,
                     status_flags,
+                    dirent_snapshot: None,
                 }),
+        }
+    }
+
+    /// 基于底层套接字对象创建一个打开文件描述，并附带固定的
+    /// `family/type/protocol` 元信息。
+    pub fn new_socket(
+        file: Arc<dyn File + Send + Sync>,
+        access_mode: AccessMode,
+        status_flags: FileStatusFlags,
+        status_fixed_bits: i32,
+        socket_spec: SocketSpec,
+    ) -> Self {
+        Self {
+            file,
+            access_mode,
+            status_fixed_bits,
+            socket_spec: Some(socket_spec),
+            inner: SpinNoIrqLock::new(FileDescriptionInner {
+                offset: 0,
+                status_flags,
+                dirent_snapshot: None,
+            }),
         }
     }
 
@@ -254,6 +330,19 @@ impl FileDescription {
         self.access_mode.bits() | self.status_fixed_bits | inner.status_flags.bits()
     }
 
+    /// 是否为 `O_PATH` 打开的描述符。这类描述符仅引用文件在树中的位置，
+    /// 不关联可操作的文件对象，套接字相关系统调用需以 `EBADF` 拒绝
+    /// （对应 Linux `fdget(FMODE_PATH)` 的行为）。
+    pub fn is_path(&self) -> bool {
+        const O_PATH: i32 = 0x200000;
+        self.status_fixed_bits & O_PATH != 0
+    }
+
+    /// 返回套接字的固定元信息；非套接字描述符返回 `None`。
+    pub fn socket_spec(&self) -> Option<SocketSpec> {
+        self.socket_spec
+    }
+
     /// 覆盖当前可变文件状态位。
     pub fn set_status_flags(&self, status_flags: FileStatusFlags) {
         self.inner.lock().status_flags = status_flags;
@@ -307,7 +396,22 @@ impl FileDescription {
     /// 读取目录项并推进共享目录位置。
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
-        let read_size = self.file.getdents64(inner.offset, buf);
+        let read_size = if self.file.is_dir() {
+            if let Some(inode) = self.as_inode() {
+                if inner.offset == 0 || inner.dirent_snapshot.is_none() {
+                    inner.dirent_snapshot = Some(inode.ls());
+                }
+                encode_dirent64_records(
+                    inner.dirent_snapshot.as_ref().unwrap().as_slice(),
+                    inner.offset,
+                    buf,
+                )
+            } else {
+                self.file.getdents64(inner.offset, buf)
+            }
+        } else {
+            self.file.getdents64(inner.offset, buf)
+        };
         if read_size == 0 {
             return 0;
         }
@@ -379,6 +483,7 @@ impl FileDescription {
             return Err(ERRNO::EINVAL);
         }
         inner.offset = new_offset as usize;
+        inner.dirent_snapshot = None;
         Ok(new_offset as u64)
     }
 }
@@ -590,20 +695,21 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, inode_stat, linkat,
+    canonicalize, do_mount, do_umount, init_dev, init_procfs, init_rootfs, init_sysfs, inode_stat, linkat,
     linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, mkdir_at,
-    mkdir_at_with_inode, mount_device, mount_tmpfs, open_file, open_file_at, open_file_at_with_status,
-    rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
+    mkdir_at_with_inode, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
+    open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::new_stdio_files;
-pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyFile, WinSize, CONSOLE_TTY};
+pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize, CONSOLE_TTY};
 
 /// Initialize the filesystem, including rootfs and devfs.
 pub fn init() {
     init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
     init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+    init_sysfs();  // Initialize sysfs for /sys/class/net entries.
     init_procfs();  // Initialize procfs for /proc entries.
 }

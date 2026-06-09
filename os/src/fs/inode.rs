@@ -7,7 +7,9 @@ use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
 use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
+use crate::fs::tty::TtyDeviceNode;
 use crate::fs::procfs::ProcRootNode;
+use crate::fs::sysfs::SysRootNode;
 use crate::drivers::block::BLOCK_DEVICES;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -131,6 +133,12 @@ pub(crate) struct MountRecord {
     pub(crate) options: String,
 }
 
+impl MountRecord {
+    fn is_readonly(&self) -> bool {
+        self.options.split(',').any(|opt| opt == "ro")
+    }
+}
+
 lazy_static! {
     /// Current mount table used by procfs.
     static ref MOUNT_TABLE: SpinNoIrqLock<BTreeMap<String, MountRecord>> =
@@ -155,6 +163,78 @@ fn record_mount(target: &str, source: &str, fs_type: &str, options: &str) {
 
 fn remove_mount_record(target: &str) {
     MOUNT_TABLE.lock().remove(target);
+}
+
+fn update_mount_record(target: &str, source: &str, fs_type: &str, options: &str) -> Result<(), ERRNO> {
+    let mut table = MOUNT_TABLE.lock();
+    let record = table.get_mut(target).ok_or(ERRNO::EINVAL)?;
+    record.source = String::from(source);
+    record.fs_type = String::from(fs_type);
+    record.options = String::from(options);
+    Ok(())
+}
+
+/// Return whether the mounted filesystem covering `abs_path` is read-only.
+///
+/// The lookup uses the longest mounted-path prefix so sub-mounts override
+/// their parents, matching Linux mount-namespace resolution.
+pub fn mount_is_readonly(abs_path: &str) -> bool {
+    let table = MOUNT_TABLE.lock();
+    let mut best_match_len = 0usize;
+    let mut readonly = false;
+
+    for (target, record) in table.iter() {
+        if !abs_path.starts_with(target) {
+            continue;
+        }
+        if abs_path.len() != target.len()
+            && !target.ends_with('/')
+            && abs_path.as_bytes().get(target.len()) != Some(&b'/')
+        {
+            continue;
+        }
+        if target.len() >= best_match_len {
+            best_match_len = target.len();
+            readonly = record.is_readonly();
+        }
+    }
+
+    readonly
+}
+
+fn prune_unused_virtual_dirs(start_path: &str) {
+    let mut current = String::from(start_path);
+
+    while current != "/" {
+        let vdir = {
+            let map = VIRT_DIRS.lock();
+            map.get(current.as_str()).cloned()
+        };
+        let Some(vdir) = vdir else {
+            break;
+        };
+
+        if vdir.mount_count() != 0 || vdir.keep_bound_without_children() {
+            break;
+        }
+
+        let (parent_path, name) = split_for_mount(current.as_str());
+        let parent_vdir = if parent_path == "/" {
+            Arc::clone(&VIRT_ROOT)
+        } else {
+            let map = VIRT_DIRS.lock();
+            match map.get(parent_path).cloned() {
+                Some(parent) => parent,
+                None => break,
+            }
+        };
+
+        if !parent_vdir.unbind(name) {
+            break;
+        }
+        VIRT_DIRS.lock().remove(current.as_str());
+        current = String::from(parent_path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,11 +281,15 @@ fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
     // from an explicit mount or from the backing overlay), preserve it as the
     // overlay of the new virtual dir so mount wrappers do not hide existing
     // mount points like `/tmp`.
+    let preserve_mount_binding = parent_vdir.has_mount(name);
     let child_overlay: Option<Arc<dyn VfsNode>> = parent_vdir.namespace_child_dir(name);
 
     let new_vdir = VirtualDirNode::new();
     if let Some(ov) = child_overlay {
         new_vdir.set_overlay(ov);
+    }
+    if preserve_mount_binding {
+        new_vdir.mark_persistent_mount_wrapper();
     }
 
     // Insert into the virtual namespace.
@@ -282,6 +366,7 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
     // Clean up the registry entry (no-op if `abs` was a real-FS mount, not
     // a VirtualDirNode we created).
     VIRT_DIRS.lock().remove(&abs);
+    prune_unused_virtual_dirs(parent_path);
 
     info!("[kernel] unmounted {}", abs);
     Ok(())
@@ -293,32 +378,50 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
 /// and filesystem initialisation) and before any file-system operations.
 /// Invoked from `rust_main` in `main.rs`.
 pub fn init_rootfs() {
-    use crate::drivers::BLOCK_DEVICE;
+    let (root_dev_name, root_dev, extra_dev) = {
+        let map = BLOCK_DEVICES.lock();
+        if let Some(dev) = map.get("vdb").cloned() {
+            ("/dev/vdb", dev, map.get("vda").cloned().map(|dev| ("/dev/vda", dev)))
+        } else {
+            let dev = map
+                .get("vda")
+                .cloned()
+                .expect("[kernel] rootfs device vda not found");
+            ("/dev/vda", dev, None)
+        }
+    };
 
     #[cfg(feature = "fat32")]
     {
         use fs::Fat32FileSystem;
-        let vfs = Fat32FileSystem::open(BLOCK_DEVICE.clone());
+        let vfs = Fat32FileSystem::open(root_dev.clone());
         let root = Fat32FileSystem::root_inode(&vfs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
-        record_mount("/", "rootfs", "fat32", "rw");
+        record_mount("/", root_dev_name, "fat32", "rw");
     }
     #[cfg(feature = "easyfs")]
     {
         use fs::EasyFileSystem;
-        let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
+        let efs = EasyFileSystem::open(root_dev.clone());
         let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
-        record_mount("/", "rootfs", "easyfs", "rw");
+        record_mount("/", root_dev_name, "easyfs", "rw");
     }
     #[cfg(feature = "ext4")]
     {
         use fs::Ext4FileSystem;
-        let efs = Ext4FileSystem::open(BLOCK_DEVICE.clone());
+        let efs = Ext4FileSystem::open(root_dev.clone());
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
-        record_mount("/", "/dev/vda", "ext4", "rw");
-        // do_mount("/mnt/vda", root).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt/sda"));
+        record_mount("/", root_dev_name, "ext4", "rw");
+        if let Some((extra_dev_name, extra_dev)) = extra_dev {
+            let extra_fs = Ext4FileSystem::open(extra_dev);
+            let extra_root = Ext4FileSystem::root_inode(&extra_fs);
+            do_mount("/mnt", extra_root)
+                .unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt"));
+            record_mount("/mnt", extra_dev_name, "ext4", "rw");
+            info!("[kernel] mounted extra ext4 at /mnt from {}", extra_dev_name);
+        }
     }
 
     let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
@@ -867,6 +970,9 @@ impl File for OSInode {
         if let Some(rtc) = vfs_node.as_any().downcast_ref::<RtcDevNode>() {
             return rtc.ioctl(req, arg);
         }
+        if let Some(tty) = vfs_node.as_any().downcast_ref::<TtyDeviceNode>() {
+            return tty.ioctl(req, arg);
+        }
         Err(ERRNO::ENOTTY)
     }
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -989,6 +1095,12 @@ pub fn init_dev() {
     dev_dir.bind("cpu_dma_latency", cpu_dma_latency_node as Arc<dyn VfsNode>);
     info!("[kernel] /dev/cpu_dma_latency registered");
 
+    let console_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(crate::fs::TtyDeviceKind::Console, 0x0501));
+    dev_dir.bind("console", Arc::clone(&console_node));
+    let tty_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(crate::fs::TtyDeviceKind::Tty, 0x0500));
+    dev_dir.bind("tty", tty_node);
+    info!("[kernel] /dev/console and /dev/tty registered");
+
     // Register discovered block devices (e.g. /dev/vda)
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
@@ -1031,12 +1143,22 @@ pub fn init_procfs() {
     info!("[kernel] /proc initialized");
 }
 
+/// Mount sysfs at `/sys`.
+pub fn init_sysfs() {
+    let sys_root: Arc<dyn VfsNode> = Arc::new(SysRootNode::new());
+    let sys_inode = Inode::from_vfs_node(sys_root);
+    do_mount("/sys", sys_inode)
+        .unwrap_or_else(|_| panic!("[kernel] failed to mount sysfs at /sys"));
+    record_mount("/sys", "sysfs", "sysfs", "rw");
+    info!("[kernel] /sys initialized");
+}
+
 /// Mount the filesystem on `dev_path` at the absolute path `abs_mnt`.
 ///
 /// `dev_path` must resolve to a [`BlockDevNode`] in the VFS (e.g. `/dev/vda`).
 /// `abs_mnt` must be an already-canonicalized absolute pathname.
 /// `fs_type` is a filesystem type string: `"vfat"`, `"fat32"`, or `"ext4"`.
-pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), ERRNO> {
+pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str, readonly: bool) -> Result<(), ERRNO> {
     debug!(
         "mount_device: dev_path={}, abs_mnt={}, fs_type={}",
         dev_path,
@@ -1068,14 +1190,40 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str) -> Result<(), 
     };
 
     do_mount(abs_mnt, fs_root)?;
-    record_mount(abs_mnt, &canonicalize("/", dev_path), fs_type, "rw");
+    record_mount(
+        abs_mnt,
+        &canonicalize("/", dev_path),
+        fs_type,
+        if readonly { "ro" } else { "rw" },
+    );
     Ok(())
 }
 
 /// Mount a fresh tmpfs instance at `abs_mnt`.
-pub fn mount_tmpfs(abs_mnt: &str) -> Result<(), ERRNO> {
+pub fn mount_tmpfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
     let fs_root = Inode::from_vfs_node(new_tmpfs_root());
     do_mount(abs_mnt, fs_root)?;
-    record_mount(abs_mnt, "tmpfs", "tmpfs", "rw");
+    record_mount(abs_mnt, "tmpfs", "tmpfs", if readonly { "ro" } else { "rw" });
     Ok(())
+}
+
+/// Mount a sysfs view rooted at `abs_mnt`.
+pub fn mount_sysfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
+    let fs_root = Inode::from_vfs_node(Arc::new(SysRootNode::new()) as Arc<dyn VfsNode>);
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, "sysfs", "sysfs", if readonly { "ro" } else { "rw" });
+    Ok(())
+}
+
+/// Update an existing mount record in place, preserving the mounted tree.
+///
+/// CosmOS currently tracks remount state in mount metadata so path-based checks
+/// can observe `ro` versus `rw` without rebuilding the mounted filesystem.
+pub fn remount_path(abs_mnt: &str, dev_path: &str, fs_type: &str, readonly: bool) -> Result<(), ERRNO> {
+    update_mount_record(
+        abs_mnt,
+        dev_path,
+        fs_type,
+        if readonly { "ro" } else { "rw" },
+    )
 }

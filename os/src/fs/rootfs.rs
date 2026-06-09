@@ -33,7 +33,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
 use fs::remove_dentry;
@@ -74,6 +74,7 @@ struct VirtDirInner {
 pub struct VirtualDirNode {
     ino: u64,
     inner: SpinNoIrqLock<VirtDirInner>,
+    keep_bound_without_children: AtomicBool,
 }
 
 // SAFETY: SpinNoIrqLock now uses an atomic spinlock internally, so concurrent
@@ -91,6 +92,7 @@ impl VirtualDirNode {
         Arc::new(Self {
             ino: alloc_virt_ino(),
             inner,
+            keep_bound_without_children: AtomicBool::new(false),
         })
     }
 
@@ -158,8 +160,21 @@ impl VirtualDirNode {
         self.overlay_child_dir(name)
     }
 
-    fn has_mount(&self, name: &str) -> bool {
+    pub(crate) fn has_mount(&self, name: &str) -> bool {
         self.inner.lock().mounts.contains_key(name)
+    }
+
+    pub(crate) fn mount_count(&self) -> usize {
+        self.inner.lock().mounts.len()
+    }
+
+    pub(crate) fn mark_persistent_mount_wrapper(&self) {
+        self.keep_bound_without_children
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn keep_bound_without_children(&self) -> bool {
+        self.keep_bound_without_children.load(Ordering::Relaxed)
     }
 
     fn overlay_node(&self) -> Option<Arc<dyn VfsNode>> {

@@ -1,10 +1,11 @@
-use crate::mm::{MapPermission, USER_SPACE_END, VirtAddr};
+use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::task::yield_current_and_run_next;
 use crate::timer::get_time_ns;
 use crate::{
+    config::PAGE_SIZE,
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hart::hartid,
     ipc::{self, IPC_RMID},
@@ -18,6 +19,12 @@ use crate::{
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
+
+const UID_NO_CHANGE: u32 = u32::MAX;
+
+fn unprivileged_uid_change_allowed(current_uid: u32, current_euid: u32, current_suid: u32, new_uid: u32) -> bool {
+    new_uid == current_uid || new_uid == current_euid || new_uid == current_suid
+}
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -42,6 +49,17 @@ const EXEC_INTERPRETER_MAX_DEPTH: usize = 4;
 const EXEC_PROBE_SIZE: usize = 256;
 /// ELF 文件头魔数。
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+fn should_trace_exec(path: &str, argv: &[String]) -> bool {
+    path.contains("acct02")
+        || argv.iter().any(|arg| arg.contains("acct02"))
+}
+
+fn path_env_from_envs(envs: &[String]) -> Option<&str> {
+    envs.iter()
+        .find_map(|env| env.strip_prefix("PATH="))
+}
+
 /// 判断当前文件是否为 ELF 映像。
 fn is_elf_image(file_data: &[u8]) -> bool {
     file_data.starts_with(ELF_MAGIC)
@@ -209,6 +227,100 @@ pub fn sys_getegid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getegid pid:{}", process.getpid());
     process.getegid() as isize
+}
+
+/// setuid syscall
+pub fn sys_setuid(uid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setuid pid:{} uid={}", process.getpid(), uid);
+    syscall_body!({
+        let current_uid = process.getuid();
+        let current_euid = process.geteuid();
+        let current_suid = process.getsuid();
+        if current_euid != 0 && !unprivileged_uid_change_allowed(current_uid, current_euid, current_suid, uid) {
+            return Err(ERRNO::EPERM);
+        }
+        process.setuid_cred(uid);
+        Ok(0)
+    })
+}
+
+/// setreuid syscall
+pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setreuid pid:{} ruid={} euid={}", process.getpid(), ruid, euid);
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_ruid = cred.uid;
+        let old_euid = cred.euid;
+        let old_suid = cred.suid;
+        let privileged = old_euid == 0;
+
+        if !privileged {
+            if ruid != UID_NO_CHANGE
+                && !unprivileged_uid_change_allowed(old_ruid, old_euid, old_suid, ruid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+            if euid != UID_NO_CHANGE
+                && !unprivileged_uid_change_allowed(old_ruid, old_euid, old_suid, euid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+        }
+
+        let new_ruid = if ruid == UID_NO_CHANGE { old_ruid } else { ruid };
+        let new_euid = if euid == UID_NO_CHANGE { old_euid } else { euid };
+        cred.uid = new_ruid;
+        cred.euid = new_euid;
+        if ruid != UID_NO_CHANGE || (euid != UID_NO_CHANGE && new_euid != old_ruid) {
+            cred.suid = new_euid;
+        }
+        Ok(0)
+    })
+}
+
+/// setresuid syscall
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
+    let process = current_process();
+    trace!(
+        "kernel: sys_setresuid pid:{} ruid={} euid={} suid={}",
+        process.getpid(),
+        ruid,
+        euid,
+        suid
+    );
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_ruid = cred.uid;
+        let old_euid = cred.euid;
+        let old_suid = cred.suid;
+        let privileged = old_euid == 0;
+
+        if !privileged {
+            for new_uid in [ruid, euid, suid] {
+                if new_uid == UID_NO_CHANGE {
+                    continue;
+                }
+                if !unprivileged_uid_change_allowed(old_ruid, old_euid, old_suid, new_uid) {
+                    return Err(ERRNO::EPERM);
+                }
+            }
+        }
+
+        if ruid != UID_NO_CHANGE {
+            cred.uid = ruid;
+        }
+        if euid != UID_NO_CHANGE {
+            cred.euid = euid;
+        }
+        if suid != UID_NO_CHANGE {
+            cred.suid = suid;
+        }
+        Ok(0)
+    })
 }
 
 /// umask syscall
@@ -487,6 +599,18 @@ bitflags! {
         const CLONE_DETACHED = 0x0040_0000;
         /// 在子地址空间写入子 tid。
         const CLONE_CHILD_SETTID = 0x0100_0000;
+        /// 创建新的 mount namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWNS = 0x0002_0000;
+        /// 创建新的 UTS namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWUTS = 0x0400_0000;
+        /// 创建新的 IPC namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWIPC = 0x0800_0000;
+        /// 创建新的 user namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWUSER = 0x1000_0000;
+        /// 创建新的 PID namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWPID = 0x2000_0000;
+        /// 创建新的 network namespace；当前先按兼容 no-op 处理。
+        const CLONE_NEWNET = 0x4000_0000;
     }
 }
 
@@ -533,9 +657,21 @@ pub fn sys_clone(
             );
             return Err(ERRNO::EINVAL);
         }
-        let thread_clone = flags.contains(CloneFlags::CLONE_VM);
-        if thread_clone && !flags.contains(CloneFlags::CLONE_THREAD) {
+        let vfork_clone = flags.contains(CloneFlags::CLONE_VFORK);
+        let thread_clone = flags.contains(CloneFlags::CLONE_VM) && !vfork_clone;
+        if flags.contains(CloneFlags::CLONE_VM)
+            && !flags.contains(CloneFlags::CLONE_THREAD)
+            && !vfork_clone
+        {
             warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
+            return Err(ERRNO::EINVAL);
+        }
+        if vfork_clone && !flags.contains(CloneFlags::CLONE_VM) {
+            warn!("kernel: sys_clone CLONE_VFORK without CLONE_VM is unsupported");
+            return Err(ERRNO::EINVAL);
+        }
+        if vfork_clone && flags.contains(CloneFlags::CLONE_THREAD) {
+            warn!("kernel: sys_clone CLONE_VFORK with CLONE_THREAD is unsupported");
             return Err(ERRNO::EINVAL);
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
@@ -552,10 +688,6 @@ pub fn sys_clone(
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
             warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
-            return Err(ERRNO::EINVAL);
-        }
-        if flags.contains(CloneFlags::CLONE_VFORK) {
-            warn!("kernel: sys_clone unsupported flag CLONE_VFORK");
             return Err(ERRNO::EINVAL);
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
@@ -641,6 +773,11 @@ pub fn sys_clone(
             add_task(new_task);
             Ok(new_tid as isize)
         } else {
+            if vfork_clone {
+                debug!(
+                    "kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone"
+                );
+            }
             let new_process = current_process.clone_process(stack, child_tls, child_set_tid)?;
             let child_pid = new_process.getpid() as i32;
             debug!(
@@ -655,6 +792,26 @@ pub fn sys_clone(
             }
             Ok(child_pid as isize)
         }
+    })
+}
+
+/// `setns` 兼容实现。
+///
+/// 当前内核尚未提供独立 namespace 隔离，但 LTP 的网络 helper 需要
+/// `/proc/<pid>/ns/*` 可打开且 `setns()` 可成功返回，才能继续构造本地
+/// 双端口拓扑。这里先校验 fd 有效，再按 no-op 成功处理。
+pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
+    syscall_body!({
+        if fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let fd = fd as usize;
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return Err(ERRNO::EBADF);
+        }
+        Ok(0)
     })
 }
 /// sys_execve
@@ -688,17 +845,61 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
                 envp = envp.add(1);
             }
         }
-
         let process = current_process();
+        if envs_vec.is_empty() {
+            let inherited_envs = process.inner_exclusive_access().environment.clone();
+            if !inherited_envs.is_empty() {
+                if should_trace_exec(path.as_str(), args_vec.as_slice()) {
+                    debug!(
+                        "[execve] pid={} inherited empty envp from current environment PATH={:?}",
+                        process.getpid(),
+                        path_env_from_envs(inherited_envs.as_slice())
+                    );
+                }
+                envs_vec = inherited_envs;
+            }
+        }
+        if should_trace_exec(path.as_str(), args_vec.as_slice()) {
+            debug!(
+                "[execve] pid={} path='{}' argv={:?} PATH={:?}",
+                process.getpid(),
+                path,
+                args_vec,
+                path_env_from_envs(envs_vec.as_slice())
+            );
+        }
+
         let cwd = process.inner_exclusive_access().cwd.clone();
         debug!(" ------------------- Resolve -----------------------");
-        let resolved = resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0)?;
+        let resolved = match resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0) {
+            Ok(resolved) => resolved,
+            Err(errno) => {
+                if path.contains("acct02") {
+                    debug!(
+                        "[execve] resolve failed pid={} cwd='{}' path='{}': {:?}",
+                        process.getpid(),
+                        cwd,
+                        path,
+                        errno
+                    );
+                }
+                return Err(errno);
+            }
+        };
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage {
             elf_data,
             argv,
             exec_path,
         } = resolved;
+        if exec_path.contains("acct02") || argv.iter().any(|arg| arg.contains("acct02")) {
+            debug!(
+                "[execve] resolved pid={} exec_path='{}' argv={:?}",
+                process.getpid(),
+                exec_path,
+                argv
+            );
+        }
         process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
@@ -760,7 +961,18 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 // 编码为wstatus
                let exit_status = match child_inner.exit_reason {
                     ExitReason::Exit(code) => (code & 0xff) << 8,
-                    ExitReason::Signal(signum) => (signum & 0x7f) as i32,
+                    ExitReason::Signal(signum) => {
+                        // 低 7 位为终止信号；若该信号默认动作会转储核心，
+                        // 置上 0x80（WCOREDUMP）以满足 `WCOREDUMP(status)`。
+                        let mut status = (signum & 0x7f) as i32;
+                        let dumps_core = crate::signal::SignalNum::from_number(signum)
+                            .map(|sig| sig.dumps_core())
+                            .unwrap_or(false);
+                        if dumps_core {
+                            status |= 0x80;
+                        }
+                        status
+                    }
                 };
                 inner.child_user_time = inner
                     .child_user_time
@@ -975,6 +1187,27 @@ pub struct UtsName {
 
 impl Pod for UtsName {}
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SysInfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+    pub _f: [u8; 0],
+}
+
+impl Pod for SysInfo {}
+
 impl UtsName {
     pub fn new() -> Self {
         // 按照 Linux 标准填充字段，可以根据实际情况修改
@@ -1002,6 +1235,36 @@ impl UtsName {
         uname.domainname[..domainname.len()].copy_from_slice(domainname);
         uname
     }
+}
+
+/// sysinfo syscall
+pub fn sys_sysinfo(info_ptr: *mut SysInfo) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_sysinfo",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let stats = frame_allocator_stats();
+        let page_bytes = PAGE_SIZE as u64;
+        let info = SysInfo {
+            uptime: (get_time_ns() / 1_000_000_000).min(i64::MAX as u64) as i64,
+            loads: [0; 3],
+            totalram: stats.total_pages as u64 * page_bytes,
+            freeram: stats.free_pages as u64 * page_bytes,
+            sharedram: 0,
+            bufferram: 0,
+            totalswap: 0,
+            freeswap: 0,
+            procs: list_pids().len().min(u16::MAX as usize) as u16,
+            pad: 0,
+            totalhigh: 0,
+            freehigh: 0,
+            mem_unit: 1,
+            _f: [],
+        };
+        write_pod_to_user(info_ptr, &info)?;
+        Ok(0)
+    })
 }
 
 /// uname syscall

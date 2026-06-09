@@ -5,6 +5,7 @@
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.
+//! - `/proc/<pid>/maps` — virtual memory regions of the process.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -18,7 +19,8 @@ use fs::vfs::{VfsFileType, VfsNode};
 use crate::config::{MAX_HARTS, PAGE_SIZE};
 use crate::fs::inode::snapshot_mount_table;
 use crate::fs::PAGE_CACHE_MANAGER;
-use crate::mm::{frame_allocator_stats, VmaKind};
+use crate::keys;
+use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
 use crate::task::{current_process, TaskStatus};
@@ -75,6 +77,16 @@ fn build_mounts() -> String {
         );
     }
     out
+}
+
+fn parse_proc_u32(buf: &[u8]) -> Result<u32, FS_ERRNO> {
+    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    text.parse::<u32>().map_err(|_| FS_ERRNO::EINVAL)
+}
+
+fn parse_proc_usize(buf: &[u8]) -> Result<usize, FS_ERRNO> {
+    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    text.parse::<usize>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
 fn read_string_at(data: String, offset: usize, buf: &mut [u8]) -> usize {
@@ -346,8 +358,10 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
         ppid,
         uid,
         euid,
+        suid,
         gid,
         egid,
+        sgid,
         pgrp,
         session,
         proc_pending,
@@ -374,8 +388,10 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
             .unwrap_or(0);
         let uid = inner.cred.uid;
         let euid = inner.cred.euid;
+        let suid = inner.cred.suid;
         let gid = inner.cred.gid;
         let egid = inner.cred.egid;
+        let sgid = inner.cred.sgid;
         let pgrp = inner.cred.pgid;
         let session = inner.cred.sid;
         let proc_pending = inner.pending_signals.bits();
@@ -416,8 +432,10 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
             ppid,
             uid,
             euid,
+            suid,
             gid,
             egid,
+            sgid,
             pgrp,
             session,
             proc_pending,
@@ -457,8 +475,8 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     let _ = writeln!(&mut out, "Pid:\t{}", pid);
     let _ = writeln!(&mut out, "PPid:\t{}", ppid);
     let _ = writeln!(&mut out, "TracerPid:\t0");
-    let _ = writeln!(&mut out, "Uid:\t{}\t{}\t{}\t{}", uid, euid, euid, euid);
-    let _ = writeln!(&mut out, "Gid:\t{}\t{}\t{}\t{}", gid, egid, egid, egid);
+    let _ = writeln!(&mut out, "Uid:\t{}\t{}\t{}\t{}", uid, euid, suid, euid);
+    let _ = writeln!(&mut out, "Gid:\t{}\t{}\t{}\t{}", gid, egid, sgid, egid);
     let _ = writeln!(&mut out, "FDSize:\t{}", fd_size);
     let _ = writeln!(&mut out, "Groups:\t");
     let _ = writeln!(&mut out, "NStgid:\t{}", tgid);
@@ -504,6 +522,56 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     Ok(out)
 }
 
+/// Render the permission column (`rwxp`) for a `/proc/<pid>/maps` line.
+/// CosmOS has no per-VMA shared/private bit on anonymous regions, so file
+/// mappings report `s` when shared and everything else reports `p`.
+fn maps_perm_string(perm: MapPermission, shared: bool) -> [u8; 4] {
+    [
+        if perm.contains(MapPermission::R) { b'r' } else { b'-' },
+        if perm.contains(MapPermission::W) { b'w' } else { b'-' },
+        if perm.contains(MapPermission::X) { b'x' } else { b'-' },
+        if shared { b's' } else { b'p' },
+    ]
+}
+
+/// Build the contents of `/proc/<pid>/maps`: one line per user VMA, formatted
+/// like Linux (`start-end perms offset dev inode path`).
+fn build_pid_maps(pid: usize) -> Result<String, FS_ERRNO> {
+    let process = pid2process(pid).ok_or(FS_ERRNO::ENOENT)?;
+    let inner = process.inner_exclusive_access();
+    let mut out = String::new();
+    for vma in inner.memory_set.vmas.values() {
+        // Kernel-only regions are not part of the user address space view.
+        if matches!(vma.kind, VmaKind::Kernel) {
+            continue;
+        }
+        let start = usize::from(vma.start_vpn()) * PAGE_SIZE;
+        let end = usize::from(vma.end_vpn()) * PAGE_SIZE;
+        let shared = vma.file.as_ref().map(|f| f.shared).unwrap_or(false);
+        let pgoff = vma.file.as_ref().map(|f| f.pgoff * PAGE_SIZE).unwrap_or(0);
+        let perms = maps_perm_string(vma.map_perm, shared);
+        let perms = core::str::from_utf8(&perms).unwrap_or("----");
+        let label = match vma.kind {
+            VmaKind::Heap => "[heap]",
+            VmaKind::UserStack { .. } => "[stack]",
+            VmaKind::Vdso => "[vdso]",
+            _ => "",
+        };
+        let _ = write!(
+            &mut out,
+            "{:08x}-{:08x} {} {:08x} 00:00 0 ",
+            start, end, perms, pgoff
+        );
+        if !label.is_empty() {
+            let _ = writeln!(&mut out, "                  {}", label);
+        } else {
+            let _ = writeln!(&mut out);
+        }
+    }
+    Ok(out)
+}
+
+
 /// `/proc` root directory node.
 #[derive(Default, Debug)]
 pub struct ProcRootNode;
@@ -529,6 +597,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("self"), VfsFileType::Symlink));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
+        entries.push((String::from("key-users"), VfsFileType::Regular));
+        entries.push((String::from("sys"), VfsFileType::Directory));
         for pid in list_pids() {
             entries.push((alloc::format!("{}", pid), VfsFileType::Directory));
         }
@@ -540,6 +610,8 @@ impl VfsNode for ProcRootNode {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
+            "sys" => Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>),
             _ => {
                 let pid = parse_pid(name)?;
                 if pid2process(pid).is_some() {
@@ -567,6 +639,295 @@ impl VfsNode for ProcRootNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcStaticDirKind {
+    Sys,
+    Kernel,
+    Keys,
+}
+
+#[derive(Debug)]
+struct ProcStaticDirNode {
+    kind: ProcStaticDirKind,
+}
+
+impl ProcStaticDirNode {
+    fn new(kind: ProcStaticDirKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl VfsNode for ProcStaticDirNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        match self.kind {
+            ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
+            ProcStaticDirKind::Kernel => alloc::vec![
+                (String::from("keys"), VfsFileType::Directory),
+                (String::from("tainted"), VfsFileType::Regular),
+            ],
+            ProcStaticDirKind::Keys => alloc::vec![
+                (String::from("gc_delay"), VfsFileType::Regular),
+                (String::from("maxkeys"), VfsFileType::Regular),
+                (String::from("maxbytes"), VfsFileType::Regular),
+            ],
+        }
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        match (self.kind, name) {
+            (ProcStaticDirKind::Sys, "kernel") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Kernel)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Kernel, "keys") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Kernel, "tainted") => {
+                Some(Arc::new(ProcKernelTaintedNode::new()) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Keys, "gc_delay") => {
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::GcDelay)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Keys, "maxkeys") => {
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxKeys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Keys, "maxbytes") => {
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxBytes)) as Arc<dyn VfsNode>)
+            }
+            _ => None,
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Default, Debug)]
+struct ProcKernelTaintedNode;
+
+impl ProcKernelTaintedNode {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcKernelTaintedNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        2
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(String::from("0\n"), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+}
+
+#[derive(Default, Debug)]
+struct ProcKeyUsersNode;
+
+impl ProcKeyUsersNode {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcKeyUsersNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        keys::render_key_users().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(keys::render_key_users(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcKeySysctlKind {
+    GcDelay,
+    MaxKeys,
+    MaxBytes,
+}
+
+#[derive(Debug)]
+struct ProcKeySysctlNode {
+    kind: ProcKeySysctlKind,
+}
+
+impl ProcKeySysctlNode {
+    fn new(kind: ProcKeySysctlKind) -> Self {
+        Self { kind }
+    }
+
+    fn render(&self) -> String {
+        match self.kind {
+            ProcKeySysctlKind::GcDelay => alloc::format!("{}\n", keys::gc_delay()),
+            ProcKeySysctlKind::MaxKeys => alloc::format!("{}\n", keys::max_keys()),
+            ProcKeySysctlKind::MaxBytes => alloc::format!("{}\n", keys::max_bytes()),
+        }
+    }
+}
+
+impl VfsNode for ProcKeySysctlNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let result = match self.kind {
+            ProcKeySysctlKind::GcDelay => parse_proc_u32(buf).map(keys::set_gc_delay),
+            ProcKeySysctlKind::MaxKeys => parse_proc_u32(buf).map(keys::set_max_keys),
+            ProcKeySysctlKind::MaxBytes => parse_proc_usize(buf).map(keys::set_max_bytes),
+        };
+        if result.is_ok() {
+            buf.len()
+        } else {
+            0
+        }
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
@@ -796,7 +1157,9 @@ impl VfsNode for ProcPidDirNode {
         }
         alloc::vec![
             (String::from("exe"), VfsFileType::Symlink),
+            (String::from("maps"), VfsFileType::Regular),
             (String::from("mounts"), VfsFileType::Regular),
+            (String::from("ns"), VfsFileType::Directory),
             (String::from("stat"), VfsFileType::Regular),
             (String::from("status"), VfsFileType::Regular),
         ]
@@ -806,7 +1169,9 @@ impl VfsNode for ProcPidDirNode {
         pid2process(self.pid)?;
         match name {
             "exe" => Some(Arc::new(ProcPidExeLinkNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "maps" => Some(Arc::new(ProcPidMapsNode::new(self.pid)) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            "ns" => Some(Arc::new(ProcPidNsDirNode::new(self.pid)) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
             _ => None,
@@ -825,6 +1190,145 @@ impl VfsNode for ProcPidDirNode {
 
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/ns` directory node.
+#[derive(Debug)]
+pub struct ProcPidNsDirNode {
+    pid: usize,
+}
+
+impl ProcPidNsDirNode {
+    /// Create a new `/proc/<pid>/ns` directory node.
+    pub fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+}
+
+impl VfsNode for ProcPidNsDirNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        if pid2process(self.pid).is_none() {
+            return Vec::new();
+        }
+        alloc::vec![
+            (String::from("mnt"), VfsFileType::Regular),
+            (String::from("net"), VfsFileType::Regular),
+        ]
+    }
+
+    fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        pid2process(self.pid)?;
+        match name {
+            "mnt" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "mnt")) as Arc<dyn VfsNode>),
+            "net" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "net")) as Arc<dyn VfsNode>),
+            _ => None,
+        }
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/ns/<kind>` placeholder node.
+#[derive(Debug)]
+pub struct ProcPidNsEntryNode {
+    pid: usize,
+    kind: &'static str,
+}
+
+impl ProcPidNsEntryNode {
+    /// Create a new `/proc/<pid>/ns/<kind>` placeholder node.
+    pub fn new(pid: usize, kind: &'static str) -> Self {
+        Self { pid, kind }
+    }
+
+    fn content(&self) -> Result<String, FS_ERRNO> {
+        pid2process(self.pid).ok_or(FS_ERRNO::ENOENT)?;
+        Ok(alloc::format!("{}:[{}]\n", self.kind, self.pid))
+    }
+}
+
+impl VfsNode for ProcPidNsEntryNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.content().map(|data| data.len()).unwrap_or(0)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.content()
+            .map(|data| read_string_at(data, offset, buf))
+            .unwrap_or(0)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
@@ -900,6 +1404,71 @@ impl VfsNode for ProcPidExeLinkNode {
 
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/maps` node.
+#[derive(Debug)]
+pub struct ProcPidMapsNode {
+    pid: usize,
+}
+
+impl ProcPidMapsNode {
+    /// Create a new `/proc/<pid>/maps` node.
+    pub fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+}
+
+impl VfsNode for ProcPidMapsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_pid_maps(self.pid).map(|data| data.len()).unwrap_or(0)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        match build_pid_maps(self.pid) {
+            Ok(data) => read_string_at(data, offset, buf),
+            Err(_) => 0,
+        }
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {

@@ -4,7 +4,11 @@
 //! - Driver side uses VirtIO token-based completion.
 //! - Socket side uses per-socket wait queues + poll source notifications.
 
+mod af_alg;
+pub(crate) mod compat;
+mod compat_socket;
 mod loopback;
+mod raw_ipv6;
 mod socket_timeout;
 mod tcp;
 mod udp;
@@ -29,6 +33,24 @@ use crate::{
     timer::get_time_us,
 };
 
+pub(crate) use af_alg::{
+    create_alg_socket_file, AlgRequestFile, AlgSendMsgParams, AlgSocketFile, AF_ALG,
+    ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV, ALG_SET_KEY,
+    ALG_SET_OP, SOCK_SEQPACKET, SOL_ALG,
+};
+pub(crate) use compat_socket::{
+    compat_ifreq_ioctl, create_compat_ifreq_socket_file, create_netlink_route_socket_file,
+    create_packet_socket_file, CompatIfreqSocketFile, NetlinkRouteSocketFile, PacketSocketFile,
+    SockAddrLl,
+};
+pub(crate) use raw_ipv6::{
+    create_raw_ipv6_socket_file, In6PktInfo, RawIpv6ControlMessage, RawIpv6SendMeta,
+    RawIpv6SocketFile, SockAddrIn6, AF_INET6, ICMP6_FILTER, IPPROTO_ICMPV6,
+    IPV6_2292DSTOPTS, IPV6_2292HOPOPTS, IPV6_2292HOPLIMIT, IPV6_2292PKTINFO, IPV6_2292RTHDR,
+    IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPOPTS,
+    IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS,
+    SOL_IPV6,
+};
 pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
 pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
 pub(crate) use socket_timeout::{
@@ -36,8 +58,10 @@ pub(crate) use socket_timeout::{
     socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketTimerTag,
     SocketWakeState,
 };
+pub(crate) use unix_socket::create_unix_stream_socket_file;
 pub use unix_socket::{
-    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS, SocketLevel
+    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS,
+    SocketLevel,
 };
 
 const RX_BUF_LEN: usize = 32 * 1024;
@@ -141,6 +165,7 @@ pub(crate) struct NetStack {
 impl NetStack {
     fn new(dev: Arc<drivers::net::VirtIONetDevice>) -> Self {
         let mac = dev.mac_address();
+        compat::set_eth0_mac(mac);
         let eth = EthernetAddress(mac);
 
         let mut device = MultiDevice::new(dev);

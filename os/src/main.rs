@@ -43,19 +43,20 @@ pub mod drivers;
 pub mod fs;
 pub mod hart;
 pub mod ipc;
+pub mod keys;
 pub mod lang_items;
 pub mod klog;
 pub mod mm;
 pub mod net;
 pub mod signal;
 mod poll;
+pub mod random;
 pub mod sbi;
+pub mod sched;
 pub mod sync;
 pub mod syscall;
 pub mod task;
 pub mod timer;
-pub mod random;
-pub mod sched;
 pub mod trap;
 
 use core::arch::global_asm;
@@ -63,6 +64,15 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 global_asm!(include_str!("entry.asm"));
+
+const ANSI_RESET: &str = "\u{1b}[0m";
+const ANSI_FRAME: &str = "\u{1b}[38;5;45m";
+const ANSI_GLOW: &str = "\u{1b}[38;5;117m";
+const ANSI_TITLE: &str = "\u{1b}[1;38;5;159m";
+const ANSI_SUBTITLE: &str = "\u{1b}[38;5;111m";
+const ANSI_STAGE: &str = "\u{1b}[38;5;81m";
+const ANSI_DETAIL: &str = "\u{1b}[38;5;252m";
+const ANSI_ACCENT: &str = "\u{1b}[38;5;218m";
 
 /// secondary hart 在访问 `.bss` 中的全局对象前，必须先等 bootstrap hart 完成 `clear_bss()`。
 ///
@@ -92,6 +102,70 @@ fn clear_bss() {
     }
 }
 
+fn print_boot_splash(hart_id: usize, hart_count: usize) {
+    const LOGO: [&str; 7] = [
+        "        ______                    ____   _____                  ",
+        "       / ____/___  _________ ___ / __ \\ / ___/                  ",
+        "      / /   / __ \\/ ___/ __ `__ \\/ / / /\\__ \\                 ",
+        "     / /___/ /_/ (__  ) / / / / / /_/ /___/ /                  ",
+        "     \\____/\\____/____/_/ /_/ /_/\\____//____/                   ",
+        "                            CosmOS                              ",
+        "              a small universe in supervisor mode               ",
+    ];
+
+    println!("");
+    println!(
+        "{frame}+------------------------------------------------------------------+{reset}",
+        frame = ANSI_FRAME,
+        reset = ANSI_RESET,
+    );
+    for line in LOGO {
+        println!(
+            "{frame}|{reset} {title}{line:<66}{reset} {frame}|{reset}",
+            frame = ANSI_FRAME,
+            title = ANSI_TITLE,
+            line = line,
+            reset = ANSI_RESET,
+        );
+    }
+    println!(
+        "{frame}|{reset} {subtitle}{msg:<66}{reset} {frame}|{reset}",
+        frame = ANSI_FRAME,
+        subtitle = ANSI_SUBTITLE,
+        msg = "CosmOS boot sequence engaged",
+        reset = ANSI_RESET,
+    );
+    println!(
+        "{frame}|{reset} {subtitle}{msg:<66}{reset} {frame}|{reset}",
+        frame = ANSI_FRAME,
+        subtitle = ANSI_SUBTITLE,
+        msg = format_args!("Bootstrap hart #{hart_id} | {hart_count}-core startup"),
+        reset = ANSI_RESET,
+    );
+    println!(
+        "{frame}|{reset} {subtitle}{msg:<66}{reset} {frame}|{reset}",
+        frame = ANSI_FRAME,
+        subtitle = ANSI_SUBTITLE,
+        msg = "Target: RISC-V virt machine",
+        reset = ANSI_RESET,
+    );
+    println!(
+        "{frame}+------------------------------------------------------------------+{reset}",
+        frame = ANSI_FRAME,
+        reset = ANSI_RESET,
+    );
+    println!("");
+}
+fn print_boot_stage(stage: &str, detail: &str) {
+    println!(
+        "{stage_color}>> {stage:<12}{reset} {detail_color}{detail}{reset}",
+        stage_color = ANSI_STAGE,
+        stage = stage,
+        reset = ANSI_RESET,
+        detail_color = ANSI_DETAIL,
+        detail = detail,
+    );
+}
 /// 完成当前 hart 的本地初始化。
 ///
 /// 这里只放“每个 hart 都需要各自执行一次”的初始化项，
@@ -102,6 +176,23 @@ fn init_local_hart(hart_id: usize) {
     drivers::plic::init_hart(hart_id);
     mm::mark_online(hart_id);
     debug!("hart {} local init done", hart_id);
+}
+/// Probe the firmware-visible hart IDs and return the number of usable harts.
+fn detect_hart_count() -> usize {
+    const SBI_SUCCESS: isize = 0;
+    const SBI_ERR_INVALID_PARAM: isize = -3;
+
+    let mut hart_count = 0usize;
+    for target_hart in 0..config::MAX_HARTS {
+        let status = sbi::hart_get_status(target_hart);
+        if status.error == SBI_ERR_INVALID_PARAM {
+            break;
+        }
+        if status.error == SBI_SUCCESS {
+            hart_count += 1;
+        }
+    }
+    hart_count.max(1)
 }
 
 /// 记录当前环境下各 hart 的 HSM 状态，并尝试拉起处于 stopped 状态的 hart。
@@ -200,17 +291,25 @@ fn first_hart_main(hart_id: usize) -> ! {
     mm::init();
     mm::remap_test();
     klog::init();
+    let hart_count = detect_hart_count();
+    print_boot_splash(hart_id, hart_count);
+    print_boot_stage("memory", "SV39 mappings online");
     info!("hart {} boot", hart_id);
     info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
+    print_boot_stage("devices", "virtio buses enumerated");
     net::init();
+    print_boot_stage("network", "smoltcp stack synchronized");
     fs::init();
+    print_boot_stage("storage", "root filesystem mounted");
     timer::init_realtime_offset_from_rtc();
+    print_boot_stage("clock", "realtime source calibrated");
     probe_and_start_other_harts(hart_id);
     init_local_hart(hart_id);
+    print_boot_stage("scheduler", "bootstrap hart entering run queue");
     task::add_initproc();
     BOOT_DONE.store(true, Ordering::Release);
-    println!("[kernel] Hello, world!");
+    println!("{glow}[kernel] Hello, world! Welcome to CosmOS.{reset}", glow = ANSI_GLOW, reset = ANSI_RESET);
     info!("hart {} entered scheduler", hart_id);
     sched::run_tasks();
     panic!("Unreachable in rust_main!");
@@ -237,8 +336,8 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
 pub fn rust_main(hart_id: usize) -> ! {
     let _hart_id = hart::init_with_hartid(hart_id);
-    unsafe { 
-        riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial); 
+    unsafe {
+        riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
     }
     if !try_claim_bootstrap_hart(hart_id) {
         secondary_hart_main(hart_id);

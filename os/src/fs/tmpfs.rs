@@ -102,6 +102,36 @@ impl TmpfsFileNode {
     }
 }
 
+struct TmpfsSymlinkState {
+    ino: u64,
+    inner: SpinNoIrqLock<TmpfsSymlinkInner>,
+}
+
+struct TmpfsSymlinkInner {
+    target: String,
+    meta: TmpfsMeta,
+}
+
+/// Symbolic link node backed by an in-memory target path.
+#[derive(Clone)]
+pub struct TmpfsSymlinkNode {
+    state: Arc<TmpfsSymlinkState>,
+}
+
+impl TmpfsSymlinkNode {
+    fn new(target: &str) -> Self {
+        Self {
+            state: Arc::new(TmpfsSymlinkState {
+                ino: alloc_tmpfs_ino(),
+                inner: SpinNoIrqLock::new(TmpfsSymlinkInner {
+                    target: String::from(target),
+                    meta: TmpfsMeta::new(0o120777),
+                }),
+            }),
+        }
+    }
+}
+
 impl fmt::Debug for TmpfsFileNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.state.inner.lock();
@@ -119,9 +149,26 @@ impl fmt::Debug for TmpfsFileNode {
     }
 }
 
+impl fmt::Debug for TmpfsSymlinkNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.state.inner.lock();
+        f.debug_struct("TmpfsSymlinkNode")
+            .field("ino", &self.state.ino)
+            .field("target", &inner.target)
+            .field("mode", &inner.meta.mode)
+            .field("uid", &inner.meta.uid)
+            .field("gid", &inner.meta.gid)
+            .field("atime", &inner.meta.atime)
+            .field("mtime", &inner.meta.mtime)
+            .field("ctime", &inner.meta.ctime)
+            .finish()
+    }
+}
+
 enum TmpfsNode {
     File(TmpfsFileNode),
     Dir(TmpfsDirNode),
+    Symlink(TmpfsSymlinkNode),
 }
 
 impl TmpfsNode {
@@ -129,11 +176,20 @@ impl TmpfsNode {
         match self {
             Self::File(file) => Arc::new(file) as Arc<dyn VfsNode>,
             Self::Dir(dir) => Arc::new(dir) as Arc<dyn VfsNode>,
+            Self::Symlink(link) => Arc::new(link) as Arc<dyn VfsNode>,
         }
     }
 
     fn is_dir(&self) -> bool {
         matches!(self, Self::Dir(_))
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        match self {
+            Self::File(_) => VfsFileType::Regular,
+            Self::Dir(_) => VfsFileType::Directory,
+            Self::Symlink(_) => VfsFileType::Symlink,
+        }
     }
 }
 
@@ -210,6 +266,7 @@ impl TmpfsDirNode {
         match node {
             TmpfsNode::File(file) => Arc::new(file.clone()) as Arc<dyn VfsNode>,
             TmpfsNode::Dir(dir) => Arc::new(dir.clone()) as Arc<dyn VfsNode>,
+            TmpfsNode::Symlink(link) => Arc::new(link.clone()) as Arc<dyn VfsNode>,
         }
     }
 }
@@ -446,6 +503,131 @@ impl VfsNode for TmpfsFileNode {
     }
 }
 
+impl VfsNode for TmpfsSymlinkNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Symlink
+    }
+
+    fn read_link(&self) -> Result<String, FS_ERRNO> {
+        Ok(self.state.inner.lock().target.clone())
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn fs_id(&self) -> u64 {
+        TMPFS_FS_ID
+    }
+
+    fn ino(&self) -> u64 {
+        self.state.ino
+    }
+
+    fn nlink(&self) -> u32 {
+        1
+    }
+
+    fn size(&self) -> usize {
+        self.state.inner.lock().target.len()
+    }
+
+    fn mode(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.mode)
+    }
+
+    fn set_mode(&self, mode: u32) -> Result<(), FS_ERRNO> {
+        self.state.inner.lock().meta.mode = mode;
+        Ok(())
+    }
+
+    fn uid(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.uid)
+    }
+
+    fn gid(&self) -> Option<u32> {
+        Some(self.state.inner.lock().meta.gid)
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FS_ERRNO> {
+        let mut inner = self.state.inner.lock();
+        inner.meta.uid = uid;
+        inner.meta.gid = gid;
+        Ok(())
+    }
+
+    fn atime(&self) -> Option<InodeTime> {
+        self.state.inner.lock().meta.atime
+    }
+
+    fn mtime(&self) -> Option<InodeTime> {
+        self.state.inner.lock().meta.mtime
+    }
+
+    fn ctime(&self) -> Option<InodeTime> {
+        self.state.inner.lock().meta.ctime
+    }
+
+    fn set_times(
+        &self,
+        atime: Option<InodeTime>,
+        mtime: Option<InodeTime>,
+        ctime: Option<InodeTime>,
+    ) -> Result<(), FS_ERRNO> {
+        let mut inner = self.state.inner.lock();
+        inner.meta.atime = atime;
+        inner.meta.mtime = mtime;
+        inner.meta.ctime = ctime;
+        Ok(())
+    }
+
+    fn stat_attrs(&self) -> VfsAttrs {
+        let inner = self.state.inner.lock();
+        VfsAttrs {
+            mode: Some(inner.meta.mode),
+            ino: self.state.ino,
+            nlink: 1,
+            size: inner.target.len(),
+            uid: Some(inner.meta.uid),
+            gid: Some(inner.meta.gid),
+            rdev: 0,
+            atime: inner.meta.atime,
+            mtime: inner.meta.mtime,
+            ctime: inner.meta.ctime,
+        }
+    }
+
+    fn statfs(&self) -> Result<StatFs64, FS_ERRNO> {
+        Ok(tmpfs_statfs())
+    }
+}
+
 impl VfsNode for TmpfsDirNode {
     fn as_any(&self) -> &dyn Any {
         self
@@ -457,16 +639,7 @@ impl VfsNode for TmpfsDirNode {
             .lock()
             .children
             .iter()
-            .map(|(name, node)| {
-                (
-                    name.clone(),
-                    if node.is_dir() {
-                        VfsFileType::Directory
-                    } else {
-                        VfsFileType::Regular
-                    },
-                )
-            })
+            .map(|(name, node)| (name.clone(), node.file_type()))
             .collect()
     }
 
@@ -495,6 +668,17 @@ impl VfsNode for TmpfsDirNode {
         let node = TmpfsNode::Dir(dir.clone());
         inner.children.insert(String::from(name), node);
         Some(Arc::new(dir) as Arc<dyn VfsNode>)
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        let mut inner = self.state.inner.lock();
+        if inner.children.contains_key(name) {
+            return Err(FS_ERRNO::EEXIST);
+        }
+        let link = TmpfsSymlinkNode::new(target);
+        let node = TmpfsNode::Symlink(link.clone());
+        inner.children.insert(String::from(name), node);
+        Ok(Arc::new(link) as Arc<dyn VfsNode>)
     }
 
     fn file_type(&self) -> VfsFileType {

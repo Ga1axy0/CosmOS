@@ -9,7 +9,7 @@ use alloc::string::String;
 use core::ptr;
 
 use user_lib::{
-    chdir, close, exec, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
+    chdir, close, exec, execve, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
     OpenFlags, Stat,
 };
 
@@ -21,25 +21,46 @@ const BIN_DIR_CSTR: &str = "/bin\0";
 const BIN_BASH: &str = "/bin/bash";
 const BIN_BUSYBOX: &str = "/bin/busybox";
 const BIN_BUSYBOX_CSTR: &str = "/bin/busybox\0";
+const BIN_DATE: &str = "/bin/date";
+const BOOT_DIR: &str = "/boot";
+const BOOT_CONFIG_PATH: &str = "/boot/config-6.6.0";
 const LIB_DIR: &str = "/lib";
 const ETC_DIR: &str = "/etc";
+const ETC_PASSWD_PATH: &str = "/etc/passwd";
+const ETC_GROUP_PATH: &str = "/etc/group";
+const ETC_PROTOCOLS_PATH: &str = "/etc/protocols";
 const HOME_DIR: &str = "/home";
 const ROOT_HOME_DIR: &str = "/root";
 const TMP_DIR: &str = "/tmp";
+const LIB_AR: &str = "/lib/ar";
+const MUSL_AR: &str = "/usr/lib/riscv64-linux-musl/ar";
+const GLIBC_AR: &str = "/lib/riscv64-linux-gnu/ar";
+const MUSL_LEGACY_AR: &str = "/musl/lib/ar";
+const GLIBC_LEGACY_AR: &str = "/glibc/lib/ar";
 const USR_DIR: &str = "/usr";
 const USR_BIN_DIR: &str = "/usr/bin";
 const USR_BIN_DIR_CSTR: &str = "/usr/bin\0";
+const BIN_AR: &str = "/bin/ar";
 const USR_LIB_DIR: &str = "/usr/lib";
 const VAR_DIR: &str = "/var";
+const VAR_RUN_DIR: &str = "/var/run";
+const VAR_RUN_NETNS_DIR: &str = "/var/run/netns";
+const LTP_NETNS_LINK: &str = "/var/run/netns/ltp_ns";
 const BIN_SH_CSTR: &str = "/bin/sh\0";
 const BUSYBOX_ARG0_CSTR: &str = "busybox\0";
 const ROOT_BASH: &str = "/bash";
 const ROOT_BUSYBOX: &str = "/busybox";
+const ROOT_DATE: &str = "/root/date";
+const MODULES_ROOT_DIR: &str = "/lib/modules";
+const MODULES_DIR: &str = "/lib/modules/6.6.0";
+const MODULES_BUILTIN_PATH: &str = "/lib/modules/6.6.0/modules.builtin";
+const MODULES_DEP_PATH: &str = "/lib/modules/6.6.0/modules.dep";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_LEGACY_LIB_DIR: &str = "/musl/lib";
 const MUSL_LIB_DIR: &str = "/usr/lib/riscv64-linux-musl";
 const MUSL_LIBC_PATH: &str = "/usr/lib/riscv64-linux-musl/libc.so";
 const MUSL_LD_PATH: &str = "/lib/ld-musl-riscv64-sf.so.1";
+const MUSL_LD_COMPAT_PATH: &str = "/lib/ld-musl-riscv64.so.1";
 const MUSL_LD_CONFIG_PATH: &str = "/etc/ld-musl-riscv64-sf.path";
 const MUSL_LD_CONFIG_CONTENT: &[u8] = b"/usr/lib/riscv64-linux-musl\n/lib\n";
 const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
@@ -51,9 +72,42 @@ const GLIBC_USR_LIB_DIR: &str = "/usr/lib/riscv64-linux-gnu";
 const GLIBC_LD_NAME: &str = "ld-linux-riscv64-lp64d.so.1";
 const GLIBC_LD_TARGET: &str = "/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1";
 const GLIBC_LD_PATH: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
+const ROOT_GROUPDEL: &str = "/root/groupdel";
+const ROOT_USERADD: &str = "/root/useradd";
+const ROOT_USERDEL: &str = "/root/userdel";
+const MUSL_LTPROOT: &str = "/musl/ltp";
+const GLIBC_LTPROOT: &str = "/glibc/ltp";
+const MUSL_LTP_ENV_SH: &str = "/musl/ltp_env.sh";
+const GLIBC_LTP_ENV_SH: &str = "/glibc/ltp_env.sh";
 const INSTALL_ARG_CSTR: &str = "--install\0";
 const DENTS_BUF_SIZE: usize = 4096;
 const DT_DIR: u8 = 4;
+const PASSWD_CONTENT: &[u8] = b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/sh\n";
+const GROUP_CONTENT: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
+const PROTOCOLS_CONTENT: &[u8] = concat!(
+    "hopopt\t0\tHOPOPT\tip\tIP\n",
+    "icmp\t1\tICMP\n",
+    "tcp\t6\tTCP\n",
+    "udp\t17\tUDP\n",
+    "ipv6\t41\tIPv6\n",
+    "ipv6-route\t43\tIPv6-Route\n",
+    "ipv6-frag\t44\tIPv6-Frag\n",
+    "esp\t50\tESP\n",
+    "ah\t51\tAH\n",
+    "ipv6-icmp\t58\tIPv6-ICMP\tICMPV6\n",
+    "ipv6-nonxt\t59\tIPv6-NoNxt\n",
+    "ipv6-opts\t60\tIPv6-Opts\n",
+).as_bytes();
+const KERNEL_CONFIG_CONTENT: &[u8] = b"CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\nCONFIG_BSD_PROCESS_ACCT=y\nCONFIG_BSD_PROCESS_ACCT_V3=y\n";
+const MODULES_BUILTIN_CONTENT: &[u8] = b"kernel/drivers/net/veth.ko\n";
+const MODULES_DEP_CONTENT: &[u8] = b"kernel/drivers/net/veth.ko:\n";
+const SHELL_PATH_ENV_CSTR: &str =
+    "PATH=/sbin:/usr/sbin:/bin:/usr/bin:/glibc/ltp/testcases/bin:/musl/ltp/testcases/bin\0";
+const USR_BIN_AR: &str = "/usr/bin/ar";
+const USR_BIN_DATE: &str = "/usr/bin/date";
+const USR_BIN_GROUPDEL: &str = "/usr/bin/groupdel";
+const USR_BIN_USERADD: &str = "/usr/bin/useradd";
+const USR_BIN_USERDEL: &str = "/usr/bin/userdel";
 
 fn path_exists(path: &str) -> bool {
     let mut st = Stat::new();
@@ -70,6 +124,31 @@ fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
     if pid == 0 {
         let ret = exec(path, argv);
         println!("[setupsh] exec {} failed: {}", path, ret);
+        exit(127);
+    }
+
+    let mut exit_code = 0i32;
+    let waited = waitpid(pid as usize, &mut exit_code);
+    if waited != pid {
+        println!(
+            "[setupsh] waitpid mismatch: expected {}, got {}",
+            pid, waited
+        );
+        return -1;
+    }
+    exit_code
+}
+
+/// 运行一个外部程序并显式传入环境变量，然后等待其退出。
+fn spawn_and_wait_with_env(path: &str, argv: &[*const u8], envp: &[*const u8]) -> i32 {
+    let pid = fork();
+    if pid < 0 {
+        println!("[setupsh] fork failed for {}", path);
+        return -1;
+    }
+    if pid == 0 {
+        let ret = execve(path, argv, envp);
+        println!("[setupsh] execve {} failed: {}", path, ret);
         exit(127);
     }
 
@@ -148,6 +227,10 @@ fn remove_if_exists(path: &str) -> bool {
         return false;
     }
     true
+}
+
+fn first_existing_path<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates.iter().copied().find(|path| path_exists(path))
 }
 
 /// 拼接目录与文件名，返回完整路径。
@@ -265,7 +348,9 @@ fn keep_top_level_lib_entry(name: &str, dtype: u8) -> bool {
     dtype == DT_DIR
         || name == "."
         || name == ".."
+        || name == "ar"
         || name == MUSL_LD_PATH.trim_start_matches('/')
+        || name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
         || name == GLIBC_LD_PATH.trim_start_matches('/')
 }
 
@@ -323,7 +408,10 @@ fn clean_top_level_lib() -> bool {
 fn ensure_dirs() -> bool {
     for dir in [
         BIN_DIR,
+        BOOT_DIR,
         LIB_DIR,
+        MODULES_ROOT_DIR,
+        MODULES_DIR,
         ETC_DIR,
         HOME_DIR,
         ROOT_HOME_DIR,
@@ -332,6 +420,8 @@ fn ensure_dirs() -> bool {
         USR_BIN_DIR,
         USR_LIB_DIR,
         VAR_DIR,
+        VAR_RUN_DIR,
+        VAR_RUN_NETNS_DIR,
         MUSL_LIB_DIR,
         GLIBC_LIB_DIR,
         GLIBC_USR_LIB_DIR,
@@ -365,8 +455,36 @@ fn write_file(path: &str, content: &[u8]) -> bool {
     true
 }
 
+fn ltp_env_script(ltproot: &str) -> String {
+    let mut script = String::new();
+    script.push_str("#!/bin/sh\n\n");
+    script.push_str("export LTPROOT=\"");
+    script.push_str(ltproot);
+    script.push_str("\"\n");
+    script.push_str("export PATH=\"$LTPROOT/testcases/bin:$LTPROOT/bin:$PATH\"\n");
+    script
+}
+
+fn install_ltp_env_scripts() -> bool {
+    let scripts = [
+        (MUSL_LTP_ENV_SH, MUSL_LTPROOT),
+        (GLIBC_LTP_ENV_SH, GLIBC_LTPROOT),
+    ];
+
+    for (path, ltproot) in scripts {
+        let script = ltp_env_script(ltproot);
+        if !write_file(path, script.as_bytes()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn install_loader_links() -> bool {
     if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
+        return false;
+    }
+    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_COMPAT_PATH) {
         return false;
     }
     if !ensure_hard_link(GLIBC_LD_TARGET, GLIBC_LD_PATH) {
@@ -389,6 +507,21 @@ fn install_busybox_entries() -> bool {
     optional_hard_link(BIN_BUSYBOX, ROOT_BUSYBOX);
     optional_hard_link(ROOT_BASH, BIN_BASH);
     true
+}
+
+fn install_account_files() -> bool {
+    write_file(ETC_PASSWD_PATH, PASSWD_CONTENT)
+        && write_file(ETC_GROUP_PATH, GROUP_CONTENT)
+        && write_file(ETC_PROTOCOLS_PATH, PROTOCOLS_CONTENT)
+}
+
+fn install_kernel_config_file() -> bool {
+    write_file(BOOT_CONFIG_PATH, KERNEL_CONFIG_CONTENT)
+}
+
+fn install_kernel_module_metadata() -> bool {
+    write_file(MODULES_BUILTIN_PATH, MODULES_BUILTIN_CONTENT)
+        && write_file(MODULES_DEP_PATH, MODULES_DEP_CONTENT)
 }
 
 fn install_busybox_applets() -> bool {
@@ -422,9 +555,51 @@ fn install_busybox_applets() -> bool {
     true
 }
 
+fn install_ltp_helper_commands() -> bool {
+    let musl_ar = first_existing_path(&[LIB_AR, MUSL_AR, MUSL_LEGACY_AR]);
+    let glibc_ar = first_existing_path(&[LIB_AR, GLIBC_AR, GLIBC_LEGACY_AR]);
+
+    for (src, dst) in [
+        (
+            musl_ar.unwrap_or(LIB_AR),
+            BIN_AR,
+        ),
+        (
+            glibc_ar.or(musl_ar).unwrap_or(LIB_AR),
+            USR_BIN_AR,
+        ),
+        (ROOT_DATE, BIN_DATE),
+        (ROOT_DATE, USR_BIN_DATE),
+        (ROOT_USERADD, USR_BIN_USERADD),
+        (ROOT_USERDEL, USR_BIN_USERDEL),
+        (ROOT_GROUPDEL, USR_BIN_GROUPDEL),
+    ] {
+        if !path_exists(src) {
+            println!("[setupsh] helper command missing: {}", src);
+            return false;
+        }
+        if !ensure_hard_link(src, dst) {
+            return false;
+        }
+    }
+    install_ltp_env_scripts()
+}
+
+fn cleanup_ltp_runtime_state() -> bool {
+    let unlink_ret = unlink(LTP_NETNS_LINK);
+    if unlink_ret == 0 || unlink_ret == ENOENT {
+        return true;
+    }
+    println!(
+        "[setupsh] unlink stale {} failed: {}",
+        LTP_NETNS_LINK, unlink_ret
+    );
+    false
+}
+
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 8;
+    const TOTAL_STEPS: usize = 11;
     if let Some(arg) = argv.get(1) {
         println!(
             "[setupsh] ignoring legacy libc selector '{}'; installing musl and glibc",
@@ -435,6 +610,9 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
     println!("[setupsh] start Linux-style libc layout setup");
     print_step(1, TOTAL_STEPS, "prepare Linux-style directories");
     if !ensure_dirs() {
+        return 1;
+    }
+    if !cleanup_ltp_runtime_state() {
         return 1;
     }
 
@@ -476,7 +654,25 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(8, TOTAL_STEPS, "launch /bin/sh");
+    print_step(8, TOTAL_STEPS, "install ltp helper commands");
+    if !install_ltp_helper_commands() {
+        return 1;
+    }
+
+    print_step(9, TOTAL_STEPS, "install minimal account database");
+    if !install_account_files() {
+        return 1;
+    }
+
+    print_step(10, TOTAL_STEPS, "write kernel config fallback");
+    if !install_kernel_config_file() {
+        return 1;
+    }
+    if !install_kernel_module_metadata() {
+        return 1;
+    }
+
+    print_step(11, TOTAL_STEPS, "launch /bin/sh");
     let chdir_ret = chdir(ROOT_HOME_DIR);
     if chdir_ret < 0 {
         println!(
@@ -485,7 +681,8 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         );
     }
     let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
-    let shell_exit = spawn_and_wait(BIN_SH_CSTR, &shell_argv);
+    let shell_envp = [SHELL_PATH_ENV_CSTR.as_ptr(), ptr::null()];
+    let shell_exit = spawn_and_wait_with_env(BIN_SH_CSTR, &shell_argv, &shell_envp);
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
     shell_exit
 }
