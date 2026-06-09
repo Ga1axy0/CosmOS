@@ -33,7 +33,12 @@ pub const USER_STACK_BASE: usize = 0x0800_0000;
 /// placed between stack and mmap region to avoid conflicts
 pub const INTERP_BASE: usize = 0x4000_0000;
 /// the virtual addr of trapoline
+#[cfg(not(target_arch = "loongarch64"))]
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
+/// LoongArch64 keeps trap trampoline and per-task kernel stacks in the low half
+/// so the current PGDL-only address-space activation can cover them.
+#[cfg(target_arch = "loongarch64")]
+pub const TRAMPOLINE: usize = 0x0000_003f_ffff_f000;
 /// the virtual addr of trap context
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
 /// 用户态 signal trampoline 页起始地址。

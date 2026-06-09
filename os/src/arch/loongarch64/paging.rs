@@ -10,9 +10,11 @@ const CSR_ASID: usize = 0x18;
 const PTE_V: usize = 1 << 0;
 const PTE_D: usize = 1 << 1;
 const PTE_PLV_USER: usize = 0b11 << 2;
+const PTE_MAT_CC: usize = 0b01 << 4;
 const PTE_G: usize = 1 << 6;
 const PTE_P: usize = 1 << 7;
 const PTE_W: usize = 1 << 8;
+const PTE_A: usize = 1 << 10;
 const PTE_GNX: usize = 1 << 62;
 const PTE_GNR: usize = 1 << 61;
 const PPN_SHIFT: usize = 12;
@@ -39,9 +41,11 @@ impl PagingArch for LoongArchPaging {
 
     unsafe fn activate_token(token: AddressSpaceToken) {
         asm!(
+            "dbar 0",
             "csrwr {pgd}, {pgdl}",
             "csrwr $zero, {asid}",
             "invtlb 0x00, $zero, $zero",
+            "ibar 0",
             pgd = in(reg) token,
             pgdl = const CSR_PGDL,
             asid = const CSR_ASID,
@@ -55,11 +59,18 @@ impl PagingArch for LoongArchPaging {
     }
 
     unsafe fn flush_tlb() {
-        asm!("invtlb 0x00, $zero, $zero");
+        asm!(
+            "dbar 0",
+            "invtlb 0x00, $zero, $zero",
+            "ibar 0",
+        );
     }
 
     fn make_pte(ppn: usize, flags: PTEFlags) -> usize {
-        let mut bits = (ppn << PPN_SHIFT) | PTE_P | PTE_V;
+        let mut bits = (ppn << PPN_SHIFT) | PTE_P | PTE_V | PTE_MAT_CC;
+        if flags.contains(PTEFlags::A) {
+            bits |= PTE_A;
+        }
         if flags.contains(PTEFlags::W) {
             bits |= PTE_W | PTE_D;
         }
@@ -79,8 +90,10 @@ impl PagingArch for LoongArchPaging {
     }
 
     fn make_dir_entry(ppn: usize) -> usize {
-        // Directory (non-leaf) PTEs must NOT have GNR/GNX set; only valid + PA.
-        (ppn << PPN_SHIFT) | PTE_V
+        // LoongArch hardware walkers consume non-leaf directory entries as the
+        // physical address of the next-level table. Keep them as a bare next
+        // table pointer instead of reusing leaf-style permission bits.
+        ppn << PPN_SHIFT
     }
 
     fn pte_ppn(entry_bits: usize) -> usize {
@@ -97,6 +110,9 @@ impl PagingArch for LoongArchPaging {
         }
         if entry_bits & PTE_D != 0 {
             flags |= PTEFlags::D;
+        }
+        if entry_bits & PTE_A != 0 {
+            flags |= PTEFlags::A;
         }
         if entry_bits & PTE_PLV_USER != 0 {
             flags |= PTEFlags::U;

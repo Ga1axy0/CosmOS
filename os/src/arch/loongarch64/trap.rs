@@ -2,6 +2,7 @@
 
 use core::arch::{asm, global_asm};
 
+use crate::config::TRAMPOLINE;
 use crate::hal::traits::{InterruptControl, TrapCause, TrapContextAbi, TrapInfo, TrapMachine};
 
 global_asm!(include_str!("trap.S"));
@@ -13,8 +14,10 @@ const CSR_ECFG: usize = 0x4;
 const CSR_ESTAT: usize = 0x5;
 const CSR_ERA: usize = 0x6;
 const CSR_BADV: usize = 0x7;
+const CSR_BADI: usize = 0x8;
 const CSR_EENTRY: usize = 0xc;
 const CSR_TLBRENTRY: usize = 0x88;
+const CSR_TLBREHI: usize = 0x8e;
 const CSR_PWCL: usize = 0x1c;
 const CSR_PWCH: usize = 0x1d;
 const CSR_STLBPS: usize = 0x1e;
@@ -29,6 +32,7 @@ const ECODE_INT: usize = 0x0;
 const ECODE_PIL: usize = 0x1;
 const ECODE_PIS: usize = 0x2;
 const ECODE_PIF: usize = 0x3;
+const ECODE_PME: usize = 0x4;
 const ECODE_ADE: usize = 0x8;
 const ECODE_SYS: usize = 0xb;
 const ECODE_INE: usize = 0xd;
@@ -105,9 +109,11 @@ impl InterruptControl for LoongArchInterruptControl {
             "csrwr {tlbr}, {tlbr_csr}",
             "csrwr {pwcl}, {pwcl_csr}",
             "csrwr {pwch}, {pwch_csr}",
-            // STLBPS: page size = 12 (4KB)
+            // STLBPS / TLBREHI.PS: page size = 12 (4KB) for software-managed
+            // refill entries as well as the shared TLB configuration.
             "ori   $t0, $zero, 12",
             "csrwr $t0, {stlbps_csr}",
+            "csrwr $t0, {tlbrehi_csr}",
             eentry     = in(reg) (__trap_from_kernel as usize),
             eentry_csr = const CSR_EENTRY,
             tlbr       = in(reg) (__tlb_refill as usize),
@@ -117,15 +123,20 @@ impl InterruptControl for LoongArchInterruptControl {
             pwch       = in(reg) PWCH,
             pwch_csr   = const CSR_PWCH,
             stlbps_csr = const CSR_STLBPS,
+            tlbrehi_csr = const CSR_TLBREHI,
             out("$t0") _,
         );
     }
 
     unsafe fn set_user_trap_entry() {
-        extern "C" { fn __alltraps(); }
+        extern "C" {
+            fn __alltraps();
+            fn strampoline();
+        }
+        let trap_entry = __alltraps as usize - strampoline as usize + TRAMPOLINE;
         asm!(
             "csrwr {entry}, {eentry}",
-            entry = in(reg) (__alltraps as usize),
+            entry = in(reg) trap_entry,
             eentry = const CSR_EENTRY,
         );
     }
@@ -138,7 +149,7 @@ impl TrapMachine for LoongArchTrapMachine {
         let ecode = (estat >> 16) & 0x3f;
         let cause = match ecode {
             ECODE_SYS => TrapCause::UserSyscall,
-            ECODE_PIS => TrapCause::StorePageFault,
+            ECODE_PIS | ECODE_PME => TrapCause::StorePageFault,
             ECODE_PIL => TrapCause::LoadPageFault,
             ECODE_PIF => TrapCause::InstructionPageFault,
             ECODE_INE => TrapCause::IllegalInstruction,
@@ -161,11 +172,15 @@ impl TrapMachine for LoongArchTrapMachine {
     }
 
     unsafe fn return_to_user(trap_cx_user_va: usize, user_token: usize) -> ! {
-        extern "C" { fn __restore(); }
+        extern "C" {
+            fn __restore();
+            fn strampoline();
+        }
+        let restore_va = __restore as usize - strampoline as usize + TRAMPOLINE;
         asm!(
             "ibar 0",
             "jirl $zero, {restore}, 0",
-            restore = in(reg) (__restore as usize),
+            restore = in(reg) restore_va,
             in("$a0") trap_cx_user_va,
             in("$a1") user_token,
             options(noreturn)
@@ -193,7 +208,9 @@ impl TrapContextAbi for LoongArchTrapContextAbi {
     ) -> Self::Frame {
         let mut frame = LoongArchTrapContextFrame {
             r: [0; 32],
-            prmd: 0,
+            // PPLV=3 (user) and PIE=1 so `ertn` returns to PLV3 with
+            // interrupts restored according to the saved user context.
+            prmd: 0b0111,
             era: entry,
             kernel_hartid: 0,
             kernel_pgdl: kernel_token,
@@ -310,6 +327,13 @@ fn read_estat() -> usize {
 fn read_badv() -> usize {
     let value: usize;
     unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_BADV) };
+    value
+}
+
+#[inline]
+fn read_badi() -> usize {
+    let value: usize;
+    unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_BADI) };
     value
 }
 

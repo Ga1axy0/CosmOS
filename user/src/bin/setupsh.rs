@@ -25,6 +25,7 @@ const BIN_DATE: &str = "/bin/date";
 const BOOT_DIR: &str = "/boot";
 const BOOT_CONFIG_PATH: &str = "/boot/config-6.6.0";
 const LIB_DIR: &str = "/lib";
+const LIB64_DIR: &str = "/lib64";
 const ETC_DIR: &str = "/etc";
 const ETC_PASSWD_PATH: &str = "/etc/passwd";
 const ETC_GROUP_PATH: &str = "/etc/group";
@@ -57,21 +58,53 @@ const MODULES_BUILTIN_PATH: &str = "/lib/modules/6.6.0/modules.builtin";
 const MODULES_DEP_PATH: &str = "/lib/modules/6.6.0/modules.dep";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_LEGACY_LIB_DIR: &str = "/musl/lib";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LIB_DIR: &str = "/usr/lib/riscv64-linux-musl";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LIBC_PATH: &str = "/usr/lib/riscv64-linux-musl/libc.so";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_PATH: &str = "/lib/ld-musl-riscv64-sf.so.1";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_COMPAT_PATH: &str = "/lib/ld-musl-riscv64.so.1";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_CONFIG_PATH: &str = "/etc/ld-musl-riscv64-sf.path";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_CONFIG_CONTENT: &[u8] = b"/usr/lib/riscv64-linux-musl\n/lib\n";
+
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LIB_DIR: &str = "/usr/lib/loongarch64-linux-musl";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LIBC_PATH: &str = "/usr/lib/loongarch64-linux-musl/libc.so";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LD_PATH: &str = "/lib64/ld-musl-loongarch-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LD_CONFIG_PATH: &str = "/etc/ld-musl-loongarch-lp64d.path";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LD_CONFIG_CONTENT: &[u8] = b"/usr/lib/loongarch64-linux-musl\n/lib\n/lib64\n";
 const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
 const GLIBC_BUSYBOX_TARGET: &str = "/usr/bin/glibc-busybox";
 const GLIBC_BUSYBOX_TARGET_CSTR: &str = "/usr/bin/glibc-busybox\0";
 const GLIBC_LEGACY_LIB_DIR: &str = "/glibc/lib";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LIB_DIR: &str = "/lib/riscv64-linux-gnu";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_USR_LIB_DIR: &str = "/usr/lib/riscv64-linux-gnu";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LD_NAME: &str = "ld-linux-riscv64-lp64d.so.1";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LD_TARGET: &str = "/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LD_PATH: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LIB_DIR: &str = "/lib/loongarch64-linux-gnu";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_USR_LIB_DIR: &str = "/usr/lib/loongarch64-linux-gnu";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LD_NAME: &str = "ld-linux-loongarch-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LD_TARGET: &str = "/lib/loongarch64-linux-gnu/ld-linux-loongarch-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LD_PATH: &str = "/lib64/ld-linux-loongarch-lp64d.so.1";
 const ROOT_GROUPDEL: &str = "/root/groupdel";
 const ROOT_USERADD: &str = "/root/useradd";
 const ROOT_USERDEL: &str = "/root/userdel";
@@ -412,6 +445,7 @@ fn ensure_dirs() -> bool {
         LIB_DIR,
         MODULES_ROOT_DIR,
         MODULES_DIR,
+        LIB64_DIR,
         ETC_DIR,
         HOME_DIR,
         ROOT_HOME_DIR,
@@ -427,6 +461,26 @@ fn ensure_dirs() -> bool {
         GLIBC_USR_LIB_DIR,
     ] {
         if !ensure_dir(dir) {
+            return false;
+        }
+    }
+    true
+}
+
+fn install_loader_links() -> bool {
+    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
+        return false;
+    }
+    if !ensure_hard_link(GLIBC_LD_TARGET, GLIBC_LD_PATH) {
+        println!(
+            "[setupsh] glibc loader must exist as {} in {}",
+            GLIBC_LD_NAME, GLIBC_LIB_DIR
+        );
+        return false;
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_COMPAT_PATH) {
             return false;
         }
     }
@@ -476,23 +530,6 @@ fn install_ltp_env_scripts() -> bool {
         if !write_file(path, script.as_bytes()) {
             return false;
         }
-    }
-    true
-}
-
-fn install_loader_links() -> bool {
-    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
-        return false;
-    }
-    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_COMPAT_PATH) {
-        return false;
-    }
-    if !ensure_hard_link(GLIBC_LD_TARGET, GLIBC_LD_PATH) {
-        println!(
-            "[setupsh] glibc loader must exist as {} in {}",
-            GLIBC_LD_NAME, GLIBC_LIB_DIR
-        );
-        return false;
     }
     true
 }

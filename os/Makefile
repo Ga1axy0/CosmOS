@@ -1,5 +1,16 @@
 # Building
 ARCH ?= riscv64
+ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
+ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
+
+ifneq ($(filter $(ARCH_NORMALIZED),riscv64 rv64 rv),)
+	ARCH := riscv64
+else ifneq ($(filter $(ARCH_NORMALIZED),loongarch64 la64 la),)
+	ARCH := loongarch64
+else
+$(error Unsupported target '$(ARCH_REQUEST)'. Use riscv64/rv64/rv or loongarch64/la64/la)
+endif
+
 ifeq ($(ARCH),loongarch64)
 	TARGET := loongarch64-unknown-none
 	QEMU ?= qemu-system-loongarch64
@@ -8,11 +19,17 @@ ifeq ($(ARCH),loongarch64)
 	LOONGARCH_BIOS ?= /usr/local/share/qemu/edk2-loongarch64-code.fd
 	LOONGARCH_BOOT_MODE ?= direct
 	LOONGARCH_BOOTLOADER := ../bootloader/loongarch64-direct/target/loongarch64-unknown-none/release/loongarch64-direct-boot
+	BASE_IMG ?= ../sdcard-la.img
+	QEMU_MEMORY ?= 4G
+	GDB ?= loongarch64-unknown-elf-gdb
 else
 	TARGET := riscv64gc-unknown-none-elf
 	QEMU ?= qemu-system-riscv64
 	OBJDUMP := rust-objdump --arch-name=riscv64
 	OBJCOPY := rust-objcopy --binary-architecture=riscv64
+	BASE_IMG ?= ../sdcard-rv.img
+	QEMU_MEMORY ?= 2G
+	GDB ?= riscv64-unknown-elf-gdb
 endif
 MODE ?= release
 KERNEL_ELF = target/$(TARGET)/$(MODE)/os
@@ -24,9 +41,6 @@ FS_IMG ?= ../user/target/$(TARGET)/$(USER_MODE)/fs.img
 MAIN_FS := ext4
 MEM ?= 1G
 SMP ?= 1
-# Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
-# image and injects user apps into it.
-BASE_IMG ?= ../sdcard-rv.img
 APPS := ../user/src/bin/*
 OFFLINE :=
 
@@ -54,6 +68,38 @@ MODE_ARG = $(if $(filter release,$(MODE)),--release)
 
 # KERNEL ENTRY
 KERNEL_ENTRY_PA := $(if $(filter $(ARCH),loongarch64),0x90000000,0x80200000)
+DEBUG_MEMORY ?= 512M
+NET_PORT_FORWARD ?= user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778,hostfwd=udp::7778-:7778
+QEMU_EXTRA_DEVICES = \
+	# -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
+	# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
+	# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+
+ifeq ($(ARCH),loongarch64)
+QEMU_COMMON_ARGS = -m $(QEMU_MEMORY) -machine virt -cpu la464 -smp $(SMP) -nographic
+QEMU_NET_ARGS = \
+	-netdev $(NET_PORT_FORWARD) \
+	-device virtio-net-pci,netdev=net0,id=net0
+QEMU_BLK_ARGS = \
+	-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
+	-device virtio-blk-pci,drive=x0,id=x0
+ifeq ($(LOONGARCH_BOOT_MODE),direct)
+QEMU_BOOT_ARGS = -kernel $(LOONGARCH_BOOTLOADER) -device loader,file=$(KERNEL_ELF),addr=$(KERNEL_ENTRY_PA)
+else
+QEMU_BOOT_ARGS = -bios $(LOONGARCH_BIOS) -device loader,file=$(KERNEL_ELF),addr=$(KERNEL_ENTRY_PA)
+endif
+GDB_ARCH_EX =
+else
+QEMU_COMMON_ARGS = -m $(QEMU_MEMORY) -machine virt -smp $(SMP) -nographic
+QEMU_NET_ARGS = \
+	-netdev $(NET_PORT_FORWARD) \
+	-device virtio-net-device,netdev=net0,id=net0
+QEMU_BLK_ARGS = \
+	-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
+	-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+QEMU_BOOT_ARGS = -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA)
+GDB_ARCH_EX = -ex 'set arch riscv:rv64'
+endif
 
 # Disassembly
 DISASM ?= -x
@@ -124,84 +170,44 @@ disasm-vim: kernel
 
 run: build bootloader run-inner
 
-run-trace: build run-inner-trace
+run-trace: build bootloader run-inner-trace
 
 fast-run: kernel
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 	@$(MAKE) run-inner
 
 run-inner:
-ifeq ($(ARCH),loongarch64)
-ifeq ($(LOONGARCH_BOOT_MODE),direct)
 	@$(QEMU) \
-		-m 4G \
-		-machine virt \
-		-cpu la464 \
-		-smp $(SMP) \
-		-nographic \
-		-kernel $(LOONGARCH_BOOTLOADER) \
-		-device loader,file=$(KERNEL_ELF),addr=$(KERNEL_ENTRY_PA)
-else
-	@$(QEMU) \
-		-m 4G \
-		-machine virt \
-		-cpu la464 \
-		-smp $(SMP) \
-		-nographic \
-		-bios $(LOONGARCH_BIOS) \
-		-device loader,file=$(KERNEL_ELF),addr=$(KERNEL_ENTRY_PA)
-endif
-else
-	@$(QEMU) \
-		-m $(MEM) \
-		-machine virt \
-		-smp $(SMP) \
-		-nographic \
-		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777,hostfwd=tcp::7778-:7778,hostfwd=udp::7778-:7778 \
-        -device virtio-net-device,netdev=net0,id=net0 \
-		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
-		# -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
-		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
-		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
-endif
+		$(QEMU_COMMON_ARGS) \
+		$(QEMU_BOOT_ARGS) \
+		$(QEMU_NET_ARGS) \
+		$(QEMU_BLK_ARGS)
 #	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
 
 run-inner-trace:
 	@$(QEMU) \
-		-m $(MEM) \
-		-machine virt \
-		-smp $(SMP) \
-		-nographic \
-		-bios $(BOOTLOADER) \
-		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		-netdev user,id=net0,hostfwd=udp::5555-:5555,hostfwd=udp::5564-:5564,hostfwd=tcp::7777-:7777 \
-        -object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap \
-        -device virtio-net-device,netdev=net0,id=net0 \
-		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
+		$(QEMU_COMMON_ARGS) \
+		$(QEMU_BOOT_ARGS) \
+		$(QEMU_NET_ARGS) \
+		$(QEMU_BLK_ARGS) \
 		-d int,in_asm \
-		-D qemu.log \
-		# -drive file=../second-fat32.img,if=none,format=raw,id=x1 \
-		# -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
-#	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
+		-D qemu.log
 
 debug: MODE=debug
-debug: build
+debug: build bootloader
 	@tmux new-session -d \
-		"$(QEMU) -m $(MEM) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
-		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
+		"$(QEMU) -m $(DEBUG_MEMORY) $(filter-out -m $(QEMU_MEMORY),$(QEMU_COMMON_ARGS)) $(QEMU_BOOT_ARGS) $(QEMU_NET_ARGS) $(QEMU_BLK_ARGS) -s -S" && \
+		tmux split-window -h "$(GDB) -ex 'file $(KERNEL_ELF)' $(GDB_ARCH_EX) -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: MODE=debug
-gdbserver: build
-	@$(QEMU) -m $(MEM) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
-		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
+gdbserver: build bootloader
+	@$(QEMU) -m $(DEBUG_MEMORY) $(filter-out -m $(QEMU_MEMORY),$(QEMU_COMMON_ARGS)) $(QEMU_BOOT_ARGS) $(QEMU_NET_ARGS) $(QEMU_BLK_ARGS) \
 		-s -S
 
 gdbclient: MODE=debug
 gdbclient:
-	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
+	@$(GDB) -ex 'file $(KERNEL_ELF)' $(GDB_ARCH_EX) -ex 'target remote localhost:1234'
 
 .PHONY: build env kernel clean disasm disasm-vim run run-trace fast-run run-inner fs-img debug gdbserver gdbclient

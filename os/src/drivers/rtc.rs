@@ -132,6 +132,15 @@ lazy_static! {
 /// 标记 RTC 是否已完成初始化。
 static RTC_READY: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_arch = "loongarch64")]
+/// 初始化全局 RTC 驱动。
+pub fn init() {
+    // QEMU loongarch64 virt does not currently expose the Goldfish RTC MMIO
+    // block at the RISC-V-compatible address we use elsewhere.
+    warn!("rtc init skipped on loongarch64 virt");
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
 /// 初始化全局 RTC 驱动。
 pub fn init() {
     let rtc = RTC.lock();

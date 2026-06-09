@@ -18,6 +18,14 @@ pub const MMIO: &[(usize, usize)] = &[
 pub const VIRT_UART: usize = IO_ADDR_OFFSET | 0x1fe0_01e0;
 /// RTC-compatible MMIO virtual address (uncached DMW0 window).
 pub const VIRT_RTC: usize = IO_ADDR_OFFSET | 0x1fe0_01f8;
+/// VirtIO MMIO window base address.
+pub const VIRTIO_MMIO_BASE: usize = IO_ADDR_OFFSET | 0x1fe2_0000;
+/// Size of each VirtIO MMIO slot.
+pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+/// Number of VirtIO MMIO slots exposed by the board.
+pub const VIRTIO_MMIO_SLOTS: usize = 8;
+/// First IRQ line assigned to VirtIO MMIO devices.
+pub const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
 /// Alias for compatibility.
 pub const VIRT_UART_EARLY: usize = VIRT_UART;
 

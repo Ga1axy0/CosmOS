@@ -215,20 +215,42 @@ pub fn init_heap() {
 }
 
 pub fn init_heap_virtual_window() {
-    KERNEL_HEAP_VIRTUAL_READY.store(true, Ordering::Release);
     #[cfg(target_arch = "loongarch64")]
-    crate::early_puts("[heap] grow start\r\n");
+    {
+        // LA64 bring-up still faults on the first access into the low-half
+        // heap window even after the leaf PTE is installed and TLB state is
+        // refreshed. Keep using the already-working DMW-backed bootstrap heap
+        // path for now so the kernel can continue booting on LoongArch.
+        crate::early_puts("[heap] virtual window disabled on loongarch64\r\n");
+        return;
+    }
+    KERNEL_HEAP_VIRTUAL_READY.store(true, Ordering::Release);
     assert!(
         HEAP_ALLOCATOR.grow(KERNEL_HEAP_GROW_SIZE),
         "failed to initialize virtual kernel heap"
     );
-    #[cfg(target_arch = "loongarch64")]
-    crate::early_puts("[heap] grow done\r\n");
 }
 
 /// Map a single heap VA page. Called from trap_from_kernel on LoongArch.
 pub fn map_one_heap_page(va: usize) -> bool {
     map_heap_pages(va, 1)
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn early_put_hex(label: &str, value: usize) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 2 + 16 + 2];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for (idx, slot) in buf[2..18].iter_mut().enumerate() {
+        let shift = (15 - idx) * 4;
+        *slot = HEX[(value >> shift) & 0xf];
+    }
+    buf[18] = b'\r';
+    buf[19] = b'\n';
+    crate::early_puts(label);
+    // SAFETY: ASCII hex buffer is always valid UTF-8.
+    crate::early_puts(core::str::from_utf8(&buf).unwrap());
 }
 
 fn layout_required_bytes(layout: Layout) -> Option<usize> {
@@ -366,12 +388,29 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
             rollback_heap_pages(subtree_root_ppn, start_va, page);
             return false;
         };
-        *entry = PageTableEntry::new(frame.ppn, PTEFlags::R | PTEFlags::W | PTEFlags::V);
+        *entry = PageTableEntry::new(
+            frame.ppn,
+            PTEFlags::R | PTEFlags::W | PTEFlags::V | PTEFlags::A | PTEFlags::D,
+        );
         core::mem::forget(frame);
     }
-    unsafe { crate::hal::flush_tlb() };
     #[cfg(target_arch = "loongarch64")]
-    crate::early_puts("[heap] pages mapped, flush done\r\n");
+    if pages > 0 {
+        let vpn = VirtAddr::from(start_va).floor();
+        let root_idx = crate::hal::vpn_index(vpn.0, 0);
+        let mid_idx = crate::hal::vpn_index(vpn.0, 1);
+        let leaf_idx = crate::hal::vpn_index(vpn.0, 2);
+        let root = PhysPageNum(crate::hal::root_ppn_from_token(crate::mm::kernel_token()));
+        let root_pte = root.get_pte_array()[root_idx].bits;
+        let mid_ppn = PhysPageNum(crate::hal::pte_ppn(root_pte));
+        let mid_pte = mid_ppn.get_pte_array()[mid_idx].bits;
+        let leaf_ppn = PhysPageNum(crate::hal::pte_ppn(mid_pte));
+        let leaf_pte = leaf_ppn.get_pte_array()[leaf_idx].bits;
+        early_put_hex("[heap] root_pte=", root_pte);
+        early_put_hex("[heap] mid_pte=", mid_pte);
+        early_put_hex("[heap] leaf_pte=", leaf_pte);
+    }
+    unsafe { crate::hal::flush_tlb() };
     true
 }
 

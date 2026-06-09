@@ -364,23 +364,9 @@ pub fn rust_main(hart_id: usize) -> ! {
     unsafe {
         riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
     }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        // LoongArch64 bring-up currently follows a single-bootstrap-hart path.
-        if !try_claim_bootstrap_hart(hart_id) {
-            secondary_hart_main(hart_id);
-        }
+    if !try_claim_bootstrap_hart(hart_id) {
+        secondary_hart_main(hart_id);
+    } else {
         first_hart_main(hart_id);
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        unsafe {
-            riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
-        }
-        if !try_claim_bootstrap_hart(hart_id) {
-            secondary_hart_main(hart_id);
-        } else {
-            first_hart_main(hart_id);
-        }
     }
 }

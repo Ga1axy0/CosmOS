@@ -1122,7 +1122,7 @@ fn dynamic_watermarks() -> (usize, usize) {
 
 /// 初始化时使用的保守水位估算。
 fn default_watermarks() -> (usize, usize) {
-    let managed_start = PhysAddr::from(ekernel as usize).ceil();
+    let managed_start = PhysAddr::from(crate::mm::virt_to_phys(ekernel as usize)).ceil();
     let managed_end = PhysAddr::from(MEMORY_END).floor();
     let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
     let high_watermark = max(128, total_pages / 4);

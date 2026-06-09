@@ -4,14 +4,14 @@ use crate::task::{current_task, WaitQueueKeyed, WaitReason};
 use core::hint::spin_loop;
 use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk},
-    transport::mmio::MmioTransport,
+    transport::SomeTransport,
 };
 
 use crate::drivers::virtio::VirtioHal;
 
 /// VirtIOBlock device driver strcuture for virtio_blk device
 pub struct VirtIOBlock {
-    inner: SpinNoIrqLock<VirtIOBlk<VirtioHal, MmioTransport<'static>>>,
+    inner: SpinNoIrqLock<VirtIOBlk<VirtioHal, SomeTransport<'static>>>,
     wait_queue: WaitQueueKeyed<u16>,
 }
 
@@ -135,8 +135,8 @@ impl BlockDevice for VirtIOBlock {
 }
 
 impl VirtIOBlock {
-    /// Build a wrapper from an initialized MMIO transport.
-    pub fn try_new(transport: MmioTransport<'static>) -> Option<Self> {
+    /// Build a wrapper from an initialized VirtIO transport.
+    pub fn try_new(transport: SomeTransport<'static>) -> Option<Self> {
         VirtIOBlk::<VirtioHal, _>::new(transport).ok().map(|blk| Self {
             inner: SpinNoIrqLock::new(blk),
             wait_queue: WaitQueueKeyed::new(),

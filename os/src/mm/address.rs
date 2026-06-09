@@ -21,6 +21,18 @@ pub fn phys_to_virt(pa: usize) -> usize {
     #[cfg(not(target_arch = "loongarch64"))]
     pa
 }
+
+/// Convert one direct-mapped kernel virtual address back to a physical address.
+#[inline(always)]
+pub fn virt_to_phys(va: usize) -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        use crate::board::KERNEL_ADDR_OFFSET;
+        va & !KERNEL_ADDR_OFFSET
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    va
+}
 /// Exclusive end of the canonical low-half user virtual-address range.
 pub const USER_SPACE_END: usize = {
     let _ = crate::hal::page_table_levels();

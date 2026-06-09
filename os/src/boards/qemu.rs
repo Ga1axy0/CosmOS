@@ -16,6 +16,14 @@ pub const MMIO: &[(usize, usize)] = &[
 pub const VIRT_UART: usize = 0x1000_0000;
 /// QEMU virt 机型上的 Goldfish RTC MMIO 基址。
 pub const VIRT_RTC: usize = 0x0010_1000;
+/// VirtIO MMIO window base address.
+pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+/// Size of each VirtIO MMIO slot.
+pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+/// Number of VirtIO MMIO slots exposed by the board.
+pub const VIRTIO_MMIO_SLOTS: usize = 8;
+/// First IRQ line assigned to VirtIO MMIO devices.
+pub const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
 
 /// Block device implementation for QEMU virt.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;

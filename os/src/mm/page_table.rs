@@ -39,7 +39,17 @@ impl PageTableEntry {
     }
     /// The page pointered by page table entry is valid?
     pub fn is_valid(&self) -> bool {
-        (self.flags() & PTEFlags::V) != PTEFlags::empty()
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // LoongArch non-leaf directory entries are encoded as bare
+            // next-level-table physical addresses, so software page-table walks
+            // must treat any non-zero entry as present.
+            self.bits != 0
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            (self.flags() & PTEFlags::V) != PTEFlags::empty()
+        }
     }
     /// The page pointered by page table entry is readable?
     pub fn readable(&self) -> bool {

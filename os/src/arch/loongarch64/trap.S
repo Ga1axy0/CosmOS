@@ -1,14 +1,15 @@
     # TLB refill handler — must be 4K-aligned, placed first in trampoline section.
-    # Uses hardware page-table walker: PGDL → lddir × N → ldpte × 2 → tlbfill.
+    # Uses hardware page-table walker: PGD → lddir × N → ldpte × 2 → tlbfill.
     .section .text.trampoline
+    .equ      CSR_SAVE, 0x30
     .globl __tlb_refill
     .balign 4096
 __tlb_refill:
     csrwr   $t0, 0x8b          # save t0 to TLBRSAVE
-    csrrd   $t0, 0x1b          # t0 = PGD base
+    csrrd   $t0, 0x1b          # t0 = effective PGD selected by hardware
     lddir   $t0, $t0, 2        # walk root → mid (Dir2 → Dir1)
     beqz    $t0, 1f
-    lddir   $t0, $t0, 1        # walk mid → leaf (Dir1 → PT)
+    lddir   $t0, $t0, 1        # walk mid → leaf PT
     beqz    $t0, 1f
     ldpte   $t0, 0
     ldpte   $t0, 1
@@ -26,7 +27,7 @@ __tlb_refill:
     .align 3
 __alltraps:
     move    $t0, $sp
-    move    $sp, $a0
+    csrrd   $sp, CSR_SAVE
     st.d    $ra, $sp, 1*8
     st.d    $tp, $sp, 2*8
     st.d    $t0, $sp, 3*8
@@ -63,11 +64,10 @@ __alltraps:
     st.d    $t0, $sp, 32*8
     st.d    $t1, $sp, 33*8
 
-    fld.d   $f0, $sp, 38*8
-    movgr2fr.d $f0, $zero
-    fst.d   $f0, $sp, 38*8
-    csrrd   $t0, 0x2
-    st.d    $t0, $sp, 70*8
+    # Keep the first user-trap path free of FP instructions.
+    # LoongArch can trap on FP use when EUEN/FPU state is not fully prepared,
+    # and nested traps here corrupt the user trap frame before Rust sees it.
+    st.d    $zero, $sp, 70*8
 
     ld.d    $tp, $sp, 34*8
     ld.d    $t0, $sp, 35*8
@@ -78,6 +78,8 @@ __alltraps:
     jr      $t1
 
 __restore:
+    csrwr   $a0, CSR_SAVE
+    csrrd   $a0, CSR_SAVE
     csrwr   $a1, 0x19
     invtlb  0x00, $zero, $zero
     move    $sp, $a0
