@@ -1,2 +1,2 @@
 ## CosmOS
-Does noe have name yet...
+CosmOS is a microkernel operating system written in Rust. It is designed to be modular, secure, and efficient, making it suitable for a wide range of applications, from embedded systems to desktop environments.
