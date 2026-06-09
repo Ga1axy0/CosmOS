@@ -19,11 +19,7 @@ pub use crate::arch::loongarch64::{
     LoongArchTrapMachine as ArchTrapMachine, LoongArchPaging as ArchPaging,
 };
 
-#[cfg(target_arch = "riscv64")]
-pub use crate::platform::qemu_virt::SbiPlatform as Plat;
-
-#[cfg(target_arch = "loongarch64")]
-pub use crate::platform::loongarch_virt::LoongArchPlatform as Plat;
+pub use crate::platform::PlatformImpl as Plat;
 
 /// Return the current hart id.
 #[inline]
@@ -127,6 +123,36 @@ pub fn pte_ppn(entry_bits: usize) -> usize {
 #[inline]
 pub fn pte_flags(entry_bits: usize) -> PTEFlags {
     ArchPaging::pte_flags(entry_bits)
+}
+
+/// Return whether one raw PTE/directory entry should be treated as present.
+#[inline]
+pub fn pte_is_valid(entry_bits: usize) -> bool {
+    ArchPaging::pte_is_valid(entry_bits)
+}
+
+/// Normalize leaf PTE flags for the current architecture.
+#[inline]
+pub fn normalize_leaf_pte_flags(flags: PTEFlags) -> PTEFlags {
+    ArchPaging::normalize_leaf_flags(flags)
+}
+
+/// Convert an arbitrary raw virtual address input into the stored form.
+#[inline]
+pub fn normalize_virt_addr_input(bits: usize) -> usize {
+    ArchPaging::normalize_virt_addr_input(bits)
+}
+
+/// Convert an arbitrary raw virtual address input into a virtual page number.
+#[inline]
+pub fn virt_page_num_from_addr(bits: usize) -> usize {
+    ArchPaging::virt_page_num_from_addr(bits)
+}
+
+/// Return the default trap-context page permissions for this architecture.
+#[inline]
+pub fn trap_context_flags() -> PTEFlags {
+    ArchPaging::trap_context_flags()
 }
 
 /// Return the architecture's physical address width in bits.

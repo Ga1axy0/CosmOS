@@ -14,12 +14,8 @@
 mod context;
 
 use crate::config::PAGE_SIZE;
-#[cfg(target_arch = "loongarch64")]
-use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE};
 use crate::hal::hartid;
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
-#[cfg(target_arch = "loongarch64")]
-use crate::mm::map_one_heap_page;
 use crate::signal::{SignalBit, handle_signals};
 use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
@@ -91,40 +87,6 @@ fn log_lazy_fault_oom(path: &str, access: &str, fault_addr: usize) {
         cx.reg(11),
         cx.syscall_nr(),
     );
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn early_put_hex(label: &str, value: usize) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 2 + 16 + 2];
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for (idx, slot) in buf[2..18].iter_mut().enumerate() {
-        let shift = (15 - idx) * 4;
-        *slot = HEX[(value >> shift) & 0xf];
-    }
-    buf[18] = b'\r';
-    buf[19] = b'\n';
-    crate::early_puts(label);
-    crate::early_puts(core::str::from_utf8(&buf).unwrap());
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn dump_kernel_trap_state() {
-    let crmd: usize;
-    let estat: usize;
-    let era: usize;
-    let badv: usize;
-    unsafe {
-        core::arch::asm!("csrrd {}, {}", out(reg) crmd, const 0x0);
-        core::arch::asm!("csrrd {}, {}", out(reg) estat, const 0x5);
-        core::arch::asm!("csrrd {}, {}", out(reg) era, const 0x6);
-        core::arch::asm!("csrrd {}, {}", out(reg) badv, const 0x7);
-    }
-    early_put_hex("[trap] crmd=", crmd);
-    early_put_hex("[trap] estat=", estat);
-    early_put_hex("[trap] era=", era);
-    early_put_hex("[trap] badv=", badv);
 }
 
 /// 初始化当前 hart 的 trap 相关状态。

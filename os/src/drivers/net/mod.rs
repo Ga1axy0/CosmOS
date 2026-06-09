@@ -11,7 +11,9 @@ use virtio_drivers::transport::{
     mmio::{MmioTransport, VirtIOHeader},
 };
 
-use crate::board::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE};
+use crate::platform::{
+    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+};
 use crate::sync::SpinNoIrqLock;
 
 pub use virtio_net::VirtIONetDevice;

@@ -4,34 +4,16 @@ use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
-const VPN_WIDTH_BITS: usize = crate::hal::virt_addr_bits() - PAGE_SIZE_BITS;
-
 /// Convert a physical address to a kernel virtual address for direct access.
-///
-/// On RiscV the kernel is linked at its physical address so this is a no-op.
-/// On LoongArch the kernel lives in the DMW1 cached window, so physical
-/// addresses need the 0x9000_0000_0000_0000 prefix to be accessible.
 #[inline(always)]
 pub fn phys_to_virt(pa: usize) -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        use crate::board::KERNEL_ADDR_OFFSET;
-        pa | KERNEL_ADDR_OFFSET
-    }
-    #[cfg(not(target_arch = "loongarch64"))]
-    pa
+    crate::platform::direct_map_phys_to_virt(pa)
 }
 
 /// Convert one direct-mapped kernel virtual address back to a physical address.
 #[inline(always)]
 pub fn virt_to_phys(va: usize) -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        use crate::board::KERNEL_ADDR_OFFSET;
-        va & !KERNEL_ADDR_OFFSET
-    }
-    #[cfg(not(target_arch = "loongarch64"))]
-    va
+    crate::platform::direct_map_virt_to_phys(va)
 }
 /// Exclusive end of the canonical low-half user virtual-address range.
 pub const USER_SPACE_END: usize = {
@@ -98,18 +80,12 @@ impl From<usize> for PhysPageNum {
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        #[cfg(target_arch = "loongarch64")]
-        return Self(v);
-        #[cfg(not(target_arch = "loongarch64"))]
-        return Self(v & ((1 << crate::hal::virt_addr_bits()) - 1));
+        Self(crate::hal::normalize_virt_addr_input(v))
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        #[cfg(target_arch = "loongarch64")]
-        return Self(v >> PAGE_SIZE_BITS);
-        #[cfg(not(target_arch = "loongarch64"))]
-        return Self(v & ((1 << VPN_WIDTH_BITS) - 1));
+        Self(crate::hal::virt_page_num_from_addr(v))
     }
 }
 impl From<PhysAddr> for usize {

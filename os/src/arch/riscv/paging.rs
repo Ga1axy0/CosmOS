@@ -49,6 +49,10 @@ impl PagingArch for Sv39Paging {
         PTEFlags::from_bits_truncate(entry_bits as u16)
     }
 
+    fn normalize_virt_addr_input(bits: usize) -> usize {
+        bits & ((1usize << Self::VA_BITS) - 1)
+    }
+
     fn vpn_index(vpn: usize, level: usize) -> usize {
         debug_assert!(level < Self::LEVELS);
         let mask = (1usize << Self::INDEX_BITS) - 1;

@@ -1,4 +1,9 @@
-//! block device driver
+//! Reusable device drivers.
+//!
+//! Drivers implement one device IP block or transport protocol such as
+//! NS16550A, VirtIO, or Goldfish RTC. They should stay as platform-agnostic as
+//! practical; the `platform` layer is responsible for deciding which drivers
+//! are instantiated and how their MMIO ranges and IRQs are routed.
 
 pub mod block;
 pub mod chardev;
@@ -17,10 +22,5 @@ pub fn init() {
     chardev::init();
     rtc::init();
     crate::platform::init_external_irq();
-    #[cfg(target_arch = "riscv64")]
-    {
-        block::probe_block_devices();
-        net::probe_net_devices();
-    }
     crate::platform::probe_platform_devices();
 }

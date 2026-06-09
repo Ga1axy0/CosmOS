@@ -1225,10 +1225,7 @@ impl UtsName {
         let nodename = b"localhost";
         let release = b"6.6.0";
         let version = b"#1 SMP PREEMPT cosmOS";
-        #[cfg(target_arch = "riscv64")]
-        let machine = b"riscv64";
-        #[cfg(target_arch = "loongarch64")]
-        let machine = b"loongarch64";
+        let machine = crate::platform::machine_name().as_bytes();
         let domainname = b"localdomain";
         uname.sysname[..sysname.len()].copy_from_slice(sysname);
         uname.nodename[..nodename.len()].copy_from_slice(nodename);

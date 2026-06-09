@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 
-use crate::board::CharDeviceImpl;
+use crate::platform::CharDeviceImpl;
 
 mod ns16550a;
 

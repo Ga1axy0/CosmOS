@@ -16,7 +16,9 @@ use virtio_drivers::transport::{
     DeviceType, SomeTransport,
     mmio::{MmioTransport, VirtIOHeader},
 };
-use crate::board::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE};
+use crate::platform::{
+    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+};
 
 fn virtio_blk_name(idx: usize) -> String {
     alloc::format!("vd{}", (b'a' + idx as u8) as char)

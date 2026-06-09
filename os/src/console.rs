@@ -1,5 +1,5 @@
 //! Kernel console output helpers.
-use crate::drivers::chardev::{uart_ready, CharDevice, UART};
+use crate::drivers::chardev::{CharDevice, UART};
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -20,13 +20,11 @@ impl Write for Stdout {
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
 struct EarlyStdout;
 
-#[cfg(target_arch = "loongarch64")]
 impl Write for EarlyStdout {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::early_puts(s);
+        crate::platform::early_console_write(s);
         Ok(())
     }
 }
@@ -67,8 +65,7 @@ impl Drop for ConsoleGuard {
 /// print to the host console using the format string and arguments.
 pub fn print(args: fmt::Arguments) {
     let _guard = ConsoleGuard::lock();
-    #[cfg(target_arch = "loongarch64")]
-    if !uart_ready() {
+    if crate::platform::use_early_console() {
         EarlyStdout.write_fmt(args).unwrap();
         return;
     }

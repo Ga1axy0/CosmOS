@@ -35,16 +35,8 @@ struct BounceMapping {
 
 #[inline]
 fn translate_kernel_va(va: usize) -> usize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        use crate::board::{IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET};
-
-        if va & KERNEL_ADDR_OFFSET == KERNEL_ADDR_OFFSET {
-            return va & !KERNEL_ADDR_OFFSET;
-        }
-        if va & IO_ADDR_OFFSET == IO_ADDR_OFFSET {
-            return va & !IO_ADDR_OFFSET;
-        }
+    if let Some(pa) = crate::platform::translate_direct_mapped_kernel_va(va) {
+        return pa;
     }
 
     PageTable::from_token(kernel_token())
@@ -155,16 +147,8 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: VirtioPhysAddr, _size: usize) -> NonNull<u8> {
-        #[cfg(target_arch = "loongarch64")]
-        {
-            use crate::board::IO_ADDR_OFFSET;
-            return NonNull::new((paddr as usize | IO_ADDR_OFFSET) as *mut u8)
-                .expect("virtio mmio_phys_to_virt: null");
-        }
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            NonNull::new(paddr as usize as *mut u8).expect("virtio mmio_phys_to_virt: null")
-        }
+        NonNull::new(crate::platform::mmio_phys_to_virt(paddr as usize) as *mut u8)
+            .expect("virtio mmio_phys_to_virt: null")
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtioPhysAddr {

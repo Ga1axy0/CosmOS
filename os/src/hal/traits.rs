@@ -203,6 +203,26 @@ pub trait PagingArch {
     fn pte_ppn(entry_bits: usize) -> usize;
     /// Extract the semantic flags from one raw PTE.
     fn pte_flags(entry_bits: usize) -> PTEFlags;
+    /// Return whether one raw PTE/directory entry should be treated as present.
+    fn pte_is_valid(entry_bits: usize) -> bool {
+        (Self::pte_flags(entry_bits) & PTEFlags::V) != PTEFlags::empty()
+    }
+    /// Normalize leaf PTE flags for the current architecture.
+    fn normalize_leaf_flags(flags: PTEFlags) -> PTEFlags {
+        flags
+    }
+    /// Convert an arbitrary raw virtual address input into the stored form.
+    fn normalize_virt_addr_input(bits: usize) -> usize {
+        bits & ((1usize << Self::VA_BITS) - 1)
+    }
+    /// Convert an arbitrary raw virtual address input into a virtual page number.
+    fn virt_page_num_from_addr(bits: usize) -> usize {
+        Self::normalize_virt_addr_input(bits) >> 12
+    }
+    /// Return the default trap-context page permissions for this architecture.
+    fn trap_context_flags() -> PTEFlags {
+        PTEFlags::R | PTEFlags::W
+    }
     /// Return the exclusive end of the canonical low-half user address range.
     fn user_space_end() -> usize {
         1usize << (Self::VA_BITS - 1)

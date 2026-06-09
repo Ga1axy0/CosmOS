@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::sync::Arc;
 use lazy_static::lazy_static;
 
-use crate::board::VIRT_RTC;
+use crate::platform::VIRT_RTC;
 use crate::sync::SpinNoIrqLock;
 
 /// Goldfish RTC 时间低 32 位寄存器。
@@ -132,17 +132,12 @@ lazy_static! {
 /// 标记 RTC 是否已完成初始化。
 static RTC_READY: AtomicBool = AtomicBool::new(false);
 
-#[cfg(target_arch = "loongarch64")]
 /// 初始化全局 RTC 驱动。
 pub fn init() {
-    // QEMU loongarch64 virt does not currently expose the Goldfish RTC MMIO
-    // block at the RISC-V-compatible address we use elsewhere.
-    warn!("rtc init skipped on loongarch64 virt");
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-/// 初始化全局 RTC 驱动。
-pub fn init() {
+    if !crate::platform::rtc_is_supported() {
+        warn!("rtc init skipped on this platform");
+        return;
+    }
     let rtc = RTC.lock();
     rtc.init();
     let time_ns = rtc.read_time_ns();

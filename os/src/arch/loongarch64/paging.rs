@@ -129,6 +129,30 @@ impl PagingArch for LoongArchPaging {
         flags
     }
 
+    fn pte_is_valid(entry_bits: usize) -> bool {
+        entry_bits != 0
+    }
+
+    fn normalize_leaf_flags(mut flags: PTEFlags) -> PTEFlags {
+        flags.insert(PTEFlags::A);
+        if flags.contains(PTEFlags::W) {
+            flags.insert(PTEFlags::D);
+        }
+        flags
+    }
+
+    fn normalize_virt_addr_input(bits: usize) -> usize {
+        bits
+    }
+
+    fn virt_page_num_from_addr(bits: usize) -> usize {
+        bits >> 12
+    }
+
+    fn trap_context_flags() -> PTEFlags {
+        PTEFlags::R | PTEFlags::W | PTEFlags::U
+    }
+
     fn vpn_index(vpn: usize, level: usize) -> usize {
         debug_assert!(level < Self::LEVELS);
         let mask = (1usize << Self::INDEX_BITS) - 1;

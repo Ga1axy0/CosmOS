@@ -215,13 +215,12 @@ pub fn init_heap() {
 }
 
 pub fn init_heap_virtual_window() {
-    #[cfg(target_arch = "loongarch64")]
-    {
+    if !crate::platform::kernel_heap_virtual_window_supported() {
         // LA64 bring-up still faults on the first access into the low-half
         // heap window even after the leaf PTE is installed and TLB state is
         // refreshed. Keep using the already-working DMW-backed bootstrap heap
         // path for now so the kernel can continue booting on LoongArch.
-        crate::early_puts("[heap] virtual window disabled on loongarch64\r\n");
+        crate::platform::early_console_write("[heap] virtual window disabled on loongarch64\r\n");
         return;
     }
     KERNEL_HEAP_VIRTUAL_READY.store(true, Ordering::Release);
@@ -236,7 +235,6 @@ pub fn map_one_heap_page(va: usize) -> bool {
     map_heap_pages(va, 1)
 }
 
-#[cfg(target_arch = "loongarch64")]
 fn early_put_hex(label: &str, value: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut buf = [0u8; 2 + 16 + 2];
@@ -248,9 +246,9 @@ fn early_put_hex(label: &str, value: usize) {
     }
     buf[18] = b'\r';
     buf[19] = b'\n';
-    crate::early_puts(label);
+    crate::platform::early_console_write(label);
     // SAFETY: ASCII hex buffer is always valid UTF-8.
-    crate::early_puts(core::str::from_utf8(&buf).unwrap());
+    crate::platform::early_console_write(core::str::from_utf8(&buf).unwrap());
 }
 
 fn layout_required_bytes(layout: Layout) -> Option<usize> {
@@ -358,17 +356,20 @@ fn heap_leaf_pte(
 }
 
 fn map_heap_pages(start_va: usize, pages: usize) -> bool {
-    #[cfg(target_arch = "loongarch64")]
-    crate::early_puts("[heap] map_heap_pages\r\n");
+    if crate::platform::heap_debug_enabled() {
+        crate::platform::early_console_write("[heap] map_heap_pages\r\n");
+    }
     let subtree_root_ppn = PhysPageNum(KERNEL_HEAP_SUBTREE_ROOT_PPN.load(Ordering::Acquire));
     if subtree_root_ppn.0 == 0 {
         panic!("map_heap_pages: subtree root ppn is 0");
     }
-    #[cfg(target_arch = "loongarch64")]
-    crate::early_puts("[heap] locking HEAP_PT_LOCK\r\n");
+    if crate::platform::heap_debug_enabled() {
+        crate::platform::early_console_write("[heap] locking HEAP_PT_LOCK\r\n");
+    }
     let _guard = HEAP_PT_LOCK.lock();
-    #[cfg(target_arch = "loongarch64")]
-    crate::early_puts("[heap] HEAP_PT_LOCK locked\r\n");
+    if crate::platform::heap_debug_enabled() {
+        crate::platform::early_console_write("[heap] HEAP_PT_LOCK locked\r\n");
+    }
     for page in 0..pages {
         let va = start_va + page * PAGE_SIZE;
         let vpn = VirtAddr::from(va).floor();
@@ -394,8 +395,7 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         );
         core::mem::forget(frame);
     }
-    #[cfg(target_arch = "loongarch64")]
-    if pages > 0 {
+    if crate::platform::heap_debug_enabled() && pages > 0 {
         let vpn = VirtAddr::from(start_va).floor();
         let root_idx = crate::hal::vpn_index(vpn.0, 0);
         let mid_idx = crate::hal::vpn_index(vpn.0, 1);

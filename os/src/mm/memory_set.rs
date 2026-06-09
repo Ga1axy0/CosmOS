@@ -468,17 +468,7 @@ impl MemorySet {
         if map_perm.contains(MapPermission::U) {
             flags.insert(PTEFlags::U);
         }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            // LoongArch leaf PTEs need the accessed bit set up-front, and
-            // writable mappings also need the dirty bit, otherwise the CPU may
-            // keep reporting page-invalid/store faults even after TLB refill.
-            flags.insert(PTEFlags::A);
-            if map_perm.contains(MapPermission::W) {
-                flags.insert(PTEFlags::D);
-            }
-        }
-        flags
+        crate::hal::normalize_leaf_pte_flags(flags)
     }
 
     /// 完成一次会返回延迟回收 batch 的本地页表修改。
@@ -809,10 +799,7 @@ impl MemorySet {
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
-        #[cfg(not(target_arch = "loongarch64"))]
-        let trampoline_pa = strampoline as usize;
-        #[cfg(target_arch = "loongarch64")]
-        let trampoline_pa = crate::mm::virt_to_phys(strampoline as usize);
+        let trampoline_pa = crate::platform::direct_map_virt_to_phys(strampoline as usize);
 
         self.page_table
             .map(
@@ -2266,10 +2253,8 @@ impl Vma {
     }
     /// 为某个线程生成 Trap 上下文页对应的区域描述。
     pub fn new_trap_context(start_va: VirtAddr, end_va: VirtAddr, tid: usize) -> Self {
-        #[cfg(target_arch = "loongarch64")]
-        let map_perm = MapPermission::R | MapPermission::W | MapPermission::U;
-        #[cfg(not(target_arch = "loongarch64"))]
-        let map_perm = MapPermission::R | MapPermission::W;
+        let map_perm =
+            MapPermission::from_bits_truncate(crate::hal::trap_context_flags().bits() as u8);
         Self::new(
             start_va,
             end_va,

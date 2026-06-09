@@ -56,7 +56,7 @@ pub use task::{
 };
 pub(crate) use task::TaskControlBlockInner;
 
-use crate::board::QEMUExit;
+use crate::platform::QEMUExit;
 use alloc::string::String;
 
 /// Exit the current 'Running' task and run the next task in task list.
@@ -152,10 +152,10 @@ pub fn exit_current_and_run_next(reason: ExitReason) {
             );
             if task_exit_code != 0 {
                 //crate::sbi::shutdown(255); //255 == -1 for err hint
-                crate::board::QEMU_EXIT_HANDLE.exit_failure();
+                crate::platform::QEMU_EXIT_HANDLE.exit_failure();
             } else {
                 //crate::sbi::shutdown(0); //0 for success hint
-                crate::board::QEMU_EXIT_HANDLE.exit_success();
+                crate::platform::QEMU_EXIT_HANDLE.exit_success();
             }
         }
         let mut process_inner = process.inner_exclusive_access();

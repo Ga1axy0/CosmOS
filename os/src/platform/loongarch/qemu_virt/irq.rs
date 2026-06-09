@@ -8,13 +8,12 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::board::IO_ADDR_OFFSET;
 use crate::bootstrap_hart_id;
 use crate::drivers::chardev::{CharDevice, UART};
 
 static UART_IRQ_READY: AtomicBool = AtomicBool::new(false);
 
-const PCH_PIC_BASE: usize = IO_ADDR_OFFSET | 0x1000_0000;
+const PCH_PIC_BASE: usize = crate::platform::IO_ADDR_OFFSET | 0x1000_0000;
 const PCH_PIC_INT_MASK: usize = 0x20;
 const PCH_PIC_HTMSI_VEC: usize = 0x200;
 

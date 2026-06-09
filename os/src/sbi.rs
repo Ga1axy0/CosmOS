@@ -3,13 +3,11 @@
 
 #![allow(unused)]
 
-use core::arch::asm;
 use crate::fs::sync_page_cache_all;
+use crate::hal::traits::HartCtrl as _;
 
-#[cfg(target_arch = "loongarch64")]
-use crate::board::{QEMUExit, QEMU_EXIT_HANDLE};
-#[cfg(target_arch = "loongarch64")]
-use crate::drivers::chardev::CharDevice;
+#[cfg(target_arch = "riscv64")]
+use core::arch::asm;
 
 /// SBI v0.2+ 调用返回值。
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -105,68 +103,59 @@ fn sbi_call(extension: usize, function: usize, arg0: usize, arg1: usize, arg2: u
 /// use sbi call to set timer
 #[cfg(qemu7)]
 #[cfg(target_arch = "riscv64")]
-pub fn set_timer(timer: usize) {
+pub(crate) fn set_timer_raw(timer: usize) {
     sbi_call_legacy(SBI_SET_TIMER, timer, 0, 0);
 }
 
 /// use sbi call to putchar in console (qemu uart handler)
 #[cfg(not(qemu7))]
 #[cfg(target_arch = "riscv64")]
-pub fn set_timer(timer: usize) {
+pub(crate) fn set_timer_raw(timer: usize) {
     let _ = sbi_call(SBI_SET_TIMER, 0, timer, 0, 0);
-}
-
-#[cfg(target_arch = "loongarch64")]
-/// Program the next local timer deadline on LoongArch64.
-pub fn set_timer(timer: usize) {
-    unsafe { crate::arch::loongarch64::set_timer_deadline(timer) };
 }
 
 /// use sbi call to putchar in console (qemu uart handler)
 #[cfg(qemu7)]
 #[cfg(target_arch = "riscv64")]
-pub fn console_putchar(c: usize) {
+pub(crate) fn console_putchar_raw(c: usize) {
     sbi_call_legacy(SBI_CONSOLE_PUTCHAR, c, 0, 0);
 }
 
 /// use sbi call to getchar from console (qemu uart handler)
 #[cfg(not(qemu7))]
 #[cfg(target_arch = "riscv64")]
-pub fn console_putchar(c: usize) {
+pub(crate) fn console_putchar_raw(c: usize) {
     let _ = sbi_call(SBI_CONSOLE_PUTCHAR, 0, c, 0, 0);
 }
 
-#[cfg(target_arch = "loongarch64")]
-/// Write one byte to the early console on LoongArch64.
+/// Write one byte to the platform console.
 pub fn console_putchar(c: usize) {
-    crate::drivers::chardev::UART.write(c as u8);
+    crate::platform::console_putchar(c);
 }
 
 /// use sbi call to getchar from console (qemu uart handler)
 #[cfg(qemu7)]
 #[cfg(target_arch = "riscv64")]
-pub fn console_getchar() -> usize {
+pub(crate) fn console_getchar_raw() -> usize {
     sbi_call_legacy(SBI_CONSOLE_GETCHAR, 0, 0, 0)
 }
 
 /// use sbi call to shutdown the kernel
 #[cfg(not(qemu7))]
 #[cfg(target_arch = "riscv64")]
-pub fn console_getchar() -> usize {
+pub(crate) fn console_getchar_raw() -> usize {
     sbi_call(SBI_CONSOLE_GETCHAR, 0, 0, 0, 0).value
 }
 
-#[cfg(target_arch = "loongarch64")]
-/// Read one byte from the early console on LoongArch64.
+/// Read one byte from the platform console.
 pub fn console_getchar() -> usize {
-    crate::drivers::chardev::UART.read() as usize
+    crate::platform::console_getchar()
 }
 
 /// use sbi call to shutdown the kernel
 #[cfg(qemu7)]
 #[cfg(target_arch = "riscv64")]
-pub fn shutdown() -> ! {
-    let _ = sync_page_cache_all();
+pub(crate) fn shutdown_raw() -> ! {
     sbi_call_legacy(SBI_SHUTDOWN, 0, 0, 0);
     panic!("It should shutdown!");
 }
@@ -174,23 +163,21 @@ pub fn shutdown() -> ! {
 /// use sbi call to shutdown the kernel
 #[cfg(not(qemu7))]
 #[cfg(target_arch = "riscv64")]
-pub fn shutdown() -> ! {
-    let _ = sync_page_cache_all();
+pub(crate) fn shutdown_raw() -> ! {
     let _ = sbi_call(SBI_SHUTDOWN, 0, 0, 0, 0);
     panic!("It should shutdown!");
 }
 
-#[cfg(target_arch = "loongarch64")]
-/// Shut down the LoongArch64 QEMU guest via the board exit device.
+/// Shut down the machine through the current platform backend.
 pub fn shutdown() -> ! {
     let _ = sync_page_cache_all();
-    QEMU_EXIT_HANDLE.exit_success()
+    crate::platform::shutdown()
 }
 
 /// 发送 IPI 到给定 hart mask。
 #[cfg(qemu7)]
 #[cfg(target_arch = "riscv64")]
-pub fn send_ipi_mask(hart_mask: usize) {
+pub(crate) fn send_ipi_mask_raw(hart_mask: usize) {
     let hart_mask_ptr = &hart_mask as *const usize as usize;
     sbi_call_legacy(SBI_SEND_IPI, hart_mask_ptr, 0, 0);
 }
@@ -198,23 +185,24 @@ pub fn send_ipi_mask(hart_mask: usize) {
 /// 发送 IPI 到给定 hart mask。
 #[cfg(not(qemu7))]
 #[cfg(target_arch = "riscv64")]
-pub fn send_ipi_mask(hart_mask: usize) {
+pub(crate) fn send_ipi_mask_raw(hart_mask: usize) {
     let _ = sbi_call(SBI_IPI, 0, hart_mask, 0, 0);
 }
 
-#[cfg(target_arch = "loongarch64")]
-/// Single-core bring-up keeps IPI as a no-op on LoongArch64 for now.
-pub fn send_ipi_mask(_hart_mask: usize) {}
+/// Send an inter-processor interrupt to the given hart mask.
+pub fn send_ipi_mask(hart_mask: usize) {
+    crate::hal::Plat::send_ipi(hart_mask);
+}
 
 /// 查询指定 hart 的 HSM 状态。
 #[cfg(target_arch = "riscv64")]
-pub fn hart_get_status(hart_id: usize) -> SbiRet {
+pub(crate) fn hart_get_status_raw(hart_id: usize) -> SbiRet {
     sbi_call(SBI_HSM, 2, hart_id, 0, 0)
 }
 
 /// 请求启动指定 hart，并让它从 `start_addr` 开始执行。
 #[cfg(target_arch = "riscv64")]
-pub fn hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> SbiRet {
+pub(crate) fn hart_start_raw(hart_id: usize, start_addr: usize, opaque: usize) -> SbiRet {
     sbi_call(SBI_HSM, 0, hart_id, start_addr, opaque)
 }
 
