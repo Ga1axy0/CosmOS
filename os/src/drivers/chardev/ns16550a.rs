@@ -5,7 +5,11 @@ use bitflags::bitflags;
 
 use crate::poll::{notify_poll_source, POLLIN};
 use crate::sync::SpinNoIrqLock;
-use crate::task::{WaitQueue, WaitReason};
+use crate::task::WaitQueue;
+#[cfg(target_arch = "loongarch64")]
+use crate::task::yield_current_and_run_next;
+#[cfg(not(target_arch = "loongarch64"))]
+use crate::task::WaitReason;
 
 use super::{set_uart_ready, CharDevice};
 
@@ -231,19 +235,30 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
          }
          drop(inner);
 
-         // No data: block current task until UART IRQ pushes data and signals.
-         self.rx_wait_queue
-            .wait_with_reason_or_skip(WaitReason::UartRx, || {
-               let mut inner = self.inner.lock();
-               if !inner.read_buffer.is_empty() {
-                  return true;
-               }
-               if let Some(ch) = inner.ns16550a.try_read() {
-                  inner.read_buffer.push_back(ch);
-                  return true;
-               }
-               false
-            });
+         #[cfg(target_arch = "loongarch64")]
+         {
+            // LA64 bring-up does not have UART RX interrupts wired through a
+            // platform IRQ controller yet, so avoid sleeping forever waiting
+            // for an IRQ wakeup that never comes. Poll cooperatively instead.
+            yield_current_and_run_next();
+         }
+
+         #[cfg(not(target_arch = "loongarch64"))]
+         {
+            // No data: block current task until UART IRQ pushes data and signals.
+            self.rx_wait_queue
+               .wait_with_reason_or_skip(WaitReason::UartRx, || {
+                  let mut inner = self.inner.lock();
+                  if !inner.read_buffer.is_empty() {
+                     return true;
+                  }
+                  if let Some(ch) = inner.ns16550a.try_read() {
+                     inner.read_buffer.push_back(ch);
+                     return true;
+                  }
+                  false
+               });
+         }
       }
    }
 

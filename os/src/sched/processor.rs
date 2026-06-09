@@ -129,6 +129,14 @@ pub(crate) fn run_tasks() {
             }
 
             // debug!("No task to run, idle...");
+            #[cfg(target_arch = "loongarch64")]
+            {
+                // LA64 bring-up does not have a working UART RX interrupt path
+                // yet, so drain the console UART opportunistically from the
+                // idle loop. This preserves echo/canonical processing and wakes
+                // blocked tty readers once a full line arrives.
+                crate::fs::console_receive();
+            }
 
             crate::trap::set_kernel_trap_entry();
 

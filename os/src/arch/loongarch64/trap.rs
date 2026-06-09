@@ -61,7 +61,15 @@ pub struct LoongArchTrapContextFrame {
     pub fcsr: usize,
 }
 
-const USER_VDSO_CODE: [u8; 4] = [0x00, 0x00, 0x2b, 0x00];
+/// 用户态 `rt_sigreturn` trampoline 机器码。
+///
+/// 等价指令序列：
+///   ori     $a7, $zero, 139
+///   syscall 0
+const USER_VDSO_CODE: [u8; 8] = [
+    0x0b, 0x2c, 0x82, 0x03, // ori $a7, $zero, 139
+    0x00, 0x00, 0x2b, 0x00, // syscall 0
+];
 
 impl InterruptControl for LoongArchInterruptControl {
     unsafe fn enable_timer() {
