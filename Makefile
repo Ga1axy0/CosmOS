@@ -21,9 +21,15 @@ KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src f
 ROOTFS_FILES := $(shell find rootfs -type f | sort)
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all docker build_docker fmt user-apps clean run run-trace run-comp-rv debug gdbserver gdbclient
+.PHONY: all submodules docker build_docker fmt user-apps clean run run-trace run-comp-rv debug gdbserver gdbclient
 
-all: kernel-rv kernel-la disk.img
+all:
+	$(MAKE) submodules
+	$(MAKE) kernel-rv kernel-la disk.img
+
+# 拉取所有子模块，确保后续构建依赖完整。
+submodules:
+	git submodule update --init --recursive
 
 $(STAMP_DIR):
 	mkdir -p $@
