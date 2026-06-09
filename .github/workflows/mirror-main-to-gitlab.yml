@@ -1,0 +1,34 @@
+name: Mirror Main to GitLab
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  mirror-main:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 将 main 分支同步到 GitLab 镜像仓库。
+      - name: Push main to GitLab
+        env:
+          GITLAB_MIRROR_URL: ${{ secrets.GITLAB_MIRROR_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GITLAB_MIRROR_URL" ]; then
+            echo "::error::Missing GITLAB_MIRROR_URL secret"
+            exit 1
+          fi
+
+          git remote add gitlab "$GITLAB_MIRROR_URL"
+          git push --force gitlab HEAD:main
