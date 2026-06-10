@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOTFS_DIR="${1:-rootfs}"
+ROOTFS_DIR="${1:-CosmOS-rootfs/rootfs}"
 USER_BIN_DIR="${2:-user/target/riscv64gc-unknown-none-elf/release}"
 OUT_IMG="${3:-disk.img}"
 EXTRA_MIB="${EXTRA_MIB:-512}"

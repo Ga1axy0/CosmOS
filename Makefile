@@ -18,10 +18,11 @@ USER_BUILD_STAMP := $(STAMP_DIR)/user-build.stamp
 KERNEL_BUILD_STAMP := $(STAMP_DIR)/kernel-build.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
-ROOTFS_FILES := $(shell find rootfs -type f | sort)
+ROOTFS_DIR := CosmOS-rootfs/rootfs
+ROOTFS_FILES := $(shell find $(ROOTFS_DIR) -type f | sort)
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules docker build_docker fmt user-apps clean run run-trace run-comp-rv debug gdbserver gdbclient
+.PHONY: all submodules docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient
 
 all:
 	$(MAKE) submodules
@@ -55,8 +56,11 @@ kernel-la: kernel-rv
 	@echo "warning: LoongArch kernel is not implemented in this repository yet; using kernel-rv as a temporary placeholder." >&2
 	cp kernel-rv $@
 
-disk.img: $(USER_BUILD_STAMP) $(ROOTFS_FILES) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh
-	./scripts/pack-disk-img.sh rootfs $(USER_BIN_DIR) $@
+rootfs:
+	$(MAKE) -C CosmOS-rootfs rootfs-init
+
+disk.img: $(USER_BUILD_STAMP) rootfs $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_FILES) scripts/pack-disk-img.sh
+	./scripts/pack-disk-img.sh $(ROOTFS_DIR) $(USER_BIN_DIR) $@
 
 run: kernel-rv disk.img
 	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
