@@ -88,6 +88,8 @@ pub const SYSCALL_PREADV: usize = 69;
 pub const SYSCALL_PWRITEV: usize = 70;
 /// sendfile64 syscall
 pub const SYSCALL_SENDFILE64: usize = 71;
+/// splice syscall
+pub const SYSCALL_SPLICE: usize = 76;
 /// pselect6_time32 syscall
 pub const SYSCALL_PSELECT6_TIME32: usize = 72;
 /// ppoll_time32 syscall
@@ -158,6 +160,8 @@ pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_TKILL: usize = 130;
 /// tgkill syscall
 pub const SYSCALL_TGKILL: usize = 131;
+/// sigaltstack syscall
+pub const SYSCALL_SIGALTSTACK: usize = 132;
 /// sigsuspend syscall
 pub const SYSCALL_SIGSUSPEND: usize = 133;
 /// sigaction syscall
@@ -280,6 +284,8 @@ pub const SYSCALL_CLONE: usize = 220;
 pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
 pub const SYSCALL_MMAP: usize = 222;
+/// fadvise64 syscall
+pub const SYSCALL_FADVISE64: usize = 223;
 /// mprotect syscall
 pub const SYSCALL_MPROTECT: usize = 226;
 /// msync syscall
@@ -334,6 +340,8 @@ pub const SYSCALL_FSOPEN: usize = 430;
 pub const SYSCALL_FSPICK: usize = 433;
 /// pidfd_open syscall
 pub const SYSCALL_PIDFD_OPEN: usize = 434;
+/// faccessat2 syscall
+pub const SYSCALL_FACCESSAT2: usize = 439;
 /// memfd_secret syscall
 pub const SYSCALL_MEMFD_SECRET: usize = 447;
 /*
@@ -533,6 +541,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0] as u32, args[1] as isize),
         SYSCALL_FALLOCATE => sys_fallocate(args[0] as u32, args[1] as i32, args[2] as i64, args[3] as i64),
         SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2] as i32),
+        SYSCALL_FACCESSAT2 => {
+            sys_faccessat2(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as i32)
+        }
         SYSCALL_FCHMOD => sys_fchmod(args[0] as u32, args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_FCHOWNAT => sys_fchownat(
@@ -572,6 +583,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SENDFILE64 =>
             sys_sendfile64(args[0] as i32, args[1] as i32, args[2] as *mut i64, args[3]),
+        SYSCALL_SPLICE => sys_splice(
+            args[0] as i32,
+            args[1] as *mut i64,
+            args[2] as i32,
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
+        SYSCALL_FADVISE64 => sys_fadvise64(args[0] as i32, args[1] as i64, args[2], args[3] as i32),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
             args[1] as *const u8,
@@ -817,6 +837,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MEMFD_CREATE => sys_memfd_create(args[0] as *const u8, args[1] as u32),
         SYSCALL_BPF => sys_bpf(args[0] as u32, args[1], args[2] as u32),
         SYSCALL_USERFAULTFD => sys_userfaultfd(args[0] as i32),
+        SYSCALL_SIGALTSTACK => {
+            sys_sigaltstack(args[0] as *const SigAltStack, args[1] as *mut SigAltStack)
+        }
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const UserSigAction,

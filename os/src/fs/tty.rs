@@ -29,6 +29,13 @@ const TIOCSCTTY: usize = 0x540E;
 const TIOCGPGRP: usize = 0x540F;
 /// `ioctl(TIOCSPGRP)`：设置前台进程组。
 const TIOCSPGRP: usize = 0x5410;
+/// Device ID of the devfs-like filesystem that contains the tty node.
+const TTY_FS_DEV_ID: u64 = 0;
+const TTY_INO: u64 = 1;
+/// Linux-compatible `/dev/tty` character device number: major 5, minor 0.
+const TTY_RDEV_MAJOR: u64 = 5;
+const TTY_RDEV_MINOR: u64 = 0;
+const TTY_RDEV: u64 = (TTY_RDEV_MAJOR << 8) | TTY_RDEV_MINOR;
 /// `ioctl(TIOCGWINSZ)`：读取窗口大小。
 const TIOCGWINSZ: usize = 0x5413;
 /// `ioctl(TIOCSWINSZ)`：设置窗口大小。
@@ -698,16 +705,16 @@ impl TtyFile {
     /// 构造字符设备类型的 `stat` 结果。
     fn stat_impl() -> Stat {
         Stat {
-            dev: 0,
-            ino: 0,
-            mode: StatMode::CHAR,
+            dev: TTY_FS_DEV_ID,
+            ino: TTY_INO,
+            mode: StatMode::CHAR | StatMode::from_bits_truncate(0o666),
             nlink: 1,
             uid: 0,
             gid: 0,
-            rdev: 0,
+            rdev: TTY_RDEV,
             pad0: 0,
             size: 0,
-            blksize: 0,
+            blksize: crate::config::PAGE_SIZE as u32,
             pad1: 0,
             blocks: 0,
             atime_sec: 0,
@@ -999,7 +1006,7 @@ impl VfsNode for TtyDeviceNode {
     }
 
     fn mode(&self) -> Option<u32> {
-        Some(StatMode::CHAR.bits())
+        Some((StatMode::CHAR | StatMode::from_bits_truncate(0o666)).bits())
     }
 
     fn uid(&self) -> Option<u32> {

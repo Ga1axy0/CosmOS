@@ -4,9 +4,12 @@ use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use alloc::sync::{Arc, Weak};
-use crate::fs::{Stat,StatMode}; 
+use crate::fs::{empty_statfs, Stat, StatFs64, StatMode};
 use crate::task::{WaitQueue, WaitReason};
 use core::any::Any;
+use fs::{STATFS_MAGIC_PIPEFS, STATFS_NAMELEN_DEFAULT};
+
+const PIPE_DEV_ID: u64 = STATFS_MAGIC_PIPEFS;
 
 /// IPC pipe
 pub struct Pipe {
@@ -427,16 +430,16 @@ impl File for Pipe {
 
     fn stat(&self) -> Stat {
         Stat {
-            dev: 0,
-            ino: 0,
-            mode: StatMode::FIFO,
+            dev: PIPE_DEV_ID,
+            ino: self.source_id() as u64,
+            mode: StatMode::FIFO | StatMode::from_bits_truncate(0o600),
             nlink: 1,
             uid: 0,
             gid: 0,
             rdev: 0,
             pad0: 0,
             size: 0,
-            blksize: 0,
+            blksize: crate::config::PAGE_SIZE as u32,
             pad1: 0,
             blocks: 0,
             atime_sec: 0,
@@ -447,6 +450,15 @@ impl File for Pipe {
             ctime_nsec: 0,
             unused: [0; 2],
         }
+    }
+
+    fn statfs(&self) -> Result<StatFs64, ERRNO> {
+        Ok(empty_statfs(
+            STATFS_MAGIC_PIPEFS,
+            crate::config::PAGE_SIZE as u64,
+            self.source_id() as u64,
+            STATFS_NAMELEN_DEFAULT,
+        ))
     }
 }
 

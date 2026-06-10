@@ -22,11 +22,11 @@ ROOTFS_DIR := CosmOS-rootfs/rootfs
 ROOTFS_FILES := $(shell find $(ROOTFS_DIR) -type f | sort)
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient
+.PHONY: all submodules docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs
 
 all:
 	$(MAKE) submodules
-	$(MAKE) kernel-rv kernel-la disk.img
+	$(MAKE) user-apps kernel-rv kernel-la rootfs
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
@@ -59,10 +59,32 @@ kernel-la: kernel-rv
 rootfs:
 	$(MAKE) -C CosmOS-rootfs rootfs-init
 
-disk.img: $(USER_BUILD_STAMP) rootfs $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_FILES) scripts/pack-disk-img.sh
+check-kernel:
+	@test -x kernel-rv || { \
+		echo "missing kernel-rv; run 'make all' first" >&2; \
+		exit 1; \
+	}
+
+check-user-apps:
+	@test -d "$(USER_BIN_DIR)" || { \
+		echo "missing user binaries in $(USER_BIN_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+
+check-rootfs:
+	@test -d "$(ROOTFS_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_DIR)/root" || { \
+		echo "rootfs is incomplete under $(ROOTFS_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+
+disk.img: check-user-apps check-rootfs $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_FILES) scripts/pack-disk-img.sh
 	./scripts/pack-disk-img.sh $(ROOTFS_DIR) $(USER_BIN_DIR) $@
 
-run: kernel-rv disk.img
+run: check-kernel disk.img
 	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
 
 run-trace: QEMU_TRACE_ARGS = -d int,in_asm -D qemu.log
@@ -70,10 +92,10 @@ run-trace: run
 
 run-comp-rv: run
 
-debug: kernel-rv disk.img
+debug: check-kernel disk.img
 	$(MAKE) -C os debug
 
-gdbserver: kernel-rv disk.img
+gdbserver: check-kernel disk.img
 	$(MAKE) -C os gdbserver
 
 gdbclient:

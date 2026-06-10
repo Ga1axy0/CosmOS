@@ -1456,8 +1456,8 @@ fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     } else {
         AccessMode::from_open_bits(flags)?
     };
-    let ignored_flags = flags & (O_LARGEFILE | O_NOFOLLOW);
-    let unsupported_flags = flags & O_NOCTTY;
+    let ignored_flags = flags & (O_LARGEFILE | O_NOFOLLOW | O_NOCTTY);
+    let unsupported_flags = 0;
     let status_flags = FileStatusFlags::from_bits_truncate(flags & (O_APPEND | O_NONBLOCK));
     let effective_flags = flags & !(ignored_flags | path_flag | O_APPEND | O_NONBLOCK);
 
@@ -1770,6 +1770,160 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -
         }
 
         result
+    })
+}
+
+/// splice syscall：在两个 fd 之间搬运数据。
+///
+/// GNU grep probes `splice(2)` on pipe input and falls back to normal reads
+/// when the fd combination is not supported. Returning ENOSYS is treated as an
+/// input error by that grep build, so unsupported combinations must return
+/// EINVAL instead.
+pub fn sys_splice(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
+    _flags: u32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_splice",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if fd_in < 0 || fd_out < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        if len > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let in_desc = get_readable_file(fd_in as usize)?;
+        let out_desc = get_writable_file(fd_out as usize)?;
+
+        // GNU grep probes splice on pipe input. Until the pipe fast path can
+        // preserve grep's buffered-output semantics, report the combination as
+        // unsupported so userspace uses its normal write path.
+        if !in_desc.is_seekable() || !out_desc.is_seekable() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        if out_desc.status_flags().contains(FileStatusFlags::APPEND) {
+            return Err(ERRNO::EINVAL);
+        }
+        if !off_in.is_null() && !in_desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        if !off_out.is_null() && !out_desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+
+        let mut in_pos = if off_in.is_null() {
+            if in_desc.is_seekable() {
+                Some(usize::try_from(in_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?)
+            } else {
+                None
+            }
+        } else {
+            Some(parse_pos64(read_pod_from_user(off_in as *const i64)?)?)
+        };
+        let mut out_pos = if off_out.is_null() {
+            if out_desc.is_seekable() {
+                Some(usize::try_from(out_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?)
+            } else {
+                None
+            }
+        } else {
+            Some(parse_pos64(read_pod_from_user(off_out as *const i64)?)?)
+        };
+
+        let chunk_len = len.min(SENDFILE_CHUNK_SIZE);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(chunk_len).map_err(|_| ERRNO::ENOMEM)?;
+        buf.resize(chunk_len, 0);
+
+        let mut copied = 0usize;
+        let result: Result<isize, ERRNO> = (|| {
+            while copied < len {
+                let want = (len - copied).min(buf.len());
+                let read = match in_pos {
+                    Some(pos) => in_desc.read_bytes_at(pos, &mut buf[..want]),
+                    None => in_desc.read_bytes_at(0, &mut buf[..want]),
+                };
+                let read = match read {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if read == 0 {
+                    break;
+                }
+
+                let written = match out_pos {
+                    Some(pos) if !off_out.is_null() => out_desc.write_bytes_at(pos, &buf[..read]),
+                    _ => out_desc.write_bytes(&buf[..read]),
+                };
+                let written = match written {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if written == 0 {
+                    break;
+                }
+
+                if let Some(pos) = &mut in_pos {
+                    *pos = pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                }
+                if let Some(pos) = &mut out_pos {
+                    *pos = pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                }
+                copied = copied.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if written < read {
+                    break;
+                }
+            }
+            Ok(copied as isize)
+        })();
+
+        if off_in.is_null() {
+            if let Some(pos) = in_pos {
+                in_desc.seek(pos as i64, 0)?;
+            }
+        } else if let Some(pos) = in_pos {
+            write_pod_to_user(off_in, &(pos as i64))?;
+        }
+        if off_out.is_null() {
+            if let Some(pos) = out_pos {
+                out_desc.seek(pos as i64, 0)?;
+            }
+        } else if let Some(pos) = out_pos {
+            write_pod_to_user(off_out, &(pos as i64))?;
+        }
+
+        result
+    })
+}
+
+/// fadvise64 syscall：接受用户态的文件访问模式提示。
+pub fn sys_fadvise64(fd: i32, _offset: i64, _len: usize, advice: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fadvise64",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        get_any_file(fd as usize)?;
+        if !(0..=5).contains(&advice) {
+            return Err(ERRNO::EINVAL);
+        }
+        Ok(0)
     })
 }
 
@@ -2527,6 +2681,72 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
             Ok(0)
         } else {
             Err(ERRNO::EACCES)
+        }
+    })
+}
+
+/// `faccessat2` 系统调用：带 flags 的路径可访问性检查。
+pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_faccessat2",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    const AT_EACCESS: i32 = 0x200;
+    const SUPPORTED_FLAGS: i32 = AT_EACCESS | AT_EMPTY_PATH as i32 | AT_SYMLINK_NOFOLLOW as i32;
+    syscall_body!({
+        if mode & !(R_OK | W_OK | X_OK) != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if flags & !SUPPORTED_FLAGS != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let path = read_cstring_from_user(path, PATH_MAX)?;
+        if path.is_empty() && flags & AT_EMPTY_PATH as i32 == 0 {
+            return Err(ERRNO::ENOENT);
+        }
+
+        let target = resolve_at_target(dirfd, path.as_str(), flags)?;
+        if mode == F_OK {
+            return Ok(0);
+        }
+
+        let process = current_process();
+        let uid = if flags & AT_EACCESS != 0 {
+            process.geteuid()
+        } else {
+            process.getuid()
+        };
+        let gid = if flags & AT_EACCESS != 0 {
+            process.getegid()
+        } else {
+            process.getgid()
+        };
+
+        match target {
+            ResolvedAtTarget::Inode(inode) => {
+                if mode & W_OK != 0 && !path.is_empty() {
+                    let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+                    let abs_path = canonicalize(cwd.as_str(), path.as_str());
+                    if mount_is_readonly(abs_path.as_str()) {
+                        return Err(ERRNO::EROFS);
+                    }
+                }
+                if inode_allows_access(&inode, uid, gid, mode as u32) {
+                    Ok(0)
+                } else {
+                    Err(ERRNO::EACCES)
+                }
+            }
+            ResolvedAtTarget::FileDesc(desc) => {
+                let readable = mode & R_OK == 0 || desc.readable();
+                let writable = mode & W_OK == 0 || desc.writable();
+                if readable && writable {
+                    Ok(0)
+                } else {
+                    Err(ERRNO::EACCES)
+                }
+            }
         }
     })
 }

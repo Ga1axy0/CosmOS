@@ -89,6 +89,14 @@ fn parse_proc_usize(buf: &[u8]) -> Result<usize, FS_ERRNO> {
     text.parse::<usize>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
+fn parse_proc_bool(buf: &[u8]) -> Result<bool, FS_ERRNO> {
+    match parse_proc_u32(buf)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(FS_ERRNO::EINVAL),
+    }
+}
+
 fn read_string_at(data: String, offset: usize, buf: &mut [u8]) -> usize {
     if buf.is_empty() {
         return 0;
@@ -683,6 +691,7 @@ impl VfsNode for ProcStaticDirNode {
             ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
             ProcStaticDirKind::Kernel => alloc::vec![
                 (String::from("keys"), VfsFileType::Directory),
+                (String::from("sched_autogroup_enabled"), VfsFileType::Regular),
                 (String::from("tainted"), VfsFileType::Regular),
             ],
             ProcStaticDirKind::Keys => alloc::vec![
@@ -701,6 +710,10 @@ impl VfsNode for ProcStaticDirNode {
             (ProcStaticDirKind::Kernel, "keys") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
             }
+            (ProcStaticDirKind::Kernel, "sched_autogroup_enabled") => Some(
+                Arc::new(ProcKernelSysctlNode::new(ProcKernelSysctlKind::SchedAutogroupEnabled))
+                    as Arc<dyn VfsNode>,
+            ),
             (ProcStaticDirKind::Kernel, "tainted") => {
                 Some(Arc::new(ProcKernelTaintedNode::new()) as Arc<dyn VfsNode>)
             }
@@ -791,6 +804,92 @@ impl VfsNode for ProcKernelTaintedNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcKernelSysctlKind {
+    SchedAutogroupEnabled,
+}
+
+#[derive(Debug)]
+struct ProcKernelSysctlNode {
+    kind: ProcKernelSysctlKind,
+}
+
+impl ProcKernelSysctlNode {
+    fn new(kind: ProcKernelSysctlKind) -> Self {
+        Self { kind }
+    }
+
+    fn render(&self) -> String {
+        match self.kind {
+            ProcKernelSysctlKind::SchedAutogroupEnabled => {
+                alloc::format!("{}\n", crate::sched::autogroup_enabled() as u8)
+            }
+        }
+    }
+}
+
+impl VfsNode for ProcKernelSysctlNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let result = match self.kind {
+            ProcKernelSysctlKind::SchedAutogroupEnabled => {
+                parse_proc_bool(buf).map(crate::sched::set_autogroup_enabled)
+            }
+        };
+        if result.is_ok() {
+            buf.len()
+        } else {
+            0
+        }
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
     }
 }
 

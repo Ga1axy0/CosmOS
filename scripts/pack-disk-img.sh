@@ -79,6 +79,10 @@ if [ -f lib/glibc/ar ] && [ -d "$STAGE_DIR/glibc/lib" ]; then
     cp -f lib/glibc/ar "$STAGE_DIR/glibc/lib/ar"
 fi
 
+if [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1" ]; then
+    ln -sf libc.so "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1"
+fi
+
 rootfs_mib="$(du -sm "$STAGE_DIR" | awk '{print $1}')"
 size_mib=$((rootfs_mib + EXTRA_MIB))
 if [ "$size_mib" -lt "$MIN_SIZE_MIB" ]; then

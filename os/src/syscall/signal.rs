@@ -26,6 +26,41 @@ struct SigSet64(u64);
 
 impl Pod for SigSet64 {}
 
+/// Linux `stack_t` used by `sigaltstack(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SigAltStack {
+    ss_sp: usize,
+    ss_flags: i32,
+    ss_size: usize,
+}
+
+impl Pod for SigAltStack {}
+
+const SS_DISABLE: i32 = 2;
+
+pub fn sys_sigaltstack(new_stack: *const SigAltStack, old_stack: *mut SigAltStack) -> isize {
+    syscall_body!({
+        if !old_stack.is_null() {
+            write_pod_to_user(
+                old_stack,
+                &SigAltStack {
+                    ss_sp: 0,
+                    ss_flags: SS_DISABLE,
+                    ss_size: 0,
+                },
+            )?;
+        }
+        if !new_stack.is_null() {
+            let stack = read_pod_from_user(new_stack)?;
+            if stack.ss_flags & !SS_DISABLE != 0 {
+                return Err(ERRNO::EINVAL);
+            }
+        }
+        Ok(0)
+    })
+}
+
 fn read_user_sigset(mask: *const u64, sigsetsize: usize) -> Result<SignalBit, ERRNO> {
     if mask.is_null() {
         return Err(ERRNO::EFAULT);
