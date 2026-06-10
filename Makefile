@@ -5,8 +5,8 @@ USER_MODE ?= release
 USER_BIN_DIR := user/target/$(TARGET)/$(USER_MODE)
 KERNEL_RV_ELF := os/target/$(TARGET)/release/os
 QEMU ?= qemu-system-riscv64
-MEM ?= 2G
-SMP ?= 8
+MEM ?= 1G
+SMP ?= 1
 TEST_FS ?= sdcard-rv.img
 QEMU_NETDEV ?= user,id=net
 QEMU_TRACE_ARGS ?=

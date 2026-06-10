@@ -8,6 +8,7 @@ USER_MODE := release
 FS_IMG ?= ../user/target/$(TARGET)/$(USER_MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
+MEM ?= 1G
 SMP ?= 1
 # Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
 # image and injects user apps into it.
@@ -117,7 +118,7 @@ fast-run: kernel
 
 run-inner:
 	@$(QEMU) \
-		-m 2G \
+		-m $(MEM) \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \
@@ -133,7 +134,7 @@ run-inner:
 
 run-inner-trace:
 	@$(QEMU) \
-		-m 512M \
+		-m $(MEM) \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \
@@ -152,14 +153,14 @@ run-inner-trace:
 debug: MODE=debug
 debug: build
 	@tmux new-session -d \
-		"$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
+		"$(QEMU) -m $(MEM) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
 		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: MODE=debug
 gdbserver: build
-	@$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+	@$(QEMU) -m $(MEM) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
 		-s -S
 
