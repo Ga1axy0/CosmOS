@@ -8,32 +8,18 @@
 #![allow(missing_docs)]
 
 #[cfg(target_arch = "riscv64")]
-#[path = "../boards/qemu.rs"]
-mod board_impl;
-
-#[cfg(target_arch = "loongarch64")]
-#[path = "../boards/loongarch_virt.rs"]
-mod board_impl;
-
-#[cfg(target_arch = "riscv64")]
 pub mod riscv;
 
 #[cfg(target_arch = "loongarch64")]
 pub mod loongarch;
 
-pub use board_impl::{
-    BlockDeviceImpl, CharDeviceImpl, QEMUExit, QEMU_EXIT_HANDLE, CLOCK_FREQ, MMIO, VIRT_RTC,
-    VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
-};
-
-#[cfg(target_arch = "loongarch64")]
-pub use board_impl::{IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET};
-
 #[cfg(target_arch = "riscv64")]
 pub use riscv::qemu_virt::{
-    console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
-    console_getchar, console_putchar, direct_map_phys_to_virt, direct_map_virt_to_phys,
-    early_console_write, heap_debug_enabled, kernel_heap_virtual_window_supported,
+    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
+    VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+    console_getchar, console_putchar, console_rx_irq_ready, direct_map_phys_to_virt,
+    direct_map_virt_to_phys, early_console_write, handle_external_irq, heap_debug_enabled,
+    init_external_irq, init_external_irq_hart, kernel_heap_virtual_window_supported,
     machine_name, mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown,
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console,
     KERNEL_HEAP_BASE, SbiPlatform as PlatformImpl, TRAMPOLINE,
@@ -41,10 +27,13 @@ pub use riscv::qemu_virt::{
 
 #[cfg(target_arch = "loongarch64")]
 pub use loongarch::qemu_virt::{
-    console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
-    console_getchar, console_putchar, direct_map_phys_to_virt, direct_map_virt_to_phys,
-    early_console_write, heap_debug_enabled, kernel_heap_virtual_window_supported,
-    machine_name, mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown,
+    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET, MMIO,
+    QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC, VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE,
+    VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE, console_getchar, console_putchar,
+    console_rx_irq_ready, direct_map_phys_to_virt, direct_map_virt_to_phys,
+    early_console_write, handle_external_irq, heap_debug_enabled, init_external_irq,
+    init_external_irq_hart, kernel_heap_virtual_window_supported, machine_name,
+    mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown,
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console,
     KERNEL_HEAP_BASE, LoongArchPlatform as PlatformImpl, TRAMPOLINE,
 };

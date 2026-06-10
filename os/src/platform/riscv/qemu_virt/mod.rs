@@ -1,7 +1,12 @@
 //! QEMU `virt` platform for RISC-V.
 
+mod board;
 pub mod sbi;
 
+pub use board::{
+    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
+    VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+};
 pub use sbi::SbiPlatform;
 
 pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;

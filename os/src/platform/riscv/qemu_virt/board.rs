@@ -1,67 +1,60 @@
-//! QEMU riscv-64 virt machine
+//! Static board description for the RISC-V QEMU `virt` machine.
 
-/// clock frequency
-pub const CLOCK_FREQ: usize = 12500000;
-//pub const MEMORY_END: usize = 0x801000000;
+/// Clock frequency.
+pub const CLOCK_FREQ: usize = 12_500_000;
 
-/// The base address of control registers in VIRT_TEST/RTC/Virtio_Block device
+/// MMIO windows exposed by the machine.
 pub const MMIO: &[(usize, usize)] = &[
     (0x0C00_0000, 0x400000), // PLIC
-    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
-    (0x1000_0000, 0x100),  // UART0 (NS16550a)
-    (0x1000_1000, 0x8000),  // Virtio MMIO devices, 8 slots, each slot occupies 0x1000 bytes
+    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC
+    (0x1000_0000, 0x100),    // UART0 (NS16550a)
+    (0x1000_1000, 0x8000),   // VirtIO MMIO devices, 8 slots, each slot occupies 0x1000 bytes
 ];
 
 /// UART0 MMIO base address.
 pub const VIRT_UART: usize = 0x1000_0000;
-/// QEMU virt 机型上的 Goldfish RTC MMIO 基址。
+/// Goldfish RTC MMIO base address.
 pub const VIRT_RTC: usize = 0x0010_1000;
 /// VirtIO MMIO window base address.
 pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
 /// Size of each VirtIO MMIO slot.
 pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-/// Number of VirtIO MMIO slots exposed by the board.
+/// Number of VirtIO MMIO slots exposed by the machine.
 pub const VIRTIO_MMIO_SLOTS: usize = 8;
 /// First IRQ line assigned to VirtIO MMIO devices.
 pub const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
 
-/// Block device implementation for QEMU virt.
+/// Block device implementation for QEMU `virt`.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
-/// Char device implementation for QEMU virt.
+/// Char device implementation for QEMU `virt`.
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 
-//ref:: https://github.com/andre-richter/qemu-exit
 use core::arch::asm;
 
-const EXIT_SUCCESS: u32 = 0x5555; // Equals `exit(0)`. qemu successful exit
-
+const EXIT_SUCCESS: u32 = 0x5555;
 const EXIT_FAILURE_FLAG: u32 = 0x3333;
-const EXIT_FAILURE: u32 = exit_code_encode(1); // Equals `exit(1)`. qemu failed exit
-const EXIT_RESET: u32 = 0x7777; // qemu reset
+const EXIT_FAILURE: u32 = exit_code_encode(1);
+const EXIT_RESET: u32 = 0x7777;
 
 /// QEMU exit interface.
 pub trait QEMUExit {
-    /// Exit with specified return code.
-    ///
-    /// Note: For `X86`, code is binary-OR'ed with `0x1` inside QEMU.
+    /// Exit with the specified return code.
     fn exit(&self, code: u32) -> !;
 
     /// Exit QEMU using `EXIT_SUCCESS`, aka `0`, if possible.
-    ///
-    /// Note: Not possible for `X86`.
     fn exit_success(&self) -> !;
 
     /// Exit QEMU using `EXIT_FAILURE`, aka `1`.
     fn exit_failure(&self) -> !;
 }
 
-/// RISCV64 configuration
+/// RISC-V QEMU exit wrapper.
 pub struct RISCV64 {
     /// Address of the sifive_test mapped device.
     addr: u64,
 }
 
-/// Encode the exit code using EXIT_FAILURE_FLAG.
+/// Encode the exit code using `EXIT_FAILURE_FLAG`.
 const fn exit_code_encode(code: u32) -> u32 {
     (code << 16) | EXIT_FAILURE_FLAG
 }
@@ -74,9 +67,7 @@ impl RISCV64 {
 }
 
 impl QEMUExit for RISCV64 {
-    /// Exit qemu with specified exit code.
     fn exit(&self, code: u32) -> ! {
-        // If code is not a special value, we need to encode it with EXIT_FAILURE_FLAG.
         let code_new = match code {
             EXIT_SUCCESS | EXIT_FAILURE | EXIT_RESET => code,
             _ => exit_code_encode(code),
@@ -85,13 +76,10 @@ impl QEMUExit for RISCV64 {
         unsafe {
             asm!(
                 "sw {0}, 0({1})",
-                in(reg)code_new, in(reg)self.addr
+                in(reg) code_new,
+                in(reg) self.addr
             );
 
-            // For the case that the QEMU exit attempt did not work, transition into an infinite
-            // loop. Calling `panic!()` here is unfeasible, since there is a good chance
-            // this function here is the last expression in the `panic!()` handler
-            // itself. This prevents a possible infinite loop.
             loop {
                 asm!("wfi", options(nomem, nostack));
             }

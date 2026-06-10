@@ -1,8 +1,14 @@
 //! QEMU `virt` platform for LoongArch64.
 
+mod board;
 mod irq;
 mod pci;
 
+pub use board::{
+    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET, MMIO,
+    QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC, VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE,
+    VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+};
 pub use irq::{
     console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
 };
@@ -10,7 +16,6 @@ pub use pci::probe_platform_devices;
 
 use crate::drivers::chardev::CharDevice;
 use crate::hal::traits::{HartCtrl, Timer};
-use crate::platform::QEMUExit;
 
 pub const KERNEL_HEAP_BASE: usize = 0x0000_0038_0000_0000;
 pub const TRAMPOLINE: usize = 0x0000_003f_ffff_f000;
@@ -51,10 +56,8 @@ pub fn use_early_console() -> bool {
 pub fn early_console_write(s: &str) {
     for b in s.bytes() {
         unsafe {
-            while core::ptr::read_volatile((crate::platform::VIRT_UART + 5) as *const u8) & 0x20
-                == 0
-            {}
-            core::ptr::write_volatile(crate::platform::VIRT_UART as *mut u8, b);
+            while core::ptr::read_volatile((VIRT_UART + 5) as *const u8) & 0x20 == 0 {}
+            core::ptr::write_volatile(VIRT_UART as *mut u8, b);
         }
     }
 }
@@ -71,7 +74,7 @@ pub fn console_getchar() -> usize {
 
 /// Power off the virtual machine.
 pub fn shutdown() -> ! {
-    crate::platform::QEMU_EXIT_HANDLE.exit_success()
+    QEMU_EXIT_HANDLE.exit_success()
 }
 
 /// Return the uname-style machine string.
@@ -84,28 +87,28 @@ pub fn start_secondary_harts(_bootstrap_hart_id: usize) {}
 
 /// Translate one direct-mapped physical address into the kernel VA used on this platform.
 pub fn direct_map_phys_to_virt(pa: usize) -> usize {
-    pa | crate::platform::KERNEL_ADDR_OFFSET
+    pa | KERNEL_ADDR_OFFSET
 }
 
 /// Translate one direct-mapped kernel VA back into a physical address.
 pub fn direct_map_virt_to_phys(va: usize) -> usize {
-    va & !crate::platform::KERNEL_ADDR_OFFSET
+    va & !KERNEL_ADDR_OFFSET
 }
 
 /// Translate a direct-mapped kernel VA into a physical address when applicable.
 pub fn translate_direct_mapped_kernel_va(va: usize) -> Option<usize> {
-    if va & crate::platform::KERNEL_ADDR_OFFSET == crate::platform::KERNEL_ADDR_OFFSET {
-        return Some(va & !crate::platform::KERNEL_ADDR_OFFSET);
+    if va & KERNEL_ADDR_OFFSET == KERNEL_ADDR_OFFSET {
+        return Some(va & !KERNEL_ADDR_OFFSET);
     }
-    if va & crate::platform::IO_ADDR_OFFSET == crate::platform::IO_ADDR_OFFSET {
-        return Some(va & !crate::platform::IO_ADDR_OFFSET);
+    if va & IO_ADDR_OFFSET == IO_ADDR_OFFSET {
+        return Some(va & !IO_ADDR_OFFSET);
     }
     None
 }
 
 /// Translate one MMIO physical address into the VA used by drivers.
 pub fn mmio_phys_to_virt(paddr: usize) -> usize {
-    paddr | crate::platform::IO_ADDR_OFFSET
+    paddr | IO_ADDR_OFFSET
 }
 
 /// Whether the Goldfish RTC is supported on this platform.

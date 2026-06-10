@@ -1,14 +1,14 @@
-//! QEMU LoongArch64 virt machine.
+//! Static board description for the LoongArch64 QEMU `virt` machine.
 
 /// Direct-mapped uncached I/O virtual-address offset used during early bring-up.
 pub const IO_ADDR_OFFSET: usize = 0x8000_0000_0000_0000;
 /// Direct-mapped cached kernel-address offset used during early bring-up.
 pub const KERNEL_ADDR_OFFSET: usize = 0x9000_0000_0000_0000;
 
-/// QEMU loongarch64 virt clock frequency.
+/// QEMU loongarch64 `virt` clock frequency.
 pub const CLOCK_FREQ: usize = 100_000_000;
 
-/// MMIO windows used by the kernel on QEMU loongarch64 virt (uncached DMW0 window).
+/// MMIO windows used by the kernel on QEMU loongarch64 `virt` (uncached DMW0 window).
 pub const MMIO: &[(usize, usize)] = &[
     (IO_ADDR_OFFSET | 0x1fe0_0000, 0x10000), // covers all 1fe0_xxxx MMIO
     (IO_ADDR_OFFSET | 0x1fe2_0000, 0x8000),  // VirtIO
@@ -22,16 +22,14 @@ pub const VIRT_RTC: usize = IO_ADDR_OFFSET | 0x1fe0_01f8;
 pub const VIRTIO_MMIO_BASE: usize = IO_ADDR_OFFSET | 0x1fe2_0000;
 /// Size of each VirtIO MMIO slot.
 pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-/// Number of VirtIO MMIO slots exposed by the board.
+/// Number of VirtIO MMIO slots exposed by the machine.
 pub const VIRTIO_MMIO_SLOTS: usize = 8;
 /// First IRQ line assigned to VirtIO MMIO devices.
 pub const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
-/// Alias for compatibility.
-pub const VIRT_UART_EARLY: usize = VIRT_UART;
 
-/// Block device implementation for QEMU virt.
+/// Block device implementation for QEMU `virt`.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
-/// Char device implementation for QEMU virt.
+/// Char device implementation for QEMU `virt`.
 pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
 
 use core::arch::asm;

@@ -26,7 +26,7 @@ const LEGACY_VIRTIO_NET_IRQ: u32 = 1;
 
 /// Probe the LA64 PCIe ECAM bus and register VirtIO PCI devices.
 pub fn probe_platform_devices() {
-    let ecam_vaddr = PCI_ECAM_BASE | crate::platform::IO_ADDR_OFFSET;
+    let ecam_vaddr = PCI_ECAM_BASE | super::IO_ADDR_OFFSET;
     let ecam_end = ecam_vaddr + PCI_ECAM_SIZE;
     if ecam_end < ecam_vaddr {
         panic!("PCI ECAM window overflow");
