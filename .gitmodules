@@ -2,5 +2,5 @@
 	path = fs/src/ext4_rs
 	url = git@github.com:KyleMao2023/ext4_rs.git
 [submodule "rootfs"]
-	path = rootfs
+	path = CosmOS-rootfs
 	url = https://github.com/Ga1axy0/CosmOS-rootfs.git

@@ -29,7 +29,11 @@ all:
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
-	git submodule update --init --recursive
+	@if [ -f .gitmodules ]; then \
+		git submodule update --init --recursive; \
+	else \
+		echo "No .gitmodules found; assuming dependencies are already vendored."; \
+	fi
 
 $(STAMP_DIR):
 	mkdir -p $@
