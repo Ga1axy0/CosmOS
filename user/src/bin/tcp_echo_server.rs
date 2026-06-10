@@ -72,7 +72,7 @@ struct WorkerCtx {
 }
 
 fn fmt_peer(peer: &SockAddrIn) -> ([u8; 4], u16) {
-    let ip = peer.sin_addr.to_be_bytes();
+    let ip = peer.ipv4();
     let port = u16::from_be(peer.sin_port);
     (ip, port)
 }

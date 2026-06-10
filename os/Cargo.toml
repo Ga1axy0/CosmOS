@@ -16,7 +16,7 @@ xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
 fs = { path = "../fs" }
 hashbrown = "0.12.3"
-smoltcp = { git = "https://github.com/KyleMao2023/smoltcp", branch = "udp-fix", default-features = false, features = [
+smoltcp = { git = "https://github.com/KyleMao2023/smoltcp", branch = "os", default-features = false, features = [
 	"alloc",
 	"medium-ethernet",
 	"proto-ipv4",
