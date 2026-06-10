@@ -6,7 +6,7 @@ use super::{PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
+    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_PIE_BASE, USER_STACK_BASE, USER_STACK_SIZE,
     USER_VDSO_BASE,
 };
 use crate::fs::{
@@ -62,6 +62,9 @@ pub struct ElfLoadInfo {
     /// 动态链接器路径（如果存在 INTERP 段）
     pub interp_path: Option<String>,
 }
+
+/// `R_RISCV_RELATIVE` relocation used by static PIE executables.
+const R_RISCV_RELATIVE: u32 = 3;
 
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
@@ -171,6 +174,185 @@ fn format_hex_bytes(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", byte);
     }
     out
+}
+
+fn add_load_bias(addr: usize, load_bias: usize) -> Result<usize, MmError> {
+    addr.checked_add(load_bias).ok_or(MmError::InvalidElf)
+}
+
+fn relocated_value(load_bias: usize, addend: i64) -> Result<usize, MmError> {
+    if addend >= 0 {
+        load_bias
+            .checked_add(addend as usize)
+            .ok_or(MmError::InvalidElf)
+    } else {
+        load_bias
+            .checked_sub(addend.unsigned_abs() as usize)
+            .ok_or(MmError::InvalidElf)
+    }
+}
+
+fn write_user_usize(memory_set: &mut MemorySet, va: usize, value: usize) -> Result<(), MmError> {
+    for (idx, byte) in value.to_le_bytes().iter().copied().enumerate() {
+        let pa = memory_set
+            .page_table
+            .translate_va(VirtAddr(va + idx))
+            .ok_or(MmError::NoMapping)?;
+        *pa.get_mut::<u8>() = byte;
+    }
+    Ok(())
+}
+
+fn file_offset_for_vaddr(elf: &xmas_elf::ElfFile<'_>, vaddr: usize) -> Option<usize> {
+    let ph_count = elf.header.pt2.ph_count();
+    for i in 0..ph_count {
+        let ph = elf.program_header(i).ok()?;
+        if ph.get_type().ok()? != xmas_elf::program::Type::Load {
+            continue;
+        }
+        let seg_start = ph.virtual_addr() as usize;
+        let seg_size = ph.file_size() as usize;
+        let seg_end = seg_start.checked_add(seg_size)?;
+        if vaddr < seg_start || vaddr >= seg_end {
+            continue;
+        }
+        let within_seg = vaddr.checked_sub(seg_start)?;
+        return (ph.offset() as usize).checked_add(within_seg);
+    }
+    None
+}
+
+fn read_dynsym_value(
+    elf: &xmas_elf::ElfFile<'_>,
+    symtab_vaddr: usize,
+    sym_ent: usize,
+    sym_index: u32,
+) -> Result<(usize, u16), MmError> {
+    if sym_ent != 24 {
+        return Err(MmError::InvalidElf);
+    }
+    let symtab_offset = file_offset_for_vaddr(elf, symtab_vaddr).ok_or(MmError::InvalidElf)?;
+    let sym_offset = symtab_offset
+        .checked_add(sym_ent.checked_mul(sym_index as usize).ok_or(MmError::InvalidElf)?)
+        .ok_or(MmError::InvalidElf)?;
+    let sym_end = sym_offset.checked_add(sym_ent).ok_or(MmError::InvalidElf)?;
+    let sym = elf
+        .input
+        .get(sym_offset..sym_end)
+        .ok_or(MmError::InvalidElf)?;
+    let shndx = u16::from_le_bytes(sym[6..8].try_into().map_err(|_| MmError::InvalidElf)?);
+    let value = usize::from_le_bytes(sym[8..16].try_into().map_err(|_| MmError::InvalidElf)?);
+    Ok((value, shndx))
+}
+
+fn apply_static_pie_relocations(
+    memory_set: &mut MemorySet,
+    elf: &xmas_elf::ElfFile<'_>,
+    load_bias: usize,
+) -> Result<(), MmError> {
+    let mut rela_vaddr: Option<usize> = None;
+    let mut rela_size = 0usize;
+    let mut rela_ent = 0usize;
+    let mut symtab_vaddr: Option<usize> = None;
+    let mut sym_ent = 0usize;
+    let ph_count = elf.header.pt2.ph_count();
+
+    for i in 0..ph_count {
+        let ph = elf.program_header(i).map_err(|_| MmError::InvalidElf)?;
+        if ph.get_type().map_err(|_| MmError::InvalidElf)? != xmas_elf::program::Type::Dynamic {
+            continue;
+        }
+        let entries = ph.get_data(elf).map_err(|_| MmError::InvalidElf)?;
+        let xmas_elf::program::SegmentData::Dynamic64(entries) = entries else {
+            return Err(MmError::InvalidElf);
+        };
+        for entry in entries {
+            match entry.get_tag().map_err(|_| MmError::InvalidElf)? {
+                xmas_elf::dynamic::Tag::Rela => {
+                    rela_vaddr = Some(entry.get_ptr().map_err(|_| MmError::InvalidElf)? as usize);
+                }
+                xmas_elf::dynamic::Tag::RelaSize => {
+                    rela_size = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
+                }
+                xmas_elf::dynamic::Tag::RelaEnt => {
+                    rela_ent = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
+                }
+                xmas_elf::dynamic::Tag::SymTab => {
+                    symtab_vaddr = Some(entry.get_ptr().map_err(|_| MmError::InvalidElf)? as usize);
+                }
+                xmas_elf::dynamic::Tag::SymEnt => {
+                    sym_ent = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
+                }
+                xmas_elf::dynamic::Tag::Rel | xmas_elf::dynamic::Tag::JmpRel => {
+                    return Err(MmError::InvalidElf);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if rela_size == 0 {
+        return Ok(());
+    }
+    if rela_ent != 24 {
+        return Err(MmError::InvalidElf);
+    }
+
+    let rela_vaddr = rela_vaddr.ok_or(MmError::InvalidElf)?;
+    let rela_offset = file_offset_for_vaddr(elf, rela_vaddr).ok_or(MmError::InvalidElf)?;
+    let rela_end = rela_offset
+        .checked_add(rela_size)
+        .ok_or(MmError::InvalidElf)?;
+    let rela_bytes = elf
+        .input
+        .get(rela_offset..rela_end)
+        .ok_or(MmError::InvalidElf)?;
+    if rela_bytes.len() % rela_ent != 0 {
+        return Err(MmError::InvalidElf);
+    }
+
+    for chunk in rela_bytes.chunks_exact(rela_ent) {
+        let offset = usize::from_le_bytes(
+            chunk[0..8]
+                .try_into()
+                .map_err(|_| MmError::InvalidElf)?,
+        );
+        let info = u64::from_le_bytes(
+            chunk[8..16]
+                .try_into()
+                .map_err(|_| MmError::InvalidElf)?,
+        );
+        let addend = i64::from_le_bytes(
+            chunk[16..24]
+                .try_into()
+                .map_err(|_| MmError::InvalidElf)?,
+        );
+        let rel_type = info as u32;
+        let sym_index = (info >> 32) as u32;
+        let target = add_load_bias(offset, load_bias)?;
+        let value = match rel_type {
+            R_RISCV_RELATIVE => {
+                if sym_index != 0 {
+                    return Err(MmError::InvalidElf);
+                }
+                relocated_value(load_bias, addend)?
+            }
+            2 => {
+                let symtab_vaddr = symtab_vaddr.ok_or(MmError::InvalidElf)?;
+                let (sym_value, shndx) =
+                    read_dynsym_value(elf, symtab_vaddr, sym_ent, sym_index)?;
+                if shndx == 0 {
+                    return Err(MmError::InvalidElf);
+                }
+                let sym_addr = add_load_bias(sym_value, load_bias)?;
+                relocated_value(sym_addr, addend)?
+            }
+            _ => return Err(MmError::InvalidElf),
+        };
+        write_user_usize(memory_set, target, value)?;
+    }
+
+    Ok(())
 }
 
 /// address space
@@ -725,6 +907,12 @@ impl MemorySet {
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        let elf_type = elf_header.pt2.type_().as_type();
+        let load_bias = if elf_type == xmas_elf::header::Type::SharedObject {
+            USER_PIE_BASE
+        } else {
+            0
+        };
         let ph_count = elf_header.pt2.ph_count();
         let mut max_end_vpn = VirtPageNum(0);
 
@@ -754,8 +942,9 @@ impl MemorySet {
             }
 
             if ph_type == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+                let start_va: VirtAddr = add_load_bias(ph.virtual_addr() as usize, load_bias)?.into();
+                let end_va: VirtAddr =
+                    add_load_bias((ph.virtual_addr() + ph.mem_size()) as usize, load_bias)?.into();
 
                 // 检查程序头表是否在这个 LOAD 段内
                 if phdr_load_vaddr.is_none() {
@@ -764,7 +953,8 @@ impl MemorySet {
                     if phdr_vaddr >= seg_file_start && phdr_vaddr < seg_file_end {
                         // 程序头表在此段内，计算其虚拟地址
                         let offset_in_seg = phdr_vaddr - seg_file_start;
-                        phdr_load_vaddr = Some(ph.virtual_addr() as usize + offset_in_seg);
+                        phdr_load_vaddr =
+                            Some(add_load_bias(ph.virtual_addr() as usize + offset_in_seg, load_bias)?);
                     }
                 }
 
@@ -801,6 +991,9 @@ impl MemorySet {
                 memory_set.insert_vma(vma, Some(seg_data))?;
             }
         }
+        if elf_type == xmas_elf::header::Type::SharedObject && interp_path.is_none() {
+            apply_static_pie_relocations(&mut memory_set, &elf, load_bias)?;
+        }
         let max_end_va: VirtAddr = max_end_vpn.into();
         let start_brk: usize = max_end_va.into();
         let layout = UserSpaceLayout {
@@ -811,7 +1004,7 @@ impl MemorySet {
         };
 
         let load_info = ElfLoadInfo {
-            entry_point: elf.header.pt2.entry_point() as usize,
+            entry_point: add_load_bias(elf.header.pt2.entry_point() as usize, load_bias)?,
             phdr_vaddr: phdr_load_vaddr.unwrap_or(0),
             phent_size: elf.header.pt2.ph_entry_size() as usize,
             phnum: ph_count as usize,

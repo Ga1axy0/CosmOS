@@ -20,6 +20,8 @@ pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 /// default base address for anonymous mmap allocations
 pub const USER_MMAP_BASE: usize = 0x1000_0000;
+/// fixed load bias used for PIE main executables without an interpreter
+pub const USER_PIE_BASE: usize = 0x0020_0000;
 /// default base address for the main thread's user stack region
 pub const USER_STACK_BASE: usize = 0x0800_0000;
 /// base address for loading dynamic linker (interpreter)
