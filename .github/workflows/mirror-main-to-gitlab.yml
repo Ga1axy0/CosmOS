@@ -6,7 +6,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   mirror-main:
@@ -17,9 +17,40 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
-      # 将 main 分支同步到 GitLab 镜像仓库。
-      - name: Push main to GitLab
+      - name: Build evaluation snapshot commit
+        id: snapshot
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          source_commit_message_file="$(mktemp)"
+          git log -1 --pretty=%B > "$source_commit_message_file"
+
+          bash scripts/export-eval-tree.sh
+
+          tree_sha="$(git write-tree)"
+
+          if git ls-remote --exit-code --heads origin gitlab-output >/dev/null 2>&1; then
+            git fetch --depth=1 origin gitlab-output:refs/remotes/origin/gitlab-output
+            commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file" -p refs/remotes/origin/gitlab-output)"
+          else
+            commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file")"
+          fi
+
+          git update-ref refs/heads/gitlab-output "$commit_sha"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Push snapshot branch to GitHub
+        run: |
+          set -euo pipefail
+          git push --force origin refs/heads/gitlab-output:refs/heads/gitlab-output
+
+      # 将 gitlab-output 快照分支同步到 GitLab 的 main 分支。
+      - name: Push snapshot to GitLab main
         env:
           GITLAB_MIRROR_URL: ${{ secrets.GITLAB_MIRROR_URL }}
         run: |
@@ -31,4 +62,4 @@ jobs:
           fi
 
           git remote add gitlab "$GITLAB_MIRROR_URL"
-          git push --force gitlab HEAD:main
+          git push --force gitlab refs/heads/gitlab-output:refs/heads/main
