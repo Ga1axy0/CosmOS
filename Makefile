@@ -22,10 +22,11 @@ ROOTFS_DIR := CosmOS-rootfs/rootfs
 ROOTFS_FILES := $(shell find $(ROOTFS_DIR) -type f | sort)
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs
 
 all:
 	$(MAKE) submodules
+	$(MAKE) cargo-config
 	$(MAKE) user-apps kernel-rv kernel-la rootfs
 
 # 拉取所有子模块，确保后续构建依赖完整。
@@ -36,16 +37,22 @@ submodules:
 		echo "No .gitmodules found; assuming dependencies are already vendored."; \
 	fi
 
+# 评测会过滤隐藏目录，构建前从非隐藏目录恢复 Cargo 配置。
+cargo-config:
+	@mkdir -p os/.cargo user/.cargo
+	@cp os/cargo-config/config.toml os/.cargo/config.toml
+	@cp user/cargo-config/config.toml user/.cargo/config.toml
+
 $(STAMP_DIR):
 	mkdir -p $@
 
-$(USER_BUILD_STAMP): $(USER_BUILD_DEPS) | $(STAMP_DIR)
+$(USER_BUILD_STAMP): $(USER_BUILD_DEPS) | $(STAMP_DIR) cargo-config
 	$(MAKE) -C user build
 	touch $@
 
 user-apps: $(USER_BUILD_STAMP)
 
-$(KERNEL_BUILD_STAMP): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR)
+$(KERNEL_BUILD_STAMP): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR) cargo-config
 	$(MAKE) -C os kernel
 	touch $@
 
@@ -111,6 +118,6 @@ fmt:
 	cd fs; cargo fmt; cd ../fs-fuse; cargo fmt; cd ../os; cargo fmt; cd ../user; cargo fmt; cd ..
 
 clean:
-	rm -rf $(STAMP_DIR) disk.img kernel-rv kernel-la
+	rm -rf $(STAMP_DIR) disk.img kernel-rv kernel-la os/.cargo user/.cargo
 	$(MAKE) -C os clean
 	$(MAKE) -C user clean
