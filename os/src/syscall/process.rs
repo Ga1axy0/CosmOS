@@ -398,7 +398,7 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
             let _ = chosen_end;
             chosen
         } else {
-            if !shmaddr.is_multiple_of(crate::config::PAGE_SIZE) {
+            if !shmaddr % crate::config::PAGE_SIZE == 0 {
                 ipc::detach_segment(shmid);
                 return Err(ERRNO::EINVAL);
             }

@@ -370,7 +370,7 @@ fn append_cmsg(buf: &mut Vec<u8>, level: i32, ty: i32, payload: &[u8]) {
 }
 
 fn parse_rights_payload(payload: &[u8]) -> Result<Vec<Arc<FileDescription>>, ERRNO> {
-    if !payload.len().is_multiple_of(size_of::<i32>()) {
+    if !payload.len() % size_of::<i32>() == 0 {
         return Err(ERRNO::EINVAL);
     }
 

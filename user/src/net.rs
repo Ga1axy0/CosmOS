@@ -100,14 +100,15 @@ impl SockAddrIn {
         Self {
             sin_family: AF_INET as u16,
             sin_port: port.to_be(),
-            sin_addr: u32::from_be_bytes(ip),
+            // Store the integer so the raw struct bytes match network order.
+            sin_addr: u32::from_ne_bytes(ip),
             sin_zero: [0; 8],
         }
     }
 
     /// Return IPv4 octets in host byte order.
     pub fn ipv4(&self) -> [u8; 4] {
-        self.sin_addr.to_be_bytes()
+        self.sin_addr.to_ne_bytes()
     }
 
     /// Return port in host byte order.
