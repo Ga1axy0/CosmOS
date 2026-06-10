@@ -56,9 +56,10 @@ build: env kernel fs-img
 env:
 ifeq ($(OFFLINE),)
 	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
-	cargo install cargo-binutils
-	rustup component add rust-src
-	rustup component add llvm-tools-preview
+	# 评测镜像已预装 cargo-binutils；缺失时才尝试安装。
+	command -v rust-objcopy >/dev/null || cargo install cargo-binutils
+	# rust-objcopy/rust-objdump 依赖 llvm-tools-preview。
+	rustup component list --installed | grep -q "llvm-tools-preview" || rustup component add llvm-tools-preview
 endif
 
 fs-img:
