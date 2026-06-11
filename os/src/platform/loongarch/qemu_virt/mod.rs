@@ -3,6 +3,7 @@
 mod board;
 mod irq;
 mod pci;
+pub mod rtc;
 
 pub use board::{
     BlockDeviceImpl, CharDeviceImpl, USER_STACK_BASE, USER_MMAP_BASE, INTERP_BASE, CLOCK_FREQ, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET, MMIO,
@@ -37,13 +38,69 @@ impl Timer for LoongArchPlatform {
     }
 }
 
+const IOCSR_IPI_SEND: usize = 0x1040;
+const IOCSR_MBUF_SEND: usize = 0x1048;
+
+const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
+const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
+
+const IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
+const IOCSR_MBUF_SEND_BOX_SHIFT: u64 = 2;
+const IOCSR_MBUF_SEND_CPU_SHIFT: u64 = 16;
+const IOCSR_MBUF_SEND_BUF_SHIFT: u64 = 32;
+const IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
+
+// ACTION_BOOT_CPU matches Linux's SMP_RESCHEDULE_YOURSELF bit used for boot IPI
+const ACTION_BOOT_CPU: u32 = 1;
+const ACTION_RESCHEDULE: u32 = 1;
+
+#[inline]
+unsafe fn iocsr_write32(addr: usize, val: u32) {
+    core::arch::asm!("iocsrwr.w {v}, {a}", v = in(reg) val, a = in(reg) addr);
+}
+
+#[inline]
+unsafe fn iocsr_write64(addr: usize, val: u64) {
+    core::arch::asm!("iocsrwr.d {v}, {a}", v = in(reg) val, a = in(reg) addr);
+}
+
+fn ipi_send(hart_id: usize, action: u32) {
+    let val = IOCSR_IPI_SEND_BLOCKING | action | (hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT;
+    unsafe { iocsr_write32(IOCSR_IPI_SEND, val) };
+}
+
+// Sends a 64-bit value to the target hart's MBUF0 mailbox, split into two 32-bit writes.
+fn mail_send(data: u64, hart_id: usize, mailbox: u64) {
+    let cpu = (hart_id as u64) << IOCSR_MBUF_SEND_CPU_SHIFT;
+    // high 32 bits
+    let hi = IOCSR_MBUF_SEND_BLOCKING
+        | (((mailbox << 1) + 1) << IOCSR_MBUF_SEND_BOX_SHIFT)
+        | cpu
+        | (data & IOCSR_MBUF_SEND_H32_MASK);
+    // low 32 bits
+    let lo = IOCSR_MBUF_SEND_BLOCKING
+        | ((mailbox << 1) << IOCSR_MBUF_SEND_BOX_SHIFT)
+        | cpu
+        | (data << IOCSR_MBUF_SEND_BUF_SHIFT);
+    unsafe {
+        iocsr_write64(IOCSR_MBUF_SEND, hi);
+        iocsr_write64(IOCSR_MBUF_SEND, lo);
+    }
+}
+
 impl HartCtrl for LoongArchPlatform {
-    fn start_hart(_hart_id: usize, _start_addr: usize, _opaque: usize) -> Result<(), ()> {
-        Err(())
+    fn start_hart(hart_id: usize, start_addr: usize, _opaque: usize) -> Result<(), ()> {
+        mail_send(start_addr as u64, hart_id, 0);
+        ipi_send(hart_id, ACTION_BOOT_CPU);
+        Ok(())
     }
 
-    fn send_ipi(_hart_mask: usize) {
-        // Single-core bring-up only for now.
+    fn send_ipi(hart_mask: usize) {
+        for hart_id in 0..usize::BITS as usize {
+            if hart_mask & (1 << hart_id) != 0 {
+                ipi_send(hart_id, ACTION_RESCHEDULE);
+            }
+        }
     }
 }
 
@@ -82,8 +139,19 @@ pub fn machine_name() -> &'static str {
     "loongarch64"
 }
 
-/// Secondary-hart start-up is not wired up on this platform yet.
-pub fn start_secondary_harts(_bootstrap_hart_id: usize) {}
+/// Start all secondary harts via IOCSR mailbox + IPI.
+pub fn start_secondary_harts(bootstrap_hart_id: usize) {
+    extern "C" { fn _start(); }
+    // The firmware polls IOCSR_MBUF0 for a physical address, so strip the DMW offset.
+    let entry_phys = (_start as usize) & !KERNEL_ADDR_OFFSET;
+    for hart_id in 0..crate::config::MAX_HARTS {
+        if hart_id == bootstrap_hart_id {
+            continue;
+        }
+        let _ = <LoongArchPlatform as HartCtrl>::start_hart(hart_id, entry_phys, 0);
+        info!("hart {} requested startup for hart {}", bootstrap_hart_id, hart_id);
+    }
+}
 
 /// Translate one direct-mapped physical address into the kernel VA used on this platform.
 pub fn direct_map_phys_to_virt(pa: usize) -> usize {
@@ -111,9 +179,9 @@ pub fn mmio_phys_to_virt(paddr: usize) -> usize {
     paddr | IO_ADDR_OFFSET
 }
 
-/// Whether the Goldfish RTC is supported on this platform.
+/// Whether the RTC is supported on this platform.
 pub fn rtc_is_supported() -> bool {
-    false
+    true
 }
 
 /// Whether the kernel heap may grow inside its dedicated virtual window.

@@ -231,6 +231,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     info!("hart {} boot", hart_id);
     info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
+    platform::init();
     print_boot_stage("devices", "virtio buses enumerated");
     net::init();
     print_boot_stage("network", "smoltcp stack synchronized");

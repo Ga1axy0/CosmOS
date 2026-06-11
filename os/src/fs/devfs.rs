@@ -18,10 +18,10 @@ use fs::vfs::{VfsFileType, VfsNode};
 use fs::{BlockDevice, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT};
 
 use crate::drivers::block::BLOCK_DEVICES;
-use crate::drivers::rtc;
 use crate::fs::{Stat, StatMode};
 use super::{empty_statfs, StatFs64};
 use crate::mm::translated_ref;
+use crate::platform::rtc;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;

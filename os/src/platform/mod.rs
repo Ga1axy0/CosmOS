@@ -14,6 +14,12 @@ pub mod riscv;
 pub mod loongarch;
 
 #[cfg(target_arch = "riscv64")]
+pub use riscv::qemu_virt::rtc;
+
+#[cfg(target_arch = "loongarch64")]
+pub use loongarch::qemu_virt::rtc;
+
+#[cfg(target_arch = "riscv64")]
 pub use riscv::qemu_virt::{
     BlockDeviceImpl, CharDeviceImpl, USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
     VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
@@ -37,3 +43,10 @@ pub use loongarch::qemu_virt::{
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console,
     KERNEL_HEAP_BASE, LoongArchPlatform as PlatformImpl, TRAMPOLINE,
 };
+
+/// Initialize platform-owned devices and interrupt routing.
+pub fn init() {
+    rtc::init();
+    init_external_irq();
+    probe_platform_devices();
+}

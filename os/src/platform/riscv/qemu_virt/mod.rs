@@ -1,6 +1,7 @@
 //! QEMU `virt` platform for RISC-V.
 
 mod board;
+pub mod rtc;
 pub mod sbi;
 
 pub use board::{

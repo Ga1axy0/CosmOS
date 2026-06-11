@@ -19,14 +19,15 @@ pub const CLOCK_FREQ: usize = 100_000_000;
 
 /// MMIO windows used by the kernel on QEMU loongarch64 `virt` (uncached DMW0 window).
 pub const MMIO: &[(usize, usize)] = &[
-    (IO_ADDR_OFFSET | 0x1fe0_0000, 0x10000), // covers all 1fe0_xxxx MMIO
-    (IO_ADDR_OFFSET | 0x1fe2_0000, 0x8000),  // VirtIO
+    (IO_ADDR_OFFSET | 0x1000_0000, 0x100000), // LS7A bridge (RTC at 0x100d0100, GED at 0x100e001c)
+    (IO_ADDR_OFFSET | 0x1fe0_0000, 0x10000),  // covers all 1fe0_xxxx MMIO
+    (IO_ADDR_OFFSET | 0x1fe2_0000, 0x8000),   // VirtIO
 ];
 
 /// UART MMIO virtual address (uncached DMW0 window).
 pub const VIRT_UART: usize = IO_ADDR_OFFSET | 0x1fe0_01e0;
-/// RTC-compatible MMIO virtual address (uncached DMW0 window).
-pub const VIRT_RTC: usize = IO_ADDR_OFFSET | 0x1fe0_01f8;
+/// LS7A RTC MMIO virtual address (uncached DMW0 window).
+pub const VIRT_RTC: usize = IO_ADDR_OFFSET | 0x100d_0100;
 /// VirtIO MMIO window base address.
 pub const VIRTIO_MMIO_BASE: usize = IO_ADDR_OFFSET | 0x1fe2_0000;
 /// Size of each VirtIO MMIO slot.
