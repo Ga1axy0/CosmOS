@@ -2,25 +2,25 @@ name: Mirror Main to GitLab
 
 on:
   push:
-    branches:
-      - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   mirror-main:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout main
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Build evaluation snapshot commit
+      - name: Build and push evaluation snapshot
         id: snapshot
+        env:
+          GITLAB_MIRROR_URL: ${{ secrets.GITLAB_MIRROR_URL }}
         run: |
           set -euo pipefail
 
@@ -34,32 +34,18 @@ jobs:
 
           tree_sha="$(git write-tree)"
 
-          if git ls-remote --exit-code --heads origin gitlab-output >/dev/null 2>&1; then
-            git fetch --depth=1 origin gitlab-output:refs/remotes/origin/gitlab-output
-            commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file" -p refs/remotes/origin/gitlab-output)"
-          else
-            commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file")"
-          fi
-
-          git update-ref refs/heads/gitlab-output "$commit_sha"
-          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Push snapshot branch to GitHub
-        run: |
-          set -euo pipefail
-          git push --force origin refs/heads/gitlab-output:refs/heads/gitlab-output
-
-      # 将 gitlab-output 快照分支同步到 GitLab 的 main 分支。
-      - name: Push snapshot to GitLab main
-        env:
-          GITLAB_MIRROR_URL: ${{ secrets.GITLAB_MIRROR_URL }}
-        run: |
-          set -euo pipefail
-
           if [ -z "$GITLAB_MIRROR_URL" ]; then
             echo "::error::Missing GITLAB_MIRROR_URL secret"
             exit 1
           fi
 
           git remote add gitlab "$GITLAB_MIRROR_URL"
-          git push --force gitlab refs/heads/gitlab-output:refs/heads/main
+
+          if git ls-remote --exit-code --heads gitlab main >/dev/null 2>&1; then
+            git fetch --depth=1 gitlab +main:refs/remotes/gitlab/main
+            commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file" -p refs/remotes/gitlab/main)"
+          else
+            commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file")"
+          fi
+
+          git push --force gitlab "$commit_sha:refs/heads/main"

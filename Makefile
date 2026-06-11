@@ -21,10 +21,11 @@ KERNEL_BUILD_STAMP := $(STAMP_DIR)/kernel-build.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
 ROOTFS_DIR := CosmOS-rootfs/rootfs
-ROOTFS_FILES := $(shell find $(ROOTFS_DIR) -type f | sort)
+ROOTFS_TAR := rootfs.tar
+ROOTFS_FILES := $(shell if [ -d $(ROOTFS_DIR) ]; then find $(ROOTFS_DIR) -type f | sort; fi) $(wildcard $(ROOTFS_TAR))
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs prepare-run-test-fs
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs prepare-rootfs prepare-run-test-fs
 
 all:
 	$(MAKE) submodules
@@ -80,7 +81,7 @@ check-user-apps:
 		exit 1; \
 	}
 
-check-rootfs:
+check-rootfs: prepare-rootfs
 	@test -d "$(ROOTFS_DIR)" || { \
 		echo "missing rootfs directory $(ROOTFS_DIR); run 'make all' first" >&2; \
 		exit 1; \
@@ -89,6 +90,15 @@ check-rootfs:
 		echo "rootfs is incomplete under $(ROOTFS_DIR); run 'make all' first" >&2; \
 		exit 1; \
 	}
+
+# GitLab 快照用 rootfs.tar 代替 rootfs 子模块，构建前先恢复目录。
+prepare-rootfs:
+	@if [ -f "$(ROOTFS_TAR)" ]; then \
+		echo "unpacking $(ROOTFS_TAR) into $(ROOTFS_DIR)"; \
+		rm -rf "$(ROOTFS_DIR)"; \
+		mkdir -p "$(ROOTFS_DIR)"; \
+		tar -xf "$(ROOTFS_TAR)" -C "$(ROOTFS_DIR)"; \
+	fi
 
 disk.img: check-user-apps check-rootfs $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_FILES) scripts/pack-disk-img.sh
 	./scripts/pack-disk-img.sh $(ROOTFS_DIR) $(USER_BIN_DIR) $@
