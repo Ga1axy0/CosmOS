@@ -8,9 +8,11 @@ QEMU ?= qemu-system-riscv64
 MEM ?= 1G
 SMP ?= 1
 TEST_FS ?= sdcard-rv.img
+# make run 使用写时复制副本，避免 QEMU 写坏原始测试镜像。
+RUN_TEST_FS ?= .make/sdcard-rv-run.img
 QEMU_NETDEV ?= user,id=net
 QEMU_TRACE_ARGS ?=
-QEMU_COMP_BLK_ARGS = -drive file=$(TEST_FS),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+QEMU_COMP_BLK_ARGS = -drive file=$(RUN_TEST_FS),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 QEMU_COMP_EXTRA_BLK_ARGS = -drive file=disk.img,if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 
 STAMP_DIR := .make
@@ -22,7 +24,7 @@ ROOTFS_DIR := CosmOS-rootfs/rootfs
 ROOTFS_FILES := $(shell find $(ROOTFS_DIR) -type f | sort)
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs prepare-run-test-fs
 
 all:
 	$(MAKE) submodules
@@ -91,7 +93,14 @@ check-rootfs:
 disk.img: check-user-apps check-rootfs $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_FILES) scripts/pack-disk-img.sh
 	./scripts/pack-disk-img.sh $(ROOTFS_DIR) $(USER_BIN_DIR) $@
 
-run: check-kernel disk.img
+prepare-run-test-fs: | $(STAMP_DIR)
+	@if [ ! -f "$(TEST_FS)" ]; then \
+		echo "Test image not found: $(TEST_FS)"; \
+		exit 2; \
+	fi
+	cp -c "$(TEST_FS)" "$(RUN_TEST_FS)" 2>/dev/null || cp --reflink=auto "$(TEST_FS)" "$(RUN_TEST_FS)" 2>/dev/null || cp "$(TEST_FS)" "$(RUN_TEST_FS)"
+
+run: check-kernel disk.img prepare-run-test-fs
 	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
 
 run-trace: QEMU_TRACE_ARGS = -d int,in_asm -D qemu.log
@@ -118,6 +127,6 @@ fmt:
 	cd fs; cargo fmt; cd ../fs-fuse; cargo fmt; cd ../os; cargo fmt; cd ../user; cargo fmt; cd ..
 
 clean:
-	rm -rf $(STAMP_DIR) disk.img kernel-rv kernel-la os/.cargo user/.cargo
+	rm -rf $(STAMP_DIR) $(RUN_TEST_FS) disk.img kernel-rv kernel-la os/.cargo user/.cargo
 	$(MAKE) -C os clean
 	$(MAKE) -C user clean
