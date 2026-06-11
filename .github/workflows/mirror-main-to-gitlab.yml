@@ -25,13 +25,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 推送 GitLab main，最多重试 5 次以规避临时网络波动。
+          # 推送指定 ref，最多重试 5 次以规避临时网络波动。
           retry_git_push() {
+            local source_ref="$1"
+            local target_branch="$2"
             local attempt
             for attempt in 1 2 3 4 5; do
-              echo "[mirror] step: push temporary commit to GitLab main (attempt ${attempt}/5)"
-              if git push --force gitlab "HEAD:refs/heads/main"; then
-                echo "[mirror] done: push temporary commit to GitLab main"
+              echo "[mirror] step: push ${source_ref} to GitLab ${target_branch} (attempt ${attempt}/5)"
+              if git push --force gitlab "${source_ref}:refs/heads/${target_branch}"; then
+                echo "[mirror] done: push ${source_ref} to GitLab ${target_branch}"
                 return 0
               fi
               if [ "$attempt" -eq 5 ]; then
@@ -41,6 +43,58 @@ jobs:
               sleep "$((attempt * 5))"
             done
           }
+
+          # 先用临时分支上传最大 blob，降低最终 main 推送的单包大小。
+          seed_large_blob() {
+            local seed_file="CosmOS-rootfs/third-party/binutils-2.41.tar.xz"
+            local seed_branch="mirror-seed-large-blob"
+            local seed_index
+            local seed_tree_sha
+            local seed_commit_sha
+            local parent_args=()
+
+            if [ ! -f "$seed_file" ]; then
+              echo "[mirror] skip: seed file not found: ${seed_file}"
+              return
+            fi
+
+            if git show-ref --verify --quiet refs/remotes/gitlab/main; then
+              parent_args=(-p refs/remotes/gitlab/main)
+            fi
+
+            echo "[mirror] step: create seed commit for ${seed_file}"
+            seed_index="$(mktemp)"
+            rm -f "$seed_index"
+            GIT_INDEX_FILE="$seed_index" git add -- "$seed_file"
+            seed_tree_sha="$(GIT_INDEX_FILE="$seed_index" git write-tree)"
+            seed_commit_sha="$(git commit-tree "$seed_tree_sha" "${parent_args[@]}" -m "Seed large mirror blob ${seed_file}")"
+            rm -f "$seed_index"
+            echo "[mirror] done: create seed commit ${seed_commit_sha}"
+
+            MIRROR_SEED_BRANCH="$seed_branch"
+            MIRROR_SEED_COMMIT_SHA="$seed_commit_sha"
+            retry_git_push "$seed_commit_sha" "$seed_branch"
+          }
+
+          # 创建完整展开提交，父提交接 seed，确保最终推送不再携带最大 blob。
+          create_mirror_commit() {
+            local full_tree_sha
+            local mirror_commit_sha
+            local parent_args=()
+
+            if [ -n "$MIRROR_SEED_COMMIT_SHA" ]; then
+              parent_args=(-p "$MIRROR_SEED_COMMIT_SHA")
+            elif git show-ref --verify --quiet refs/remotes/gitlab/main; then
+              parent_args=(-p refs/remotes/gitlab/main)
+            fi
+
+            full_tree_sha="$(git write-tree)"
+            mirror_commit_sha="$(git commit-tree "$full_tree_sha" "${parent_args[@]}" -m "Mirror ${GITHUB_REF_NAME}@${GITHUB_SHA} with flattened submodules")"
+            echo "$mirror_commit_sha"
+          }
+
+          MIRROR_SEED_BRANCH=""
+          MIRROR_SEED_COMMIT_SHA=""
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -59,12 +113,18 @@ jobs:
           bash scripts/export-eval-tree.sh
           echo "[mirror] done: flatten submodules"
 
-          echo "[mirror] step: create temporary mirror commit"
-          git commit --allow-empty -m "Mirror ${GITHUB_REF_NAME}@${GITHUB_SHA} with flattened submodules"
-          echo "[mirror] done: create temporary mirror commit $(git rev-parse HEAD)"
-
           echo "[mirror] step: add GitLab remote"
           git remote add gitlab "$GITLAB_MIRROR_URL"
           echo "[mirror] done: add GitLab remote"
 
-          retry_git_push
+          echo "[mirror] step: fetch GitLab main"
+          git fetch --depth=1 gitlab main:refs/remotes/gitlab/main || true
+          echo "[mirror] done: fetch GitLab main"
+
+          seed_large_blob
+
+          echo "[mirror] step: create temporary mirror commit"
+          mirror_commit_sha="$(create_mirror_commit)"
+          echo "[mirror] done: create temporary mirror commit ${mirror_commit_sha}"
+
+          retry_git_push "$mirror_commit_sha" main
