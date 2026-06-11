@@ -15,7 +15,7 @@ pub mod loongarch;
 
 #[cfg(target_arch = "riscv64")]
 pub use riscv::qemu_virt::{
-    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
+    BlockDeviceImpl, CharDeviceImpl, USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
     VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
     console_getchar, console_putchar, console_rx_irq_ready, direct_map_phys_to_virt,
     direct_map_virt_to_phys, early_console_write, handle_external_irq, heap_debug_enabled,
@@ -27,7 +27,7 @@ pub use riscv::qemu_virt::{
 
 #[cfg(target_arch = "loongarch64")]
 pub use loongarch::qemu_virt::{
-    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET, MMIO,
+    BlockDeviceImpl, CharDeviceImpl, USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET, MMIO,
     QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC, VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE,
     VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE, console_getchar, console_putchar,
     console_rx_irq_ready, direct_map_phys_to_virt, direct_map_virt_to_phys,

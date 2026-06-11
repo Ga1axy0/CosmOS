@@ -1,5 +1,14 @@
 //! Static board description for the RISC-V QEMU `virt` machine.
 
+/// default base address for anonymous mmap allocations
+pub const USER_MMAP_BASE: usize = 0x1000_0000;
+
+/// default base address for the main thread's user stack region
+pub const USER_STACK_BASE: usize = 0x0800_0000;
+
+/// base address for loading dynamic linker (interpreter)
+pub const INTERP_BASE: usize = 0x4000_0000;
+
 /// Clock frequency.
 pub const CLOCK_FREQ: usize = 12_500_000;
 

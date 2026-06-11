@@ -2,8 +2,7 @@
 
 use crate::{
     config::USER_VDSO_RT_SIGRETURN,
-    hal::ArchTrapMachine,
-    hal::traits::TrapMachine,
+    hal::{ArchTrapContextAbi, ArchTrapMachine, traits::{TrapContextAbi, TrapMachine}},
     syscall::write_pod_to_user,
     task::{current_task, current_trap_cx},
 };
@@ -246,18 +245,20 @@ pub fn handle_signals() -> Option<i32> {
         let result = trap_cx.syscall_ret() as isize;
         if result == -(crate::syscall::errno::ERRNO::EINTR as isize) {
             if trap_cx.restartable_syscall && action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
+                let a0_idx = <ArchTrapContextAbi as TrapContextAbi>::signal_gpr_arg0_index();
                 debug!(
-                    "handle_signals: syscall restart: backing up PC from {:#x} to {:#x}, restoring a0 from {:#x} to {:#x}",
+                    "handle_signals: syscall restart: backing up PC from {:#x} to {:#x}, restoring a0 (gregs[{}]) from {:#x} to {:#x}",
                     mcontext.gregs[0],
                     trap_cx
                         .user_pc()
                         .wrapping_sub(ArchTrapMachine::syscall_instruction_len()),
-                    mcontext.gregs[10], trap_cx.orig_a0
+                    a0_idx,
+                    mcontext.gregs[a0_idx], trap_cx.orig_a0
                 );
                 mcontext.gregs[0] = trap_cx
                     .user_pc()
                     .wrapping_sub(ArchTrapMachine::syscall_instruction_len());
-                mcontext.gregs[10] = trap_cx.orig_a0;
+                mcontext.gregs[a0_idx] = trap_cx.orig_a0;
             } else if action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
                 debug!(
                     "handle_signals: syscall returned EINTR but syscall is not restartable, preserving EINTR"

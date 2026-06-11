@@ -1,5 +1,14 @@
 //! Static board description for the LoongArch64 QEMU `virt` machine.
 
+/// default base address for anonymous mmap allocations
+pub const USER_MMAP_BASE: usize = 0x20_0000_0000;
+
+/// default base address for the main thread's user stack region
+pub const USER_STACK_BASE: usize = 0x3e_0000_0000;
+
+/// base address for loading dynamic linker (interpreter)
+pub const INTERP_BASE: usize = 0x1e_0000_0000;
+
 /// Direct-mapped uncached I/O virtual-address offset used during early bring-up.
 pub const IO_ADDR_OFFSET: usize = 0x8000_0000_0000_0000;
 /// Direct-mapped cached kernel-address offset used during early bring-up.

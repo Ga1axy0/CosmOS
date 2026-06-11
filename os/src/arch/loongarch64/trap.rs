@@ -309,6 +309,10 @@ impl TrapContextAbi for LoongArchTrapContextAbi {
         frame.era = signal_gprs[0];
     }
 
+    fn signal_gpr_arg0_index() -> usize {
+        4 // LoongArch: r4 = a0
+    }
+
     fn copy_fp_state_to(frame: &Self::Frame, fpregs: &mut [u64; 32], fcsr: &mut u32) {
         fpregs.copy_from_slice(&frame.f);
         *fcsr = frame.fcsr as u32;

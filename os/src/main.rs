@@ -238,7 +238,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     print_boot_stage("storage", "root filesystem mounted");
     timer::init_realtime_offset_from_rtc();
     print_boot_stage("clock", "realtime source calibrated");
-    crate::platform::start_secondary_harts(hart_id);
+    platform::start_secondary_harts(hart_id);
     init_local_hart(hart_id);
     print_boot_stage("scheduler", "bootstrap hart entering run queue");
     task::add_initproc();

@@ -4,7 +4,7 @@ mod board;
 pub mod sbi;
 
 pub use board::{
-    BlockDeviceImpl, CharDeviceImpl, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
+    BlockDeviceImpl, CharDeviceImpl, USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
     VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
 };
 pub use sbi::SbiPlatform;

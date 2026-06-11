@@ -155,6 +155,8 @@ pub trait TrapContextAbi {
     fn export_signal_gprs(frame: &Self::Frame) -> [usize; 32];
     /// Import the Linux-compatible signal GPR layout back into the trap context.
     fn import_signal_gprs(frame: &mut Self::Frame, signal_gprs: &[usize; 32]);
+    /// Return the index of the a0 register within the 32-entry signal GPR array
+    fn signal_gpr_arg0_index() -> usize;
     /// Copy floating-point state into an external signal frame.
     fn copy_fp_state_to(frame: &Self::Frame, fpregs: &mut [u64; 32], fcsr: &mut u32);
     /// Restore floating-point state from an external signal frame.
