@@ -1,4 +1,4 @@
-name: Mirror Main to GitLab
+name: Mirror Branch to GitLab
 
 on:
   push:
@@ -7,8 +7,9 @@ permissions:
   contents: read
 
 jobs:
-  mirror-main:
+  mirror-branch:
     runs-on: ubuntu-latest
+    if: github.ref_type == 'branch'
 
     steps:
       - name: Checkout source
@@ -17,42 +18,53 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Build and push evaluation snapshot
-        id: snapshot
+      - name: Flatten submodules and push temporary commit
+        id: mirror
         env:
           GITLAB_MIRROR_URL: ${{ secrets.GITLAB_MIRROR_URL }}
         run: |
           set -euo pipefail
 
+          # 推送 GitLab main，最多重试 5 次以规避临时网络波动。
+          retry_git_push() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              echo "[mirror] step: push temporary commit to GitLab main (attempt ${attempt}/5)"
+              if git push --force gitlab "HEAD:refs/heads/main"; then
+                echo "[mirror] done: push temporary commit to GitLab main"
+                return 0
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                echo "::error::Failed to push to GitLab after 5 attempts"
+                return 1
+              fi
+              sleep "$((attempt * 5))"
+            done
+          }
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          echo "[mirror] step: save source commit message"
-          source_commit_message_file="$(mktemp)"
-          git log -1 --pretty=%B > "$source_commit_message_file"
-          echo "[mirror] done: save source commit message"
-
-          echo "[mirror] step: build evaluation tree"
-          bash scripts/export-eval-tree.sh
-          echo "[mirror] done: build evaluation tree"
-
-          echo "[mirror] step: write evaluation tree"
-          tree_sha="$(git write-tree)"
-          echo "[mirror] done: write evaluation tree $tree_sha"
 
           if [ -z "$GITLAB_MIRROR_URL" ]; then
             echo "::error::Missing GITLAB_MIRROR_URL secret"
             exit 1
           fi
 
+          # 在当前 GitHub 分支上创建临时提交，避免生成无父快照提交。
+          echo "[mirror] step: prepare source branch ${GITHUB_REF_NAME}"
+          git checkout -B "$GITHUB_REF_NAME" "$GITHUB_SHA"
+          echo "[mirror] done: prepare source branch ${GITHUB_REF_NAME}"
+
+          echo "[mirror] step: flatten submodules"
+          bash scripts/export-eval-tree.sh
+          echo "[mirror] done: flatten submodules"
+
+          echo "[mirror] step: create temporary mirror commit"
+          git commit --allow-empty -m "Mirror ${GITHUB_REF_NAME}@${GITHUB_SHA} with flattened submodules"
+          echo "[mirror] done: create temporary mirror commit $(git rev-parse HEAD)"
+
           echo "[mirror] step: add GitLab remote"
           git remote add gitlab "$GITLAB_MIRROR_URL"
           echo "[mirror] done: add GitLab remote"
 
-          echo "[mirror] step: create one-shot snapshot commit"
-          commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file")"
-          echo "[mirror] done: create one-shot snapshot commit $commit_sha"
-
-          echo "[mirror] step: push snapshot commit to GitLab main"
-          git push --force gitlab "$commit_sha:refs/heads/main"
-          echo "[mirror] done: push snapshot commit to GitLab main"
+          retry_git_push
