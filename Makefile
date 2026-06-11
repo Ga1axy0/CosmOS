@@ -20,7 +20,7 @@ USER_BUILD_STAMP := $(STAMP_DIR)/user-build.stamp
 KERNEL_BUILD_STAMP := $(STAMP_DIR)/kernel-build.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
-ROOTFS_DIR := CosmOS-rootfs/rootfs
+ROOTFS_DIR := rootfs
 ROOTFS_TAR := rootfs.tar
 ROOTFS_FILES := $(shell if [ -d $(ROOTFS_DIR) ]; then find $(ROOTFS_DIR) -type f | sort; fi) $(wildcard $(ROOTFS_TAR))
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
@@ -30,7 +30,7 @@ OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 all:
 	$(MAKE) submodules
 	$(MAKE) cargo-config
-	$(MAKE) user-apps kernel-rv kernel-la rootfs
+	$(MAKE) user-apps kernel-rv kernel-la disk.img
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
@@ -67,7 +67,10 @@ kernel-la: kernel-rv
 	cp kernel-rv $@
 
 rootfs:
-	$(MAKE) -C CosmOS-rootfs rootfs-init
+	@test -d "$(ROOTFS_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_DIR); run 'make submodules' first" >&2; \
+		exit 1; \
+	}
 
 check-kernel:
 	@test -x kernel-rv || { \

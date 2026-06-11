@@ -27,25 +27,53 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          echo "[mirror] step: save source commit message"
           source_commit_message_file="$(mktemp)"
           git log -1 --pretty=%B > "$source_commit_message_file"
+          echo "[mirror] done: save source commit message"
 
+          echo "[mirror] step: build evaluation tree"
           bash scripts/export-eval-tree.sh
+          echo "[mirror] done: build evaluation tree"
 
+          echo "[mirror] step: write evaluation tree"
           tree_sha="$(git write-tree)"
+          echo "[mirror] done: write evaluation tree $tree_sha"
 
           if [ -z "$GITLAB_MIRROR_URL" ]; then
             echo "::error::Missing GITLAB_MIRROR_URL secret"
             exit 1
           fi
 
+          echo "[mirror] step: add GitLab remote"
           git remote add gitlab "$GITLAB_MIRROR_URL"
+          echo "[mirror] done: add GitLab remote"
 
-          if git ls-remote --exit-code --heads gitlab main >/dev/null 2>&1; then
+          echo "[mirror] step: check GitLab main branch"
+          set +e
+          git ls-remote --exit-code --heads gitlab main >/tmp/gitlab-main.out 2>&1
+          ls_remote_status=$?
+          set -e
+
+          if [ "$ls_remote_status" -eq 0 ]; then
+            echo "[mirror] done: GitLab main branch exists"
+            echo "[mirror] step: fetch GitLab main branch"
             git fetch --depth=1 gitlab +main:refs/remotes/gitlab/main
+            echo "[mirror] done: fetch GitLab main branch"
+            echo "[mirror] step: create snapshot commit with GitLab main as parent"
             commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file" -p refs/remotes/gitlab/main)"
-          else
+            echo "[mirror] done: create snapshot commit $commit_sha"
+          elif [ "$ls_remote_status" -eq 2 ]; then
+            echo "[mirror] done: GitLab main branch does not exist"
+            echo "[mirror] step: create first snapshot commit"
             commit_sha="$(git commit-tree "$tree_sha" -F "$source_commit_message_file")"
+            echo "[mirror] done: create first snapshot commit $commit_sha"
+          else
+            cat /tmp/gitlab-main.out >&2
+            echo "::error::failed: check GitLab main branch"
+            exit "$ls_remote_status"
           fi
 
+          echo "[mirror] step: push snapshot commit to GitLab main"
           git push --force gitlab "$commit_sha:refs/heads/main"
+          echo "[mirror] done: push snapshot commit to GitLab main"

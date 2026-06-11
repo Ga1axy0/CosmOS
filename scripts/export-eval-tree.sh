@@ -26,9 +26,11 @@ pack_rootfs_submodule() {
     # rootfs 体积较大，评测快照中只保留 tar 包。
     rm -f "$ROOTFS_TAR"
     tar -cf "$ROOTFS_TAR" -C "$submodule_path" .
+    echo "[INFO] done: pack rootfs into $ROOTFS_TAR"
     git rm --cached -f -q "$submodule_path"
     rm -rf "$submodule_path"
     git add "$ROOTFS_TAR"
+    echo "[INFO] done: replace rootfs directory with $ROOTFS_TAR"
 }
 
 flatten_regular_submodule() {
@@ -38,6 +40,7 @@ flatten_regular_submodule() {
     git rm --cached -f -q "$submodule_path"
     rm -rf "$submodule_path/.git"
     git add -A "$submodule_path"
+    echo "[INFO] done: flatten submodule $submodule_path"
 }
 
 flatten_submodules() {
@@ -71,6 +74,8 @@ flatten_submodules() {
     git rm --cached -f -q .gitmodules || true
     rm -f .gitmodules
     git add -A
+    echo "[INFO] done: remove .gitmodules from evaluation snapshot"
 }
 
 flatten_submodules
+echo "[INFO] done: export evaluation tree"
