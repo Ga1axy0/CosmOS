@@ -39,20 +39,18 @@ impl Timer for LoongArchPlatform {
 }
 
 const IOCSR_IPI_SEND: usize = 0x1040;
+const IOCSR_IPI_EN: usize = 0x1004;
+const IOCSR_IPI_CLEAR: usize = 0x100c;
 const IOCSR_MBUF_SEND: usize = 0x1048;
 
-const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
 const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
-
-const IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
-const IOCSR_MBUF_SEND_BOX_SHIFT: u64 = 2;
 const IOCSR_MBUF_SEND_CPU_SHIFT: u64 = 16;
-const IOCSR_MBUF_SEND_BUF_SHIFT: u64 = 32;
-const IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
+const IOCSR_MBUF_SEND_DATA_SHIFT: u64 = 32;
 
-// ACTION_BOOT_CPU matches Linux's SMP_RESCHEDULE_YOURSELF bit used for boot IPI
-const ACTION_BOOT_CPU: u32 = 1;
-const ACTION_RESCHEDULE: u32 = 1;
+// QEMU's LoongArch IPI model treats IOCSR_IPI_SEND[4:0] as a vector number,
+// and the per-core enable/clear registers as vector bitmasks.
+const IPI_VECTOR_WAKEUP: u32 = 1;
+const IPI_VECTOR_MASK: u32 = 1 << IPI_VECTOR_WAKEUP;
 
 #[inline]
 unsafe fn iocsr_write32(addr: usize, val: u32) {
@@ -64,41 +62,52 @@ unsafe fn iocsr_write64(addr: usize, val: u64) {
     core::arch::asm!("iocsrwr.d {v}, {a}", v = in(reg) val, a = in(reg) addr);
 }
 
-fn ipi_send(hart_id: usize, action: u32) {
-    let val = IOCSR_IPI_SEND_BLOCKING | action | (hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT;
+fn ipi_send(hart_id: usize, vector: u32) {
+    let val = vector | (hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT;
     unsafe { iocsr_write32(IOCSR_IPI_SEND, val) };
 }
 
-// Sends a 64-bit value to the target hart's MBUF0 mailbox, split into two 32-bit writes.
+fn enable_ipi() {
+    unsafe { iocsr_write32(IOCSR_IPI_EN, IPI_VECTOR_MASK) };
+}
+
+fn clear_ipi(vector: u32) {
+    unsafe { iocsr_write32(IOCSR_IPI_CLEAR, 1 << vector) };
+}
+
+#[inline]
+fn mailbox_word_slot(mailbox: u64, upper_half: bool) -> u64 {
+    debug_assert!(mailbox < 4);
+    (mailbox << 3) | ((upper_half as u64) << 2)
+}
+
+#[inline]
+fn mail_send_word(word: u32, hart_id: usize, slot: u64) {
+    let val = ((word as u64) << IOCSR_MBUF_SEND_DATA_SHIFT)
+        | ((hart_id as u64) << IOCSR_MBUF_SEND_CPU_SHIFT)
+        | slot;
+    unsafe { iocsr_write64(IOCSR_MBUF_SEND, val) };
+}
+
+// QEMU decodes MAIL_SEND as one 32-bit mailbox-slot write per request. To
+// publish a 64-bit entry address in MBUF0, we must write its low/high halves
+// into CORE_BUF_20 and CORE_BUF_24 separately.
 fn mail_send(data: u64, hart_id: usize, mailbox: u64) {
-    let cpu = (hart_id as u64) << IOCSR_MBUF_SEND_CPU_SHIFT;
-    // high 32 bits
-    let hi = IOCSR_MBUF_SEND_BLOCKING
-        | (((mailbox << 1) + 1) << IOCSR_MBUF_SEND_BOX_SHIFT)
-        | cpu
-        | (data & IOCSR_MBUF_SEND_H32_MASK);
-    // low 32 bits
-    let lo = IOCSR_MBUF_SEND_BLOCKING
-        | ((mailbox << 1) << IOCSR_MBUF_SEND_BOX_SHIFT)
-        | cpu
-        | (data << IOCSR_MBUF_SEND_BUF_SHIFT);
-    unsafe {
-        iocsr_write64(IOCSR_MBUF_SEND, hi);
-        iocsr_write64(IOCSR_MBUF_SEND, lo);
-    }
+    mail_send_word(data as u32, hart_id, mailbox_word_slot(mailbox, false));
+    mail_send_word((data >> 32) as u32, hart_id, mailbox_word_slot(mailbox, true));
 }
 
 impl HartCtrl for LoongArchPlatform {
     fn start_hart(hart_id: usize, start_addr: usize, _opaque: usize) -> Result<(), ()> {
         mail_send(start_addr as u64, hart_id, 0);
-        ipi_send(hart_id, ACTION_BOOT_CPU);
+        ipi_send(hart_id, IPI_VECTOR_WAKEUP);
         Ok(())
     }
 
     fn send_ipi(hart_mask: usize) {
         for hart_id in 0..usize::BITS as usize {
             if hart_mask & (1 << hart_id) != 0 {
-                ipi_send(hart_id, ACTION_RESCHEDULE);
+                ipi_send(hart_id, IPI_VECTOR_WAKEUP);
             }
         }
     }
@@ -141,16 +150,37 @@ pub fn machine_name() -> &'static str {
 
 /// Start all secondary harts via IOCSR mailbox + IPI.
 pub fn start_secondary_harts(bootstrap_hart_id: usize) {
-    extern "C" { fn _start(); }
-    // The firmware polls IOCSR_MBUF0 for a physical address, so strip the DMW offset.
-    let entry_phys = (_start as usize) & !KERNEL_ADDR_OFFSET;
+    extern "C" {
+        fn _start();
+    }
+
+    // Under direct boot, CPU0 reaches the kernel through our tiny bootloader,
+    // which jumps to the high-half DMW alias of `_start`. QEMU's secondary
+    // slave stub simply `jirl`s to the mailbox value, so feeding it the raw
+    // physical address would drop APs outside the cached DMW window right
+    // after wakeup.
+    let entry = _start as usize;
+    enable_ipi();
     for hart_id in 0..crate::config::MAX_HARTS {
         if hart_id == bootstrap_hart_id {
             continue;
         }
-        let _ = <LoongArchPlatform as HartCtrl>::start_hart(hart_id, entry_phys, 0);
-        info!("hart {} requested startup for hart {}", bootstrap_hart_id, hart_id);
+        let _ = <LoongArchPlatform as HartCtrl>::start_hart(hart_id, entry, 0);
+        warn!(
+            "hart {} requested startup for hart {} at {:#x}",
+            bootstrap_hart_id, hart_id, entry
+        );
     }
+}
+
+/// Initialize per-hart IPI receive state.
+pub fn init_ipi_hart() {
+    enable_ipi();
+}
+
+/// Clear the wake/reschedule IPI vector on the current hart.
+pub fn clear_ipi_vector() {
+    clear_ipi(IPI_VECTOR_WAKEUP);
 }
 
 /// Translate one direct-mapped physical address into the kernel VA used on this platform.

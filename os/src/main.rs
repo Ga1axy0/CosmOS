@@ -170,6 +170,7 @@ fn print_boot_stage(stage: &str, detail: &str) {
 fn init_local_hart(hart_id: usize) {
     trap::init_hart();
     timer::init_hart();
+    crate::platform::init_local_hart();
     crate::platform::init_external_irq_hart(hart_id);
     mm::mark_online(hart_id);
     debug!("hart {} local init done", hart_id);
@@ -257,7 +258,7 @@ fn first_hart_main(hart_id: usize) -> ! {
 fn secondary_hart_main(hart_id: usize) -> ! {
     wait_for_bootstrap();
     mm::activate_kernel_space();    // 激活内核页表：但 satp 是 per-hart 寄存器
-    info!("hart {} boot", hart_id);
+    info!("hart {} entered secondary_hart_main", hart_id);
     init_local_hart(hart_id);
     debug!("hart {} entered scheduler", hart_id);
     sched::run_tasks();

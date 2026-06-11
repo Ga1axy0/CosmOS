@@ -39,8 +39,10 @@ pub unsafe extern "C" fn _start() -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn boot_main(hart_id: usize) -> ! {
-    puts("[boot] loongarch64 direct loader\r\n");
-    puts("[boot] jumping to kernel @ 0x90000000\r\n");
+    if hart_id == 0 {
+        puts("[boot] loongarch64 direct loader\r\n");
+        puts("[boot] jumping to kernel @ 0x90000000\r\n");
+    }
     unsafe {
         let entry: extern "C" fn(usize) -> ! = core::mem::transmute(KERNEL_ENTRY);
         entry(hart_id);

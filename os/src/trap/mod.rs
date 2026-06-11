@@ -147,6 +147,7 @@ pub fn clear_software_interrupt_pending() {
 /// so the idle loop can observe newly queued work on the next iteration.
 fn handle_reschedule_ipi() {
     handle_ipi();
+    crate::platform::clear_ipi();
     clear_software_interrupt_pending();
     request_current_task_resched(ReschedReason::HigherRtPriority);
 }

@@ -94,6 +94,7 @@ impl InterruptControl for LoongArchInterruptControl {
 
     unsafe fn enable_software() {
         update_ecfg(ECFG_SIP, true);
+        update_ecfg(ECFG_IPI, true);
     }
 
     unsafe fn clear_software_pending() {
@@ -357,7 +358,7 @@ fn decode_interrupt_cause(estat: usize, ecfg: usize) -> TrapCause {
     let int_vec = (estat & ecfg) & 0x1fff;
     let highest = (0..=12).rev().find(|bit| int_vec & (1usize << bit) != 0);
     match highest {
-        Some(12) => TrapCause::Unknown,
+        Some(12) => TrapCause::SoftwareInterrupt,
         Some(11) => TrapCause::TimerInterrupt,
         Some(1) | Some(0) => TrapCause::SoftwareInterrupt,
         Some(2..=9) => TrapCause::ExternalInterrupt,
