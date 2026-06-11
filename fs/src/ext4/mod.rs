@@ -554,6 +554,12 @@ impl VfsNode for Ext4Inode {
         ext4.write_at(self.inode_num, offset, buf).unwrap_or(0)
     }
 
+    /// ext4 写入需要保留 ENOSPC/ENOTSUP，供 page cache 回写路径处理失败页。
+    fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        let ext4 = self.fs.ext4.lock();
+        ext4.write_at(self.inode_num, offset, buf).map_err(FS_ERRNO::from)
+    }
+
     fn ino(&self) -> u64 {
         self.inode_num as u64
     }

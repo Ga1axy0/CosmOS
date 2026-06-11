@@ -1,6 +1,7 @@
 use ext4_rs::{Ext4, Ext4Error};
 
 #[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum FS_ERRNO {
     EPERM = 1,  // Operation not permitted

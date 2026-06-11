@@ -162,6 +162,10 @@ pub trait VfsNode: Send + Sync + Any + Debug {
     }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
+    /// 向固定偏移写入数据，并保留底层文件系统返回的真实错误。
+    fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        Ok(self.write_at(offset, buf))
+    }
     /// Stable inode number for stat-like metadata.
     fn ino(&self) -> u64 {
         0
@@ -452,6 +456,24 @@ impl Inode {
             self.invalidate_stat_cache();
         }
         written
+    }
+
+    /// 向固定偏移写入数据，并把底层错误传给调用方。
+    pub fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        let written = self.inner.write_at_result(offset, buf).map_err(|err| {
+            log::error!(
+                "[vfs] write_at_result failed: ino={} offset={} len={} errno={}",
+                self.ino(),
+                offset,
+                buf.len(),
+                err as i32
+            );
+            err
+        })?;
+        if written != 0 {
+            self.invalidate_stat_cache();
+        }
+        Ok(written)
     }
 
     pub fn ino(&self) -> u64 {
