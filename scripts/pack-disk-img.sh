@@ -7,6 +7,7 @@ OUT_IMG="${3:-disk.img}"
 EXTRA_MIB="${EXTRA_MIB:-512}"
 MIN_SIZE_MIB="${MIN_SIZE_MIB:-1024}"
 LABEL="${LABEL:-COSMOSDISK}"
+MUSL_ARCH="${MUSL_ARCH:-riscv64}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 USER_APP_SRC_DIR="${USER_APP_SRC_DIR:-$PROJECT_ROOT/user/src/bin}"
@@ -79,7 +80,11 @@ if [ -f lib/glibc/ar ] && [ -d "$STAGE_DIR/glibc/lib" ]; then
     cp -f lib/glibc/ar "$STAGE_DIR/glibc/lib/ar"
 fi
 
-if [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1" ]; then
+if [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-$MUSL_ARCH.so.1" ]; then
+    ln -sf libc.so "$STAGE_DIR/lib/ld-musl-$MUSL_ARCH.so.1"
+fi
+
+if [ "$MUSL_ARCH" = "riscv64" ] && [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1" ]; then
     ln -sf libc.so "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1"
 fi
 

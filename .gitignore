@@ -30,6 +30,7 @@ os/vendor/
 notes
 base.img
 disk.img
+disk-la.img 
 kernel-rv
 kernel-la
 sdcard-rv.img

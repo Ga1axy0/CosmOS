@@ -21,16 +21,33 @@ KERNEL_BUILD_STAMP := $(STAMP_DIR)/kernel-build.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
 ROOTFS_REPO := CosmOS-rootfs
-ROOTFS_DIR := $(ROOTFS_REPO)/rootfs
-ROOTFS_FILES := $(shell if [ -d $(ROOTFS_DIR) ]; then find $(ROOTFS_DIR) -type f | sort; fi)
+ROOTFS_BASE_DIR := $(ROOTFS_REPO)/rootfs
+ROOTFS_RV_DIR := $(ROOTFS_REPO)/rootfs-rv
+ROOTFS_LA_DIR := $(ROOTFS_REPO)/rootfs-la
+ROOTFS_RV_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-rv
+ROOTFS_LA_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-la
+ROOTFS_RV_FILES := $(shell if [ -d $(ROOTFS_RV_DIR) ]; then find $(ROOTFS_RV_DIR) -type f | sort; fi)
+ROOTFS_LA_FILES := $(shell if [ -d $(ROOTFS_LA_DIR) ]; then find $(ROOTFS_LA_DIR) -type f | sort; fi)
+DISK_RV_IMG := disk.img
+DISK_LA_IMG := disk-la.img
+RV_ROOTFS_TARGET ?= riscv64-linux-musl
+RV_TOOLCHAIN_BIN ?= /opt/riscv64-linux-musl-cross/bin
+RV_GLIBC_LIB ?= /usr/riscv64-linux-gnu/lib
+RV_MUSL_LIB ?= /opt/riscv64-linux-musl-cross/riscv64-linux-musl/lib
+RV_MUSL_ARCH ?= riscv64
+LA_ROOTFS_TARGET ?= loongarch64-linux-musl
+LA_TOOLCHAIN_BIN ?= /opt/loongarch64-linux-musl-cross/bin
+LA_GLIBC_TOOLCHAIN ?= /opt/gcc-13.2.0-loongarch64-linux-gnu
+LA_MUSL_LIB ?= /opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib
+LA_MUSL_ARCH ?= loongarch64
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs prepare-run-test-fs
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs rootfs-rv rootfs-la rv la disk-la clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la prepare-run-test-fs
 
 all:
 	$(MAKE) submodules
 	$(MAKE) cargo-config
-	$(MAKE) user-apps kernel-rv kernel-la disk.img
+	$(MAKE) user-apps kernel-rv kernel-la $(DISK_RV_IMG) $(DISK_LA_IMG)
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
@@ -69,6 +86,32 @@ kernel-la: kernel-rv
 rootfs:
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init
 
+rootfs-rv:
+	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
+		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
+		STAMP_DIR="$(CURDIR)/$(ROOTFS_RV_STAMP_DIR)" \
+		TARGET=$(RV_ROOTFS_TARGET) \
+		TOOLCHAIN_BIN=$(RV_TOOLCHAIN_BIN) \
+		BUSYBOX_ARCH=riscv \
+		GLIBC_LIB=$(RV_GLIBC_LIB) \
+		MUSL_LIB=$(RV_MUSL_LIB) \
+		MUSL_ARCH=$(RV_MUSL_ARCH)
+
+rootfs-la:
+	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
+		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_LA_DIR)" \
+		STAMP_DIR="$(CURDIR)/$(ROOTFS_LA_STAMP_DIR)" \
+		TARGET=$(LA_ROOTFS_TARGET) \
+		TOOLCHAIN_BIN=$(LA_TOOLCHAIN_BIN) \
+		BUSYBOX_ARCH=loongarch \
+		GLIBC_TOOLCHAIN=$(LA_GLIBC_TOOLCHAIN) \
+		MUSL_LIB=$(LA_MUSL_LIB) \
+		MUSL_ARCH=$(LA_MUSL_ARCH)
+
+rv: $(DISK_RV_IMG)
+
+la disk-la: $(DISK_LA_IMG)
+
 check-kernel:
 	@test -x kernel-rv || { \
 		echo "missing kernel-rv; run 'make all' first" >&2; \
@@ -82,17 +125,40 @@ check-user-apps:
 	}
 
 check-rootfs: rootfs
-	@test -d "$(ROOTFS_DIR)" || { \
-		echo "missing rootfs directory $(ROOTFS_DIR); run 'make all' first" >&2; \
+	@test -d "$(ROOTFS_BASE_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_BASE_DIR); run 'make all' first" >&2; \
 		exit 1; \
 	}
-	@test -d "$(ROOTFS_DIR)/root" || { \
-		echo "rootfs is incomplete under $(ROOTFS_DIR); run 'make all' first" >&2; \
+	@test -d "$(ROOTFS_BASE_DIR)/root" || { \
+		echo "rootfs is incomplete under $(ROOTFS_BASE_DIR); run 'make all' first" >&2; \
 		exit 1; \
 	}
 
-disk.img: check-user-apps check-rootfs $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_FILES) scripts/pack-disk-img.sh
-	./scripts/pack-disk-img.sh $(ROOTFS_DIR) $(USER_BIN_DIR) $@
+check-rootfs-rv: rootfs-rv
+	@test -d "$(ROOTFS_RV_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_RV_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_RV_DIR)/root" || { \
+		echo "rootfs is incomplete under $(ROOTFS_RV_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+
+check-rootfs-la: rootfs-la
+	@test -d "$(ROOTFS_LA_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_LA_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_LA_DIR)/root" || { \
+		echo "rootfs is incomplete under $(ROOTFS_LA_DIR); run 'make all' first" >&2; \
+		exit 1; \
+	}
+
+$(DISK_RV_IMG): check-user-apps check-rootfs-rv $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
+	MUSL_ARCH=$(RV_MUSL_ARCH) ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR) $@
+
+$(DISK_LA_IMG): check-user-apps check-rootfs-la $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh
+	MUSL_ARCH=$(LA_MUSL_ARCH) ./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR) $@
 
 prepare-run-test-fs: | $(STAMP_DIR)
 	@if [ ! -f "$(TEST_FS)" ]; then \
@@ -128,6 +194,6 @@ fmt:
 	cd fs; cargo fmt; cd ../fs-fuse; cargo fmt; cd ../os; cargo fmt; cd ../user; cargo fmt; cd ..
 
 clean:
-	rm -rf $(STAMP_DIR) $(RUN_TEST_FS) disk.img kernel-rv kernel-la os/.cargo user/.cargo
+	rm -rf $(STAMP_DIR) $(RUN_TEST_FS) $(DISK_RV_IMG) $(DISK_LA_IMG) kernel-rv kernel-la os/.cargo user/.cargo $(ROOTFS_RV_DIR) $(ROOTFS_LA_DIR) $(ROOTFS_RV_STAMP_DIR) $(ROOTFS_LA_STAMP_DIR)
 	$(MAKE) -C os clean
 	$(MAKE) -C user clean
