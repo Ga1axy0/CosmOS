@@ -26,7 +26,7 @@ pub use riscv::qemu_virt::{
     console_getchar, console_putchar, console_rx_irq_ready, direct_map_phys_to_virt,
     direct_map_virt_to_phys, early_console_write, handle_external_irq, heap_debug_enabled,
     init_external_irq, init_external_irq_hart, kernel_heap_virtual_window_supported,
-    machine_name, mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown,
+    machine_name, platform_name, mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown,
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console,
     KERNEL_HEAP_BASE, SbiPlatform as PlatformImpl, TRAMPOLINE,
 };
@@ -39,7 +39,7 @@ pub use loongarch::qemu_virt::{
     console_rx_irq_ready, direct_map_phys_to_virt, direct_map_virt_to_phys,
     early_console_write, handle_external_irq, heap_debug_enabled, init_external_irq,
     init_external_irq_hart, init_ipi_hart, kernel_heap_virtual_window_supported, machine_name,
-    mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown, clear_ipi_vector,
+    platform_name, mmio_phys_to_virt, probe_platform_devices, rtc_is_supported, shutdown, clear_ipi_vector,
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console,
     KERNEL_HEAP_BASE, LoongArchPlatform as PlatformImpl, TRAMPOLINE,
 };

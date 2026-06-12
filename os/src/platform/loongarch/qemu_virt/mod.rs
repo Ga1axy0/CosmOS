@@ -148,6 +148,11 @@ pub fn machine_name() -> &'static str {
     "loongarch64"
 }
 
+/// Return the platform name for display purposes.
+pub fn platform_name() -> &'static str {
+    "qemu virt"
+}
+
 /// Start all secondary harts via IOCSR mailbox + IPI.
 pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     extern "C" {

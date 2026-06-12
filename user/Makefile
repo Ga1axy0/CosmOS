@@ -12,8 +12,6 @@ MODE := release
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)
 BUILD_DIR := build
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
 
 ifeq ($(MODE), release)
 	MODE_ARG := --release
@@ -25,7 +23,7 @@ ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
 
 binary:
 	@echo $(ELFS)
-	@cargo build $(MODE_ARG)
+	@cargo build $(MODE_ARG) --target $(TARGET)
 	@$(foreach elf, $(ELFS), 		$(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf)); 		cp $(elf) $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.elf, $(elf));)
 
 disasm:

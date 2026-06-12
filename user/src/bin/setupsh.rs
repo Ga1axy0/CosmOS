@@ -282,6 +282,16 @@ fn install_lib_link(src: &str, dst: &str) -> bool {
     ensure_hard_link(src, dst)
 }
 
+#[cfg(target_arch = "riscv64")]
+fn keep_musl_compat_top_level_entry(name: &str) -> bool {
+    name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn keep_musl_compat_top_level_entry(_name: &str) -> bool {
+    false
+}
+
 /// 目标目录中已有普通文件时，认为镜像已迁移过。
 fn dir_has_runtime_files(target_dir: &str) -> bool {
     let fd = open(target_dir, OpenFlags::RDONLY | OpenFlags::DIRECTORY);
@@ -384,7 +394,7 @@ fn keep_top_level_lib_entry(name: &str, dtype: u8) -> bool {
         || name == ".."
         || name == "ar"
         || name == MUSL_LD_PATH.trim_start_matches('/')
-        || name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
+        || keep_musl_compat_top_level_entry(name)
         || name == GLIBC_LD_PATH.trim_start_matches('/')
 }
 

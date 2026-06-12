@@ -1,9 +1,14 @@
 DOCKER_NAME ?= rcore-docker
 
-TARGET ?= riscv64gc-unknown-none-elf
 USER_MODE ?= release
-USER_BIN_DIR := user/target/$(TARGET)/$(USER_MODE)
-KERNEL_RV_ELF := os/target/$(TARGET)/release/os
+RV_USER_TARGET := riscv64gc-unknown-none-elf
+LA_USER_TARGET := loongarch64-unknown-none
+RV_KERNEL_TARGET := riscv64gc-unknown-none-elf
+LA_KERNEL_TARGET := loongarch64-unknown-none
+USER_BIN_DIR_RV := user/target/$(RV_USER_TARGET)/$(USER_MODE)
+USER_BIN_DIR_LA := user/target/$(LA_USER_TARGET)/$(USER_MODE)
+KERNEL_RV_ELF := os/target/$(RV_KERNEL_TARGET)/release/os
+KERNEL_LA_ELF := os/target/$(LA_KERNEL_TARGET)/release/os
 QEMU ?= qemu-system-riscv64
 MEM ?= 1G
 SMP ?= 1
@@ -16,8 +21,10 @@ QEMU_COMP_BLK_ARGS = -drive file=$(RUN_TEST_FS),if=none,format=raw,id=x0 -device
 QEMU_COMP_EXTRA_BLK_ARGS = -drive file=disk.img,if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 
 STAMP_DIR := .make
-USER_BUILD_STAMP := $(STAMP_DIR)/user-build.stamp
-KERNEL_BUILD_STAMP := $(STAMP_DIR)/kernel-build.stamp
+USER_BUILD_STAMP_RV := $(STAMP_DIR)/user-build-rv.stamp
+USER_BUILD_STAMP_LA := $(STAMP_DIR)/user-build-la.stamp
+KERNEL_BUILD_STAMP_RV := $(STAMP_DIR)/kernel-build-rv.stamp
+KERNEL_BUILD_STAMP_LA := $(STAMP_DIR)/kernel-build-la.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
 ROOTFS_REPO := CosmOS-rootfs
@@ -66,22 +73,30 @@ cargo-config:
 $(STAMP_DIR):
 	mkdir -p $@
 
-$(USER_BUILD_STAMP): $(USER_BUILD_DEPS) | $(STAMP_DIR) cargo-config
-	$(MAKE) -C user build
+$(USER_BUILD_STAMP_RV): $(USER_BUILD_DEPS) | $(STAMP_DIR)
+	$(MAKE) -C user build ARCH=riscv64
 	touch $@
 
-user-apps: $(USER_BUILD_STAMP)
-
-$(KERNEL_BUILD_STAMP): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR) cargo-config
-	$(MAKE) -C os kernel
+$(USER_BUILD_STAMP_LA): $(USER_BUILD_DEPS) | $(STAMP_DIR)
+	$(MAKE) -C user build ARCH=loongarch64
 	touch $@
 
-kernel-rv: $(KERNEL_BUILD_STAMP)
+user-apps: $(USER_BUILD_STAMP_RV)
+user-apps-la: $(USER_BUILD_STAMP_LA)
+
+$(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR)
+	$(MAKE) -C os kernel ARCH=riscv64
+	touch $@
+
+$(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR)
+	$(MAKE) -C os kernel ARCH=loongarch64
+	touch $@
+
+kernel-rv: $(KERNEL_BUILD_STAMP_RV)
 	cp $(KERNEL_RV_ELF) $@
 
-kernel-la: kernel-rv
-	@echo "warning: LoongArch kernel is not implemented in this repository yet; using kernel-rv as a temporary placeholder." >&2
-	cp kernel-rv $@
+kernel-la: $(KERNEL_BUILD_STAMP_LA)
+	cp $(KERNEL_LA_ELF) $@
 
 rootfs:
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init

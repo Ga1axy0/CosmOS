@@ -4,7 +4,6 @@ use super::{
     VirtAddr, VirtPageNum,
 };
 use crate::config::PAGE_SIZE;
-use crate::arch::riscv::Sv39Paging;
 use crate::hal::traits::{AddressSpaceToken, PagingArch, PTEFlags};
 use alloc::string::String;
 use alloc::vec;

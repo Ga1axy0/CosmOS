@@ -71,6 +71,11 @@ pub fn machine_name() -> &'static str {
     "riscv64"
 }
 
+/// Return the platform name for display purposes.
+pub fn platform_name() -> &'static str {
+    "qemu virt"
+}
+
 /// Discover stopped harts via SBI HSM and start them on QEMU `virt`.
 pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     extern "C" {

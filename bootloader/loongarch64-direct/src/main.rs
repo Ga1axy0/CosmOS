@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(naked_functions)]
 use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
 
@@ -13,7 +14,7 @@ const KERNEL_ENTRY: usize = 0x9000_0000_9000_0000;
 #[unsafe(no_mangle)]
 static mut BOOT_STACK: [u8; 4096] = [0; 4096];
 
-#[unsafe(naked)]
+#[naked]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     naked_asm!(

@@ -62,14 +62,12 @@ pub mod trap;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use alloc::format;
+
+#[cfg(target_arch = "riscv64")]
+use crate::platform::riscv::qemu_virt::sbi::hart_get_status;
+
 const ANSI_RESET: &str = "\u{1b}[0m";
-const ANSI_FRAME: &str = "\u{1b}[38;5;45m";
-const ANSI_GLOW: &str = "\u{1b}[38;5;117m";
-const ANSI_TITLE: &str = "\u{1b}[1;38;5;159m";
-const ANSI_SUBTITLE: &str = "\u{1b}[38;5;111m";
-const ANSI_STAGE: &str = "\u{1b}[38;5;81m";
-const ANSI_DETAIL: &str = "\u{1b}[38;5;252m";
-const ANSI_ACCENT: &str = "\u{1b}[38;5;218m";
 
 /// secondary hart 在访问 `.bss` 中的全局对象前，必须先等 bootstrap hart 完成 `clear_bss()`。
 ///
@@ -99,7 +97,29 @@ fn clear_bss() {
     }
 }
 
+
+macro_rules! ansi_fg_256 {
+    ($n:literal) => {
+        concat!("\x1b[38;5;", stringify!($n), "m")
+    };
+}
+
+#[allow(non_upper_case_globals)]
+const ANSI_FRAME: &str = if cfg!(target_arch = "loongarch64") {
+    ansi_fg_256!(222)
+} else {
+    ansi_fg_256!(45)
+};
+
+#[allow(non_upper_case_globals)]
+const ANSI_GLOW: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(226) } else { ansi_fg_256!(117) };
+const ANSI_TITLE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(214) } else { ansi_fg_256!(159) };
+const ANSI_SUBTITLE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(11) } else { ansi_fg_256!(111) };
+const ANSI_STAGE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(229) } else { ansi_fg_256!(81) };
+const ANSI_DETAIL: &str = ansi_fg_256!(252);
+
 fn print_boot_splash(hart_id: usize, hart_count: usize) {
+
     const LOGO: [&str; 7] = [
         "        ______                    ____   _____                  ",
         "       / ____/___  _________ ___ / __ \\ / ___/                  ",
@@ -143,7 +163,7 @@ fn print_boot_splash(hart_id: usize, hart_count: usize) {
         "{frame}|{reset} {subtitle}{msg:<66}{reset} {frame}|{reset}",
         frame = ANSI_FRAME,
         subtitle = ANSI_SUBTITLE,
-        msg = "Target: RISC-V virt machine",
+        msg = format!("Target: {} - {}", crate::platform::machine_name(), crate::platform::platform_name()),
         reset = ANSI_RESET,
     );
     println!(
@@ -153,6 +173,7 @@ fn print_boot_splash(hart_id: usize, hart_count: usize) {
     );
     println!("");
 }
+
 fn print_boot_stage(stage: &str, detail: &str) {
     println!(
         "{stage_color}>> {stage:<12}{reset} {detail_color}{detail}{reset}",
@@ -176,13 +197,14 @@ fn init_local_hart(hart_id: usize) {
     debug!("hart {} local init done", hart_id);
 }
 /// Probe the firmware-visible hart IDs and return the number of usable harts.
+#[cfg(target_arch = "riscv64")]
 fn detect_hart_count() -> usize {
     const SBI_SUCCESS: isize = 0;
     const SBI_ERR_INVALID_PARAM: isize = -3;
 
     let mut hart_count = 0usize;
     for target_hart in 0..config::MAX_HARTS {
-        let status = sbi::hart_get_status(target_hart);
+        let status = hart_get_status(target_hart);
         if status.error == SBI_ERR_INVALID_PARAM {
             break;
         }
@@ -191,6 +213,12 @@ fn detect_hart_count() -> usize {
         }
     }
     hart_count.max(1)
+}
+
+/// Probe the usable hart count on non-RISC-V platforms.
+#[cfg(target_arch = "loongarch64")]
+fn detect_hart_count() -> usize {
+    1
 }
 
 /// 竞争并记录负责一次性全局初始化的 bootstrap hart。
