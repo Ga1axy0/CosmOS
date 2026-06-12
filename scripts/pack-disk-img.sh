@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOTFS_DIR="${1:-rootfs}"
+ROOTFS_DIR="${1:-CosmOS-rootfs/rootfs}"
 USER_BIN_DIR="${2:-user/target/riscv64gc-unknown-none-elf/release}"
 OUT_IMG="${3:-disk.img}"
 EXTRA_MIB="${EXTRA_MIB:-512}"
 MIN_SIZE_MIB="${MIN_SIZE_MIB:-1024}"
 LABEL="${LABEL:-COSMOSDISK}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+USER_APP_SRC_DIR="${USER_APP_SRC_DIR:-$PROJECT_ROOT/user/src/bin}"
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -33,6 +36,11 @@ if [ ! -d "$USER_BIN_DIR" ]; then
     exit 1
 fi
 
+if [ ! -d "$USER_APP_SRC_DIR" ]; then
+    echo "user app source directory not found: $USER_APP_SRC_DIR" >&2
+    exit 1
+fi
+
 STAGE_DIR="$(mktemp -d /tmp/pack-disk-img.XXXXXX)"
 cleanup() {
     rm -rf "$STAGE_DIR"
@@ -46,16 +54,19 @@ if [ ! -d "$STAGE_DIR/root" ]; then
     exit 1
 fi
 
-for host_path in "$USER_BIN_DIR"/*; do
-    [ -f "$host_path" ] || continue
-    [ -x "$host_path" ] || continue
+for app_src in "$USER_APP_SRC_DIR"/*.rs; do
+    [ -f "$app_src" ] || continue
 
-    name="$(basename "$host_path")"
-    case "$name" in
-        *.bin|*.elf)
-            continue
-            ;;
-    esac
+    name="$(basename "$app_src" .rs)"
+    host_path="$USER_BIN_DIR/$name"
+    if [ ! -f "$host_path" ]; then
+        echo "user app binary not found: $host_path" >&2
+        exit 1
+    fi
+    if [ ! -x "$host_path" ]; then
+        echo "user app binary is not executable: $host_path" >&2
+        exit 1
+    fi
 
     cp -f "$host_path" "$STAGE_DIR/root/$name"
 done
@@ -66,6 +77,10 @@ fi
 
 if [ -f lib/glibc/ar ] && [ -d "$STAGE_DIR/glibc/lib" ]; then
     cp -f lib/glibc/ar "$STAGE_DIR/glibc/lib/ar"
+fi
+
+if [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1" ]; then
+    ln -sf libc.so "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1"
 fi
 
 rootfs_mib="$(du -sm "$STAGE_DIR" | awk '{print $1}')"

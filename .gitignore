@@ -5,6 +5,7 @@
 !.vscode/settings.json
 .idea/*
 os/target/*
+os/.cargo/
 os/.idea/*
 os/src/link_app.S
 os/last-*
@@ -13,6 +14,7 @@ os/.gdb_history
 os/qemu-net.pcap
 user/build/*
 user/target/*
+user/.cargo/
 user/.idea/*
 user/Cargo.lock
 fs/Cargo.lock

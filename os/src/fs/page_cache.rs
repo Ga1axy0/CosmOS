@@ -144,8 +144,8 @@ impl PageMappingHandle {
     }
 
     /// 调整当前文件长度，并同步更新已有缓存页。
-    pub fn truncate(&self, new_size: usize) {
-        truncate_mapping(&self.inner, new_size);
+    pub fn truncate(&self, new_size: usize) -> Result<(), FS_ERRNO> {
+        truncate_mapping(&self.inner, new_size)
     }
 
     /// Reserve file space without forcing eager page creation.
@@ -278,10 +278,18 @@ pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRN
         if new_size < mapping.size() {
             invalidate_inode_mappings_after_truncate(inode, new_size);
         }
-        mapping.truncate(new_size);
-        return Ok(());
+        return mapping.truncate(new_size);
     }
-    inode.truncate(new_size)?;
+    if let Err(err) = inode.truncate(new_size) {
+        error!(
+            "[page_cache] truncate backing inode failed: fs_id={} ino={} new_size={} errno={}",
+            inode.fs_id(),
+            inode.ino(),
+            new_size,
+            err as i32
+        );
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -349,6 +357,35 @@ pub fn sync_inode_range(inode: &Arc<Inode>, offset: usize, len: usize) -> Result
         return Ok(());
     };
     mapping.sync_range(offset, len)
+}
+
+/// 丢弃指定 inode 的 page cache，并断开旧页 owner，防止删除后脏页迟到回写。
+pub fn discard_inode(inode: &Arc<Inode>) {
+    if !is_inode_page_cacheable(inode) {
+        return;
+    }
+    let Some(mapping) = inode.take_page_cache_state::<SpinNoIrqLock<PageMapping>>() else {
+        return;
+    };
+    let removed_pages = {
+        let mut mapping_guard = mapping.lock();
+        for page in mapping_guard.pages.values() {
+            let mut page_guard = page.lock();
+            page_guard.owner = Weak::new();
+            page_guard.state.remove(CachePageState::DIRTY | CachePageState::WRITEBACK);
+            page_guard.pin_count = page_guard.pin_count.saturating_sub(1);
+            page_guard.wait_queue.wake_all();
+        }
+        let removed_pages = mapping_guard.pages.len();
+        mapping_guard.pages.clear();
+        mapping_guard.dirty_pages.clear();
+        removed_pages
+    };
+    {
+        let mut manager = PAGE_CACHE_MANAGER.lock();
+        manager.cached_pages = manager.cached_pages.saturating_sub(removed_pages);
+        manager.mappings.remove(&InodeKey::from_inode(inode));
+    }
 }
 
 /// 返回指定页对应的 cache page；供后续 `mmap` 缺页路径复用。
@@ -513,7 +550,7 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
 }
 
 /// 调整当前 mapping 长度，并同步更新已有缓存页。
-fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) {
+fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) -> Result<(), FS_ERRNO> {
     let inode = {
         let mapping_guard = mapping.lock();
         mapping_guard
@@ -528,7 +565,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
             "[page_cache] truncate skip: old_size == new_size == {}",
             new_size
         );
-        return;
+        return Ok(());
     }
 
     debug!(
@@ -537,9 +574,17 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
         new_size
     );
 
-    // 这里底层 inode truncate 失败时直接 panic，避免 page cache 与底层长度分离。
-    if inode.truncate(new_size).is_err() {
-        panic!("page cache truncate must stay consistent with backing inode");
+    // 先让底层 inode 调整成功，再修改 page cache 视图，避免失败时两边长度分离。
+    if let Err(err) = inode.truncate(new_size) {
+        error!(
+            "[page_cache] truncate backing inode failed: fs_id={} ino={} old_size={} new_size={} errno={}",
+            inode.fs_id(),
+            inode.ino(),
+            old_size,
+            new_size,
+            err as i32
+        );
+        return Err(err);
     }
 
     let old_last_valid = old_size.saturating_sub(1);
@@ -625,6 +670,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
             }
         }
     }
+    Ok(())
 }
 
 fn fallocate_mapping(
@@ -895,15 +941,26 @@ fn flush_page(
                 page_idx,
                 valid_bytes
             );
-            let written = owner_inode.write_at(page_start(page_idx), &bytes[..valid_bytes]);
-            if written != valid_bytes {
-                error!(
-                    "[page_cache] short writeback: page_idx={} expected={} actual={}",
-                    page_idx,
-                    valid_bytes,
-                    written
-                );
-                write_ok = false;
+            match owner_inode.write_at_result(page_start(page_idx), &bytes[..valid_bytes]) {
+                Ok(written) if written == valid_bytes => {}
+                Ok(written) => {
+                    error!(
+                        "[page_cache] short writeback: page_idx={} expected={} actual={}",
+                        page_idx,
+                        valid_bytes,
+                        written
+                    );
+                    write_ok = false;
+                }
+                Err(err) => {
+                    error!(
+                        "[page_cache] writeback failed: page_idx={} expected={} errno={}",
+                        page_idx,
+                        valid_bytes,
+                        err as i32
+                    );
+                    write_ok = false;
+                }
             }
         }
 

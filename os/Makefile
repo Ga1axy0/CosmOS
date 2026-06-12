@@ -8,6 +8,7 @@ USER_MODE := release
 FS_IMG ?= ../user/target/$(TARGET)/$(USER_MODE)/fs.img
 # easyfs or fat32 or ext4
 MAIN_FS := ext4
+MEM ?= 1G
 SMP ?= 1
 # Optional prebuilt ext4 image path. When set and valid, fs-fuse clones this
 # image and injects user apps into it.
@@ -56,9 +57,10 @@ build: env kernel fs-img
 env:
 ifeq ($(OFFLINE),)
 	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
-	cargo install cargo-binutils
-	rustup component add rust-src
-	rustup component add llvm-tools-preview
+	# 评测镜像已预装 cargo-binutils；缺失时才尝试安装。
+	command -v rust-objcopy >/dev/null || cargo install cargo-binutils
+	# rust-objcopy/rust-objdump 依赖 llvm-tools-preview。
+	rustup component list --installed | grep -q "llvm-tools-preview" || rustup component add llvm-tools-preview
 endif
 
 fs-img:
@@ -116,7 +118,7 @@ fast-run: kernel
 
 run-inner:
 	@$(QEMU) \
-		-m 2G \
+		-m $(MEM) \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \
@@ -132,7 +134,7 @@ run-inner:
 
 run-inner-trace:
 	@$(QEMU) \
-		-m 512M \
+		-m $(MEM) \
 		-machine virt \
 		-smp $(SMP) \
 		-nographic \
@@ -151,14 +153,14 @@ run-inner-trace:
 debug: MODE=debug
 debug: build
 	@tmux new-session -d \
-		"$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
+		"$(QEMU) -m $(MEM) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) -s -S" && \
 		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: MODE=debug
 gdbserver: build
-	@$(QEMU) -m 512M -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+	@$(QEMU) -m $(MEM) -machine virt -smp $(SMP) -nographic -bios $(BOOTLOADER) -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 		$(QEMU_PRIMARY_BLK_ARGS) $(QEMU_EXTRA_ARGS) \
 		-s -S
 

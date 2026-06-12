@@ -1,4 +1,4 @@
-use super::{page_cache, File, Stat, StatFs64, StatMode};
+use super::{discard_inode, page_cache, File, Stat, StatFs64, StatMode};
 use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use super::tmpfs::new_tmpfs_root;
@@ -881,7 +881,18 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
         if flags & AT_REMOVEDIR != 0 {
             return Err(ERRNO::ENOTDIR);
         }
-        parent.unlink(name.as_str())?
+        // 删除普通文件前丢弃旧页，避免已经解除目录项后仍有脏页迟到回写。
+        discard_inode(&inode);
+        if let Err(err) = parent.unlink(name.as_str()) {
+            error!(
+                "[unlinkat] unlink regular file failed: cwd={} path={} name={} errno={}",
+                cwd,
+                path,
+                name,
+                err as i32
+            );
+            return Err(err.into());
+        }
     }
     Ok(())
 }

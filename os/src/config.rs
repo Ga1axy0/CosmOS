@@ -12,14 +12,16 @@ pub const MAX_KERNEL_HEAP_SIZE: usize = 0x4000_0000;
 pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
-/// physical memory end address
-pub const MEMORY_END: usize = 0x100000000;
+/// QEMU virt 1GiB 内存的物理结束地址，起始地址为 0x8000_0000。
+pub const MEMORY_END: usize = 0xC0000000;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12
 pub const PAGE_SIZE_BITS: usize = 0xc;
 /// default base address for anonymous mmap allocations
 pub const USER_MMAP_BASE: usize = 0x1000_0000;
+/// fixed load bias used for PIE main executables without an interpreter
+pub const USER_PIE_BASE: usize = 0x0020_0000;
 /// default base address for the main thread's user stack region
 pub const USER_STACK_BASE: usize = 0x0800_0000;
 /// base address for loading dynamic linker (interpreter)

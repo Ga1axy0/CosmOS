@@ -23,6 +23,7 @@ use crate::syscall::Pod;
 use core::any::Any;
 pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
+    discard_inode,
     mapping_for_inode, sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
     sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
     retain_mapped_page, PAGE_CACHE_MANAGER

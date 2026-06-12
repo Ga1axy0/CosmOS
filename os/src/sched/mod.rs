@@ -3,6 +3,7 @@
 //! This module owns CPU-local scheduling state and context switching
 //! primitives. Task and process object definitions remain under `task`.
 
+mod autogroup;
 mod api;
 mod context;
 mod policy;
@@ -10,6 +11,7 @@ mod processor;
 mod runqueue;
 mod switch;
 
+pub use autogroup::{autogroup_enabled, set_autogroup_enabled};
 pub use api::{
     block_current_and_run_next, current_task_need_resched, mark_current_task_need_resched,
     on_timer_tick, request_current_task_resched, schedule_if_needed, suspend_current_and_run_next,
