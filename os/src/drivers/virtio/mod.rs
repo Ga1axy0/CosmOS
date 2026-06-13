@@ -10,8 +10,8 @@ use virtio_drivers::{BufferDirection, Hal, PhysAddr as VirtioPhysAddr};
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    frame_alloc_contiguous, frame_dealloc_range, kernel_token, ContiguousFrames, PageTable,
-    PhysAddr as KernelPhysAddr, PhysPageNum, VirtAddr,
+    frame_alloc_contiguous, frame_dealloc_range, kernel_token, phys_to_virt, ContiguousFrames,
+    PageTable, PhysAddr as KernelPhysAddr, PhysPageNum, VirtAddr,
 };
 use crate::sync::SpinNoIrqLock;
 
@@ -35,6 +35,10 @@ struct BounceMapping {
 
 #[inline]
 fn translate_kernel_va(va: usize) -> usize {
+    if let Some(pa) = crate::platform::translate_direct_mapped_kernel_va(va) {
+        return pa;
+    }
+
     PageTable::from_token(kernel_token())
         .translate_va(VirtAddr::from(va))
         .expect("virtio: translate_va failed")
@@ -115,7 +119,8 @@ unsafe impl Hal for VirtioHal {
 
         let pa: KernelPhysAddr = ppn_base.into();
         let paddr = pa.0 as VirtioPhysAddr;
-        let vaddr = NonNull::new(pa.0 as *mut u8).expect("virtio dma_alloc: null vaddr");
+        let vaddr = NonNull::new(phys_to_virt(pa.0) as *mut u8)
+            .expect("virtio dma_alloc: null vaddr");
         QUEUE_FRAMES.lock().push(frames);
         (paddr, vaddr)
     }
@@ -142,7 +147,8 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: VirtioPhysAddr, _size: usize) -> NonNull<u8> {
-        NonNull::new(paddr as usize as *mut u8).expect("virtio mmio_phys_to_virt: null")
+        NonNull::new(crate::platform::mmio_phys_to_virt(paddr as usize) as *mut u8)
+            .expect("virtio mmio_phys_to_virt: null")
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtioPhysAddr {
@@ -162,7 +168,7 @@ unsafe impl Hal for VirtioHal {
         let base_ppn = frames.start_ppn();
         let base_pa: KernelPhysAddr = base_ppn.into();
         let base_pa_usize = base_pa.0;
-        let bounced_vaddr = base_pa_usize + page_offset;
+        let bounced_vaddr = phys_to_virt(base_pa_usize) + page_offset;
         let shared_paddr = (base_pa_usize + page_offset) as VirtioPhysAddr;
 
         if matches!(

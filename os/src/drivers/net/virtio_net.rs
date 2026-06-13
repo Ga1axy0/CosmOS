@@ -7,7 +7,7 @@ use core::hint::spin_loop;
 
 use virtio_drivers::{
     device::net::VirtIONetRaw,
-    transport::mmio::MmioTransport,
+    transport::SomeTransport,
     Error,
 };
 
@@ -28,7 +28,7 @@ const QUEUE_SIZE: usize = 16;
 pub struct VirtIONetDevice {
     irq: u32,
     mac: [u8; 6],
-    inner: SpinNoIrqLock<VirtIONetRaw<VirtioHal, MmioTransport<'static>, QUEUE_SIZE>>,
+    inner: SpinNoIrqLock<VirtIONetRaw<VirtioHal, SomeTransport<'static>, QUEUE_SIZE>>,
     tx_wait_queue: WaitQueueKeyed<u16>,
     /// TX buffers that are in-flight via non-blocking `try_send`.
     tx_slots: SpinNoIrqLock<[Option<Vec<u8>>; QUEUE_SIZE]>,
@@ -39,7 +39,7 @@ pub struct VirtIONetDevice {
 
 impl VirtIONetDevice {
     /// Try to create one device instance from an already initialized transport.
-    pub fn try_new(transport: MmioTransport<'static>, irq: u32) -> Option<Self> {
+    pub fn try_new(transport: SomeTransport<'static>, irq: u32) -> Option<Self> {
         let mut inner = VirtIONetRaw::<VirtioHal, _, QUEUE_SIZE>::new(transport).ok()?;
         let mac = inner.mac_address();
 

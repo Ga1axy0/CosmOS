@@ -43,11 +43,12 @@ pub enum PageFaultHandled {
     NotHandled,
 }
 
-pub use address::{PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END, VirtAddr, VirtPageNum};
+pub use address::{phys_to_virt, virt_to_phys, PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END, VirtAddr, VirtPageNum};
 pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_allocator_stats, frame_dealloc,
     frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
 };
+pub use heap_allocator::map_one_heap_page;
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
@@ -63,14 +64,13 @@ pub use page_table::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
     PageTableEntry, UserBuffer, UserBufferIterator,
 };
+pub use crate::hal::traits::PTEFlags;
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     frame_allocator::init_frame_allocator();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
-    // Build the kernel-heap window's page-table backbone before any virtual-window
-    // growth, so growth never recurses into the `KERNEL_SPACE` lock.
     heap_allocator::init_kernel_heap_mapping();
     heap_allocator::init_heap_virtual_window();
 }

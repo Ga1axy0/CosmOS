@@ -9,7 +9,8 @@ use alloc::string::String;
 use core::ptr;
 
 use user_lib::{
-    chdir, close, exec, execve, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid, write,
+    chdir, close, exec_ptr, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid,
+    write,
     OpenFlags, Stat,
 };
 
@@ -25,6 +26,7 @@ const BIN_DATE: &str = "/bin/date";
 const BOOT_DIR: &str = "/boot";
 const BOOT_CONFIG_PATH: &str = "/boot/config-6.6.0";
 const LIB_DIR: &str = "/lib";
+const LIB64_DIR: &str = "/lib64";
 const ETC_DIR: &str = "/etc";
 const ETC_PASSWD_PATH: &str = "/etc/passwd";
 const ETC_GROUP_PATH: &str = "/etc/group";
@@ -57,21 +59,53 @@ const MODULES_BUILTIN_PATH: &str = "/lib/modules/6.6.0/modules.builtin";
 const MODULES_DEP_PATH: &str = "/lib/modules/6.6.0/modules.dep";
 const MUSL_BUSYBOX_PATH: &str = "/musl/busybox";
 const MUSL_LEGACY_LIB_DIR: &str = "/musl/lib";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LIB_DIR: &str = "/usr/lib/riscv64-linux-musl";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LIBC_PATH: &str = "/usr/lib/riscv64-linux-musl/libc.so";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_PATH: &str = "/lib/ld-musl-riscv64-sf.so.1";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_COMPAT_PATH: &str = "/lib/ld-musl-riscv64.so.1";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_CONFIG_PATH: &str = "/etc/ld-musl-riscv64-sf.path";
+#[cfg(target_arch = "riscv64")]
 const MUSL_LD_CONFIG_CONTENT: &[u8] = b"/usr/lib/riscv64-linux-musl\n/lib\n";
+
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LIB_DIR: &str = "/usr/lib/loongarch64-linux-musl";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LIBC_PATH: &str = "/usr/lib/loongarch64-linux-musl/libc.so";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LD_PATH: &str = "/lib64/ld-musl-loongarch-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LD_CONFIG_PATH: &str = "/etc/ld-musl-loongarch-lp64d.path";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_LD_CONFIG_CONTENT: &[u8] = b"/usr/lib/loongarch64-linux-musl\n/lib\n/lib64\n";
 const GLIBC_BUSYBOX_PATH: &str = "/glibc/busybox";
 const GLIBC_BUSYBOX_TARGET: &str = "/usr/bin/glibc-busybox";
 const GLIBC_BUSYBOX_TARGET_CSTR: &str = "/usr/bin/glibc-busybox\0";
 const GLIBC_LEGACY_LIB_DIR: &str = "/glibc/lib";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LIB_DIR: &str = "/lib/riscv64-linux-gnu";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_USR_LIB_DIR: &str = "/usr/lib/riscv64-linux-gnu";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LD_NAME: &str = "ld-linux-riscv64-lp64d.so.1";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LD_TARGET: &str = "/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_LD_PATH: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LIB_DIR: &str = "/lib/loongarch64-linux-gnu";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_USR_LIB_DIR: &str = "/usr/lib/loongarch64-linux-gnu";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LD_NAME: &str = "ld-linux-loongarch-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LD_TARGET: &str = "/lib/loongarch64-linux-gnu/ld-linux-loongarch-lp64d.so.1";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_LD_PATH: &str = "/lib64/ld-linux-loongarch-lp64d.so.1";
 const ROOT_GROUPDEL: &str = "/root/groupdel";
 const ROOT_USERADD: &str = "/root/useradd";
 const ROOT_USERDEL: &str = "/root/userdel";
@@ -115,15 +149,15 @@ fn path_exists(path: &str) -> bool {
 }
 
 /// 运行一个外部程序并等待其退出。
-fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
+fn spawn_and_wait(child_exec: fn() -> isize, path_display: &str) -> i32 {
     let pid = fork();
     if pid < 0 {
-        println!("[setupsh] fork failed for {}", path);
+        println!("[setupsh] fork failed for {}", path_display);
         return -1;
     }
     if pid == 0 {
-        let ret = exec(path, argv);
-        println!("[setupsh] exec {} failed: {}", path, ret);
+        let ret = child_exec();
+        println!("[setupsh] exec {} failed: {}", path_display, ret);
         exit(127);
     }
 
@@ -139,29 +173,29 @@ fn spawn_and_wait(path: &str, argv: &[*const u8]) -> i32 {
     exit_code
 }
 
-/// 运行一个外部程序并显式传入环境变量，然后等待其退出。
-fn spawn_and_wait_with_env(path: &str, argv: &[*const u8], envp: &[*const u8]) -> i32 {
-    let pid = fork();
-    if pid < 0 {
-        println!("[setupsh] fork failed for {}", path);
-        return -1;
-    }
-    if pid == 0 {
-        let ret = execve(path, argv, envp);
-        println!("[setupsh] execve {} failed: {}", path, ret);
-        exit(127);
-    }
+fn exec_bin_busybox_install() -> isize {
+    let argv = [
+        BUSYBOX_ARG0_CSTR.as_ptr(),
+        INSTALL_ARG_CSTR.as_ptr(),
+        BIN_DIR_CSTR.as_ptr(),
+        ptr::null(),
+    ];
+    exec_ptr(BIN_BUSYBOX_CSTR.as_ptr(), &argv)
+}
 
-    let mut exit_code = 0i32;
-    let waited = waitpid(pid as usize, &mut exit_code);
-    if waited != pid {
-        println!(
-            "[setupsh] waitpid mismatch: expected {}, got {}",
-            pid, waited
-        );
-        return -1;
-    }
-    exit_code
+fn exec_glibc_busybox_install() -> isize {
+    let argv = [
+        BUSYBOX_ARG0_CSTR.as_ptr(),
+        INSTALL_ARG_CSTR.as_ptr(),
+        USR_BIN_DIR_CSTR.as_ptr(),
+        ptr::null(),
+    ];
+    exec_ptr(GLIBC_BUSYBOX_TARGET_CSTR.as_ptr(), &argv)
+}
+
+fn exec_bin_sh() -> isize {
+    let argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
+    exec_ptr(BIN_SH_CSTR.as_ptr(), &argv)
 }
 
 /// 打印阶段进度，便于观察 `setupsh` 当前执行到哪一步。
@@ -246,6 +280,16 @@ fn join_path(dir: &str, name: &str) -> String {
 /// 安装一条同名运行库硬链接。
 fn install_lib_link(src: &str, dst: &str) -> bool {
     ensure_hard_link(src, dst)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn keep_musl_compat_top_level_entry(name: &str) -> bool {
+    name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn keep_musl_compat_top_level_entry(_name: &str) -> bool {
+    false
 }
 
 /// 目标目录中已有普通文件时，认为镜像已迁移过。
@@ -350,7 +394,7 @@ fn keep_top_level_lib_entry(name: &str, dtype: u8) -> bool {
         || name == ".."
         || name == "ar"
         || name == MUSL_LD_PATH.trim_start_matches('/')
-        || name == MUSL_LD_COMPAT_PATH.trim_start_matches('/')
+        || keep_musl_compat_top_level_entry(name)
         || name == GLIBC_LD_PATH.trim_start_matches('/')
 }
 
@@ -412,6 +456,7 @@ fn ensure_dirs() -> bool {
         LIB_DIR,
         MODULES_ROOT_DIR,
         MODULES_DIR,
+        LIB64_DIR,
         ETC_DIR,
         HOME_DIR,
         ROOT_HOME_DIR,
@@ -427,6 +472,26 @@ fn ensure_dirs() -> bool {
         GLIBC_USR_LIB_DIR,
     ] {
         if !ensure_dir(dir) {
+            return false;
+        }
+    }
+    true
+}
+
+fn install_loader_links() -> bool {
+    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
+        return false;
+    }
+    if !ensure_hard_link(GLIBC_LD_TARGET, GLIBC_LD_PATH) {
+        println!(
+            "[setupsh] glibc loader must exist as {} in {}",
+            GLIBC_LD_NAME, GLIBC_LIB_DIR
+        );
+        return false;
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_COMPAT_PATH) {
             return false;
         }
     }
@@ -480,23 +545,6 @@ fn install_ltp_env_scripts() -> bool {
     true
 }
 
-fn install_loader_links() -> bool {
-    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_PATH) {
-        return false;
-    }
-    if !ensure_hard_link(MUSL_LIBC_PATH, MUSL_LD_COMPAT_PATH) {
-        return false;
-    }
-    if !ensure_hard_link(GLIBC_LD_TARGET, GLIBC_LD_PATH) {
-        println!(
-            "[setupsh] glibc loader must exist as {} in {}",
-            GLIBC_LD_NAME, GLIBC_LIB_DIR
-        );
-        return false;
-    }
-    true
-}
-
 fn install_busybox_entries() -> bool {
     if !ensure_hard_link(MUSL_BUSYBOX_PATH, BIN_BUSYBOX) {
         return false;
@@ -526,13 +574,7 @@ fn install_kernel_module_metadata() -> bool {
 
 fn install_busybox_applets() -> bool {
     if !path_exists("/bin/sh") {
-        let musl_install_argv = [
-            BUSYBOX_ARG0_CSTR.as_ptr(),
-            INSTALL_ARG_CSTR.as_ptr(),
-            BIN_DIR_CSTR.as_ptr(),
-            ptr::null(),
-        ];
-        let install_exit = spawn_and_wait(BIN_BUSYBOX_CSTR, &musl_install_argv);
+        let install_exit = spawn_and_wait(exec_bin_busybox_install, BIN_BUSYBOX);
         if install_exit != 0 {
             println!("[setupsh] musl busybox --install failed: {}", install_exit);
             return false;
@@ -540,13 +582,7 @@ fn install_busybox_applets() -> bool {
     }
 
     if !path_exists("/usr/bin/sh") {
-        let glibc_install_argv = [
-            BUSYBOX_ARG0_CSTR.as_ptr(),
-            INSTALL_ARG_CSTR.as_ptr(),
-            USR_BIN_DIR_CSTR.as_ptr(),
-            ptr::null(),
-        ];
-        let install_exit = spawn_and_wait(GLIBC_BUSYBOX_TARGET_CSTR, &glibc_install_argv);
+        let install_exit = spawn_and_wait(exec_glibc_busybox_install, GLIBC_BUSYBOX_TARGET);
         if install_exit != 0 {
             println!("[setupsh] glibc busybox --install failed: {}", install_exit);
             return false;
@@ -680,9 +716,7 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
             ROOT_HOME_DIR, chdir_ret
         );
     }
-    let shell_argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
-    let shell_envp = [SHELL_PATH_ENV_CSTR.as_ptr(), ptr::null()];
-    let shell_exit = spawn_and_wait_with_env(BIN_SH_CSTR, &shell_argv, &shell_envp);
+    let shell_exit = spawn_and_wait(exec_bin_sh, "/bin/sh");
     println!("[setupsh] /bin/sh exited with {}", shell_exit);
     shell_exit
 }

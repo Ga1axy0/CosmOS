@@ -12,7 +12,13 @@ use core::convert::TryFrom;
 use fs::BlockDevice;
 use lazy_static::*;
 use core::ptr::NonNull;
-use virtio_drivers::transport::{DeviceType, mmio::{MmioTransport, VirtIOHeader}};
+use virtio_drivers::transport::{
+    DeviceType, SomeTransport,
+    mmio::{MmioTransport, VirtIOHeader},
+};
+use crate::platform::{
+    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+};
 
 fn virtio_blk_name(idx: usize) -> String {
     alloc::format!("vd{}", (b'a' + idx as u8) as char)
@@ -61,11 +67,6 @@ lazy_static! {
 ///
 /// Must be called **before** `fs::init_rootfs` and `fs::init_dev`.
 pub fn probe_block_devices() {
-    const VIRTIO_MMIO_BASE:   usize = 0x1000_1000;
-    const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-    const VIRTIO_MMIO_SLOTS:  usize = 8;
-    const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
-
     let mut map = BLOCK_DEVICES.lock();
     let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut idx = 0usize;
@@ -88,7 +89,7 @@ pub fn probe_block_devices() {
             Err(_) => continue,
         };
 
-        if let Some(dev) = VirtIOBlock::try_new(transport) {
+        if let Some(dev) = VirtIOBlock::try_new(SomeTransport::from(transport)) {
             let dev = Arc::new(dev);
             // let name = alloc::format!("vd{}", (b'a' + idx as u8) as char);
             let name = virtio_blk_name(idx);

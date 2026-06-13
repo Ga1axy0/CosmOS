@@ -17,9 +17,3 @@ lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 opt-level = "z" # Optimize for size.
 strip = true    # Automatically strip symbols from the binary.
 lto = true
-
-[target.riscv64gc-unknown-none-elf]
-rustflags = [
-    "-C", "link-arg=-Tsrc/linker.ld",
-    "-C", "target-feature=+f,+d",
-]

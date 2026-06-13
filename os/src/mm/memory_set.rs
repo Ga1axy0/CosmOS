@@ -1,8 +1,7 @@
 //! Address Space [`MemorySet`] management of Process
 
 use super::{frame_alloc, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
-use super::page_table::PTEFlags;
-use super::{PageTable, PageTableEntry};
+use super::{PageTable, PageTableEntry, PTEFlags};
 use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
@@ -13,6 +12,8 @@ use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
     FileDescription,
 };
+use crate::hal::ArchTrapMachine;
+use crate::hal::traits::{AddressSpaceToken, TrapMachine};
 use crate::sync::SpinNoIrqLock;
 use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
@@ -21,11 +22,9 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::Inode;
 use lazy_static::*;
-use riscv::register::satp;
 
 extern "C" {
     fn stext();
@@ -39,15 +38,6 @@ extern "C" {
     fn ekernel();
     fn strampoline();
 }
-
-/// 用户态 rt_sigreturn trampoline 机器码。
-///
-/// RISC-V Linux 不依赖用户提供 `SA_RESTORER`，handler 返回后跳到这里执行
-/// `rt_sigreturn` 系统调用。
-const USER_VDSO_CODE: [u8; 8] = [
-    0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 139
-    0x73, 0x00, 0x00, 0x00, // ecall
-];
 
 /// ELF 加载结果，包含动态链接所需的额外信息
 pub struct ElfLoadInfo {
@@ -76,7 +66,7 @@ lazy_static! {
 }
 
 /// the kernel token
-pub fn kernel_token() -> usize {
+pub fn kernel_token() -> AddressSpaceToken {
     KERNEL_SPACE.lock().token()
 }
 /// 用于稳定标识一个底层 inode。
@@ -457,19 +447,36 @@ impl DeferredUserReclaim {
                 self.token,
                 self.mask
             );
-            shootdown(self.mask, ShootdownKind::AddressSpace { satp: self.token });
+            shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
         }
         // self 在函数返回时析构，batch 的 Drop 会真正释放旧页引用。
     }
 }
 
 impl MemorySet {
+    fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {
+        let mut flags = PTEFlags::empty();
+        if map_perm.contains(MapPermission::R) {
+            flags.insert(PTEFlags::R);
+        }
+        if map_perm.contains(MapPermission::W) {
+            flags.insert(PTEFlags::W);
+        }
+        if map_perm.contains(MapPermission::X) {
+            flags.insert(PTEFlags::X);
+        }
+        if map_perm.contains(MapPermission::U) {
+            flags.insert(PTEFlags::U);
+        }
+        crate::hal::normalize_leaf_pte_flags(flags)
+    }
+
     /// 完成一次会返回延迟回收 batch 的本地页表修改。
     fn finish_deferred_page_table_edit(&self) {
         // 本地 hart 可能刚刚使用过被拆除的翻译，必须先清掉本地 TLB；
         // 远端 hart 的同步由调用方构造 `DeferredUserReclaim` 后在锁外完成。
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
     }
 
@@ -482,7 +489,7 @@ impl MemorySet {
         }
     }
     /// Get he page table token
-    pub fn token(&self) -> usize {
+    pub fn token(&self) -> AddressSpaceToken {
         self.page_table.token()
     }
     /// 标记某个 hart 即将返回用户态并装载该地址空间。
@@ -539,7 +546,7 @@ impl MemorySet {
             self.token(),
             mask
         );
-        shootdown(mask, ShootdownKind::AddressSpace { satp: self.token() });
+        shootdown(mask, ShootdownKind::AddressSpace { token: self.token() });
     }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
@@ -558,7 +565,7 @@ impl MemorySet {
         let start_va = VirtAddr::from(USER_VDSO_BASE);
         let end_va = VirtAddr::from(USER_VDSO_BASE + PAGE_SIZE);
         let vma = Vma::new_vdso(start_va, end_va);
-        self.insert_vma(vma, Some(&USER_VDSO_CODE))
+        self.insert_vma(vma, Some(ArchTrapMachine::rt_sigreturn_trampoline()))
     }
     /// 根据起始虚拟页号删除一段用户区域，并延迟释放拆下的旧页对象。
     pub(crate) fn remove_vma_with_start_vpn_user_deferred(
@@ -792,10 +799,12 @@ impl MemorySet {
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
+        let trampoline_pa = crate::platform::direct_map_virt_to_phys(strampoline as usize);
+
         self.page_table
             .map(
             VirtAddr::from(TRAMPOLINE).into(),
-            PhysAddr::from(strampoline as usize).into(),
+            PhysAddr::from(trampoline_pa).into(),
             PTEFlags::R | PTEFlags::X,
         )
             .expect("failed to map trampoline");
@@ -805,6 +814,11 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
+        // On LoongArch, kernel sections / physical memory / MMIO are covered by
+        // DMW windows, but trap trampoline and task kernel stacks live in the
+        // low-half page-table space and are mapped explicitly.
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
         // map kernel sections
         info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
         info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
@@ -893,6 +907,7 @@ impl MemorySet {
             )
                 .expect("failed to map mmio window");
         }
+        } // end #[cfg(not(loongarch64))]
         memory_set
     }
     /// Include ELF segments and trampoline, and compute initial process VM layout.
@@ -1122,18 +1137,16 @@ impl MemorySet {
         }
         if parent_tlb_needs_flush {
             unsafe {
-                asm!("sfence.vma");
+                crate::hal::flush_tlb();
             }
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
         Ok((memory_set, parent_tlb_needs_flush))
     }
-    /// Change page table by writing satp CSR Register.
+    /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
-        let satp = self.page_table.token();
         unsafe {
-            satp::write(satp);
-            asm!("sfence.vma");
+            crate::hal::activate_address_space(self.page_table.token());
         }
     }
     /// Translate a virtual page number to a page table entry
@@ -1159,7 +1172,7 @@ impl MemorySet {
         }
         self.vmas.clear();
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
     }
 
@@ -1258,7 +1271,7 @@ impl MemorySet {
         if let Some(area) = self.vmas.get_mut(&start.floor()) {
             area.shrink_present_to(&mut self.page_table, new_end.ceil());
             unsafe {
-                asm!("sfence.vma");
+                crate::hal::flush_tlb();
             }
             true
         } else {
@@ -1323,7 +1336,7 @@ impl MemorySet {
         );
         self.register_vma_metadata(Vma::new_anonymous(start_va, end_va, permission))?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         Ok(())
     }
@@ -1352,7 +1365,7 @@ impl MemorySet {
             None,
         )?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         Ok(())
     }
@@ -1529,7 +1542,7 @@ impl MemorySet {
                 ppn
             }
         };
-        let pte_flags = PTEFlags::from_bits(map_perm.bits).unwrap();
+        let pte_flags = Self::map_perm_to_pte_flags(map_perm);
         self.page_table.map(vpn, ppn, pte_flags)?;
         Ok(())
     }
@@ -1554,7 +1567,7 @@ impl MemorySet {
         }
         self.map_private_page_in_vma(vpn)?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         Ok(PageFaultHandled::Handled)
     }
@@ -1571,7 +1584,7 @@ impl MemorySet {
         if !self.can_commit_file_page_fault(plan) {
             return Ok(PageFaultHandled::NotHandled);
         }
-        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
         if plan.shared
             && plan.map_perm.contains(MapPermission::W)
             && plan.access != PageFaultAccess::Write
@@ -1594,7 +1607,7 @@ impl MemorySet {
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} writable={} path={:?}",
@@ -1658,7 +1671,7 @@ impl MemorySet {
         if !self.can_commit_file_page_fault(plan) {
             return Ok(PageFaultHandled::NotHandled);
         }
-        let mut pte_flags = PTEFlags::from_bits(plan.map_perm.bits).unwrap();
+        let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
         pte_flags.remove(PTEFlags::W);
         pte_flags.remove(PTEFlags::D);
         let ppn = page.lock().ppn();
@@ -1671,7 +1684,7 @@ impl MemorySet {
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[cow] install MAP_PRIVATE readonly cache page: vpn={:#x} page_idx={} ppn={:#x} access={:?} path={:?}",
@@ -1719,7 +1732,7 @@ impl MemorySet {
         // 首次写 fault 时立即把 page cache 页记脏，避免等待 teardown 才传播脏状态。
         mark_cached_page_dirty(&page);
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[mmap] shared write-notify fault: vpn={:#x} ppn={:#x} path={:?}",
@@ -1892,7 +1905,7 @@ impl MemorySet {
         let src = page_guard.ppn().get_bytes_array();
         dst.copy_from_slice(src);
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         debug!(
             "[cow] materialize MAP_PRIVATE page on first write fault: vpn={:#x} page_idx={} dst_ppn={:#x} path={:?}",
@@ -2036,7 +2049,7 @@ impl MemorySet {
                 };
 
                 // update middle pages' PTE flags
-                let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
+                let pte_flags = Self::map_perm_to_pte_flags(permission);
                 for vpn in VPNRange::new(overlap_start, overlap_end) {
                     if self.page_table.translate(vpn).is_some() {
                         self.page_table.update_flags(vpn, pte_flags);
@@ -2049,7 +2062,7 @@ impl MemorySet {
                 new_areas.push(right_area);
             } else {
                 // no right split, area becomes the middle area
-                let pte_flags = PTEFlags::from_bits(permission.bits).unwrap();
+                let pte_flags = Self::map_perm_to_pte_flags(permission);
                 for vpn in VPNRange::new(overlap_start, overlap_end) {
                     if self.page_table.translate(vpn).is_some() {
                         self.page_table.update_flags(vpn, pte_flags);
@@ -2064,7 +2077,7 @@ impl MemorySet {
         self.rebuild_vmas_from_vec(new_areas);
         self.merge_adjacent_vmas();
         unsafe {
-            asm!("sfence.vma");
+            crate::hal::flush_tlb();
         }
         true
     }
@@ -2240,11 +2253,13 @@ impl Vma {
     }
     /// 为某个线程生成 Trap 上下文页对应的区域描述。
     pub fn new_trap_context(start_va: VirtAddr, end_va: VirtAddr, tid: usize) -> Self {
+        let map_perm =
+            MapPermission::from_bits_truncate(crate::hal::trap_context_flags().bits() as u8);
         Self::new(
             start_va,
             end_va,
             MapType::Framed,
-            MapPermission::R | MapPermission::W,
+            map_perm,
             VmaKind::TrapContext { tid },
         )
     }
@@ -2535,7 +2550,7 @@ impl Vma {
                 self.data_frames.insert(vpn, page);
             }
         }
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        let pte_flags = MemorySet::map_perm_to_pte_flags(self.map_perm);
         page_table.map(vpn, ppn, pte_flags)?;
         Ok(())
     }

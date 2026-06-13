@@ -1,9 +1,8 @@
 //! Kernel console output helpers.
-use crate::{drivers::chardev::{CharDevice, UART}};
+use crate::drivers::chardev::{CharDevice, UART};
 use core::fmt::{self, Write};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, Ordering};
-use riscv::register::sstatus;
 
 /// 串行化所有 hart 的控制台输出，避免多个 hart 同时逐字符写 UART 时互相穿插。
 static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
@@ -21,6 +20,15 @@ impl Write for Stdout {
     }
 }
 
+struct EarlyStdout;
+
+impl Write for EarlyStdout {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        crate::platform::early_console_write(s);
+        Ok(())
+    }
+}
+
 /// 控制台输出期间的临界区守卫。
 ///
 /// 它同时负责两件事：
@@ -34,8 +42,8 @@ struct ConsoleGuard {
 impl ConsoleGuard {
     /// 获取控制台输出锁。
     fn lock() -> Self {
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
+        let sie_was_enabled = crate::hal::local_irqs_enabled();
+        unsafe { crate::hal::disable_local_irqs() };
         while CONSOLE_LOCK
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
@@ -50,13 +58,17 @@ impl Drop for ConsoleGuard {
     fn drop(&mut self) {
         CONSOLE_LOCK.store(false, Ordering::Release);
         if self.sie_was_enabled {
-            unsafe { sstatus::set_sie() };
+            unsafe { crate::hal::enable_local_irqs() };
         }
     }
 }
 /// print to the host console using the format string and arguments.
 pub fn print(args: fmt::Arguments) {
     let _guard = ConsoleGuard::lock();
+    if crate::platform::use_early_console() {
+        EarlyStdout.write_fmt(args).unwrap();
+        return;
+    }
     Stdout.write_fmt(args).unwrap();
 }
 

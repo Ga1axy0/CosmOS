@@ -11,7 +11,7 @@
 //! - [`fs`]: Separate user from file system with some structures
 //!
 //! The operating system also starts in this module. Kernel code starts
-//! executing from `entry.asm`, after which [`rust_main()`] is called to
+//! executing from the architecture entry assembly, after which [`rust_main()`] is called to
 //! initialize various pieces of functionality. (See its source code for
 //! details.)
 //!
@@ -25,6 +25,7 @@
 #![feature(panic_info_message)]
 #![feature(alloc_error_handler)]
 
+
 #[macro_use]
 extern crate log;
 
@@ -33,15 +34,15 @@ extern crate alloc;
 #[macro_use]
 extern crate bitflags;
 
-#[path = "boards/qemu.rs"]
-mod board;
+pub mod arch;
+pub mod hal;
+pub mod platform;
 
 #[macro_use]
 mod console;
 pub mod config;
 pub mod drivers;
 pub mod fs;
-pub mod hart;
 pub mod ipc;
 pub mod keys;
 pub mod lang_items;
@@ -59,20 +60,15 @@ pub mod task;
 pub mod timer;
 pub mod trap;
 
-use core::arch::global_asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-global_asm!(include_str!("entry.asm"));
+use alloc::format;
+
+#[cfg(target_arch = "riscv64")]
+use crate::platform::riscv::qemu_virt::sbi::hart_get_status;
 
 const ANSI_RESET: &str = "\u{1b}[0m";
-const ANSI_FRAME: &str = "\u{1b}[38;5;45m";
-const ANSI_GLOW: &str = "\u{1b}[38;5;117m";
-const ANSI_TITLE: &str = "\u{1b}[1;38;5;159m";
-const ANSI_SUBTITLE: &str = "\u{1b}[38;5;111m";
-const ANSI_STAGE: &str = "\u{1b}[38;5;81m";
-const ANSI_DETAIL: &str = "\u{1b}[38;5;252m";
-const ANSI_ACCENT: &str = "\u{1b}[38;5;218m";
 
 /// secondary hart 在访问 `.bss` 中的全局对象前，必须先等 bootstrap hart 完成 `clear_bss()`。
 ///
@@ -102,7 +98,29 @@ fn clear_bss() {
     }
 }
 
+
+macro_rules! ansi_fg_256 {
+    ($n:literal) => {
+        concat!("\x1b[38;5;", stringify!($n), "m")
+    };
+}
+
+#[allow(non_upper_case_globals)]
+const ANSI_FRAME: &str = if cfg!(target_arch = "loongarch64") {
+    ansi_fg_256!(222)
+} else {
+    ansi_fg_256!(45)
+};
+
+#[allow(non_upper_case_globals)]
+const ANSI_GLOW: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(226) } else { ansi_fg_256!(117) };
+const ANSI_TITLE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(214) } else { ansi_fg_256!(159) };
+const ANSI_SUBTITLE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(11) } else { ansi_fg_256!(111) };
+const ANSI_STAGE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(229) } else { ansi_fg_256!(81) };
+const ANSI_DETAIL: &str = ansi_fg_256!(252);
+
 fn print_boot_splash(hart_id: usize, hart_count: usize) {
+
     const LOGO: [&str; 7] = [
         "        ______                    ____   _____                  ",
         "       / ____/___  _________ ___ / __ \\ / ___/                  ",
@@ -146,7 +164,7 @@ fn print_boot_splash(hart_id: usize, hart_count: usize) {
         "{frame}|{reset} {subtitle}{msg:<66}{reset} {frame}|{reset}",
         frame = ANSI_FRAME,
         subtitle = ANSI_SUBTITLE,
-        msg = "Target: RISC-V virt machine",
+        msg = format!("Target: {} - {}", crate::platform::machine_name(), crate::platform::platform_name()),
         reset = ANSI_RESET,
     );
     println!(
@@ -156,6 +174,7 @@ fn print_boot_splash(hart_id: usize, hart_count: usize) {
     );
     println!("");
 }
+
 fn print_boot_stage(stage: &str, detail: &str) {
     println!(
         "{stage_color}>> {stage:<12}{reset} {detail_color}{detail}{reset}",
@@ -173,18 +192,20 @@ fn print_boot_stage(stage: &str, detail: &str) {
 fn init_local_hart(hart_id: usize) {
     trap::init_hart();
     timer::init_hart();
-    drivers::plic::init_hart(hart_id);
+    crate::platform::init_local_hart();
+    crate::platform::init_external_irq_hart(hart_id);
     mm::mark_online(hart_id);
     debug!("hart {} local init done", hart_id);
 }
 /// Probe the firmware-visible hart IDs and return the number of usable harts.
+#[cfg(target_arch = "riscv64")]
 fn detect_hart_count() -> usize {
     const SBI_SUCCESS: isize = 0;
     const SBI_ERR_INVALID_PARAM: isize = -3;
 
     let mut hart_count = 0usize;
     for target_hart in 0..config::MAX_HARTS {
-        let status = sbi::hart_get_status(target_hart);
+        let status = hart_get_status(target_hart);
         if status.error == SBI_ERR_INVALID_PARAM {
             break;
         }
@@ -195,69 +216,10 @@ fn detect_hart_count() -> usize {
     hart_count.max(1)
 }
 
-/// 记录当前环境下各 hart 的 HSM 状态，并尝试拉起处于 stopped 状态的 hart。
-///
-/// 这里的目标不是“盲目对所有 hart 重复 `hart_start`”，而是先看清固件报告的
-/// 状态，再只对明确处于 `Stopped` 的 hart 发起启动请求。
-fn probe_and_start_other_harts(bootstrap_hart_id: usize) {
-    extern "C" {
-        fn _start();
-    }
-
-    const SBI_SUCCESS: isize = 0;
-    const SBI_ERR_INVALID_PARAM: isize = -3;
-    const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
-
-    info!(
-        "hart {} entering HSM probe/start loop",
-        bootstrap_hart_id
-    );
-
-    for target_hart in 0..config::MAX_HARTS {
-        let status = sbi::hart_get_status(target_hart);
-        if status.error == SBI_ERR_INVALID_PARAM {
-            info!(
-                "hart {} got invalid hart id while probing hart {}, stop scan",
-                bootstrap_hart_id, target_hart
-            );
-            break;
-        }
-        if status.error != SBI_SUCCESS {
-            info!(
-                "hart {} HSM status query for hart {} failed: error={}, value={}",
-                bootstrap_hart_id, target_hart, status.error, status.value
-            );
-            continue;
-        }
-
-        let state = sbi::hart_state(status.value);
-        info!(
-            "hart {} sees hart {} in HSM state {:?}",
-            bootstrap_hart_id, target_hart, state
-        );
-
-        if target_hart == bootstrap_hart_id {
-            continue;
-        }
-
-        if let sbi::HartState::Stopped = state {
-            let ret = sbi::hart_start(target_hart, _start as usize, 0);
-            match ret.error {
-                SBI_SUCCESS => info!(
-                    "hart {} requested startup for hart {}",
-                    bootstrap_hart_id, target_hart
-                ),
-                SBI_ERR_ALREADY_AVAILABLE => info!(
-                    "hart {} found hart {} already available while starting",
-                    bootstrap_hart_id, target_hart
-                ),
-                error => info!(
-                    "hart {} failed to start hart {}: error={}, value={}",
-                    bootstrap_hart_id, target_hart, error, ret.value
-                ),
-            }
-        }
-    }
+/// Probe the usable hart count on non-RISC-V platforms.
+#[cfg(target_arch = "loongarch64")]
+fn detect_hart_count() -> usize {
+    1
 }
 
 /// 竞争并记录负责一次性全局初始化的 bootstrap hart。
@@ -288,8 +250,10 @@ fn wait_for_bootstrap() {
 fn first_hart_main(hart_id: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
+    // Install TLB refill handler and page-walker CSRs before activating page tables.
+    trap::init();
     mm::init();
-    mm::remap_test();
+    // mm::remap_test();
     klog::init();
     let hart_count = detect_hart_count();
     print_boot_splash(hart_id, hart_count);
@@ -297,6 +261,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     info!("hart {} boot", hart_id);
     info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
+    platform::init();
     print_boot_stage("devices", "virtio buses enumerated");
     net::init();
     print_boot_stage("network", "smoltcp stack synchronized");
@@ -304,7 +269,7 @@ fn first_hart_main(hart_id: usize) -> ! {
     print_boot_stage("storage", "root filesystem mounted");
     timer::init_realtime_offset_from_rtc();
     print_boot_stage("clock", "realtime source calibrated");
-    probe_and_start_other_harts(hart_id);
+    platform::start_secondary_harts(hart_id);
     init_local_hart(hart_id);
     print_boot_stage("scheduler", "bootstrap hart entering run queue");
     task::add_initproc();
@@ -322,7 +287,7 @@ fn first_hart_main(hart_id: usize) -> ! {
 fn secondary_hart_main(hart_id: usize) -> ! {
     wait_for_bootstrap();
     mm::activate_kernel_space();    // 激活内核页表：但 satp 是 per-hart 寄存器
-    info!("hart {} boot", hart_id);
+    info!("hart {} entered secondary_hart_main", hart_id);
     init_local_hart(hart_id);
     debug!("hart {} entered scheduler", hart_id);
     sched::run_tasks();
@@ -335,10 +300,7 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 /// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
 pub fn rust_main(hart_id: usize) -> ! {
-    let _hart_id = hart::init_with_hartid(hart_id);
-    unsafe {
-        riscv::register::sstatus::set_fs(riscv::register::mstatus::FS::Initial);
-    }
+    unsafe { crate::hal::init_with_hartid(hart_id) };
     if !try_claim_bootstrap_hart(hart_id) {
         secondary_hart_main(hart_id);
     } else {

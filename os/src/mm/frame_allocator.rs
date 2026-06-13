@@ -1,6 +1,6 @@
 //! Physical page frame allocator
 
-use super::{PhysAddr, PhysPageNum};
+use super::{virt_to_phys, PhysAddr, PhysPageNum};
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::mm::heap_allocator::KERNEL_HEAP_BYTES;
 use crate::{config::MEMORY_END, sync::SpinNoIrqLock};
@@ -279,7 +279,7 @@ pub fn init_frame_allocator() {
         fn ekernel();
     }
     FRAME_ALLOCATOR.lock().init(
-        PhysAddr::from(ekernel as usize).ceil(),
+        PhysAddr::from(virt_to_phys(ekernel as usize)).ceil(),
         PhysAddr::from(MEMORY_END).floor(),
     );
 }

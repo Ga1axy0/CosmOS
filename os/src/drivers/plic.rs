@@ -5,7 +5,7 @@ use core::ptr::{read_volatile, write_volatile};
 use crate::bootstrap_hart_id;
 use crate::config::MAX_HARTS;
 use crate::drivers::chardev::{CharDevice, UART};
-use crate::hart::hartid;
+use crate::hal::hartid;
 use crate::sync::SpinNoIrqLock;
 use lazy_static::*;
 

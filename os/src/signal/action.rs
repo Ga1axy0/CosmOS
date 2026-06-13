@@ -1,5 +1,6 @@
 use crate::signal::signals::MAX_SIG;
 use crate::syscall::Pod;
+use crate::trap::TrapContext;
 
 /// Action for a signal (Linux rt_sigaction layout)
 #[repr(C)]
@@ -183,6 +184,20 @@ impl Default for FpState {
 
 impl Pod for FpState {}
 
+impl FpState {
+    /// Build an fp-state blob from the saved trap context.
+    pub fn from_trap_context(trap_cx: &TrapContext) -> Self {
+        let mut fpstate = Self::default();
+        trap_cx.copy_fp_state_to(&mut fpstate.fpregs, &mut fpstate.fcsr);
+        fpstate
+    }
+
+    /// Restore floating-point state into the saved trap context.
+    pub fn apply_to_trap_context(&self, trap_cx: &mut TrapContext) {
+        trap_cx.restore_fp_state(&self.fpregs, self.fcsr);
+    }
+}
+
 /// riscv64 Linux `mcontext_t`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +209,22 @@ pub struct MContext {
 }
 
 impl Pod for MContext {}
+
+impl MContext {
+    /// Build a Linux-compatible machine context from the saved trap context.
+    pub fn from_trap_context(trap_cx: &TrapContext) -> Self {
+        Self {
+            gregs: trap_cx.export_signal_gprs(),
+            fpstate: FpState::from_trap_context(trap_cx),
+        }
+    }
+
+    /// Restore a Linux-compatible machine context into the saved trap context.
+    pub fn apply_to_trap_context(&self, trap_cx: &mut TrapContext) {
+        trap_cx.import_signal_gprs(&self.gregs);
+        self.fpstate.apply_to_trap_context(trap_cx);
+    }
+}
 
 /// ucontext_t structure
 #[repr(C)]

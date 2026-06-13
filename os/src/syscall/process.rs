@@ -7,7 +7,7 @@ use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
-    hart::hartid,
+    hal::hartid,
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
@@ -754,13 +754,13 @@ pub fn sys_clone(
                 }
                 let trap_cx = new_inner.get_trap_cx();
                 *trap_cx = inherited_cx;
-                trap_cx.kernel_sp = new_task.kstack.get_top();
-                trap_cx.x[10] = 0;
+                trap_cx.set_kernel_sp(new_task.kstack.get_top());
+                trap_cx.set_syscall_ret(0);
                 if stack != 0 {
-                    trap_cx.x[2] = stack;
+                    trap_cx.set_user_sp(stack);
                 }
                 if let Some(tls) = child_tls {
-                    trap_cx.x[4] = tls;
+                    trap_cx.set_tls(tls);
                 }
                 if let Some(ptr) = child_set_tid {
                     write_pod_to_user(ptr as *mut i32, &new_tid)?;
@@ -1225,7 +1225,7 @@ impl UtsName {
         let nodename = b"localhost";
         let release = b"6.6.0";
         let version = b"#1 SMP PREEMPT cosmOS";
-        let machine = b"riscv64";
+        let machine = crate::platform::machine_name().as_bytes();
         let domainname = b"localdomain";
         uname.sysname[..sysname.len()].copy_from_slice(sysname);
         uname.nodename[..nodename.len()].copy_from_slice(nodename);

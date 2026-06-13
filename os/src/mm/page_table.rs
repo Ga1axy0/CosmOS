@@ -4,24 +4,10 @@ use super::{
     VirtAddr, VirtPageNum,
 };
 use crate::config::PAGE_SIZE;
+use crate::hal::traits::{AddressSpaceToken, PagingArch, PTEFlags};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use bitflags::*;
-
-bitflags! {
-    /// page table entry flags
-    pub struct PTEFlags: u8 {
-        const V = 1 << 0;
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-        const G = 1 << 5;
-        const A = 1 << 6;
-        const D = 1 << 7;
-    }
-}
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -35,7 +21,7 @@ impl PageTableEntry {
     /// Create a new page table entry
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: crate::hal::make_pte(ppn.0, flags),
         }
     }
     /// Create an empty page table entry
@@ -44,15 +30,15 @@ impl PageTableEntry {
     }
     /// Get the physical page number from the page table entry
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        crate::hal::pte_ppn(self.bits).into()
     }
     /// Get the flags from the page table entry
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap()
+        crate::hal::pte_flags(self.bits)
     }
     /// The page pointered by page table entry is valid?
     pub fn is_valid(&self) -> bool {
-        (self.flags() & PTEFlags::V) != PTEFlags::empty()
+        crate::hal::pte_is_valid(self.bits)
     }
     /// The page pointered by page table entry is readable?
     pub fn readable(&self) -> bool {
@@ -88,69 +74,66 @@ impl PageTable {
         })
     }
     /// Temporarily used to get arguments from user space.
-    pub fn from_token(satp: usize) -> Self {
+    pub fn from_token(token: AddressSpaceToken) -> Self {
         Self {
-            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
+            root_ppn: PhysPageNum::from(crate::hal::root_ppn_from_token(token)),
             frames: Vec::new(),
         }
     }
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Result<Option<&mut PageTableEntry>, MmError> {
-        let idxs = vpn.indexes();
+        let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+        for level in 0..levels {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &mut ppn.get_pte_array()[idx];
+            if level + 1 == levels {
+                return Ok(Some(pte));
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
         }
-        Ok(result)
+        Ok(None)
     }
     fn find_pte_create_untracked(
         &mut self,
         vpn: VirtPageNum,
     ) -> Result<Option<&mut PageTableEntry>, MmError> {
-        let idxs = vpn.indexes();
+        let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+        for level in 0..levels {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &mut ppn.get_pte_array()[idx];
+            if level + 1 == levels {
+                return Ok(Some(pte));
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 core::mem::forget(frame);
             }
             ppn = pte.ppn();
         }
-        Ok(result)
+        Ok(None)
     }
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
-        let idxs = vpn.indexes();
+        let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                result = Some(pte);
-                break;
+        for level in 0..levels {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &mut ppn.get_pte_array()[idx];
+            if level + 1 == levels {
+                return Some(pte);
             }
             if !pte.is_valid() {
                 return None;
             }
             ppn = pte.ppn();
         }
-        result
+        None
     }
     /// set the map between virtual page number and physical page number
     #[allow(unused)]
@@ -179,19 +162,24 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         Ok(())
     }
-    /// Ensure the level-1 (1GiB-granularity) intermediate table covering `vpn`
+    /// Ensure the first-level subtree table under the root covering `vpn`
     /// exists, creating it untracked if necessary, and return its physical page
     /// number.
     ///
-    /// Used to pre-build the kernel-heap window's level-1 table once at boot so
-    /// that subsequent heap growth can install leaf PTEs into a disjoint subtree
-    /// without re-walking (and re-locking) the global kernel page table.
-    pub fn ensure_l1_table_untracked(&mut self, vpn: VirtPageNum) -> PhysPageNum {
-        let idxs = vpn.indexes();
-        let pte = &mut self.root_ppn.get_pte_array()[idxs[0]];
+    /// Used to pre-build the kernel-heap window's root-entry subtree once at
+    /// boot so that subsequent heap growth can install leaf PTEs into a
+    /// disjoint subtree without re-walking (and re-locking) the global kernel
+    /// page table.
+    pub fn ensure_subtree_root_untracked(&mut self, vpn: VirtPageNum) -> PhysPageNum {
+        debug_assert!(
+            crate::hal::page_table_levels() >= 2,
+            "kernel heap subtree caching requires a multi-level page table"
+        );
+        let idx = crate::hal::vpn_index(vpn.0, 0);
+        let pte = &mut self.root_ppn.get_pte_array()[idx];
         if !pte.is_valid() {
             let frame = frame_alloc().unwrap();
-            *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+            pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
         }
         pte.ppn()
@@ -247,8 +235,8 @@ impl PageTable {
         })
     }
     /// get the token from the page table
-    pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0
+    pub fn token(&self) -> AddressSpaceToken {
+        crate::hal::make_address_space_token(self.root_ppn.0)
     }
 }
 
@@ -268,10 +256,7 @@ fn checked_user_range(start: usize, len: usize) -> Option<usize> {
 }
 
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
-    if len == 0 {
-        return Some(Vec::new());
-    }
+pub fn translated_byte_buffer(token: AddressSpaceToken, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = checked_user_range(start, len)?;
@@ -296,7 +281,7 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Optio
 }
 
 /// Create String in kernel address space from u8 Array(end with 0) in other address space
-pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
+pub fn translated_str(token: AddressSpaceToken, ptr: *const u8) -> Option<String> {
     let page_table = PageTable::from_token(token);
     let mut string = String::new();
     let mut va = ptr as usize;
@@ -319,7 +304,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> Option<String> {
 }
 
 /// translate a pointer `ptr` in other address space to a immutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
-pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
+pub fn translated_ref<T>(token: AddressSpaceToken, ptr: *const T) -> Option<&'static T> {
     let page_table = PageTable::from_token(token);
     checked_user_range(ptr as usize, core::mem::size_of::<T>().max(1))?;
     page_table
@@ -328,7 +313,7 @@ pub fn translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
 }
 
 /// translate a pointer `ptr` in other address space to a mutable u8 slice in kernel address space. NOTICE: the content pointed to by the pointer `ptr` cannot cross physical pages, otherwise translated_byte_buffer should be used.
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {
+pub fn translated_refmut<T>(token: AddressSpaceToken, ptr: *mut T) -> Option<&'static mut T> {
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
     checked_user_range(va, core::mem::size_of::<T>().max(1))?;

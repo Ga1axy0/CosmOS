@@ -47,6 +47,7 @@ fn clear_bss() {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 global_asm!(
     r#"
     .section .text.entry
@@ -54,6 +55,17 @@ global_asm!(
 _start:
     mv a0, sp
     call __user_start
+"#
+);
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+_start:
+    move $a0, $sp
+    bl __user_start
 "#
 );
 
@@ -578,6 +590,17 @@ pub fn exec(path: &str, args: &[*const u8]) -> isize {
 
 pub fn execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {
     sys_execve(path, args, envp)
+}
+
+/// 显式使用 NUL 结尾 C 字符串路径的 `execve` 变体。
+pub fn exec_ptr(path: *const u8, args: &[*const u8]) -> isize {
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    sys_execve_ptr(path, args, &envp)
+}
+
+/// 显式使用 NUL 结尾 C 字符串路径的 `execve` 变体。
+pub fn execve_ptr(path: *const u8, args: &[*const u8], envp: &[*const u8]) -> isize {
+    sys_execve_ptr(path, args, envp)
 }
 
 pub fn set_priority(prio: isize) -> isize {

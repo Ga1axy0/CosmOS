@@ -326,6 +326,8 @@ pub const SYSCALL_MEMFD_CREATE: usize = 279;
 pub const SYSCALL_BPF: usize = 280;
 /// userfaultfd syscall
 pub const SYSCALL_USERFAULTFD: usize = 282;
+/// statx syscall
+pub const SYSCALL_STATX: usize = 291;
 /// spawn syscall
 pub const SYSCALL_SPAWN: usize = 400;
 /// clock_adjtime64 syscall
@@ -603,6 +605,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as *mut Stat,
             args[3] as i32,
+        ),
+        SYSCALL_STATX => sys_statx(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as i32,
+            args[3] as u32,
+            args[4] as *mut crate::syscall::fs::Statx,
         ),
         SYSCALL_UTIMENSAT => sys_utimensat(
             args[0] as isize,

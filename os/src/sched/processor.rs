@@ -7,7 +7,8 @@
 use super::__switch;
 use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
-use crate::hart::hartid;
+use crate::hal::{enable_irqs_and_wait, hartid};
+use crate::hal::traits::AddressSpaceToken;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
 use crate::timer::{get_time, get_time_ns};
@@ -128,12 +129,15 @@ pub(crate) fn run_tasks() {
             }
 
             // debug!("No task to run, idle...");
+            if !crate::platform::console_rx_irq_ready() {
+                // Keep the old cooperative polling path only as a pre-init
+                // fallback before the EXTIOI/PCH-PIC chain is configured.
+                crate::fs::console_receive();
+            }
 
             crate::trap::set_kernel_trap_entry();
 
-            unsafe { riscv::register::sstatus::set_sie() };
-            unsafe { riscv::asm::wfi() };
-            unsafe { riscv::register::sstatus::clear_sie() };
+            unsafe { enable_irqs_and_wait() };
         }
     }
 }
@@ -174,8 +178,8 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
     current_task().unwrap().process.upgrade().unwrap()
 }
 
-/// Get the current user token(addr of page table)
-pub fn current_user_token() -> usize {
+/// Get the current user address-space token.
+pub fn current_user_token() -> AddressSpaceToken {
     let task = current_task().unwrap();
     task.get_user_token()
 }

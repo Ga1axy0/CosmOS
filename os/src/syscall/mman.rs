@@ -265,9 +265,9 @@ pub fn sys_brk(addr: usize) -> isize {
         "sys_brk: pid={} addr={:#x} tp={:#x} sp={:#x} sepc={:#x}",
         pid,
         addr,
-        cx.x[4],
-        cx.x[2],
-        cx.sepc
+        cx.tls(),
+        cx.user_sp(),
+        cx.user_pc()
     );
     current_process().set_program_brk(addr) as isize
 }

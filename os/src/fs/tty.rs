@@ -543,6 +543,12 @@ impl TtyCore {
             if let Some(byte) = self.take_ready_byte() {
                 return byte;
             }
+            if !crate::platform::console_rx_irq_ready() {
+                // Fall back to cooperative polling only before the platform
+                // external IRQ path has finished setup.
+                crate::task::yield_current_and_run_next();
+                continue;
+            }
             // 3. 阻塞，直到中断路径补满输入或有信号到来。
             self.read_wq
                 .wait_with_reason_or_skip(WaitReason::UartRx, || self.read_ready());

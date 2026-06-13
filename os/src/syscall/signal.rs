@@ -365,11 +365,15 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
 pub fn sys_sigreturn() -> isize {
     syscall_body!({
         let trap_cx = crate::task::current_trap_cx();
-        let user_sp = trap_cx.x[2]; // Current sp
+        let user_sp = trap_cx.user_sp();
 
         debug!(
             "sys_sigreturn: ENTRY sepc={:#x}, sp={:#x}, ra={:#x}, a0={:#x}, a7={:#x}",
-            trap_cx.sepc, user_sp, trap_cx.x[1], trap_cx.x[10], trap_cx.x[17]
+            trap_cx.user_pc(),
+            user_sp,
+            trap_cx.ra(),
+            trap_cx.syscall_ret(),
+            trap_cx.syscall_nr()
         );
 
         // Read ucontext from user stack at sp. The frame can cross a page boundary,
@@ -401,22 +405,16 @@ pub fn sys_sigreturn() -> isize {
 
         // Restore registers from mcontext
         let mcontext = &ucontext.uc_mcontext;
-
-        trap_cx.x[0] = 0;
-        trap_cx.x[1..].copy_from_slice(&mcontext.gregs[1..]);
-        trap_cx.sepc = mcontext.gregs[0];
+        mcontext.apply_to_trap_context(trap_cx);
 
         debug!(
             "sys_sigreturn: restored sepc={:#x}, a0={:#x}",
-            trap_cx.sepc, trap_cx.x[10]
+            trap_cx.user_pc(),
+            trap_cx.syscall_ret()
         );
 
-        // Restore floating-point registers
-        trap_cx.f.copy_from_slice(&mcontext.fpstate.fpregs);
-        trap_cx.fcsr = mcontext.fpstate.fcsr as usize;
-
         // Return the original a0 value (which was saved in the trap context)
-        Ok(trap_cx.x[10] as isize)
+        Ok(trap_cx.syscall_ret() as isize)
     })
 }
 

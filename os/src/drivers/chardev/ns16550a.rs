@@ -5,7 +5,9 @@ use bitflags::bitflags;
 
 use crate::poll::{notify_poll_source, POLLIN};
 use crate::sync::SpinNoIrqLock;
-use crate::task::{WaitQueue, WaitReason};
+use crate::task::WaitQueue;
+use crate::task::yield_current_and_run_next;
+use crate::task::WaitReason;
 
 use super::{set_uart_ready, CharDevice};
 
@@ -230,6 +232,14 @@ impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
             return ch;
          }
          drop(inner);
+
+         if !crate::platform::console_rx_irq_ready() {
+            // Before the platform IRQ controller is configured, keep a
+            // cooperative polling fallback so early console input still
+            // works during bring-up.
+            yield_current_and_run_next();
+            continue;
+         }
 
          // No data: block current task until UART IRQ pushes data and signals.
          self.rx_wait_queue

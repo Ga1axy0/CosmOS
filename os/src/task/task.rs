@@ -5,6 +5,7 @@ use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
 use crate::mm::MmError;
 use crate::config::MAX_HARTS;
+use crate::hal::traits::AddressSpaceToken;
 use crate::mm::PhysPageNum;
 use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
@@ -147,8 +148,8 @@ impl TaskControlBlock {
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
     }
-    /// Get the address of app's page table
-    pub fn get_user_token(&self) -> usize {
+    /// Get the current user address-space token for this task.
+    pub fn get_user_token(&self) -> AddressSpaceToken {
         let process = self.process.upgrade().unwrap();
         let inner = process.inner_exclusive_access();
         inner.memory_set.token()

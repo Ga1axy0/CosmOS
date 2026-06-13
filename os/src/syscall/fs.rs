@@ -477,6 +477,38 @@ fn alloc_anonymous_fd_with_bits(
 fn alloc_anonymous_fd(status_flags: FileStatusFlags, cloexec: bool) -> Result<isize, ERRNO> {
     alloc_anonymous_fd_with_bits(status_flags, cloexec, 0)
 }
+const AT_NO_AUTOMOUNT: u32 = 0x800;
+const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+
+bitflags! {
+    struct StatxMask: u32 {
+        const TYPE = 0x0001;
+        const MODE = 0x0002;
+        const NLINK = 0x0004;
+        const UID = 0x0008;
+        const GID = 0x0010;
+        const ATIME = 0x0020;
+        const MTIME = 0x0040;
+        const CTIME = 0x0080;
+        const INO = 0x0100;
+        const SIZE = 0x0200;
+        const BLOCKS = 0x0400;
+        const BTIME = 0x0800;
+
+        const BASIC_STATS = Self::TYPE.bits
+            | Self::MODE.bits
+            | Self::NLINK.bits
+            | Self::UID.bits
+            | Self::GID.bits
+            | Self::ATIME.bits
+            | Self::MTIME.bits
+            | Self::CTIME.bits
+            | Self::INO.bits
+            | Self::SIZE.bits
+            | Self::BLOCKS.bits;
+        const ALL = Self::BASIC_STATS.bits | Self::BTIME.bits;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PselectFdMeta {
@@ -493,6 +525,76 @@ struct PselectSigmaskArg {
 }
 
 impl Pod for PselectSigmaskArg {}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    reserved: i32,
+}
+
+impl From<(isize, isize)> for StatxTimestamp {
+    fn from((sec, nsec): (isize, isize)) -> Self {
+        Self {
+            tv_sec: sec as i64,
+            tv_nsec: nsec as u32,
+            reserved: 0,
+        }
+    }
+}
+
+/// Linux `statx(2)` userspace ABI.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    stx_spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    stx_spare3: [u64; 12],
+}
+
+impl Pod for Statx {}
+
+fn stat_to_statx(stat: &Stat, requested_mask: StatxMask) -> Statx {
+    let available_mask = StatxMask::BASIC_STATS;
+    let _ = requested_mask;
+    Statx {
+        stx_mask: available_mask.bits(),
+        stx_blksize: stat.blksize,
+        stx_nlink: stat.nlink,
+        stx_uid: stat.uid,
+        stx_gid: stat.gid,
+        stx_mode: stat.mode.bits() as u16,
+        stx_ino: stat.ino,
+        stx_size: stat.size.max(0) as u64,
+        stx_blocks: stat.blocks,
+        stx_atime: (stat.atime_sec, stat.atime_nsec).into(),
+        stx_ctime: (stat.ctime_sec, stat.ctime_nsec).into(),
+        stx_mtime: (stat.mtime_sec, stat.mtime_nsec).into(),
+        ..Statx::default()
+    }
+}
 
 /// 从用户态复制 `pollfd` 数组，兼容跨页布局。
 fn copy_user_pollfds(token: usize, ufds: *mut PollFd, nfds: usize) -> Result<Vec<PollFd>, ERRNO> {
@@ -2643,6 +2745,59 @@ let time4 = get_time_us();
 let time5 = get_time_us();
         debug!("sys_newfstatat: resolve_dirfd_base & canonicalize = {}us, lookup_inode = {}us, inode_stat = {}us, write_pod_to_user = {}us",
             time2 - time1, time3 - time2, time4 - time3, time5 - time4);
+        Ok(0)
+    })
+}
+
+/// `statx(2)` 系统调用：按目录 fd 与路径查询增强版文件元数据。
+pub fn sys_statx(
+    dirfd: isize,
+    path: *const u8,
+    flags: i32,
+    mask: u32,
+    stx: *mut Statx,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_statx",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let flags = flags as u32;
+        let supported_flags =
+            AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
+        if flags & !supported_flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let mask = StatxMask::from_bits(mask).ok_or(ERRNO::EINVAL)?;
+        let path = if path.is_null() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(ERRNO::EFAULT);
+            }
+            String::new()
+        } else {
+            read_cstring_from_user(path, PATH_MAX)?
+        };
+
+        let stat = if path.is_empty() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(ERRNO::ENOENT);
+            }
+            match resolve_at_target(dirfd, "", flags as i32)? {
+                ResolvedAtTarget::Inode(inode) => inode_stat(&inode),
+                ResolvedAtTarget::FileDesc(desc) => desc.stat(),
+            }
+        } else {
+            let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+            let inode = lookup_inode_follow(
+                cwd.as_str(),
+                path.as_str(),
+                flags & AT_SYMLINK_NOFOLLOW == 0,
+            )?;
+            inode_stat(&inode)
+        };
+
+        let statx = stat_to_statx(&stat, mask);
+        write_pod_to_user(stx, &statx)?;
         Ok(0)
     })
 }

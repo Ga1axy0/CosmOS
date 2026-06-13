@@ -15,8 +15,6 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use riscv::register::sstatus;
-
 // ---------------------------------------------------------------------------
 // SpinLock – plain spinlock (no interrupt masking)
 // ---------------------------------------------------------------------------
@@ -118,8 +116,8 @@ impl<T> SpinNoIrqLock<T> {
     /// Acquire the lock with interrupts disabled.
     pub fn lock(&self) -> SpinNoIrqLockGuard<'_, T> {
         // Save the current SIE bit state and then disable.
-        let sie_was_enabled = sstatus::read().sie();
-        unsafe { sstatus::clear_sie() };
+        let sie_was_enabled = crate::hal::local_irqs_enabled();
+        unsafe { crate::hal::disable_local_irqs() };
 
         while self
             .locked
@@ -172,7 +170,7 @@ impl<T> Drop for SpinNoIrqLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
         if self.sie_was_enabled {
-            unsafe { sstatus::set_sie() };
+            unsafe { crate::hal::enable_local_irqs() };
         }
     }
 }
