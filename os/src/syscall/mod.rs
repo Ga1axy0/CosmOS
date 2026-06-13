@@ -120,6 +120,8 @@ pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
 /// set tid address syscall
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// unshare syscall
+pub const SYSCALL_UNSHARE: usize = 97;
 /// futex syscall
 pub const SYSCALL_FUTEX: usize = 98;
 /// set robust list syscall
@@ -176,12 +178,18 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// get priority syscall
 pub const SYSCALL_GET_PRIORITY: usize = 141;
+/// setregid syscall
+pub const SYSCALL_SETREGID: usize = 143;
+/// setgid syscall
+pub const SYSCALL_SETGID: usize = 144;
 /// setreuid syscall
 pub const SYSCALL_SETREUID: usize = 145;
 /// setuid syscall
 pub const SYSCALL_SETUID: usize = 146;
 /// setresuid syscall
 pub const SYSCALL_SETRESUID: usize = 147;
+/// setresgid syscall
+pub const SYSCALL_SETRESGID: usize = 149;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -772,9 +780,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_SETREGID => sys_setregid(args[0] as u32, args[1] as u32),
+        SYSCALL_SETGID => sys_setgid(args[0] as u32),
         SYSCALL_SETREUID => sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_SETRESGID => sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
@@ -786,6 +797,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_UNSHARE => sys_unshare(args[0]),
         SYSCALL_SETNS => sys_setns(args[0] as i32, args[1] as i32),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,

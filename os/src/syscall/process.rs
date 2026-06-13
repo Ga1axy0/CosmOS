@@ -25,6 +25,10 @@ const UID_NO_CHANGE: u32 = u32::MAX;
 fn unprivileged_uid_change_allowed(current_uid: u32, current_euid: u32, current_suid: u32, new_uid: u32) -> bool {
     new_uid == current_uid || new_uid == current_euid || new_uid == current_suid
 }
+
+fn unprivileged_gid_change_allowed(current_gid: u32, current_egid: u32, current_sgid: u32, new_gid: u32) -> bool {
+    new_gid == current_gid || new_gid == current_egid || new_gid == current_sgid
+}
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
     /// 最终需要交给 ELF 装载器处理的字节内容。
@@ -318,6 +322,101 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
         }
         if suid != UID_NO_CHANGE {
             cred.suid = suid;
+        }
+        Ok(0)
+    })
+}
+
+/// setgid syscall
+pub fn sys_setgid(gid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setgid pid:{} gid={}", process.getpid(), gid);
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        if cred.euid != 0 && !unprivileged_gid_change_allowed(cred.gid, cred.egid, cred.sgid, gid) {
+            return Err(ERRNO::EPERM);
+        }
+        cred.gid = gid;
+        cred.egid = gid;
+        cred.sgid = gid;
+        Ok(0)
+    })
+}
+
+/// setregid syscall
+pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setregid pid:{} rgid={} egid={}", process.getpid(), rgid, egid);
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_rgid = cred.gid;
+        let old_egid = cred.egid;
+        let old_sgid = cred.sgid;
+        let privileged = cred.euid == 0;
+
+        if !privileged {
+            if rgid != UID_NO_CHANGE
+                && !unprivileged_gid_change_allowed(old_rgid, old_egid, old_sgid, rgid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+            if egid != UID_NO_CHANGE
+                && !unprivileged_gid_change_allowed(old_rgid, old_egid, old_sgid, egid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+        }
+
+        let new_rgid = if rgid == UID_NO_CHANGE { old_rgid } else { rgid };
+        let new_egid = if egid == UID_NO_CHANGE { old_egid } else { egid };
+        cred.gid = new_rgid;
+        cred.egid = new_egid;
+        if rgid != UID_NO_CHANGE || (egid != UID_NO_CHANGE && new_egid != old_rgid) {
+            cred.sgid = new_egid;
+        }
+        Ok(0)
+    })
+}
+
+/// setresgid syscall
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
+    let process = current_process();
+    trace!(
+        "kernel: sys_setresgid pid:{} rgid={} egid={} sgid={}",
+        process.getpid(),
+        rgid,
+        egid,
+        sgid
+    );
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_rgid = cred.gid;
+        let old_egid = cred.egid;
+        let old_sgid = cred.sgid;
+        let privileged = cred.euid == 0;
+
+        if !privileged {
+            for new_gid in [rgid, egid, sgid] {
+                if new_gid == UID_NO_CHANGE {
+                    continue;
+                }
+                if !unprivileged_gid_change_allowed(old_rgid, old_egid, old_sgid, new_gid) {
+                    return Err(ERRNO::EPERM);
+                }
+            }
+        }
+
+        if rgid != UID_NO_CHANGE {
+            cred.gid = rgid;
+        }
+        if egid != UID_NO_CHANGE {
+            cred.egid = egid;
+        }
+        if sgid != UID_NO_CHANGE {
+            cred.sgid = sgid;
         }
         Ok(0)
     })
@@ -810,6 +909,29 @@ pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
         let fd = fd as usize;
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
             return Err(ERRNO::EBADF);
+        }
+        Ok(0)
+    })
+}
+
+/// `unshare` namespace compatibility shim.
+///
+/// CosmOS does not isolate namespace state yet. Accept the namespace flags used
+/// by LTP setup helpers as no-ops so tests can exercise the target syscall
+/// behavior behind their namespace bootstrap.
+pub fn sys_unshare(flags: usize) -> isize {
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    const CLONE_NEWUTS: usize = 0x0400_0000;
+    const CLONE_NEWIPC: usize = 0x0800_0000;
+    const CLONE_NEWUSER: usize = 0x1000_0000;
+    const CLONE_NEWPID: usize = 0x2000_0000;
+    const CLONE_NEWNET: usize = 0x4000_0000;
+    const SUPPORTED_FLAGS: usize =
+        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+
+    syscall_body!({
+        if flags & !SUPPORTED_FLAGS != 0 {
+            return Err(ERRNO::EINVAL);
         }
         Ok(0)
     })

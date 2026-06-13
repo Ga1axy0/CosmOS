@@ -58,7 +58,10 @@ pub(crate) use socket_timeout::{
     socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketTimerTag,
     SocketWakeState,
 };
-pub(crate) use unix_socket::create_unix_stream_socket_file;
+pub(crate) use unix_socket::{
+    create_unix_datagram_socket_file, create_unix_stream_socket_file, unix_stream_listener,
+    UnixDatagramSocketFile,
+};
 pub use unix_socket::{
     UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS,
     SocketLevel,

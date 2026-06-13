@@ -19,6 +19,8 @@ pub type ClockId = i32;
 pub const CLOCK_REALTIME: ClockId = 0;
 /// Linux 兼容的单调时钟 ID。
 pub const CLOCK_MONOTONIC: ClockId = 1;
+/// Linux compatible `CLOCK_MONOTONIC_RAW`.
+pub const CLOCK_MONOTONIC_RAW: ClockId = 4;
 /// Linux 兼容的 `CLOCK_REALTIME_COARSE`。
 pub const CLOCK_REALTIME_COARSE: ClockId = 5;
 /// Linux 兼容的 `CLOCK_MONOTONIC_COARSE`。
@@ -200,7 +202,11 @@ fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
 /// 返回当前内核可提供的时钟分辨率。
 fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => {
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE => {
             // Expose the timer ABI as high-resolution so Linux RT userland
             // enables hrtimer paths such as cyclictest.
             Ok(Timespec {
@@ -208,8 +214,7 @@ fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
                 tv_nsec: 1,
             })
         }
-        // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
-        // CLOCK_REALTIME_COARSE 等其它 clock id。
+        // TODO：后续按 Linux 语义继续补充其它 clock id。
         _ => Err(ERRNO::EINVAL),
     }
 }
@@ -430,10 +435,10 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
     syscall_body!({
         let timespec = match clockid {
             CLOCK_REALTIME => timespec_from_ns(get_realtime_ns()),
-            CLOCK_MONOTONIC => timespec_from_ns(get_time_ns()),
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => timespec_from_ns(get_time_ns()),
             CLOCK_REALTIME_COARSE => timespec_from_ns(get_realtime_ns()),
             CLOCK_MONOTONIC_COARSE => timespec_from_ns(get_time_ns()),
-            // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW 等其它 clock id。
+            // TODO：后续按 Linux 语义继续补充其它 clock id。
             _ => return Err(ERRNO::EINVAL),
         };
         // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
@@ -534,8 +539,7 @@ pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
         clockid
     );
     syscall_body!({
-        // TODO：后续按 Linux 语义继续补充 CLOCK_MONOTONIC_RAW、
-        // CLOCK_REALTIME_COARSE 等其它 clock id 的设置。
+        // TODO：后续按 Linux 语义继续补充其它 clock id 的设置。
         match clockid {
             CLOCK_REALTIME => {
                 let timespec = read_pod_from_user(_tp)?;
