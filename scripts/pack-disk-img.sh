@@ -72,13 +72,6 @@ for app_src in "$USER_APP_SRC_DIR"/*.rs; do
     cp -f "$host_path" "$STAGE_DIR/root/$name"
 done
 
-if [ -f lib/musl/ar ] && [ -d "$STAGE_DIR/musl/lib" ]; then
-    cp -f lib/musl/ar "$STAGE_DIR/musl/lib/ar"
-fi
-
-if [ -f lib/glibc/ar ] && [ -d "$STAGE_DIR/glibc/lib" ]; then
-    cp -f lib/glibc/ar "$STAGE_DIR/glibc/lib/ar"
-fi
 
 if [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-$MUSL_ARCH.so.1" ]; then
     ln -sf libc.so "$STAGE_DIR/lib/ld-musl-$MUSL_ARCH.so.1"
