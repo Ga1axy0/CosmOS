@@ -74,6 +74,7 @@ enum PosixSocketOption {
     SoRecvTimeo = 20,
     SoSndTimeo = 21,
     SoAcceptConn = 30,
+    SoAttachBpf = 50,
 }
 
 #[repr(i32)]
@@ -1305,7 +1306,7 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         }
 
         let (base_type, status_flags, cloexec) = parse_socket_type_flags(socket_type)?;
-        if base_type != SOCK_STREAM {
+        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
             return Err(ERRNO::ESOCKTNOSUPPORT);
         }
 
@@ -1317,7 +1318,7 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         let end1: Arc<dyn File + Send + Sync> = end1_raw;
         let spec = SocketSpec {
             family: domain,
-            socket_type: SOCK_STREAM,
+            socket_type: base_type,
             protocol: 0,
         };
 
@@ -1880,6 +1881,24 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                     let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
                     with_unix_socket(fd, |unix| {
                         unix.set_passcred(enabled);
+                        Ok(())
+                    })?;
+                    Ok(0)
+                }
+                Some(PosixSocketOption::SoAttachBpf) => {
+                    if spec.family != AF_UNIX {
+                        return Err(ERRNO::ENOPROTOOPT);
+                    }
+                    if optval.is_null() || optlen < size_of::<i32>() as i32 {
+                        return Err(ERRNO::EINVAL);
+                    }
+                    let prog_fd = read_pod_from_user(optval as *const i32)?;
+                    if prog_fd < 0 {
+                        return Err(ERRNO::EBADF);
+                    }
+                    crate::syscall::bpf_prog_is_socket_filter(prog_fd as u32)?;
+                    with_unix_socket(fd, |unix| {
+                        unix.attach_bpf_prog_fd(prog_fd as u32);
                         Ok(())
                     })?;
                     Ok(0)

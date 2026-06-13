@@ -1,6 +1,6 @@
 use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
+use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::task::yield_current_and_run_next;
 use crate::timer::get_time_ns;
@@ -21,6 +21,28 @@ use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
 const UID_NO_CHANGE: u32 = u32::MAX;
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct UserCapHeader {
+    version: u32,
+    pid: i32,
+}
+
+impl Pod for UserCapHeader {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct UserCapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+impl Pod for UserCapData {}
 
 fn unprivileged_uid_change_allowed(current_uid: u32, current_euid: u32, current_suid: u32, new_uid: u32) -> bool {
     new_uid == current_uid || new_uid == current_euid || new_uid == current_suid
@@ -231,6 +253,75 @@ pub fn sys_getegid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getegid pid:{}", process.getpid());
     process.getegid() as isize
+}
+
+fn cap_data_words(version: u32) -> Result<usize, ERRNO> {
+    match version {
+        LINUX_CAPABILITY_VERSION_1 => Ok(1),
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Ok(2),
+        _ => Err(ERRNO::EINVAL),
+    }
+}
+
+/// capget syscall
+pub fn sys_capget(header: *mut UserCapHeader, data: *mut UserCapData) -> isize {
+    syscall_body!({
+        if header.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let mut hdr = read_pod_from_user(header as *const UserCapHeader)?;
+        let words = match cap_data_words(hdr.version) {
+            Ok(words) => words,
+            Err(errno) => {
+                hdr.version = LINUX_CAPABILITY_VERSION_3;
+                write_pod_to_user(header, &hdr)?;
+                return Err(errno);
+            }
+        };
+        let pid = current_process().getpid() as i32;
+        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+            return Err(ERRNO::ESRCH);
+        }
+        if data.is_null() {
+            return Ok(0);
+        }
+
+        let word0 = UserCapData {
+            effective: u32::MAX,
+            permitted: u32::MAX,
+            inheritable: 0,
+        };
+        write_pod_to_user(data, &word0)?;
+        if words > 1 {
+            let word1 = UserCapData {
+                effective: u32::MAX,
+                permitted: u32::MAX,
+                inheritable: 0,
+            };
+            write_pod_to_user(unsafe { data.add(1) }, &word1)?;
+        }
+        Ok(0)
+    })
+}
+
+/// capset syscall
+pub fn sys_capset(header: *const UserCapHeader, data: *const UserCapData) -> isize {
+    syscall_body!({
+        if header.is_null() || data.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let hdr = read_pod_from_user(header)?;
+        let words = cap_data_words(hdr.version)?;
+        let pid = current_process().getpid() as i32;
+        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+            return Err(ERRNO::ESRCH);
+        }
+        let _ = read_pod_from_user(data)?;
+        if words > 1 {
+            let _ = read_pod_from_user(unsafe { data.add(1) })?;
+        }
+        Ok(0)
+    })
 }
 
 /// setuid syscall

@@ -106,6 +106,10 @@ pub const SYSCALL_TIMERFD_CREATE: usize = 85;
 pub const SYSCALL_UTIMENSAT: usize = 88;
 /// acct syscall
 pub const SYSCALL_ACCT: usize = 89;
+/// capget syscall
+pub const SYSCALL_CAPGET: usize = 90;
+/// capset syscall
+pub const SYSCALL_CAPSET: usize = 91;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// sync syscall
@@ -443,7 +447,7 @@ pub(crate) use utils::{
     translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
 };
-pub(crate) use fs::write_process_accounting_on_exit;
+pub(crate) use fs::{bpf_prog_is_socket_filter, bpf_run_socket_filter_prog, write_process_accounting_on_exit};
 pub use times::Timespec;
 
 
@@ -790,6 +794,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_CAPGET => sys_capget(args[0] as *mut UserCapHeader, args[1] as *mut UserCapData),
+        SYSCALL_CAPSET => sys_capset(args[0] as *const UserCapHeader, args[1] as *const UserCapData),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut SysInfo),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),

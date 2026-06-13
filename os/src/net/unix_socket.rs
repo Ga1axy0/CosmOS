@@ -77,6 +77,7 @@ struct UnixSocketPairLocalState {
     read_shutdown: bool,
     write_shutdown: bool,
     passcred: bool,
+    attached_bpf_prog_fd: Option<u32>,
     bound_addr: Option<Vec<u8>>,
     listening: bool,
     pending: VecDeque<Arc<UnixSocketPairEnd>>,
@@ -111,6 +112,7 @@ impl UnixSocketPairEnd {
                 read_shutdown: false,
                 write_shutdown: false,
                 passcred: false,
+                attached_bpf_prog_fd: None,
                 bound_addr: None,
                 listening: false,
                 pending: VecDeque::new(),
@@ -309,6 +311,10 @@ impl UnixSocketPairEnd {
             return Err(ERRNO::EPIPE);
         }
         if written > 0 {
+            if let Err(err) = self.run_peer_bpf_filter() {
+                self.tx_seq_lock.unlock();
+                return Err(err);
+            }
             self.tx_meta.lock().push_back(UnixStreamFrameMeta {
                 remaining: written,
                 rights: ancillary.rights,
@@ -396,6 +402,22 @@ impl UnixSocketPairEnd {
     /// Enable/disable receiving `SCM_CREDENTIALS` for this endpoint.
     pub fn set_passcred(&self, enabled: bool) {
         self.state.lock().passcred = enabled;
+    }
+
+    /// Attach a minimal BPF socket filter target to this receiving endpoint.
+    pub fn attach_bpf_prog_fd(&self, prog_fd: u32) {
+        self.state.lock().attached_bpf_prog_fd = Some(prog_fd);
+    }
+
+    fn run_peer_bpf_filter(&self) -> Result<(), ERRNO> {
+        let peer = self.state.lock().peer.clone();
+        let Some(peer) = peer.and_then(|peer| peer.upgrade()) else {
+            return Ok(());
+        };
+        let Some(prog_fd) = peer.state.lock().attached_bpf_prog_fd else {
+            return Ok(());
+        };
+        crate::syscall::bpf_run_socket_filter_prog(prog_fd)
     }
 
     /// Whether receiving `SCM_CREDENTIALS` is enabled on this endpoint.
@@ -762,6 +784,7 @@ impl File for UnixSocketPairEnd {
 
         let written = tx.write_bytes_at(0, buf)?;
         if written > 0 {
+            self.run_peer_bpf_filter()?;
             self.tx_meta.lock().push_back(UnixStreamFrameMeta {
                 remaining: written,
                 rights: Vec::new(),
