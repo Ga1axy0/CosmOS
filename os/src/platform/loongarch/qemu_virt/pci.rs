@@ -63,11 +63,7 @@ pub fn probe_platform_devices() {
                         continue;
                     };
                     let dev = Arc::new(dev);
-                    let name: String = if block_idx > 0 {
-                        alloc::format!("vda{}", block_idx + 1)
-                    } else {
-                        "vda".into()
-                    };
+                    let name: String = alloc::format!("vd{}", (b'a' + block_idx as u8) as char);
                     info!("[pci] virtio-blk {} at {}", name, bdf);
                     map.insert(name, dev.clone());
                     let _ = &mut irq_map;

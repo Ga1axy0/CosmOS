@@ -16,6 +16,8 @@ pub const MEMORY_END: usize = 0xC0000000;
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12
 pub const PAGE_SIZE_BITS: usize = 0xc;
+/// fixed load bias used for PIE main executables without an interpreter
+pub const USER_PIE_BASE: usize = 0x0020_0000;
 
 /// qemu board info
 pub use crate::platform::{USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, KERNEL_HEAP_BASE, MMIO, TRAMPOLINE};

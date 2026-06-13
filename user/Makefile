@@ -37,14 +37,18 @@ pre:
 	@mkdir -p $(BUILD_DIR)/asm/
 	@$(foreach t, $(APPS), cp $(t) $(BUILD_DIR)/app/;)
 
-build: clean pre binary
-	@$(foreach t, $(ELFS), cp $(t).bin $(BUILD_DIR)/bin/;)
-	@$(foreach t, $(ELFS), cp $(t).elf $(BUILD_DIR)/elf/;)
-
 clean:
 	@cargo clean
 	@rm -rf $(BUILD_DIR)
 
+prepare:
+	@rm -rf $(BUILD_DIR)
+	@mkdir -p $(BUILD_DIR)
+
+build: prepare pre binary
+	@$(foreach t, $(ELFS), cp $(t).bin $(BUILD_DIR)/bin/;)
+	@$(foreach t, $(ELFS), cp $(t).elf $(BUILD_DIR)/elf/;)
+
 all: build
 
-.PHONY: elf binary build clean all
+.PHONY: elf binary prepare build clean all
