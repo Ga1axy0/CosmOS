@@ -1,18 +1,21 @@
 use core::any::Any;
 
 use alloc::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
+use lazy_static::lazy_static;
 use strum_macros::FromRepr;
 
 use crate::{
-    fs::{File, FileDescription, Pipe, Stat, StatMode},
+    fs::{open_file_at, unlinkat, File, FileDescription, OpenFlags, Pipe, Stat, StatMode},
     mm::UserBuffer,
     poll::notify_poll_source,
     sync::{Mutex, MutexBlocking, SpinNoIrqLock},
     syscall::errno::ERRNO,
+    task::{current_process, WaitQueue, WaitReason},
 };
 
 const POLLIN: u16 = 0x001;
@@ -74,6 +77,10 @@ struct UnixSocketPairLocalState {
     read_shutdown: bool,
     write_shutdown: bool,
     passcred: bool,
+    attached_bpf_prog_fd: Option<u32>,
+    bound_addr: Option<Vec<u8>>,
+    listening: bool,
+    pending: VecDeque<Arc<UnixSocketPairEnd>>,
 }
 
 /// 使用两条单向 pipe 交叉组合为一个全双工端点。
@@ -105,6 +112,10 @@ impl UnixSocketPairEnd {
                 read_shutdown: false,
                 write_shutdown: false,
                 passcred: false,
+                attached_bpf_prog_fd: None,
+                bound_addr: None,
+                listening: false,
+                pending: VecDeque::new(),
             }),
             rx_meta,
             tx_meta,
@@ -133,6 +144,70 @@ impl UnixSocketPairEnd {
         end0.set_peer(&end1);
         end1.set_peer(&end0);
         (end0, end1)
+    }
+
+    /// Bind this socket to a UNIX-domain address.
+    pub(crate) fn bind_addr(&self, addr: Vec<u8>, create_path: bool) -> Result<(), ERRNO> {
+        {
+            let state = self.state.lock();
+            if state.bound_addr.is_some() {
+                return Err(ERRNO::EINVAL);
+            }
+        }
+
+        if create_path {
+            let path = unix_path_from_addr(&addr)?;
+            let cwd = current_process().inner_exclusive_access().cwd.clone();
+            open_file_at(cwd.as_str(), path.as_str(), OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::RDWR)
+                .map_err(|err| match err {
+                    ERRNO::EIO => ERRNO::ENOTDIR,
+                    ERRNO::EEXIST => ERRNO::EADDRINUSE,
+                    other => other,
+                })?;
+        }
+
+        let mut registry = UNIX_REGISTRY.lock();
+        if registry.stream.contains_key(&addr) || registry.datagram.contains_key(&addr) {
+            if create_path {
+                if let Ok(path) = unix_path_from_addr(&addr) {
+                    let cwd = current_process().inner_exclusive_access().cwd.clone();
+                    let _ = unlinkat(cwd.as_str(), path.as_str(), 0);
+                }
+            }
+            return Err(ERRNO::EADDRINUSE);
+        }
+        registry.stream.insert(addr.clone(), self as *const Self as usize);
+        self.state.lock().bound_addr = Some(addr);
+        Ok(())
+    }
+
+    /// Mark a bound stream socket as a listener.
+    pub(crate) fn listen(&self) -> Result<(), ERRNO> {
+        let mut state = self.state.lock();
+        if state.bound_addr.is_none() {
+            return Err(ERRNO::EINVAL);
+        }
+        state.listening = true;
+        Ok(())
+    }
+
+    pub(crate) fn bound_addr(&self) -> Option<Vec<u8>> {
+        self.state.lock().bound_addr.clone()
+    }
+
+    /// Queue an accepted stream socket for `accept(2)`.
+    pub(crate) fn push_pending(&self, socket: Arc<UnixSocketPairEnd>) -> Result<(), ERRNO> {
+        let mut state = self.state.lock();
+        if !state.listening {
+            return Err(ERRNO::ECONNREFUSED);
+        }
+        state.pending.push_back(socket);
+        Ok(())
+    }
+
+    /// Pop one accepted stream socket if available.
+    pub(crate) fn pop_pending(&self) -> Option<Arc<UnixSocketPairEnd>> {
+        self.state.lock().pending.pop_front()
     }
 
     fn set_peer(&self, peer: &Arc<Self>) {
@@ -236,6 +311,10 @@ impl UnixSocketPairEnd {
             return Err(ERRNO::EPIPE);
         }
         if written > 0 {
+            if let Err(err) = self.run_peer_bpf_filter() {
+                self.tx_seq_lock.unlock();
+                return Err(err);
+            }
             self.tx_meta.lock().push_back(UnixStreamFrameMeta {
                 remaining: written,
                 rights: ancillary.rights,
@@ -325,6 +404,22 @@ impl UnixSocketPairEnd {
         self.state.lock().passcred = enabled;
     }
 
+    /// Attach a minimal BPF socket filter target to this receiving endpoint.
+    pub fn attach_bpf_prog_fd(&self, prog_fd: u32) {
+        self.state.lock().attached_bpf_prog_fd = Some(prog_fd);
+    }
+
+    fn run_peer_bpf_filter(&self) -> Result<(), ERRNO> {
+        let peer = self.state.lock().peer.clone();
+        let Some(peer) = peer.and_then(|peer| peer.upgrade()) else {
+            return Ok(());
+        };
+        let Some(prog_fd) = peer.state.lock().attached_bpf_prog_fd else {
+            return Ok(());
+        };
+        crate::syscall::bpf_run_socket_filter_prog(prog_fd)
+    }
+
     /// Whether receiving `SCM_CREDENTIALS` is enabled on this endpoint.
     pub fn passcred_enabled(&self) -> bool {
         self.state.lock().passcred
@@ -355,6 +450,256 @@ pub(crate) fn create_unix_stream_socket_file() -> Arc<UnixSocketPairEnd> {
     let (ba_read, ba_write) = crate::fs::make_pipe();
     let (socket, _peer) = UnixSocketPairEnd::new_pair(ba_read, ab_write, ab_read, ba_write);
     socket
+}
+
+impl Drop for UnixSocketPairEnd {
+    fn drop(&mut self) {
+        if let Some(addr) = self.state.lock().bound_addr.clone() {
+            UNIX_REGISTRY.lock().stream.remove(&addr);
+        }
+        self.notify_self(POLLHUP | POLLIN | POLLOUT);
+        self.notify_peer(POLLHUP | POLLIN | POLLOUT);
+    }
+}
+
+struct UnixDatagramMessage {
+    from: Option<Vec<u8>>,
+    data: Vec<u8>,
+}
+
+struct UnixDatagramState {
+    bound_addr: Option<Vec<u8>>,
+    peer_addr: Option<Vec<u8>>,
+    queue: VecDeque<UnixDatagramMessage>,
+}
+
+/// Minimal AF_UNIX datagram socket used by local pathname/abstract tests.
+pub struct UnixDatagramSocketFile {
+    state: SpinNoIrqLock<UnixDatagramState>,
+    wait_queue: Arc<WaitQueue>,
+}
+
+impl UnixDatagramSocketFile {
+    fn new() -> Self {
+        Self {
+            state: SpinNoIrqLock::new(UnixDatagramState {
+                bound_addr: None,
+                peer_addr: None,
+                queue: VecDeque::new(),
+            }),
+            wait_queue: Arc::new(WaitQueue::new()),
+        }
+    }
+
+    pub(crate) fn bind_addr(&self, addr: Vec<u8>, create_path: bool) -> Result<(), ERRNO> {
+        {
+            let state = self.state.lock();
+            if state.bound_addr.is_some() {
+                return Err(ERRNO::EINVAL);
+            }
+        }
+
+        if create_path {
+            let path = unix_path_from_addr(&addr)?;
+            let cwd = current_process().inner_exclusive_access().cwd.clone();
+            open_file_at(cwd.as_str(), path.as_str(), OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::RDWR)
+                .map_err(|err| match err {
+                    ERRNO::EIO => ERRNO::ENOTDIR,
+                    ERRNO::EEXIST => ERRNO::EADDRINUSE,
+                    other => other,
+                })?;
+        }
+
+        let mut registry = UNIX_REGISTRY.lock();
+        if registry.stream.contains_key(&addr) || registry.datagram.contains_key(&addr) {
+            if create_path {
+                if let Ok(path) = unix_path_from_addr(&addr) {
+                    let cwd = current_process().inner_exclusive_access().cwd.clone();
+                    let _ = unlinkat(cwd.as_str(), path.as_str(), 0);
+                }
+            }
+            return Err(ERRNO::EADDRINUSE);
+        }
+        registry.datagram.insert(addr.clone(), self as *const Self as usize);
+        self.state.lock().bound_addr = Some(addr);
+        Ok(())
+    }
+
+    pub(crate) fn connect_addr(&self, addr: Vec<u8>) -> Result<(), ERRNO> {
+        if !UNIX_REGISTRY.lock().datagram.contains_key(&addr) {
+            return Err(ERRNO::ENOENT);
+        }
+        self.state.lock().peer_addr = Some(addr);
+        Ok(())
+    }
+
+    pub(crate) fn bound_addr(&self) -> Option<Vec<u8>> {
+        self.state.lock().bound_addr.clone()
+    }
+
+    pub(crate) fn send_to(&self, data: &[u8], addr: Option<Vec<u8>>) -> Result<usize, ERRNO> {
+        let (dst, src) = {
+            let state = self.state.lock();
+            let dst = addr.or_else(|| state.peer_addr.clone()).ok_or(ERRNO::ENOTCONN)?;
+            (dst, state.bound_addr.clone())
+        };
+        let peer_ptr = UNIX_REGISTRY
+            .lock()
+            .datagram
+            .get(&dst)
+            .copied()
+            .ok_or(ERRNO::ENOENT)?;
+        let peer = unsafe { &*(peer_ptr as *const UnixDatagramSocketFile) };
+        peer.state.lock().queue.push_back(UnixDatagramMessage {
+            from: src,
+            data: Vec::from(data),
+        });
+        peer.wait_queue.wake_one();
+        notify_poll_source(peer.source_id(), POLLIN);
+        Ok(data.len())
+    }
+
+    pub(crate) fn recv_from(&self, buf: UserBuffer) -> Result<(usize, Option<Vec<u8>>), ERRNO> {
+        loop {
+            if let Some(msg) = self.state.lock().queue.pop_front() {
+                let mut written = 0usize;
+                for byte_ref in buf.into_iter() {
+                    if written == msg.data.len() {
+                        break;
+                    }
+                    unsafe {
+                        *byte_ref = msg.data[written];
+                    }
+                    written += 1;
+                }
+                return Ok((written, msg.from));
+            }
+            let wait_queue = Arc::clone(&self.wait_queue);
+            wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
+                !self.state.lock().queue.is_empty()
+            });
+            if crate::signal::has_unmasked_pending_signal() {
+                return Err(ERRNO::EINTR);
+            }
+        }
+    }
+
+    fn source_id(&self) -> usize {
+        self as *const Self as usize
+    }
+}
+
+impl File for UnixDatagramSocketFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        self.recv_from(buf).map(|(n, _)| n).unwrap_or(0)
+    }
+
+    fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        let mut data = Vec::new();
+        for byte_ref in buf.into_iter() {
+            data.push(unsafe { *byte_ref });
+        }
+        self.send_to(&data, None).unwrap_or(0)
+    }
+
+    fn poll(&self, events: u16) -> u16 {
+        let mut ready = 0;
+        if (events & POLLIN) != 0 && !self.state.lock().queue.is_empty() {
+            ready |= POLLIN;
+        }
+        if (events & POLLOUT) != 0 {
+            ready |= POLLOUT;
+        }
+        ready
+    }
+
+    fn poll_source_id(&self) -> usize {
+        self.source_id()
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::SOCK,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+impl Drop for UnixDatagramSocketFile {
+    fn drop(&mut self) {
+        if let Some(addr) = self.state.lock().bound_addr.clone() {
+            UNIX_REGISTRY.lock().datagram.remove(&addr);
+        }
+    }
+}
+
+pub(crate) fn create_unix_datagram_socket_file() -> Arc<UnixDatagramSocketFile> {
+    Arc::new(UnixDatagramSocketFile::new())
+}
+
+pub(crate) fn unix_stream_listener(addr: &[u8]) -> Option<&'static UnixSocketPairEnd> {
+    UNIX_REGISTRY
+        .lock()
+        .stream
+        .get(addr)
+        .copied()
+        .map(|ptr| unsafe { &*(ptr as *const UnixSocketPairEnd) })
+}
+
+fn unix_path_from_addr(addr: &[u8]) -> Result<String, ERRNO> {
+    if addr.first().copied() == Some(0) {
+        return Err(ERRNO::EINVAL);
+    }
+    core::str::from_utf8(addr)
+        .map(String::from)
+        .map_err(|_| ERRNO::EINVAL)
+}
+
+struct UnixRegistry {
+    stream: BTreeMap<Vec<u8>, usize>,
+    datagram: BTreeMap<Vec<u8>, usize>,
+}
+
+impl UnixRegistry {
+    fn new() -> Self {
+        Self {
+            stream: BTreeMap::new(),
+            datagram: BTreeMap::new(),
+        }
+    }
+}
+
+lazy_static! {
+    static ref UNIX_REGISTRY: SpinNoIrqLock<UnixRegistry> = SpinNoIrqLock::new(UnixRegistry::new());
 }
 
 impl File for UnixSocketPairEnd {
@@ -439,6 +784,7 @@ impl File for UnixSocketPairEnd {
 
         let written = tx.write_bytes_at(0, buf)?;
         if written > 0 {
+            self.run_peer_bpf_filter()?;
             self.tx_meta.lock().push_back(UnixStreamFrameMeta {
                 remaining: written,
                 rights: Vec::new(),
@@ -493,11 +839,5 @@ impl File for UnixSocketPairEnd {
             ctime_nsec: 0,
             unused: [0; 2],
         }
-    }
-}
-impl Drop for UnixSocketPairEnd {
-    fn drop(&mut self) {
-        self.notify_self(POLLHUP | POLLIN | POLLOUT);
-        self.notify_peer(POLLHUP | POLLIN | POLLOUT);
     }
 }

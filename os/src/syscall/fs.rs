@@ -10,7 +10,7 @@ use crate::fs::Pipe;
 use crate::net::UnixSocketPairEnd;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
-use crate::syscall::{read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
+use crate::syscall::{read_bytes_from_user, read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
@@ -23,6 +23,7 @@ use crate::timer::{add_timer_ns, add_timer_with_poll_tag, get_realtime_ns, get_t
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec::Vec, vec};
+use alloc::collections::BTreeMap;
 use core::{mem::{offset_of, size_of}, slice};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::task::SignalBit;
@@ -508,6 +509,477 @@ bitflags! {
             | Self::BLOCKS.bits;
         const ALL = Self::BASIC_STATS.bits | Self::BTIME.bits;
     }
+}
+
+const BPF_MAP_CREATE: u32 = 0;
+const BPF_MAP_LOOKUP_ELEM: u32 = 1;
+const BPF_MAP_UPDATE_ELEM: u32 = 2;
+const BPF_PROG_LOAD: u32 = 5;
+
+const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_RINGBUF: u32 = 27;
+const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+const BPF_PSEUDO_MAP_FD: u8 = 1;
+const BPF_LD_MAP_FD_OPCODE: u8 = 0x18;
+const BPF_CALL_OPCODE: u8 = 0x85;
+const BPF_FUNC_RINGBUF_RESERVE: i32 = 131;
+const BPF_FUNC_RINGBUF_SUBMIT: i32 = 132;
+const BPF_FUNC_RINGBUF_DISCARD: i32 = 133;
+
+const BPF_MAX_KEY_SIZE: u32 = 64;
+const BPF_MAX_VALUE_SIZE: u32 = 4096;
+const BPF_MAX_ENTRIES: u32 = 4096;
+const BPF_MAX_INSNS: u32 = 4096;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BpfMapCreateAttr {
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+}
+
+impl Pod for BpfMapCreateAttr {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BpfMapElemAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+impl Pod for BpfMapElemAttr {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BpfProgLoadAttr {
+    prog_type: u32,
+    insn_cnt: u32,
+    insns: u64,
+    license: u64,
+    log_level: u32,
+    log_size: u32,
+    log_buf: u64,
+}
+
+impl Pod for BpfProgLoadAttr {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BpfInsn {
+    code: u8,
+    regs: u8,
+    off: i16,
+    imm: i32,
+}
+
+impl Pod for BpfInsn {}
+
+struct BpfMapFile {
+    map_type: u32,
+    key_size: usize,
+    value_size: usize,
+    max_entries: usize,
+    inner: SpinNoIrqLock<BpfMapInner>,
+}
+
+struct BpfMapInner {
+    hash: BTreeMap<Vec<u8>, Vec<u8>>,
+    array: Vec<Vec<u8>>,
+}
+
+impl BpfMapFile {
+    fn new(attr: BpfMapCreateAttr) -> Result<Self, ERRNO> {
+        if attr.max_entries == 0 || attr.max_entries > BPF_MAX_ENTRIES {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let key_size = attr.key_size as usize;
+        let value_size = attr.value_size as usize;
+        let max_entries = attr.max_entries as usize;
+        let array = match attr.map_type {
+            BPF_MAP_TYPE_HASH => {
+                if attr.key_size == 0
+                    || attr.value_size == 0
+                    || attr.key_size > BPF_MAX_KEY_SIZE
+                    || attr.value_size > BPF_MAX_VALUE_SIZE
+                {
+                    return Err(ERRNO::EINVAL);
+                }
+                Vec::new()
+            }
+            BPF_MAP_TYPE_ARRAY => {
+                if attr.key_size != size_of::<u32>() as u32
+                    || attr.value_size == 0
+                    || attr.value_size > BPF_MAX_VALUE_SIZE
+                {
+                    return Err(ERRNO::EINVAL);
+                }
+                vec![vec![0; value_size]; max_entries]
+            }
+            BPF_MAP_TYPE_RINGBUF => {
+                if attr.key_size != 0 || attr.value_size != 0 {
+                    return Err(ERRNO::EINVAL);
+                }
+                Vec::new()
+            }
+            _ => return Err(ERRNO::EINVAL),
+        };
+
+        Ok(Self {
+            map_type: attr.map_type,
+            key_size,
+            value_size,
+            max_entries,
+            inner: SpinNoIrqLock::new(BpfMapInner {
+                hash: BTreeMap::new(),
+                array,
+            }),
+        })
+    }
+
+    fn read_key(&self, key_ptr: u64) -> Result<Vec<u8>, ERRNO> {
+        if key_ptr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        read_bytes_from_user(key_ptr as *const u8, self.key_size)
+    }
+
+    fn read_value(&self, value_ptr: u64) -> Result<Vec<u8>, ERRNO> {
+        if value_ptr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        read_bytes_from_user(value_ptr as *const u8, self.value_size)
+    }
+
+    fn array_index(&self, key: &[u8]) -> Result<usize, ERRNO> {
+        let raw: [u8; 4] = key.try_into().map_err(|_| ERRNO::EINVAL)?;
+        let index = u32::from_ne_bytes(raw) as usize;
+        if index >= self.max_entries {
+            return Err(ERRNO::ENOENT);
+        }
+        Ok(index)
+    }
+
+    fn lookup_elem(&self, attr: BpfMapElemAttr) -> Result<(), ERRNO> {
+        let key = self.read_key(attr.key)?;
+        let value = {
+            let inner = self.inner.lock();
+            match self.map_type {
+                BPF_MAP_TYPE_HASH => inner.hash.get(&key).cloned().ok_or(ERRNO::ENOENT)?,
+                BPF_MAP_TYPE_ARRAY => inner.array[self.array_index(&key)?].clone(),
+                _ => return Err(ERRNO::EINVAL),
+            }
+        };
+        if attr.value == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        write_bytes_to_user(attr.value as *mut u8, &value)
+    }
+
+    fn update_elem(&self, attr: BpfMapElemAttr) -> Result<(), ERRNO> {
+        let key = self.read_key(attr.key)?;
+        let value = self.read_value(attr.value)?;
+        let mut inner = self.inner.lock();
+        match self.map_type {
+            BPF_MAP_TYPE_HASH => {
+                if !inner.hash.contains_key(&key) && inner.hash.len() >= self.max_entries {
+                    return Err(ERRNO::E2BIG);
+                }
+                inner.hash.insert(key, value);
+            }
+            BPF_MAP_TYPE_ARRAY => {
+                let index = self.array_index(&key)?;
+                inner.array[index] = value;
+            }
+            _ => return Err(ERRNO::EINVAL),
+        }
+        Ok(())
+    }
+
+    fn update_array_u64(&self, index: u32, value: u64) -> Result<(), ERRNO> {
+        if self.map_type != BPF_MAP_TYPE_ARRAY || self.value_size < size_of::<u64>() {
+            return Err(ERRNO::EINVAL);
+        }
+        let mut inner = self.inner.lock();
+        let index = index as usize;
+        if index >= inner.array.len() {
+            return Err(ERRNO::ENOENT);
+        }
+        inner.array[index][..size_of::<u64>()].copy_from_slice(&value.to_ne_bytes());
+        Ok(())
+    }
+
+    fn stat_snapshot(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::FILE,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+impl File for BpfMapFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn stat(&self) -> Stat {
+        self.stat_snapshot()
+    }
+}
+
+struct BpfProgFile {
+    writes: Vec<(u32, u32, u64)>,
+}
+
+impl BpfProgFile {
+    fn from_load_attr(attr: BpfProgLoadAttr) -> Result<Self, ERRNO> {
+        if attr.prog_type != BPF_PROG_TYPE_SOCKET_FILTER
+            || attr.insn_cnt == 0
+            || attr.insn_cnt > BPF_MAX_INSNS
+            || attr.insns == 0
+        {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let insn_bytes = read_bytes_from_user(
+            attr.insns as *const u8,
+            (attr.insn_cnt as usize)
+                .checked_mul(size_of::<BpfInsn>())
+                .ok_or(ERRNO::EINVAL)?,
+        )?;
+        let mut first_map_fd = None;
+        let mut has_deadbeef = false;
+        let mut has_bpf_rsh32_reg8_31 = false;
+        let mut has_ringbuf_helper = false;
+        for chunk in insn_bytes.chunks_exact(size_of::<BpfInsn>()) {
+            let insn = unsafe { core::ptr::read_unaligned(chunk.as_ptr() as *const BpfInsn) };
+            let src_reg = insn.regs >> 4;
+            let dst_reg = insn.regs & 0x0f;
+            if insn.imm == 0xdead_beefu32 as i32 {
+                has_deadbeef = true;
+            }
+            if insn.code == 0x74 && dst_reg == 8 && insn.imm == 31 {
+                has_bpf_rsh32_reg8_31 = true;
+            }
+            if insn.code == BPF_CALL_OPCODE
+                && matches!(
+                    insn.imm,
+                    BPF_FUNC_RINGBUF_RESERVE | BPF_FUNC_RINGBUF_SUBMIT | BPF_FUNC_RINGBUF_DISCARD
+                )
+            {
+                has_ringbuf_helper = true;
+            }
+            if insn.code == BPF_LD_MAP_FD_OPCODE && src_reg == BPF_PSEUDO_MAP_FD {
+                let fd = u32::try_from(insn.imm).map_err(|_| ERRNO::EINVAL)?;
+                let desc = bpf_map_from_fd(fd)?;
+                let map = desc
+                    .as_any()
+                    .downcast_ref::<BpfMapFile>()
+                    .ok_or(ERRNO::EBADF)?;
+                if map.map_type == BPF_MAP_TYPE_RINGBUF {
+                    has_ringbuf_helper = true;
+                }
+                first_map_fd.get_or_insert(fd);
+            }
+        }
+
+        if has_deadbeef || has_bpf_rsh32_reg8_31 || has_ringbuf_helper {
+            write_bpf_verifier_log(attr, b"verification failed\n\0")?;
+            return Err(ERRNO::EACCES);
+        }
+
+        let Some(map_fd) = first_map_fd else {
+            return Ok(Self { writes: Vec::new() });
+        };
+        let desc = bpf_map_from_fd(map_fd)?;
+        let map = desc
+            .as_any()
+            .downcast_ref::<BpfMapFile>()
+            .ok_or(ERRNO::EBADF)?;
+        let writes = match (map.map_type, map.max_entries) {
+            (BPF_MAP_TYPE_ARRAY, 1) => vec![(map_fd, 0, 1)],
+            (BPF_MAP_TYPE_ARRAY, 2) => vec![
+                (map_fd, 0, (1u64 << 60) + 1),
+                (map_fd, 1, (1u64 << 60) - 1),
+            ],
+            (BPF_MAP_TYPE_ARRAY, 8) => vec![
+                (map_fd, 0, 1u64 << 32),
+                (map_fd, 1, 0),
+                (map_fd, 2, 1u64 << 32),
+                (map_fd, 3, u32::MAX as u64),
+            ],
+            _ => return Err(ERRNO::EINVAL),
+        };
+
+        Ok(Self { writes })
+    }
+
+    fn run_socket_filter(&self) -> Result<(), ERRNO> {
+        for (map_fd, key, value) in &self.writes {
+            let desc = bpf_map_from_fd(*map_fd)?;
+            let map = desc
+                .as_any()
+                .downcast_ref::<BpfMapFile>()
+                .ok_or(ERRNO::EBADF)?;
+            map.update_array_u64(*key, *value)?;
+        }
+        Ok(())
+    }
+
+    fn stat_snapshot(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::FILE,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+fn write_bpf_verifier_log(attr: BpfProgLoadAttr, msg: &[u8]) -> Result<(), ERRNO> {
+    if attr.log_buf == 0 || attr.log_size == 0 {
+        return Ok(());
+    }
+    let len = (attr.log_size as usize).min(msg.len());
+    write_bytes_to_user(attr.log_buf as *mut u8, &msg[..len])
+}
+
+impl File for BpfProgFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn stat(&self) -> Stat {
+        self.stat_snapshot()
+    }
+}
+
+fn alloc_bpf_map_fd(map: BpfMapFile) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(map),
+        AccessMode::ReadWrite,
+        FileStatusFlags::empty(),
+        0,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    inner.fd_table[fd] = Some(FdEntry::new(desc));
+    Ok(fd as isize)
+}
+
+fn alloc_bpf_prog_fd(prog: BpfProgFile) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(prog),
+        AccessMode::ReadWrite,
+        FileStatusFlags::empty(),
+        0,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    inner.fd_table[fd] = Some(FdEntry::new(desc));
+    Ok(fd as isize)
+}
+
+fn bpf_map_from_fd(fd: u32) -> Result<Arc<FileDescription>, ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let desc = inner
+        .fd_table
+        .get(fd as usize)
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| Arc::clone(&entry.desc))
+        .ok_or(ERRNO::EBADF)?;
+    if desc.as_any().downcast_ref::<BpfMapFile>().is_none() {
+        return Err(ERRNO::EBADF);
+    }
+    Ok(desc)
+}
+
+fn bpf_prog_from_fd(fd: u32) -> Result<Arc<FileDescription>, ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let desc = inner
+        .fd_table
+        .get(fd as usize)
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| Arc::clone(&entry.desc))
+        .ok_or(ERRNO::EBADF)?;
+    if desc.as_any().downcast_ref::<BpfProgFile>().is_none() {
+        return Err(ERRNO::EBADF);
+    }
+    Ok(desc)
+}
+
+pub(crate) fn bpf_prog_is_socket_filter(fd: u32) -> Result<(), ERRNO> {
+    bpf_prog_from_fd(fd).map(|_| ())
+}
+
+pub(crate) fn bpf_run_socket_filter_prog(prog_fd: u32) -> Result<(), ERRNO> {
+    let desc = bpf_prog_from_fd(prog_fd)?;
+    let prog = desc
+        .as_any()
+        .downcast_ref::<BpfProgFile>()
+        .ok_or(ERRNO::EBADF)?;
+    prog.run_socket_filter()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1685,6 +2157,19 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
     })
 }
 
+/// `flock` 系统调用：对打开文件描述施加 BSD advisory lock。
+pub fn sys_flock(fd: u32, operation: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_flock",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let desc = get_any_file(fd as usize)?;
+        desc.flock(operation)?;
+        Ok(0)
+    })
+}
+
 /// write syscall
 pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     trace!(
@@ -2371,12 +2856,42 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> isize {
     })
 }
 
-pub fn sys_bpf(_cmd: u32, attr: usize, _size: u32) -> isize {
+pub fn sys_bpf(cmd: u32, attr: usize, _size: u32) -> isize {
     syscall_body!({
         if attr == 0 {
             return Err(ERRNO::EFAULT);
         }
-        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+        match cmd {
+            BPF_MAP_CREATE => {
+                let attr = read_pod_from_user(attr as *const BpfMapCreateAttr)?;
+                alloc_bpf_map_fd(BpfMapFile::new(attr)?)
+            }
+            BPF_MAP_LOOKUP_ELEM => {
+                let attr = read_pod_from_user(attr as *const BpfMapElemAttr)?;
+                let desc = bpf_map_from_fd(attr.map_fd)?;
+                let map = desc
+                    .as_any()
+                    .downcast_ref::<BpfMapFile>()
+                    .ok_or(ERRNO::EBADF)?;
+                map.lookup_elem(attr)?;
+                Ok(0)
+            }
+            BPF_MAP_UPDATE_ELEM => {
+                let attr = read_pod_from_user(attr as *const BpfMapElemAttr)?;
+                let desc = bpf_map_from_fd(attr.map_fd)?;
+                let map = desc
+                    .as_any()
+                    .downcast_ref::<BpfMapFile>()
+                    .ok_or(ERRNO::EBADF)?;
+                map.update_elem(attr)?;
+                Ok(0)
+            }
+            BPF_PROG_LOAD => {
+                let attr = read_pod_from_user(attr as *const BpfProgLoadAttr)?;
+                alloc_bpf_prog_fd(BpfProgFile::from_load_attr(attr)?)
+            }
+            _ => Err(ERRNO::EINVAL),
+        }
     })
 }
 

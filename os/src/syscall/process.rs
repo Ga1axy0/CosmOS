@@ -1,6 +1,6 @@
 use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{translated_byte_buffer_with_access, write_pod_to_user, Pod};
+use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::task::yield_current_and_run_next;
 use crate::timer::get_time_ns;
@@ -12,8 +12,8 @@ use crate::{
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, thread_id2task, ExitReason, ProcessControlBlock, ShmAttachment,
-        SigInfo, SignalBit, WaitReason,
+        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
+        ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -21,9 +21,35 @@ use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
 const UID_NO_CHANGE: u32 = u32::MAX;
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct UserCapHeader {
+    version: u32,
+    pid: i32,
+}
+
+impl Pod for UserCapHeader {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct UserCapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+impl Pod for UserCapData {}
 
 fn unprivileged_uid_change_allowed(current_uid: u32, current_euid: u32, current_suid: u32, new_uid: u32) -> bool {
     new_uid == current_uid || new_uid == current_euid || new_uid == current_suid
+}
+
+fn unprivileged_gid_change_allowed(current_gid: u32, current_egid: u32, current_sgid: u32, new_gid: u32) -> bool {
+    new_gid == current_gid || new_gid == current_egid || new_gid == current_sgid
 }
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
@@ -174,7 +200,13 @@ pub fn sys_exit(exit_code: i32) -> ! {
 
 /// 临时实现
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    sys_exit(exit_code);
+    trace!(
+        "kernel:pid[{}] sys_exit_group - time {}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        get_time_ns()
+    );
+    exit_group_current_and_run_next(ExitReason::Exit(exit_code));
+    panic!("Unreachable in sys_exit_group!");
 }
 
 /// getpid syscall
@@ -227,6 +259,75 @@ pub fn sys_getegid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getegid pid:{}", process.getpid());
     process.getegid() as isize
+}
+
+fn cap_data_words(version: u32) -> Result<usize, ERRNO> {
+    match version {
+        LINUX_CAPABILITY_VERSION_1 => Ok(1),
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Ok(2),
+        _ => Err(ERRNO::EINVAL),
+    }
+}
+
+/// capget syscall
+pub fn sys_capget(header: *mut UserCapHeader, data: *mut UserCapData) -> isize {
+    syscall_body!({
+        if header.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let mut hdr = read_pod_from_user(header as *const UserCapHeader)?;
+        let words = match cap_data_words(hdr.version) {
+            Ok(words) => words,
+            Err(errno) => {
+                hdr.version = LINUX_CAPABILITY_VERSION_3;
+                write_pod_to_user(header, &hdr)?;
+                return Err(errno);
+            }
+        };
+        let pid = current_process().getpid() as i32;
+        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+            return Err(ERRNO::ESRCH);
+        }
+        if data.is_null() {
+            return Ok(0);
+        }
+
+        let word0 = UserCapData {
+            effective: u32::MAX,
+            permitted: u32::MAX,
+            inheritable: 0,
+        };
+        write_pod_to_user(data, &word0)?;
+        if words > 1 {
+            let word1 = UserCapData {
+                effective: u32::MAX,
+                permitted: u32::MAX,
+                inheritable: 0,
+            };
+            write_pod_to_user(unsafe { data.add(1) }, &word1)?;
+        }
+        Ok(0)
+    })
+}
+
+/// capset syscall
+pub fn sys_capset(header: *const UserCapHeader, data: *const UserCapData) -> isize {
+    syscall_body!({
+        if header.is_null() || data.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let hdr = read_pod_from_user(header)?;
+        let words = cap_data_words(hdr.version)?;
+        let pid = current_process().getpid() as i32;
+        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+            return Err(ERRNO::ESRCH);
+        }
+        let _ = read_pod_from_user(data)?;
+        if words > 1 {
+            let _ = read_pod_from_user(unsafe { data.add(1) })?;
+        }
+        Ok(0)
+    })
 }
 
 /// setuid syscall
@@ -318,6 +419,101 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
         }
         if suid != UID_NO_CHANGE {
             cred.suid = suid;
+        }
+        Ok(0)
+    })
+}
+
+/// setgid syscall
+pub fn sys_setgid(gid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setgid pid:{} gid={}", process.getpid(), gid);
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        if cred.euid != 0 && !unprivileged_gid_change_allowed(cred.gid, cred.egid, cred.sgid, gid) {
+            return Err(ERRNO::EPERM);
+        }
+        cred.gid = gid;
+        cred.egid = gid;
+        cred.sgid = gid;
+        Ok(0)
+    })
+}
+
+/// setregid syscall
+pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
+    let process = current_process();
+    trace!("kernel: sys_setregid pid:{} rgid={} egid={}", process.getpid(), rgid, egid);
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_rgid = cred.gid;
+        let old_egid = cred.egid;
+        let old_sgid = cred.sgid;
+        let privileged = cred.euid == 0;
+
+        if !privileged {
+            if rgid != UID_NO_CHANGE
+                && !unprivileged_gid_change_allowed(old_rgid, old_egid, old_sgid, rgid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+            if egid != UID_NO_CHANGE
+                && !unprivileged_gid_change_allowed(old_rgid, old_egid, old_sgid, egid)
+            {
+                return Err(ERRNO::EPERM);
+            }
+        }
+
+        let new_rgid = if rgid == UID_NO_CHANGE { old_rgid } else { rgid };
+        let new_egid = if egid == UID_NO_CHANGE { old_egid } else { egid };
+        cred.gid = new_rgid;
+        cred.egid = new_egid;
+        if rgid != UID_NO_CHANGE || (egid != UID_NO_CHANGE && new_egid != old_rgid) {
+            cred.sgid = new_egid;
+        }
+        Ok(0)
+    })
+}
+
+/// setresgid syscall
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
+    let process = current_process();
+    trace!(
+        "kernel: sys_setresgid pid:{} rgid={} egid={} sgid={}",
+        process.getpid(),
+        rgid,
+        egid,
+        sgid
+    );
+    syscall_body!({
+        let mut inner = process.inner_exclusive_access();
+        let cred = &mut inner.cred;
+        let old_rgid = cred.gid;
+        let old_egid = cred.egid;
+        let old_sgid = cred.sgid;
+        let privileged = cred.euid == 0;
+
+        if !privileged {
+            for new_gid in [rgid, egid, sgid] {
+                if new_gid == UID_NO_CHANGE {
+                    continue;
+                }
+                if !unprivileged_gid_change_allowed(old_rgid, old_egid, old_sgid, new_gid) {
+                    return Err(ERRNO::EPERM);
+                }
+            }
+        }
+
+        if rgid != UID_NO_CHANGE {
+            cred.gid = rgid;
+        }
+        if egid != UID_NO_CHANGE {
+            cred.egid = egid;
+        }
+        if sgid != UID_NO_CHANGE {
+            cred.sgid = sgid;
         }
         Ok(0)
     })
@@ -810,6 +1006,29 @@ pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
         let fd = fd as usize;
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
             return Err(ERRNO::EBADF);
+        }
+        Ok(0)
+    })
+}
+
+/// `unshare` namespace compatibility shim.
+///
+/// CosmOS does not isolate namespace state yet. Accept the namespace flags used
+/// by LTP setup helpers as no-ops so tests can exercise the target syscall
+/// behavior behind their namespace bootstrap.
+pub fn sys_unshare(flags: usize) -> isize {
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    const CLONE_NEWUTS: usize = 0x0400_0000;
+    const CLONE_NEWIPC: usize = 0x0800_0000;
+    const CLONE_NEWUSER: usize = 0x1000_0000;
+    const CLONE_NEWPID: usize = 0x2000_0000;
+    const CLONE_NEWNET: usize = 0x4000_0000;
+    const SUPPORTED_FLAGS: usize =
+        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+
+    syscall_body!({
+        if flags & !SUPPORTED_FLAGS != 0 {
+            return Err(ERRNO::EINVAL);
         }
         Ok(0)
     })

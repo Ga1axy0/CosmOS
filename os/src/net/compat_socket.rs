@@ -515,7 +515,7 @@ pub(crate) fn compat_ifreq_ioctl(req: usize, arg: usize) -> Result<isize, ERRNO>
 }
 
 struct PacketBinding {
-    ifindex: usize,
+    ifindex: Option<usize>,
     protocol: u16,
 }
 
@@ -567,8 +567,15 @@ impl PacketSocketFile {
         if raw.sll_family != AF_PACKET_FAMILY {
             return Err(ERRNO::EAFNOSUPPORT);
         }
-        let ifindex = raw.sll_ifindex as usize;
-        compat::get_iface_by_ifindex(ifindex).ok_or(ERRNO::ENODEV)?;
+        let ifindex = if raw.sll_ifindex == 0 {
+            None
+        } else if raw.sll_ifindex > 0 {
+            let ifindex = raw.sll_ifindex as usize;
+            compat::get_iface_by_ifindex(ifindex).ok_or(ERRNO::ENODEV)?;
+            Some(ifindex)
+        } else {
+            return Err(ERRNO::ENODEV);
+        };
         *self.binding.lock() = Some(PacketBinding {
             ifindex,
             protocol: u16::from_be(raw.sll_protocol),
@@ -579,17 +586,21 @@ impl PacketSocketFile {
     pub(crate) fn getsockname_raw(&self) -> Result<SockAddrLl, ERRNO> {
         let binding = self.binding.lock();
         let binding = binding.as_ref().ok_or(ERRNO::EINVAL)?;
-        let iface = compat::get_iface_by_ifindex(binding.ifindex).ok_or(ERRNO::ENODEV)?;
+        let iface = binding
+            .ifindex
+            .and_then(compat::get_iface_by_ifindex);
         let mut out = SockAddrLl {
             sll_family: AF_PACKET_FAMILY,
             sll_protocol: binding.protocol.to_be(),
-            sll_ifindex: binding.ifindex as i32,
+            sll_ifindex: binding.ifindex.unwrap_or(0) as i32,
             sll_hatype: ARPHRD_ETHER,
             sll_pkttype: PACKET_HOST,
-            sll_halen: 6,
+            sll_halen: if iface.is_some() { 6 } else { 0 },
             sll_addr: [0; 8],
         };
-        out.sll_addr[..6].copy_from_slice(&iface.mac);
+        if let Some(iface) = iface {
+            out.sll_addr[..6].copy_from_slice(&iface.mac);
+        }
         Ok(out)
     }
 
@@ -603,11 +614,10 @@ impl PacketSocketFile {
             data.extend_from_slice(chunk);
         }
 
-        let local_ifindex = {
+        let bound_ifindex = {
             let binding = self.binding.lock();
             binding.as_ref().ok_or(ERRNO::EINVAL)?.ifindex
         };
-        let local = compat::get_iface_by_ifindex(local_ifindex).ok_or(ERRNO::ENODEV)?;
 
         let send_ifindex = if let Some(addr) = addr {
             if addr.len() < size_of::<SockAddrLl>() {
@@ -619,10 +629,13 @@ impl PacketSocketFile {
             }
             raw.sll_ifindex as usize
         } else {
-            local.ifindex
+            bound_ifindex.unwrap_or(2)
         };
-        if send_ifindex != local.ifindex {
-            return Err(ERRNO::ENODEV);
+        let local = compat::get_iface_by_ifindex(send_ifindex).ok_or(ERRNO::ENODEV)?;
+        if let Some(bound_ifindex) = bound_ifindex {
+            if send_ifindex != bound_ifindex {
+                return Err(ERRNO::ENODEV);
+            }
         }
 
         if let Some((src_mac, src_ip, dst_ip)) = read_arp_ipv4_request(data.as_slice()) {

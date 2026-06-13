@@ -1,6 +1,6 @@
 //! Per-hart runqueue management for RT and CFS scheduling classes.
 
-use super::current_task;
+use super::{current_task, processor::processor_for_hart};
 use crate::config::MAX_HARTS;
 use crate::hal::hartid;
 use crate::mm::online_mask as online_hart_mask;
@@ -537,8 +537,21 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     return true;
                 }
                 if task_inner.sched.on_cpu {
-                    drop(task_inner);
-                    return wake_running_or_queued_task(&task);
+                    let last_cpu = normalize_hart(task_inner.sched.last_cpu);
+                    let is_still_current = processor_for_hart(last_cpu)
+                        .lock()
+                        .current()
+                        .is_some_and(|current| Arc::ptr_eq(&current, &task));
+                    if is_still_current {
+                        drop(task_inner);
+                        return wake_running_or_queued_task(&task);
+                    }
+                    task_inner.sched.on_cpu = false;
+                    Some((
+                        last_cpu,
+                        task_inner.sched.cpu_affinity_mask,
+                        task_inner.sched.policy,
+                    ))
                 } else {
                     Some((
                         task_inner.sched.last_cpu,

@@ -278,8 +278,10 @@ pub fn futex_wait_addr(
     if let Some(handle) = handle {
         let wake_state = futex_wait_state(handle);
         cleanup_futex_wait(handle);
-        if matches!(wake_state, FutexWakeState::TimedOut) {
-            return Err(ERRNO::ETIMEDOUT);
+        match wake_state {
+            FutexWakeState::Ready => return Ok(0),
+            FutexWakeState::TimedOut => return Err(ERRNO::ETIMEDOUT),
+            FutexWakeState::Canceled => {}
         }
     }
     if crate::signal::has_unmasked_pending_signal() {

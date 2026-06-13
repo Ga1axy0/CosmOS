@@ -20,23 +20,29 @@ fn suspend_current_and_run_next_inner(
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.account_cfs_runtime(get_time_ns());
-        task_inner.sched.on_rq = false;
-        task_inner.task_status = TaskStatus::Runnable;
-        task_inner.wait_reason = None;
-        task_inner.sched.resched_reason = None;
-        if reset_slice {
-            task_inner.reset_time_slice();
-        }
-        if task_inner.sched.policy.is_rt() {
-            if let Some(rt_enqueue_head) = rt_enqueue_head {
-                task_inner.sched.rt_enqueue_head = rt_enqueue_head;
+        if matches!(task_inner.task_status, TaskStatus::Zombie) {
+            task_inner.sched.on_rq = false;
+            task_inner.wait_reason = None;
+            task_inner.sched.resched_reason = None;
+        } else {
+            task_inner.sched.on_rq = false;
+            task_inner.task_status = TaskStatus::Runnable;
+            task_inner.wait_reason = None;
+            task_inner.sched.resched_reason = None;
+            if reset_slice {
+                task_inner.reset_time_slice();
             }
-        }
-        if apply_cfs_yield_penalty && matches!(task_inner.sched.policy, SchedPolicy::Other) {
-            task_inner.sched.vruntime_ns = task_inner
-                .sched
-                .vruntime_ns
-                .saturating_add(CFS_YIELD_PENALTY_NS);
+            if task_inner.sched.policy.is_rt() {
+                if let Some(rt_enqueue_head) = rt_enqueue_head {
+                    task_inner.sched.rt_enqueue_head = rt_enqueue_head;
+                }
+            }
+            if apply_cfs_yield_penalty && matches!(task_inner.sched.policy, SchedPolicy::Other) {
+                task_inner.sched.vruntime_ns = task_inner
+                    .sched
+                    .vruntime_ns
+                    .saturating_add(CFS_YIELD_PENALTY_NS);
+            }
         }
         &mut task_inner.task_cx as *mut TaskContext
     };

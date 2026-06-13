@@ -21,6 +21,7 @@ use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use core::any::Any;
+use lazy_static::*;
 pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
     discard_inode,
@@ -109,6 +110,29 @@ pub enum AccessMode {
     WriteOnly,
     /// 读写打开。
     ReadWrite,
+}
+
+const LOCK_SH: i32 = 1;
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+const LOCK_UN: i32 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlockKind {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FlockRecord {
+    fs_id: u64,
+    ino: u64,
+    owner: usize,
+    kind: FlockKind,
+}
+
+lazy_static! {
+    static ref FLOCK_TABLE: SpinNoIrqLock<Vec<FlockRecord>> = SpinNoIrqLock::new(Vec::new());
 }
 
 impl AccessMode {
@@ -394,6 +418,55 @@ impl FileDescription {
         self.file.backing_inode()
     }
 
+    /// Apply a BSD `flock(2)` lock to this open file description.
+    pub fn flock(&self, operation: i32) -> Result<(), ERRNO> {
+        let op = operation & !LOCK_NB;
+        let kind = match op {
+            LOCK_SH => Some(FlockKind::Shared),
+            LOCK_EX => Some(FlockKind::Exclusive),
+            LOCK_UN => None,
+            _ => return Err(ERRNO::EINVAL),
+        };
+        if operation & !(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN) != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let inode = self.backing_inode().ok_or(ERRNO::EINVAL)?;
+        let fs_id = inode.fs_id();
+        let ino = inode.ino();
+        let owner = self as *const Self as usize;
+        let mut table = FLOCK_TABLE.lock();
+
+        if kind.is_none() {
+            table.retain(|record| {
+                !(record.fs_id == fs_id && record.ino == ino && record.owner == owner)
+            });
+            return Ok(());
+        }
+
+        let kind = kind.unwrap();
+        let has_conflict = table.iter().any(|record| {
+            if record.fs_id != fs_id || record.ino != ino || record.owner == owner {
+                return false;
+            }
+            kind == FlockKind::Exclusive || record.kind == FlockKind::Exclusive
+        });
+        if has_conflict {
+            return Err(ERRNO::EAGAIN);
+        }
+
+        table.retain(|record| {
+            !(record.fs_id == fs_id && record.ino == ino && record.owner == owner)
+        });
+        table.push(FlockRecord {
+            fs_id,
+            ino,
+            owner,
+            kind,
+        });
+        Ok(())
+    }
+
     /// 读取目录项并推进共享目录位置。
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
@@ -486,6 +559,13 @@ impl FileDescription {
         inner.offset = new_offset as usize;
         inner.dirent_snapshot = None;
         Ok(new_offset as u64)
+    }
+}
+
+impl Drop for FileDescription {
+    fn drop(&mut self) {
+        let owner = self as *const Self as usize;
+        FLOCK_TABLE.lock().retain(|record| record.owner != owner);
     }
 }
 

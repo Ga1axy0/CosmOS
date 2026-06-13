@@ -1261,6 +1261,9 @@ impl VfsNode for ProcPidDirNode {
             (String::from("ns"), VfsFileType::Directory),
             (String::from("stat"), VfsFileType::Regular),
             (String::from("status"), VfsFileType::Regular),
+            (String::from("setgroups"), VfsFileType::Regular),
+            (String::from("uid_map"), VfsFileType::Regular),
+            (String::from("gid_map"), VfsFileType::Regular),
         ]
     }
 
@@ -1273,6 +1276,11 @@ impl VfsNode for ProcPidDirNode {
             "ns" => Some(Arc::new(ProcPidNsDirNode::new(self.pid)) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "setgroups" => {
+                Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::Setgroups)) as Arc<dyn VfsNode>)
+            }
+            "uid_map" => Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::UidMap)) as Arc<dyn VfsNode>),
+            "gid_map" => Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::GidMap)) as Arc<dyn VfsNode>),
             _ => None,
         }
     }
@@ -1293,6 +1301,96 @@ impl VfsNode for ProcPidDirNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcPidUsernsKind {
+    Setgroups,
+    UidMap,
+    GidMap,
+}
+
+/// User namespace setup files used by LTP helpers.
+#[derive(Debug)]
+struct ProcPidUsernsNode {
+    pid: usize,
+    kind: ProcPidUsernsKind,
+}
+
+impl ProcPidUsernsNode {
+    fn new(pid: usize, kind: ProcPidUsernsKind) -> Self {
+        Self { pid, kind }
+    }
+
+    fn content(&self) -> Result<&'static str, FS_ERRNO> {
+        pid2process(self.pid).ok_or(FS_ERRNO::ENOENT)?;
+        Ok(match self.kind {
+            ProcPidUsernsKind::Setgroups => "allow\n",
+            ProcPidUsernsKind::UidMap | ProcPidUsernsKind::GidMap => "0 0 4294967295\n",
+        })
+    }
+}
+
+impl VfsNode for ProcPidUsernsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.content().map(|data| data.len()).unwrap_or(0)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.content()
+            .map(|data| read_string_at(data.to_string(), offset, buf))
+            .unwrap_or(0)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        if pid2process(self.pid).is_none() {
+            return 0;
+        }
+        buf.len()
+    }
+
+    fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        Ok(self.write_at(offset, buf))
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {

@@ -26,6 +26,8 @@ pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_INOTIFY_INIT1: usize = 26;
 /// ioctl syscall
 pub const SYSCALL_IOCTL: usize = 29;
+/// flock syscall
+pub const SYSCALL_FLOCK: usize = 32;
 /// mkdirat syscall
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
@@ -106,6 +108,10 @@ pub const SYSCALL_TIMERFD_CREATE: usize = 85;
 pub const SYSCALL_UTIMENSAT: usize = 88;
 /// acct syscall
 pub const SYSCALL_ACCT: usize = 89;
+/// capget syscall
+pub const SYSCALL_CAPGET: usize = 90;
+/// capset syscall
+pub const SYSCALL_CAPSET: usize = 91;
 /// fstat syscall
 pub const SYSCALL_FSTAT: usize = 80;
 /// sync syscall
@@ -120,6 +126,8 @@ pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_EXIT_GROUP: usize = 94;
 /// set tid address syscall
 pub const SYSCALL_SET_TID_ADDRESS: usize = 96;
+/// unshare syscall
+pub const SYSCALL_UNSHARE: usize = 97;
 /// futex syscall
 pub const SYSCALL_FUTEX: usize = 98;
 /// set robust list syscall
@@ -176,12 +184,18 @@ pub const SYSCALL_SIGRETURN: usize = 139;
 pub const SYSCALL_SET_PRIORITY: usize = 140;
 /// get priority syscall
 pub const SYSCALL_GET_PRIORITY: usize = 141;
+/// setregid syscall
+pub const SYSCALL_SETREGID: usize = 143;
+/// setgid syscall
+pub const SYSCALL_SETGID: usize = 144;
 /// setreuid syscall
 pub const SYSCALL_SETREUID: usize = 145;
 /// setuid syscall
 pub const SYSCALL_SETUID: usize = 146;
 /// setresuid syscall
 pub const SYSCALL_SETRESUID: usize = 147;
+/// setresgid syscall
+pub const SYSCALL_SETRESGID: usize = 149;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -431,11 +445,11 @@ use times::*;
 use resource::*;
 pub(crate) use resource::{rlimit, ResourceLimits};
 pub(crate) use utils::{
-    read_cstring_from_user, read_pod_from_process_user, read_pod_from_user,
+    read_bytes_from_user, read_cstring_from_user, read_pod_from_process_user, read_pod_from_user,
     translated_byte_buffer_with_access, write_bytes_to_user,
     write_pod_to_process_user, write_pod_to_user, Pod,
 };
-pub(crate) use fs::write_process_accounting_on_exit;
+pub(crate) use fs::{bpf_prog_is_socket_filter, bpf_run_socket_filter_prog, write_process_accounting_on_exit};
 pub use times::Timespec;
 
 
@@ -516,6 +530,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
         SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
+        SYSCALL_FLOCK => sys_flock(args[0] as u32, args[1] as i32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_SYMLINKAT => sys_symlinkat(
             args[0] as *const u8,
@@ -772,13 +787,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SENDMSG => sys_sendmsg(args[0] as i32, args[1] as *const MsgHdr, args[2] as u32),
         SYSCALL_RECVMSG => sys_recvmsg(args[0] as i32, args[1] as *mut MsgHdr, args[2] as u32),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_SETREGID => sys_setregid(args[0] as u32, args[1] as u32),
+        SYSCALL_SETGID => sys_setgid(args[0] as u32),
         SYSCALL_SETREUID => sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_SETRESGID => sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
+        SYSCALL_CAPGET => sys_capget(args[0] as *mut UserCapHeader, args[1] as *mut UserCapData),
+        SYSCALL_CAPSET => sys_capset(args[0] as *const UserCapHeader, args[1] as *const UserCapData),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut SysInfo),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),
@@ -786,6 +806,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_UNSHARE => sys_unshare(args[0]),
         SYSCALL_SETNS => sys_setns(args[0] as i32, args[1] as i32),
         SYSCALL_EXECVE => sys_execve(
             args[0] as *const u8,
