@@ -26,6 +26,8 @@ pub const SYSCALL_FCNTL: usize = 25;
 pub const SYSCALL_INOTIFY_INIT1: usize = 26;
 /// ioctl syscall
 pub const SYSCALL_IOCTL: usize = 29;
+/// flock syscall
+pub const SYSCALL_FLOCK: usize = 32;
 /// mkdirat syscall
 pub const SYSCALL_MKDIRAT: usize = 34;
 /// unlinkat syscall
@@ -528,6 +530,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
         SYSCALL_INOTIFY_INIT1 => sys_inotify_init1(args[0] as i32),
         SYSCALL_IOCTL => sys_ioctl(args[0] as u32, args[1], args[2]),
+        SYSCALL_FLOCK => sys_flock(args[0] as u32, args[1] as i32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_SYMLINKAT => sys_symlinkat(
             args[0] as *const u8,

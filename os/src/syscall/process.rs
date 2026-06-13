@@ -12,8 +12,8 @@ use crate::{
     mm::{translated_ref, translated_str, PageFaultAccess},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, thread_id2task, ExitReason, ProcessControlBlock, ShmAttachment,
-        SigInfo, SignalBit, WaitReason,
+        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
+        ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -200,7 +200,13 @@ pub fn sys_exit(exit_code: i32) -> ! {
 
 /// 临时实现
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    sys_exit(exit_code);
+    trace!(
+        "kernel:pid[{}] sys_exit_group - time {}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        get_time_ns()
+    );
+    exit_group_current_and_run_next(ExitReason::Exit(exit_code));
+    panic!("Unreachable in sys_exit_group!");
 }
 
 /// getpid syscall

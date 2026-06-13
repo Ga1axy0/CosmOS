@@ -2157,6 +2157,19 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
     })
 }
 
+/// `flock` 系统调用：对打开文件描述施加 BSD advisory lock。
+pub fn sys_flock(fd: u32, operation: i32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_flock",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let desc = get_any_file(fd as usize)?;
+        desc.flock(operation)?;
+        Ok(0)
+    })
+}
+
 /// write syscall
 pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     trace!(
