@@ -1,19 +1,21 @@
 DOCKER_NAME ?= rcore-docker
 
+ARCH ?= rv
 TARGET ?= riscv64gc-unknown-none-elf
 USER_MODE ?= release
 USER_BIN_DIR := user/target/$(TARGET)/$(USER_MODE)
 KERNEL_RV_ELF := os/target/$(TARGET)/release/os
-QEMU ?= qemu-system-riscv64
+QEMU_RV ?= qemu-system-riscv64
+QEMU_LA ?= qemu-system-loongarch64
 MEM ?= 1G
 SMP ?= 1
-TEST_FS ?= sdcard-rv.img
+TEST_FS ?= sdcard-$(ARCH).img
 # make run 使用写时复制副本，避免 QEMU 写坏原始测试镜像。
-RUN_TEST_FS ?= .make/sdcard-rv-run.img
+RUN_TEST_FS ?= .make/sdcard-$(ARCH)-run.img
 QEMU_NETDEV ?= user,id=net
 QEMU_TRACE_ARGS ?=
 QEMU_COMP_BLK_ARGS = -drive file=$(RUN_TEST_FS),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
-QEMU_COMP_EXTRA_BLK_ARGS = -drive file=disk.img,if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+QEMU_COMP_EXTRA_BLK_ARGS = -drive file=$(RUN_DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 
 STAMP_DIR := .make
 USER_BUILD_STAMP := $(STAMP_DIR)/user-build.stamp
@@ -24,6 +26,8 @@ ROOTFS_REPO := CosmOS-rootfs
 ROOTFS_BASE_DIR := $(ROOTFS_REPO)/rootfs
 ROOTFS_RV_DIR := $(ROOTFS_REPO)/rootfs-rv
 ROOTFS_LA_DIR := $(ROOTFS_REPO)/rootfs-la
+ROOTFS_RV_BUILD_DIR := $(ROOTFS_REPO)/build/rv
+ROOTFS_LA_BUILD_DIR := $(ROOTFS_REPO)/build/la
 ROOTFS_RV_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-rv
 ROOTFS_LA_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-la
 ROOTFS_RV_FILES := $(shell if [ -d $(ROOTFS_RV_DIR) ]; then find $(ROOTFS_RV_DIR) -type f | sort; fi)
@@ -35,14 +39,28 @@ RV_TOOLCHAIN_BIN ?= /opt/riscv64-linux-musl-cross/bin
 RV_GLIBC_LIB ?= /usr/riscv64-linux-gnu/lib
 RV_MUSL_LIB ?= /opt/riscv64-linux-musl-cross/riscv64-linux-musl/lib
 RV_MUSL_ARCH ?= riscv64
+RV_MUSL_LOADER_ALIASES ?= ld-musl-riscv64.so.1 ld-musl-riscv64-sf.so.1
 LA_ROOTFS_TARGET ?= loongarch64-linux-musl
 LA_TOOLCHAIN_BIN ?= /opt/loongarch64-linux-musl-cross/bin
 LA_GLIBC_TOOLCHAIN ?= /opt/gcc-13.2.0-loongarch64-linux-gnu
 LA_MUSL_LIB ?= /opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib
 LA_MUSL_ARCH ?= loongarch64
+LA_MUSL_LOADER_ALIASES ?= ld-musl-loongarch64.so.1
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs rootfs-rv rootfs-la rv la disk-la clean run run-trace run-comp-rv debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la prepare-run-test-fs
+ifeq ($(ARCH),rv)
+QEMU ?= $(QEMU_RV)
+RUN_KERNEL := kernel-rv
+RUN_DISK_IMG := $(DISK_RV_IMG)
+else ifeq ($(ARCH),la)
+QEMU ?= $(QEMU_LA)
+RUN_KERNEL := kernel-la
+RUN_DISK_IMG := $(DISK_LA_IMG)
+else
+$(error unsupported ARCH=$(ARCH), expected rv or la)
+endif
+
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean run run-trace run-comp-rv run-comp-la debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready prepare-run-test-fs force
 
 all:
 	$(MAKE) submodules
@@ -86,35 +104,54 @@ kernel-la: kernel-rv
 rootfs:
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init
 
-rootfs-rv:
+sync-rootfs-variants:
+	@test -d "$(ROOTFS_BASE_DIR)" || { \
+		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' if you need to build it" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_BASE_DIR)/root" || { \
+		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
+		exit 1; \
+	}
+	@for dir in "$(ROOTFS_RV_DIR)" "$(ROOTFS_LA_DIR)"; do \
+		echo "[SYNC] $(ROOTFS_BASE_DIR) -> $$dir"; \
+		mkdir -p "$$dir"; \
+		cp -a "$(ROOTFS_BASE_DIR)"/. "$$dir"/; \
+	done
+
+rootfs-rv: sync-rootfs-variants
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
+		BUILD_ROOT="$(CURDIR)/$(ROOTFS_RV_BUILD_DIR)" \
 		STAMP_DIR="$(CURDIR)/$(ROOTFS_RV_STAMP_DIR)" \
 		TARGET=$(RV_ROOTFS_TARGET) \
 		TOOLCHAIN_BIN=$(RV_TOOLCHAIN_BIN) \
 		BUSYBOX_ARCH=riscv \
 		GLIBC_LIB=$(RV_GLIBC_LIB) \
 		MUSL_LIB=$(RV_MUSL_LIB) \
-		MUSL_ARCH=$(RV_MUSL_ARCH)
+		MUSL_ARCH=$(RV_MUSL_ARCH) \
+		MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)"
 
-rootfs-la:
+rootfs-la: sync-rootfs-variants
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_LA_DIR)" \
+		BUILD_ROOT="$(CURDIR)/$(ROOTFS_LA_BUILD_DIR)" \
 		STAMP_DIR="$(CURDIR)/$(ROOTFS_LA_STAMP_DIR)" \
 		TARGET=$(LA_ROOTFS_TARGET) \
 		TOOLCHAIN_BIN=$(LA_TOOLCHAIN_BIN) \
 		BUSYBOX_ARCH=loongarch \
 		GLIBC_TOOLCHAIN=$(LA_GLIBC_TOOLCHAIN) \
 		MUSL_LIB=$(LA_MUSL_LIB) \
-		MUSL_ARCH=$(LA_MUSL_ARCH)
+		MUSL_ARCH=$(LA_MUSL_ARCH) \
+		MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)"
 
-rv: $(DISK_RV_IMG)
+rv disk-rv: $(DISK_RV_IMG)
 
 la disk-la: $(DISK_LA_IMG)
 
-check-kernel:
-	@test -x kernel-rv || { \
-		echo "missing kernel-rv; run 'make all' first" >&2; \
+check-kernel: $(RUN_KERNEL)
+	@test -x "$(RUN_KERNEL)" || { \
+		echo "missing $(RUN_KERNEL); run 'make all' first" >&2; \
 		exit 1; \
 	}
 
@@ -154,11 +191,33 @@ check-rootfs-la: rootfs-la
 		exit 1; \
 	}
 
-$(DISK_RV_IMG): check-user-apps check-rootfs-rv $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
-	MUSL_ARCH=$(RV_MUSL_ARCH) ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR) $@
+check-rootfs-rv-ready:
+	@test -d "$(ROOTFS_RV_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_RV_DIR); run 'make rootfs-rv' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_RV_DIR)/root" || { \
+		echo "rootfs is incomplete under $(ROOTFS_RV_DIR); run 'make rootfs-rv' first" >&2; \
+		exit 1; \
+	}
 
-$(DISK_LA_IMG): check-user-apps check-rootfs-la $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh
-	MUSL_ARCH=$(LA_MUSL_ARCH) ./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR) $@
+check-rootfs-la-ready:
+	@test -d "$(ROOTFS_LA_DIR)" || { \
+		echo "missing rootfs directory $(ROOTFS_LA_DIR); run 'make rootfs-la' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_LA_DIR)/root" || { \
+		echo "rootfs is incomplete under $(ROOTFS_LA_DIR); run 'make rootfs-la' first" >&2; \
+		exit 1; \
+	}
+
+$(DISK_RV_IMG): force check-user-apps rootfs-rv check-rootfs-rv-ready $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
+	MUSL_ARCH=$(RV_MUSL_ARCH) MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR) $@
+
+$(DISK_LA_IMG): force check-user-apps rootfs-la check-rootfs-la-ready $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh
+	MUSL_ARCH=$(LA_MUSL_ARCH) MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR) $@
+
+force:
 
 prepare-run-test-fs: | $(STAMP_DIR)
 	@if [ ! -f "$(TEST_FS)" ]; then \
@@ -167,18 +226,22 @@ prepare-run-test-fs: | $(STAMP_DIR)
 	fi
 	cp -c "$(TEST_FS)" "$(RUN_TEST_FS)" 2>/dev/null || cp --reflink=auto "$(TEST_FS)" "$(RUN_TEST_FS)" 2>/dev/null || cp "$(TEST_FS)" "$(RUN_TEST_FS)"
 
-run: check-kernel disk.img prepare-run-test-fs
-	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
+run: check-kernel $(RUN_DISK_IMG) prepare-run-test-fs
+	$(QEMU) -machine virt -kernel $(RUN_KERNEL) -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
 
 run-trace: QEMU_TRACE_ARGS = -d int,in_asm -D qemu.log
 run-trace: run
 
-run-comp-rv: run
+run-comp-rv:
+	$(MAKE) run ARCH=rv
 
-debug: check-kernel disk.img
+run-comp-la:
+	$(MAKE) run ARCH=la
+
+debug: check-kernel $(RUN_DISK_IMG)
 	$(MAKE) -C os debug
 
-gdbserver: check-kernel disk.img
+gdbserver: check-kernel $(RUN_DISK_IMG)
 	$(MAKE) -C os gdbserver
 
 gdbclient:
@@ -194,6 +257,6 @@ fmt:
 	cd fs; cargo fmt; cd ../fs-fuse; cargo fmt; cd ../os; cargo fmt; cd ../user; cargo fmt; cd ..
 
 clean:
-	rm -rf $(STAMP_DIR) $(RUN_TEST_FS) $(DISK_RV_IMG) $(DISK_LA_IMG) kernel-rv kernel-la os/.cargo user/.cargo $(ROOTFS_RV_DIR) $(ROOTFS_LA_DIR) $(ROOTFS_RV_STAMP_DIR) $(ROOTFS_LA_STAMP_DIR)
+	rm -rf $(STAMP_DIR) $(RUN_TEST_FS) $(DISK_RV_IMG) $(DISK_LA_IMG) kernel-rv kernel-la os/.cargo user/.cargo $(ROOTFS_RV_DIR) $(ROOTFS_LA_DIR) $(ROOTFS_RV_BUILD_DIR) $(ROOTFS_LA_BUILD_DIR) $(ROOTFS_RV_STAMP_DIR) $(ROOTFS_LA_STAMP_DIR)
 	$(MAKE) -C os clean
 	$(MAKE) -C user clean
