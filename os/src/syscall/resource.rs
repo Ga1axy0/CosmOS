@@ -38,6 +38,8 @@ enum Resource {
     Core = 4,
     /// Number of open files
     Nofile = 7,
+    /// Max locked memory (`RLIMIT_MEMLOCK`)
+    Memlock = 8,
     /// Address space limit
     As = 9,
 }
@@ -48,6 +50,7 @@ impl Resource {
             3 => Some(Self::Stack),
             4 => Some(Self::Core),
             7 => Some(Self::Nofile),
+            8 => Some(Self::Memlock),
             9 => Some(Self::As),
             _ => {
                 warn!("Unsupported resource type: {}", raw);
@@ -65,6 +68,8 @@ pub struct ResourceLimits {
     pub core: rlimit,
     /// `RLIMIT_NOFILE`
     pub nofile: rlimit,
+    /// `RLIMIT_MEMLOCK`
+    pub memlock: rlimit,
     /// `RLIMIT_AS`
     pub address_space: rlimit,
 }
@@ -83,6 +88,10 @@ impl Default for ResourceLimits {
                 rlim_cur: 1024,
                 rlim_max: 1024,
             },
+            memlock: rlimit {
+                rlim_cur: 64 * 1024,
+                rlim_max: RLIM_INFINITY,
+            },
             address_space: rlimit::unlimited(),
         }
     }
@@ -94,6 +103,7 @@ impl ResourceLimits {
             Resource::Stack => self.stack,
             Resource::Core => self.core,
             Resource::Nofile => self.nofile,
+            Resource::Memlock => self.memlock,
             Resource::As => self.address_space,
         }
     }
@@ -103,6 +113,7 @@ impl ResourceLimits {
             Resource::Stack => &mut self.stack,
             Resource::Core => &mut self.core,
             Resource::Nofile => &mut self.nofile,
+            Resource::Memlock => &mut self.memlock,
             Resource::As => &mut self.address_space,
         }
     }

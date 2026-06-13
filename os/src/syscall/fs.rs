@@ -10,7 +10,7 @@ use crate::fs::Pipe;
 use crate::net::UnixSocketPairEnd;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::times::Timespec;
-use crate::syscall::{read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
+use crate::syscall::{read_bytes_from_user, read_cstring_from_user, read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
@@ -23,6 +23,7 @@ use crate::timer::{add_timer_ns, add_timer_with_poll_tag, get_realtime_ns, get_t
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec::Vec, vec};
+use alloc::collections::BTreeMap;
 use core::{mem::{offset_of, size_of}, slice};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::task::SignalBit;
@@ -508,6 +509,224 @@ bitflags! {
             | Self::BLOCKS.bits;
         const ALL = Self::BASIC_STATS.bits | Self::BTIME.bits;
     }
+}
+
+const BPF_MAP_CREATE: u32 = 0;
+const BPF_MAP_LOOKUP_ELEM: u32 = 1;
+const BPF_MAP_UPDATE_ELEM: u32 = 2;
+
+const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+
+const BPF_MAX_KEY_SIZE: u32 = 64;
+const BPF_MAX_VALUE_SIZE: u32 = 4096;
+const BPF_MAX_ENTRIES: u32 = 4096;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BpfMapCreateAttr {
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+}
+
+impl Pod for BpfMapCreateAttr {}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct BpfMapElemAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+impl Pod for BpfMapElemAttr {}
+
+struct BpfMapFile {
+    map_type: u32,
+    key_size: usize,
+    value_size: usize,
+    max_entries: usize,
+    inner: SpinNoIrqLock<BpfMapInner>,
+}
+
+struct BpfMapInner {
+    hash: BTreeMap<Vec<u8>, Vec<u8>>,
+    array: Vec<Vec<u8>>,
+}
+
+impl BpfMapFile {
+    fn new(attr: BpfMapCreateAttr) -> Result<Self, ERRNO> {
+        if attr.key_size == 0
+            || attr.value_size == 0
+            || attr.max_entries == 0
+            || attr.key_size > BPF_MAX_KEY_SIZE
+            || attr.value_size > BPF_MAX_VALUE_SIZE
+            || attr.max_entries > BPF_MAX_ENTRIES
+        {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let key_size = attr.key_size as usize;
+        let value_size = attr.value_size as usize;
+        let max_entries = attr.max_entries as usize;
+        let array = match attr.map_type {
+            BPF_MAP_TYPE_HASH => Vec::new(),
+            BPF_MAP_TYPE_ARRAY => {
+                if attr.key_size != size_of::<u32>() as u32 {
+                    return Err(ERRNO::EINVAL);
+                }
+                vec![vec![0; value_size]; max_entries]
+            }
+            _ => return Err(ERRNO::EINVAL),
+        };
+
+        Ok(Self {
+            map_type: attr.map_type,
+            key_size,
+            value_size,
+            max_entries,
+            inner: SpinNoIrqLock::new(BpfMapInner {
+                hash: BTreeMap::new(),
+                array,
+            }),
+        })
+    }
+
+    fn read_key(&self, key_ptr: u64) -> Result<Vec<u8>, ERRNO> {
+        if key_ptr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        read_bytes_from_user(key_ptr as *const u8, self.key_size)
+    }
+
+    fn read_value(&self, value_ptr: u64) -> Result<Vec<u8>, ERRNO> {
+        if value_ptr == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        read_bytes_from_user(value_ptr as *const u8, self.value_size)
+    }
+
+    fn array_index(&self, key: &[u8]) -> Result<usize, ERRNO> {
+        let raw: [u8; 4] = key.try_into().map_err(|_| ERRNO::EINVAL)?;
+        let index = u32::from_ne_bytes(raw) as usize;
+        if index >= self.max_entries {
+            return Err(ERRNO::ENOENT);
+        }
+        Ok(index)
+    }
+
+    fn lookup_elem(&self, attr: BpfMapElemAttr) -> Result<(), ERRNO> {
+        let key = self.read_key(attr.key)?;
+        let value = {
+            let inner = self.inner.lock();
+            match self.map_type {
+                BPF_MAP_TYPE_HASH => inner.hash.get(&key).cloned().ok_or(ERRNO::ENOENT)?,
+                BPF_MAP_TYPE_ARRAY => inner.array[self.array_index(&key)?].clone(),
+                _ => return Err(ERRNO::EINVAL),
+            }
+        };
+        if attr.value == 0 {
+            return Err(ERRNO::EFAULT);
+        }
+        write_bytes_to_user(attr.value as *mut u8, &value)
+    }
+
+    fn update_elem(&self, attr: BpfMapElemAttr) -> Result<(), ERRNO> {
+        let key = self.read_key(attr.key)?;
+        let value = self.read_value(attr.value)?;
+        let mut inner = self.inner.lock();
+        match self.map_type {
+            BPF_MAP_TYPE_HASH => {
+                if !inner.hash.contains_key(&key) && inner.hash.len() >= self.max_entries {
+                    return Err(ERRNO::E2BIG);
+                }
+                inner.hash.insert(key, value);
+            }
+            BPF_MAP_TYPE_ARRAY => {
+                let index = self.array_index(&key)?;
+                inner.array[index] = value;
+            }
+            _ => return Err(ERRNO::EINVAL),
+        }
+        Ok(())
+    }
+
+    fn stat_snapshot(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::FILE,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+impl File for BpfMapFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn stat(&self) -> Stat {
+        self.stat_snapshot()
+    }
+}
+
+fn alloc_bpf_map_fd(map: BpfMapFile) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(map),
+        AccessMode::ReadWrite,
+        FileStatusFlags::empty(),
+        0,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    inner.fd_table[fd] = Some(FdEntry::new(desc));
+    Ok(fd as isize)
+}
+
+fn bpf_map_from_fd(fd: u32) -> Result<Arc<FileDescription>, ERRNO> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let desc = inner
+        .fd_table
+        .get(fd as usize)
+        .and_then(|entry| entry.as_ref())
+        .map(|entry| Arc::clone(&entry.desc))
+        .ok_or(ERRNO::EBADF)?;
+    if desc.as_any().downcast_ref::<BpfMapFile>().is_none() {
+        return Err(ERRNO::EBADF);
+    }
+    Ok(desc)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2371,12 +2590,38 @@ pub fn sys_memfd_create(name: *const u8, flags: u32) -> isize {
     })
 }
 
-pub fn sys_bpf(_cmd: u32, attr: usize, _size: u32) -> isize {
+pub fn sys_bpf(cmd: u32, attr: usize, _size: u32) -> isize {
     syscall_body!({
         if attr == 0 {
             return Err(ERRNO::EFAULT);
         }
-        alloc_anonymous_fd(FileStatusFlags::empty(), false)
+        match cmd {
+            BPF_MAP_CREATE => {
+                let attr = read_pod_from_user(attr as *const BpfMapCreateAttr)?;
+                alloc_bpf_map_fd(BpfMapFile::new(attr)?)
+            }
+            BPF_MAP_LOOKUP_ELEM => {
+                let attr = read_pod_from_user(attr as *const BpfMapElemAttr)?;
+                let desc = bpf_map_from_fd(attr.map_fd)?;
+                let map = desc
+                    .as_any()
+                    .downcast_ref::<BpfMapFile>()
+                    .ok_or(ERRNO::EBADF)?;
+                map.lookup_elem(attr)?;
+                Ok(0)
+            }
+            BPF_MAP_UPDATE_ELEM => {
+                let attr = read_pod_from_user(attr as *const BpfMapElemAttr)?;
+                let desc = bpf_map_from_fd(attr.map_fd)?;
+                let map = desc
+                    .as_any()
+                    .downcast_ref::<BpfMapFile>()
+                    .ok_or(ERRNO::EBADF)?;
+                map.update_elem(attr)?;
+                Ok(0)
+            }
+            _ => Err(ERRNO::EINVAL),
+        }
     })
 }
 
