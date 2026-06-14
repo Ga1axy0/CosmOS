@@ -1,6 +1,7 @@
 DOCKER_NAME ?= rcore-docker
 
 ARCH ?= rv
+BUILD_ARCH ?= all
 TARGET ?= riscv64gc-unknown-none-elf
 USER_MODE ?= release
 USER_BIN_DIR := user/target/$(TARGET)/$(USER_MODE)
@@ -63,6 +64,29 @@ MEM_LA ?= 1G
 QEMU_LA_NETDEV ?= user,id=net0
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
+# make all 默认同时构建两种架构；命令行可用 BUILD_ARCH/ARCH 只选一种。
+ifeq ($(origin BUILD_ARCH),command line)
+ALL_ARCH_REQUEST := $(BUILD_ARCH)
+else ifeq ($(origin ARCH),command line)
+ALL_ARCH_REQUEST := $(ARCH)
+else
+ALL_ARCH_REQUEST := all
+endif
+ALL_ARCH := $(shell printf '%s' "$(ALL_ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
+
+ALL_TARGETS_RV := user-apps kernel-rv $(DISK_RV_IMG)
+ALL_TARGETS_LA := user-apps-la kernel-la $(DISK_LA_IMG)
+
+ifneq ($(filter $(ALL_ARCH),all both),)
+ALL_BUILD_TARGETS := $(ALL_TARGETS_RV) $(ALL_TARGETS_LA)
+else ifneq ($(filter $(ALL_ARCH),rv riscv riscv64 rv64),)
+ALL_BUILD_TARGETS := $(ALL_TARGETS_RV)
+else ifneq ($(filter $(ALL_ARCH),la loongarch loongarch64 la64),)
+ALL_BUILD_TARGETS := $(ALL_TARGETS_LA)
+else
+$(error unsupported BUILD_ARCH/ARCH=$(ALL_ARCH_REQUEST), expected all, rv or la)
+endif
+
 ifeq ($(ARCH),rv)
 QEMU ?= $(QEMU_RV)
 RUN_KERNEL := kernel-rv
@@ -80,7 +104,7 @@ endif
 all:
 	$(MAKE) submodules
 	$(MAKE) cargo-config
-	$(MAKE) user-apps user-apps-la kernel-rv kernel-la $(DISK_RV_IMG) $(DISK_LA_IMG)
+	$(MAKE) $(ALL_BUILD_TARGETS)
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
