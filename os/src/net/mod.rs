@@ -23,7 +23,7 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp as tcp_socket, udp as udp_socket},
     time::Instant,
-    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
+    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address},
 };
 
 use crate::{
@@ -80,6 +80,8 @@ const EPHEMERAL_PORT_END: u16 = 65535;
 const MAX_IMMEDIATE_POLLS: usize = 4;
 
 const NO_POLL_DEADLINE_US: u64 = u64::MAX;
+const IPV6_LOOPBACK_SOLICITED_NODE: [u8; 16] =
+    [0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x00, 0x00, 0x01];
 
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
@@ -177,23 +179,36 @@ impl NetStack {
         cfg.random_seed = 0x5A5A_1234;
         let mut iface = Interface::new(cfg, &mut device, now);
 
-        // Configure both external and loopback addresses on the same interface
+        // Configure both external and loopback addresses on the same interface.
+        // Rebuild the list explicitly so IPv6 localhost cannot be dropped silently.
         iface.update_ip_addrs(|addrs| {
-            // External network (QEMU user networking)
-            let external = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)), 24);
-            if addrs.iter().all(|a| *a != external) {
-                let _ = addrs.push(external);
-            }
+            addrs.clear();
 
-            // Loopback address
-            let loopback = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), 8);
-            if addrs.iter().all(|a| *a != loopback) {
-                let _ = addrs.push(loopback);
-            }
+            // External network (QEMU user networking)
+            addrs
+                .push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)),
+                    24,
+                ))
+                .expect("failed to configure external IPv4 address");
+
+            // IPv4 loopback
+            addrs
+                .push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+                    8,
+                ))
+                .expect("failed to configure IPv4 loopback address");
+
+            // IPv6 loopback
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128))
+                .expect("failed to configure IPv6 loopback address");
         });
         let _ = iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+        info!("[kernel] net: iface addresses = {:?}", iface.ip_addrs());
 
         let storage_vec: Vec<smoltcp::iface::SocketStorage<'static>> =
             (0..MAX_SOCKETS).map(|_| smoltcp::iface::SocketStorage::EMPTY).collect();
@@ -252,8 +267,18 @@ impl NetStack {
 
     fn poll_once(&mut self) {
         let ts = now();
+        if !self.device.loopback.queue.is_empty() {
+            debug!(
+                "NetStack::poll_once entering with loopback queue len={}",
+                self.device.loopback.queue.len()
+            );
+        }
         let poll_result = self.iface.poll(ts, &mut self.device, &mut self.sockets);
-        trace!("NetStack::poll result={:?}, loopback queue len after={}", poll_result, self.device.loopback.queue.len());
+        debug!(
+            "NetStack::poll result={:?}, loopback queue len after={}",
+            poll_result,
+            self.device.loopback.queue.len()
+        );
 
         for st in self.udp_states.iter() {
             let mut ready = 0u16;
@@ -300,6 +325,18 @@ impl NetStack {
             {
                 let socket = self.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 let state = socket.state();
+                if let Some(prev) = st.observe_state_change(state) {
+                    debug!(
+                        "tcp socket {:?} state {} -> {} listener_owned={} open={} local={:?} remote={:?}",
+                        st.handle,
+                        tcp::tcp_state_name_repr(prev),
+                        tcp::tcp_state_name(state),
+                        st.is_listener_owned(),
+                        socket.is_open(),
+                        socket.local_endpoint(),
+                        socket.remote_endpoint()
+                    );
+                }
                 if st.is_listener_owned() {
                     listener_owned = true;
                     listener_source_id = tcp::queue_listener_connection_if_ready(st, state);
@@ -422,6 +459,15 @@ fn now() -> Instant {
     Instant::from_micros(get_time_us() as i64)
 }
 
+fn read_ipv6_addr(bytes: &[u8]) -> Option<Ipv6Address> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&bytes[..16]);
+    Some(Ipv6Address::from(octets))
+}
+
 /// Multi-device that routes packets between VirtIO (external) and Loopback (local).
 struct MultiDevice {
     virtio: VirtioSmoltcpDevice,
@@ -498,8 +544,12 @@ impl RxToken for MultiRxToken {
         F: FnOnce(&[u8]) -> R,
     {
         match self {
-            MultiRxToken::Virtio(token) => token.consume(f),
-            MultiRxToken::Loopback(token) => token.consume(f),
+            MultiRxToken::Virtio(token) => token.consume(|frame| {
+                f(frame)
+            }),
+            MultiRxToken::Loopback(token) => token.consume(|frame| {
+                f(frame)
+            }),
         }
     }
 }
@@ -544,19 +594,31 @@ impl<'a> TxToken for MultiTxToken<'a> {
                         false
                     }
                 }
+                0x86DD => {
+                    if buf.len() >= 54 {
+                        let dst = &buf[38..54];
+                        dst == Ipv6Address::LOCALHOST.octets()
+                            || dst == IPV6_LOOPBACK_SOLICITED_NODE
+                    } else {
+                        false
+                    }
+                }
                 _ => false,
             }
         } else {
             false
         };
 
-        trace!("Consume token of len {}, loopback: {}, buf[12] = {:x}, buf[13] = {:x}, buf[30] = {:x}", len, is_loopback, buf[12], buf[13], buf[30]);
 
         if is_loopback {
             // Directly push to loopback queue (our custom Loopback has a public queue field)
-            trace!("Pushing to loopback queue, current len={}", self.loopback.queue.len());
+            debug!(
+                "net tx routed to loopback queue: before_len={} frame_len={}",
+                self.loopback.queue.len(),
+                len
+            );
             self.loopback.queue.push_back(buf);
-            trace!("Loopback queue len after push={}", self.loopback.queue.len());
+            debug!("net tx routed to loopback queue: after_len={}", self.loopback.queue.len());
         } else {
             // Send to VirtIO using the standard path
             match self.virtio.dev.try_send(&buf) {

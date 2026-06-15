@@ -42,6 +42,11 @@ impl Device for Loopback {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.queue.pop_front().map(|buffer| {
+            debug!(
+                "loopback receive: remaining_len={} frame_len={}",
+                self.queue.len(),
+                buffer.len()
+            );
             let rx = RxToken { buffer };
             let tx = TxToken { queue: &mut self.queue };
             (rx, tx)

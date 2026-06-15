@@ -20,9 +20,11 @@ smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
 	"alloc",
 	"medium-ethernet",
 	"proto-ipv4",
+	"proto-ipv6",
 	"proto-ipv4-fragmentation",
 	"socket-udp",
 	"socket-tcp",
+	"iface-max-addr-count-4",
 	"fragmentation-buffer-size-16384",
 ] }
 strum_macros = "0.28.0"
