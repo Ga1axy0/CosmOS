@@ -17,7 +17,11 @@ use fs::errno::FS_ERRNO;
 use fs::vfs::{VfsFileType, VfsNode};
 
 use crate::config::{MAX_HARTS, PAGE_SIZE};
+#[cfg(feature = "io_perf_counters")]
+use crate::drivers::block as block_drivers;
 use crate::fs::inode::snapshot_mount_table;
+#[cfg(feature = "io_perf_counters")]
+use crate::fs::page_cache;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
 use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
@@ -76,6 +80,22 @@ fn build_mounts() -> String {
             escape_mount_field(&mount.options),
         );
     }
+    out
+}
+
+#[cfg(feature = "io_perf_counters")]
+fn reset_io_perf() {
+    ::fs::block_cache::reset_perf_counters();
+    block_drivers::reset_perf_counters();
+    page_cache::reset_perf_counters();
+}
+
+#[cfg(feature = "io_perf_counters")]
+fn build_io_perf() -> String {
+    let mut out = String::new();
+    out.push_str(&block_drivers::render_perf_counters());
+    out.push_str(&::fs::block_cache::render_perf_counters());
+    out.push_str(&page_cache::render_perf_counters());
     out
 }
 
@@ -605,6 +625,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("self"), VfsFileType::Symlink));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
+        #[cfg(feature = "io_perf_counters")]
+        entries.push((String::from("io_perf"), VfsFileType::Regular));
         entries.push((String::from("key-users"), VfsFileType::Regular));
         entries.push((String::from("sys"), VfsFileType::Directory));
         for pid in list_pids() {
@@ -618,6 +640,8 @@ impl VfsNode for ProcRootNode {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "io_perf_counters")]
+            "io_perf" => Some(Arc::new(ProcIoPerfNode::new()) as Arc<dyn VfsNode>),
             "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
             "sys" => Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>),
             _ => {
@@ -1147,6 +1171,77 @@ impl VfsNode for ProcMountsNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/io_perf` node.
+#[derive(Default, Debug)]
+#[cfg(feature = "io_perf_counters")]
+pub struct ProcIoPerfNode;
+
+#[cfg(feature = "io_perf_counters")]
+impl ProcIoPerfNode {
+    /// Create a new `/proc/io_perf` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "io_perf_counters")]
+impl VfsNode for ProcIoPerfNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_io_perf().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        reset_io_perf();
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        reset_io_perf();
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_io_perf(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        reset_io_perf();
+        buf.len()
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {

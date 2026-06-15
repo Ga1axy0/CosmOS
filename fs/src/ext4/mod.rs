@@ -5,7 +5,7 @@ use core::fmt;
 use log::{debug, info};
 use spin::Mutex;
 
-use crate::block_cache::get_block_cache;
+use crate::block_cache::{get_block_cache, overwrite_block_cache_range};
 use crate::block_dev::BlockDevice as OsBlockDevice;
 use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
@@ -76,31 +76,34 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
             return;
         }
 
-        let start_block = offset / BLOCK_SZ;
-        let end_block = (offset + data.len()).div_ceil(BLOCK_SZ);
+        let mut written = 0usize;
 
-        for block_id in start_block..end_block {
-            let block_start = block_id * BLOCK_SZ;
-            let seg_start = offset.max(block_start);
-            let seg_end = (offset + data.len()).min(block_start + BLOCK_SZ);
-            if seg_start >= seg_end {
-                continue;
-            }
+        if offset % BLOCK_SZ != 0 {
+            let block_id = offset / BLOCK_SZ;
+            let dst_start = offset % BLOCK_SZ;
+            let len = (BLOCK_SZ - dst_start).min(data.len());
+            get_block_cache(block_id, Arc::clone(&self.inner))
+                .lock()
+                .write_bytes(dst_start, &data[..len]);
+            written += len;
+        }
 
-            let src_start = seg_start - offset;
-            let src_end = seg_end - offset;
-            let dst_start = seg_start - block_start;
-            let dst_end = seg_end - block_start;
+        let aligned_len = (data.len() - written) / BLOCK_SZ * BLOCK_SZ;
+        if aligned_len != 0 {
+            let start_block = (offset + written) / BLOCK_SZ;
+            overwrite_block_cache_range(
+                start_block,
+                Arc::clone(&self.inner),
+                &data[written..written + aligned_len],
+            );
+            written += aligned_len;
+        }
 
-            if dst_start == 0 && dst_end == BLOCK_SZ {
-                get_block_cache(block_id, Arc::clone(&self.inner))
-                    .lock()
-                    .write_bytes(0, &data[src_start..src_end]);
-            } else {
-                get_block_cache(block_id, Arc::clone(&self.inner))
-                    .lock()
-                    .write_bytes(dst_start, &data[src_start..src_end]);
-            }
+        if written < data.len() {
+            let block_id = (offset + written) / BLOCK_SZ;
+            get_block_cache(block_id, Arc::clone(&self.inner))
+                .lock()
+                .write_bytes(0, &data[written..]);
         }
     }
 }

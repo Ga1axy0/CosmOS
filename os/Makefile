@@ -1,5 +1,7 @@
 # Building
 ARCH ?= riscv64
+EXTRA_FEATURES ?=
+# EXTRA_FEATURES ?= --features io_perf_counters
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 
@@ -151,9 +153,9 @@ fs-img:
 kernel:
 	@echo Platform: $(BOARD)
 ifeq ($(QEMU7_CFG),--cfg qemu7)
-	@LOG=$(LOG) cargo rustc $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) -- --cfg qemu7
+	@LOG=$(LOG) cargo rustc $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) $(EXTRA_FEATURES) -- --cfg qemu7
 else
-	@LOG=$(LOG) cargo build $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS)
+	@LOG=$(LOG) cargo build $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) $(EXTRA_FEATURES)
 endif
 
 clean:

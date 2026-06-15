@@ -19,3 +19,6 @@ debug = true
 [features]
 board_qemu = []
 board_k210 = []
+io_perf_counters = []
+
+default = ["io_perf_counters"]

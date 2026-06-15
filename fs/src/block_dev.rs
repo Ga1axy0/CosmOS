@@ -4,9 +4,25 @@
 
 use core::any::Any;
 
+use crate::BLOCK_SZ;
+
 pub trait BlockDevice: Send + Sync + Any {
     /// Read a block from the block device.
     fn read_block(&self, block_id: usize, buf: &mut [u8]);
     /// Write a block to the block device.
     fn write_block(&self, block_id: usize, buf: &[u8]);
+    /// Read a contiguous range of 512-byte blocks.
+    fn read_blocks(&self, start_block: usize, buf: &mut [u8]) {
+        assert!(buf.len() % BLOCK_SZ == 0);
+        for (idx, block) in buf.chunks_mut(BLOCK_SZ).enumerate() {
+            self.read_block(start_block + idx, block);
+        }
+    }
+    /// Write a contiguous range of 512-byte blocks.
+    fn write_blocks(&self, start_block: usize, buf: &[u8]) {
+        assert!(buf.len() % BLOCK_SZ == 0);
+        for (idx, block) in buf.chunks(BLOCK_SZ).enumerate() {
+            self.write_block(start_block + idx, block);
+        }
+    }
 }

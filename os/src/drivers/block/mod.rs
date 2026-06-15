@@ -20,6 +20,18 @@ use crate::platform::{
     VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
 };
 
+/// Reset block driver performance counters.
+#[cfg(feature = "io_perf_counters")]
+pub fn reset_perf_counters() {
+    virtio_blk::reset_perf_counters();
+}
+
+/// Render block driver performance counters.
+#[cfg(feature = "io_perf_counters")]
+pub fn render_perf_counters() -> String {
+    virtio_blk::render_perf_counters()
+}
+
 fn virtio_blk_name(idx: usize) -> String {
     alloc::format!("vd{}", (b'a' + idx as u8) as char)
 }

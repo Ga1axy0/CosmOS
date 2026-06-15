@@ -1,12 +1,43 @@
 //! Block Cache Layer
 //! Implements about the disk block cache functionality
 use super::{BlockDevice, BLOCK_SZ};
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Write;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use spin::Mutex;
+
+#[cfg(feature = "io_perf_counters")]
+static GET_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GET_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GET_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_DIRECT_WRITE_OPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_DIRECT_WRITE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EVICTIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_SCAN_STEPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EVICT_SCAN_STEPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static SYNC_ALL_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static SYNC_BLOCK_VISITS: AtomicUsize = AtomicUsize::new(0);
+
 /// BlockCache is a cache for a block in disk.
 pub struct BlockCache {
     cache: Vec<u8>,
@@ -28,6 +59,20 @@ impl BlockCache {
             modified: false,
         }
     }
+
+    /// Create a cache entry for a block whose entire content is being overwritten.
+    pub fn new_overwrite(block_id: usize, block_device: Arc<dyn BlockDevice>, data: &[u8]) -> Self {
+        assert!(data.len() == BLOCK_SZ);
+        let mut cache = vec![0u8; BLOCK_SZ];
+        cache.copy_from_slice(data);
+        Self {
+            cache,
+            block_id,
+            block_device,
+            modified: true,
+        }
+    }
+
     /// Get the slice in the block cache according to the offset.
     fn addr_of_offset(&self, offset: usize) -> usize {
         &self.cache[offset] as *const _ as usize
@@ -99,8 +144,10 @@ const BLOCK_CACHE_SIZE: usize = 2048;
 
 /// BlockCacheManager is a manager for BlockCache.
 pub struct BlockCacheManager {
-    /// ((device_id, block_id), block_cache)
-    queue: VecDeque<((usize, usize), Arc<Mutex<BlockCache>>)>,
+    /// Cache keys in insertion order, used only to choose eviction victims.
+    queue: VecDeque<(usize, usize)>,
+    /// Cache entries indexed by `(device_id, block_id)` for fast lookup.
+    map: BTreeMap<(usize, usize), Arc<Mutex<BlockCache>>>,
 }
 
 impl BlockCacheManager {
@@ -108,6 +155,7 @@ impl BlockCacheManager {
     pub fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            map: BTreeMap::new(),
         }
     }
 
@@ -121,33 +169,162 @@ impl BlockCacheManager {
         block_id: usize,
         block_device: Arc<dyn BlockDevice>,
     ) -> Arc<Mutex<BlockCache>> {
+        #[cfg(feature = "io_perf_counters")]
+        GET_CALLS.fetch_add(1, Ordering::Relaxed);
         let key = (Self::device_id(&block_device), block_id);
-        if let Some(pair) = self.queue.iter().find(|pair| pair.0 == key) {
-            Arc::clone(&pair.1)
-        } else {
-            // substitute
-            if self.queue.len() == BLOCK_CACHE_SIZE {
-                // from front to tail
-                if let Some((idx, _)) = self
-                    .queue
-                    .iter()
-                    .enumerate()
-                    .find(|(_, pair)| Arc::strong_count(&pair.1) == 1)
-                {
-                    self.queue.drain(idx..=idx);
-                } else {
-                    panic!("Run out of BlockCache!");
+        #[cfg(feature = "io_perf_counters")]
+        LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
+        if let Some(block_cache) = self.map.get(&key) {
+            #[cfg(feature = "io_perf_counters")]
+            GET_HITS.fetch_add(1, Ordering::Relaxed);
+            return Arc::clone(block_cache);
+        }
+        #[cfg(feature = "io_perf_counters")]
+        GET_MISSES.fetch_add(1, Ordering::Relaxed);
+
+        // substitute
+        if self.map.len() == BLOCK_CACHE_SIZE {
+            // from front to tail
+            if let Some((idx, _)) = self
+                .queue
+                .iter()
+                .enumerate()
+                .find(|(_, key)| {
+                    self.map
+                        .get(key)
+                        .map(|cache| Arc::strong_count(cache) == 1)
+                        .unwrap_or(true)
+                })
+            {
+                #[cfg(feature = "io_perf_counters")]
+                EVICT_SCAN_STEPS.fetch_add(idx + 1, Ordering::Relaxed);
+                #[cfg(feature = "io_perf_counters")]
+                EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                if let Some(evicted_key) = self.queue.remove(idx) {
+                    self.map.remove(&evicted_key);
                 }
+            } else {
+                #[cfg(feature = "io_perf_counters")]
+                EVICT_SCAN_STEPS.fetch_add(self.queue.len(), Ordering::Relaxed);
+                panic!("Run out of BlockCache!");
             }
-            // load block into mem and push back
-            let block_cache = Arc::new(Mutex::new(BlockCache::new(
-                block_id,
-                Arc::clone(&block_device),
-            )));
-            self.queue.push_back((key, Arc::clone(&block_cache)));
-            block_cache
+        }
+        // load block into mem and push back
+        let block_cache = Arc::new(Mutex::new(BlockCache::new(
+            block_id,
+            Arc::clone(&block_device),
+        )));
+        self.queue.push_back(key);
+        self.map.insert(key, Arc::clone(&block_cache));
+        block_cache
+    }
+
+    pub fn overwrite_block_cache_range(
+        &mut self,
+        start_block: usize,
+        block_device: Arc<dyn BlockDevice>,
+        data: &[u8],
+    ) {
+        assert!(data.len() % BLOCK_SZ == 0);
+        let block_count = data.len() / BLOCK_SZ;
+        #[cfg(feature = "io_perf_counters")]
+        OVERWRITE_CALLS.fetch_add(block_count, Ordering::Relaxed);
+        let device_id = Self::device_id(&block_device);
+
+        for (idx, block_data) in data.chunks(BLOCK_SZ).enumerate() {
+            let key = (device_id, start_block + idx);
+            #[cfg(feature = "io_perf_counters")]
+            LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
+            if let Some(block_cache) = self.map.get(&key) {
+                #[cfg(feature = "io_perf_counters")]
+                OVERWRITE_HITS.fetch_add(1, Ordering::Relaxed);
+                block_cache.lock().write_bytes(0, block_data);
+            } else {
+                #[cfg(feature = "io_perf_counters")]
+                OVERWRITE_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
+}
+
+fn load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn reset_perf_counters() {
+    GET_CALLS.store(0, Ordering::Relaxed);
+    GET_HITS.store(0, Ordering::Relaxed);
+    GET_MISSES.store(0, Ordering::Relaxed);
+    OVERWRITE_CALLS.store(0, Ordering::Relaxed);
+    OVERWRITE_HITS.store(0, Ordering::Relaxed);
+    OVERWRITE_MISSES.store(0, Ordering::Relaxed);
+    OVERWRITE_DIRECT_WRITE_OPS.store(0, Ordering::Relaxed);
+    OVERWRITE_DIRECT_WRITE_BLOCKS.store(0, Ordering::Relaxed);
+    EVICTIONS.store(0, Ordering::Relaxed);
+    LOOKUP_SCAN_STEPS.store(0, Ordering::Relaxed);
+    EVICT_SCAN_STEPS.store(0, Ordering::Relaxed);
+    SYNC_ALL_CALLS.store(0, Ordering::Relaxed);
+    SYNC_BLOCK_VISITS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn render_perf_counters() -> String {
+    let get_calls = load(&GET_CALLS);
+    let overwrite_calls = load(&OVERWRITE_CALLS);
+    let lookups = get_calls + overwrite_calls;
+    let evictions = load(&EVICTIONS);
+    let lookup_steps = load(&LOOKUP_SCAN_STEPS);
+    let evict_scan_steps = load(&EVICT_SCAN_STEPS);
+    let cached_blocks = BLOCK_CACHE_MANAGER.lock().map.len();
+
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "block_cache:");
+    let _ = writeln!(&mut out, "  cached_blocks {}", cached_blocks);
+    let _ = writeln!(&mut out, "  get_calls {}", get_calls);
+    let _ = writeln!(&mut out, "  get_hits {}", load(&GET_HITS));
+    let _ = writeln!(&mut out, "  get_misses {}", load(&GET_MISSES));
+    let _ = writeln!(&mut out, "  overwrite_calls {}", overwrite_calls);
+    let _ = writeln!(&mut out, "  overwrite_hits {}", load(&OVERWRITE_HITS));
+    let _ = writeln!(&mut out, "  overwrite_misses {}", load(&OVERWRITE_MISSES));
+    let _ = writeln!(
+        &mut out,
+        "  overwrite_direct_write_ops {}",
+        load(&OVERWRITE_DIRECT_WRITE_OPS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  overwrite_direct_write_blocks {}",
+        load(&OVERWRITE_DIRECT_WRITE_BLOCKS)
+    );
+    let _ = writeln!(&mut out, "  evictions {}", evictions);
+    let _ = writeln!(&mut out, "  lookup_steps {}", lookup_steps);
+    let _ = writeln!(
+        &mut out,
+        "  avg_lookup_steps_x100 {}",
+        if lookups == 0 {
+            0
+        } else {
+            lookup_steps.saturating_mul(100) / lookups
+        }
+    );
+    let _ = writeln!(&mut out, "  evict_scan_steps {}", evict_scan_steps);
+    let _ = writeln!(
+        &mut out,
+        "  avg_evict_scan_x100 {}",
+        if evictions == 0 {
+            0
+        } else {
+            evict_scan_steps.saturating_mul(100) / evictions
+        }
+    );
+    let _ = writeln!(&mut out, "  sync_all_calls {}", load(&SYNC_ALL_CALLS));
+    let _ = writeln!(
+        &mut out,
+        "  sync_block_visits {}",
+        load(&SYNC_BLOCK_VISITS)
+    );
+    out
 }
 
 lazy_static! {
@@ -164,10 +341,47 @@ pub fn get_block_cache(
         .lock()
         .get_block_cache(block_id, block_device)
 }
+
+/// Overwrite a complete block cache entry without first loading old disk data.
+pub fn overwrite_block_cache(block_id: usize, block_device: Arc<dyn BlockDevice>, data: &[u8]) {
+    #[cfg(feature = "io_perf_counters")]
+    OVERWRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    overwrite_block_cache_range(block_id, block_device, data);
+}
+
+/// Overwrite complete contiguous blocks without first loading old disk data.
+pub fn overwrite_block_cache_range(
+    start_block: usize,
+    block_device: Arc<dyn BlockDevice>,
+    data: &[u8],
+) {
+    assert!(data.len() % BLOCK_SZ == 0);
+    if data.is_empty() {
+        return;
+    }
+
+    BLOCK_CACHE_MANAGER.lock().overwrite_block_cache_range(
+        start_block,
+        Arc::clone(&block_device),
+        data,
+    );
+    #[cfg(feature = "io_perf_counters")]
+    OVERWRITE_DIRECT_WRITE_OPS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "io_perf_counters")]
+    OVERWRITE_DIRECT_WRITE_BLOCKS.fetch_add(data.len() / BLOCK_SZ, Ordering::Relaxed);
+    #[cfg(feature = "io_perf_counters")]
+    OVERWRITE_MISSES.fetch_add(1, Ordering::Relaxed);
+    block_device.write_blocks(start_block, data);
+}
+
 /// Sync(write) all the block cache to disk.
 pub fn block_cache_sync_all() {
+    #[cfg(feature = "io_perf_counters")]
+    SYNC_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
     let manager = BLOCK_CACHE_MANAGER.lock();
-    for (_, cache) in manager.queue.iter() {
+    for cache in manager.map.values() {
+        #[cfg(feature = "io_perf_counters")]
+        SYNC_BLOCK_VISITS.fetch_add(1, Ordering::Relaxed);
         cache.lock().sync();
     }
 }

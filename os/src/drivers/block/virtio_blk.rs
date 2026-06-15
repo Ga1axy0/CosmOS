@@ -1,7 +1,10 @@
 use super::BlockDevice;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueueKeyed, WaitReason};
+use alloc::string::String;
+use core::fmt::Write;
 use core::hint::spin_loop;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk},
     transport::SomeTransport,
@@ -17,9 +20,24 @@ pub struct VirtIOBlock {
 
 // static mut READ_RECORDS: SpinNoIrqLock<([usize; 512], usize)> = SpinNoIrqLock::new(([0; 512], 0));
 
+static READ_OPS: AtomicUsize = AtomicUsize::new(0);
+static READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WRITE_OPS: AtomicUsize = AtomicUsize::new(0);
+static WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WAIT_POLLS: AtomicUsize = AtomicUsize::new(0);
+static TASK_WAITS: AtomicUsize = AtomicUsize::new(0);
+
 impl BlockDevice for VirtIOBlock {
     /// Read a block from the virtio_blk device
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        self.read_blocks(block_id, buf);
+    }
+
+    /// Read contiguous blocks from the virtio_blk device.
+    fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
+        assert!(buf.len() % ::fs::BLOCK_SZ == 0);
+        READ_OPS.fetch_add(1, Ordering::Relaxed);
+        READ_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         
@@ -85,6 +103,14 @@ impl BlockDevice for VirtIOBlock {
     }
     /// Write a block to the virtio_blk device
     fn write_block(&self, block_id: usize, buf: &[u8]) {
+        self.write_blocks(block_id, buf);
+    }
+
+    /// Write contiguous blocks to the virtio_blk device.
+    fn write_blocks(&self, block_id: usize, buf: &[u8]) {
+        assert!(buf.len() % ::fs::BLOCK_SZ == 0);
+        WRITE_OPS.fetch_add(1, Ordering::Relaxed);
+        WRITE_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let token = unsafe {
@@ -148,12 +174,14 @@ impl VirtIOBlock {
         let irq_disabled = !crate::hal::local_irqs_enabled();
         if current_task().is_none() || irq_disabled {
             while !self.token_ready(token) {
+                WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
                 spin_loop();
             }
             return;
         }
 
         // Task context path: park current task and wait for precise token wakeup.
+        TASK_WAITS.fetch_add(1, Ordering::Relaxed);
         self.wait_queue
             .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
                 self.token_ready(token)
@@ -177,4 +205,29 @@ impl VirtIOBlock {
             self.wait_queue.wake_selected(token);
         }
     }
+}
+
+fn load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+pub fn reset_perf_counters() {
+    READ_OPS.store(0, Ordering::Relaxed);
+    READ_BYTES.store(0, Ordering::Relaxed);
+    WRITE_OPS.store(0, Ordering::Relaxed);
+    WRITE_BYTES.store(0, Ordering::Relaxed);
+    WAIT_POLLS.store(0, Ordering::Relaxed);
+    TASK_WAITS.store(0, Ordering::Relaxed);
+}
+
+pub fn render_perf_counters() -> String {
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "virtio_blk:");
+    let _ = writeln!(&mut out, "  read_ops {}", load(&READ_OPS));
+    let _ = writeln!(&mut out, "  read_bytes {}", load(&READ_BYTES));
+    let _ = writeln!(&mut out, "  write_ops {}", load(&WRITE_OPS));
+    let _ = writeln!(&mut out, "  write_bytes {}", load(&WRITE_BYTES));
+    let _ = writeln!(&mut out, "  wait_polls {}", load(&WAIT_POLLS));
+    let _ = writeln!(&mut out, "  task_waits {}", load(&TASK_WAITS));
+    out
 }
