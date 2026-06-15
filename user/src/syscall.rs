@@ -18,11 +18,17 @@ pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
 pub const SYSCALL_PIPE: usize = 59;
 pub const SYSCALL_GETDENTS64: usize = 61;
+pub const SYSCALL_LSEEK: usize = 62;
 pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
+pub const SYSCALL_PREAD64: usize = 67;
+pub const SYSCALL_PWRITE64: usize = 68;
 pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
+pub const SYSCALL_SYNC: usize = 81;
+pub const SYSCALL_FSYNC: usize = 82;
+pub const SYSCALL_FDATASYNC: usize = 83;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_SLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
@@ -201,6 +207,43 @@ pub fn sys_read(fd: usize, buffer: &mut [u8]) -> isize {
 
 pub fn sys_write(fd: usize, buffer: &[u8]) -> isize {
     syscall(SYSCALL_WRITE, [fd, buffer.as_ptr() as usize, buffer.len()])
+}
+
+pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
+    syscall(SYSCALL_LSEEK, [fd, offset as usize, whence])
+}
+
+pub fn sys_pread64(fd: usize, buffer: &mut [u8], offset: usize) -> isize {
+    syscall6(
+        SYSCALL_PREAD64,
+        [
+            fd,
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+            offset,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_pwrite64(fd: usize, buffer: &[u8], offset: usize) -> isize {
+    syscall6(
+        SYSCALL_PWRITE64,
+        [fd, buffer.as_ptr() as usize, buffer.len(), offset, 0, 0],
+    )
+}
+
+pub fn sys_sync() -> isize {
+    syscall(SYSCALL_SYNC, [0, 0, 0])
+}
+
+pub fn sys_fsync(fd: usize) -> isize {
+    syscall(SYSCALL_FSYNC, [fd, 0, 0])
+}
+
+pub fn sys_fdatasync(fd: usize) -> isize {
+    syscall(SYSCALL_FDATASYNC, [fd, 0, 0])
 }
 
 pub fn sys_linkat(
