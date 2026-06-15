@@ -1,12 +1,15 @@
 //! Block Cache Layer
 //! Implements about the disk block cache functionality
-use super::{BlockDevice, BLOCK_SZ};
+use super::{BlockDevice, BlockWrite, BLOCK_SZ};
 use alloc::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "io_perf_counters")]
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
+#[cfg(feature = "io_perf_counters")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use spin::Mutex;
@@ -27,6 +30,14 @@ static OVERWRITE_MISSES: AtomicUsize = AtomicUsize::new(0);
 static OVERWRITE_DIRECT_WRITE_OPS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static OVERWRITE_DIRECT_WRITE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_RANGES_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_RANGES_ITEMS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_RANGES_SINGLE_ITEM_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static OVERWRITE_RANGES_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static EVICTIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -229,24 +240,45 @@ impl BlockCacheManager {
         let block_count = data.len() / BLOCK_SZ;
         #[cfg(feature = "io_perf_counters")]
         OVERWRITE_CALLS.fetch_add(block_count, Ordering::Relaxed);
+        if block_count == 0 {
+            return;
+        }
         let device_id = Self::device_id(&block_device);
+        let end_block = start_block
+            .checked_add(block_count)
+            .expect("block cache overwrite range overflow");
+        let start_key = (device_id, start_block);
+        let end_key = (device_id, end_block);
 
-        for (idx, block_data) in data.chunks(BLOCK_SZ).enumerate() {
-            let key = (device_id, start_block + idx);
+        #[cfg(feature = "io_perf_counters")]
+        let mut hits = 0usize;
+        #[cfg(not(feature = "io_perf_counters"))]
+        let hits = ();
+
+        for ((_, block_id), block_cache) in self.map.range(start_key..end_key) {
+            let idx = *block_id - start_block;
+            let offset = idx * BLOCK_SZ;
+            block_cache
+                .lock()
+                .write_bytes(0, &data[offset..offset + BLOCK_SZ]);
             #[cfg(feature = "io_perf_counters")]
-            LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
-            if let Some(block_cache) = self.map.get(&key) {
-                #[cfg(feature = "io_perf_counters")]
-                OVERWRITE_HITS.fetch_add(1, Ordering::Relaxed);
-                block_cache.lock().write_bytes(0, block_data);
-            } else {
-                #[cfg(feature = "io_perf_counters")]
-                OVERWRITE_MISSES.fetch_add(1, Ordering::Relaxed);
+            {
+                hits += 1;
             }
         }
+
+        #[cfg(feature = "io_perf_counters")]
+        {
+            LOOKUP_SCAN_STEPS.fetch_add(1 + hits, Ordering::Relaxed);
+            OVERWRITE_HITS.fetch_add(hits, Ordering::Relaxed);
+            OVERWRITE_MISSES.fetch_add(block_count - hits, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "io_perf_counters"))]
+        let _ = hits;
     }
 }
 
+#[cfg(feature = "io_perf_counters")]
 fn load(counter: &AtomicUsize) -> usize {
     counter.load(Ordering::Relaxed)
 }
@@ -261,6 +293,10 @@ pub fn reset_perf_counters() {
     OVERWRITE_MISSES.store(0, Ordering::Relaxed);
     OVERWRITE_DIRECT_WRITE_OPS.store(0, Ordering::Relaxed);
     OVERWRITE_DIRECT_WRITE_BLOCKS.store(0, Ordering::Relaxed);
+    OVERWRITE_RANGES_CALLS.store(0, Ordering::Relaxed);
+    OVERWRITE_RANGES_ITEMS.store(0, Ordering::Relaxed);
+    OVERWRITE_RANGES_SINGLE_ITEM_CALLS.store(0, Ordering::Relaxed);
+    OVERWRITE_RANGES_BLOCKS.store(0, Ordering::Relaxed);
     EVICTIONS.store(0, Ordering::Relaxed);
     LOOKUP_SCAN_STEPS.store(0, Ordering::Relaxed);
     EVICT_SCAN_STEPS.store(0, Ordering::Relaxed);
@@ -296,6 +332,26 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  overwrite_direct_write_blocks {}",
         load(&OVERWRITE_DIRECT_WRITE_BLOCKS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  overwrite_ranges_calls {}",
+        load(&OVERWRITE_RANGES_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  overwrite_ranges_items {}",
+        load(&OVERWRITE_RANGES_ITEMS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  overwrite_ranges_single_item_calls {}",
+        load(&OVERWRITE_RANGES_SINGLE_ITEM_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  overwrite_ranges_blocks {}",
+        load(&OVERWRITE_RANGES_BLOCKS)
     );
     let _ = writeln!(&mut out, "  evictions {}", evictions);
     let _ = writeln!(&mut out, "  lookup_steps {}", lookup_steps);
@@ -344,8 +400,6 @@ pub fn get_block_cache(
 
 /// Overwrite a complete block cache entry without first loading old disk data.
 pub fn overwrite_block_cache(block_id: usize, block_device: Arc<dyn BlockDevice>, data: &[u8]) {
-    #[cfg(feature = "io_perf_counters")]
-    OVERWRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     overwrite_block_cache_range(block_id, block_device, data);
 }
 
@@ -369,9 +423,55 @@ pub fn overwrite_block_cache_range(
     OVERWRITE_DIRECT_WRITE_OPS.fetch_add(1, Ordering::Relaxed);
     #[cfg(feature = "io_perf_counters")]
     OVERWRITE_DIRECT_WRITE_BLOCKS.fetch_add(data.len() / BLOCK_SZ, Ordering::Relaxed);
-    #[cfg(feature = "io_perf_counters")]
-    OVERWRITE_MISSES.fetch_add(1, Ordering::Relaxed);
     block_device.write_blocks(start_block, data);
+}
+
+/// Overwrite multiple complete contiguous block ranges without first loading old disk data.
+pub fn overwrite_block_cache_ranges(block_device: Arc<dyn BlockDevice>, writes: &[BlockWrite<'_>]) {
+    if writes.is_empty() {
+        return;
+    }
+
+    let mut write_count = 0usize;
+    #[cfg(feature = "io_perf_counters")]
+    let mut block_count = 0usize;
+    {
+        let mut manager = BLOCK_CACHE_MANAGER.lock();
+        for write in writes {
+            assert!(write.data.len() % BLOCK_SZ == 0);
+            if write.data.is_empty() {
+                continue;
+            }
+            write_count += 1;
+            #[cfg(feature = "io_perf_counters")]
+            {
+                block_count += write.data.len() / BLOCK_SZ;
+            }
+            manager.overwrite_block_cache_range(
+                write.start_block,
+                Arc::clone(&block_device),
+                write.data,
+            );
+        }
+    }
+
+    if write_count == 0 {
+        return;
+    }
+    #[cfg(feature = "io_perf_counters")]
+    {
+        OVERWRITE_RANGES_CALLS.fetch_add(1, Ordering::Relaxed);
+        OVERWRITE_RANGES_ITEMS.fetch_add(write_count, Ordering::Relaxed);
+        if write_count == 1 {
+            OVERWRITE_RANGES_SINGLE_ITEM_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        OVERWRITE_RANGES_BLOCKS.fetch_add(block_count, Ordering::Relaxed);
+    }
+    #[cfg(feature = "io_perf_counters")]
+    OVERWRITE_DIRECT_WRITE_OPS.fetch_add(write_count, Ordering::Relaxed);
+    #[cfg(feature = "io_perf_counters")]
+    OVERWRITE_DIRECT_WRITE_BLOCKS.fetch_add(block_count, Ordering::Relaxed);
+    block_device.write_blocks_many(writes);
 }
 
 /// Sync(write) all the block cache to disk.

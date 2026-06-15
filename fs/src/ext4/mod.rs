@@ -2,11 +2,17 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
 use core::fmt;
+#[cfg(feature = "io_perf_counters")]
+use core::fmt::Write;
+#[cfg(feature = "io_perf_counters")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use log::{debug, info};
 use spin::Mutex;
 
-use crate::block_cache::{get_block_cache, overwrite_block_cache_range};
-use crate::block_dev::BlockDevice as OsBlockDevice;
+use crate::block_cache::{
+    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges,
+};
+use crate::block_dev::{BlockDevice as OsBlockDevice, BlockWrite as OsBlockWrite};
 use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
 use crate::{STATFS_MAGIC_EXT4, STATFS_NAMELEN_DEFAULT, VfsStatFs};
@@ -14,13 +20,24 @@ use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsFileType, VfsNode};
 use crate::BLOCK_SZ;
 
 use ext4_rs::{
-    BlockDevice as Ext4BlockDevice, Ext4, InodeFileType, BLOCK_SIZE
+    BlockDevice as Ext4BlockDevice, BlockWrite as Ext4BlockWrite, Ext4, InodeFileType, BLOCK_SIZE,
 };
 
 /// Adapts the OS block-id based device into ext4_rs offset-based IO.
 struct Ext4BlockDeviceAdapter {
     inner: Arc<dyn OsBlockDevice>,
 }
+
+#[cfg(feature = "io_perf_counters")]
+static WRITE_OFFSETS_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static WRITE_OFFSETS_MANY_ITEMS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static WRITE_OFFSETS_MANY_ALIGNED_ITEMS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static WRITE_OFFSETS_MANY_UNALIGNED_ITEMS: AtomicUsize = AtomicUsize::new(0);
 
 const EXT4_ROOT_INODE: u32 = 2;
 
@@ -106,6 +123,97 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
                 .write_bytes(0, &data[written..]);
         }
     }
+
+    fn write_offsets_many(&self, writes: &[Ext4BlockWrite<'_>]) {
+        #[cfg(feature = "io_perf_counters")]
+        {
+            let non_empty = writes.iter().filter(|write| !write.data.is_empty()).count();
+            if non_empty != 0 {
+                WRITE_OFFSETS_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
+                WRITE_OFFSETS_MANY_ITEMS.fetch_add(non_empty, Ordering::Relaxed);
+                if non_empty == 1 {
+                    WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let mut pending: Vec<OsBlockWrite<'_>> = Vec::new();
+        for write in writes {
+            if write.data.is_empty() {
+                continue;
+            }
+            if offset_and_len_are_block_aligned(write.offset, write.data.len()) {
+                #[cfg(feature = "io_perf_counters")]
+                WRITE_OFFSETS_MANY_ALIGNED_ITEMS.fetch_add(1, Ordering::Relaxed);
+                pending.push(OsBlockWrite {
+                    start_block: write.offset / BLOCK_SZ,
+                    data: write.data,
+                });
+            } else {
+                #[cfg(feature = "io_perf_counters")]
+                WRITE_OFFSETS_MANY_UNALIGNED_ITEMS.fetch_add(1, Ordering::Relaxed);
+                if !pending.is_empty() {
+                    overwrite_block_cache_ranges(Arc::clone(&self.inner), &pending);
+                    pending.clear();
+                }
+                self.write_offset(write.offset, write.data);
+            }
+        }
+        if !pending.is_empty() {
+            overwrite_block_cache_ranges(Arc::clone(&self.inner), &pending);
+        }
+    }
+}
+
+#[inline]
+fn offset_and_len_are_block_aligned(offset: usize, len: usize) -> bool {
+    offset % BLOCK_SZ == 0 && len % BLOCK_SZ == 0
+}
+
+#[cfg(feature = "io_perf_counters")]
+fn perf_load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn reset_perf_counters() {
+    WRITE_OFFSETS_MANY_CALLS.store(0, Ordering::Relaxed);
+    WRITE_OFFSETS_MANY_ITEMS.store(0, Ordering::Relaxed);
+    WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS.store(0, Ordering::Relaxed);
+    WRITE_OFFSETS_MANY_ALIGNED_ITEMS.store(0, Ordering::Relaxed);
+    WRITE_OFFSETS_MANY_UNALIGNED_ITEMS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn render_perf_counters() -> String {
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "ext4:");
+    let _ = writeln!(
+        &mut out,
+        "  write_offsets_many_calls {}",
+        perf_load(&WRITE_OFFSETS_MANY_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  write_offsets_many_items {}",
+        perf_load(&WRITE_OFFSETS_MANY_ITEMS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  write_offsets_many_single_item_calls {}",
+        perf_load(&WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  write_offsets_many_aligned_items {}",
+        perf_load(&WRITE_OFFSETS_MANY_ALIGNED_ITEMS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  write_offsets_many_unaligned_items {}",
+        perf_load(&WRITE_OFFSETS_MANY_UNALIGNED_ITEMS)
+    );
+    out
 }
 
 pub struct Ext4FileSystem {

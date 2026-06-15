@@ -86,6 +86,7 @@ fn build_mounts() -> String {
 #[cfg(feature = "io_perf_counters")]
 fn reset_io_perf() {
     ::fs::block_cache::reset_perf_counters();
+    ::fs::ext4::reset_perf_counters();
     block_drivers::reset_perf_counters();
     page_cache::reset_perf_counters();
 }
@@ -95,6 +96,7 @@ fn build_io_perf() -> String {
     let mut out = String::new();
     out.push_str(&block_drivers::render_perf_counters());
     out.push_str(&::fs::block_cache::render_perf_counters());
+    out.push_str(&::fs::ext4::render_perf_counters());
     out.push_str(&page_cache::render_perf_counters());
     out
 }
