@@ -1,7 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use strum_macros::FromRepr;
 use core::{mem::size_of, slice};
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
 use crate::syscall::times::TimeVal;
 use crate::fs::{
     make_pipe, AccessMode, File, FileDescription, FileStatusFlags, SocketSpec,
@@ -48,8 +48,7 @@ const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const IPPROTO_SCTP: i32 = 132;
 const IPPROTO_UDPLITE: i32 = 136;
-const IPV6_ANY: [u8; 16] = [0; 16];
-const IPV6_LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+const IPV6_V6ONLY: i32 = 26;
 
 // IP-level (SOL_IP) multicast group membership options. These use a
 // `struct group_req { __u32 gr_interface; struct sockaddr_storage gr_group; }`
@@ -570,6 +569,15 @@ fn sockaddr_to_endpoint(addr: &SockAddrIn) -> Result<IpEndpoint, ERRNO> {
     Ok(IpEndpoint::new(IpAddress::Ipv4(ip), port))
 }
 
+#[inline]
+fn unspecified_endpoint_for_family(family: i32) -> IpEndpoint {
+    if family == AF_INET6 as i32 {
+        IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0)
+    } else {
+        IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0)
+    }
+}
+
 fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
     let (sin_addr, sin_port) = match ep.addr {
         IpAddress::Ipv4(v4) => {
@@ -580,6 +588,7 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
             // and big endian hosts.
             (u32::from_ne_bytes([b[0], b[1], b[2], b[3]]), ep.port.to_be())
         }
+        IpAddress::Ipv6(_) => (u32::from_ne_bytes([0, 0, 0, 0]), ep.port.to_be()),
     };
     SockAddrIn {
         sin_family: AF_INET,
@@ -589,22 +598,42 @@ fn endpoint_to_sockaddr(ep: IpEndpoint) -> SockAddrIn {
     }
 }
 
+#[inline]
+fn ipv4_mapped_ipv6(v4: Ipv4Address) -> [u8; 16] {
+    let octets = v4.octets();
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, octets[0], octets[1], octets[2], octets[3],
+    ]
+}
+
+#[inline]
+fn ipv6_mapped_to_ipv4(bytes: [u8; 16]) -> Option<Ipv4Address> {
+    if bytes[..10] == [0; 10] && bytes[10] == 0xff && bytes[11] == 0xff {
+        Some(Ipv4Address::new(bytes[12], bytes[13], bytes[14], bytes[15]))
+    } else {
+        None
+    }
+}
+
 fn sockaddr_in6_to_endpoint(addr: &SockAddrIn6) -> Result<IpEndpoint, ERRNO> {
     if addr.sin6_family != AF_INET6 {
         return Err(ERRNO::EAFNOSUPPORT);
     }
-    let ip = match addr.sin6_addr {
-        IPV6_ANY => Ipv4Address::new(0, 0, 0, 0),
-        IPV6_LOOPBACK => Ipv4Address::new(127, 0, 0, 1),
-        _ => return Err(ERRNO::EADDRNOTAVAIL),
-    };
-    Ok(IpEndpoint::new(IpAddress::Ipv4(ip), u16::from_be(addr.sin6_port)))
+    if addr.sin6_scope_id != 0 {
+        return Err(ERRNO::EOPNOTSUPP);
+    }
+    let port = u16::from_be(addr.sin6_port);
+    if let Some(v4) = ipv6_mapped_to_ipv4(addr.sin6_addr) {
+        return Ok(IpEndpoint::new(IpAddress::Ipv4(v4), port));
+    }
+    let ip = Ipv6Address::from(addr.sin6_addr);
+    Ok(IpEndpoint::new(IpAddress::Ipv6(ip), port))
 }
 
 fn endpoint_to_sockaddr_in6(ep: IpEndpoint) -> SockAddrIn6 {
     let addr = match ep.addr {
-        IpAddress::Ipv4(v4) if v4.octets() == [0, 0, 0, 0] => IPV6_ANY,
-        IpAddress::Ipv4(_) => IPV6_LOOPBACK,
+        IpAddress::Ipv4(v4) => ipv4_mapped_ipv6(v4),
+        IpAddress::Ipv6(v6) => v6.octets(),
     };
     SockAddrIn6 {
         sin6_family: AF_INET6,
@@ -858,12 +887,14 @@ fn sockaddr_un_bytes(addr: &[u8]) -> Vec<u8> {
     out
 }
 
-fn is_local_ipv4_bind_addr(addr: IpAddress) -> bool {
-    match addr {
-        IpAddress::Ipv4(v4) => {
+fn is_local_bind_addr(spec: SocketSpec, addr: IpAddress) -> bool {
+    match (spec.family, addr) {
+        (x, IpAddress::Ipv4(v4)) if x == AF_INET as i32 => {
             let octets = v4.octets();
             octets == [0, 0, 0, 0] || octets[0] == 127
         }
+        (x, IpAddress::Ipv6(v6)) if x == AF_INET6 as i32 => v6.is_unspecified() || v6.is_loopback(),
+        _ => false,
     }
 }
 
@@ -1134,7 +1165,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
         let (file, spec): (Arc<dyn File + Send + Sync>, SocketSpec) = match domain {
             x if x == AF_INET as i32 => match base_type {
                 SOCK_DGRAM => (
-                    create_udp_socket_file()
+                    create_udp_socket_file(domain)
                         .map(|f| f as Arc<dyn File + Send + Sync>)
                         .ok_or(ERRNO::ENETDOWN)?,
                     SocketSpec {
@@ -1144,7 +1175,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                     },
                 ),
                 SOCK_STREAM => (
-                    create_tcp_socket_file()
+                    create_tcp_socket_file(domain)
                         .map(|f| f as Arc<dyn File + Send + Sync>)
                         .ok_or(ERRNO::ENETDOWN)?,
                     SocketSpec {
@@ -1161,7 +1192,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                         return Err(ERRNO::EPROTONOSUPPORT);
                     }
                     (
-                        create_udp_socket_file()
+                        create_udp_socket_file(domain)
                             .map(|f| f as Arc<dyn File + Send + Sync>)
                             .ok_or(ERRNO::ENETDOWN)?,
                         SocketSpec {
@@ -1176,7 +1207,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
                         return Err(ERRNO::EPROTONOSUPPORT);
                     }
                     (
-                        create_tcp_socket_file()
+                        create_tcp_socket_file(domain)
                             .map(|f| f as Arc<dyn File + Send + Sync>)
                             .ok_or(ERRNO::ENETDOWN)?,
                         SocketSpec {
@@ -1377,7 +1408,7 @@ pub fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
                 if ep.port < 1024 && ep.port != 0 && current_process().geteuid() != 0 {
                     return Err(ERRNO::EACCES);
                 }
-                if !is_local_ipv4_bind_addr(ep.addr) {
+                if !is_local_bind_addr(spec, ep.addr) {
                     return Err(ERRNO::EADDRNOTAVAIL);
                 }
                 match socket_backend(fd)? {
@@ -1509,7 +1540,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                 with_udp_socket(fd, |udp| {
                     let ep = udp
                         .local_endpoint()
-                        .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+                        .unwrap_or(unspecified_endpoint_for_family(socket_spec(fd)?.family));
                     copy_endpoint_to_socket_user(socket_spec(fd)?, addr, addrlen, ep)?;
                     Ok(())
                 })?;
@@ -1518,7 +1549,7 @@ pub fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut i32) -> isi
                 with_tcp_socket(fd, |tcp| {
                     let ep = tcp
                         .local_endpoint()
-                        .unwrap_or(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+                        .unwrap_or(unspecified_endpoint_for_family(socket_spec(fd)?.family));
                     copy_endpoint_to_socket_user(socket_spec(fd)?, addr, addrlen, ep)?;
                     Ok(())
                 })?;
@@ -1730,7 +1761,7 @@ pub fn sys_recvfrom(
             SocketBackendKind::Tcp => {
                 let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
                 let ep = if addr.is_null() {
-                    IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0)
+                    unspecified_endpoint_for_family(socket_spec(fd)?.family)
                 } else {
                     with_tcp_socket(fd, |tcp| Ok(tcp.remote_endpoint()))?
                         .ok_or(ERRNO::ENOTCONN)?
@@ -1741,7 +1772,7 @@ pub fn sys_recvfrom(
                 with_netlink_route_socket(fd, |netlink| {
                     netlink.recv_into_user_buffer(&mut ubuf, (flags & MSG_PEEK) != 0)
                 })?,
-                IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0),
+                unspecified_endpoint_for_family(AF_INET as i32),
             ),
             SocketBackendKind::Packet => {
                 let (n, sockaddr) =
@@ -1991,11 +2022,35 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                 }
             },
             Some(SocketLevel::IpProtoIpv6) => {
-                if spec.family != AF_INET6 as i32 || spec.socket_type != SOCK_RAW {
+                if spec.family != AF_INET6 as i32 {
                     return Err(ERRNO::ENOPROTOOPT);
                 }
                 match optname {
+                    IPV6_V6ONLY => {
+                        let token = current_user_token();
+                        let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
+                        match backend {
+                            SocketBackendKind::Udp => {
+                                with_udp_socket(fd, |udp| {
+                                    udp.set_ipv6_only(enabled);
+                                    Ok(())
+                                })?;
+                            }
+                            SocketBackendKind::Tcp => {
+                                with_tcp_socket(fd, |tcp| {
+                                    tcp.set_ipv6_only(enabled);
+                                    Ok(())
+                                })?;
+                            }
+                            SocketBackendKind::RawIpv6 => {}
+                            _ => return Err(ERRNO::ENOPROTOOPT),
+                        }
+                        Ok(0)
+                    }
                     IPV6_CHECKSUM => {
+                        if backend != SocketBackendKind::RawIpv6 {
+                            return Err(ERRNO::ENOPROTOOPT);
+                        }
                         let token = current_user_token();
                         let offset = read_sockopt_i32(token, optval, optlen)?;
                         with_raw_ipv6_socket(fd, |raw| raw.set_checksum_offset(offset))?;
@@ -2005,6 +2060,9 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                     | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO
                     | IPV6_2292HOPLIMIT | IPV6_2292RTHDR | IPV6_2292HOPOPTS
                     | IPV6_2292DSTOPTS => {
+                        if backend != SocketBackendKind::RawIpv6 {
+                            return Err(ERRNO::ENOPROTOOPT);
+                        }
                         let token = current_user_token();
                         let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
                         with_raw_ipv6_socket(fd, |raw| raw.set_bool_option(optname, enabled))?;
@@ -2232,11 +2290,38 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                 }
             },
             Some(SocketLevel::IpProtoIpv6) => {
-                if spec.family != AF_INET6 as i32 || spec.socket_type != SOCK_RAW {
+                if spec.family != AF_INET6 as i32 {
                     return Err(ERRNO::ENOPROTOOPT);
                 }
                 match optname {
+                    IPV6_V6ONLY => {
+                        let value = match backend {
+                            SocketBackendKind::Udp => {
+                                let mut value = 0i32;
+                                with_udp_socket(fd, |udp| {
+                                    value = if udp.ipv6_only() { 1 } else { 0 };
+                                    Ok(())
+                                })?;
+                                value
+                            }
+                            SocketBackendKind::Tcp => {
+                                let mut value = 0i32;
+                                with_tcp_socket(fd, |tcp| {
+                                    value = if tcp.ipv6_only() { 1 } else { 0 };
+                                    Ok(())
+                                })?;
+                                value
+                            }
+                            SocketBackendKind::RawIpv6 => 1,
+                            _ => return Err(ERRNO::ENOPROTOOPT),
+                        };
+                        write_getsockopt_i32(token, optval, optlen, value)?;
+                        Ok(0)
+                    }
                     IPV6_CHECKSUM => {
+                        if backend != SocketBackendKind::RawIpv6 {
+                            return Err(ERRNO::ENOPROTOOPT);
+                        }
                         let value = with_raw_ipv6_socket(fd, |raw| Ok(raw.checksum_offset()))?;
                         write_getsockopt_i32(token, optval, optlen, value)?;
                         Ok(0)
@@ -2245,6 +2330,9 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
                     | IPV6_RECVDSTOPTS | IPV6_RECVTCLASS | IPV6_2292PKTINFO
                     | IPV6_2292HOPLIMIT | IPV6_2292RTHDR | IPV6_2292HOPOPTS
                     | IPV6_2292DSTOPTS => {
+                        if backend != SocketBackendKind::RawIpv6 {
+                            return Err(ERRNO::ENOPROTOOPT);
+                        }
                         let value = with_raw_ipv6_socket(fd, |raw| raw.get_bool_option(optname))?;
                         write_getsockopt_i32(token, optval, optlen, value)?;
                         Ok(0)

@@ -1,7 +1,11 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::cmp::{max, min};
+use core::fmt::Write;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use fs::errno::FS_ERRNO;
 use fs::Inode;
@@ -15,6 +19,19 @@ use crate::mm::{
 use crate::syscall::errno::ERRNO;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
+
+static READ_PAGE_LOADS: AtomicUsize = AtomicUsize::new(0);
+static READ_PAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WRITE_MAPPING_CALLS: AtomicUsize = AtomicUsize::new(0);
+static WRITE_MAPPING_BYTES: AtomicUsize = AtomicUsize::new(0);
+static SYNC_MAPPING_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SYNC_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static WRITEBACK_PAGES: AtomicUsize = AtomicUsize::new(0);
+static WRITEBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
+static WRITEBACK_BATCH_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
 
 extern "C" {
     fn ekernel();
@@ -348,6 +365,59 @@ pub fn sync_all() -> Result<(), ERRNO> {
     Ok(())
 }
 
+fn perf_load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+pub fn reset_perf_counters() {
+    READ_PAGE_LOADS.store(0, Ordering::Relaxed);
+    READ_PAGE_BYTES.store(0, Ordering::Relaxed);
+    WRITE_MAPPING_CALLS.store(0, Ordering::Relaxed);
+    WRITE_MAPPING_BYTES.store(0, Ordering::Relaxed);
+    SYNC_MAPPING_CALLS.store(0, Ordering::Relaxed);
+    SYNC_RANGE_CALLS.store(0, Ordering::Relaxed);
+    WRITEBACK_PAGES.store(0, Ordering::Relaxed);
+    WRITEBACK_BYTES.store(0, Ordering::Relaxed);
+    WRITEBACK_BATCHES.store(0, Ordering::Relaxed);
+    WRITEBACK_BATCH_PAGES.store(0, Ordering::Relaxed);
+}
+
+pub fn render_perf_counters() -> String {
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "page_cache:");
+    let _ = writeln!(&mut out, "  read_page_loads {}", perf_load(&READ_PAGE_LOADS));
+    let _ = writeln!(&mut out, "  read_page_bytes {}", perf_load(&READ_PAGE_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  write_mapping_calls {}",
+        perf_load(&WRITE_MAPPING_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  write_mapping_bytes {}",
+        perf_load(&WRITE_MAPPING_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  sync_mapping_calls {}",
+        perf_load(&SYNC_MAPPING_CALLS)
+    );
+    let _ = writeln!(&mut out, "  sync_range_calls {}", perf_load(&SYNC_RANGE_CALLS));
+    let _ = writeln!(&mut out, "  writeback_pages {}", perf_load(&WRITEBACK_PAGES));
+    let _ = writeln!(&mut out, "  writeback_bytes {}", perf_load(&WRITEBACK_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  writeback_batches {}",
+        perf_load(&WRITEBACK_BATCHES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  writeback_batch_pages {}",
+        perf_load(&WRITEBACK_BATCH_PAGES)
+    );
+    out
+}
+
 /// 同步某个 inode 指定范围内的脏页。
 pub fn sync_inode_range(inode: &Arc<Inode>, offset: usize, len: usize) -> Result<(), ERRNO> {
     if len == 0 || !is_inode_page_cacheable(inode) {
@@ -500,6 +570,8 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
     if buf.is_empty() {
         return 0;
     }
+    WRITE_MAPPING_CALLS.fetch_add(1, Ordering::Relaxed);
+    WRITE_MAPPING_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
 
     let old_size = mapping.lock().size;
     let new_size = offset.saturating_add(buf.len());
@@ -825,7 +897,10 @@ fn ensure_page_uptodate(
                 valid_bytes
             );
             // TODO：后续接入通用 truncate 后，需要避免装页与截断并发时把旧数据重新提交回 cache。
-            inode.read_at(page_start_off, &mut bytes[..valid_bytes])
+            let read = inode.read_at(page_start_off, &mut bytes[..valid_bytes]);
+            READ_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
+            READ_PAGE_BYTES.fetch_add(read, Ordering::Relaxed);
+            read
         };
 
         let wait_queue = {
@@ -853,14 +928,9 @@ fn mark_page_dirty(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page_guard: &mut C
 
 /// 同步单个 mapping 的全部脏页。
 fn sync_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>) -> Result<(), ERRNO> {
-    let dirty_pages: alloc::vec::Vec<_> = mapping.lock().dirty_pages.iter().copied().collect();
-    for page_idx in dirty_pages {
-        let page = mapping.lock().pages.get(&page_idx).cloned();
-        if let Some(page) = page {
-            flush_page(mapping, &page)?;
-        }
-    }
-    Ok(())
+    SYNC_MAPPING_CALLS.fetch_add(1, Ordering::Relaxed);
+    let dirty_pages: Vec<_> = mapping.lock().dirty_pages.iter().copied().collect();
+    flush_dirty_pages(mapping, &dirty_pages)
 }
 
 /// 同步单个 mapping 中指定范围的脏页。
@@ -869,6 +939,7 @@ fn sync_mapping_range(
     offset: usize,
     len: usize,
 ) -> Result<(), ERRNO> {
+    SYNC_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
     if len == 0 {
         return Ok(());
     }
@@ -877,7 +948,7 @@ fn sync_mapping_range(
         .checked_add(len.saturating_sub(1))
         .ok_or(ERRNO::EOVERFLOW)?;
     let end_idx = file_page_index(end_off);
-    let dirty_pages: alloc::vec::Vec<_> = {
+    let dirty_pages: Vec<_> = {
         let mapping_guard = mapping.lock();
         mapping_guard
             .dirty_pages
@@ -885,13 +956,218 @@ fn sync_mapping_range(
             .copied()
             .collect()
     };
-    for page_idx in dirty_pages {
-        let page = mapping.lock().pages.get(&page_idx).cloned();
-        if let Some(page) = page {
-            flush_page(mapping, &page)?;
+    flush_dirty_pages(mapping, &dirty_pages)
+}
+
+struct WritebackPage {
+    page_idx: u64,
+    page: Arc<SpinNoIrqLock<CachePage>>,
+}
+
+struct WritebackBatch {
+    pages: Vec<WritebackPage>,
+    data: Vec<u8>,
+    owner_inode: Arc<Inode>,
+}
+
+enum BatchCollectResult {
+    Batch {
+        batch: WritebackBatch,
+        consumed: usize,
+    },
+    Wait(Arc<SpinNoIrqLock<CachePage>>),
+    Single(Arc<SpinNoIrqLock<CachePage>>),
+    Skip,
+}
+
+fn flush_dirty_pages(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    dirty_pages: &[u64],
+) -> Result<(), ERRNO> {
+    let mut pos = 0usize;
+    while pos < dirty_pages.len() {
+        match collect_writeback_batch(mapping, dirty_pages, pos) {
+            BatchCollectResult::Batch { batch, consumed } => {
+                flush_writeback_batch(mapping, batch)?;
+                pos += consumed.max(1);
+            }
+            BatchCollectResult::Wait(page) | BatchCollectResult::Single(page) => {
+                flush_page(mapping, &page)?;
+                pos += 1;
+            }
+            BatchCollectResult::Skip => {
+                pos += 1;
+            }
         }
     }
     Ok(())
+}
+
+fn collect_writeback_batch(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    dirty_pages: &[u64],
+    start_pos: usize,
+) -> BatchCollectResult {
+    let owner_inode = {
+        let mapping_guard = mapping.lock();
+        mapping_guard
+            .inode
+            .upgrade()
+            .expect("page cache inode disappeared")
+    };
+
+    let mut pages = Vec::new();
+    let mut data = Vec::new();
+    let mut consumed = 0usize;
+    let mut expected_page_idx = dirty_pages[start_pos];
+
+    while start_pos + consumed < dirty_pages.len() && pages.len() < MAX_WRITEBACK_BATCH_PAGES {
+        let page_idx = dirty_pages[start_pos + consumed];
+        if page_idx != expected_page_idx {
+            break;
+        }
+
+        let Some(page) = mapping.lock().pages.get(&page_idx).cloned() else {
+            if pages.is_empty() {
+                return BatchCollectResult::Skip;
+            }
+            break;
+        };
+
+        let valid_bytes = {
+            let mut page_guard = page.lock();
+            if page_guard.state.contains(CachePageState::WRITEBACK) {
+                if pages.is_empty() {
+                    return BatchCollectResult::Wait(page.clone());
+                }
+                break;
+            }
+            if !page_guard.state.contains(CachePageState::DIRTY) {
+                if pages.is_empty() {
+                    return BatchCollectResult::Skip;
+                }
+                break;
+            }
+            if page_guard.valid_bytes == 0 {
+                if pages.is_empty() {
+                    return BatchCollectResult::Single(page.clone());
+                }
+                break;
+            }
+
+            page_guard.state.insert(CachePageState::WRITEBACK);
+            page_guard.pin_count += 1;
+            let valid_bytes = page_guard.valid_bytes;
+            let bytes = page_guard.ppn().get_bytes_array();
+            data.extend_from_slice(&bytes[..valid_bytes]);
+            valid_bytes
+        };
+
+        pages.push(WritebackPage {
+            page_idx,
+            page,
+        });
+        consumed += 1;
+
+        if valid_bytes != PAGE_SIZE {
+            break;
+        }
+        expected_page_idx += 1;
+    }
+
+    if pages.is_empty() {
+        BatchCollectResult::Skip
+    } else {
+        BatchCollectResult::Batch {
+            batch: WritebackBatch {
+                pages,
+                data,
+                owner_inode,
+            },
+            consumed,
+        }
+    }
+}
+
+fn flush_writeback_batch(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    batch: WritebackBatch,
+) -> Result<(), ERRNO> {
+    let start_page_idx = batch.pages[0].page_idx;
+    let expected = batch.data.len();
+    let mut write_ok = true;
+
+    WRITEBACK_PAGES.fetch_add(batch.pages.len(), Ordering::Relaxed);
+    WRITEBACK_BYTES.fetch_add(expected, Ordering::Relaxed);
+    WRITEBACK_BATCHES.fetch_add(1, Ordering::Relaxed);
+    WRITEBACK_BATCH_PAGES.fetch_add(batch.pages.len(), Ordering::Relaxed);
+
+    debug!(
+        "[page_cache] writeback batch: start_page_idx={} pages={} bytes={}",
+        start_page_idx,
+        batch.pages.len(),
+        expected
+    );
+
+    match batch
+        .owner_inode
+        .write_at_result(page_start(start_page_idx), &batch.data)
+    {
+        Ok(written) if written == expected => {}
+        Ok(written) => {
+            error!(
+                "[page_cache] short batch writeback: start_page_idx={} expected={} actual={}",
+                start_page_idx,
+                expected,
+                written
+            );
+            write_ok = false;
+        }
+        Err(err) => {
+            error!(
+                "[page_cache] batch writeback failed: start_page_idx={} expected={} errno={}",
+                start_page_idx,
+                expected,
+                err as i32
+            );
+            write_ok = false;
+        }
+    }
+
+    for info in batch.pages {
+        finish_page_writeback(mapping, info.page_idx, &info.page, write_ok);
+    }
+
+    if write_ok {
+        Ok(())
+    } else {
+        Err(ERRNO::EIO)
+    }
+}
+
+fn finish_page_writeback(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    page_idx: u64,
+    page: &Arc<SpinNoIrqLock<CachePage>>,
+    write_ok: bool,
+) {
+    let wait_queue = {
+        let mut page_guard = page.lock();
+        if page_guard.state.contains(CachePageState::DIRTY) {
+            if !write_ok || page_guard.map_count > 0 {
+                // 共享映射仍然存在时先保守地维持脏状态，避免写回后后续写入无法再次通知内核。
+                // TODO：后续补齐反向映射后，可在写回前清 PTE 脏位并重新写保护，从而精确清脏。
+                mapping.lock().dirty_pages.insert(page_idx);
+            } else {
+                page_guard.state.remove(CachePageState::DIRTY);
+                mapping.lock().dirty_pages.remove(&page_idx);
+            }
+        }
+        page_guard.state.remove(CachePageState::WRITEBACK);
+        page_guard.pin_count = page_guard.pin_count.saturating_sub(1);
+        Arc::clone(&page_guard.wait_queue)
+    };
+    wait_queue.wake_all();
 }
 
 /// 将单个脏页写回底层文件。
@@ -936,6 +1212,8 @@ fn flush_page(
         let mut write_ok = true;
         if valid_bytes != 0 {
             let bytes = ppn.get_bytes_array();
+            WRITEBACK_PAGES.fetch_add(1, Ordering::Relaxed);
+            WRITEBACK_BYTES.fetch_add(valid_bytes, Ordering::Relaxed);
             debug!(
                 "[page_cache] writeback page: page_idx={} valid_bytes={}",
                 page_idx,
@@ -964,23 +1242,7 @@ fn flush_page(
             }
         }
 
-        let wait_queue = {
-            let mut page_guard = page.lock();
-            if page_guard.state.contains(CachePageState::DIRTY) {
-                if !write_ok || page_guard.map_count > 0 {
-                    // 共享映射仍然存在时先保守地维持脏状态，避免写回后后续写入无法再次通知内核。
-                    // TODO：后续补齐反向映射后，可在写回前清 PTE 脏位并重新写保护，从而精确清脏。
-                    mapping.lock().dirty_pages.insert(page_idx);
-                } else {
-                    page_guard.state.remove(CachePageState::DIRTY);
-                    mapping.lock().dirty_pages.remove(&page_idx);
-                }
-            }
-            page_guard.state.remove(CachePageState::WRITEBACK);
-            page_guard.pin_count = page_guard.pin_count.saturating_sub(1);
-            Arc::clone(&page_guard.wait_queue)
-        };
-        wait_queue.wake_all();
+        finish_page_writeback(mapping, page_idx, page, write_ok);
         if write_ok {
             return Ok(());
         }

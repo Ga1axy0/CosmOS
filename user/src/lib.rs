@@ -347,6 +347,34 @@ pub fn write(fd: usize, buf: &[u8]) -> isize {
     sys_write(fd, buf)
 }
 
+pub const SEEK_SET: usize = 0;
+pub const SEEK_CUR: usize = 1;
+pub const SEEK_END: usize = 2;
+
+pub fn lseek(fd: usize, offset: isize, whence: usize) -> isize {
+    sys_lseek(fd, offset, whence)
+}
+
+pub fn pread64(fd: usize, buf: &mut [u8], offset: usize) -> isize {
+    sys_pread64(fd, buf, offset)
+}
+
+pub fn pwrite64(fd: usize, buf: &[u8], offset: usize) -> isize {
+    sys_pwrite64(fd, buf, offset)
+}
+
+pub fn sync() -> isize {
+    sys_sync()
+}
+
+pub fn fsync(fd: usize) -> isize {
+    sys_fsync(fd)
+}
+
+pub fn fdatasync(fd: usize) -> isize {
+    sys_fdatasync(fd)
+}
+
 pub fn link(old_path: &str, new_path: &str) -> isize {
     let old_path = to_cstring(old_path);
     let new_path = to_cstring(new_path);

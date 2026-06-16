@@ -19,6 +19,7 @@ RUN_TEST_FS ?= .make/sdcard-$(ARCH)-run.img
 TEST_FS_LA ?= sdcard-la.img
 RUN_TEST_FS_LA ?= .make/sdcard-la-run.img
 QEMU_NETDEV ?= user,id=net
+FAST_RUN_QEMU_NETDEV ?= user,id=net,hostfwd=tcp::7777-:7777
 QEMU_TRACE_ARGS ?=
 QEMU_COMP_BLK_ARGS = -drive file=$(RUN_TEST_FS),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 QEMU_COMP_EXTRA_BLK_ARGS = -drive file=$(RUN_DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
@@ -28,6 +29,9 @@ USER_BUILD_STAMP_RV := $(USER_BIN_DIR_RV)/.xxos-build.stamp
 USER_BUILD_STAMP_LA := $(USER_BIN_DIR_LA)/.xxos-build.stamp
 KERNEL_BUILD_STAMP_RV := $(STAMP_DIR)/kernel-build-rv.stamp
 KERNEL_BUILD_STAMP_LA := $(STAMP_DIR)/kernel-build-la.stamp
+KERNEL_LOG_KEY := $(if $(strip $(LOG)),$(strip $(LOG)),OFF)
+KERNEL_LOG_STAMP_RV := $(STAMP_DIR)/kernel-log-rv-$(KERNEL_LOG_KEY).stamp
+KERNEL_LOG_STAMP_LA := $(STAMP_DIR)/kernel-log-la-$(KERNEL_LOG_KEY).stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
 LA_BOOTLOADER_DIR ?= bootloader/loongarch64-direct
@@ -134,11 +138,17 @@ $(USER_BUILD_STAMP_LA): $(USER_BUILD_DEPS)
 user-apps: $(USER_BUILD_STAMP_RV)
 user-apps-la: $(USER_BUILD_STAMP_LA)
 
-$(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR)
+$(KERNEL_LOG_STAMP_RV): | $(STAMP_DIR)
+	touch $@
+
+$(KERNEL_LOG_STAMP_LA): | $(STAMP_DIR)
+	touch $@
+
+$(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) $(KERNEL_LOG_STAMP_RV) | $(STAMP_DIR)
 	$(MAKE) -C os kernel ARCH=riscv64
 	touch $@
 
-$(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) | $(STAMP_DIR)
+$(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) $(KERNEL_LOG_STAMP_LA) | $(STAMP_DIR)
 	$(MAKE) -C os kernel ARCH=loongarch64
 	touch $@
 
@@ -204,7 +214,7 @@ check-kernel: $(RUN_KERNEL)
 		exit 1; \
 	}
 
-check-kernel-la:
+check-kernel-la: kernel-la
 	@test -x kernel-la || { \
 		echo "missing kernel-la; run 'make all' first" >&2; \
 		exit 1; \
@@ -304,7 +314,7 @@ run-la: check-kernel-la $(LA_BOOTLOADER_ELF) $(DISK_LA_IMG) prepare-run-test-fs-
 	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS)
 
 fast-run: check-kernel
-	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
+	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
 
 fast-run-la: check-kernel-la $(LA_BOOTLOADER_ELF)
 	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS)

@@ -3,11 +3,11 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use smoltcp::socket::udp as udp_socket;
 use smoltcp::socket::udp::SendError;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
@@ -21,6 +21,8 @@ use crate::syscall::errno::ERRNO;
 use crate::task::{current_task, WaitQueue, WaitReason};
 use crate::timer::{add_timer_with_socket_tag, get_time_ns};
 
+const AF_INET_FAMILY: i32 = 2;
+
 #[inline]
 fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
     let addr = if ep.addr.is_unspecified() {
@@ -32,11 +34,21 @@ fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
 }
 
 #[inline]
+fn unspecified_addr_for_family(family: i32) -> IpAddress {
+    if family == super::AF_INET6 as i32 {
+        IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+    } else {
+        IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0))
+    }
+}
+
+#[inline]
 fn loopback_source_addr_for_peer(peer: IpEndpoint) -> Option<IpAddress> {
     match peer.addr {
         IpAddress::Ipv4(v4) if v4.is_loopback() => {
             Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)))
         }
+        IpAddress::Ipv6(v6) if v6.is_loopback() => Some(IpAddress::Ipv6(Ipv6Address::LOCALHOST)),
         _ => None,
     }
 }
@@ -62,28 +74,42 @@ impl UdpSocketState {
 }
 
 pub(crate) struct UdpSocketFile {
+    family: i32,
     st: Arc<UdpSocketState>,
+    bound_endpoint: SpinNoIrqLock<Option<IpListenEndpoint>>,
     connected: SpinNoIrqLock<Option<IpEndpoint>>,
+    ipv6_only: AtomicBool,
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
 }
 
 impl UdpSocketFile {
-    fn new(st: Arc<UdpSocketState>) -> Self {
+    fn new(st: Arc<UdpSocketState>, family: i32) -> Self {
         Self {
+            family,
             st,
+            bound_endpoint: SpinNoIrqLock::new(None),
             connected: SpinNoIrqLock::new(None),
+            ipv6_only: AtomicBool::new(false),
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
         }
     }
 
+    pub(crate) fn set_ipv6_only(&self, enabled: bool) {
+        self.ipv6_only.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn ipv6_only(&self) -> bool {
+        self.ipv6_only.load(Ordering::Acquire)
+    }
+
     pub(crate) fn recv_buffer_size(&self) -> usize {
-        super::UDP_BUF
+        super::UDP_RX_BUF
     }
 
     pub(crate) fn send_buffer_size(&self) -> usize {
-        super::UDP_BUF
+        super::UDP_TX_BUF
     }
 
     pub(crate) fn set_recv_timeout_ns(&self, timeout_ns: u64) {
@@ -104,13 +130,28 @@ impl UdpSocketFile {
 
     /// Return the local (bound) endpoint of this UDP socket. If not bound, returns None.
     pub(crate) fn local_endpoint(&self) -> Option<IpEndpoint> {
+        if self.connected.lock().is_some() {
+            let mut guard = crate::net::NET_STACK.lock();
+            let stack = guard.as_mut()?;
+            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+            let listen = socket.endpoint();
+            let addr = listen.addr.unwrap_or(unspecified_addr_for_family(self.family));
+            return Some(IpEndpoint::new(addr, listen.port));
+        }
+
+        if let Some(bound) = *self.bound_endpoint.lock() {
+            let addr = bound.addr.unwrap_or(unspecified_addr_for_family(self.family));
+            return Some(IpEndpoint::new(addr, bound.port));
+        }
+
         let mut guard = crate::net::NET_STACK.lock();
         let stack = guard.as_mut()?;
         let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
         let listen = socket.endpoint();
-        let addr = listen
-            .addr
-            .unwrap_or(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)));
+        if listen.port == 0 {
+            return None;
+        }
+        let addr = listen.addr.unwrap_or(unspecified_addr_for_family(self.family));
         Some(IpEndpoint::new(addr, listen.port))
     }
 
@@ -128,10 +169,33 @@ impl UdpSocketFile {
             ep.port
         };
         let bind_ep = listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port));
-        debug!("UDP socket {:?} binding to {:?}", self.st.handle, bind_ep);
+        let stack_ep = if bind_ep.addr.is_some() {
+            bind_ep
+        } else if self.family == AF_INET_FAMILY {
+            IpListenEndpoint {
+                addr: Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))),
+                port: bind_ep.port,
+            }
+        } else if self.family == super::AF_INET6 as i32 && self.ipv6_only() {
+            IpListenEndpoint {
+                addr: Some(IpAddress::Ipv6(Ipv6Address::LOCALHOST)),
+                port: bind_ep.port,
+            }
+        } else {
+            // AF_INET6 wildcard with IPV6_V6ONLY=0 keeps addr=None so one UDP
+            // socket can accept both IPv6 and IPv4 loopback datagrams.
+            bind_ep
+        };
+        debug!(
+            "UDP socket {:?} binding to {:?} stack_ep={:?}",
+            self.st.handle,
+            bind_ep,
+            stack_ep
+        );
         let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
-        match socket.bind(bind_ep) {
+        match socket.bind(stack_ep) {
             Ok(()) => {
+                *self.bound_endpoint.lock() = Some(bind_ep);
                 debug!("UDP socket {:?} bind succeeded", self.st.handle);
                 Ok(())
             }
@@ -194,9 +258,17 @@ impl UdpSocketFile {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             self.ensure_bound_for_send_locked(stack, ep)?;
-            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+            if ep.port != 0 && stack.deliver_udp_loopback(self.st.handle, ep, data) {
+                if let Some(handle) = timeout_handle.take() {
+                    socket_wait_mark_ready(handle);
+                    cleanup_socket_wait(handle);
+                }
+                crate::net::perf_udp_user_send(data.len());
+                return Ok(data.len());
+            }
 
             // Check if socket can send
+            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
             let can_send = socket.can_send();
 
             if can_send {
@@ -214,6 +286,7 @@ impl UdpSocketFile {
                             socket_wait_mark_ready(handle);
                             cleanup_socket_wait(handle);
                         }
+                        crate::net::perf_udp_user_send(data.len());
                         return Ok(data.len());
                     }
                     Err(e) => {
@@ -335,6 +408,7 @@ impl UdpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_udp_user_recv(off);
                     return Ok((off, meta.endpoint));
                 }
             }
@@ -462,6 +536,7 @@ impl File for UdpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_udp_user_recv(n);
                     return Ok(n);
                 }
             }
@@ -591,9 +666,9 @@ impl Drop for UdpSocketFile {
     }
 }
 
-pub(crate) fn create_udp_socket_file() -> Option<Arc<UdpSocketFile>> {
+pub(crate) fn create_udp_socket_file(family: i32) -> Option<Arc<UdpSocketFile>> {
     let mut guard = NET_STACK.lock();
     let stack = guard.as_mut()?;
     let (_handle, st) = stack.create_udp_socket();
-    Some(Arc::new(UdpSocketFile::new(st)))
+    Some(Arc::new(UdpSocketFile::new(st, family)))
 }

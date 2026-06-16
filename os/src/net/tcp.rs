@@ -9,7 +9,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use smoltcp::socket::tcp as tcp_socket;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
@@ -24,6 +24,31 @@ use crate::task::{current_task, WaitQueue, WaitReason};
 use crate::timer::{add_timer_with_socket_tag, get_time_ns};
 
 const SOMAXCONN: usize = 128;
+
+#[inline]
+fn unspecified_addr_for_family(family: i32) -> IpAddress {
+    if family == super::AF_INET6 as i32 {
+        IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+    } else {
+        IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0))
+    }
+}
+
+#[inline]
+fn stack_listen_addr_for_family(family: i32, addr: Option<IpAddress>) -> Option<IpAddress> {
+    match (family, addr) {
+        (x, None) if x == super::AF_INET6 as i32 => Some(IpAddress::Ipv6(Ipv6Address::LOCALHOST)),
+        (_, addr) => addr,
+    }
+}
+
+#[inline]
+fn ipv4_loopback_listen_endpoint(port: u16) -> IpListenEndpoint {
+    IpListenEndpoint {
+        addr: Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))),
+        port,
+    }
+}
 
 #[inline]
 fn normalize_backlog(backlog: usize) -> usize {
@@ -41,20 +66,24 @@ fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
 }
 
 pub(crate) struct TcpListenerShared {
+    family: i32,
     addr: SpinNoIrqLock<Option<IpAddress>>,
     port: AtomicUsize,
     backlog: AtomicUsize,
+    dual_stack_v4: AtomicBool,
     pending: SpinNoIrqLock<VecDeque<Arc<TcpSocketState>>>,
     passive: SpinNoIrqLock<Vec<Arc<TcpSocketState>>>,
     accept_wait: WaitQueue,
 }
 
 impl TcpListenerShared {
-    fn new(endpoint: IpListenEndpoint, backlog: usize) -> Self {
+    fn new(family: i32, endpoint: IpListenEndpoint, backlog: usize) -> Self {
         Self {
+            family,
             addr: SpinNoIrqLock::new(endpoint.addr),
             port: AtomicUsize::new(endpoint.port as usize),
             backlog: AtomicUsize::new(backlog),
+            dual_stack_v4: AtomicBool::new(false),
             pending: SpinNoIrqLock::new(VecDeque::new()),
             passive: SpinNoIrqLock::new(Vec::new()),
             accept_wait: WaitQueue::new(),
@@ -83,6 +112,31 @@ impl TcpListenerShared {
             addr: self.addr(),
             port: self.port(),
         }
+    }
+
+    fn stack_endpoint(&self) -> IpListenEndpoint {
+        let endpoint = self.endpoint();
+        IpListenEndpoint {
+            addr: stack_listen_addr_for_family(self.family, endpoint.addr),
+            port: endpoint.port,
+        }
+    }
+
+    fn set_dual_stack_v4(&self, enabled: bool) {
+        self.dual_stack_v4.store(enabled, Ordering::Release);
+    }
+
+    fn stack_endpoints(&self) -> Vec<IpListenEndpoint> {
+        let mut endpoints = Vec::new();
+        let primary = self.stack_endpoint();
+        endpoints.push(primary);
+        if self.dual_stack_v4.load(Ordering::Acquire) && self.family == super::AF_INET6 as i32 {
+            let base = self.endpoint();
+            if base.addr.is_none() {
+                endpoints.push(ipv4_loopback_listen_endpoint(base.port));
+            }
+        }
+        endpoints
     }
 
     fn backlog(&self) -> usize {
@@ -167,7 +221,9 @@ pub(crate) struct TcpSocketState {
     pub(crate) write_wait: WaitQueue,
     pub(crate) orphaned: AtomicBool,
     listener: SpinNoIrqLock<Option<Weak<TcpListenerShared>>>,
+    listener_endpoint: SpinNoIrqLock<Option<IpListenEndpoint>>,
     queued_for_accept: AtomicBool,
+    last_state: AtomicUsize,
 }
 
 impl TcpSocketState {
@@ -178,7 +234,9 @@ impl TcpSocketState {
             write_wait: WaitQueue::new(),
             orphaned: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
+            listener_endpoint: SpinNoIrqLock::new(None),
             queued_for_accept: AtomicBool::new(false),
+            last_state: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -197,6 +255,15 @@ impl TcpSocketState {
 
     fn clear_listener(&self) {
         *self.listener.lock() = None;
+        *self.listener_endpoint.lock() = None;
+    }
+
+    fn listener_endpoint(&self) -> Option<IpListenEndpoint> {
+        *self.listener_endpoint.lock()
+    }
+
+    fn set_listener_endpoint(&self, endpoint: IpListenEndpoint) {
+        *self.listener_endpoint.lock() = Some(endpoint);
     }
 
     pub(crate) fn is_listener_owned(&self) -> bool {
@@ -211,6 +278,52 @@ impl TcpSocketState {
 
     fn clear_queued_for_accept(&self) {
         self.queued_for_accept.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn observe_state_change(&self, state: tcp_socket::State) -> Option<usize> {
+        let next = state as usize;
+        let prev = self.last_state.swap(next, Ordering::AcqRel);
+        if prev == next {
+            None
+        } else {
+            Some(prev)
+        }
+    }
+}
+
+pub(crate) fn tcp_state_name(state: tcp_socket::State) -> &'static str {
+    match state {
+        tcp_socket::State::Closed => "CLOSED",
+        tcp_socket::State::Listen => "LISTEN",
+        tcp_socket::State::SynSent => "SYN-SENT",
+        tcp_socket::State::SynReceived => "SYN-RECEIVED",
+        tcp_socket::State::Established => "ESTABLISHED",
+        tcp_socket::State::FinWait1 => "FIN-WAIT-1",
+        tcp_socket::State::FinWait2 => "FIN-WAIT-2",
+        tcp_socket::State::CloseWait => "CLOSE-WAIT",
+        tcp_socket::State::Closing => "CLOSING",
+        tcp_socket::State::LastAck => "LAST-ACK",
+        tcp_socket::State::TimeWait => "TIME-WAIT",
+    }
+}
+
+pub(crate) fn tcp_state_name_repr(state: usize) -> &'static str {
+    if state == usize::MAX {
+        return "<unobserved>";
+    }
+    match state {
+        x if x == tcp_socket::State::Closed as usize => "CLOSED",
+        x if x == tcp_socket::State::Listen as usize => "LISTEN",
+        x if x == tcp_socket::State::SynSent as usize => "SYN-SENT",
+        x if x == tcp_socket::State::SynReceived as usize => "SYN-RECEIVED",
+        x if x == tcp_socket::State::Established as usize => "ESTABLISHED",
+        x if x == tcp_socket::State::FinWait1 as usize => "FIN-WAIT-1",
+        x if x == tcp_socket::State::FinWait2 as usize => "FIN-WAIT-2",
+        x if x == tcp_socket::State::CloseWait as usize => "CLOSE-WAIT",
+        x if x == tcp_socket::State::Closing as usize => "CLOSING",
+        x if x == tcp_socket::State::LastAck as usize => "LAST-ACK",
+        x if x == tcp_socket::State::TimeWait as usize => "TIME-WAIT",
+        _ => "<unknown>",
     }
 }
 
@@ -228,6 +341,11 @@ pub(crate) fn queue_listener_connection_if_ready(
         return None;
     }
 
+    debug!(
+        "Tcp listener queued established connection: handle={:?} state={}",
+        st.handle,
+        tcp_state_name(state)
+    );
     listener.remove_passive(st.handle);
     listener.push_pending(Arc::clone(st));
     st.clear_listener();
@@ -236,10 +354,12 @@ pub(crate) fn queue_listener_connection_if_ready(
 }
 
 pub(crate) struct TcpSocketFile {
+    family: i32,
     st: SpinNoIrqLock<Arc<TcpSocketState>>,
     bound_endpoint: SpinNoIrqLock<Option<IpListenEndpoint>>,
     listening: AtomicBool,
     listener: SpinNoIrqLock<Option<Arc<TcpListenerShared>>>,
+    ipv6_only: AtomicBool,
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
     /// IPv4 multicast groups this socket has joined (per-socket membership).
@@ -250,16 +370,26 @@ pub(crate) struct TcpSocketFile {
 }
 
 impl TcpSocketFile {
-    fn new(st: Arc<TcpSocketState>) -> Self {
+    fn new(st: Arc<TcpSocketState>, family: i32) -> Self {
         Self {
+            family,
             st: SpinNoIrqLock::new(st),
             bound_endpoint: SpinNoIrqLock::new(None),
             listening: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
+            ipv6_only: AtomicBool::new(false),
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             mcast_groups: SpinNoIrqLock::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn set_ipv6_only(&self, enabled: bool) {
+        self.ipv6_only.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn ipv6_only(&self) -> bool {
+        self.ipv6_only.load(Ordering::Acquire)
     }
 
     /// Join an IPv4 multicast group. Returns `false` if the socket was already
@@ -324,9 +454,7 @@ impl TcpSocketFile {
         }
         let bound = *self.bound_endpoint.lock();
         bound.map(|bound| {
-            let addr = bound
-                .addr
-                .unwrap_or(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)));
+            let addr = bound.addr.unwrap_or(unspecified_addr_for_family(self.family));
             IpEndpoint::new(addr, bound.port)
         })
     }
@@ -346,6 +474,28 @@ impl TcpSocketFile {
 
     fn listener_shared(&self) -> Option<Arc<TcpListenerShared>> {
         self.listener.lock().as_ref().map(Arc::clone)
+    }
+
+    fn should_dual_stack_with_ipv4(&self, endpoint: IpListenEndpoint) -> bool {
+        self.family == super::AF_INET6 as i32 && !self.ipv6_only() && endpoint.addr.is_none()
+    }
+
+    fn choose_refill_endpoint(&self, listener: &Arc<TcpListenerShared>) -> IpListenEndpoint {
+        let endpoints = listener.stack_endpoints();
+        let passive = listener.passive.lock();
+        let mut best = endpoints[0];
+        let mut best_count = usize::MAX;
+        for endpoint in endpoints {
+            let count = passive
+                .iter()
+                .filter(|st| st.listener_endpoint() == Some(endpoint))
+                .count();
+            if count < best_count {
+                best = endpoint;
+                best_count = count;
+            }
+        }
+        best
     }
 
     fn trim_listener_slots(&self, listener: &Arc<TcpListenerShared>) -> Result<(), ERRNO> {
@@ -381,17 +531,28 @@ impl TcpSocketFile {
     }
 
     fn refill_listener_slots(&self, listener: &Arc<TcpListenerShared>) -> Result<(), ERRNO> {
-        let target = listener.backlog();
+        let target = listener.backlog().min(super::MAX_PASSIVE_LISTEN_SOCKETS);
         let mut guard = NET_STACK.lock();
         let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
 
         while listener.slot_count() < target {
             let (_h, st) = stack.create_tcp_socket();
+            let listen_endpoint = self.choose_refill_endpoint(listener);
             {
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                socket.listen(listener.endpoint()).map_err(|_| ERRNO::EIO)?;
+                socket
+                    .listen(listen_endpoint)
+                    .map_err(|_| ERRNO::EIO)?;
             }
+            debug!(
+                "Tcp listener refill: passive_handle={:?} endpoint={:?} slots={}/{}",
+                st.handle,
+                listen_endpoint,
+                listener.slot_count() + 1,
+                target
+            );
             st.set_listener(Some(Arc::downgrade(listener)));
+            st.set_listener_endpoint(listen_endpoint);
             listener.push_passive(Arc::clone(&st));
         }
 
@@ -412,13 +573,26 @@ impl TcpSocketFile {
             ep.port
         };
         *self.bound_endpoint.lock() = Some(listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port)));
+        debug!(
+            "Tcp bind: requested={} effective={:?}",
+            ep,
+            *self.bound_endpoint.lock()
+        );
         Ok(())
     }
 
     pub(crate) fn listen(&self, backlog: usize) -> Result<(), ERRNO> {
         let endpoint = (*self.bound_endpoint.lock()).ok_or(ERRNO::EINVAL)?;
 
-        info!("Tcp listen: endpoint={:?} backlog={}", endpoint, backlog);
+        info!(
+            "Tcp listen: endpoint={:?} stack_endpoint={:?} backlog={}",
+            endpoint,
+            IpListenEndpoint {
+                addr: stack_listen_addr_for_family(self.family, endpoint.addr),
+                port: endpoint.port,
+            },
+            backlog
+        );
         
         let backlog = normalize_backlog(backlog);
         let was_listening = self.listening.load(Ordering::Acquire);
@@ -428,13 +602,14 @@ impl TcpSocketFile {
             match guard.as_ref() {
                 Some(ls) => Arc::clone(ls),
                 None => {
-                    let ls = Arc::new(TcpListenerShared::new(endpoint, backlog));
+                    let ls = Arc::new(TcpListenerShared::new(self.family, endpoint, backlog));
                     *guard = Some(Arc::clone(&ls));
                     ls
                 }
             }
         };
 
+        listener.set_dual_stack_v4(self.should_dual_stack_with_ipv4(endpoint));
         listener.set_endpoint(endpoint);
         listener.set_backlog(backlog);
 
@@ -443,9 +618,16 @@ impl TcpSocketFile {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             if !listener.contains_passive(st.handle) && !st.is_listener_owned() {
+                let listen_endpoint = listener.stack_endpoints()[0];
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                if socket.listen(endpoint).is_ok() {
+                if socket.listen(listen_endpoint).is_ok() {
+                    debug!(
+                        "Tcp listen armed primary passive socket: handle={:?} endpoint={:?}",
+                        st.handle,
+                        listen_endpoint
+                    );
                     st.set_listener(Some(Arc::downgrade(&listener)));
+                    st.set_listener_endpoint(listen_endpoint);
                     listener.push_passive(Arc::clone(&st));
                 } else if !was_listening {
                     return Err(ERRNO::EADDRINUSE);
@@ -474,21 +656,23 @@ impl TcpSocketFile {
             }
             if let Some(st) = listener.pop_pending() {
                 st.clear_queued_for_accept();
+                debug!("Tcp accept: popped pending handle={:?}", st.handle);
 
                 let mut was_closed = false;
-                let peer = {
+                let (peer, local) = {
                     let mut guard = NET_STACK.lock();
                     let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
                     let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                     if matches!(socket.state(), tcp_socket::State::Closed | tcp_socket::State::TimeWait)
                     {
                         was_closed = true;
-                        None
+                        (None, None)
                     } else {
-                        socket.remote_endpoint()
+                        (socket.remote_endpoint(), socket.local_endpoint())
                     }
                 };
                 if was_closed {
+                    debug!("Tcp accept: pending handle={:?} was already closed", st.handle);
                     st.orphaned.store(true, Ordering::Release);
                     continue;
                 }
@@ -496,10 +680,12 @@ impl TcpSocketFile {
                 self.refill_listener_slots(&listener)?;
 
                 let accepted = Arc::new(TcpSocketFile {
+                    family: self.family,
                     st: SpinNoIrqLock::new(Arc::clone(&st)),
-                    bound_endpoint: SpinNoIrqLock::new(Some(listener.endpoint())),
+                    bound_endpoint: SpinNoIrqLock::new(local.map(listen_endpoint_from_bind)),
                     listening: AtomicBool::new(false),
                     listener: SpinNoIrqLock::new(None),
+                    ipv6_only: AtomicBool::new(self.ipv6_only()),
                     recv_timeout_ns: AtomicU64::new(self.recv_timeout_ns()),
                     send_timeout_ns: AtomicU64::new(self.send_timeout_ns()),
                     // A freshly accepted socket must NOT inherit the listening
@@ -507,6 +693,7 @@ impl TcpSocketFile {
                     mcast_groups: SpinNoIrqLock::new(Vec::new()),
                 });
 
+                debug!("Tcp accept: accepted handle={:?} peer={:?}", st.handle, peer);
                 NEED_POLL.store(true, Ordering::Release);
                 return Ok((accepted, peer));
             }
@@ -553,9 +740,22 @@ impl TcpSocketFile {
 
             let st = self.state();
             let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+            debug!(
+                "Tcp connect attempt: handle={:?} local={:?} remote={} iface_addrs={:?} chosen_src={:?}",
+                st.handle,
+                local_endpoint,
+                ep,
+                stack.iface.ip_addrs(),
+                stack.iface.get_source_address(&ep.addr)
+            );
             socket
                 .connect(stack.iface.context(), ep, local_endpoint)
                 .map_err(|_| ERRNO::EADDRINUSE)?;
+            debug!(
+                "Tcp connect submitted: handle={:?} state={}",
+                st.handle,
+                tcp_state_name(socket.state())
+            );
 
             stack.poll();
         }
@@ -572,8 +772,24 @@ impl TcpSocketFile {
                 let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 match socket.state() {
-                    tcp_socket::State::Established | tcp_socket::State::CloseWait => return Ok(()),
+                    tcp_socket::State::Established | tcp_socket::State::CloseWait => {
+                        debug!(
+                            "Tcp connect complete: handle={:?} local={:?} remote={:?} state={}",
+                            st.handle,
+                            socket.local_endpoint(),
+                            socket.remote_endpoint(),
+                            tcp_state_name(socket.state())
+                        );
+                        return Ok(());
+                    }
                     tcp_socket::State::Closed | tcp_socket::State::TimeWait => {
+                        warn!(
+                            "Tcp connect refused: handle={:?} local={:?} remote={:?} state={}",
+                            st.handle,
+                            socket.local_endpoint(),
+                            socket.remote_endpoint(),
+                            tcp_state_name(socket.state())
+                        );
                         return Err(ERRNO::ECONNREFUSED)
                     }
                     _ => {}
@@ -656,6 +872,9 @@ impl TcpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_tcp_user_recv(total);
+                    stack.poll_socket_recv_work();
+                    NEED_POLL.store(true, Ordering::Release);
                     return Ok(total);
                 }
                 if !socket.may_recv() {
@@ -773,7 +992,8 @@ impl TcpSocketFile {
                         }
                     }
                     if total > 0 {
-                        stack.poll();
+                        crate::net::perf_tcp_user_send(total);
+                        stack.poll_socket_work_for(st.handle);
                         NEED_POLL.store(true, Ordering::Release);
                         if let Some(handle) = timeout_handle.take() {
                             socket_wait_mark_ready(handle);
@@ -934,6 +1154,9 @@ impl File for TcpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_tcp_user_recv(n);
+                    stack.poll_socket_recv_work();
+                    NEED_POLL.store(true, Ordering::Release);
                     return Ok(n);
                 }
                 if !socket.may_recv() {
@@ -1040,7 +1263,8 @@ impl File for TcpSocketFile {
                         }
                         return Err(ERRNO::EIO);
                     }
-                    stack.poll();
+                    crate::net::perf_tcp_user_send(n);
+                    stack.poll_socket_work_for(st.handle);
                     NEED_POLL.store(true, Ordering::Release);
                     if let Some(handle) = timeout_handle.take() {
                         socket_wait_mark_ready(handle);
@@ -1258,9 +1482,9 @@ impl Drop for TcpSocketFile {
     }
 }
 
-pub(crate) fn create_tcp_socket_file() -> Option<Arc<TcpSocketFile>> {
+pub(crate) fn create_tcp_socket_file(family: i32) -> Option<Arc<TcpSocketFile>> {
     let mut guard = NET_STACK.lock();
     let stack = guard.as_mut()?;
     let (_handle, st) = stack.create_tcp_socket();
-    Some(Arc::new(TcpSocketFile::new(st)))
+    Some(Arc::new(TcpSocketFile::new(st, family)))
 }

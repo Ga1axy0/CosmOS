@@ -15,15 +15,21 @@ mod udp;
 mod unix_socket;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+#[cfg(feature = "net_perf_counters")]
+use alloc::string::String;
+#[cfg(feature = "net_perf_counters")]
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "net_perf_counters")]
+use core::sync::atomic::AtomicUsize;
 
 use lazy_static::lazy_static;
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken},
     socket::{tcp as tcp_socket, udp as udp_socket},
     time::Instant,
-    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
+    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address},
 };
 
 use crate::{
@@ -69,17 +75,23 @@ pub use unix_socket::{
 
 const RX_BUF_LEN: usize = 32 * 1024;
 const MAX_SOCKETS: usize = 256;
-const UDP_RX_META: usize = 512;
+const UDP_RX_META: usize = 2048;
 const UDP_TX_META: usize = 512;
-const UDP_BUF: usize = 64 * 1024;
-const TCP_RX_BUF: usize = 128 * 1024;
-const TCP_TX_BUF: usize = 128 * 1024;
+const UDP_RX_BUF: usize = 512 * 1024;
+const UDP_TX_BUF: usize = 64 * 1024;
+const TCP_RX_BUF: usize = 512 * 1024;
+const TCP_TX_BUF: usize = 512 * 1024;
 
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
-const MAX_IMMEDIATE_POLLS: usize = 4;
+const MAX_IMMEDIATE_POLLS: usize = 64;
+const MAX_SOCKET_IMMEDIATE_POLLS: usize = 8;
+const MAX_SOCKET_CATCHUP_POLLS: usize = 32;
+const MAX_PASSIVE_LISTEN_SOCKETS: usize = 16;
 
 const NO_POLL_DEADLINE_US: u64 = u64::MAX;
+const IPV6_LOOPBACK_SOLICITED_NODE: [u8; 16] =
+    [0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x00, 0x00, 0x01];
 
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
@@ -95,6 +107,318 @@ pub(crate) static NEED_POLL: AtomicBool = AtomicBool::new(false);
 /// Next soft deadline (us since boot) for calling into smoltcp.
 /// `u64::MAX` means no timer-driven deadline currently exists.
 pub(crate) static NEXT_POLL_DEADLINE_US: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_US);
+
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_WORK_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_WORK_DEEP: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_WORK_LIGHT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_WORK_CATCHUP: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_RECV_WORK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_WORK_ACTIVE_SUM: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_SOCKET_WORK_ACTIVE_MAX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_ONCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_POLL_BUDGET_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_LOOPBACK_TX_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_LOOPBACK_TX_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_LOOPBACK_RX_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_LOOPBACK_RX_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_LOOPBACK_MAX_QUEUE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_VIRTIO_TX_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_VIRTIO_TX_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_VIRTIO_RX_FRAMES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_VIRTIO_RX_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_DIRECT_PKTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_DIRECT_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_DIRECT_DROPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_USER_SEND_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_USER_SEND_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_USER_RECV_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_UDP_USER_RECV_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_TCP_USER_SEND_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_TCP_USER_SEND_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_TCP_USER_RECV_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_TCP_USER_RECV_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+fn perf_load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+fn perf_inc(counter: &AtomicUsize) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+fn perf_add(counter: &AtomicUsize, value: usize) {
+    counter.fetch_add(value, Ordering::Relaxed);
+}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+fn perf_update_max(counter: &AtomicUsize, value: usize) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
+}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+pub(crate) fn perf_tcp_user_send(bytes: usize) {
+    perf_inc(&PERF_TCP_USER_SEND_CALLS);
+    perf_add(&PERF_TCP_USER_SEND_BYTES, bytes);
+}
+
+#[cfg(not(feature = "net_perf_counters"))]
+#[inline]
+pub(crate) fn perf_tcp_user_send(_bytes: usize) {}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+pub(crate) fn perf_tcp_user_recv(bytes: usize) {
+    perf_inc(&PERF_TCP_USER_RECV_CALLS);
+    perf_add(&PERF_TCP_USER_RECV_BYTES, bytes);
+}
+
+#[cfg(not(feature = "net_perf_counters"))]
+#[inline]
+pub(crate) fn perf_tcp_user_recv(_bytes: usize) {}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+pub(crate) fn perf_udp_user_send(bytes: usize) {
+    perf_inc(&PERF_UDP_USER_SEND_CALLS);
+    perf_add(&PERF_UDP_USER_SEND_BYTES, bytes);
+}
+
+#[cfg(not(feature = "net_perf_counters"))]
+#[inline]
+pub(crate) fn perf_udp_user_send(_bytes: usize) {}
+
+#[cfg(feature = "net_perf_counters")]
+#[inline]
+pub(crate) fn perf_udp_user_recv(bytes: usize) {
+    perf_inc(&PERF_UDP_USER_RECV_CALLS);
+    perf_add(&PERF_UDP_USER_RECV_BYTES, bytes);
+}
+
+#[cfg(not(feature = "net_perf_counters"))]
+#[inline]
+pub(crate) fn perf_udp_user_recv(_bytes: usize) {}
+
+#[cfg(feature = "net_perf_counters")]
+pub(crate) fn reset_perf_counters() {
+    for counter in [
+        &PERF_POLL_CALLS,
+        &PERF_POLL_SOCKET_WORK_CALLS,
+        &PERF_POLL_SOCKET_WORK_DEEP,
+        &PERF_POLL_SOCKET_WORK_LIGHT,
+        &PERF_POLL_SOCKET_WORK_CATCHUP,
+        &PERF_POLL_SOCKET_RECV_WORK,
+        &PERF_POLL_SOCKET_WORK_ACTIVE_SUM,
+        &PERF_POLL_SOCKET_WORK_ACTIVE_MAX,
+        &PERF_POLL_ONCE_CALLS,
+        &PERF_POLL_BUDGET_EXHAUSTED,
+        &PERF_LOOPBACK_TX_FRAMES,
+        &PERF_LOOPBACK_TX_BYTES,
+        &PERF_LOOPBACK_RX_FRAMES,
+        &PERF_LOOPBACK_RX_BYTES,
+        &PERF_LOOPBACK_MAX_QUEUE,
+        &PERF_VIRTIO_TX_FRAMES,
+        &PERF_VIRTIO_TX_BYTES,
+        &PERF_VIRTIO_RX_FRAMES,
+        &PERF_VIRTIO_RX_BYTES,
+        &PERF_UDP_DIRECT_PKTS,
+        &PERF_UDP_DIRECT_BYTES,
+        &PERF_UDP_DIRECT_DROPS,
+        &PERF_UDP_USER_SEND_CALLS,
+        &PERF_UDP_USER_SEND_BYTES,
+        &PERF_UDP_USER_RECV_CALLS,
+        &PERF_UDP_USER_RECV_BYTES,
+        &PERF_TCP_USER_SEND_CALLS,
+        &PERF_TCP_USER_SEND_BYTES,
+        &PERF_TCP_USER_RECV_CALLS,
+        &PERF_TCP_USER_RECV_BYTES,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "net_perf_counters")]
+pub(crate) fn render_perf_counters() -> String {
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "net:");
+    let _ = writeln!(&mut out, "  poll_calls {}", perf_load(&PERF_POLL_CALLS));
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_work_calls {}",
+        perf_load(&PERF_POLL_SOCKET_WORK_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_work_deep {}",
+        perf_load(&PERF_POLL_SOCKET_WORK_DEEP)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_work_light {}",
+        perf_load(&PERF_POLL_SOCKET_WORK_LIGHT)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_work_catchup {}",
+        perf_load(&PERF_POLL_SOCKET_WORK_CATCHUP)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_recv_work {}",
+        perf_load(&PERF_POLL_SOCKET_RECV_WORK)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_work_active_sum {}",
+        perf_load(&PERF_POLL_SOCKET_WORK_ACTIVE_SUM)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  poll_socket_work_active_max {}",
+        perf_load(&PERF_POLL_SOCKET_WORK_ACTIVE_MAX)
+    );
+    let _ = writeln!(&mut out, "  poll_once_calls {}", perf_load(&PERF_POLL_ONCE_CALLS));
+    let _ = writeln!(
+        &mut out,
+        "  poll_budget_exhausted {}",
+        perf_load(&PERF_POLL_BUDGET_EXHAUSTED)
+    );
+    let _ = writeln!(&mut out, "loopback:");
+    let _ = writeln!(&mut out, "  tx_frames {}", perf_load(&PERF_LOOPBACK_TX_FRAMES));
+    let _ = writeln!(&mut out, "  tx_bytes {}", perf_load(&PERF_LOOPBACK_TX_BYTES));
+    let _ = writeln!(&mut out, "  rx_frames {}", perf_load(&PERF_LOOPBACK_RX_FRAMES));
+    let _ = writeln!(&mut out, "  rx_bytes {}", perf_load(&PERF_LOOPBACK_RX_BYTES));
+    let _ = writeln!(&mut out, "  max_queue_len {}", perf_load(&PERF_LOOPBACK_MAX_QUEUE));
+    let _ = writeln!(&mut out, "virtio:");
+    let _ = writeln!(&mut out, "  tx_frames {}", perf_load(&PERF_VIRTIO_TX_FRAMES));
+    let _ = writeln!(&mut out, "  tx_bytes {}", perf_load(&PERF_VIRTIO_TX_BYTES));
+    let _ = writeln!(&mut out, "  rx_frames {}", perf_load(&PERF_VIRTIO_RX_FRAMES));
+    let _ = writeln!(&mut out, "  rx_bytes {}", perf_load(&PERF_VIRTIO_RX_BYTES));
+    let _ = writeln!(&mut out, "udp:");
+    let _ = writeln!(&mut out, "  direct_packets {}", perf_load(&PERF_UDP_DIRECT_PKTS));
+    let _ = writeln!(&mut out, "  direct_bytes {}", perf_load(&PERF_UDP_DIRECT_BYTES));
+    let _ = writeln!(&mut out, "  direct_drops {}", perf_load(&PERF_UDP_DIRECT_DROPS));
+    let _ = writeln!(&mut out, "  user_send_calls {}", perf_load(&PERF_UDP_USER_SEND_CALLS));
+    let _ = writeln!(&mut out, "  user_send_bytes {}", perf_load(&PERF_UDP_USER_SEND_BYTES));
+    let _ = writeln!(&mut out, "  user_recv_calls {}", perf_load(&PERF_UDP_USER_RECV_CALLS));
+    let _ = writeln!(&mut out, "  user_recv_bytes {}", perf_load(&PERF_UDP_USER_RECV_BYTES));
+    let _ = writeln!(&mut out, "tcp:");
+    let _ = writeln!(&mut out, "  user_send_calls {}", perf_load(&PERF_TCP_USER_SEND_CALLS));
+    let _ = writeln!(&mut out, "  user_send_bytes {}", perf_load(&PERF_TCP_USER_SEND_BYTES));
+    let _ = writeln!(&mut out, "  user_recv_calls {}", perf_load(&PERF_TCP_USER_RECV_CALLS));
+    let _ = writeln!(&mut out, "  user_recv_bytes {}", perf_load(&PERF_TCP_USER_RECV_BYTES));
+    render_tcp_state_snapshot(&mut out);
+    out
+}
+
+#[cfg(feature = "net_perf_counters")]
+fn render_tcp_state_snapshot(out: &mut String) {
+    let mut guard = NET_STACK.lock();
+    let Some(stack) = guard.as_mut() else {
+        let _ = writeln!(out, "tcp_state_current:");
+        let _ = writeln!(out, "  unavailable 1");
+        return;
+    };
+
+    let mut total = 0usize;
+    let mut closed = 0usize;
+    let mut listen = 0usize;
+    let mut syn_sent = 0usize;
+    let mut syn_received = 0usize;
+    let mut established = 0usize;
+    let mut fin_wait1 = 0usize;
+    let mut fin_wait2 = 0usize;
+    let mut close_wait = 0usize;
+    let mut closing = 0usize;
+    let mut last_ack = 0usize;
+    let mut time_wait = 0usize;
+    let mut listener_owned = 0usize;
+    let mut orphaned = 0usize;
+
+    for st in stack.tcp_states.iter() {
+        total += 1;
+        if st.is_listener_owned() {
+            listener_owned += 1;
+        }
+        if st.orphaned.load(Ordering::Relaxed) {
+            orphaned += 1;
+        }
+        let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        match socket.state() {
+            tcp_socket::State::Closed => closed += 1,
+            tcp_socket::State::Listen => listen += 1,
+            tcp_socket::State::SynSent => syn_sent += 1,
+            tcp_socket::State::SynReceived => syn_received += 1,
+            tcp_socket::State::Established => established += 1,
+            tcp_socket::State::FinWait1 => fin_wait1 += 1,
+            tcp_socket::State::FinWait2 => fin_wait2 += 1,
+            tcp_socket::State::CloseWait => close_wait += 1,
+            tcp_socket::State::Closing => closing += 1,
+            tcp_socket::State::LastAck => last_ack += 1,
+            tcp_socket::State::TimeWait => time_wait += 1,
+        }
+    }
+
+    let _ = writeln!(out, "tcp_state_current:");
+    let _ = writeln!(out, "  total {}", total);
+    let _ = writeln!(out, "  closed {}", closed);
+    let _ = writeln!(out, "  listen {}", listen);
+    let _ = writeln!(out, "  syn_sent {}", syn_sent);
+    let _ = writeln!(out, "  syn_received {}", syn_received);
+    let _ = writeln!(out, "  established {}", established);
+    let _ = writeln!(out, "  fin_wait1 {}", fin_wait1);
+    let _ = writeln!(out, "  fin_wait2 {}", fin_wait2);
+    let _ = writeln!(out, "  close_wait {}", close_wait);
+    let _ = writeln!(out, "  closing {}", closing);
+    let _ = writeln!(out, "  last_ack {}", last_ack);
+    let _ = writeln!(out, "  time_wait {}", time_wait);
+    let _ = writeln!(out, "  listener_owned {}", listener_owned);
+    let _ = writeln!(out, "  orphaned {}", orphaned);
+}
 
 /// Userspace-visible IPv4 socket address layout.
 ///
@@ -138,6 +462,8 @@ pub fn notify_irq() {
 /// Call this from a safe context (e.g. timer interrupt path or scheduler tick).
 pub fn poll() {
     // print!("p");
+    #[cfg(feature = "net_perf_counters")]
+    perf_inc(&PERF_POLL_CALLS);
     let now_us = get_time_us() as u64;
     let need_immediate = NEED_POLL.swap(false, Ordering::AcqRel);
     let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
@@ -177,23 +503,36 @@ impl NetStack {
         cfg.random_seed = 0x5A5A_1234;
         let mut iface = Interface::new(cfg, &mut device, now);
 
-        // Configure both external and loopback addresses on the same interface
+        // Configure both external and loopback addresses on the same interface.
+        // Rebuild the list explicitly so IPv6 localhost cannot be dropped silently.
         iface.update_ip_addrs(|addrs| {
-            // External network (QEMU user networking)
-            let external = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)), 24);
-            if addrs.iter().all(|a| *a != external) {
-                let _ = addrs.push(external);
-            }
+            addrs.clear();
 
-            // Loopback address
-            let loopback = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), 8);
-            if addrs.iter().all(|a| *a != loopback) {
-                let _ = addrs.push(loopback);
-            }
+            // External network (QEMU user networking)
+            addrs
+                .push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)),
+                    24,
+                ))
+                .expect("failed to configure external IPv4 address");
+
+            // IPv4 loopback
+            addrs
+                .push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+                    8,
+                ))
+                .expect("failed to configure IPv4 loopback address");
+
+            // IPv6 loopback
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128))
+                .expect("failed to configure IPv6 loopback address");
         });
         let _ = iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+        info!("[kernel] net: iface addresses = {:?}", iface.ip_addrs());
 
         let storage_vec: Vec<smoltcp::iface::SocketStorage<'static>> =
             (0..MAX_SOCKETS).map(|_| smoltcp::iface::SocketStorage::EMPTY).collect();
@@ -233,7 +572,66 @@ impl NetStack {
     }
 
     fn poll(&mut self) {
-        for _ in 0..MAX_IMMEDIATE_POLLS {
+        self.poll_with_budget(MAX_IMMEDIATE_POLLS);
+    }
+
+    pub(crate) fn poll_socket_work_for(&mut self, handle: smoltcp::iface::SocketHandle) {
+        #[cfg(feature = "net_perf_counters")]
+        perf_inc(&PERF_POLL_SOCKET_WORK_CALLS);
+        let active = self.active_tcp_socket_count();
+        #[cfg(feature = "net_perf_counters")]
+        perf_add(&PERF_POLL_SOCKET_WORK_ACTIVE_SUM, active);
+        #[cfg(feature = "net_perf_counters")]
+        perf_update_max(&PERF_POLL_SOCKET_WORK_ACTIVE_MAX, active);
+        if active <= 2 {
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_POLL_SOCKET_WORK_DEEP);
+            self.poll_with_budget(MAX_IMMEDIATE_POLLS);
+            return;
+        } else {
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_POLL_SOCKET_WORK_LIGHT);
+            let queued_before = self
+                .sockets
+                .get_mut::<tcp_socket::Socket>(handle)
+                .send_queue();
+            self.poll_with_budget(MAX_SOCKET_IMMEDIATE_POLLS);
+            let socket = self.sockets.get_mut::<tcp_socket::Socket>(handle);
+            let queued_after = socket.send_queue();
+            if queued_after > 0
+                && (queued_after >= queued_before.saturating_sub(queued_before / 4)
+                    || queued_after >= TCP_TX_BUF / 8
+                    || !socket.can_send())
+            {
+                #[cfg(feature = "net_perf_counters")]
+                perf_inc(&PERF_POLL_SOCKET_WORK_CATCHUP);
+                self.poll_with_budget(MAX_SOCKET_CATCHUP_POLLS);
+            }
+        }
+    }
+
+    pub(crate) fn poll_socket_recv_work(&mut self) {
+        #[cfg(feature = "net_perf_counters")]
+        perf_inc(&PERF_POLL_SOCKET_RECV_WORK);
+        self.poll_with_budget(MAX_SOCKET_IMMEDIATE_POLLS);
+    }
+
+    fn active_tcp_socket_count(&mut self) -> usize {
+        let mut count = 0usize;
+        for st in self.tcp_states.iter() {
+            if st.is_listener_owned() {
+                continue;
+            }
+            let socket = self.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+            if matches!(socket.state(), tcp_socket::State::Established) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn poll_with_budget(&mut self, budget: usize) {
+        for _ in 0..budget {
             self.poll_once();
 
             // Loopback packets and newly queued socket work often need another
@@ -246,14 +644,28 @@ impl NetStack {
         }
 
         if !self.device.loopback.queue.is_empty() {
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_POLL_BUDGET_EXHAUSTED);
             NEED_POLL.store(true, Ordering::Release);
         }
     }
 
     fn poll_once(&mut self) {
+        #[cfg(feature = "net_perf_counters")]
+        perf_inc(&PERF_POLL_ONCE_CALLS);
         let ts = now();
+        if !self.device.loopback.queue.is_empty() {
+            debug!(
+                "NetStack::poll_once entering with loopback queue len={}",
+                self.device.loopback.queue.len()
+            );
+        }
         let poll_result = self.iface.poll(ts, &mut self.device, &mut self.sockets);
-        trace!("NetStack::poll result={:?}, loopback queue len after={}", poll_result, self.device.loopback.queue.len());
+        debug!(
+            "NetStack::poll result={:?}, loopback queue len after={}",
+            poll_result,
+            self.device.loopback.queue.len()
+        );
 
         for st in self.udp_states.iter() {
             let mut ready = 0u16;
@@ -300,6 +712,18 @@ impl NetStack {
             {
                 let socket = self.sockets.get_mut::<tcp_socket::Socket>(st.handle);
                 let state = socket.state();
+                if let Some(prev) = st.observe_state_change(state) {
+                    debug!(
+                        "tcp socket {:?} state {} -> {} listener_owned={} open={} local={:?} remote={:?}",
+                        st.handle,
+                        tcp::tcp_state_name_repr(prev),
+                        tcp::tcp_state_name(state),
+                        st.is_listener_owned(),
+                        socket.is_open(),
+                        socket.local_endpoint(),
+                        socket.remote_endpoint()
+                    );
+                }
                 if st.is_listener_owned() {
                     listener_owned = true;
                     listener_source_id = tcp::queue_listener_connection_if_ready(st, state);
@@ -376,8 +800,8 @@ impl NetStack {
     ) -> (smoltcp::iface::SocketHandle, Arc<UdpSocketState>) {
         let rx_meta = vec![udp_socket::PacketMetadata::EMPTY; UDP_RX_META];
         let tx_meta = vec![udp_socket::PacketMetadata::EMPTY; UDP_TX_META];
-        let rx_buf = vec![0u8; UDP_BUF];
-        let tx_buf = vec![0u8; UDP_BUF];
+        let rx_buf = vec![0u8; UDP_RX_BUF];
+        let tx_buf = vec![0u8; UDP_TX_BUF];
         let udp = udp_socket::Socket::new(
             udp_socket::PacketBuffer::new(rx_meta, rx_buf),
             udp_socket::PacketBuffer::new(tx_meta, tx_buf),
@@ -394,12 +818,87 @@ impl NetStack {
         self.udp_states.retain(|s| s.handle != handle);
     }
 
+    pub(crate) fn deliver_udp_loopback(
+        &mut self,
+        source_handle: smoltcp::iface::SocketHandle,
+        dst: IpEndpoint,
+        payload: &[u8],
+    ) -> bool {
+        if !is_loopback_ip(dst.addr) {
+            return false;
+        }
+
+        let source = self.sockets.get_mut::<udp_socket::Socket>(source_handle);
+        let source_endpoint = source.endpoint();
+        let source_addr = source_endpoint
+            .addr
+            .unwrap_or_else(|| loopback_addr_for(dst.addr));
+        let remote = IpEndpoint::new(source_addr, source_endpoint.port);
+        let metadata = udp_socket::UdpMetadata {
+            endpoint: remote,
+            local_address: Some(dst.addr),
+            meta: PacketMeta::default(),
+        };
+
+        let mut best: Option<(u8, Arc<UdpSocketState>)> = None;
+        for st in self.udp_states.iter() {
+            let socket = self.sockets.get_mut::<udp_socket::Socket>(st.handle);
+            let endpoint = socket.endpoint();
+            if endpoint.port != dst.port {
+                continue;
+            }
+
+            let addr_matches = match endpoint.addr {
+                Some(addr) => addr == dst.addr,
+                None => true,
+            };
+            if !addr_matches {
+                continue;
+            }
+
+            let priority = match socket.remote_endpoint() {
+                Some(peer) if peer == remote => 3,
+                Some(_) => continue,
+                None if endpoint.addr.is_some() => 2,
+                None => 1,
+            };
+
+            if best
+                .as_ref()
+                .map(|(best_priority, _)| priority > *best_priority)
+                .unwrap_or(true)
+            {
+                best = Some((priority, Arc::clone(st)));
+            }
+        }
+
+        let Some((_, target)) = best else {
+            return false;
+        };
+
+        let socket = self.sockets.get_mut::<udp_socket::Socket>(target.handle);
+        if socket.inject_recv_slice(payload, metadata).is_ok() {
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_UDP_DIRECT_PKTS);
+            #[cfg(feature = "net_perf_counters")]
+            perf_add(&PERF_UDP_DIRECT_BYTES, payload.len());
+            target.read_wait.wake_one();
+            notify_poll_source(target.source_id(), POLLIN);
+        } else {
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_UDP_DIRECT_DROPS);
+        }
+        true
+    }
+
     pub(crate) fn create_tcp_socket(
         &mut self,
     ) -> (smoltcp::iface::SocketHandle, Arc<TcpSocketState>) {
         let rx = tcp_socket::SocketBuffer::new(vec![0u8; TCP_RX_BUF]);
         let tx = tcp_socket::SocketBuffer::new(vec![0u8; TCP_TX_BUF]);
-        let tcp = tcp_socket::Socket::new(rx, tx);
+        let mut tcp = tcp_socket::Socket::new(rx, tx);
+        tcp.set_ack_delay(None);
+        tcp.set_nagle_enabled(false);
         let handle = self.sockets.add(tcp);
         let st = Arc::new(TcpSocketState::new(handle));
         self.tcp_states.push(Arc::clone(&st));
@@ -420,6 +919,31 @@ impl NetStack {
 #[inline]
 fn now() -> Instant {
     Instant::from_micros(get_time_us() as i64)
+}
+
+#[inline]
+fn is_loopback_ip(addr: IpAddress) -> bool {
+    match addr {
+        IpAddress::Ipv4(addr) => addr.is_loopback(),
+        IpAddress::Ipv6(addr) => addr.is_loopback(),
+    }
+}
+
+#[inline]
+fn loopback_addr_for(addr: IpAddress) -> IpAddress {
+    match addr {
+        IpAddress::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+        IpAddress::Ipv6(_) => IpAddress::Ipv6(Ipv6Address::LOCALHOST),
+    }
+}
+
+fn read_ipv6_addr(bytes: &[u8]) -> Option<Ipv6Address> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&bytes[..16]);
+    Some(Ipv6Address::from(octets))
 }
 
 /// Multi-device that routes packets between VirtIO (external) and Loopback (local).
@@ -498,8 +1022,20 @@ impl RxToken for MultiRxToken {
         F: FnOnce(&[u8]) -> R,
     {
         match self {
-            MultiRxToken::Virtio(token) => token.consume(f),
-            MultiRxToken::Loopback(token) => token.consume(f),
+            MultiRxToken::Virtio(token) => token.consume(|frame| {
+                #[cfg(feature = "net_perf_counters")]
+                perf_inc(&PERF_VIRTIO_RX_FRAMES);
+                #[cfg(feature = "net_perf_counters")]
+                perf_add(&PERF_VIRTIO_RX_BYTES, frame.len());
+                f(frame)
+            }),
+            MultiRxToken::Loopback(token) => token.consume(|frame| {
+                #[cfg(feature = "net_perf_counters")]
+                perf_inc(&PERF_LOOPBACK_RX_FRAMES);
+                #[cfg(feature = "net_perf_counters")]
+                perf_add(&PERF_LOOPBACK_RX_BYTES, frame.len());
+                f(frame)
+            }),
         }
     }
 }
@@ -544,23 +1080,46 @@ impl<'a> TxToken for MultiTxToken<'a> {
                         false
                     }
                 }
+                0x86DD => {
+                    if buf.len() >= 54 {
+                        let dst = &buf[38..54];
+                        dst == Ipv6Address::LOCALHOST.octets()
+                            || dst == IPV6_LOOPBACK_SOLICITED_NODE
+                    } else {
+                        false
+                    }
+                }
                 _ => false,
             }
         } else {
             false
         };
 
-        trace!("Consume token of len {}, loopback: {}, buf[12] = {:x}, buf[13] = {:x}, buf[30] = {:x}", len, is_loopback, buf[12], buf[13], buf[30]);
 
         if is_loopback {
             // Directly push to loopback queue (our custom Loopback has a public queue field)
-            trace!("Pushing to loopback queue, current len={}", self.loopback.queue.len());
+            debug!(
+                "net tx routed to loopback queue: before_len={} frame_len={}",
+                self.loopback.queue.len(),
+                len
+            );
             self.loopback.queue.push_back(buf);
-            trace!("Loopback queue len after push={}", self.loopback.queue.len());
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_LOOPBACK_TX_FRAMES);
+            #[cfg(feature = "net_perf_counters")]
+            perf_add(&PERF_LOOPBACK_TX_BYTES, len);
+            #[cfg(feature = "net_perf_counters")]
+            perf_update_max(&PERF_LOOPBACK_MAX_QUEUE, self.loopback.queue.len());
+            debug!("net tx routed to loopback queue: after_len={}", self.loopback.queue.len());
         } else {
             // Send to VirtIO using the standard path
             match self.virtio.dev.try_send(&buf) {
-                Ok(true) => {}
+                Ok(true) => {
+                    #[cfg(feature = "net_perf_counters")]
+                    perf_inc(&PERF_VIRTIO_TX_FRAMES);
+                    #[cfg(feature = "net_perf_counters")]
+                    perf_add(&PERF_VIRTIO_TX_BYTES, len);
+                }
                 Ok(false) => {
                     trace!("net: tx queue busy, drop one frame");
                 }
@@ -657,7 +1216,12 @@ impl TxToken for VirtioTxToken {
         let ret = f(&mut buf);
 
         match self.dev.try_send(&buf) {
-            Ok(true) => {}
+            Ok(true) => {
+                #[cfg(feature = "net_perf_counters")]
+                perf_inc(&PERF_VIRTIO_TX_FRAMES);
+                #[cfg(feature = "net_perf_counters")]
+                perf_add(&PERF_VIRTIO_TX_BYTES, len);
+            }
             Ok(false) => {
                 trace!("net: tx queue busy, drop one frame");
             }
