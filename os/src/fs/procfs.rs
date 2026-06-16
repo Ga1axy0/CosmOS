@@ -25,6 +25,8 @@ use crate::fs::page_cache;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
 use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
+#[cfg(feature = "net_perf_counters")]
+use crate::net;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
 use crate::task::{current_process, TaskStatus};
@@ -629,6 +631,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("mounts"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
         entries.push((String::from("io_perf"), VfsFileType::Regular));
+        #[cfg(feature = "net_perf_counters")]
+        entries.push((String::from("net_perf"), VfsFileType::Regular));
         entries.push((String::from("key-users"), VfsFileType::Regular));
         entries.push((String::from("sys"), VfsFileType::Directory));
         for pid in list_pids() {
@@ -644,6 +648,8 @@ impl VfsNode for ProcRootNode {
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
             "io_perf" => Some(Arc::new(ProcIoPerfNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "net_perf_counters")]
+            "net_perf" => Some(Arc::new(ProcNetPerfNode::new()) as Arc<dyn VfsNode>),
             "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
             "sys" => Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>),
             _ => {
@@ -1243,6 +1249,77 @@ impl VfsNode for ProcIoPerfNode {
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
         reset_io_perf();
+        buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/net_perf` node.
+#[derive(Default, Debug)]
+#[cfg(feature = "net_perf_counters")]
+pub struct ProcNetPerfNode;
+
+#[cfg(feature = "net_perf_counters")]
+impl ProcNetPerfNode {
+    /// Create a new `/proc/net_perf` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "net_perf_counters")]
+impl VfsNode for ProcNetPerfNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        net::render_perf_counters().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        net::reset_perf_counters();
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        net::reset_perf_counters();
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(net::render_perf_counters(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        net::reset_perf_counters();
         buf.len()
     }
 

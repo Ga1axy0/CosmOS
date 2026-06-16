@@ -442,6 +442,23 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
+    /// Enqueue a received packet directly into the receive buffer.
+    ///
+    /// This is useful for host-side loopback paths that have already performed
+    /// address and port selection and do not need to synthesize a full IP/UDP
+    /// frame just to feed it back into the socket layer.
+    pub fn inject_recv_slice(
+        &mut self,
+        data: &[u8],
+        meta: impl Into<UdpMetadata>,
+    ) -> Result<(), SendError> {
+        self.rx_buffer
+            .enqueue(data.len(), meta.into())
+            .map_err(|_| SendError::BufferFull)?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
     /// Dequeue a packet received from a remote endpoint, and return the endpoint as well
     /// as a pointer to the payload.
     ///

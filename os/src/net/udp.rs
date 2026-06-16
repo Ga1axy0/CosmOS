@@ -105,11 +105,11 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn recv_buffer_size(&self) -> usize {
-        super::UDP_BUF
+        super::UDP_RX_BUF
     }
 
     pub(crate) fn send_buffer_size(&self) -> usize {
-        super::UDP_BUF
+        super::UDP_TX_BUF
     }
 
     pub(crate) fn set_recv_timeout_ns(&self, timeout_ns: u64) {
@@ -258,9 +258,17 @@ impl UdpSocketFile {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
             self.ensure_bound_for_send_locked(stack, ep)?;
-            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
+            if ep.port != 0 && stack.deliver_udp_loopback(self.st.handle, ep, data) {
+                if let Some(handle) = timeout_handle.take() {
+                    socket_wait_mark_ready(handle);
+                    cleanup_socket_wait(handle);
+                }
+                crate::net::perf_udp_user_send(data.len());
+                return Ok(data.len());
+            }
 
             // Check if socket can send
+            let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
             let can_send = socket.can_send();
 
             if can_send {
@@ -278,6 +286,7 @@ impl UdpSocketFile {
                             socket_wait_mark_ready(handle);
                             cleanup_socket_wait(handle);
                         }
+                        crate::net::perf_udp_user_send(data.len());
                         return Ok(data.len());
                     }
                     Err(e) => {
@@ -399,6 +408,7 @@ impl UdpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_udp_user_recv(off);
                     return Ok((off, meta.endpoint));
                 }
             }
@@ -526,6 +536,7 @@ impl File for UdpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_udp_user_recv(n);
                     return Ok(n);
                 }
             }

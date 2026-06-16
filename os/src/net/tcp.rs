@@ -531,7 +531,7 @@ impl TcpSocketFile {
     }
 
     fn refill_listener_slots(&self, listener: &Arc<TcpListenerShared>) -> Result<(), ERRNO> {
-        let target = listener.backlog();
+        let target = listener.backlog().min(super::MAX_PASSIVE_LISTEN_SOCKETS);
         let mut guard = NET_STACK.lock();
         let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
 
@@ -872,6 +872,9 @@ impl TcpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_tcp_user_recv(total);
+                    stack.poll_socket_recv_work();
+                    NEED_POLL.store(true, Ordering::Release);
                     return Ok(total);
                 }
                 if !socket.may_recv() {
@@ -989,7 +992,8 @@ impl TcpSocketFile {
                         }
                     }
                     if total > 0 {
-                        stack.poll();
+                        crate::net::perf_tcp_user_send(total);
+                        stack.poll_socket_work_for(st.handle);
                         NEED_POLL.store(true, Ordering::Release);
                         if let Some(handle) = timeout_handle.take() {
                             socket_wait_mark_ready(handle);
@@ -1150,6 +1154,9 @@ impl File for TcpSocketFile {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
                     }
+                    crate::net::perf_tcp_user_recv(n);
+                    stack.poll_socket_recv_work();
+                    NEED_POLL.store(true, Ordering::Release);
                     return Ok(n);
                 }
                 if !socket.may_recv() {
@@ -1256,7 +1263,8 @@ impl File for TcpSocketFile {
                         }
                         return Err(ERRNO::EIO);
                     }
-                    stack.poll();
+                    crate::net::perf_tcp_user_send(n);
+                    stack.poll_socket_work_for(st.handle);
                     NEED_POLL.store(true, Ordering::Release);
                     if let Some(handle) = timeout_handle.take() {
                         socket_wait_mark_ready(handle);
