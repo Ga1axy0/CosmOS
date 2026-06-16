@@ -1,12 +1,12 @@
-use crate::signal::{SigInfo, SignalWaitHandle, SignalWakeState, register_signal_wait};
+use crate::hal::ArchSignalAbi;
+use crate::signal::{register_signal_wait, SigInfo, SignalAbi, SignalWaitHandle, SignalWakeState};
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
-use crate::task::UContext;
 use crate::{
     mm::{PageFaultAccess, VirtAddr, translated_ref},
     syscall_body,
     task::{
         block_current_and_run_next, current_process, current_task, current_user_token,
-        SignalAction, SignalBit, TaskStatus, WaitReason,
+        SignalBit, TaskStatus, WaitReason,
     },
 };
 use crate::timer::{add_timer_with_signal_tag, get_time_ns};
@@ -151,44 +151,7 @@ fn signal_wait_sleep(handle: SignalWaitHandle, signal_set: SignalBit) {
     block_current_and_run_next(WaitReason::SignalTimedWait);
 }
 
-/// RISC-V Linux `rt_sigaction` 用户态 ABI 布局。
-///
-/// RISC-V 不使用 `SA_RESTORER` 字段，第三个 word 是 `sigset_t` 的低 64 位。
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct UserSigAction {
-    /// handler 地址，或 SIG_DFL/SIG_IGN。
-    pub handler: usize,
-    /// Linux `SA_*` 标志位。
-    pub sa_flags: usize,
-    /// 用户态信号掩码，当前内核按低 64 位读取并裁剪未支持的信号位。
-    pub sa_mask: u64,
-}
-
-impl Pod for UserSigAction {}
-
-impl From<UserSigAction> for SignalAction {
-    fn from(action: UserSigAction) -> Self {
-        Self {
-            handler: action.handler,
-            sa_flags: action.sa_flags as u32,
-            sa_restorer: 0,
-            sa_mask: SignalBit::from_user_bits(action.sa_mask).bits(),
-        }
-    }
-}
-
-impl From<SignalAction> for UserSigAction {
-    fn from(action: SignalAction) -> Self {
-        Self {
-            handler: action.handler,
-            sa_flags: action.sa_flags as usize,
-            sa_mask: SignalBit::from_bits(action.sa_mask)
-                .unwrap_or(SignalBit::empty())
-                .user_bits(),
-        }
-    }
-}
+pub type UserSigAction = <ArchSignalAbi as SignalAbi>::UserSigAction;
 
 fn is_valid_signal_handler_address(handler: usize) -> bool {
     if handler == crate::task::SIG_DFL || handler == crate::task::SIG_IGN {
@@ -267,7 +230,7 @@ pub fn sys_sigaction(
                     ),
                 }
             }
-            let new_action = SignalAction::from(user_action);
+            let new_action = ArchSignalAbi::decode_user_sigaction(user_action);
             debug!(
                 "sys_sigaction parsed action: handler={:#x}, flags={:#x}, mask={:#x}",
                 new_action.handler,
@@ -299,7 +262,7 @@ pub fn sys_sigaction(
 
         // Return old action after dropping process.inner; copyout may prefault user pages.
         if !old_action.is_null() {
-            let user_old = UserSigAction::from(old);
+            let user_old = ArchSignalAbi::encode_user_sigaction(old);
             write_pod_to_user(old_action, &user_old)?;
             debug!(
                 "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
@@ -379,7 +342,10 @@ pub fn sys_sigreturn() -> isize {
         // Read ucontext from user stack at sp. The frame can cross a page boundary,
         // so this must use the byte-wise copy helper instead of translated_ref.
         let ucontext_ptr = user_sp;
-        let ucontext = read_pod_from_user(ucontext_ptr as *const UContext).map_err(|err| {
+        let ucontext = read_pod_from_user(
+            ucontext_ptr as *const <ArchSignalAbi as SignalAbi>::UContext,
+        )
+        .map_err(|err| {
             error!(
                 "sys_sigreturn: failed to read ucontext at {:#x}: {:?}",
                 ucontext_ptr, err
@@ -390,22 +356,21 @@ pub fn sys_sigreturn() -> isize {
         debug!(
             "sys_sigreturn: restoring context from {:#x}, sigmask={:#x}",
             ucontext_ptr,
-            ucontext.uc_sigmask.low_bits()
+            ArchSignalAbi::signal_mask(&ucontext)
         );
 
         // Restore signal mask
         {
             let task = current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            let mask = SignalBit::from_user_bits(ucontext.uc_sigmask.low_bits());
+            let mask = SignalBit::from_user_bits(ArchSignalAbi::signal_mask(&ucontext));
             inner.signal_mask = mask;
             inner.signal_mask_backup = None;
             debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
         }
 
         // Restore registers from mcontext
-        let mcontext = &ucontext.uc_mcontext;
-        mcontext.apply_to_trap_context(trap_cx);
+        ArchSignalAbi::restore_ucontext(&ucontext, trap_cx);
 
         debug!(
             "sys_sigreturn: restored sepc={:#x}, a0={:#x}",

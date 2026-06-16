@@ -2,7 +2,7 @@
 
 use crate::{
     config::USER_VDSO_RT_SIGRETURN,
-    hal::{ArchTrapContextAbi, ArchTrapMachine, traits::{TrapContextAbi, TrapMachine}},
+    hal::{ArchSignalAbi, ArchTrapContextAbi, ArchTrapMachine, traits::{TrapContextAbi, TrapMachine}},
     syscall::write_pod_to_user,
     task::{current_task, current_trap_cx},
 };
@@ -11,7 +11,7 @@ mod action;
 mod signals;
 mod wait;
 
-pub use action::{FpState, MContext, SigInfo, SigSetT, StackT, UContext, SignalAction, SignalActions};
+pub use action::{SigInfo, SigSetT, SignalAbi, SignalAction, SignalActions, StackT};
 pub use signals::{SignalBit, SignalNum, FIRST_RT_SIG, LAST_RT_SIG, MAX_SIG};
 pub(crate) use wait::{
     cleanup_signal_wait, cleanup_signal_wait_for_task, handle_signal_wait_timeout,
@@ -211,7 +211,7 @@ pub fn handle_signals() -> Option<i32> {
     }
 
     // Allocate space for ucontext_t
-    user_sp -= core::mem::size_of::<UContext>();
+    user_sp -= core::mem::size_of::<<ArchSignalAbi as SignalAbi>::UContext>();
 
     // Align stack to 16 bytes BEFORE setting pointers
     user_sp &= !0xf;
@@ -219,7 +219,7 @@ pub fn handle_signals() -> Option<i32> {
     // Now set the pointers based on aligned sp
     let ucontext_ptr = user_sp;
     let siginfo_ptr = if action.sa_flags & SaFlags::SA_SIGINFO.bits() != 0 {
-        user_sp + core::mem::size_of::<UContext>()
+        user_sp + core::mem::size_of::<<ArchSignalAbi as SignalAbi>::UContext>()
     } else {
         0
     };
@@ -236,7 +236,7 @@ pub fn handle_signals() -> Option<i32> {
             .bits()
     };
 
-    let mut mcontext = MContext::from_trap_context(trap_cx);
+    let mut ucontext = ArchSignalAbi::build_ucontext(trap_cx, old_mask);
 
     // Syscall restart: if the signal interrupted a syscall that returned -EINTR
     // and SA_RESTART is set, back up PC to the ecall instruction and restore
@@ -248,17 +248,20 @@ pub fn handle_signals() -> Option<i32> {
                 let a0_idx = <ArchTrapContextAbi as TrapContextAbi>::signal_gpr_arg0_index();
                 debug!(
                     "handle_signals: syscall restart: backing up PC from {:#x} to {:#x}, restoring a0 (gregs[{}]) from {:#x} to {:#x}",
-                    mcontext.gregs[0],
+                    ArchSignalAbi::saved_pc(&ucontext),
                     trap_cx
                         .user_pc()
                         .wrapping_sub(ArchTrapMachine::syscall_instruction_len()),
                     a0_idx,
-                    mcontext.gregs[a0_idx], trap_cx.orig_a0
+                    ArchSignalAbi::saved_arg0(&ucontext), trap_cx.orig_a0
                 );
-                mcontext.gregs[0] = trap_cx
-                    .user_pc()
-                    .wrapping_sub(ArchTrapMachine::syscall_instruction_len());
-                mcontext.gregs[a0_idx] = trap_cx.orig_a0;
+                ArchSignalAbi::set_saved_pc(
+                    &mut ucontext,
+                    trap_cx
+                        .user_pc()
+                        .wrapping_sub(ArchTrapMachine::syscall_instruction_len()),
+                );
+                ArchSignalAbi::set_saved_arg0(&mut ucontext, trap_cx.orig_a0);
             } else if action.sa_flags & SaFlags::SA_RESTART.bits() != 0 {
                 debug!(
                     "handle_signals: syscall returned EINTR but syscall is not restartable, preserving EINTR"
@@ -273,24 +276,12 @@ pub fn handle_signals() -> Option<i32> {
     } else {
         debug!(
             "handle_signals: in_syscall=false, saved PC={:#x}",
-            mcontext.gregs[0]
+            ArchSignalAbi::saved_pc(&ucontext)
         );
     }
 
-    let ucontext = UContext {
-        uc_flags: 0,
-        uc_link: 0,
-        uc_stack: StackT {
-            ss_sp: 0,
-            ss_flags: 0,
-            ss_size: 0,
-        },
-        uc_sigmask: SigSetT::from_signal_bits(old_mask),
-        uc_mcontext: mcontext,
-    };
-
     // Write ucontext to user stack
-    if let Err(err) = write_pod_to_user(ucontext_ptr as *mut UContext, &ucontext) {
+    if let Err(err) = write_pod_to_user(ucontext_ptr as *mut <ArchSignalAbi as SignalAbi>::UContext, &ucontext) {
         warn!(
             "[kernel] handle_signals: failed to write ucontext for signal {}: {:?}",
             signum, err

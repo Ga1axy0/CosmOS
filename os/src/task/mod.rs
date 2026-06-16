@@ -41,8 +41,8 @@ pub use crate::sched::{
     yield_current_and_run_next,
 };
 pub use crate::signal::{
-    check_signals_of_current, handle_signals, MContext, MAX_SIG, SaFlags, SigInfo, SignalAction,
-    SignalActions, SignalBit, StackT, UContext, SIG_DFL, SIG_IGN,
+    check_signals_of_current, handle_signals, MAX_SIG, SaFlags, SigInfo, SignalAction,
+    SignalActions, SignalBit, SIG_DFL, SIG_IGN,
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 pub use process::{ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment};

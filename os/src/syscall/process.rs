@@ -1,3 +1,4 @@
+use crate::hal::traits::CloneArgs;
 use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_pod_to_user, Pod};
@@ -813,14 +814,15 @@ bitflags! {
 /// Linux `clone` syscall。
 ///
 /// 当前支持 fork-like 进程创建，以及 musl pthread 使用的 CLONE_VM 线程创建子集。
-pub fn sys_clone(
-    flags: usize,
-    stack: usize,
-    parent_tid: usize,
-    tls: usize,
-    child_tid: usize,
-) -> isize {
+pub fn sys_clone(args: CloneArgs) -> isize {
     syscall_body!({
+        let CloneArgs {
+            flags,
+            stack,
+            parent_tid,
+            tls,
+            child_tid,
+        } = args;
         let clone_flags_arg = flags;
         trace!(
             "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
@@ -912,7 +914,6 @@ pub fn sys_clone(
         }
         let mut child_tls = None;
         if flags.contains(CloneFlags::CLONE_SETTLS) {
-            debug!("kernel: sys_clone set child TLS to {:#x}", tls);
             child_tls = Some(tls);
         }
         let current_process = current_process();

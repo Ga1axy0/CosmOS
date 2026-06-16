@@ -125,7 +125,7 @@ impl SigInfo {
     }
 }
 
-/// Linux `sigset_t` layout used inside `ucontext_t` on riscv64 glibc.
+/// Linux `sigset_t` layout used inside `ucontext_t` on 64-bit Linux ABIs.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SigSetT {
@@ -160,90 +160,6 @@ impl Default for SigSetT {
 
 impl Pod for SigSetT {}
 
-/// Floating-point state area embedded in riscv64 Linux `mcontext_t`.
-#[repr(C, align(16))]
-#[derive(Debug, Clone, Copy)]
-pub struct FpState {
-    /// 32 double-precision FP registers.
-    pub fpregs: [u64; 32],
-    /// Floating-point control/status register.
-    pub fcsr: u32,
-    /// Padding that preserves the glibc-visible size of the FP-state union.
-    pub reserved: [u32; 67],
-}
-
-impl Default for FpState {
-    fn default() -> Self {
-        Self {
-            fpregs: [0; 32],
-            fcsr: 0,
-            reserved: [0; 67],
-        }
-    }
-}
-
-impl Pod for FpState {}
-
-impl FpState {
-    /// Build an fp-state blob from the saved trap context.
-    pub fn from_trap_context(trap_cx: &TrapContext) -> Self {
-        let mut fpstate = Self::default();
-        trap_cx.copy_fp_state_to(&mut fpstate.fpregs, &mut fpstate.fcsr);
-        fpstate
-    }
-
-    /// Restore floating-point state into the saved trap context.
-    pub fn apply_to_trap_context(&self, trap_cx: &mut TrapContext) {
-        trap_cx.restore_fp_state(&self.fpregs, self.fcsr);
-    }
-}
-
-/// riscv64 Linux `mcontext_t`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct MContext {
-    /// General-purpose register file. Slot 0 stores the saved PC on riscv64.
-    pub gregs: [usize; 32],
-    /// Floating-point state blob.
-    pub fpstate: FpState,
-}
-
-impl Pod for MContext {}
-
-impl MContext {
-    /// Build a Linux-compatible machine context from the saved trap context.
-    pub fn from_trap_context(trap_cx: &TrapContext) -> Self {
-        Self {
-            gregs: trap_cx.export_signal_gprs(),
-            fpstate: FpState::from_trap_context(trap_cx),
-        }
-    }
-
-    /// Restore a Linux-compatible machine context into the saved trap context.
-    pub fn apply_to_trap_context(&self, trap_cx: &mut TrapContext) {
-        trap_cx.import_signal_gprs(&self.gregs);
-        self.fpstate.apply_to_trap_context(trap_cx);
-    }
-}
-
-/// ucontext_t structure
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct UContext {
-    /// Context flags
-    pub uc_flags: usize,
-    /// Link to next context
-    pub uc_link: usize,
-    /// Signal stack
-    pub uc_stack: StackT,
-    /// Signal mask
-    pub uc_sigmask: SigSetT,
-    /// Machine context (registers)
-    pub uc_mcontext: MContext,
-}
-
-impl Pod for UContext {}
-
 /// stack_t structure
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -257,3 +173,36 @@ pub struct StackT {
 }
 
 impl Pod for StackT {}
+
+/// Architecture-specific Linux signal ABI hooks.
+///
+/// Concrete `rt_sigaction` and `ucontext_t` layouts differ across Linux
+/// architectures. The common signal code owns delivery policy, while each
+/// architecture owns the byte layout written to and read from userspace.
+pub trait SignalAbi {
+    /// Raw userspace layout accepted by `rt_sigaction(2)`.
+    type UserSigAction: Copy + core::fmt::Debug + Pod;
+    /// Raw userspace `ucontext_t` layout used by signal frames.
+    type UContext: Copy + Pod;
+
+    /// Convert a raw userspace `rt_sigaction` payload into kernel state.
+    fn decode_user_sigaction(action: Self::UserSigAction) -> SignalAction;
+    /// Convert kernel signal action state back into userspace layout.
+    fn encode_user_sigaction(action: SignalAction) -> Self::UserSigAction;
+    /// Return debug-friendly raw `rt_sigaction` fields: handler, flags, restorer, mask.
+    fn user_sigaction_parts(action: &Self::UserSigAction) -> (usize, usize, usize, u64);
+    /// Build a userspace `ucontext_t` for the interrupted trap context.
+    fn build_ucontext(trap_cx: &TrapContext, old_mask: u64) -> Self::UContext;
+    /// Return the low signal-mask bits stored in a userspace context.
+    fn signal_mask(ucontext: &Self::UContext) -> u64;
+    /// Restore the saved machine context into the trap context.
+    fn restore_ucontext(ucontext: &Self::UContext, trap_cx: &mut TrapContext);
+    /// Read the saved PC used for syscall-restart diagnostics.
+    fn saved_pc(ucontext: &Self::UContext) -> usize;
+    /// Update the saved PC before writing the context to userspace.
+    fn set_saved_pc(ucontext: &mut Self::UContext, pc: usize);
+    /// Read the saved first argument / return register.
+    fn saved_arg0(ucontext: &Self::UContext) -> usize;
+    /// Update the saved first argument / return register.
+    fn set_saved_arg0(ucontext: &mut Self::UContext, value: usize);
+}

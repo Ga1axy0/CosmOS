@@ -97,7 +97,9 @@ pub fn sys_futex(
                 let flags = op & !FUTEX_CMD_MASK;
                 let current = read_pod_from_user(uaddr);
                 debug!(
-                    "sys_futex WAIT: uaddr={:#x} expected={} current={:?} flags={:#x} timeout_ptr={:#x}",
+                    "[futex-debug] syscall WAIT pid={} tid={} uaddr={:#x} expected={} current={:?} flags={:#x} timeout_ptr={:#x}",
+                    current_process().getpid(),
+                    current_tid(),
                     uaddr as usize,
                     val,
                     current,
@@ -119,15 +121,22 @@ pub fn sys_futex(
                     None => None,
                 };
                 let ret = futex_wait_addr(uaddr, val, deadline);
-                debug!(
-                    "sys_futex WAIT result: uaddr={:#x} expected={} ret={:?}",
+                warn!(
+                    "[futex-debug] syscall WAIT result pid={} tid={} uaddr={:#x} expected={} deadline={:?} ret={:?}",
+                    current_process().getpid(),
+                    current_tid(),
                     uaddr as usize,
                     val,
+                    deadline,
                     ret
                 );
                 ret
             }
-            FUTEX_WAKE => Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize)),
+            FUTEX_WAKE => {
+                let max_count = val.max(0) as usize;
+                let ret = futex_wake_addr(uaddr as usize, max_count);
+                Ok(ret)
+            }
             FUTEX_REQUEUE => {
                 let flags = op & !FUTEX_CMD_MASK;
                 if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0
@@ -149,12 +158,13 @@ pub fn sys_futex(
                 }
                 let src = futex_queue(uaddr as usize);
                 let dst = futex_queue(uaddr2);
-                Ok(src.wake_and_requeue_with(
+                let ret = src.wake_and_requeue_with(
                     &dst,
                     val.max(0) as usize,
                     timeout,
                     futex_wait_mark_ready,
-                ) as isize)
+                ) as isize;
+                Ok(ret)
             }
             FUTEX_WAIT_BITSET => {
                 let flags = op & !FUTEX_CMD_MASK;
@@ -206,7 +216,9 @@ pub fn sys_futex(
                     );
                     return Err(ERRNO::EINVAL);
                 }
-                Ok(futex_wake_addr(uaddr as usize, val.max(0) as usize))
+                let max_count = val.max(0) as usize;
+                let ret = futex_wake_addr(uaddr as usize, max_count);
+                Ok(ret)
             }
             _ => {
                 warn!(

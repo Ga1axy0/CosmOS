@@ -9,4 +9,7 @@ pub mod trap;
 
 pub use hart::{read_time, set_timer_deadline, LoongArchHartId};
 pub use paging::LoongArchPaging;
-pub use trap::{LoongArchInterruptControl, LoongArchTrapContextAbi, LoongArchTrapMachine};
+pub use trap::{
+    LoongArchInterruptControl, LoongArchSignalAbi, LoongArchSyscallAbi, LoongArchTrapContextAbi,
+    LoongArchTrapMachine,
+};

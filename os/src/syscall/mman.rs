@@ -199,7 +199,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                 (chosen, chosen_end, hint)
             };
             debug!(
-                "[mmap] auto-selected range: pid={} start={:#x} end={:#x} hint_in={:#x} hint_out={:#x} file_backed={} shared={} lazy={}",
+                "[mmap-debug] auto-selected pid={} start={:#x} end={:#x} hint_in={:#x} hint_out={:#x} file_backed={} shared={} lazy={}",
                 pid,
                 chosen,
                 chosen_end,
@@ -230,7 +230,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
             };
             mapped?;
             debug!(
-                "[mmap] fixed range registered: pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
+                "[mmap-debug] fixed registered pid={} start={:#x} end={:#x} file_backed={} shared={} lazy={}",
                 pid,
                 addr,
                 end,
@@ -295,7 +295,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
         if munmap_current_process(VirtAddr::from(start), VirtAddr::from(end)) {
             debug!(
-                "[munmap] complete: pid={} start={:#x} end={:#x}",
+                "[munmap-debug] complete pid={} start={:#x} end={:#x}",
                 pid,
                 start,
                 end
