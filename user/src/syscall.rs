@@ -71,6 +71,7 @@ pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
 pub const SYSCALL_GETTID: usize = 178;
 pub const SYSCALL_CLONE: usize = 220;
+pub const SYSCALL_CLONE3: usize = 435;
 pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
 pub const SYSCALL_RENAMEAT2: usize = 276;
@@ -93,6 +94,22 @@ pub const SYSCALL_SEMAPHORE_DOWN: usize = 470;
 pub const SYSCALL_CONDVAR_CREATE: usize = 471;
 pub const SYSCALL_CONDVAR_SIGNAL: usize = 472;
 pub const SYSCALL_CONDVAR_WAIT: usize = 473;
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Clone3Args {
+    pub flags: u64,
+    pub pidfd: u64,
+    pub child_tid: u64,
+    pub parent_tid: u64,
+    pub exit_signal: u64,
+    pub stack: u64,
+    pub stack_size: u64,
+    pub tls: u64,
+    pub set_tid: u64,
+    pub set_tid_size: u64,
+    pub cgroup: u64,
+}
 
 #[cfg(target_arch = "riscv64")]
 pub fn syscall(id: usize, args: [usize; 3]) -> isize {
@@ -536,6 +553,10 @@ pub fn sys_clone(
         SYSCALL_CLONE,
         [flags, stack, parent_tid, tls, child_tid, 0],
     )
+}
+
+pub fn sys_clone3(uargs: *const Clone3Args, size: usize) -> isize {
+    syscall(SYSCALL_CLONE3, [uargs as usize, size, 0])
 }
 
 pub fn sys_execve(path: &str, args: &[*const u8], envp: &[*const u8]) -> isize {

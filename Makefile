@@ -319,6 +319,9 @@ fast-run: check-kernel
 fast-run-la: check-kernel-la $(LA_BOOTLOADER_ELF)
 	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS)
 
+fast-run-la-trace: check-kernel-la $(LA_BOOTLOADER_ELF)
+	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS) -d int,in_asm -D qemu.log
+
 run-trace: QEMU_TRACE_ARGS = -d int,in_asm -D qemu.log
 run-trace: run
 
