@@ -130,6 +130,9 @@ pub struct Credentials {
     pub sgid: u32,
     pub sid: u32,
     pub pgid: u32,
+    pub cap_effective: [u32; 2],
+    pub cap_permitted: [u32; 2],
+    pub cap_inheritable: [u32; 2],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -154,6 +157,9 @@ impl Credentials {
             sgid: 0,
             sid: 0,
             pgid: 0,
+            cap_effective: [u32::MAX; 2],
+            cap_permitted: [u32::MAX; 2],
+            cap_inheritable: [0; 2],
         }
     }
 }

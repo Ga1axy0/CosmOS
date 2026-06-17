@@ -35,7 +35,7 @@ use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 pub(crate) use id::recycle_deferred_kstack_ids;
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
+pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID, PID_MAX};
 pub use crate::sched::{
     block_current_and_run_next, current_process, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, schedule_if_needed,

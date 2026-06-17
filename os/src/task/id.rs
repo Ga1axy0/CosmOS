@@ -81,6 +81,8 @@ const KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 /// The init process runs as pid 1 (Linux-style); pid 0 is the reserved
 /// idle/swapper pid. The kernel shuts down when the process with this pid exits.
 pub const IDLE_PID: usize = 1;
+/// Linux-compatible reported upper bound for `/proc/sys/kernel/pid_max`.
+pub const PID_MAX: usize = 4_194_304;
 
 /// A handle to a pid
 pub struct PidHandle(pub usize);

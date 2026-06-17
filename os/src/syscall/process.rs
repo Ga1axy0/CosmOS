@@ -289,25 +289,33 @@ pub fn sys_capget(header: *mut UserCapHeader, data: *mut UserCapData) -> isize {
                 return Err(errno);
             }
         };
-        let pid = current_process().getpid() as i32;
-        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+        if hdr.pid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let process = if hdr.pid == 0 {
+            current_process()
+        } else {
+            pid2process(hdr.pid as usize).ok_or(ERRNO::ESRCH)?
+        };
+        if hdr.pid != 0 && hdr.pid as usize != process.getpid() {
             return Err(ERRNO::ESRCH);
         }
         if data.is_null() {
             return Ok(0);
         }
 
+        let cred = process.inner_exclusive_access().cred;
         let word0 = UserCapData {
-            effective: u32::MAX,
-            permitted: u32::MAX,
-            inheritable: 0,
+            effective: cred.cap_effective[0],
+            permitted: cred.cap_permitted[0],
+            inheritable: cred.cap_inheritable[0],
         };
         write_pod_to_user(data, &word0)?;
         if words > 1 {
             let word1 = UserCapData {
-                effective: u32::MAX,
-                permitted: u32::MAX,
-                inheritable: 0,
+                effective: cred.cap_effective[1],
+                permitted: cred.cap_permitted[1],
+                inheritable: cred.cap_inheritable[1],
             };
             write_pod_to_user(unsafe { data.add(1) }, &word1)?;
         }
@@ -323,13 +331,32 @@ pub fn sys_capset(header: *const UserCapHeader, data: *const UserCapData) -> isi
         }
         let hdr = read_pod_from_user(header)?;
         let words = cap_data_words(hdr.version)?;
-        let pid = current_process().getpid() as i32;
-        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+        if hdr.pid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let process = current_process();
+        let pid = process.getpid() as i32;
+        if hdr.pid != 0 && hdr.pid != pid {
             return Err(ERRNO::ESRCH);
         }
-        let _ = read_pod_from_user(data)?;
+        let word0 = read_pod_from_user(data)?;
+        let word1 = if words > 1 {
+            read_pod_from_user(unsafe { data.add(1) })?
+        } else {
+            UserCapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }
+        };
+        let mut inner = process.inner_exclusive_access();
+        inner.cred.cap_effective[0] = word0.effective;
+        inner.cred.cap_permitted[0] = word0.permitted;
+        inner.cred.cap_inheritable[0] = word0.inheritable;
         if words > 1 {
-            let _ = read_pod_from_user(unsafe { data.add(1) })?;
+            inner.cred.cap_effective[1] = word1.effective;
+            inner.cred.cap_permitted[1] = word1.permitted;
+            inner.cred.cap_inheritable[1] = word1.inheritable;
         }
         Ok(0)
     })

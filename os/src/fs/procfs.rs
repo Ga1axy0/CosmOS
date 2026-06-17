@@ -722,6 +722,7 @@ impl VfsNode for ProcStaticDirNode {
             ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
             ProcStaticDirKind::Kernel => alloc::vec![
                 (String::from("keys"), VfsFileType::Directory),
+                (String::from("pid_max"), VfsFileType::Regular),
                 (String::from("sched_autogroup_enabled"), VfsFileType::Regular),
                 (String::from("tainted"), VfsFileType::Regular),
             ],
@@ -740,6 +741,9 @@ impl VfsNode for ProcStaticDirNode {
             }
             (ProcStaticDirKind::Kernel, "keys") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Kernel, "pid_max") => {
+                Some(Arc::new(ProcKernelPidMaxNode::new()) as Arc<dyn VfsNode>)
             }
             (ProcStaticDirKind::Kernel, "sched_autogroup_enabled") => Some(
                 Arc::new(ProcKernelSysctlNode::new(ProcKernelSysctlKind::SchedAutogroupEnabled))
@@ -773,6 +777,68 @@ impl VfsNode for ProcStaticDirNode {
 
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Default, Debug)]
+struct ProcKernelPidMaxNode;
+
+impl ProcKernelPidMaxNode {
+    fn new() -> Self {
+        Self
+    }
+
+    fn render(&self) -> String {
+        alloc::format!("{}\n", crate::task::PID_MAX)
+    }
+}
+
+impl VfsNode for ProcKernelPidMaxNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
