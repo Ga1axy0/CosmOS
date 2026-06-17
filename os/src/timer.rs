@@ -164,6 +164,12 @@ fn normalize_hart(hart: usize) -> usize {
 }
 
 fn timer_hart_for_task(task: &Arc<TaskControlBlock>) -> usize {
+    if current_task()
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, task))
+    {
+        return normalize_hart(hartid());
+    }
     let task_inner = task.inner_exclusive_access();
     normalize_hart(task_inner.sched.last_cpu)
 }

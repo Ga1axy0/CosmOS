@@ -3,6 +3,7 @@ use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
 use crate::signal::has_interrupting_signal;
 use crate::timer::set_realtime_offset_from_time_ns;
+use core::sync::atomic::{AtomicI32, Ordering};
 use crate::{
     config::CLOCK_FREQ,
     sched::block_current_and_run_next,
@@ -68,6 +69,12 @@ const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
 const ADJ_OFFSET_SS_READ: u32 = 0xa001;
 
 const TIME_OK: isize = 0;
+const TIME_INS: isize = 1;
+const TIME_DEL: isize = 2;
+const STA_INS: i32 = 0x0010;
+const STA_DEL: i32 = 0x0020;
+
+static ADJTIMEX_STATUS: AtomicI32 = AtomicI32::new(0);
 
 const ADJTIMEX_ALLOWED_MODES: u32 = ADJ_OFFSET
     | ADJ_FREQUENCY
@@ -306,7 +313,9 @@ fn adjtimex_tick_bounds() -> (i64, i64) {
 
 fn current_adjtimex_snapshot() -> Timex {
     let realtime_us = get_realtime_ns() / 1_000;
+    let status = ADJTIMEX_STATUS.load(Ordering::Relaxed);
     Timex {
+        status,
         precision: 1,
         time: TimexTimeVal {
             tv_sec: (realtime_us / 1_000_000) as i64,
@@ -335,9 +344,20 @@ fn do_adjtimex(buf: *mut Timex) -> Result<isize, ERRNO> {
         }
     }
 
+    if timex.modes & ADJ_STATUS != 0 {
+        ADJTIMEX_STATUS.store(timex.status, Ordering::Relaxed);
+    }
+
     let snapshot = current_adjtimex_snapshot();
+    let state = if snapshot.status & STA_INS != 0 {
+        TIME_INS
+    } else if snapshot.status & STA_DEL != 0 {
+        TIME_DEL
+    } else {
+        TIME_OK
+    };
     write_pod_to_user(buf, &snapshot)?;
-    Ok(TIME_OK)
+    Ok(state)
 }
 
 /// get_time syscall

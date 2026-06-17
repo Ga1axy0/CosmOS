@@ -1935,7 +1935,7 @@ impl ProcessControlBlock {
         &self,
         which: i32,
         now_raw: usize,
-        now_realtime_ns: u64,
+        _now_realtime_ns: u64,
     ) -> Result<(u64, u64), ERRNO> {
         let inner = self.inner.lock();
         let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
@@ -1950,10 +1950,11 @@ impl ProcessControlBlock {
             ),
             CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
         };
+        let monotonic_ns = raw_counter_to_ns(now_raw);
         let user_ns = raw_counter_to_ns(user_raw);
         let kernel_ns = raw_counter_to_ns(kernel_raw);
         let (timer, now_ns) = match which {
-            0 => (&inner.itimer_real, now_realtime_ns),
+            0 => (&inner.itimer_real, monotonic_ns),
             1 => (&inner.itimer_virtual, user_ns),
             2 => (&inner.itimer_prof, user_ns.saturating_add(kernel_ns)),
             _ => return Err(ERRNO::EINVAL),
@@ -1974,7 +1975,7 @@ impl ProcessControlBlock {
         &self,
         which: i32,
         now_raw: usize,
-        now_realtime_ns: u64,
+        _now_realtime_ns: u64,
         new_value: Option<(u64, u64)>,
     ) -> Result<(u64, u64), ERRNO> {
         let mut inner = self.inner.lock();
@@ -1990,10 +1991,11 @@ impl ProcessControlBlock {
             ),
             CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
         };
+        let monotonic_ns = raw_counter_to_ns(now_raw);
         let user_ns = raw_counter_to_ns(user_raw);
         let kernel_ns = raw_counter_to_ns(kernel_raw);
         let (timer, now_ns) = match which {
-            0 => (&mut inner.itimer_real, now_realtime_ns),
+            0 => (&mut inner.itimer_real, monotonic_ns),
             1 => (&mut inner.itimer_virtual, user_ns),
             2 => (&mut inner.itimer_prof, user_ns.saturating_add(kernel_ns)),
             _ => return Err(ERRNO::EINVAL),
@@ -2024,7 +2026,7 @@ impl ProcessControlBlock {
     }
 
     /// 在一个时钟 tick 上推进进程级 interval timers，并返回本次应投递的信号集合。
-    pub fn consume_expired_itimers(&self, now_raw: usize, now_realtime_ns: u64) -> SignalBit {
+    pub fn consume_expired_itimers(&self, now_raw: usize, _now_realtime_ns: u64) -> SignalBit {
         let mut inner = self.inner.lock();
         let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
         let (user_raw, kernel_raw) = match inner.accounting_state {
@@ -2038,14 +2040,15 @@ impl ProcessControlBlock {
             ),
             CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
         };
+        let monotonic_ns = raw_counter_to_ns(now_raw);
         let user_ns = raw_counter_to_ns(user_raw);
         let prof_ns = user_ns.saturating_add(raw_counter_to_ns(kernel_raw));
 
         let mut pending = SignalBit::empty();
 
-        if inner.itimer_real.deadline_ns != 0 && inner.itimer_real.deadline_ns <= now_realtime_ns {
+        if inner.itimer_real.deadline_ns != 0 && inner.itimer_real.deadline_ns <= monotonic_ns {
             pending |= SignalBit::SIGALRM;
-            rearm_itimer_after_expire(&mut inner.itimer_real, now_realtime_ns);
+            rearm_itimer_after_expire(&mut inner.itimer_real, monotonic_ns);
             if inner.itimer_real.deadline_ns == 0 {
                 itimer_account_disarm();
             }
