@@ -13,7 +13,7 @@ use crate::poll::{self, PollTimerTag};
 use crate::net::{handle_socket_wait_timeout, SocketTimerTag};
 use crate::signal::{handle_signal_wait_timeout, SignalTimerTag};
 use crate::sync::{FutexTimerTag, SpinNoIrqLock, handle_futex_wait_timeout};
-use crate::task::{current_task, wakeup_task, TaskControlBlock};
+use crate::task::{add_signal_to_process, current_task, wakeup_task, SignalBit, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use core::array;
@@ -130,6 +130,7 @@ pub(crate) enum TimerTagKind {
     Signal(SignalTimerTag),
     Futex(FutexTimerTag),
     Socket(SocketTimerTag),
+    PosixSignal(i32),
 }
 
 impl PartialEq for TimerCondVar {
@@ -228,6 +229,15 @@ pub(crate) fn add_timer_with_socket_tag(
     socket_tag: Option<SocketTimerTag>,
 ) {
     add_timer_with_tag(expire_ns, task, socket_tag.map(TimerTagKind::Socket));
+}
+
+/// Add a POSIX per-process timer that delivers a signal on expiry.
+pub(crate) fn add_timer_with_posix_signal_tag(
+    expire_ns: u64,
+    task: Arc<TaskControlBlock>,
+    signum: i32,
+) {
+    add_timer_with_tag(expire_ns, task, Some(TimerTagKind::PosixSignal(signum)));
 }
 
 fn add_timer_with_tag(
@@ -359,6 +369,14 @@ fn check_timer_expired(current_ns: u64) {
                         if handle_socket_wait_timeout(socket_tag, &timer.task) {
                             timers.pop();
                         }
+                    }
+                    TimerTagKind::PosixSignal(signum) => {
+                        if let Some(signal) = SignalBit::from_signum(signum as u32) {
+                            if let Some(process) = timer.task.process.upgrade() {
+                                add_signal_to_process(&process, signal);
+                            }
+                        }
+                        timers.pop();
                     }
                 }
                 continue;

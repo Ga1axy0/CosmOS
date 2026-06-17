@@ -1,9 +1,12 @@
 use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
-use crate::signal::has_interrupting_signal;
-use crate::timer::set_realtime_offset_from_time_ns;
+use crate::signal::{has_interrupting_signal, SignalBit};
+use crate::sync::SpinNoIrqLock;
+use crate::timer::{add_timer_with_posix_signal_tag, set_realtime_offset_from_time_ns};
+use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicI32, Ordering};
+use lazy_static::lazy_static;
 use crate::{
     config::CLOCK_FREQ,
     sched::block_current_and_run_next,
@@ -39,6 +42,9 @@ pub const CLOCK_REALTIME_ALARM: ClockId = 8;
 pub const CLOCK_BOOTTIME_ALARM: ClockId = 9;
 /// `clock_nanosleep(2)` absolute-deadline flag.
 pub const TIMER_ABSTIME: i32 = 1;
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGALRM: i32 = 14;
 
 /// Linux `getrusage(2)` 的当前进程选择器。
 pub const RUSAGE_SELF: i32 = 0;
@@ -75,6 +81,11 @@ const STA_INS: i32 = 0x0010;
 const STA_DEL: i32 = 0x0020;
 
 static ADJTIMEX_STATUS: AtomicI32 = AtomicI32::new(0);
+
+lazy_static! {
+    static ref POSIX_TIMER_SIGNALS: SpinNoIrqLock<BTreeMap<(usize, i32), i32>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+}
 
 const ADJTIMEX_ALLOWED_MODES: u32 = ADJ_OFFSET
     | ADJ_FREQUENCY
@@ -133,7 +144,7 @@ impl Pod for RUsage {}
 
 /// Linux 风格的 `timespec` 结构。
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Timespec {
     /// second
     pub tv_sec: usize,
@@ -142,6 +153,25 @@ pub struct Timespec {
 }
 
 impl Pod for Timespec {}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ItimerSpec {
+    pub it_interval: Timespec,
+    pub it_value: Timespec,
+}
+
+impl Pod for ItimerSpec {}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SigeventCompat {
+    pub sigev_value: usize,
+    pub sigev_signo: i32,
+    pub sigev_notify: i32,
+}
+
+impl Pod for SigeventCompat {}
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -632,7 +662,7 @@ pub fn sys_clock_nanosleep(
     })
 }
 
-pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
+pub fn sys_clock_settime(clockid: ClockId, tp: *const Timespec) -> isize {
     trace!(
         "kernel:pid[{}] sys_clock_settime clockid={}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -642,13 +672,102 @@ pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
         // TODO：后续按 Linux 语义继续补充其它 clock id 的设置。
         match clockid {
             CLOCK_REALTIME => {
-                let timespec = read_pod_from_user(_tp)?;
-                let time_ns = (timespec.tv_sec as u64) * 1_000_000_000 + (timespec.tv_nsec as u64);
+                let timespec = read_pod_from_user(tp)?;
+                let time_ns = timespec_to_ns(&timespec)?;
                 set_realtime_offset_from_time_ns(time_ns);
                 Ok(0)
             }
             _ => Err(ERRNO::EINVAL),
         }
+    })
+}
+
+pub fn sys_timer_create(
+    clockid: ClockId,
+    sevp: *const SigeventCompat,
+    timerid: *mut i32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_timer_create clockid={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid
+    );
+    syscall_body!({
+        if clockid != CLOCK_REALTIME {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let (notify, signum) = if sevp.is_null() {
+            (SIGEV_SIGNAL, SIGALRM)
+        } else {
+            let event = read_pod_from_user(sevp)?;
+            (event.sigev_notify, event.sigev_signo)
+        };
+
+        if notify != SIGEV_SIGNAL && notify != SIGEV_NONE {
+            return Err(ERRNO::EINVAL);
+        }
+        if notify == SIGEV_SIGNAL && SignalBit::from_signum(signum as u32).is_none() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let process = current_process();
+        let pid = process.getpid();
+        let id = 0;
+        POSIX_TIMER_SIGNALS.lock().insert(
+            (pid, id),
+            if notify == SIGEV_SIGNAL { signum } else { 0 },
+        );
+        write_pod_to_user(timerid, &id)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_timer_settime(
+    timerid: i32,
+    flags: i32,
+    new_value: *const ItimerSpec,
+    old_value: *mut ItimerSpec,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_timer_settime timerid={} flags={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        timerid,
+        flags
+    );
+    syscall_body!({
+        if flags & !TIMER_ABSTIME != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let process = current_process();
+        let pid = process.getpid();
+        let signum = POSIX_TIMER_SIGNALS
+            .lock()
+            .get(&(pid, timerid))
+            .copied()
+            .ok_or(ERRNO::EINVAL)?;
+
+        let new_timer = read_pod_from_user(new_value)?;
+        let value_ns = timespec_to_ns(&new_timer.it_value)?;
+        let _interval_ns = timespec_to_ns(&new_timer.it_interval)?;
+
+        if !old_value.is_null() {
+            write_pod_to_user(old_value, &ItimerSpec::default())?;
+        }
+
+        if value_ns == 0 || signum == 0 {
+            return Ok(0);
+        }
+
+        let sleep_ns = if flags & TIMER_ABSTIME != 0 {
+            value_ns.saturating_sub(get_realtime_ns())
+        } else {
+            value_ns
+        };
+        let expire_ns = get_time_ns().saturating_add(sleep_ns.max(1));
+        add_timer_with_posix_signal_tag(expire_ns, current_task().unwrap(), signum);
+        Ok(0)
     })
 }
 

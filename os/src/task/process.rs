@@ -246,7 +246,7 @@ pub struct ProcessControlBlockInner {
     pub timens_boottime_offset_ns: i128,
     /// CLOCK_BOOTTIME offset that children will inherit after CLONE_NEWTIME setup.
     pub timens_child_boottime_offset_ns: i128,
-    /// `ITIMER_REAL`：基于 `CLOCK_REALTIME`（墙钟时间）。
+    /// `ITIMER_REAL`：基于不可被 `clock_settime` 调整的 elapsed real time。
     pub itimer_real: ItimerState,
     /// `ITIMER_VIRTUAL`：基于进程用户态 CPU 时间。
     pub itimer_virtual: ItimerState,

@@ -142,6 +142,10 @@ pub const SYSCALL_NANOSLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
 /// setitimer syscall
 pub const SYSCALL_SETITIMER: usize = 103;
+/// timer_create syscall
+pub const SYSCALL_TIMER_CREATE: usize = 107;
+/// timer_settime syscall
+pub const SYSCALL_TIMER_SETTIME: usize = 110;
 /// clock_settime syscall
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 /// clock_gettime syscall
@@ -707,6 +711,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as i32,
             args[1] as *const OldItimerval,
             args[2] as *mut OldItimerval,
+        ),
+        SYSCALL_TIMER_CREATE => sys_timer_create(
+            args[0] as ClockId,
+            args[1] as *const SigeventCompat,
+            args[2] as *mut i32,
+        ),
+        SYSCALL_TIMER_SETTIME => sys_timer_settime(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as *const ItimerSpec,
+            args[3] as *mut ItimerSpec,
         ),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
