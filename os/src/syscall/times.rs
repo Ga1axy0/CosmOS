@@ -1,6 +1,7 @@
 use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
+use crate::signal::has_interrupting_signal;
 use crate::timer::set_realtime_offset_from_time_ns;
 use crate::{
     config::CLOCK_FREQ,
@@ -200,6 +201,10 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
     }
 }
 
+fn current_monotonic_ns() -> u64 {
+    current_process().monotonic_time_ns(get_time_ns())
+}
+
 fn timespec_from_raw_ticks(raw_time: usize) -> Timespec {
     timespec_from_ns(((raw_time as u128) * 1_000_000_000u128 / (CLOCK_FREQ as u128)) as u64)
 }
@@ -262,7 +267,7 @@ fn timeval_to_ns(tv: &TimeVal) -> Result<u64, ERRNO> {
 
 /// 将 `timespec` 转为纳秒时间长度。
 fn timespec_to_ns(ts: &Timespec) -> Result<u64, ERRNO> {
-    if ts.tv_nsec >= 1_000_000_000 {
+    if ts.tv_sec > i64::MAX as usize || ts.tv_nsec >= 1_000_000_000 {
         return Err(ERRNO::EINVAL);
     }
     let sec_ns = (ts.tv_sec as u128) * 1_000_000_000u128;
@@ -455,7 +460,7 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
         let timespec = match clockid {
             CLOCK_REALTIME | CLOCK_REALTIME_ALARM => timespec_from_ns(get_realtime_ns()),
             CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
-                timespec_from_ns(get_time_ns())
+                timespec_from_ns(current_monotonic_ns())
             }
             CLOCK_REALTIME_COARSE => timespec_from_ns(get_realtime_ns()),
             CLOCK_PROCESS_CPUTIME_ID => {
@@ -523,6 +528,7 @@ pub fn sys_clock_nanosleep(
         }
         match clockid {
             CLOCK_REALTIME | CLOCK_MONOTONIC => {}
+            CLOCK_THREAD_CPUTIME_ID => return Err(ERRNO::EOPNOTSUPP),
             _ => return Err(ERRNO::EINVAL),
         }
 
@@ -531,7 +537,8 @@ pub fn sys_clock_nanosleep(
         // 单调时钟现值：定时器队列（`add_timer_ns` / `check_timer`）只按
         // CLOCK_MONOTONIC 的 `get_time_ns()` 判定到期，因此最终的到期时刻必须
         // 落在单调时间轴上。我们这里把它取一次并复用，避免读两次时钟产生缝隙。
-        let monotonic_now_ns = get_time_ns();
+        let raw_monotonic_now_ns = get_time_ns();
+        let monotonic_now_ns = current_process().monotonic_time_ns(raw_monotonic_now_ns);
         let now_ns = match clockid {
             CLOCK_REALTIME => get_realtime_ns(),
             CLOCK_MONOTONIC => monotonic_now_ns,
@@ -558,7 +565,13 @@ pub fn sys_clock_nanosleep(
         // 数十年，定时器永远不会触发——glibc 的 `usleep` 走
         // `clock_nanosleep(CLOCK_REALTIME, 0, …)`，于是阻塞至天荒地老（musl 的
         // `usleep` 走 `nanosleep` 用单调时钟，故不受影响）。
-        let expire_ns = monotonic_now_ns.saturating_add(sleep_ns.max(1));
+        let expire_ns = raw_monotonic_now_ns.saturating_add(sleep_ns.max(1));
+        if has_interrupting_signal() {
+            if !rem.is_null() && flags & TIMER_ABSTIME == 0 {
+                write_pod_to_user(rem, &timespec_from_ns(sleep_ns))?;
+            }
+            return Err(ERRNO::EINTR);
+        }
         let task = current_task().unwrap();
         // Publish the sleep state before arming the timer so an immediate
         // expiry cannot drop the timer while this task is still marked Running.
@@ -569,6 +582,14 @@ pub fn sys_clock_nanosleep(
         }
         add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
+
+        if has_interrupting_signal() {
+            if !rem.is_null() && flags & TIMER_ABSTIME == 0 {
+                let remaining_ns = expire_ns.saturating_sub(get_time_ns());
+                write_pod_to_user(rem, &timespec_from_ns(remaining_ns))?;
+            }
+            return Err(ERRNO::EINTR);
+        }
 
         if !rem.is_null() {
             write_pod_to_user(rem, &Timespec { tv_sec: 0, tv_nsec: 0 })?;

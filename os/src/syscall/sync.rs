@@ -3,7 +3,7 @@ use crate::sync::{
     Mutex, MutexBlocking, MutexSpin, Semaphore,
 };
 use crate::syscall_body;
-use crate::syscall::{read_pod_from_user, times::Timespec};
+use crate::syscall::{read_pod_from_user, write_pod_to_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
 use crate::task::{current_process, current_task, TaskStatus, WaitReason};
 use crate::timer::{add_timer_ns, get_realtime_ns, get_time_ns};
@@ -295,13 +295,21 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
     );
 
     syscall_body!({
-        let _ = rem;
         let timespec = read_pod_from_user(req)?;
+        if timespec.tv_sec > i64::MAX as usize || timespec.tv_nsec >= 1_000_000_000 {
+            return Err(ERRNO::EINVAL);
+        }
         let current_time = get_time_ns();
         let sleep_ns = (timespec.tv_sec as u64)
             .saturating_mul(1_000_000_000)
             .saturating_add(timespec.tv_nsec as u64);
         let expire_ns = current_time.saturating_add(sleep_ns.max(1));
+        if crate::signal::has_interrupting_signal() {
+            if !rem.is_null() {
+                write_pod_to_user(rem, &timespec)?;
+            }
+            return Err(ERRNO::EINTR);
+        }
         debug!(
             "nanosleep: current_time_ns = {}, expire_time_ns = {}",
             current_time,
@@ -318,6 +326,19 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
         }
         add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
+        if crate::signal::has_interrupting_signal() {
+            if !rem.is_null() {
+                let remaining_ns = expire_ns.saturating_sub(get_time_ns());
+                write_pod_to_user(
+                    rem,
+                    &Timespec {
+                        tv_sec: (remaining_ns / 1_000_000_000) as usize,
+                        tv_nsec: (remaining_ns % 1_000_000_000) as usize,
+                    },
+                )?;
+            }
+            return Err(ERRNO::EINTR);
+        }
         Ok(0)
     })
 }

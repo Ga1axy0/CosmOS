@@ -238,6 +238,10 @@ pub struct ProcessControlBlockInner {
     pub accounting_timestamp: usize,
     /// Process birth time on the realtime clock, used for BSD process accounting.
     pub accounting_start_time_ns: u64,
+    /// Effective CLOCK_MONOTONIC offset inherited from a parent time namespace.
+    pub timens_monotonic_offset_ns: i128,
+    /// CLOCK_MONOTONIC offset that children will inherit after CLONE_NEWTIME setup.
+    pub timens_child_monotonic_offset_ns: i128,
     /// `ITIMER_REAL`：基于 `CLOCK_REALTIME`（墙钟时间）。
     pub itimer_real: ItimerState,
     /// `ITIMER_VIRTUAL`：基于进程用户态 CPU 时间。
@@ -784,6 +788,27 @@ impl ProcessControlBlock {
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
     }
+
+    /// Apply this process's effective time namespace offset to CLOCK_MONOTONIC.
+    pub fn monotonic_time_ns(&self, base_ns: u64) -> u64 {
+        let offset = self.inner.lock().timens_monotonic_offset_ns;
+        if offset >= 0 {
+            base_ns.saturating_add(offset.min(u64::MAX as i128) as u64)
+        } else {
+            base_ns.saturating_sub((-offset).min(u64::MAX as i128) as u64)
+        }
+    }
+
+    /// Set the CLOCK_MONOTONIC offset inherited by future children.
+    pub fn set_child_timens_monotonic_offset_ns(&self, offset_ns: i128) {
+        self.inner.lock().timens_child_monotonic_offset_ns = offset_ns;
+    }
+
+    /// Return the CLOCK_MONOTONIC offset inherited by future children.
+    pub fn child_timens_monotonic_offset_ns(&self) -> i128 {
+        self.inner.lock().timens_child_monotonic_offset_ns
+    }
+
     /// Construct a task owned by this process without publishing it to the scheduler.
     pub fn create_task(
         self: &Arc<Self>,
@@ -869,6 +894,8 @@ impl ProcessControlBlock {
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
                     accounting_start_time_ns: get_realtime_ns(),
+                    timens_monotonic_offset_ns: 0,
+                    timens_child_monotonic_offset_ns: 0,
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -1112,6 +1139,8 @@ impl ProcessControlBlock {
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
                     accounting_start_time_ns: get_realtime_ns(),
+                    timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
+                    timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -1297,6 +1326,8 @@ impl ProcessControlBlock {
                     accounting_state: CpuAccountingState::Inactive,
                     accounting_timestamp: 0,
                     accounting_start_time_ns: get_realtime_ns(),
+                    timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
+                    timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),

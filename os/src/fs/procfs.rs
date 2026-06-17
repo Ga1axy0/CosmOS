@@ -56,6 +56,27 @@ fn build_meminfo() -> String {
     out
 }
 
+fn build_cpuinfo() -> String {
+    let mut out = String::new();
+    for hart in 0..MAX_HARTS {
+        let _ = writeln!(&mut out, "processor\t: {}", hart);
+        let _ = writeln!(&mut out, "model name\t: QEMU Virtual CPU");
+        #[cfg(target_arch = "riscv64")]
+        {
+            let _ = writeln!(&mut out, "hart\t\t: {}", hart);
+            let _ = writeln!(&mut out, "isa\t\t: rv64imafdc");
+            let _ = writeln!(&mut out, "mmu\t\t: sv39");
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let _ = writeln!(&mut out, "CPU Family\t: LoongArch");
+            let _ = writeln!(&mut out, "Model Name\t: CosmOS virtual CPU");
+        }
+        let _ = writeln!(&mut out);
+    }
+    out
+}
+
 fn escape_mount_field(input: &str) -> String {
     let mut out = String::new();
     for ch in input.chars() {
@@ -626,6 +647,7 @@ impl VfsNode for ProcRootNode {
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         let mut entries = Vec::new();
         entries.push((String::from("self"), VfsFileType::Symlink));
+        entries.push((String::from("cpuinfo"), VfsFileType::Regular));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
@@ -643,6 +665,7 @@ impl VfsNode for ProcRootNode {
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         match name {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
+            "cpuinfo" => Some(Arc::new(ProcCpuinfoNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
@@ -1136,6 +1159,66 @@ impl VfsNode for ProcKeySysctlNode {
     }
 }
 
+/// `/proc/cpuinfo` node.
+#[derive(Default, Debug)]
+pub struct ProcCpuinfoNode;
+
+impl ProcCpuinfoNode {
+    /// Create a new cpuinfo node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcCpuinfoNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_cpuinfo().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_cpuinfo(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
 /// `/proc/meminfo` node.
 #[derive(Default, Debug)]
 pub struct ProcMeminfoNode;
@@ -1500,6 +1583,7 @@ impl VfsNode for ProcPidDirNode {
             (String::from("ns"), VfsFileType::Directory),
             (String::from("stat"), VfsFileType::Regular),
             (String::from("status"), VfsFileType::Regular),
+            (String::from("timens_offsets"), VfsFileType::Regular),
             (String::from("setgroups"), VfsFileType::Regular),
             (String::from("uid_map"), VfsFileType::Regular),
             (String::from("gid_map"), VfsFileType::Regular),
@@ -1515,6 +1599,7 @@ impl VfsNode for ProcPidDirNode {
             "ns" => Some(Arc::new(ProcPidNsDirNode::new(self.pid)) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "timens_offsets" => Some(Arc::new(ProcPidTimensOffsetsNode::new(self.pid)) as Arc<dyn VfsNode>),
             "setgroups" => {
                 Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::Setgroups)) as Arc<dyn VfsNode>)
             }
@@ -1540,6 +1625,101 @@ impl VfsNode for ProcPidDirNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct ProcPidTimensOffsetsNode {
+    pid: usize,
+}
+
+impl ProcPidTimensOffsetsNode {
+    fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+
+    fn content(&self) -> String {
+        let offset_ns = pid2process(self.pid)
+            .map(|process| process.child_timens_monotonic_offset_ns())
+            .unwrap_or(0);
+        let sec = offset_ns / 1_000_000_000;
+        let nsec = offset_ns % 1_000_000_000;
+        alloc::format!("monotonic {} {}\n", sec, nsec)
+    }
+}
+
+impl VfsNode for ProcPidTimensOffsetsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.content().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.content(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let Ok(text) = core::str::from_utf8(buf) else {
+            return 0;
+        };
+        let mut parts = text.split_whitespace();
+        let Some(clock) = parts.next().and_then(|part| part.parse::<i32>().ok()) else {
+            return 0;
+        };
+        let Some(sec) = parts.next().and_then(|part| part.parse::<i128>().ok()) else {
+            return 0;
+        };
+        let Some(nsec) = parts.next().and_then(|part| part.parse::<i128>().ok()) else {
+            return 0;
+        };
+        if clock != 1 || !(0..1_000_000_000).contains(&nsec) {
+            return 0;
+        }
+        let Some(process) = pid2process(self.pid) else {
+            return 0;
+        };
+        process.set_child_timens_monotonic_offset_ns(
+            sec.saturating_mul(1_000_000_000).saturating_add(nsec),
+        );
+        buf.len()
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {

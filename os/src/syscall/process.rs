@@ -1303,8 +1303,9 @@ pub fn sys_unshare(flags: usize) -> isize {
     const CLONE_NEWUSER: usize = 0x1000_0000;
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
+    const CLONE_NEWTIME: usize = 0x0000_0080;
     const SUPPORTED_FLAGS: usize =
-        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME;
 
     syscall_body!({
         if flags & !SUPPORTED_FLAGS != 0 {
