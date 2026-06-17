@@ -1292,6 +1292,49 @@ impl MemorySet {
         Some(batch)
     }
 
+    /// 按 `brk` 语义收缩 heap，覆盖被 `mprotect` 拆分出的所有 heap VMA。
+    pub(crate) fn shrink_heap_to_deferred(
+        &mut self,
+        heap_start: VirtAddr,
+        new_end: VirtAddr,
+    ) -> Option<UserReleaseBatch> {
+        let heap_start_vpn = heap_start.floor();
+        let new_end_vpn = new_end.ceil();
+        if new_end_vpn < heap_start_vpn {
+            return None;
+        }
+
+        let keys: Vec<VirtPageNum> = self
+            .vmas
+            .range(heap_start_vpn..)
+            .filter_map(|(start, area)| area.is_heap().then_some(*start))
+            .collect();
+
+        let mut batch = UserReleaseBatch::new();
+        let mut changed = false;
+        for start in keys {
+            let Some(area) = self.vmas.get_mut(&start) else {
+                continue;
+            };
+            if area.end_vpn() <= new_end_vpn {
+                continue;
+            }
+            if area.start_vpn() < new_end_vpn {
+                area.shrink_to_deferred(&mut self.page_table, new_end_vpn, &mut batch);
+                changed = true;
+                continue;
+            }
+            let mut area = self.vmas.remove(&start).unwrap();
+            area.teardown_user_deferred(&mut self.page_table, &mut batch);
+            changed = true;
+        }
+        if changed {
+            self.finish_deferred_page_table_edit();
+            self.merge_adjacent_vmas();
+        }
+        Some(batch)
+    }
+
     /// 失效指定 inode 在 truncate 后越过 EOF 的 file-backed 用户映射。
     pub(crate) fn invalidate_file_mappings_after_truncate_deferred(
         &mut self,
@@ -1419,6 +1462,72 @@ impl MemorySet {
         };
         area.vpn_range = VPNRange::new(start_vpn, new_end_vpn);
         true
+    }
+
+    /// 按 `brk` 语义扩展 heap 元数据，允许 heap 已被 `mprotect` 拆成多个 VMA。
+    pub fn append_heap_metadata_to(
+        &mut self,
+        heap_start: VirtAddr,
+        old_brk: VirtAddr,
+        new_brk: VirtAddr,
+        permission: MapPermission,
+    ) -> Result<(), MmError> {
+        let heap_start_vpn = heap_start.floor();
+        let old_end_vpn = old_brk.ceil();
+        let new_end_vpn = new_brk.ceil();
+        if new_end_vpn <= old_end_vpn {
+            return Ok(());
+        }
+
+        let has_heap = self
+            .vmas
+            .values()
+            .any(|vma| vma.is_heap() && vma.end_vpn() > heap_start_vpn);
+        let grow_start = if has_heap {
+            old_end_vpn
+        } else {
+            heap_start_vpn
+        };
+
+        for area in self.vmas.values() {
+            if area.end_vpn() <= grow_start || area.start_vpn() >= new_end_vpn {
+                continue;
+            }
+            if !area.is_heap() {
+                return Err(MmError::Conflict);
+            }
+        }
+
+        let mut cursor = grow_start;
+        let mut new_areas = Vec::new();
+        for area in self.vmas.values() {
+            if area.end_vpn() <= cursor || area.start_vpn() >= new_end_vpn {
+                continue;
+            }
+            if area.start_vpn() > cursor {
+                let end = if area.start_vpn() < new_end_vpn {
+                    area.start_vpn()
+                } else {
+                    new_end_vpn
+                };
+                new_areas.push(Vma::new_heap(cursor.into(), end.into(), permission));
+            }
+            if area.end_vpn() > cursor {
+                cursor = area.end_vpn();
+            }
+            if cursor >= new_end_vpn {
+                break;
+            }
+        }
+        if cursor < new_end_vpn {
+            new_areas.push(Vma::new_heap(cursor.into(), new_end_vpn.into(), permission));
+        }
+
+        for area in new_areas {
+            self.register_vma_metadata(area)?;
+        }
+        self.merge_adjacent_vmas();
+        Ok(())
     }
 
     /// map an anonymous area with given permission, return true if success

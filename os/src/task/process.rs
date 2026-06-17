@@ -1702,26 +1702,28 @@ impl ProcessControlBlock {
             }
 
             if new_brk > old_brk {
-                let success = inner.memory_set.append_metadata_to(heap_start, new_brk_va)
-                    || inner
-                        .memory_set
-                        .register_vma_metadata(Vma::new_heap(
-                            heap_start,
-                            new_brk_va,
-                            MapPermission::R | MapPermission::W | MapPermission::U,
-                        ))
-                        .is_ok();
-                if !success {
-                    warn!("set_program_brk: FAILED at append metadata to heap ({:#x} -> {:#x})", old_brk, new_brk);
+                if inner
+                    .memory_set
+                    .append_heap_metadata_to(
+                        heap_start,
+                        old_brk_va,
+                        new_brk_va,
+                        MapPermission::R | MapPermission::W | MapPermission::U,
+                    )
+                    .is_err()
+                {
+                    warn!(
+                        "set_program_brk: FAILED at append metadata to heap ({:#x} -> {:#x})",
+                        old_brk, new_brk
+                    );
                     return old_brk;
                 }
-            } else if new_brk == inner.vm_layout.start_brk {
-                batch = Some(inner
-                    .memory_set
-                    .remove_vma_with_start_vpn_user_deferred(heap_start.floor()));
             } else if old_end_vpn != new_end_vpn {
-                let Some(shrink_batch) = inner.memory_set.shrink_to_deferred(heap_start, new_brk_va) else {
-                    warn!("set_program_brk: FAILED at shrink to deferred");
+                let Some(shrink_batch) = inner
+                    .memory_set
+                    .shrink_heap_to_deferred(heap_start, new_brk_va)
+                else {
+                    warn!("set_program_brk: FAILED at shrink heap to deferred");
                     return old_brk;
                 };
                 batch = Some(shrink_batch);
