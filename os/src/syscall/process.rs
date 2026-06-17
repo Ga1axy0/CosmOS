@@ -1273,10 +1273,12 @@ pub fn sys_clone3(uargs: *const Clone3Args, size: usize) -> isize {
 
 /// `setns` 兼容实现。
 ///
-/// 当前内核尚未提供独立 namespace 隔离，但 LTP 的网络 helper 需要
-/// `/proc/<pid>/ns/*` 可打开且 `setns()` 可成功返回，才能继续构造本地
-/// 双端口拓扑。这里先校验 fd 有效，再按 no-op 成功处理。
-pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
+/// 当前内核尚未提供完整 namespace 隔离，但 LTP helper 需要
+/// `/proc/<pid>/ns/*` 可打开且 `setns()` 可成功返回。这里先校验 fd 有效；
+/// 对 time namespace，切回初始 namespace 的零 offset 视图。
+pub fn sys_setns(fd: i32, nstype: i32) -> isize {
+    const CLONE_NEWTIME: i32 = 0x0000_0080;
+
     syscall_body!({
         if fd < 0 {
             return Err(ERRNO::EBADF);
@@ -1286,6 +1288,10 @@ pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
         let fd = fd as usize;
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
             return Err(ERRNO::EBADF);
+        }
+        drop(inner);
+        if nstype == CLONE_NEWTIME {
+            process.reset_timens_offsets();
         }
         Ok(0)
     })

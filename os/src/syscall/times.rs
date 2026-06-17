@@ -201,8 +201,21 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
     }
 }
 
-fn current_monotonic_ns() -> u64 {
-    current_process().monotonic_time_ns(get_time_ns())
+fn timespec_from_signed_ns(time_ns: i128) -> Timespec {
+    let sec = time_ns.div_euclid(1_000_000_000);
+    let nsec = time_ns.rem_euclid(1_000_000_000);
+    Timespec {
+        tv_sec: (sec as i64) as usize,
+        tv_nsec: nsec as usize,
+    }
+}
+
+fn current_monotonic_timespec() -> Timespec {
+    timespec_from_signed_ns(current_process().monotonic_time_ns_signed(get_time_ns()))
+}
+
+fn current_boottime_timespec() -> Timespec {
+    timespec_from_signed_ns(current_process().boottime_ns_signed(get_time_ns()))
 }
 
 fn timespec_from_raw_ticks(raw_time: usize) -> Timespec {
@@ -459,9 +472,10 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
     syscall_body!({
         let timespec = match clockid {
             CLOCK_REALTIME | CLOCK_REALTIME_ALARM => timespec_from_ns(get_realtime_ns()),
-            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
-                timespec_from_ns(current_monotonic_ns())
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+                current_monotonic_timespec()
             }
+            CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => current_boottime_timespec(),
             CLOCK_REALTIME_COARSE => timespec_from_ns(get_realtime_ns()),
             CLOCK_PROCESS_CPUTIME_ID => {
                 let (utime, stime, _, _) = current_process().times_snapshot(get_time());

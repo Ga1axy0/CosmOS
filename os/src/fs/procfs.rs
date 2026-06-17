@@ -1648,12 +1648,25 @@ impl ProcPidTimensOffsetsNode {
     }
 
     fn content(&self) -> String {
-        let offset_ns = pid2process(self.pid)
-            .map(|process| process.child_timens_monotonic_offset_ns())
-            .unwrap_or(0);
-        let sec = offset_ns / 1_000_000_000;
-        let nsec = offset_ns % 1_000_000_000;
-        alloc::format!("monotonic {} {}\n", sec, nsec)
+        let (monotonic_ns, boottime_ns) = pid2process(self.pid)
+            .map(|process| {
+                (
+                    process.child_timens_monotonic_offset_ns(),
+                    process.child_timens_boottime_offset_ns(),
+                )
+            })
+            .unwrap_or((0, 0));
+        let monotonic_sec = monotonic_ns.div_euclid(1_000_000_000);
+        let monotonic_nsec = monotonic_ns.rem_euclid(1_000_000_000);
+        let boottime_sec = boottime_ns.div_euclid(1_000_000_000);
+        let boottime_nsec = boottime_ns.rem_euclid(1_000_000_000);
+        alloc::format!(
+            "monotonic {} {}\nboottime {} {}\n",
+            monotonic_sec,
+            monotonic_nsec,
+            boottime_sec,
+            boottime_nsec
+        )
     }
 }
 
@@ -1710,15 +1723,18 @@ impl VfsNode for ProcPidTimensOffsetsNode {
         let Some(nsec) = parts.next().and_then(|part| part.parse::<i128>().ok()) else {
             return 0;
         };
-        if clock != 1 || !(0..1_000_000_000).contains(&nsec) {
+        if !(0..1_000_000_000).contains(&nsec) {
             return 0;
         }
         let Some(process) = pid2process(self.pid) else {
             return 0;
         };
-        process.set_child_timens_monotonic_offset_ns(
-            sec.saturating_mul(1_000_000_000).saturating_add(nsec),
-        );
+        let offset_ns = sec.saturating_mul(1_000_000_000).saturating_add(nsec);
+        match clock {
+            1 => process.set_child_timens_monotonic_offset_ns(offset_ns),
+            7 => process.set_child_timens_boottime_offset_ns(offset_ns),
+            _ => return 0,
+        }
         buf.len()
     }
 
@@ -1851,6 +1867,7 @@ impl VfsNode for ProcPidNsDirNode {
         alloc::vec![
             (String::from("mnt"), VfsFileType::Regular),
             (String::from("net"), VfsFileType::Regular),
+            (String::from("time_for_children"), VfsFileType::Regular),
         ]
     }
 
@@ -1859,6 +1876,9 @@ impl VfsNode for ProcPidNsDirNode {
         match name {
             "mnt" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "mnt")) as Arc<dyn VfsNode>),
             "net" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "net")) as Arc<dyn VfsNode>),
+            "time_for_children" => {
+                Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "time")) as Arc<dyn VfsNode>)
+            }
             _ => None,
         }
     }
