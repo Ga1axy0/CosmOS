@@ -212,6 +212,8 @@ pub struct ProcessControlBlockInner {
     pub semaphore_detector: DeadlockDetector,
     /// current working directory (absolute path)
     pub cwd: String,
+    /// process root directory used by chroot-aware absolute path resolution
+    pub root: String,
     /// absolute path of the last executed image (for /proc/<pid>/exe)
     pub exec_path: String,
     /// process environment seen by future `execve` inheritance/fallback
@@ -854,6 +856,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: String::from(INIT_CWD),
+                    root: String::from("/"),
                     exec_path,
                     environment: init_envs.clone(),
                     umask: DEFAULT_UMASK,
@@ -1052,6 +1055,7 @@ impl ProcessControlBlock {
         let cred = parent.cred;
         let parent_signal_actions = parent.signal_actions.clone();
         let parent_cwd = parent.cwd.clone();
+        let parent_root = parent.root.clone();
         let parent_exec_path = parent.exec_path.clone();
         let parent_umask = parent.umask;
         let parent_keyrings = parent.keyrings;
@@ -1095,6 +1099,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent_cwd,
+                    root: parent_root,
                     exec_path: parent_exec_path,
                     environment: parent.environment.clone(),
                     umask: parent_umask,
@@ -1279,6 +1284,7 @@ impl ProcessControlBlock {
                     mutex_detector: DeadlockDetector::new(),
                     semaphore_detector: DeadlockDetector::new(),
                     cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                    root: parent.root.clone(),
                     exec_path,
                     environment: parent.environment.clone(),
                     umask: parent.umask,

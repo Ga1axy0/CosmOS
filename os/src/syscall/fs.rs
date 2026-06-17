@@ -425,8 +425,9 @@ pub fn sys_acct(filename: *const u8) -> isize {
 
         let path = read_cstring_from_user(filename, PATH_MAX)?;
         let cwd = process.inner_exclusive_access().cwd.clone();
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
-        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
+        let lookup_path = rooted_lookup_path(path.as_str());
+        let abs_path = canonicalize(cwd.as_str(), lookup_path);
+        let inode = lookup_inode_follow(cwd.as_str(), lookup_path, true)?;
 
         if path.ends_with('/') && !inode.is_dir() {
             return Err(ERRNO::ENOTDIR);
@@ -1877,14 +1878,14 @@ fn resolve_at_target(dirfd: isize, path: &str, flags: i32) -> Result<ResolvedAtT
 
     let cwd = resolve_dirfd_base(dirfd, path)?;
     let follow_final = flags & AT_SYMLINK_NOFOLLOW as i32 == 0;
-    lookup_inode_follow(cwd.as_str(), path, follow_final).map(ResolvedAtTarget::Inode)
+    lookup_inode_follow(cwd.as_str(), rooted_lookup_path(path), follow_final).map(ResolvedAtTarget::Inode)
 }
 
 fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
-    if path.starts_with('/') {
-        return Ok(String::from("/"));
-    }
     let process = current_process();
+    if path.starts_with('/') {
+        return Ok(process.inner_exclusive_access().root.clone());
+    }
     if dirfd == AT_FDCWD {
         return Ok(process.inner_exclusive_access().cwd.clone());
     }
@@ -1965,7 +1966,7 @@ fn check_path_search_permissions(cwd: &str, path: &str, uid: u32, gid: u32) -> R
         return Ok(());
     }
 
-    let abs = canonicalize(cwd, path);
+    let abs = canonicalize(cwd, rooted_lookup_path(path));
     let components: Vec<&str> = abs.split('/').filter(|s| !s.is_empty()).collect();
     if components.len() <= 1 {
         return Ok(());
@@ -1986,6 +1987,14 @@ fn check_path_search_permissions(cwd: &str, path: &str, uid: u32, gid: u32) -> R
         }
     }
     Ok(())
+}
+
+fn rooted_lookup_path(path: &str) -> &str {
+    if path.starts_with('/') {
+        path.trim_start_matches('/')
+    } else {
+        path
+    }
 }
 
 fn current_cred_in_group(gid: u32) -> bool {
@@ -3308,7 +3317,8 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
 let time1 = get_time_us();
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
 let time2 = get_time_us();
-        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        let lookup_path = rooted_lookup_path(path.as_str());
+        let inode = lookup_inode_follow(cwd.as_str(), lookup_path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
 let time3 = get_time_us();
         let stat = inode_stat(&inode);
 let time4 = get_time_us();
@@ -3380,7 +3390,7 @@ pub fn sys_statx(
             let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
             let inode = lookup_inode_follow(
                 cwd.as_str(),
-                path.as_str(),
+                rooted_lookup_path(path.as_str()),
                 flags & AT_SYMLINK_NOFOLLOW == 0,
             )?;
             inode_stat(&inode)
@@ -3413,11 +3423,12 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: i32) -> isize {
         let uid = process.getuid();
         let gid = process.getgid();
         check_path_search_permissions(cwd.as_str(), path.as_str(), uid, gid)?;
-        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
+        let lookup_path = rooted_lookup_path(path.as_str());
+        let inode = lookup_inode_follow(cwd.as_str(), lookup_path, true)?;
         if mode == F_OK {
             return Ok(0);
         }
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let abs_path = canonicalize(cwd.as_str(), lookup_path);
         if mode & W_OK != 0 && mount_is_readonly(abs_path.as_str()) {
             return Err(ERRNO::EROFS);
         }
@@ -3472,7 +3483,7 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: i32, flags: i32) -> i
             ResolvedAtTarget::Inode(inode) => {
                 if mode & W_OK != 0 && !path.is_empty() {
                     let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-                    let abs_path = canonicalize(cwd.as_str(), path.as_str());
+                    let abs_path = canonicalize(cwd.as_str(), rooted_lookup_path(path.as_str()));
                     if mount_is_readonly(abs_path.as_str()) {
                         return Err(ERRNO::EROFS);
                     }
@@ -3563,7 +3574,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
             return Err(ERRNO::ENOENT);
         }
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), false)?;
+        let inode = lookup_inode_follow(cwd.as_str(), rooted_lookup_path(path.as_str()), false)?;
         if !inode.is_symlink() {
             return Err(ERRNO::EINVAL);
         }
@@ -3679,6 +3690,40 @@ pub fn sys_chdir(path: *const u8) -> isize {
             return Err(ERRNO::ENOTDIR);
         }
         process.inner_exclusive_access().cwd = new_abs;
+        Ok(0)
+    })
+}
+
+/// chroot – change the process root directory for absolute path resolution.
+pub fn sys_chroot(path: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_chroot",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let path = read_cstring_from_user(path, PATH_MAX)?;
+        if path.split('/').any(|component| component.len() > NAME_MAX) {
+            return Err(ERRNO::ENAMETOOLONG);
+        }
+
+        let cwd = resolve_dirfd_base(AT_FDCWD, path.as_str())?;
+        let lookup_path = rooted_lookup_path(path.as_str());
+        let process = current_process();
+        let euid = process.geteuid();
+        let egid = process.getegid();
+        check_path_search_permissions(cwd.as_str(), lookup_path, euid, egid)?;
+        let (inode, new_root) = lookup_inode_follow_with_path(cwd.as_str(), lookup_path, true)?;
+        if !inode.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        if !inode_allows_access(&inode, euid, egid, X_OK as u32) {
+            return Err(ERRNO::EACCES);
+        }
+        if euid != 0 {
+            return Err(ERRNO::EPERM);
+        }
+
+        process.inner_exclusive_access().root = new_root;
         Ok(0)
     })
 }
@@ -3829,7 +3874,7 @@ pub fn sys_fchownat(dirfd: isize, pathname: *const u8, user: u32, group: u32, fl
             let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
             let process = current_process();
             check_path_search_permissions(cwd.as_str(), path.as_str(), process.geteuid(), process.getegid())?;
-            let abs_path = canonicalize(cwd.as_str(), path.as_str());
+            let abs_path = canonicalize(cwd.as_str(), rooted_lookup_path(path.as_str()));
             if mount_is_readonly(abs_path.as_str()) {
                 return Err(ERRNO::EROFS);
             }
@@ -3888,11 +3933,12 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> isize {
         let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
         let process = current_process();
         check_path_search_permissions(cwd.as_str(), path.as_str(), process.geteuid(), process.getegid())?;
-        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let lookup_path = rooted_lookup_path(path.as_str());
+        let abs_path = canonicalize(cwd.as_str(), lookup_path);
         if mount_is_readonly(abs_path.as_str()) {
             return Err(ERRNO::EROFS);
         }
-        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
+        let inode = lookup_inode_follow(cwd.as_str(), lookup_path, true)?;
 
         chmod_inode(&inode, mode)?;
         debug!("sys_fchmodat: ok");
@@ -4128,7 +4174,7 @@ pub fn sys_statfs64(path: *const u8, buf: *mut u8) -> isize {
         let path_str = translated_str(token, path).ok_or(ERRNO::EFAULT)?;
         let cwd = resolve_dirfd_base(AT_FDCWD, path_str.as_str())?;
         debug!("sys_statfs64: cwd = '{}', path = '{}'", cwd, path_str);
-        let inode = lookup_inode_follow(cwd.as_str(), path_str.as_str(), true)?;
+        let inode = lookup_inode_follow(cwd.as_str(), rooted_lookup_path(path_str.as_str()), true)?;
         let stat = inode.statfs()?;
         let buf_ptr = buf as *mut StatFs64;
         write_pod_to_user(buf_ptr, &stat)?;

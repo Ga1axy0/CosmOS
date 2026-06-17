@@ -54,6 +54,8 @@ pub const SYSCALL_FALLOCATE: usize = 47;
 pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 pub const SYSCALL_CHDIR: usize = 49;
+/// chroot syscall
+pub const SYSCALL_CHROOT: usize = 51;
 /// fchmod syscall
 pub const SYSCALL_FCHMOD: usize = 52;
 /// fchmodat syscall
@@ -681,6 +683,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0] as u32),
