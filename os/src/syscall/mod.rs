@@ -216,6 +216,8 @@ pub const SYSCALL_SETRLIMIT: usize = 164;
 pub const SYSCALL_GETRUSAGE: usize = 165;
 /// umask syscall
 pub const SYSCALL_UMASK: usize = 166;
+/// prctl syscall
+pub const SYSCALL_PRCTL: usize = 167;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
@@ -812,6 +814,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_CAPGET => sys_capget(args[0] as *mut UserCapHeader, args[1] as *mut UserCapData),
         SYSCALL_CAPSET => sys_capset(args[0] as *const UserCapHeader, args[1] as *const UserCapData),
+        SYSCALL_PRCTL => sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut SysInfo),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),

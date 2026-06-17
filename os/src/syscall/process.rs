@@ -29,6 +29,10 @@ const UID_NO_CHANGE: u32 = u32::MAX;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_SETPCAP: usize = 8;
+const CAP_LAST_CAP: usize = 63;
+const PR_CAPBSET_READ: i32 = 23;
+const PR_CAPBSET_DROP: i32 = 24;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -274,6 +278,33 @@ fn cap_data_words(version: u32) -> Result<usize, ERRNO> {
     }
 }
 
+fn cap_bit(cap: usize) -> Result<(usize, u32), ERRNO> {
+    if cap > CAP_LAST_CAP {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok((cap / 32, 1u32 << (cap % 32)))
+}
+
+fn cap_has(set: &[u32; 2], cap: usize) -> bool {
+    cap_bit(cap)
+        .map(|(word, bit)| (set[word] & bit) != 0)
+        .unwrap_or(false)
+}
+
+fn cap_subset(candidate: &[u32; 2], allowed: &[u32; 2], words: usize) -> bool {
+    (0..words).all(|idx| (candidate[idx] & !allowed[idx]) == 0)
+}
+
+fn cap_union(lhs: &[u32; 2], rhs: &[u32; 2]) -> [u32; 2] {
+    [lhs[0] | rhs[0], lhs[1] | rhs[1]]
+}
+
+fn cap_drop(set: &mut [u32; 2], cap: usize) -> Result<(), ERRNO> {
+    let (word, bit) = cap_bit(cap)?;
+    set[word] &= !bit;
+    Ok(())
+}
+
 /// capget syscall
 pub fn sys_capget(header: *mut UserCapHeader, data: *mut UserCapData) -> isize {
     syscall_body!({
@@ -329,14 +360,24 @@ pub fn sys_capset(header: *const UserCapHeader, data: *const UserCapData) -> isi
         if header.is_null() || data.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        let hdr = read_pod_from_user(header)?;
-        let words = cap_data_words(hdr.version)?;
+        let mut hdr = read_pod_from_user(header)?;
+        let words = match cap_data_words(hdr.version) {
+            Ok(words) => words,
+            Err(errno) => {
+                hdr.version = LINUX_CAPABILITY_VERSION_3;
+                write_pod_to_user(header as *mut UserCapHeader, &hdr)?;
+                return Err(errno);
+            }
+        };
         if hdr.pid < 0 {
             return Err(ERRNO::EINVAL);
         }
         let process = current_process();
         let pid = process.getpid() as i32;
         if hdr.pid != 0 && hdr.pid != pid {
+            if pid2process(hdr.pid as usize).is_some() {
+                return Err(ERRNO::EPERM);
+            }
             return Err(ERRNO::ESRCH);
         }
         let word0 = read_pod_from_user(data)?;
@@ -350,15 +391,64 @@ pub fn sys_capset(header: *const UserCapHeader, data: *const UserCapData) -> isi
             }
         };
         let mut inner = process.inner_exclusive_access();
-        inner.cred.cap_effective[0] = word0.effective;
-        inner.cred.cap_permitted[0] = word0.permitted;
-        inner.cred.cap_inheritable[0] = word0.inheritable;
+        let old_effective = inner.cred.cap_effective;
+        let old_permitted = inner.cred.cap_permitted;
+        let old_inheritable = inner.cred.cap_inheritable;
+        let mut new_effective = old_effective;
+        let mut new_permitted = old_permitted;
+        let mut new_inheritable = old_inheritable;
+
+        new_effective[0] = word0.effective;
+        new_permitted[0] = word0.permitted;
+        new_inheritable[0] = word0.inheritable;
         if words > 1 {
-            inner.cred.cap_effective[1] = word1.effective;
-            inner.cred.cap_permitted[1] = word1.permitted;
-            inner.cred.cap_inheritable[1] = word1.inheritable;
+            new_effective[1] = word1.effective;
+            new_permitted[1] = word1.permitted;
+            new_inheritable[1] = word1.inheritable;
         }
+
+        if !cap_subset(&new_effective, &new_permitted, words) {
+            return Err(ERRNO::EPERM);
+        }
+        if !cap_subset(&new_permitted, &old_permitted, words) {
+            return Err(ERRNO::EPERM);
+        }
+        let mut allowed_inheritable = cap_union(&old_inheritable, &old_permitted);
+        if cap_has(&old_effective, CAP_SETPCAP) {
+            allowed_inheritable = cap_union(&allowed_inheritable, &inner.cred.cap_bounding);
+        }
+        if !cap_subset(&new_inheritable, &allowed_inheritable, words) {
+            return Err(ERRNO::EPERM);
+        }
+
+        inner.cred.cap_effective = new_effective;
+        inner.cred.cap_permitted = new_permitted;
+        inner.cred.cap_inheritable = new_inheritable;
         Ok(0)
+    })
+}
+
+/// prctl syscall
+pub fn sys_prctl(option: i32, arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+    syscall_body!({
+        match option {
+            PR_CAPBSET_READ => {
+                let (word, bit) = cap_bit(arg2)?;
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                Ok(((inner.cred.cap_bounding[word] & bit) != 0) as isize)
+            }
+            PR_CAPBSET_DROP => {
+                let process = current_process();
+                let mut inner = process.inner_exclusive_access();
+                if !cap_has(&inner.cred.cap_effective, CAP_SETPCAP) {
+                    return Err(ERRNO::EPERM);
+                }
+                cap_drop(&mut inner.cred.cap_bounding, arg2)?;
+                Ok(0)
+            }
+            _ => Err(ERRNO::ENOSYS),
+        }
     })
 }
 
