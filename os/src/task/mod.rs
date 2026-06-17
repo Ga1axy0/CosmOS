@@ -56,7 +56,7 @@ pub use crate::signal::{
     SignalActions, SignalBit, SIG_DFL, SIG_IGN,
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
-pub use process::{ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment};
+pub use process::{CloneResourceFlags, ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment};
 pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
     clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
@@ -255,6 +255,17 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         process_inner.is_zombie = true;
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
+        let clone_shared_resources = process_inner.clone_shared_resources;
+        let clone_parent = process_inner.parent.clone();
+        let clone_shared_fd_table = clone_shared_resources
+            .contains(CloneResourceFlags::FILES)
+            .then(|| process_inner.fd_table.clone());
+        let clone_shared_cwd = clone_shared_resources
+            .contains(CloneResourceFlags::FS)
+            .then(|| process_inner.cwd.clone());
+        let clone_shared_signal_actions = clone_shared_resources
+            .contains(CloneResourceFlags::SIGHAND)
+            .then(|| process_inner.signal_actions.clone());
         let children_to_reparent = process_inner.children.clone();
         for child in children_to_reparent.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
@@ -266,6 +277,20 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             }
         }
         drop(process_inner);
+        if !clone_shared_resources.is_empty() {
+            if let Some(parent) = clone_parent.and_then(|parent| parent.upgrade()) {
+                let mut parent_inner = parent.inner_exclusive_access();
+                if let Some(fd_table) = clone_shared_fd_table {
+                    parent_inner.fd_table = fd_table;
+                }
+                if let Some(cwd) = clone_shared_cwd {
+                    parent_inner.cwd = cwd;
+                }
+                if let Some(signal_actions) = clone_shared_signal_actions {
+                    parent_inner.signal_actions = signal_actions;
+                }
+            }
+        }
         write_process_accounting_on_exit(&process, exit_reason);
 
         // deallocate user res (including tid/trap_cx/ustack) of all threads

@@ -1161,6 +1161,10 @@ impl MemorySet {
                 if share_private_pages {
                     shared_private_pages += 1;
                     let mut child_flags = user_space.translate(vpn).unwrap().flags();
+                    if area.is_shared_anonymous() {
+                        memory_set.map_existing_private_page(vpn, page, child_flags)?;
+                        continue;
+                    }
                     child_flags.remove(PTEFlags::D);
                     if map_perm.contains(MapPermission::W) {
                         // 将父子双方都降为只读，后续写入通过缺页走 COW。
@@ -1242,6 +1246,71 @@ impl MemorySet {
             );
         }
         Ok((memory_set, parent_tlb_needs_flush))
+    }
+
+    /// Create a new address space for `clone(CLONE_VM)` process-style clones.
+    ///
+    /// User private pages that are safe to share are installed into the child
+    /// page table with their current permissions. Kernel-managed per-task pages
+    /// such as trap contexts still get copied, so each task keeps independent
+    /// saved register state.
+    pub fn from_existed_user_shared_vm(user_space: &mut Self) -> Result<Self, MmError> {
+        let mut memory_set = Self::new_bare()?;
+        memory_set.map_trampoline()?;
+        let parent_vma_starts: Vec<_> = user_space.vmas.keys().copied().collect();
+        for area_start in parent_vma_starts {
+            let Some(area) = user_space.vmas.get(&area_start) else {
+                continue;
+            };
+            let share_private_pages = area.supports_private_page_sharing()
+                || area.shared_anon
+                || area.is_shared_anonymous();
+            let new_area = area.clone_metadata();
+            if share_private_pages {
+                memory_set.register_vma_metadata(new_area)?;
+            } else {
+                memory_set.insert_vma(new_area, None)?;
+            }
+
+            let private_pages: Vec<_> = area
+                .data_frames
+                .iter()
+                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                .collect();
+            let direct_cache_pages: Vec<_> = area
+                .direct_cache_pages
+                .iter()
+                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                .collect();
+            let inherit_direct_cache_pages = area.file.is_some();
+
+            for (vpn, page) in private_pages {
+                if share_private_pages {
+                    let flags = user_space.translate(vpn).unwrap().flags();
+                    memory_set.map_existing_private_page(vpn, page, flags)?;
+                    continue;
+                }
+                if memory_set.translate(vpn).is_none() {
+                    memory_set.map_private_page_in_vma(vpn)?;
+                }
+                let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                dst_ppn
+                    .get_bytes_array()
+                    .copy_from_slice(src_ppn.get_bytes_array());
+            }
+
+            if inherit_direct_cache_pages {
+                for (vpn, page) in direct_cache_pages {
+                    if memory_set.translate(vpn).is_some() {
+                        continue;
+                    }
+                    let flags = user_space.translate(vpn).unwrap().flags();
+                    memory_set.map_existing_direct_cache_page(vpn, page, flags)?;
+                }
+            }
+        }
+        Ok(memory_set)
     }
     /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
@@ -1546,10 +1615,16 @@ impl MemorySet {
             shared,
             shared
         );
-        self.insert_vma(
-            Vma::new_anonymous(start_va, end_va, permission, shared),
-            None,
-        )?;
+        let vma = if shared {
+            Vma::new_shared_anonymous(start_va, end_va, permission)
+        } else {
+            Vma::new_anonymous(start_va, end_va, permission, false)
+        };
+        if shared {
+            self.insert_vma_eager(vma)?;
+        } else {
+            self.register_vma_metadata(vma)?;
+        }
         unsafe {
             crate::hal::flush_tlb();
         }
@@ -2321,6 +2396,8 @@ pub enum VmaKind {
     },
     /// 普通匿名映射区域。
     Anonymous,
+    /// `MAP_SHARED | MAP_ANONYMOUS` 映射区域。
+    SharedAnonymous,
     /// 文件映射区域。
     File,
     /// 用户态 vDSO/trampoline 区域。
@@ -2510,6 +2587,18 @@ impl Vma {
         vma.shared_anon = shared;
         vma
     }
+    /// 为 `MAP_SHARED | MAP_ANONYMOUS` 创建一段可跨 fork 共享的匿名区域。
+    pub fn new_shared_anonymous(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
+        let mut vma = Self::new(
+            start_va,
+            end_va,
+            MapType::Framed,
+            map_perm,
+            VmaKind::SharedAnonymous,
+        );
+        vma.shared_anon = true;
+        vma
+    }
     /// 为文件映射场景保留文件偏移等来源信息。
     pub fn new_file(
         start_va: VirtAddr,
@@ -2607,6 +2696,10 @@ impl Vma {
         }
         !matches!(self.file.as_ref(), Some(file) if file.shared)
     }
+    /// 是否为 `MAP_SHARED | MAP_ANONYMOUS` 区域。
+    pub fn is_shared_anonymous(&self) -> bool {
+        matches!(self.kind, VmaKind::SharedAnonymous)
+    }
     /// 判断指定虚拟页是否属于匿名帧映射区域，供当前匿名 unmap 逻辑复用。
     pub fn is_anonymous_framed_containing(&self, vpn: VirtPageNum) -> bool {
         self.map_type == MapType::Framed
@@ -2628,7 +2721,7 @@ impl Vma {
             && !self.shared_anon
             && matches!(
                 self.kind,
-                VmaKind::Anonymous | VmaKind::Heap | VmaKind::UserStack { .. }
+                VmaKind::Anonymous | VmaKind::SharedAnonymous | VmaKind::Heap | VmaKind::UserStack { .. }
             )
     }
     /// 判断当前区域是否需要在建 VMA 时立即分配并建立页表映射。

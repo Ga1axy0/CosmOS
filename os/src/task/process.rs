@@ -98,6 +98,45 @@ pub enum ExitReason {
     Signal(u32),
 }
 
+/// Resource sharing requested by a process-style Linux `clone`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CloneResourceFlags(u8);
+
+impl CloneResourceFlags {
+    /// Share the user address space.
+    pub const VM: Self = Self(1 << 0);
+    /// Share filesystem context such as the current working directory.
+    pub const FS: Self = Self(1 << 1);
+    /// Share the file descriptor table.
+    pub const FILES: Self = Self(1 << 2);
+    /// Share installed signal handlers.
+    pub const SIGHAND: Self = Self(1 << 3);
+    /// Use the caller's parent as the new child's parent.
+    pub const PARENT: Self = Self(1 << 4);
+    /// Create a private lightweight network namespace state.
+    pub const NEWNET: Self = Self(1 << 5);
+
+    /// Return an empty sharing set.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Test whether all bits in `other` are present.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Return whether no resources are shared.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Add sharing bits to this set.
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
 #[repr(usize)]
 #[derive(Debug, Clone, Copy)]
 enum Auxv {
@@ -184,6 +223,8 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     /// exit reason observed by wait4/waitpid
     pub exit_reason: ExitReason,
+    /// Resource-sharing flags used by process-style `clone`.
+    pub clone_shared_resources: CloneResourceFlags,
     /// file descriptor table
     pub fd_table: Vec<Option<FdEntry>>,
     /// per-process resource limits
@@ -246,6 +287,10 @@ pub struct ProcessControlBlockInner {
     pub timens_boottime_offset_ns: i128,
     /// CLOCK_BOOTTIME offset that children will inherit after CLONE_NEWTIME setup.
     pub timens_child_boottime_offset_ns: i128,
+    /// Minimal per-network-namespace loopback tag exposed through procfs.
+    pub netns_loopback_tag: u32,
+    /// Minimal per-network-namespace default interface tag exposed through procfs.
+    pub netns_default_tag: u32,
     /// `ITIMER_REAL`：基于不可被 `clock_settime` 调整的 elapsed real time。
     pub itimer_real: ItimerState,
     /// `ITIMER_VIRTUAL`：基于进程用户态 CPU 时间。
@@ -852,6 +897,26 @@ impl ProcessControlBlock {
         self.inner.lock().timens_child_boottime_offset_ns
     }
 
+    /// Read the lightweight loopback network namespace tag.
+    pub fn netns_loopback_tag(&self) -> u32 {
+        self.inner.lock().netns_loopback_tag
+    }
+
+    /// Update the lightweight loopback network namespace tag.
+    pub fn set_netns_loopback_tag(&self, tag: u32) {
+        self.inner.lock().netns_loopback_tag = tag;
+    }
+
+    /// Read the lightweight default network namespace tag.
+    pub fn netns_default_tag(&self) -> u32 {
+        self.inner.lock().netns_default_tag
+    }
+
+    /// Update the lightweight default network namespace tag.
+    pub fn set_netns_default_tag(&self, tag: u32) {
+        self.inner.lock().netns_default_tag = tag;
+    }
+
     /// Construct a task owned by this process without publishing it to the scheduler.
     pub fn create_task(
         self: &Arc<Self>,
@@ -910,6 +975,7 @@ impl ProcessControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
+                    clone_shared_resources: CloneResourceFlags::empty(),
                     fd_table: new_stdio_files(),
                     resource_limits: ResourceLimits::default(),
                     pending_signals: SignalBit::empty(),
@@ -941,6 +1007,8 @@ impl ProcessControlBlock {
                     timens_child_monotonic_offset_ns: 0,
                     timens_boottime_offset_ns: 0,
                     timens_child_boottime_offset_ns: 0,
+                    netns_loopback_tag: 0,
+                    netns_default_tag: 0,
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -1091,7 +1159,9 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         child_stack: usize,
         child_tls: Option<usize>,
+        parent_set_tid: Option<usize>,
         child_set_tid: Option<usize>,
+        shared_resources: CloneResourceFlags,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
         let clone_start_ns = get_time_ns();
@@ -1113,16 +1183,26 @@ impl ProcessControlBlock {
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let addr_space_start_ns = get_time_ns();
-        let (memory_set, parent_tlb_needs_flush) =
-            MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
+        let (memory_set, parent_token, parent_mask) = if shared_resources
+            .contains(CloneResourceFlags::VM)
+        {
+            let memory_set =
+                MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
+                    .map_err(mm_error_to_errno)?;
+            (memory_set, parent.memory_set.token(), 0)
+        } else {
+            let (memory_set, parent_tlb_needs_flush) =
+                MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
+            let parent_token = parent.memory_set.token();
+            let parent_mask = if parent_tlb_needs_flush {
+                parent.memory_set.loaded_user_harts()
+            } else {
+                0
+            };
+            (memory_set, parent_token, parent_mask)
+        };
         let addr_space_ns = get_time_ns() - addr_space_start_ns;
         // warn_heap_state("fork_after_memory_set_clone", self.getpid());
-        let parent_token = parent.memory_set.token();
-        let parent_mask = if parent_tlb_needs_flush {
-            parent.memory_set.loaded_user_harts()
-        } else {
-            0
-        };
         let vm_layout = parent.vm_layout;
         let cred = parent.cred;
         let parent_signal_actions = parent.signal_actions.clone();
@@ -1131,6 +1211,17 @@ impl ProcessControlBlock {
         let parent_exec_path = parent.exec_path.clone();
         let parent_umask = parent.umask;
         let parent_keyrings = parent.keyrings;
+        let parent_netns_loopback_tag = parent.netns_loopback_tag;
+        let parent_netns_default_tag = parent.netns_default_tag;
+        let clone_parent_target = if shared_resources.contains(CloneResourceFlags::PARENT) {
+            parent.parent.as_ref().and_then(|parent| parent.upgrade())
+        } else {
+            None
+        };
+        let child_parent = clone_parent_target
+            .as_ref()
+            .map(Arc::downgrade)
+            .unwrap_or_else(|| Arc::downgrade(self));
         let parent_shm_attachments = parent.shm_attachments.clone();
         let parent_fd_count = parent.fd_table.len();
         // alloc a pid
@@ -1154,9 +1245,10 @@ impl ProcessControlBlock {
                     is_zombie: false,
                     memory_set,
                     vm_layout,
-                    parent: Some(Arc::downgrade(self)),
+                    parent: Some(child_parent),
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
+                    clone_shared_resources: shared_resources,
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
@@ -1188,6 +1280,12 @@ impl ProcessControlBlock {
                     timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
                     timens_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
                     timens_child_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
+                    netns_loopback_tag: if shared_resources.contains(CloneResourceFlags::NEWNET) {
+                        parent_netns_default_tag
+                    } else {
+                        parent_netns_loopback_tag
+                    },
+                    netns_default_tag: parent_netns_default_tag,
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -1198,8 +1296,6 @@ impl ProcessControlBlock {
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
-        // add child
-        parent.children.push(Arc::clone(&child));
         let parent_task = parent.get_task(0);
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
@@ -1209,7 +1305,16 @@ impl ProcessControlBlock {
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         let parent_signal_mask = parent_task_inner.signal_mask;
         drop(parent_task_inner);
+        if !shared_resources.contains(CloneResourceFlags::PARENT) {
+            parent.children.push(Arc::clone(&child));
+        }
         drop(parent);
+        if let Some(target_parent) = clone_parent_target.as_ref() {
+            target_parent
+                .inner_exclusive_access()
+                .children
+                .push(Arc::clone(&child));
+        }
         let tlb_shootdown_start_ns = get_time_ns();
         if parent_mask != 0 {
             debug!(
@@ -1235,9 +1340,16 @@ impl ProcessControlBlock {
             false,
             parent_sched_attr,
         ).map_err(|err| {
-            self.inner_exclusive_access()
-                .children
-                .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+            if let Some(target_parent) = clone_parent_target.as_ref() {
+                target_parent
+                    .inner_exclusive_access()
+                    .children
+                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+            } else {
+                self.inner_exclusive_access()
+                    .children
+                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+            }
             mm_error_to_errno(err)
         })?;
         let task_create_ns = get_time_ns() - task_create_start_ns;
@@ -1273,10 +1385,52 @@ impl ProcessControlBlock {
             if let Err(err) =
                 write_pod_to_process_user(&child, child_tid_ptr as *mut i32, &child_tid_value)
             {
-                self.inner_exclusive_access()
-                    .children
-                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                if let Some(target_parent) = clone_parent_target.as_ref() {
+                    target_parent
+                        .inner_exclusive_access()
+                        .children
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                } else {
+                    self.inner_exclusive_access()
+                        .children
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                }
                 return Err(err);
+            }
+        }
+        if let Some(parent_tid_ptr) = parent_set_tid {
+            let child_tid_value = child.getpid() as i32;
+            if let Err(err) =
+                write_pod_to_process_user(self, parent_tid_ptr as *mut i32, &child_tid_value)
+            {
+                if let Some(target_parent) = clone_parent_target.as_ref() {
+                    target_parent
+                        .inner_exclusive_access()
+                        .children
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                } else {
+                    self.inner_exclusive_access()
+                        .children
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                }
+                return Err(err);
+            }
+            if shared_resources.contains(CloneResourceFlags::VM) {
+                if let Err(err) =
+                    write_pod_to_process_user(&child, parent_tid_ptr as *mut i32, &child_tid_value)
+                {
+                    if let Some(target_parent) = clone_parent_target.as_ref() {
+                        target_parent
+                            .inner_exclusive_access()
+                            .children
+                            .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                    } else {
+                        self.inner_exclusive_access()
+                            .children
+                            .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                    }
+                    return Err(err);
+                }
             }
         }
         for attachment in parent_shm_attachments {
@@ -1346,6 +1500,7 @@ impl ProcessControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_reason: ExitReason::Exit(0),
+                    clone_shared_resources: CloneResourceFlags::empty(),
                     fd_table: new_fd_table,
                     resource_limits: parent.resource_limits,
                     pending_signals: SignalBit::empty(),
@@ -1377,6 +1532,8 @@ impl ProcessControlBlock {
                     timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
                     timens_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
                     timens_child_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
+                    netns_loopback_tag: parent.netns_loopback_tag,
+                    netns_default_tag: parent.netns_default_tag,
                     itimer_real: ItimerState::default(),
                     itimer_virtual: ItimerState::default(),
                     itimer_prof: ItimerState::default(),
@@ -1429,6 +1586,10 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+    /// Return whether this process has exited and is waiting to be reaped.
+    pub fn is_zombie(&self) -> bool {
+        self.inner.lock().is_zombie
     }
     /// Get absolute path of the last executed image.
     pub fn exec_path(&self) -> String {

@@ -18,7 +18,7 @@ use crate::{
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
-        ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
+        CloneResourceFlags, ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -1023,6 +1023,8 @@ bitflags! {
         const CLONE_SIGHAND = 0x0000_0800;
         /// vfork 语义标志，当前暂不支持。
         const CLONE_VFORK = 0x0000_4000;
+        /// 让新进程与调用者拥有同一个父进程。
+        const CLONE_PARENT = 0x0000_8000;
         /// 线程组标志，当前暂不支持。
         const CLONE_THREAD = 0x0001_0000;
         /// 共享 SysV semaphore undo 状态；当前没有 SysV semaphore，线程路径中按 no-op 处理。
@@ -1103,14 +1105,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             return Err(ERRNO::EINVAL);
         }
         let vfork_clone = flags.contains(CloneFlags::CLONE_VFORK);
-        let thread_clone = flags.contains(CloneFlags::CLONE_VM) && !vfork_clone;
-        if flags.contains(CloneFlags::CLONE_VM)
-            && !flags.contains(CloneFlags::CLONE_THREAD)
-            && !vfork_clone
-        {
-            warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
-            return Err(ERRNO::EINVAL);
-        }
+        let thread_clone = flags.contains(CloneFlags::CLONE_THREAD) && !vfork_clone;
         if vfork_clone && !flags.contains(CloneFlags::CLONE_VM) {
             warn!("kernel: sys_clone CLONE_VFORK without CLONE_VM is unsupported");
             return Err(ERRNO::EINVAL);
@@ -1121,18 +1116,6 @@ fn sys_clone_request(req: CloneRequest) -> isize {
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
             warn!("kernel: sys_clone unsupported process flag CLONE_SYSVSEM");
-            return Err(ERRNO::EINVAL);
-        }
-        if !thread_clone && flags.contains(CloneFlags::CLONE_FS) {
-            warn!("kernel: sys_clone unsupported flag CLONE_FS");
-            return Err(ERRNO::EINVAL);
-        }
-        if !thread_clone && flags.contains(CloneFlags::CLONE_FILES) {
-            warn!("kernel: sys_clone unsupported flag CLONE_FILES");
-            return Err(ERRNO::EINVAL);
-        }
-        if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
-            warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
             return Err(ERRNO::EINVAL);
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
@@ -1231,7 +1214,27 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                     "kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone"
                 );
             }
-            let new_process = current_process.clone_process(stack, child_tls, child_set_tid)?;
+            let mut shared_resources = CloneResourceFlags::empty();
+            if flags.contains(CloneFlags::CLONE_VM) {
+                shared_resources.insert(CloneResourceFlags::VM);
+            }
+            if flags.contains(CloneFlags::CLONE_FS) {
+                shared_resources.insert(CloneResourceFlags::FS);
+            }
+            if flags.contains(CloneFlags::CLONE_FILES) {
+                shared_resources.insert(CloneResourceFlags::FILES);
+            }
+            if flags.contains(CloneFlags::CLONE_SIGHAND) {
+                shared_resources.insert(CloneResourceFlags::SIGHAND);
+            }
+            if flags.contains(CloneFlags::CLONE_PARENT) {
+                shared_resources.insert(CloneResourceFlags::PARENT);
+            }
+            if flags.contains(CloneFlags::CLONE_NEWNET) {
+                shared_resources.insert(CloneResourceFlags::NEWNET);
+            }
+            let new_process =
+                current_process.clone_process(stack, child_tls, parent_set_tid, child_set_tid, shared_resources)?;
             let child_pid = new_process.getpid() as i32;
             debug!(
                 "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
@@ -1240,8 +1243,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_tid,
                 child_pid
             );
-            if let Some(ptr) = parent_set_tid {
-                write_pod_to_user(ptr as *mut i32, &child_pid)?;
+            if vfork_clone {
+                current_process.wait_exit_queue.wait_with_reason_or_skip(
+                    WaitReason::ProcessWaitExit,
+                    || new_process.is_zombie(),
+                );
             }
             Ok(child_pid as isize)
         }
@@ -1441,15 +1447,28 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
         if (options & 0xffff_ffff) & !WAIT_RECOGNIZED != 0 {
             return Err(ERRNO::EINVAL);
         }
+        let current_pgid = process.getpgid();
 
         loop {
             let mut inner = process.inner_exclusive_access();
+            let matches_wait_pid = |child: &Arc<ProcessControlBlock>| -> bool {
+                if pid == -1 {
+                    return true;
+                }
+                if pid == 0 {
+                    return child.getpgid() == current_pgid;
+                }
+                if pid > 0 {
+                    return child.getpid() == pid as usize;
+                }
+                child.getpgid() == (-pid) as u32
+            };
 
             // 1) 没有任何匹配的子进程
             let has_target_child = inner
                 .children
                 .iter()
-                .any(|p| pid == -1 || pid as usize == p.getpid());
+                .any(|p| matches_wait_pid(p));
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
@@ -1457,7 +1476,19 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             // 2) 查找已经退出的目标子进程
             let zombie_idx = inner.children.iter().position(|p| {
                 let p_inner = p.inner_exclusive_access();
-                p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+                if !p_inner.is_zombie {
+                    return false;
+                }
+                if pid == -1 {
+                    return true;
+                }
+                if pid == 0 {
+                    return p_inner.cred.pgid == current_pgid;
+                }
+                if pid > 0 {
+                    return p.getpid() == pid as usize;
+                }
+                p_inner.cred.pgid == (-pid) as u32
             });
 
             if let Some(idx) = zombie_idx {
@@ -1525,10 +1556,22 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     let has_target_child = inner
                         .children
                         .iter()
-                        .any(|p| pid == -1 || pid as usize == p.getpid());
+                        .any(|p| matches_wait_pid(p));
                     let has_target_zombie = inner.children.iter().any(|p| {
                         let p_inner = p.inner_exclusive_access();
-                        p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+                        if !p_inner.is_zombie {
+                            return false;
+                        }
+                        if pid == -1 {
+                            return true;
+                        }
+                        if pid == 0 {
+                            return p_inner.cred.pgid == current_pgid;
+                        }
+                        if pid > 0 {
+                            return p.getpid() == pid as usize;
+                        }
+                        p_inner.cred.pgid == (-pid) as u32
                     });
                     !has_target_child || has_target_zombie
                 });

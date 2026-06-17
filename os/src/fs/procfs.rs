@@ -718,6 +718,12 @@ enum ProcStaticDirKind {
     Sys,
     Kernel,
     Keys,
+    Net,
+    NetIpv4,
+    NetIpv4Conf,
+    NetIpv4ConfAll,
+    NetIpv4ConfDefault,
+    NetIpv4ConfLo,
 }
 
 #[derive(Debug)]
@@ -742,7 +748,10 @@ impl VfsNode for ProcStaticDirNode {
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         match self.kind {
-            ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
+            ProcStaticDirKind::Sys => alloc::vec![
+                (String::from("kernel"), VfsFileType::Directory),
+                (String::from("net"), VfsFileType::Directory),
+            ],
             ProcStaticDirKind::Kernel => alloc::vec![
                 (String::from("keys"), VfsFileType::Directory),
                 (String::from("pid_max"), VfsFileType::Regular),
@@ -754,6 +763,22 @@ impl VfsNode for ProcStaticDirNode {
                 (String::from("maxkeys"), VfsFileType::Regular),
                 (String::from("maxbytes"), VfsFileType::Regular),
             ],
+            ProcStaticDirKind::Net => {
+                alloc::vec![(String::from("ipv4"), VfsFileType::Directory)]
+            }
+            ProcStaticDirKind::NetIpv4 => {
+                alloc::vec![(String::from("conf"), VfsFileType::Directory)]
+            }
+            ProcStaticDirKind::NetIpv4Conf => alloc::vec![
+                (String::from("all"), VfsFileType::Directory),
+                (String::from("default"), VfsFileType::Directory),
+                (String::from("lo"), VfsFileType::Directory),
+            ],
+            ProcStaticDirKind::NetIpv4ConfAll
+            | ProcStaticDirKind::NetIpv4ConfDefault
+            | ProcStaticDirKind::NetIpv4ConfLo => {
+                alloc::vec![(String::from("tag"), VfsFileType::Regular)]
+            }
         }
     }
 
@@ -761,6 +786,9 @@ impl VfsNode for ProcStaticDirNode {
         match (self.kind, name) {
             (ProcStaticDirKind::Sys, "kernel") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Kernel)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Sys, "net") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Net)) as Arc<dyn VfsNode>)
             }
             (ProcStaticDirKind::Kernel, "keys") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
@@ -783,6 +811,33 @@ impl VfsNode for ProcStaticDirNode {
             }
             (ProcStaticDirKind::Keys, "maxbytes") => {
                 Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxBytes)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Net, "ipv4") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4, "conf") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4Conf)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4Conf, "all") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfAll)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4Conf, "default") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfDefault)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4Conf, "lo") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfLo)) as Arc<dyn VfsNode>)
+            }
+            (
+                ProcStaticDirKind::NetIpv4ConfAll
+                | ProcStaticDirKind::NetIpv4ConfDefault
+                | ProcStaticDirKind::NetIpv4ConfLo,
+                "tag",
+            ) => {
+                let kind = match self.kind {
+                    ProcStaticDirKind::NetIpv4ConfDefault => ProcNetIpv4ConfTagKind::Default,
+                    _ => ProcNetIpv4ConfTagKind::Loopback,
+                };
+                Some(Arc::new(ProcNetIpv4ConfTagNode::new(kind)) as Arc<dyn VfsNode>)
             }
             _ => None,
         }
@@ -1000,6 +1055,97 @@ impl VfsNode for ProcKernelSysctlNode {
             buf.len()
         } else {
             0
+        }
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct ProcNetIpv4ConfTagNode {
+    kind: ProcNetIpv4ConfTagKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProcNetIpv4ConfTagKind {
+    Loopback,
+    Default,
+}
+
+impl ProcNetIpv4ConfTagNode {
+    fn new(kind: ProcNetIpv4ConfTagKind) -> Self {
+        Self { kind }
+    }
+
+    fn render(&self) -> String {
+        let tag = match self.kind {
+            ProcNetIpv4ConfTagKind::Loopback => current_process().netns_loopback_tag(),
+            ProcNetIpv4ConfTagKind::Default => current_process().netns_default_tag(),
+        };
+        alloc::format!("{}\n", tag)
+    }
+}
+
+impl VfsNode for ProcNetIpv4ConfTagNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        match parse_proc_u32(buf) {
+            Ok(tag) => {
+                match self.kind {
+                    ProcNetIpv4ConfTagKind::Loopback => {
+                        current_process().set_netns_loopback_tag(tag);
+                    }
+                    ProcNetIpv4ConfTagKind::Default => {
+                        current_process().set_netns_default_tag(tag);
+                    }
+                }
+                buf.len()
+            }
+            Err(_) => 0,
         }
     }
 
