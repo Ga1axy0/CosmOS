@@ -103,12 +103,17 @@ else
 $(error unsupported ARCH=$(ARCH), expected rv or la)
 endif
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready prepare-run-test-fs prepare-run-test-fs-la force
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready prepare-run-test-fs prepare-run-test-fs-la force
 
 all:
 	$(MAKE) submodules
 	$(MAKE) cargo-config
 	$(MAKE) $(ALL_BUILD_TARGETS)
+	$(MAKE) clean-eval-sdcard
+
+# 清理评测脚本解压测试盘后留下的残留镜像，避免 gzip -d 撞名。
+clean-eval-sdcard:
+	rm -f sdcard-rv.img sdcard-la.img sdcard.img
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
