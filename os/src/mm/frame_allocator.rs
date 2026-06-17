@@ -1,16 +1,19 @@
 //! Physical page frame allocator
 
-use super::{virt_to_phys, PhysAddr, PhysPageNum};
+use super::{virt_to_phys, PhysPageNum};
+use crate::bootinfo::{self, PhysMemoryRegion};
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::mm::heap_allocator::KERNEL_HEAP_BYTES;
-use crate::{config::MEMORY_END, sync::SpinNoIrqLock};
+use crate::sync::SpinNoIrqLock;
+use core::cmp::{max, min};
 use core::fmt::{self, Debug, Formatter};
+use core::sync::atomic::Ordering;
 use lazy_static::*;
 use virtio_drivers::PAGE_SIZE;
-use core::sync::atomic::Ordering;
 
 const MAX_ORDER: usize = 32;
 const INVALID_PPN: usize = usize::MAX;
+const MAX_MANAGED_REGIONS: usize = 16;
 
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
@@ -82,19 +85,73 @@ trait FrameAllocator {
 pub struct BuddyFrameAllocator {
     start: usize,
     end: usize,
+    regions: [PpnRegion; MAX_MANAGED_REGIONS],
+    region_count: usize,
     free_list: [Option<usize>; MAX_ORDER],
     free_pages: usize,
     allocated_pages: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PpnRegion {
+    start: usize,
+    end: usize,
+}
+
+impl PpnRegion {
+    const fn empty() -> Self {
+        Self { start: 0, end: 0 }
+    }
+}
+
 impl BuddyFrameAllocator {
-    pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
-        self.start = l.0;
-        self.end = r.0;
+    pub fn init_from_bootinfo(&mut self, kernel_start: PhysPageNum, kernel_end: PhysPageNum) {
+        self.reset();
+        bootinfo::for_each_usable_memory_region(|region| {
+            self.add_usable_region(region, kernel_start.0, kernel_end.0);
+        });
+    }
+
+    fn reset(&mut self) {
+        self.start = usize::MAX;
+        self.end = 0;
+        self.regions = [PpnRegion::empty(); MAX_MANAGED_REGIONS];
+        self.region_count = 0;
         self.free_list = [None; MAX_ORDER];
         self.free_pages = 0;
         self.allocated_pages = 0;
-        self.add_range(l.0, r.0);
+    }
+
+    fn add_usable_region(&mut self, region: PhysMemoryRegion, kernel_start: usize, kernel_end: usize) {
+        let start = phys_addr_ceil_ppn(region.start);
+        let end = phys_addr_floor_ppn(region.end);
+        if start >= end {
+            return;
+        }
+
+        if kernel_start < kernel_end {
+            self.add_managed_range(start, min(end, kernel_start));
+            self.add_managed_range(max(start, kernel_end), end);
+        } else {
+            self.add_managed_range(start, end);
+        }
+    }
+
+    fn add_managed_range(&mut self, start: usize, end: usize) {
+        if start >= end || self.region_count >= MAX_MANAGED_REGIONS {
+            return;
+        }
+        self.regions[self.region_count] = PpnRegion { start, end };
+        self.region_count += 1;
+        self.start = self.start.min(start);
+        self.end = self.end.max(end);
+        self.add_range(start, end);
+    }
+
+    fn is_managed_range(&self, ppn: usize, pages: usize) -> bool {
+        self.regions[..self.region_count]
+            .iter()
+            .any(|region| ppn >= region.start && ppn.saturating_add(pages) <= region.end)
     }
 
     fn set_next(ppn: usize, next: Option<usize>) {
@@ -198,11 +255,12 @@ impl BuddyFrameAllocator {
     }
 
     fn dealloc_order(&mut self, ppn: PhysPageNum, order: usize) {
+        if order >= MAX_ORDER {
+            panic!("Frame ppn={:#x}, order={} has not been allocated!", ppn.0, order);
+        }
         let mut ppn = ppn.0;
         let pages = 1usize << order;
-        if order >= MAX_ORDER
-            || ppn < self.start
-            || ppn + pages > self.end
+        if !self.is_managed_range(ppn, pages)
             || ppn & (pages - 1) != 0
             || self.contains_free_block(ppn)
         {
@@ -215,7 +273,7 @@ impl BuddyFrameAllocator {
         let mut current_order = order;
         while current_order + 1 < MAX_ORDER {
             let buddy = ppn ^ (1usize << current_order);
-            if buddy < self.start || buddy + (1usize << current_order) > self.end {
+            if !self.is_managed_range(buddy, 1usize << current_order) {
                 break;
             }
             if !self.remove_block(current_order, buddy) {
@@ -236,6 +294,8 @@ impl FrameAllocator for BuddyFrameAllocator {
         Self {
             start: 0,
             end: 0,
+            regions: [PpnRegion::empty(); MAX_MANAGED_REGIONS],
+            region_count: 0,
             free_list: [None; MAX_ORDER],
             free_pages: 0,
             allocated_pages: 0,
@@ -276,12 +336,14 @@ lazy_static! {
 
 pub fn init_frame_allocator() {
     extern "C" {
+        fn skernel();
         fn ekernel();
     }
-    FRAME_ALLOCATOR.lock().init(
-        PhysAddr::from(virt_to_phys(ekernel as usize)).ceil(),
-        PhysAddr::from(MEMORY_END).floor(),
-    );
+    let kernel_start = PhysPageNum(phys_addr_floor_ppn(virt_to_phys(skernel as usize)));
+    let kernel_end = PhysPageNum(phys_addr_ceil_ppn(virt_to_phys(ekernel as usize)));
+    FRAME_ALLOCATOR
+        .lock()
+        .init_from_bootinfo(kernel_start, kernel_end);
 }
 
 /// Return runtime statistics of the frame allocator.
@@ -298,7 +360,11 @@ pub fn frame_allocator_stats() -> FrameAllocatorStats {
 
 /// Allocate a physical page frame in FrameTracker style
 pub fn frame_alloc() -> Option<FrameTracker> {
-    FRAME_ALLOCATOR.lock().alloc().map(FrameTracker::new).or_else(|| {
+    let ppn = {
+        let mut allocator = FRAME_ALLOCATOR.lock();
+        allocator.alloc()
+    };
+    ppn.map(FrameTracker::new).or_else(|| {
         let frame_allocator_stats = frame_allocator_stats();
         error!(
             "frame_alloc: out of memory (free={} cached={} low={} high={} total={})",
@@ -320,17 +386,20 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
 /// Allocate a physically contiguous frame range.
 /// Simplified implmentation: maybe fail when align_pages > pages (require over-alignment)
 pub fn frame_alloc_contiguous(pages: usize, align_pages: usize) -> Option<ContiguousFrames> {
-    info!("Allocating contiguous frames: pages={}, align_pages={}", pages, align_pages);
     if pages == 0 || align_pages == 0 || !pages.is_power_of_two() || !align_pages.is_power_of_two()
     {
         return None;
     }
     let order = pages.trailing_zeros() as usize;
-    let start = FRAME_ALLOCATOR.lock().alloc_order(order)?;
-    if start.0 & (align_pages - 1) != 0 {
-        FRAME_ALLOCATOR.lock().dealloc_order(start, order);
-        return None;
-    }
+    let start = {
+        let mut allocator = FRAME_ALLOCATOR.lock();
+        let start = allocator.alloc_order(order)?;
+        if start.0 & (align_pages - 1) != 0 {
+            allocator.dealloc_order(start, order);
+            return None;
+        }
+        start
+    };
     Some(ContiguousFrames::new(start, pages))
 }
 
@@ -352,6 +421,14 @@ fn clear_frame(ppn: PhysPageNum) {
 
 fn floor_log2(value: usize) -> usize {
     usize::BITS as usize - 1 - value.leading_zeros() as usize
+}
+
+fn phys_addr_floor_ppn(pa: usize) -> usize {
+    pa / PAGE_SIZE
+}
+
+fn phys_addr_ceil_ppn(pa: usize) -> usize {
+    pa.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE
 }
 
 #[allow(unused)]

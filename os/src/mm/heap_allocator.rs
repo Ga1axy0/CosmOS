@@ -2,9 +2,7 @@
 
 use super::frame_allocator::{frame_alloc, frame_alloc_contiguous, frame_dealloc};
 use super::{phys_to_virt, PageTableEntry, PhysPageNum, PTEFlags, VirtAddr, KERNEL_SPACE};
-use crate::config::{
-    KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, MEMORY_END, PAGE_SIZE, PAGE_SIZE_BITS,
-};
+use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, PAGE_SIZE, PAGE_SIZE_BITS};
 use crate::sync::SpinNoIrqLock;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
@@ -437,16 +435,14 @@ pub fn heap_test() {
     extern "C" {
         fn sbss();
         fn ebss();
-        fn ekernel();
     }
     let bss_range = sbss as usize..ebss as usize;
-    let bootstrap_frame_backed_range = ekernel as usize..MEMORY_END;
     let virtual_heap_range = KERNEL_HEAP_BASE..KERNEL_HEAP_BASE + MAX_KERNEL_HEAP_SIZE;
     let a = Box::new(5);
     assert_eq!(*a, 5);
     let a_ptr = a.as_ref() as *const _ as usize;
     assert!(!bss_range.contains(&a_ptr));
-    assert!(bootstrap_frame_backed_range.contains(&a_ptr) || virtual_heap_range.contains(&a_ptr));
+    assert!(is_bootinfo_ram_va(a_ptr) || virtual_heap_range.contains(&a_ptr));
     drop(a);
     let mut v: Vec<usize> = Vec::new();
     for i in 0..500 {
@@ -457,7 +453,17 @@ pub fn heap_test() {
     }
     let v_ptr = v.as_ptr() as usize;
     assert!(!bss_range.contains(&v_ptr));
-    assert!(bootstrap_frame_backed_range.contains(&v_ptr) || virtual_heap_range.contains(&v_ptr));
+    assert!(is_bootinfo_ram_va(v_ptr) || virtual_heap_range.contains(&v_ptr));
     drop(v);
     println!("heap_test passed!");
+}
+
+#[allow(unused)]
+fn is_bootinfo_ram_va(va: usize) -> bool {
+    let pa = crate::platform::direct_map_virt_to_phys(va);
+    let mut found = false;
+    crate::bootinfo::for_each_usable_memory_region(|region| {
+        found |= pa >= region.start && pa < region.end;
+    });
+    found
 }

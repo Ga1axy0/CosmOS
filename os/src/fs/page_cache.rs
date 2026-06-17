@@ -11,10 +11,11 @@ use fs::errno::FS_ERRNO;
 use fs::Inode;
 use lazy_static::lazy_static;
 
-use crate::config::{MEMORY_END, PAGE_SIZE};
+use crate::bootinfo;
+use crate::config::PAGE_SIZE;
 use crate::mm::{
     frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
-    InodeKey, MmError, PhysAddr, PhysPageNum,
+    InodeKey, MmError, PhysPageNum,
 };
 use crate::syscall::errno::ERRNO;
 use crate::sync::SpinNoIrqLock;
@@ -32,10 +33,6 @@ static WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
 static WRITEBACK_BATCH_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
-
-extern "C" {
-    fn ekernel();
-}
 
 bitflags! {
     /// 单个缓存页的状态位。
@@ -1384,9 +1381,13 @@ fn dynamic_watermarks() -> (usize, usize) {
 
 /// 初始化时使用的保守水位估算。
 fn default_watermarks() -> (usize, usize) {
-    let managed_start = PhysAddr::from(crate::mm::virt_to_phys(ekernel as usize)).ceil();
-    let managed_end = PhysAddr::from(MEMORY_END).floor();
-    let total_pages = max(1, managed_end.0.saturating_sub(managed_start.0));
+    let mut total_pages = 0usize;
+    bootinfo::for_each_usable_memory_region(|region| {
+        let start = region.start.div_ceil(PAGE_SIZE);
+        let end = region.end / PAGE_SIZE;
+        total_pages = total_pages.saturating_add(end.saturating_sub(start));
+    });
+    let total_pages = max(1, total_pages);
     let high_watermark = max(128, total_pages / 4);
     let low_watermark = max(96, high_watermark * 3 / 4);
     (high_watermark, low_watermark)

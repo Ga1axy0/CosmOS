@@ -10,8 +10,8 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 32;
 pub const MAX_KERNEL_HEAP_SIZE: usize = 0x4000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
-/// QEMU virt 1GiB 内存的物理结束地址，起始地址为 0x8000_0000。
-pub const MEMORY_END: usize = 0xB0000000; 
+/// Fallback physical memory end used only when firmware memory discovery fails.
+pub const MEMORY_END: usize = 0xC0000000;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12

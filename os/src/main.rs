@@ -35,6 +35,7 @@ extern crate alloc;
 extern crate bitflags;
 
 pub mod arch;
+pub mod bootinfo;
 pub mod hal;
 pub mod platform;
 
@@ -200,6 +201,11 @@ fn init_local_hart(hart_id: usize) {
 /// Probe the firmware-visible hart IDs and return the number of usable harts.
 #[cfg(target_arch = "riscv64")]
 fn detect_hart_count() -> usize {
+    let fdt_hart_count = bootinfo::hart_count();
+    if fdt_hart_count > 1 {
+        return fdt_hart_count;
+    }
+
     const SBI_SUCCESS: isize = 0;
     const SBI_ERR_INVALID_PARAM: isize = -3;
 
@@ -219,7 +225,7 @@ fn detect_hart_count() -> usize {
 /// Probe the usable hart count on non-RISC-V platforms.
 #[cfg(target_arch = "loongarch64")]
 fn detect_hart_count() -> usize {
-    1
+    bootinfo::hart_count()
 }
 
 /// 竞争并记录负责一次性全局初始化的 bootstrap hart。
@@ -247,9 +253,10 @@ fn wait_for_bootstrap() {
 }
 
 /// bootstrap hart 的主入口
-fn first_hart_main(hart_id: usize) -> ! {
+fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
+    bootinfo::init(fdt_ptr); 
     // Install TLB refill handler and page-walker CSRs before activating page tables.
     trap::init();
     mm::init();
@@ -299,11 +306,11 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 ///
 /// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
-pub fn rust_main(hart_id: usize) -> ! {
+pub fn rust_main(hart_id: usize, fdt_ptr: usize) -> ! {
     unsafe { crate::hal::init_with_hartid(hart_id) };
     if !try_claim_bootstrap_hart(hart_id) {
         secondary_hart_main(hart_id);
     } else {
-        first_hart_main(hart_id);
+        first_hart_main(hart_id, fdt_ptr);
     }
 }

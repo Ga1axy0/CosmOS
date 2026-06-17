@@ -4,8 +4,9 @@ use super::{frame_alloc, shootdown, FrameTracker, MmError, PageFaultHandled, Sho
 use super::{PageTable, PageTableEntry, PTEFlags};
 use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
+use crate::bootinfo;
 use crate::config::{
-    MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_PIE_BASE, USER_STACK_BASE, USER_STACK_SIZE,
+    MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_PIE_BASE, USER_STACK_BASE, USER_STACK_SIZE,
     USER_VDSO_BASE,
 };
 use crate::fs::{
@@ -35,6 +36,7 @@ extern "C" {
     fn edata();
     fn sbss_with_stack();
     fn ebss();
+    fn skernel();
     fn ekernel();
     fn strampoline();
 }
@@ -149,6 +151,32 @@ pub fn invalidate_inode_mappings_after_truncate(inode: &Arc<Inode>, new_size: us
 fn align_up(value: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
     value.checked_add(align - 1).map(|v| v & !(align - 1))
+}
+
+fn align_up_to_page(value: usize) -> usize {
+    align_up(value, PAGE_SIZE).unwrap_or(usize::MAX)
+}
+
+fn align_down_to_page(value: usize) -> usize {
+    value & !(PAGE_SIZE - 1)
+}
+
+fn map_kernel_ram_fragment(memory_set: &mut MemorySet, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    memory_set
+        .insert_vma(
+            Vma::new(
+                start.into(),
+                end.into(),
+                MapType::Identical,
+                MapPermission::R | MapPermission::W,
+                VmaKind::Kernel,
+            ),
+            None,
+        )
+        .expect("failed to map physical memory window");
 }
 
 fn format_hex_bytes(bytes: &[u8]) -> String {
@@ -880,18 +908,14 @@ impl MemorySet {
         )
             .expect("failed to map kernel bss");
         info!("mapping physical memory");
-        memory_set
-            .insert_vma(
-            Vma::new(
-                (ekernel as usize).into(),
-                MEMORY_END.into(),
-                MapType::Identical,
-                MapPermission::R | MapPermission::W,
-                VmaKind::Kernel,
-            ),
-            None,
-        )
-            .expect("failed to map physical memory window");
+        let kernel_start = skernel as usize;
+        let kernel_end = ekernel as usize;
+        bootinfo::for_each_usable_memory_region(|region| {
+            let start = align_up_to_page(region.start);
+            let end = align_down_to_page(region.end);
+            map_kernel_ram_fragment(&mut memory_set, start, kernel_start.min(end));
+            map_kernel_ram_fragment(&mut memory_set, kernel_end.max(start), end);
+        });
         info!("mapping memory-mapped registers");
         for pair in MMIO {
             memory_set
