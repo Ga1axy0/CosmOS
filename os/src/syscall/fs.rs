@@ -2004,6 +2004,36 @@ fn check_path_search_permissions(cwd: &str, path: &str, uid: u32, gid: u32) -> R
     Ok(())
 }
 
+fn current_cred_in_group(gid: u32) -> bool {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let cred = inner.cred;
+    cred.egid == gid
+        || cred.supplementary_groups[..cred.supplementary_group_count]
+            .iter()
+            .any(|group| *group == gid)
+}
+
+fn chmod_inode(inode: &Arc<fs::Inode>, mode: u32) -> Result<(), ERRNO> {
+    const S_ISGID: u32 = 0o2000;
+
+    let process = current_process();
+    let euid = process.geteuid();
+    let owner = inode.uid().unwrap_or(0);
+    if euid != 0 && euid != owner {
+        return Err(ERRNO::EPERM);
+    }
+
+    let old_mode = inode_stat(inode).mode.bits();
+    let mut new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
+    let group = inode.gid().unwrap_or(0);
+    if euid != 0 && (new_mode & S_ISGID) != 0 && !current_cred_in_group(group) {
+        new_mode &= !S_ISGID;
+    }
+    inode.set_mode(new_mode)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum UtimeArg {
     Now,
@@ -3806,9 +3836,7 @@ pub fn sys_fchmod(fd: u32, mode: u32) -> isize {
             ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
         };
 
-        let old_mode = inode_stat(&inode).mode.bits();
-        let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
-        inode.set_mode(new_mode)?;
+        chmod_inode(&inode, mode)?;
         Ok(0)
     })
 }
@@ -3820,22 +3848,25 @@ pub fn sys_fchmodat(dirfd: isize, pathname: *const u8, mode: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     debug!("sys_fchmodat: dirfd = {}, pathname = {:?}, mode = {:#o}", dirfd, pathname, mode);
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, pathname).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(pathname, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
+        if path.split('/').any(|component| component.len() > NAME_MAX) {
+            return Err(ERRNO::ENAMETOOLONG);
+        }
 
-        let target = resolve_at_target(dirfd, path.as_str(), 0)?;
-        let inode = match target {
-            ResolvedAtTarget::Inode(i) => i,
-            ResolvedAtTarget::FileDesc(_) => return Err(ERRNO::EBADF),
-        };
+        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+        let process = current_process();
+        check_path_search_permissions(cwd.as_str(), path.as_str(), process.geteuid(), process.getegid())?;
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        if mount_is_readonly(abs_path.as_str()) {
+            return Err(ERRNO::EROFS);
+        }
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
 
-        let old_mode = inode_stat(&inode).mode.bits();
-        let new_mode = (old_mode & StatMode::TYPE_MASK.bits()) | (mode & StatMode::PERM_MASK.bits());
-        inode.set_mode(new_mode)?;
+        chmod_inode(&inode, mode)?;
         debug!("sys_fchmodat: ok");
         Ok(0)
     })

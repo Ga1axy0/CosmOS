@@ -206,6 +206,10 @@ pub const SYSCALL_GETPGID: usize = 155;
 pub const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
 pub const SYSCALL_SETSID: usize = 157;
+/// getgroups syscall
+pub const SYSCALL_GETGROUPS: usize = 158;
+/// setgroups syscall
+pub const SYSCALL_SETGROUPS: usize = 159;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
@@ -808,6 +812,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_SETRESGID => sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
+        SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),

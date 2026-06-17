@@ -31,6 +31,7 @@ const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const CAP_SETPCAP: usize = 8;
 const CAP_LAST_CAP: usize = 63;
+const NGROUPS_MAX: usize = 32;
 const PR_CAPBSET_READ: i32 = 23;
 const PR_CAPBSET_DROP: i32 = 24;
 
@@ -268,6 +269,46 @@ pub fn sys_getegid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getegid pid:{}", process.getpid());
     process.getegid() as isize
+}
+
+/// getgroups syscall
+pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        let cred = process.inner_exclusive_access().cred;
+        let count = cred.supplementary_group_count;
+        if size == 0 {
+            return Ok(count as isize);
+        }
+        if size < count {
+            return Err(ERRNO::EINVAL);
+        }
+        for i in 0..count {
+            write_pod_to_user(unsafe { list.add(i) }, &cred.supplementary_groups[i])?;
+        }
+        Ok(count as isize)
+    })
+}
+
+/// setgroups syscall
+pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        if size > NGROUPS_MAX {
+            return Err(ERRNO::EINVAL);
+        }
+        let mut groups = [0u32; NGROUPS_MAX];
+        for i in 0..size {
+            groups[i] = read_pod_from_user(unsafe { list.add(i) })?;
+        }
+        let mut inner = process.inner_exclusive_access();
+        if inner.cred.euid != 0 {
+            return Err(ERRNO::EPERM);
+        }
+        inner.cred.supplementary_groups = groups;
+        inner.cred.supplementary_group_count = size;
+        Ok(0)
+    })
 }
 
 fn cap_data_words(version: u32) -> Result<usize, ERRNO> {
