@@ -109,6 +109,7 @@ all:
 	$(MAKE) submodules
 	$(MAKE) cargo-config
 	$(MAKE) $(ALL_BUILD_TARGETS)
+	rm -f kernel-la
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
