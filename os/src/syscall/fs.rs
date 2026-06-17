@@ -1,7 +1,7 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device,
+    inode_stat, linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, make_pipe, mkdir_at_with_inode, mount_device,
     mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat, do_bind_mount, do_move_mount,
 };
@@ -83,6 +83,7 @@ const MAX_POLL_NFDS: usize = 4096;
 const FD_SET_BITS_PER_WORD: usize = usize::BITS as usize;
 const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
+const NAME_MAX: usize = 255;
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
 const MS_BIND: usize = 4096;
@@ -3608,13 +3609,14 @@ pub fn sys_chdir(path: *const u8) -> isize {
         "kernel:pid[{}] sys_chdir",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     let process = current_process();
     syscall_body!({
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
+        if path.split('/').any(|component| component.len() > NAME_MAX) {
+            return Err(ERRNO::ENAMETOOLONG);
+        }
         let cwd = process.inner_exclusive_access().cwd.clone();
-        let new_abs = canonicalize(cwd.as_str(), path.as_str());
-        let inode = lookup_inode_follow("/", new_abs.as_str(), true)?;
+        let (inode, new_abs) = lookup_inode_follow_with_path(cwd.as_str(), path.as_str(), true)?;
         if !inode.is_dir() {
             warn!("sys_chdir: target '{}' resolved to '{}', which is not a directory",
                 path, new_abs);

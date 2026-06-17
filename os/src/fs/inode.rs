@@ -638,8 +638,13 @@ fn join_remaining(target: &str, rest: &[String]) -> String {
     out
 }
 
-/// Resolve a path and optionally leave the final symlink unresolved.
-pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<Arc<Inode>, ERRNO> {
+/// Resolve a path and optionally leave the final symlink unresolved, returning
+/// both the target inode and the final canonical path after symlink expansion.
+pub fn lookup_inode_follow_with_path(
+    cwd: &str,
+    path: &str,
+    follow_final: bool,
+) -> Result<(Arc<Inode>, String), ERRNO> {
     let mut abs = canonicalize(cwd, path);
     let mut depth = 0usize;
 
@@ -650,7 +655,7 @@ pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<
             .map(String::from)
             .collect();
         if components.is_empty() {
-            return Ok(Arc::clone(&ROOT_INODE));
+            return Ok((Arc::clone(&ROOT_INODE), String::from("/")));
         }
 
         let mut cur = Arc::clone(&ROOT_INODE);
@@ -689,9 +694,14 @@ pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<
         if let Some(next_abs) = restart {
             abs = next_abs;
         } else {
-            return Ok(cur);
+            return Ok((cur, abs));
         }
     }
+}
+
+/// Resolve a path and optionally leave the final symlink unresolved.
+pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<Arc<Inode>, ERRNO> {
+    lookup_inode_follow_with_path(cwd, path, follow_final).map(|(inode, _)| inode)
 }
 
 /// Resolve parent directory with symlinks followed in all parent components.
