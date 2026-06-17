@@ -19,12 +19,22 @@ pub type ClockId = i32;
 pub const CLOCK_REALTIME: ClockId = 0;
 /// Linux 兼容的单调时钟 ID。
 pub const CLOCK_MONOTONIC: ClockId = 1;
+/// Linux compatible per-process CPU-time clock.
+pub const CLOCK_PROCESS_CPUTIME_ID: ClockId = 2;
+/// Linux compatible per-thread CPU-time clock.
+pub const CLOCK_THREAD_CPUTIME_ID: ClockId = 3;
 /// Linux compatible `CLOCK_MONOTONIC_RAW`.
 pub const CLOCK_MONOTONIC_RAW: ClockId = 4;
 /// Linux 兼容的 `CLOCK_REALTIME_COARSE`。
 pub const CLOCK_REALTIME_COARSE: ClockId = 5;
 /// Linux 兼容的 `CLOCK_MONOTONIC_COARSE`。
 pub const CLOCK_MONOTONIC_COARSE: ClockId = 6;
+/// Linux compatible `CLOCK_BOOTTIME`.
+pub const CLOCK_BOOTTIME: ClockId = 7;
+/// Linux compatible `CLOCK_REALTIME_ALARM`.
+pub const CLOCK_REALTIME_ALARM: ClockId = 8;
+/// Linux compatible `CLOCK_BOOTTIME_ALARM`.
+pub const CLOCK_BOOTTIME_ALARM: ClockId = 9;
 /// `clock_nanosleep(2)` absolute-deadline flag.
 pub const TIMER_ABSTIME: i32 = 1;
 
@@ -190,6 +200,10 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
     }
 }
 
+fn timespec_from_raw_ticks(raw_time: usize) -> Timespec {
+    timespec_from_ns(((raw_time as u128) * 1_000_000_000u128 / (CLOCK_FREQ as u128)) as u64)
+}
+
 /// 将内核 CPU 账户的原始时间计数转换为 `timeval`。
 fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
     let raw_time = raw_time as u128;
@@ -204,9 +218,14 @@ fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     match clockid {
         CLOCK_REALTIME
         | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
         | CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
-        | CLOCK_MONOTONIC_COARSE => {
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_BOOTTIME_ALARM => {
             // Expose the timer ABI as high-resolution so Linux RT userland
             // enables hrtimer paths such as cyclictest.
             Ok(Timespec {
@@ -434,11 +453,30 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
     );
     syscall_body!({
         let timespec = match clockid {
-            CLOCK_REALTIME => timespec_from_ns(get_realtime_ns()),
-            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => timespec_from_ns(get_time_ns()),
+            CLOCK_REALTIME | CLOCK_REALTIME_ALARM => timespec_from_ns(get_realtime_ns()),
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
+                timespec_from_ns(get_time_ns())
+            }
             CLOCK_REALTIME_COARSE => timespec_from_ns(get_realtime_ns()),
-            CLOCK_MONOTONIC_COARSE => timespec_from_ns(get_time_ns()),
-            // TODO：后续按 Linux 语义继续补充其它 clock id。
+            CLOCK_PROCESS_CPUTIME_ID => {
+                let (utime, stime, _, _) = current_process().times_snapshot(get_time());
+                timespec_from_raw_ticks(utime.saturating_add(stime))
+            }
+            CLOCK_THREAD_CPUTIME_ID => {
+                let now_ns = get_time_ns();
+                let task = current_task().unwrap();
+                let inner = task.inner_exclusive_access();
+                let active_delta = if inner.sched.exec_start_ns == 0 {
+                    0
+                } else {
+                    now_ns.saturating_sub(inner.sched.exec_start_ns)
+                };
+                let runtime = inner
+                    .sched
+                    .sum_exec_runtime_ns
+                    .saturating_add(active_delta);
+                timespec_from_ns(runtime)
+            }
             _ => return Err(ERRNO::EINVAL),
         };
         // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
