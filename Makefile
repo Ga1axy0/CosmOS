@@ -1,6 +1,6 @@
 DOCKER_NAME ?= rcore-docker
 
-ARCH ?= rv
+RUN_ARCH ?= rv
 BUILD_ARCH ?= all
 TARGET ?= riscv64gc-unknown-none-elf
 USER_MODE ?= release
@@ -13,9 +13,11 @@ QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
 MEM ?= 1G
 SMP ?= 1
-TEST_FS ?= sdcard-$(ARCH).img
+TEST_FS ?= sdcard-$(RUN_ARCH).img
+# 本地调试可设为 1，保留评测测试盘镜像。
+KEEP_SDCARD ?= 0
 # make run 使用写时复制副本，避免 QEMU 写坏原始测试镜像。
-RUN_TEST_FS ?= .make/sdcard-$(ARCH)-run.img
+RUN_TEST_FS ?= .make/sdcard-$(RUN_ARCH)-run.img
 TEST_FS_LA ?= sdcard-la.img
 RUN_TEST_FS_LA ?= .make/sdcard-la-run.img
 QEMU_NETDEV ?= user,id=net
@@ -68,14 +70,8 @@ MEM_LA ?= 1G
 QEMU_LA_NETDEV ?= user,id=net0
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
-# make all 默认同时构建两种架构；命令行可用 BUILD_ARCH/ARCH 只选一种。
-ifeq ($(origin BUILD_ARCH),command line)
+# make all 默认同时构建两种架构；命令行可用 BUILD_ARCH 只选一种。
 ALL_ARCH_REQUEST := $(BUILD_ARCH)
-else ifeq ($(origin ARCH),command line)
-ALL_ARCH_REQUEST := $(ARCH)
-else
-ALL_ARCH_REQUEST := all
-endif
 ALL_ARCH := $(shell printf '%s' "$(ALL_ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 
 ALL_TARGETS_RV := user-apps kernel-rv $(DISK_RV_IMG)
@@ -88,19 +84,19 @@ ALL_BUILD_TARGETS := $(ALL_TARGETS_RV)
 else ifneq ($(filter $(ALL_ARCH),la loongarch loongarch64 la64),)
 ALL_BUILD_TARGETS := $(ALL_TARGETS_LA)
 else
-$(error unsupported BUILD_ARCH/ARCH=$(ALL_ARCH_REQUEST), expected all, rv or la)
+$(error unsupported BUILD_ARCH=$(ALL_ARCH_REQUEST), expected all, rv or la)
 endif
 
-ifeq ($(ARCH),rv)
+ifeq ($(RUN_ARCH),rv)
 QEMU ?= $(QEMU_RV)
 RUN_KERNEL := kernel-rv
 RUN_DISK_IMG := $(DISK_RV_IMG)
-else ifeq ($(ARCH),la)
+else ifeq ($(RUN_ARCH),la)
 QEMU ?= $(QEMU_LA)
 RUN_KERNEL := kernel-la
 RUN_DISK_IMG := $(DISK_LA_IMG)
 else
-$(error unsupported ARCH=$(ARCH), expected rv or la)
+$(error unsupported RUN_ARCH=$(RUN_ARCH), expected rv or la)
 endif
 
 .PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready prepare-run-test-fs prepare-run-test-fs-la force
@@ -113,7 +109,11 @@ all:
 
 # 清理评测脚本解压测试盘后留下的残留镜像，避免 gzip -d 撞名。
 clean-eval-sdcard:
-	rm -f sdcard-rv.img sdcard-la.img sdcard.img
+	@if [ "$(KEEP_SDCARD)" = "1" ]; then \
+		echo "Keeping evaluation sdcard images."; \
+	else \
+		rm -f sdcard-rv.img sdcard-la.img sdcard.img; \
+	fi
 
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
@@ -334,10 +334,10 @@ run-trace: QEMU_TRACE_ARGS = -d int,in_asm -D qemu.log
 run-trace: run
 
 run-comp-rv:
-	$(MAKE) run ARCH=rv
+	$(MAKE) run RUN_ARCH=rv
 
 run-comp-la:
-	$(MAKE) run ARCH=la
+	$(MAKE) run RUN_ARCH=la
 
 debug: check-kernel $(RUN_DISK_IMG)
 	$(MAKE) -C os debug
