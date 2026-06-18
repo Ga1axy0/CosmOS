@@ -589,6 +589,14 @@ pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
     RUN_QUEUES[hart].lock().stop_task = Some(task);
 }
 
+/// Drop the stopped-task reference for the current hart.
+/// Called by the idle loop after `__switch` returns, once the previous
+/// task's kernel stack is guaranteed unused.
+pub fn clear_stopping_task() {
+    let hart = hartid();
+    RUN_QUEUES[hart].lock().stop_task = None;
+}
+
 /// Get process by pid.
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     let map = (*PID2PCB).lock();

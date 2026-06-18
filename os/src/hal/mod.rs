@@ -8,6 +8,7 @@ use crate::hal::traits::{AddressSpaceToken, HartId, PTEFlags, PagingArch};
 #[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv::{
     RiscvHartId as ArchHart, RiscvInterruptControl as ArchInterrupt,
+    RiscvSignalAbi as ArchSignalAbi, RiscvSyscallAbi as ArchSyscallAbi,
     RiscvTrapContextAbi as ArchTrapContextAbi,
     RiscvTrapMachine as ArchTrapMachine, Sv39Paging as ArchPaging,
 };
@@ -15,6 +16,7 @@ pub use crate::arch::riscv::{
 #[cfg(target_arch = "loongarch64")]
 pub use crate::arch::loongarch64::{
     LoongArchHartId as ArchHart, LoongArchInterruptControl as ArchInterrupt,
+    LoongArchSignalAbi as ArchSignalAbi, LoongArchSyscallAbi as ArchSyscallAbi,
     LoongArchTrapContextAbi as ArchTrapContextAbi,
     LoongArchTrapMachine as ArchTrapMachine, LoongArchPaging as ArchPaging,
 };

@@ -610,6 +610,11 @@ pub fn fork() -> isize {
     sys_clone(SIGCHLD as usize, 0, 0, 0, 0)
 }
 
+/// Linux `clone3` 系统调用的便捷封装。
+pub fn clone3(args: &Clone3Args) -> isize {
+    sys_clone3(args as *const _, core::mem::size_of::<Clone3Args>())
+}
+
 /// 兼容接口：执行程序（不传环境变量），内部等价于 `execve(path, args, [NULL])`。
 pub fn exec(path: &str, args: &[*const u8]) -> isize {
     let envp: [*const u8; 1] = [core::ptr::null()];

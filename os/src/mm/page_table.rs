@@ -1,6 +1,7 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{
-    frame_alloc, FrameTracker, MmError, PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END,
+    frame_alloc, frame_alloc_with_reclaim, FrameTracker, MmError, PhysAddr, PhysPageNum,
+    StepByOne, USER_SPACE_END,
     VirtAddr, VirtPageNum,
 };
 use crate::config::PAGE_SIZE;
@@ -67,7 +68,7 @@ pub struct PageTable {
 impl PageTable {
     /// Create a new page table
     pub fn new() -> Result<Self, MmError> {
-        let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
+        let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
         Ok(PageTable {
             root_ppn: frame.ppn,
             frames: vec![frame],
@@ -90,7 +91,7 @@ impl PageTable {
                 return Ok(Some(pte));
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
+                let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 self.frames.push(frame);
             }
@@ -111,7 +112,7 @@ impl PageTable {
                 return Ok(Some(pte));
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
+                let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 core::mem::forget(frame);
             }

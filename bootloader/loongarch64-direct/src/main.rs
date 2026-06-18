@@ -10,6 +10,7 @@ const UART_THR: usize = 0x00;
 const UART_LSR: usize = 0x05;
 const UART_LSR_THRE: u8 = 1 << 5;
 const KERNEL_ENTRY: usize = 0x9000_0000_9000_0000;
+const FDT_BASE: usize = 0x0010_0000;
 
 #[unsafe(no_mangle)]
 static mut BOOT_STACK: [u8; 4096] = [0; 4096];
@@ -45,8 +46,8 @@ extern "C" fn boot_main(hart_id: usize) -> ! {
         puts("[boot] jumping to kernel @ 0x90000000\r\n");
     }
     unsafe {
-        let entry: extern "C" fn(usize) -> ! = core::mem::transmute(KERNEL_ENTRY);
-        entry(hart_id);
+        let entry: extern "C" fn(usize, usize) -> ! = core::mem::transmute(KERNEL_ENTRY);
+        entry(hart_id, FDT_BASE);
     }
 }
 

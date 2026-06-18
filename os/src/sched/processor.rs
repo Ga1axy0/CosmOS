@@ -88,6 +88,9 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
 pub(crate) fn run_tasks() {
     loop {
+        // Drop any stopped-task reference left by the previous exit on this hart.
+        // The previous task's kernel stack is now guaranteed unused.
+        super::clear_stopping_task();
         if let Some(task) = pick_next_task(hartid()) {
             // debug!(
             //     "kernel: hart {} run_tasks, pid[{}]",

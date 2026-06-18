@@ -68,6 +68,29 @@ pub struct TrapInfo {
     pub fault_addr: usize,
 }
 
+/// One architecture-labeled general-purpose register used in fault dumps.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct NamedReg {
+    pub name: &'static str,
+    pub value: usize,
+}
+
+/// Architecture-normalized arguments for the legacy Linux `clone` syscall.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CloneArgs {
+    pub flags: usize,
+    pub stack: usize,
+    pub parent_tid: usize,
+    pub tls: usize,
+    pub child_tid: usize,
+}
+
+/// Architecture-specific syscall ABI details that are visible above traps.
+pub trait SyscallAbi {
+    /// Decode raw syscall argument registers into the common legacy `clone` layout.
+    fn decode_clone_args(args: [usize; 6]) -> CloneArgs;
+}
+
 /// Arch-specific trap/syscall machine operations used by common code.
 pub trait TrapMachine {
     /// Read the current trap cause and associated fault address.
@@ -161,6 +184,10 @@ pub trait TrapContextAbi {
     fn copy_fp_state_to(frame: &Self::Frame, fpregs: &mut [u64; 32], fcsr: &mut u32);
     /// Restore floating-point state from an external signal frame.
     fn restore_fp_state(frame: &mut Self::Frame, fpregs: &[u64; 32], fcsr: u32);
+    /// Export a compact architecture-labeled summary used by common fault logs.
+    fn fault_dump_summary(frame: &Self::Frame) -> [NamedReg; 7];
+    /// Export a wider architecture-labeled register snapshot used by fault logs.
+    fn fault_dump_detail(frame: &Self::Frame) -> [NamedReg; 19];
 }
 
 /// Opaque address-space activation token used by the current architecture.

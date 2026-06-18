@@ -20,7 +20,7 @@ use fs::vfs::{
 
 use crate::config::PAGE_SIZE;
 use crate::fs::{empty_statfs, StatFs64};
-use crate::mm::{frame_alloc, FrameTracker};
+use crate::mm::{frame_alloc_with_reclaim, FrameTracker};
 use crate::sync::SpinNoIrqLock;
 
 const TMPFS_FS_ID: u64 = STATFS_MAGIC_TMPFS;
@@ -406,7 +406,7 @@ impl VfsNode for TmpfsFileNode {
             let page = match inner.pages.entry(page_idx) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => entry.insert(
-                    frame_alloc().expect("tmpfs page allocation failed while writing file"),
+                    frame_alloc_with_reclaim().expect("tmpfs page allocation failed while writing file"),
                 ),
             };
             let bytes = page.ppn.get_bytes_array();

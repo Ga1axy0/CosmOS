@@ -294,6 +294,8 @@ pub const SYSCALL_KEYCTL: usize = 219;
 pub const SYSCALL_MUNMAP: usize = 215;
 /// clone syscall
 pub const SYSCALL_CLONE: usize = 220;
+/// clone3 syscall
+pub const SYSCALL_CLONE3: usize = 435;
 /// execve syscall
 pub const SYSCALL_EXECVE: usize = 221;
 /// mmap syscall
@@ -453,7 +455,13 @@ pub(crate) use fs::{bpf_prog_is_socket_filter, bpf_run_socket_filter_prog, write
 pub use times::Timespec;
 
 
-use crate::{fs::Stat, net::SockAddrIn, syscall::errno::ERRNO};
+use crate::{
+    fs::Stat,
+    hal::traits::SyscallAbi,
+    hal::ArchSyscallAbi,
+    net::SockAddrIn,
+    syscall::errno::ERRNO,
+};
 use crate::klog::*;
 
 /// Execute a syscall body that returns `Result<isize, ERRNO>`, automatically
@@ -472,7 +480,12 @@ macro_rules! syscall_body {
         let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
         match result {
             Ok(v) => v,
-            Err(e) => -(e as isize),
+            Err(e) => {
+                if matches!(e, $crate::syscall::errno::ERRNO::ENOMEM) {
+                    $crate::mm::log_oom("syscall", None, None);
+                }
+                -(e as isize)
+            }
         }
     }};
 }
@@ -805,7 +818,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMCTL => sys_shmctl(args[0], args[1] as i32, args[2]),
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2] as i32),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
-        SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_CLONE => sys_clone(ArchSyscallAbi::decode_clone_args(args)),
+        SYSCALL_CLONE3 => sys_clone3(args[0] as *const Clone3Args, args[1]),
         SYSCALL_UNSHARE => sys_unshare(args[0]),
         SYSCALL_SETNS => sys_setns(args[0] as i32, args[1] as i32),
         SYSCALL_EXECVE => sys_execve(

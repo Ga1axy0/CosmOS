@@ -1,6 +1,6 @@
 //! Implementation of [`TrapContext`]
 use crate::hal::ArchTrapContextAbi;
-use crate::hal::traits::TrapContextAbi;
+use crate::hal::traits::{NamedReg, TrapContextAbi};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -141,6 +141,16 @@ impl TrapContext {
         ArchTrapContextAbi::restore_fp_state(&mut self.arch, fpregs, fcsr);
     }
 
+    /// Export an architecture-labeled summary used by common fault logs.
+    pub fn fault_dump_summary(&self) -> [NamedReg; 7] {
+        ArchTrapContextAbi::fault_dump_summary(&self.arch)
+    }
+
+    /// Export a wider architecture-labeled register snapshot used by fault logs.
+    pub fn fault_dump_detail(&self) -> [NamedReg; 19] {
+        ArchTrapContextAbi::fault_dump_detail(&self.arch)
+    }
+
     /// init the trap context of an application
     pub fn app_init_context(
         entry: usize,
@@ -150,7 +160,7 @@ impl TrapContext {
         trap_handler: usize,
     ) -> Self {
         unsafe { crate::hal::enable_fp() };
-        let mut cx = Self {
+        let cx = Self {
             arch: ArchTrapContextAbi::new_user_frame(
                 entry,
                 sp,

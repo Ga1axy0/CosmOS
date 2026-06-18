@@ -249,6 +249,7 @@ pub fn futex_wait_addr(
     expected: i32,
     deadline_ns: Option<u64>,
 ) -> Result<isize, ERRNO> {
+    let task = current_task().unwrap();
     let current = read_pod_from_user(uaddr)?;
     if current != expected {
         return Err(ERRNO::EAGAIN);
@@ -262,7 +263,6 @@ pub fn futex_wait_addr(
     }
 
     let queue = futex_queue(uaddr as usize);
-    let task = current_task().unwrap();
     let handle = deadline_ns
         .map(|_| register_futex_wait(&task).ok_or(ERRNO::EAGAIN))
         .transpose()?;
@@ -270,10 +270,13 @@ pub fn futex_wait_addr(
         add_timer_with_futex_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
     }
     queue.wait_with_reason_or_skip(WaitReason::Futex, || {
-        read_pod_from_user(uaddr)
-            .map(|current| current != expected)
-            .unwrap_or(true)
-            || handle.is_some_and(futex_wait_should_skip)
+        let current_after_enqueue = read_pod_from_user(uaddr);
+        let value_changed = current_after_enqueue
+            .as_ref()
+            .map(|current| *current != expected)
+            .unwrap_or(true);
+        let handle_ready = handle.is_some_and(futex_wait_should_skip);
+        value_changed || handle_ready
     });
     if let Some(handle) = handle {
         let wake_state = futex_wait_state(handle);

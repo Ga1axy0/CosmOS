@@ -10,6 +10,7 @@ mod address;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
+mod oom;
 mod page_table;
 mod tlb_shootdown;
 
@@ -45,16 +46,17 @@ pub enum PageFaultHandled {
 
 pub use address::{phys_to_virt, virt_to_phys, PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END, VirtAddr, VirtPageNum};
 pub use frame_allocator::{
-    frame_alloc, frame_alloc_contiguous, frame_allocator_stats, frame_dealloc,
-    frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
+    frame_alloc, frame_alloc_contiguous, frame_alloc_with_reclaim, frame_allocator_stats,
+    frame_dealloc, frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
 };
-pub use heap_allocator::map_one_heap_page;
+pub use heap_allocator::{map_one_heap_page, KERNEL_HEAP_USED_BYTES};
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
-    DeferredUserReclaim, ElfLoadInfo, InodeKey, MapPermission, MemorySet, PageFaultAccess,
-    UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
+    unregister_file_mappings_for_process, DeferredUserReclaim, ElfLoadInfo, InodeKey,
+    MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
+pub use oom::{log_oom, warn_heap_state, warn_heap_state_lockfree};
 pub use tlb_shootdown::{
     clear_deferred, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
     defer_release, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush, online_mask, shootdown,

@@ -3,7 +3,13 @@
 use core::arch::{asm, global_asm};
 
 use crate::config::TRAMPOLINE;
-use crate::hal::traits::{InterruptControl, TrapCause, TrapContextAbi, TrapInfo, TrapMachine};
+use crate::hal::traits::{
+    CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
+    TrapMachine,
+};
+use crate::signal::{SignalAbi, SignalAction, SignalBit, SigSetT, StackT};
+use crate::syscall::Pod;
+use crate::trap::TrapContext;
 
 global_asm!(include_str!("trap.S"));
 
@@ -50,6 +56,12 @@ pub struct LoongArchTrapMachine;
 /// LoongArch64 register-layout helpers for the common trap context.
 pub struct LoongArchTrapContextAbi;
 
+/// LoongArch64 Linux signal ABI implementation.
+pub struct LoongArchSignalAbi;
+
+/// LoongArch64 legacy Linux syscall ABI implementation.
+pub struct LoongArchSyscallAbi;
+
 /// LoongArch64 trap frame layout shared with `trap.S`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +76,66 @@ pub struct LoongArchTrapContextFrame {
     pub f: [u64; 32],
     pub fcsr: usize,
 }
+
+/// LoongArch musl raw `rt_sigaction` syscall layout:
+/// handler, flags, and the low 64 bits of sigset_t.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LoongArchUserSigAction {
+    pub handler: usize,
+    pub sa_flags: usize,
+    pub sa_mask: u64,
+}
+
+impl Pod for LoongArchUserSigAction {}
+
+impl SyscallAbi for LoongArchSyscallAbi {
+    fn decode_clone_args(args: [usize; 6]) -> CloneArgs {
+        // Linux LoongArch does not select CONFIG_CLONE_BACKWARDS:
+        // clone(flags, stack, parent_tidptr, child_tidptr, tls).
+        CloneArgs {
+            flags: args[0],
+            stack: args[1],
+            parent_tid: args[2],
+            tls: args[4],
+            child_tid: args[3],
+        }
+    }
+}
+
+/// LoongArch musl `mcontext_t`.
+///
+/// Verified against the local LoongArch musl headers:
+/// size = 272, align = 16, pc at 0, gregs at 8, flags at 264.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
+pub struct LoongArchMContext {
+    pub pc: usize,
+    pub gregs: [usize; 32],
+    pub flags: u32,
+    pub _pad: u32,
+}
+
+impl Pod for LoongArchMContext {}
+
+const _: [(); 272] = [(); core::mem::size_of::<LoongArchMContext>()];
+const _: [(); 16] = [(); core::mem::align_of::<LoongArchMContext>()];
+
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
+pub struct LoongArchUContext {
+    pub uc_flags: usize,
+    pub uc_link: usize,
+    pub uc_stack: StackT,
+    pub uc_sigmask: SigSetT,
+    pub uc_pad: isize,
+    pub uc_mcontext: LoongArchMContext,
+}
+
+impl Pod for LoongArchUContext {}
+
+const _: [(); 448] = [(); core::mem::size_of::<LoongArchUContext>()];
+const _: [(); 16] = [(); core::mem::align_of::<LoongArchUContext>()];
 
 /// 用户态 `rt_sigreturn` trampoline 机器码。
 ///
@@ -201,6 +273,89 @@ impl TrapMachine for LoongArchTrapMachine {
     }
 }
 
+impl SignalAbi for LoongArchSignalAbi {
+    type UserSigAction = LoongArchUserSigAction;
+    type UContext = LoongArchUContext;
+
+    fn decode_user_sigaction(action: Self::UserSigAction) -> SignalAction {
+        SignalAction {
+            handler: action.handler,
+            sa_flags: action.sa_flags as u32,
+            sa_restorer: 0,
+            sa_mask: SignalBit::from_user_bits(action.sa_mask).bits(),
+        }
+    }
+
+    fn encode_user_sigaction(action: SignalAction) -> Self::UserSigAction {
+        Self::UserSigAction {
+            handler: action.handler,
+            sa_flags: action.sa_flags as usize,
+            sa_mask: SignalBit::from_bits(action.sa_mask)
+                .unwrap_or(SignalBit::empty())
+                .user_bits(),
+        }
+    }
+
+    fn user_sigaction_parts(action: &Self::UserSigAction) -> (usize, usize, usize, u64) {
+        (action.handler, action.sa_flags, 0, action.sa_mask)
+    }
+
+    fn build_ucontext(trap_cx: &TrapContext, old_mask: u64) -> Self::UContext {
+        let mut gregs = [0usize; 32];
+        for (idx, reg) in gregs.iter_mut().enumerate() {
+            *reg = trap_cx.reg(idx);
+        }
+        gregs[0] = 0;
+
+        Self::UContext {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: StackT {
+                ss_sp: 0,
+                ss_flags: 0,
+                ss_size: 0,
+            },
+            uc_sigmask: SigSetT::from_signal_bits(old_mask),
+            uc_pad: 0,
+            uc_mcontext: LoongArchMContext {
+                pc: trap_cx.user_pc(),
+                gregs,
+                flags: 0,
+                _pad: 0,
+            },
+        }
+    }
+
+    fn signal_mask(ucontext: &Self::UContext) -> u64 {
+        ucontext.uc_sigmask.low_bits()
+    }
+
+    fn restore_ucontext(ucontext: &Self::UContext, trap_cx: &mut TrapContext) {
+        trap_cx.set_user_pc(ucontext.uc_mcontext.pc);
+        for idx in 1..32 {
+            trap_cx.set_reg(idx, ucontext.uc_mcontext.gregs[idx]);
+        }
+    }
+
+    fn saved_pc(ucontext: &Self::UContext) -> usize {
+        ucontext.uc_mcontext.pc
+    }
+
+    fn set_saved_pc(ucontext: &mut Self::UContext, pc: usize) {
+        ucontext.uc_mcontext.pc = pc;
+    }
+
+    fn saved_arg0(ucontext: &Self::UContext) -> usize {
+        let index = <LoongArchTrapContextAbi as TrapContextAbi>::signal_gpr_arg0_index();
+        ucontext.uc_mcontext.gregs[index]
+    }
+
+    fn set_saved_arg0(ucontext: &mut Self::UContext, value: usize) {
+        let index = <LoongArchTrapContextAbi as TrapContextAbi>::signal_gpr_arg0_index();
+        ucontext.uc_mcontext.gregs[index] = value;
+    }
+}
+
 impl TrapContextAbi for LoongArchTrapContextAbi {
     type Frame = LoongArchTrapContextFrame;
 
@@ -322,6 +477,42 @@ impl TrapContextAbi for LoongArchTrapContextAbi {
     fn restore_fp_state(frame: &mut Self::Frame, fpregs: &[u64; 32], fcsr: u32) {
         frame.f.copy_from_slice(fpregs);
         frame.fcsr = fcsr as usize;
+    }
+
+    fn fault_dump_summary(frame: &Self::Frame) -> [NamedReg; 7] {
+        [
+            NamedReg { name: "ra", value: frame.r[1] },
+            NamedReg { name: "sp", value: frame.r[3] },
+            NamedReg { name: "fp", value: frame.r[22] },
+            NamedReg { name: "tp", value: frame.r[2] },
+            NamedReg { name: "a0", value: frame.r[4] },
+            NamedReg { name: "a1", value: frame.r[5] },
+            NamedReg { name: "a7", value: frame.r[11] },
+        ]
+    }
+
+    fn fault_dump_detail(frame: &Self::Frame) -> [NamedReg; 19] {
+        [
+            NamedReg { name: "a2", value: frame.r[6] },
+            NamedReg { name: "a3", value: frame.r[7] },
+            NamedReg { name: "a4", value: frame.r[8] },
+            NamedReg { name: "a5", value: frame.r[9] },
+            NamedReg { name: "a6", value: frame.r[10] },
+            NamedReg { name: "t0", value: frame.r[12] },
+            NamedReg { name: "t1", value: frame.r[13] },
+            NamedReg { name: "t2", value: frame.r[14] },
+            NamedReg { name: "t3", value: frame.r[15] },
+            NamedReg { name: "t4", value: frame.r[16] },
+            NamedReg { name: "t5", value: frame.r[17] },
+            NamedReg { name: "t6", value: frame.r[18] },
+            NamedReg { name: "t7", value: frame.r[19] },
+            NamedReg { name: "t8", value: frame.r[20] },
+            NamedReg { name: "u0", value: frame.r[21] },
+            NamedReg { name: "s0", value: frame.r[23] },
+            NamedReg { name: "s1", value: frame.r[24] },
+            NamedReg { name: "s2", value: frame.r[25] },
+            NamedReg { name: "s3", value: frame.r[26] },
+        ]
     }
 }
 

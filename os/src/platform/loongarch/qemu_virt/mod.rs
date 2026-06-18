@@ -165,8 +165,14 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     // physical address would drop APs outside the cached DMW window right
     // after wakeup.
     let entry = _start as usize;
+    let boot_info = crate::bootinfo::get();
+    let hart_count = if boot_info.fdt_blob().is_some() {
+        boot_info.hart_count()
+    } else {
+        crate::config::MAX_HARTS
+    };
     enable_ipi();
-    for hart_id in 0..crate::config::MAX_HARTS {
+    for hart_id in 0..hart_count.min(crate::config::MAX_HARTS) {
         if hart_id == bootstrap_hart_id {
             continue;
         }

@@ -10,4 +10,7 @@ pub mod trap;
 
 pub use hart::RiscvHartId;
 pub use paging::Sv39Paging;
-pub use trap::{RiscvInterruptControl, RiscvTrapContextAbi, RiscvTrapMachine};
+pub use trap::{
+    RiscvInterruptControl, RiscvSignalAbi, RiscvSyscallAbi, RiscvTrapContextAbi,
+    RiscvTrapMachine,
+};

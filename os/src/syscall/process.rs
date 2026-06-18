@@ -1,15 +1,20 @@
-use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
+use crate::hal::traits::CloneArgs;
+use crate::mm::{
+    frame_allocator_stats, unregister_file_mappings_for_process, warn_heap_state, MapPermission,
+    USER_SPACE_END, VirtAddr,
+};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{read_pod_from_user, translated_byte_buffer_with_access, write_pod_to_user, Pod};
+use crate::syscall::{
+    read_bytes_from_user, read_pod_from_user, write_pod_to_user, Pod,
+};
 use crate::syscall_body;
-use crate::task::yield_current_and_run_next;
 use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
     hal::hartid,
     ipc::{self, IPC_RMID},
-    mm::{translated_ref, translated_str, PageFaultAccess},
+    mm::{translated_ref, translated_str},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
@@ -18,7 +23,7 @@ use crate::{
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 const UID_NO_CHANGE: u32 = u32::MAX;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
@@ -768,6 +773,85 @@ const CLONE_EXIT_SIGNAL_SIGCHLD: usize = 17;
 /// Linux clone flags 中低 8 位保存退出信号。
 const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
 
+/// Linux `clone3` 的用户态参数布局。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Clone3Args {
+    pub flags: u64,
+    pub pidfd: u64,
+    pub child_tid: u64,
+    pub parent_tid: u64,
+    pub exit_signal: u64,
+    pub stack: u64,
+    pub stack_size: u64,
+    pub tls: u64,
+    pub set_tid: u64,
+    pub set_tid_size: u64,
+    pub cgroup: u64,
+}
+
+const CLONE3_ARGS_SIZE: usize = core::mem::size_of::<Clone3Args>();
+
+#[derive(Debug, Clone, Copy)]
+struct CloneRequest {
+    flags: usize,
+    exit_signal: usize,
+    stack: usize,
+    stack_size: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
+}
+
+impl CloneRequest {
+    fn from_legacy(args: CloneArgs) -> Self {
+        Self {
+            flags: args.flags,
+            exit_signal: args.flags & CLONE_EXIT_SIGNAL_MASK,
+            stack: args.stack,
+            stack_size: 0,
+            parent_tid: args.parent_tid,
+            tls: args.tls,
+            child_tid: args.child_tid,
+        }
+    }
+
+    fn from_clone3(args: Clone3Args, size: usize) -> Result<Self, ERRNO> {
+        if size == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if size > CLONE3_ARGS_SIZE {
+            return Err(ERRNO::E2BIG);
+        }
+        let flags = args.flags as usize;
+        if flags & CLONE_EXIT_SIGNAL_MASK != 0 {
+            warn!("kernel: sys_clone3 flags may not contain an exit signal");
+            return Err(ERRNO::EINVAL);
+        }
+        if args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
+            warn!("kernel: sys_clone3 unsupported pidfd/set_tid/cgroup fields");
+            return Err(ERRNO::EINVAL);
+        }
+        let exit_signal = args.exit_signal as usize;
+        if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
+            warn!(
+                "kernel: sys_clone3 unsupported exit signal {}, only SIGCHLD/0 is implemented",
+                exit_signal
+            );
+            return Err(ERRNO::EINVAL);
+        }
+        Ok(Self {
+            flags,
+            exit_signal,
+            stack: args.stack as usize,
+            stack_size: args.stack_size as usize,
+            parent_tid: args.parent_tid as usize,
+            tls: args.tls as usize,
+            child_tid: args.child_tid as usize,
+        })
+    }
+}
+
 bitflags! {
     /// Linux `clone` 的功能标志位，不包含低 8 位退出信号。
     struct CloneFlags: usize {
@@ -813,20 +897,28 @@ bitflags! {
 /// Linux `clone` syscall。
 ///
 /// 当前支持 fork-like 进程创建，以及 musl pthread 使用的 CLONE_VM 线程创建子集。
-pub fn sys_clone(
-    flags: usize,
-    stack: usize,
-    parent_tid: usize,
-    tls: usize,
-    child_tid: usize,
-) -> isize {
+pub fn sys_clone(args: CloneArgs) -> isize {
+    sys_clone_request(CloneRequest::from_legacy(args))
+}
+
+fn sys_clone_request(req: CloneRequest) -> isize {
     syscall_body!({
-        let clone_flags_arg = flags;
-        trace!(
-            "kernel:pid[{}] sys_clone flags={:#x} stack={:#x}",
-            current_task().unwrap().process.upgrade().unwrap().getpid(),
+        let CloneRequest {
             flags,
+            exit_signal,
             stack,
+            stack_size,
+            parent_tid,
+            tls,
+            child_tid,
+        } = req;
+        let clone_flags_arg = flags | exit_signal;
+        trace!(
+            "kernel:pid[{}] sys_clone flags={:#x} stack={:#x} stack_size={:#x}",
+            current_task().unwrap().process.upgrade().unwrap().getpid(),
+            clone_flags_arg,
+            stack,
+            stack_size,
         );
         debug!(
             "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
@@ -835,7 +927,6 @@ pub fn sys_clone(
             child_tid
         );
 
-        let exit_signal = flags & CLONE_EXIT_SIGNAL_MASK;
         let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
         let flags = CloneFlags::from_bits_truncate(raw_clone_flags);
         let unsupported_flags = raw_clone_flags & !CloneFlags::all().bits();
@@ -912,7 +1003,6 @@ pub fn sys_clone(
         }
         let mut child_tls = None;
         if flags.contains(CloneFlags::CLONE_SETTLS) {
-            debug!("kernel: sys_clone set child TLS to {:#x}", tls);
             child_tls = Some(tls);
         }
         let current_process = current_process();
@@ -933,6 +1023,15 @@ pub fn sys_clone(
                 .map_err(|_| ERRNO::ENOMEM)?;
             let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
             let new_inner_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid;
+            let child_user_sp = if stack_size != 0 {
+                if stack == 0 {
+                    warn!("kernel: sys_clone clone3 stack_size set without a stack base");
+                    return Err(ERRNO::EINVAL);
+                }
+                stack.checked_add(stack_size).ok_or(ERRNO::EINVAL)?
+            } else {
+                stack
+            };
             debug!(
                 "kernel: sys_clone thread: new_tid(thread_id)={} inner_tid={} parent_set_tid_addr={:#x} child_set_tid_addr={:#x} clear_child_tid_addr={:#x}",
                 new_tid,
@@ -952,8 +1051,8 @@ pub fn sys_clone(
                 *trap_cx = inherited_cx;
                 trap_cx.set_kernel_sp(new_task.kstack.get_top());
                 trap_cx.set_syscall_ret(0);
-                if stack != 0 {
-                    trap_cx.set_user_sp(stack);
+                if child_user_sp != 0 {
+                    trap_cx.set_user_sp(child_user_sp);
                 }
                 if let Some(tls) = child_tls {
                     trap_cx.set_tls(tls);
@@ -988,6 +1087,29 @@ pub fn sys_clone(
             }
             Ok(child_pid as isize)
         }
+    })
+}
+
+/// Linux `clone3` syscall。
+pub fn sys_clone3(uargs: *const Clone3Args, size: usize) -> isize {
+    syscall_body!({
+        if uargs.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        let mut args = Clone3Args::default();
+        let copy_len = size.min(CLONE3_ARGS_SIZE);
+        if copy_len != 0 {
+            let bytes = read_bytes_from_user(uargs as *const u8, copy_len)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    &mut args as *mut Clone3Args as *mut u8,
+                    copy_len,
+                );
+            }
+        }
+        let req = CloneRequest::from_clone3(args, size)?;
+        Ok(sys_clone_request(req))
     })
 }
 
@@ -1176,6 +1298,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             if let Some(idx) = zombie_idx {
                 let child = inner.children.remove(idx);
                 let found_pid = child.getpid();
+                // warn_heap_state("reap_begin", found_pid);
                 let child_inner = child.inner_exclusive_access();
                 // 编码为wstatus
                let exit_status = match child_inner.exit_reason {
@@ -1203,12 +1326,22 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     .saturating_add(child_inner.child_kernel_time);
                 drop(child_inner);
                 drop(inner);
+                let strong_before = Arc::strong_count(&child);
+                let weak_before = Arc::weak_count(&child);
+                unregister_file_mappings_for_process(&child);
                 remove_from_pid2process(found_pid);
+                let strong_after_pid2pcb = Arc::strong_count(&child);
+                drop(child);
+                warn!(
+                    "[heap_trace] reap_pcb_dropped pid={} strong_before={} strong_after_pid2pcb={} weak={}",
+                    found_pid, strong_before, strong_after_pid2pcb, weak_before,
+                );
 
                 if !exit_status_ptr.is_null() {
                     write_pod_to_user(exit_status_ptr, &exit_status)?;
                 }
 
+                // warn_heap_state("reap_end", found_pid);
                 return Ok(found_pid as isize);
             }
 
