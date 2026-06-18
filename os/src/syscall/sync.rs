@@ -1,4 +1,7 @@
-use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore, futex_queue, futex_wait_mark_ready, futex_wake_addr, futex_wait_addr};
+use crate::sync::{
+    futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar, Mutex, MutexBlocking,
+    MutexSpin, Semaphore,
+};
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
@@ -120,8 +123,9 @@ pub fn sys_futex(
                     Some(ptr) => futex_deadline_mono_ns(ptr, false, false)?,
                     None => None,
                 };
-                let ret = futex_wait_addr(uaddr, val, deadline);
-                warn!(
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                let ret = futex_wait_addr(uaddr, val, deadline, private);
+                debug!(
                     "[futex-debug] syscall WAIT result pid={} tid={} uaddr={:#x} expected={} deadline={:?} ret={:?}",
                     current_process().getpid(),
                     current_tid(),
@@ -133,8 +137,18 @@ pub fn sys_futex(
                 ret
             }
             FUTEX_WAKE => {
+                let flags = op & !FUTEX_CMD_MASK;
+                if flags & !FUTEX_PRIVATE_FLAG != 0 {
+                    warn!(
+                        "Unsupported futex WAKE flags: op={:#x} flags={:#x}",
+                        op,
+                        flags
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
                 let max_count = val.max(0) as usize;
-                let ret = futex_wake_addr(uaddr as usize, max_count);
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                let ret = futex_wake_addr(uaddr as usize, max_count, private)?;
                 Ok(ret)
             }
             FUTEX_REQUEUE => {
@@ -156,14 +170,14 @@ pub fn sys_futex(
                     );
                     return Err(ERRNO::EINVAL);
                 }
-                let src = futex_queue(uaddr as usize);
-                let dst = futex_queue(uaddr2);
-                let ret = src.wake_and_requeue_with(
-                    &dst,
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                let ret = futex_requeue_addr(
+                    uaddr as usize,
+                    uaddr2,
                     val.max(0) as usize,
                     timeout,
-                    futex_wait_mark_ready,
-                ) as isize;
+                    private,
+                )?;
                 Ok(ret)
             }
             FUTEX_WAIT_BITSET => {
@@ -196,7 +210,8 @@ pub fn sys_futex(
                     }
                     None => None,
                 };
-                futex_wait_addr(uaddr, val, deadline)
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                futex_wait_addr(uaddr, val, deadline, private)
             }
             FUTEX_WAKE_BITSET => {
                 let flags = op & !FUTEX_CMD_MASK;
@@ -217,7 +232,8 @@ pub fn sys_futex(
                     return Err(ERRNO::EINVAL);
                 }
                 let max_count = val.max(0) as usize;
-                let ret = futex_wake_addr(uaddr as usize, max_count);
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                let ret = futex_wake_addr(uaddr as usize, max_count, private)?;
                 Ok(ret)
             }
             _ => {

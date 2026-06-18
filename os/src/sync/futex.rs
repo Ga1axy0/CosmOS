@@ -1,14 +1,26 @@
 use crate::sync::SpinNoIrqLock;
 use crate::{
+    config::PAGE_SIZE,
+    mm::VirtAddr,
     syscall::{read_pod_from_user, errno::ERRNO},
-    task::{current_task, wakeup_task, TaskControlBlock, WaitQueue, WaitReason},
+    task::{
+        current_process, current_task, wakeup_task, ProcessControlBlock, TaskControlBlock,
+        WaitQueue, WaitReason,
+    },
     timer::{add_timer_with_futex_tag, get_time_ns},
 };
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
 
 const MAX_FUTEX_WAITERS: usize = 256;
+const MAX_CACHED_FUTEX_KEYS: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FutexKey {
+    address: usize,
+    private_mm: Option<usize>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FutexWaitState {
@@ -40,7 +52,7 @@ impl Default for FutexWaitSlot {
 }
 
 lazy_static! {
-    static ref FUTEX_QUEUES: SpinNoIrqLock<HashMap<usize, Arc<WaitQueue>>> =
+    static ref FUTEX_QUEUES: SpinNoIrqLock<HashMap<FutexKey, Weak<WaitQueue>>> =
         SpinNoIrqLock::new(HashMap::new());
     static ref FUTEX_WAIT_REGISTRY: SpinNoIrqLock<FutexWaitRegistry> =
         SpinNoIrqLock::new(FutexWaitRegistry::new());
@@ -125,13 +137,47 @@ enum FutexWakeState {
     Canceled,
 }
 
-/// Get or create the wait queue associated with the given futex address.
-pub fn futex_queue(uaddr: usize) -> Arc<WaitQueue> {
+fn futex_key(
+    process: &Arc<ProcessControlBlock>,
+    uaddr: usize,
+    private: bool,
+) -> Result<FutexKey, ERRNO> {
+    let process_inner = process.inner_exclusive_access();
+    if private {
+        return Ok(FutexKey {
+            address: uaddr,
+            private_mm: Some(process_inner.memory_set.token()),
+        });
+    }
+
+    let va = VirtAddr(uaddr);
+    let pte = process_inner
+        .memory_set
+        .translate(va.floor())
+        .ok_or(ERRNO::EFAULT)?;
+    Ok(FutexKey {
+        address: pte.ppn().0 * PAGE_SIZE + va.page_offset(),
+        private_mm: None,
+    })
+}
+
+fn futex_queue_by_key(key: FutexKey) -> Arc<WaitQueue> {
     let mut queues = FUTEX_QUEUES.lock();
-    queues
-        .entry(uaddr)
-        .or_insert_with(|| Arc::new(WaitQueue::new()))
-        .clone()
+    if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
+        return queue;
+    }
+    if queues.len() >= MAX_CACHED_FUTEX_KEYS {
+        queues.retain(|_, queue| queue.strong_count() != 0);
+    }
+    let queue = Arc::new(WaitQueue::new());
+    queues.insert(key, Arc::downgrade(&queue));
+    queue
+}
+
+/// Get or create the wait queue associated with a futex in the current process.
+pub fn futex_queue(uaddr: usize, private: bool) -> Result<Arc<WaitQueue>, ERRNO> {
+    let key = futex_key(&current_process(), uaddr, private)?;
+    Ok(futex_queue_by_key(key))
 }
 
 fn register_futex_wait(task: &Arc<TaskControlBlock>) -> Option<FutexWaitHandle> {
@@ -227,15 +273,61 @@ pub fn handle_futex_wait_timeout(tag: FutexTimerTag, task: &Arc<TaskControlBlock
     true
 }
 
-/// Wake up tasks waiting on the given futex address, up to the specified maximum count.
-pub fn futex_wake_addr(uaddr: usize, max_count: usize) -> isize {
+fn futex_wake_key(key: FutexKey, uaddr: usize, max_count: usize) -> isize {
     let queue = {
         let queues = FUTEX_QUEUES.lock();
-        queues.get(&uaddr).cloned()
+        queues.get(&key).and_then(Weak::upgrade)
     };
-    queue
-        .map(|q| q.wake_up_to_with(max_count, futex_wait_mark_ready) as isize)
-        .unwrap_or(0)
+    let woke = queue
+        .map(|q| {
+            q.wake_up_to_with(max_count, |task| {
+
+                futex_wait_mark_ready(task);
+            }) as isize
+        })
+        .unwrap_or(0);
+    woke
+}
+
+/// Wake tasks waiting on a futex in the current process.
+pub fn futex_wake_addr(
+    uaddr: usize,
+    max_count: usize,
+    private: bool,
+) -> Result<isize, ERRNO> {
+    futex_wake_addr_in_process(&current_process(), uaddr, max_count, private)
+}
+
+/// Wake tasks using an explicitly supplied process address space.
+pub fn futex_wake_addr_in_process(
+    process: &Arc<ProcessControlBlock>,
+    uaddr: usize,
+    max_count: usize,
+    private: bool,
+) -> Result<isize, ERRNO> {
+    let key = futex_key(process, uaddr, private)?;
+    Ok(futex_wake_key(key, uaddr, max_count))
+}
+
+/// Wake waiters on one futex and move more waiters to another futex queue.
+pub fn futex_requeue_addr(
+    uaddr: usize,
+    uaddr2: usize,
+    wake_count: usize,
+    requeue_count: usize,
+    private: bool,
+) -> Result<isize, ERRNO> {
+    let process = current_process();
+    let src_key = futex_key(&process, uaddr, private)?;
+    let dst_key = futex_key(&process, uaddr2, private)?;
+    let src = futex_queue_by_key(src_key);
+    let dst = futex_queue_by_key(dst_key);
+    Ok(src.wake_and_requeue_with(
+        &dst,
+        wake_count,
+        requeue_count,
+        futex_wait_mark_ready,
+    ) as isize)
 }
 
 /// Wait on the futex at `uaddr` while its value still equals `expected`.
@@ -248,6 +340,7 @@ pub fn futex_wait_addr(
     uaddr: *const i32,
     expected: i32,
     deadline_ns: Option<u64>,
+    private: bool,
 ) -> Result<isize, ERRNO> {
     let task = current_task().unwrap();
     let current = read_pod_from_user(uaddr)?;
@@ -262,7 +355,7 @@ pub fn futex_wait_addr(
         }
     }
 
-    let queue = futex_queue(uaddr as usize);
+    let queue = futex_queue(uaddr as usize, private)?;
     let handle = deadline_ns
         .map(|_| register_futex_wait(&task).ok_or(ERRNO::EAGAIN))
         .transpose()?;
