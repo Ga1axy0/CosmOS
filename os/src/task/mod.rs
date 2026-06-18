@@ -25,7 +25,7 @@ use crate::syscall::write_process_accounting_on_exit;
 use crate::ipc;
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
-use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
+use crate::sync::{cleanup_futex_wait_for_task, futex_wake_addr_in_process};
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
 use crate::mm::{warn_heap_state, warn_heap_state_lockfree, DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::{get_time, get_time_us};
@@ -172,12 +172,24 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 );
             }
         }
-        let woke = futex_wake_addr(clear_child_tid, 1);
-        debug!(
-            "exit_current_and_run_next: futex_wake_addr({:#x}, 1) -> {}",
-            clear_child_tid,
-            woke
-        );
+        // CLONE_CHILD_CLEARTID specifies a plain FUTEX_WAKE. In particular,
+        // musl points child_tid at its shared __thread_list_lock.
+        match futex_wake_addr_in_process(&process, clear_child_tid, 1, false) {
+            Ok(woke) => {
+                debug!(
+                    "exit_current_and_run_next: futex_wake_addr({:#x}, 1) -> {}",
+                    clear_child_tid,
+                    woke
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "exit_current_and_run_next: failed to wake clear_child_tid futex at {:#x}: {:?}",
+                    clear_child_tid,
+                    err
+                );
+            }
+        }
     }
     cleanup_signal_wait_for_task(&task);
     cleanup_futex_wait_for_task(&task);
@@ -251,20 +263,23 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         let process_inner = process.inner_exclusive_access();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
-            let (thread_id, was_on_cpu, last_cpu) = {
+            let (thread_id, was_on_cpu, last_cpu, wait_handle) = {
                 let mut task_inner = task.inner_exclusive_access();
                 task_inner.exit_code.get_or_insert(task_exit_code);
                 task_inner.task_status = TaskStatus::Zombie;
                 task_inner.wait_reason = None;
                 task_inner.sched.on_rq = false;
                 task_inner.sched.resched_reason = Some(ReschedReason::HigherRtPriority);
-                task_inner.current_wq_handle = None;
                 (
                     task_inner.res.as_ref().map(|res| res.thread_id()),
                     task_inner.sched.on_cpu,
                     task_inner.sched.last_cpu,
+                    task_inner.current_wq_handle.take(),
                 )
             };
+            if let Some(wait_handle) = wait_handle {
+                wait_handle.remove_waiter(task);
+            }
             if let Some(thread_id) = thread_id {
                 remove_from_tid2task(thread_id);
             }

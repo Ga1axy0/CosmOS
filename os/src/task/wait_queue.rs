@@ -22,6 +22,7 @@ use hashbrown::HashMap;
 pub struct WaitQueueHandle {
     ptr: *const (),
     wake_fn: fn(ptr: *const (), task: &Arc<TaskControlBlock>),
+    remove_fn: fn(ptr: *const (), task: &Arc<TaskControlBlock>),
 }
 
 // Safety: ptr always points to a Sync+Send object with static effective lifetime.
@@ -33,6 +34,11 @@ impl WaitQueueHandle {
     /// and then calling `wakeup_task`.
     pub fn wake_waiter(&self, task: &Arc<TaskControlBlock>) {
         (self.wake_fn)(self.ptr, task);
+    }
+
+    /// Remove a task from this wait queue without making it runnable.
+    pub fn remove_waiter(&self, task: &Arc<TaskControlBlock>) {
+        (self.remove_fn)(self.ptr, task);
     }
 
     fn points_to(&self, ptr: *const ()) -> bool {
@@ -109,14 +115,24 @@ impl WaitQueue {
         }
 
         block_current_and_run_next(reason);
+
+        // Wakers normally remove the task before scheduling it. Keep this
+        // cleanup idempotent so forced exits and competing wake paths cannot
+        // leave a stale strong reference in the queue.
+        self.remove_waiter_by_ptr(&task);
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner
+            .current_wq_handle
+            .as_ref()
+            .is_some_and(|handle| handle.points_to(self as *const Self as *const ()))
+        {
+            task_inner.current_wq_handle = None;
+        }
     }
 
     /// Wake one waiter (FIFO order).
     pub fn wake_one(&self) {
-        let mut queue = self.queue.lock();
-        if let Some(task) = queue.pop_front() {
-            wakeup_task(task);
-        }
+        self.wake_up_to(1);
     }
 
     /// Wake up to `limit` waiters and return the number actually woken.
@@ -129,30 +145,32 @@ impl WaitQueue {
     where
         F: FnMut(&Arc<TaskControlBlock>),
     {
-        let mut queue = self.queue.lock();
-        let mut wake_list = Vec::new();
         let mut count = 0;
         while count < limit {
-            let Some(task) = queue.pop_front() else {
+            let Some(task) = self.queue.lock().pop_front() else {
                 break;
             };
-            wake_list.push(task);
-            count += 1;
-        }
-        drop(queue);
-        for task in wake_list {
+            if !self.is_current_waiter(&task) {
+                continue;
+            }
             on_wake(&task);
             wakeup_task(task);
+            count += 1;
         }
         count
     }
 
     /// Wake all waiters.
     pub fn wake_all(&self) {
-        let mut queue = self.queue.lock();
-        while let Some(task) = queue.pop_front() {
-            wakeup_task(task);
-        }
+        self.wake_up_to(usize::MAX);
+    }
+
+    pub(crate) fn debug_waiter_count(&self) -> usize {
+        self.queue.lock().len()
+    }
+
+    pub(crate) fn debug_waiters(&self) -> Vec<Arc<TaskControlBlock>> {
+        self.queue.lock().iter().cloned().collect()
     }
 
     /// Wake some waiters from this queue and requeue the rest onto `dst`.
@@ -193,6 +211,7 @@ impl WaitQueue {
             Self::collect_wake_and_requeue(
                 &mut src_queue,
                 &mut dst_queue,
+                self as *const Self as *const (),
                 &dst_handle,
                 wake_count,
                 requeue_count,
@@ -205,6 +224,7 @@ impl WaitQueue {
             Self::collect_wake_and_requeue(
                 &mut src_queue,
                 &mut dst_queue,
+                self as *const Self as *const (),
                 &dst_handle,
                 wake_count,
                 requeue_count,
@@ -226,23 +246,30 @@ impl WaitQueue {
     fn collect_wake_and_requeue(
         src_queue: &mut VecDeque<Arc<TaskControlBlock>>,
         dst_queue: &mut VecDeque<Arc<TaskControlBlock>>,
+        src_ptr: *const (),
         dst_handle: &WaitQueueHandle,
         wake_count: usize,
         requeue_count: usize,
         wake_list: &mut Vec<Arc<TaskControlBlock>>,
         requeue_list: &mut Vec<Arc<TaskControlBlock>>,
     ) {
-        for _ in 0..wake_count {
+        while wake_list.len() < wake_count {
             let Some(task) = src_queue.pop_front() else {
                 break;
             };
+            if !Self::task_waits_on_ptr(&task, src_ptr) {
+                continue;
+            }
             wake_list.push(task);
         }
 
-        for _ in 0..requeue_count {
+        while requeue_list.len() < requeue_count {
             let Some(task) = src_queue.pop_front() else {
                 break;
             };
+            if !Self::task_waits_on_ptr(&task, src_ptr) {
+                continue;
+            }
             task.inner_exclusive_access().current_wq_handle = Some(dst_handle.clone());
             dst_queue.push_back(task.clone());
             requeue_list.push(task);
@@ -261,9 +288,28 @@ impl WaitQueue {
                 return;
             }
         }
-        let task_ptr = Arc::as_ptr(task);
-        self.queue.lock().retain(|t| Arc::as_ptr(t) != task_ptr);
+        self.remove_waiter_by_ptr(task);
         wakeup_task(task.clone());
+    }
+
+    fn remove_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
+        let task_ptr = Arc::as_ptr(task);
+        self.queue.lock().retain(|queued| Arc::as_ptr(queued) != task_ptr);
+    }
+
+    fn is_current_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        Self::task_waits_on_ptr(task, self as *const Self as *const ())
+    }
+
+    fn task_waits_on_ptr(task: &Arc<TaskControlBlock>, wait_queue_ptr: *const ()) -> bool {
+        let task_inner = task.inner_exclusive_access();
+        matches!(
+            task_inner.task_status,
+            TaskStatus::Interruptible | TaskStatus::Uninterruptible
+        ) && task_inner
+            .current_wq_handle
+            .as_ref()
+            .is_some_and(|handle| handle.points_to(wait_queue_ptr))
     }
 
     /// Build a type-erased handle for signal delivery.
@@ -272,9 +318,14 @@ impl WaitQueue {
             let wq = unsafe { &*(ptr as *const WaitQueue) };
             wq.wake_waiter_by_ptr(task);
         }
+        fn remove_fn(ptr: *const (), task: &Arc<TaskControlBlock>) {
+            let wq = unsafe { &*(ptr as *const WaitQueue) };
+            wq.remove_waiter_by_ptr(task);
+        }
         WaitQueueHandle {
             ptr: self as *const Self as *const (),
             wake_fn,
+            remove_fn,
         }
     }
 }
@@ -327,20 +378,17 @@ where
         self.queue.lock().push_back(key);
         block_current_and_run_next(reason);
 
-        // Self-cleanup: remove ourselves from waiters and clear the handle.
+        self.waiters.lock().remove(&key);
+        self.queue.lock().retain(|queued| *queued != key);
         let task = current_task().unwrap();
-        let task_ptr = Arc::as_ptr(&task);
-        let k = {
-            let waiters = self.waiters.lock();
-            waiters
-                .iter()
-                .find(|(_, t)| Arc::as_ptr(t) == task_ptr)
-                .map(|(k, _)| *k)
-        };
-        if let Some(k) = k {
-            self.waiters.lock().remove(&k);
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner
+            .current_wq_handle
+            .as_ref()
+            .is_some_and(|handle| handle.points_to(self as *const Self as *const ()))
+        {
+            task_inner.current_wq_handle = None;
         }
-        task.inner_exclusive_access().current_wq_handle = None;
     }
 
     /// Enqueue current task with a selected key and block with a specific reason.
@@ -376,6 +424,7 @@ where
         // cancel the sleep transition and keep running on this hart.
         if should_skip() {
             self.waiters.lock().remove(&key);
+            self.queue.lock().retain(|queued| *queued != key);
             if let Some(task) = current_task() {
                 let mut task_inner = task.inner_exclusive_access();
                 if matches!(task_inner.task_status, TaskStatus::Interruptible) {
@@ -390,6 +439,18 @@ where
         }
 
         block_current_and_run_next(reason);
+
+        self.waiters.lock().remove(&key);
+        self.queue.lock().retain(|queued| *queued != key);
+        let task = current_task().unwrap();
+        let mut task_inner = task.inner_exclusive_access();
+        if task_inner
+            .current_wq_handle
+            .as_ref()
+            .is_some_and(|handle| handle.points_to(self as *const Self as *const ()))
+        {
+            task_inner.current_wq_handle = None;
+        }
     }
 
     fn pop_next_task_keyed(
@@ -415,6 +476,7 @@ where
     /// Returns whether a waiter is found and woken.
     pub fn wake_selected(&self, key: T) -> bool {
         if let Some(task) = self.waiters.lock().remove(&key) {
+            self.queue.lock().retain(|queued| *queued != key);
             // debug!("Poll: waking with key {}", key);
             wakeup_task(task);
             true
@@ -432,6 +494,11 @@ where
 
     /// Remove this specific task from the waiters and wake it.
     pub fn wake_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
+        self.remove_waiter_by_ptr(task);
+        wakeup_task(task.clone());
+    }
+
+    fn remove_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
         let task_ptr = Arc::as_ptr(task);
         let key = {
             let waiters = self.waiters.lock();
@@ -442,8 +509,8 @@ where
         };
         if let Some(key) = key {
             self.waiters.lock().remove(&key);
+            self.queue.lock().retain(|queued| *queued != key);
         }
-        wakeup_task(task.clone());
     }
 
     /// Build a type-erased handle for signal delivery.
@@ -460,9 +527,22 @@ where
             let wq = unsafe { &*(ptr as *const WaitQueueKeyed<T>) };
             wq.wake_waiter_by_ptr(task);
         }
+        fn remove_fn<T>(ptr: *const (), task: &Arc<TaskControlBlock>)
+        where
+            T: Default
+                + Eq
+                + core::hash::Hash
+                + core::fmt::Display
+                + Copy
+                + NextKey,
+        {
+            let wq = unsafe { &*(ptr as *const WaitQueueKeyed<T>) };
+            wq.remove_waiter_by_ptr(task);
+        }
         WaitQueueHandle {
             ptr: self as *const Self as *const (),
             wake_fn: wake_fn::<T>,
+            remove_fn: remove_fn::<T>,
         }
     }
 }

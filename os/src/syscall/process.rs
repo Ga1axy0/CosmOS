@@ -1332,10 +1332,10 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 remove_from_pid2process(found_pid);
                 let strong_after_pid2pcb = Arc::strong_count(&child);
                 drop(child);
-                warn!(
-                    "[heap_trace] reap_pcb_dropped pid={} strong_before={} strong_after_pid2pcb={} weak={}",
-                    found_pid, strong_before, strong_after_pid2pcb, weak_before,
-                );
+                // warn!(
+                //     "[heap_trace] reap_pcb_dropped pid={} strong_before={} strong_after_pid2pcb={} weak={}",
+                //     found_pid, strong_before, strong_after_pid2pcb, weak_before,
+                // );
 
                 if !exit_status_ptr.is_null() {
                     write_pod_to_user(exit_status_ptr, &exit_status)?;
