@@ -2,6 +2,7 @@
 
 use super::{virt_to_phys, PhysPageNum};
 use crate::bootinfo::{self, PhysMemoryRegion};
+use crate::config::PAGE_SIZE;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::sync::SpinNoIrqLock;
 use core::cmp::{max, min};
