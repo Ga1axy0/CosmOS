@@ -3,17 +3,16 @@
 use super::{virt_to_phys, PhysPageNum};
 use crate::bootinfo::{self, PhysMemoryRegion};
 use crate::fs::PAGE_CACHE_MANAGER;
-use crate::mm::heap_allocator::KERNEL_HEAP_BYTES;
 use crate::sync::SpinNoIrqLock;
 use core::cmp::{max, min};
 use core::fmt::{self, Debug, Formatter};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
-use virtio_drivers::PAGE_SIZE;
 
 const MAX_ORDER: usize = 32;
 const INVALID_PPN: usize = usize::MAX;
 const MAX_MANAGED_REGIONS: usize = 16;
+static FRAME_ALLOC_OOM_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
@@ -327,6 +326,8 @@ pub struct FrameAllocatorStats {
     pub allocated_pages: usize,
     /// Total number of managed physical pages.
     pub total_pages: usize,
+    /// Number of failed single-frame allocation attempts.
+    pub oom_count: usize,
 }
 
 lazy_static! {
@@ -355,6 +356,7 @@ pub fn frame_allocator_stats() -> FrameAllocatorStats {
         free_pages,
         allocated_pages,
         total_pages: free_pages + allocated_pages,
+        oom_count: FRAME_ALLOC_OOM_COUNT.load(Ordering::Acquire),
     }
 }
 
@@ -365,6 +367,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         allocator.alloc()
     };
     ppn.map(FrameTracker::new).or_else(|| {
+        FRAME_ALLOC_OOM_COUNT.fetch_add(1, Ordering::AcqRel);
         let frame_allocator_stats = frame_allocator_stats();
         error!(
             "frame_alloc: out of memory (free={} cached={} low={} high={} total={})",
@@ -376,6 +379,18 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         );
         None
     })
+}
+
+/// Allocate a physical page frame, triggering page-cache reclamation on first
+/// failure. Prefer this over [`frame_alloc`] in process-context paths
+/// (syscall handling, page faults) where blocking on I/O is safe. Do not use
+/// from interrupt or trap-from-kernel context.
+pub fn frame_alloc_with_reclaim() -> Option<FrameTracker> {
+    if let Some(frame) = frame_alloc() {
+        return Some(frame);
+    }
+    crate::fs::reclaim_if_needed();
+    frame_alloc()
 }
 
 /// Deallocate a physical page frame with a given ppn

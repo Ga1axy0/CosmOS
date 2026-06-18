@@ -27,7 +27,7 @@ use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
-use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
+use crate::mm::{warn_heap_state, warn_heap_state_lockfree, DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
@@ -83,6 +83,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
     process.pause_cpu_accounting(get_time());
+    warn_heap_state("exit_begin", process.getpid());
     let mut task_inner = task.inner_exclusive_access();
     let (tid, thread_id) = match task_inner.res.as_ref() {
         Some(res) => (Some(res.tid), Some(res.thread_id())),
@@ -275,19 +276,24 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             let token = process_inner.memory_set.token();
             let mask = process_inner.memory_set.loaded_user_harts();
             let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
+            warn_heap_state_lockfree("exit_after_vmas_clear", pid);
             let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
             let closed_fds = process_inner.take_all_fds();
             process_inner.fd_table.clear();
+            warn_heap_state_lockfree("exit_after_fd_take", pid);
             // remove all tasks
             process_inner.tasks.clear();
+            warn_heap_state_lockfree("exit_after_tasks_clear", pid);
 
             let parent_weak = process_inner.parent.clone();
             let shm_attachments = core::mem::take(&mut process_inner.shm_attachments);
             (closed_fds, parent_weak, reclaim, shm_attachments)
         };
         reclaim.flush_then_release();
+        warn_heap_state("exit_after_user_reclaim", pid);
         drop(closed_fds);
+        warn_heap_state("exit_after_fd_drop", pid);
         for attachment in shm_attachments {
             ipc::detach_segment(attachment.shmid);
         }
@@ -296,6 +302,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             add_signal_to_process(&parent, SignalBit::SIGCHLD);
             parent.wait_exit_queue.wake_one();
         }
+        warn_heap_state("exit_end", pid);
     } else {
         let mut process_inner = process.inner_exclusive_access();
         if let Some(tid) = tid {
@@ -303,7 +310,20 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             process_inner.semaphore_detector.clear_thread(tid);
         }
     }
+    let exit_pid = process.getpid();
+    let tcb_strong = Arc::strong_count(&exiting_task);
+    let tcb_weak = Arc::weak_count(&exiting_task);
+    // Move the exiting task reference off the stack into stop_task so that
+    // the idle loop's `finish_pending_task_release` can drop it once the
+    // kernel stack is no longer in use (after __switch completes).
+    add_stopping_task(exiting_task);
     drop(process);
+    warn!(
+        "[heap_trace] exit_tcb_cleaned pid={} tcb_strong={} tcb_weak={}",
+        exit_pid,
+        tcb_strong,
+        tcb_weak,
+    );
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);

@@ -24,10 +24,10 @@ use core::any::Any;
 use lazy_static::*;
 pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
-    discard_inode,
-    mapping_for_inode, sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
+    discard_inode, mapping_for_inode, reclaim_if_needed,
+    sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
     sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
-    retain_mapped_page, PAGE_CACHE_MANAGER
+    retain_mapped_page, PAGE_CACHE_MANAGER,
 };
 
 fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {

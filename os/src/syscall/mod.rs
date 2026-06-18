@@ -480,7 +480,12 @@ macro_rules! syscall_body {
         let result: Result<isize, ERRNO> = (|| -> Result<isize, ERRNO> { $body })();
         match result {
             Ok(v) => v,
-            Err(e) => -(e as isize),
+            Err(e) => {
+                if matches!(e, $crate::syscall::errno::ERRNO::ENOMEM) {
+                    $crate::mm::log_oom("syscall", None, None);
+                }
+                -(e as isize)
+            }
         }
     }};
 }

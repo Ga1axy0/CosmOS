@@ -33,7 +33,7 @@ pub use processor::{
 };
 pub use runqueue::wakeup_task;
 pub(crate) use runqueue::{
-    add_stopping_task, add_task, cfs_should_preempt, enqueue_task_on,
+    add_stopping_task, add_task, cfs_should_preempt, clear_stopping_task, enqueue_task_on,
     has_runnable_task_at_or_above, insert_into_pid2process, list_pids, pick_next_task, pid2process,
     remove_from_pid2process, remove_task, resched_hart, PID2PCB,
 };

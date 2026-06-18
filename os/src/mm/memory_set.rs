@@ -1,6 +1,6 @@
 //! Address Space [`MemorySet`] management of Process
 
-use super::{frame_alloc, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
+use super::{frame_alloc_with_reclaim, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
 use super::{PageTable, PageTableEntry, PTEFlags};
 use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -124,6 +124,25 @@ pub fn register_file_mapping(inode: &Arc<Inode>, process: &Arc<ProcessControlBlo
         inode.ino,
         process.getpid()
     );
+}
+
+/// 在进程退出/被回收后清除该进程注册的所有文件映射条目，
+/// 避免 `Weak<ProcessControlBlock>` 阻止 `ArcInner` 块释放。
+pub fn unregister_file_mappings_for_process(process: &ProcessControlBlock) {
+    let process_ptr = process as *const ProcessControlBlock;
+    let mut registry = FILE_MAPPING_REGISTRY.lock();
+    registry.retain(|entry| {
+        let keep = entry.process.as_ptr() != process_ptr;
+        if !keep {
+            debug!(
+                "[mmap] unregister file mapping: fs_id={} ino={} pid={}",
+                entry.inode.fs_id,
+                entry.inode.ino,
+                process.getpid()
+            );
+        }
+        keep
+    });
 }
 
 /// 在 truncate 缩小时失效所有映射了该 inode 的用户页表项。
@@ -509,12 +528,12 @@ impl MemorySet {
     }
 
     /// Create a new empty `MemorySet`.
-    pub fn new_bare() -> Self {
-        Self {
-            page_table: PageTable::new().expect("failed to allocate root page table"),
+    pub fn new_bare() -> Result<Self, MmError> {
+        Ok(Self {
+            page_table: PageTable::new()?,
             vmas: BTreeMap::new(),
             loaded_user_harts: AtomicUsize::new(0),
-        }
+        })
     }
     /// Get he page table token
     pub fn token(&self) -> AddressSpaceToken {
@@ -826,7 +845,7 @@ impl MemorySet {
             .sum()
     }
     /// Mention that trampoline is not collected by areas.
-    fn map_trampoline(&mut self) {
+    fn map_trampoline(&mut self) -> Result<(), MmError> {
         let trampoline_pa = crate::platform::direct_map_virt_to_phys(strampoline as usize);
 
         self.page_table
@@ -834,14 +853,17 @@ impl MemorySet {
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(trampoline_pa).into(),
             PTEFlags::R | PTEFlags::X,
-        )
-            .expect("failed to map trampoline");
+        )?;
+        Ok(())
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set =
+            Self::new_bare().expect("failed to allocate boot-time kernel root page table");
         // map trampoline
-        memory_set.map_trampoline();
+        memory_set
+            .map_trampoline()
+            .expect("failed to map boot-time kernel trampoline");
         // On LoongArch, kernel sections / physical memory / MMIO are covered by
         // DMW windows, but trap trampoline and task kernel stacks live in the
         // low-half page-table space and are mapped explicitly.
@@ -937,9 +959,9 @@ impl MemorySet {
     /// Include ELF segments and trampoline, and compute initial process VM layout.
     /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo)
     pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_bare()?;
         // map trampoline
-        memory_set.map_trampoline();
+        memory_set.map_trampoline()?;
         memory_set.map_user_vdso()?;
         // map program headers of elf, with U flag
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| MmError::InvalidElf)?;
@@ -1054,9 +1076,9 @@ impl MemorySet {
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &mut Self) -> Result<(Self, bool), MmError> {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_bare()?;
         // map trampoline
-        memory_set.map_trampoline();
+        memory_set.map_trampoline()?;
         let mut parent_tlb_needs_flush = false;
         debug!(
             "[cow] fork clone address space: parent_vmas={}",
@@ -1554,7 +1576,7 @@ impl MemorySet {
         let ppn: PhysPageNum = match map_type {
             MapType::Identical => PhysPageNum(vpn.0),
             MapType::Framed => {
-                let frame = frame_alloc().ok_or(MmError::OutOfMemory)?;
+                let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
                 let page = Arc::new(PrivatePage::new(frame));
                 let ppn = page.ppn();
                 // debug!(
@@ -1800,7 +1822,7 @@ impl MemorySet {
                 .find_vma_containing(vpn)
                 .and_then(|area| area.file.as_ref().and_then(|file| file.file.path()));
             let new_page = Arc::new(PrivatePage::new(
-                frame_alloc().ok_or(MmError::OutOfMemory)?,
+                frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
             ));
             new_page
                 .ppn()
@@ -1875,7 +1897,7 @@ impl MemorySet {
         }
 
         let new_page = Arc::new(PrivatePage::new(
-            frame_alloc().ok_or(MmError::OutOfMemory)?,
+            frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
         ));
         new_page
             .ppn()
@@ -2568,7 +2590,7 @@ impl Vma {
             }
             MapType::Framed => {
                 let page = Arc::new(PrivatePage::new(
-                    frame_alloc().ok_or(MmError::OutOfMemory)?,
+                    frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
                 ));
                 ppn = page.ppn();
                 self.data_frames.insert(vpn, page);

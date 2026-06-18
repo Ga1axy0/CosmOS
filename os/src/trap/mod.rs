@@ -16,13 +16,14 @@ mod context;
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
-use crate::signal::{SignalBit, handle_signals};
+use crate::signal::{SignalBit, SignalNum, handle_signals};
 use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
     current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    exit_group_current_and_run_next,
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
 use crate::hal::{ArchInterrupt, ArchTrapMachine};
@@ -99,7 +100,7 @@ fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
     );
 }
 
-fn log_lazy_fault_oom(path: &str, access: &str, fault_addr: usize) {
+fn handle_user_oom(path: &str, access: &str, fault_addr: usize) -> ! {
     let cx = current_trap_cx();
     let summary = cx.fault_dump_summary();
     error!(
@@ -122,6 +123,9 @@ fn log_lazy_fault_oom(path: &str, access: &str, fault_addr: usize) {
         summary[6].name,
         summary[6].value,
     );
+    crate::mm::log_oom(path, Some(access), Some(fault_addr));
+    exit_group_current_and_run_next(ExitReason::Signal(SignalNum::SIGKILL.number() as u32));
+    panic!("unreachable: OOM exit_group_current_and_run_next returned");
 }
 
 /// 初始化当前 hart 的 trap 相关状态。
@@ -223,9 +227,7 @@ pub fn trap_handler() -> ! {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
-                    log_lazy_fault_oom("private_cow", "write", trap_info.fault_addr);
-                    current_add_signal(SignalBit::SIGKILL);
-                    handled = true;
+                    handle_user_oom("private_cow", "write", trap_info.fault_addr);
                 }
                 Err(_) => {}
             }
@@ -234,9 +236,7 @@ pub fn trap_handler() -> ! {
                     Ok(PageFaultHandled::Handled) => handled = true,
                     Ok(PageFaultHandled::NotHandled) => {}
                     Err(MmError::OutOfMemory) => {
-                        log_lazy_fault_oom("lazy_user", "write", trap_info.fault_addr);
-                        current_add_signal(SignalBit::SIGKILL);
-                        handled = true;
+                        handle_user_oom("lazy_user", "write", trap_info.fault_addr);
                     }
                     Err(_) => {}
                 }
@@ -253,8 +253,7 @@ pub fn trap_handler() -> ! {
                         current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(MmError::OutOfMemory) => {
-                        log_lazy_fault_oom("file_mmap", "write", trap_info.fault_addr);
-                        current_add_signal(SignalBit::SIGKILL);
+                        handle_user_oom("file_mmap", "write", trap_info.fault_addr);
                     }
                     Err(_) => {
                         log_user_fault("store page fault", "write", trap_info.fault_addr, "SIGSEGV");
@@ -287,9 +286,7 @@ pub fn trap_handler() -> ! {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
-                    log_lazy_fault_oom("lazy_user", "read", trap_info.fault_addr);
-                    current_add_signal(SignalBit::SIGKILL);
-                    handled = true;
+                    handle_user_oom("lazy_user", "read", trap_info.fault_addr);
                 }
                 Err(_) => {}
             }
@@ -305,8 +302,7 @@ pub fn trap_handler() -> ! {
                         current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(MmError::OutOfMemory) => {
-                        log_lazy_fault_oom("file_mmap", "read", trap_info.fault_addr);
-                        current_add_signal(SignalBit::SIGKILL);
+                        handle_user_oom("file_mmap", "read", trap_info.fault_addr);
                     }
                     Err(_) => {
                         log_user_fault("load page fault", "read", trap_info.fault_addr, "SIGSEGV");
@@ -326,9 +322,7 @@ pub fn trap_handler() -> ! {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
-                    log_lazy_fault_oom("lazy_user", "exec", trap_info.fault_addr);
-                    current_add_signal(SignalBit::SIGKILL);
-                    handled = true;
+                    handle_user_oom("lazy_user", "exec", trap_info.fault_addr);
                 }
                 Err(_) => {}
             }
@@ -344,8 +338,7 @@ pub fn trap_handler() -> ! {
                         current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(MmError::OutOfMemory) => {
-                        log_lazy_fault_oom("file_mmap", "exec", trap_info.fault_addr);
-                        current_add_signal(SignalBit::SIGKILL);
+                        handle_user_oom("file_mmap", "exec", trap_info.fault_addr);
                     }
                     Err(_) => {
                         log_user_fault("instruction page fault", "exec", trap_info.fault_addr, "SIGSEGV");

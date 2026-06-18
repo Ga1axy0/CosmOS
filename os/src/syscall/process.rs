@@ -1,5 +1,8 @@
 use crate::hal::traits::CloneArgs;
-use crate::mm::{frame_allocator_stats, MapPermission, USER_SPACE_END, VirtAddr};
+use crate::mm::{
+    frame_allocator_stats, unregister_file_mappings_for_process, warn_heap_state, MapPermission,
+    USER_SPACE_END, VirtAddr,
+};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::{
     read_bytes_from_user, read_pod_from_user, write_pod_to_user, Pod,
@@ -1295,6 +1298,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             if let Some(idx) = zombie_idx {
                 let child = inner.children.remove(idx);
                 let found_pid = child.getpid();
+                warn_heap_state("reap_begin", found_pid);
                 let child_inner = child.inner_exclusive_access();
                 // 编码为wstatus
                let exit_status = match child_inner.exit_reason {
@@ -1322,12 +1326,22 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     .saturating_add(child_inner.child_kernel_time);
                 drop(child_inner);
                 drop(inner);
+                let strong_before = Arc::strong_count(&child);
+                let weak_before = Arc::weak_count(&child);
+                unregister_file_mappings_for_process(&child);
                 remove_from_pid2process(found_pid);
+                let strong_after_pid2pcb = Arc::strong_count(&child);
+                drop(child);
+                warn!(
+                    "[heap_trace] reap_pcb_dropped pid={} strong_before={} strong_after_pid2pcb={} weak={}",
+                    found_pid, strong_before, strong_after_pid2pcb, weak_before,
+                );
 
                 if !exit_status_ptr.is_null() {
                     write_pod_to_user(exit_status_ptr, &exit_status)?;
                 }
 
+                warn_heap_state("reap_end", found_pid);
                 return Ok(found_pid as isize);
             }
 
