@@ -1250,57 +1250,121 @@ fn flush_page(
 /// 若当前缓存压力过大，则回收到低水位。
 pub fn reclaim_if_needed() {
     refresh_page_cache_watermarks();
+    let mut pass = 0usize;
+    let mut deferred_only_passes = 0usize;
     loop {
-        let need_reclaim = {
+        let (cached_before, low_watermark, high_watermark, inactive_before) = {
             let manager = PAGE_CACHE_MANAGER.lock();
-            manager.cached_pages > manager.high_watermark
+            (
+                manager.cached_pages,
+                manager.low_watermark,
+                manager.high_watermark,
+                manager.inactive.len(),
+            )
         };
-        if !need_reclaim {
+        if cached_before <= low_watermark {
             break;
         }
-        if !reclaim_one() {
+        if inactive_before == 0 {
+            break;
+        }
+
+        pass += 1;
+        let stats = run_reclaim_pass(inactive_before);
+
+        if stats.reclaimed > 0 {
+            deferred_only_passes = 0;
+            continue;
+        }
+
+        if stats.deferred == 0 {
+            break;
+        }
+
+        deferred_only_passes += 1;
+        if deferred_only_passes >= MAX_DEFERRED_ONLY_PASSES {
             break;
         }
     }
 }
 
+const MAX_DEFERRED_ONLY_PASSES: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimStep {
+    Reclaimed,
+    Deferred,
+    Skipped,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReclaimPassStats {
+    scanned: usize,
+    reclaimed: usize,
+    deferred: usize,
+    skipped: usize,
+    stopped: bool,
+}
+
+fn run_reclaim_pass(scan_budget: usize) -> ReclaimPassStats {
+    let mut stats = ReclaimPassStats::default();
+    for _ in 0..scan_budget {
+        stats.scanned += 1;
+        match reclaim_one() {
+            ReclaimStep::Reclaimed => stats.reclaimed += 1,
+            ReclaimStep::Deferred => stats.deferred += 1,
+            ReclaimStep::Skipped => stats.skipped += 1,
+            ReclaimStep::Stop => {
+                stats.stopped = true;
+                break;
+            }
+        }
+    }
+    stats
+}
+
 /// 尝试推进一轮缓存页回收。
 ///
-/// 返回值语义：
-/// - `true`：本轮已经处理了一个候选页，外层可继续尝试下一轮回收；
-///   这并不保证一定真正释放了一页，也可能只是跳过、清理失效队列项
-///   或先触发脏页回写。
-/// - `false`：当前没有必要继续回收，或已经没有可扫描的候选页，外层应停止回收循环。
-fn reclaim_one() -> bool {
+/// 返回值区分：
+/// - `Reclaimed`：本轮真正释放了一个缓存页；
+/// - `Deferred`：本轮只做了“让页更可回收”的软推进，例如清 ref_bit 或写回脏页；
+/// - `Skipped`：本轮遇到忙页/失效项等，无实质进展；
+/// - `Stop`：当前没有必要或无法继续扫描，外层应停止本轮 direct reclaim。
+fn reclaim_one() -> ReclaimStep {
     let candidate = {
         let mut manager = PAGE_CACHE_MANAGER.lock();
         if manager.cached_pages <= manager.low_watermark {
-            return false;
+            return ReclaimStep::Stop;
         }
         manager.inactive.pop_front()
     };
     let Some(candidate) = candidate else {
-        return false;
+        return ReclaimStep::Stop;
     };
     let Some(page) = candidate.upgrade() else {
-        return true;
+        return ReclaimStep::Skipped;
     };
 
     {
         let mut page_guard = page.lock();
+        let page_idx = page_guard.index;
         if page_guard.pin_count > 0
             || page_guard.map_count > 0
             || page_guard
                 .state
                 .intersects(CachePageState::LOADING | CachePageState::WRITEBACK | CachePageState::EVICTING)
         {
+            let pin_count = page_guard.pin_count;
+            let map_count = page_guard.map_count;
+            let state_bits = page_guard.state.bits();
             PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
-            return true;
+            return ReclaimStep::Skipped;
         }
         if page_guard.ref_bit {
             page_guard.ref_bit = false;
             PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
-            return true;
+            return ReclaimStep::Deferred;
         }
         if page_guard.state.contains(CachePageState::DIRTY) {
             drop(page_guard);
@@ -1309,11 +1373,17 @@ fn reclaim_one() -> bool {
                 page_guard.owner.upgrade()
             };
 
-            if let Some(mapping) = mapping {
-                let _ = flush_page(&mapping, &page);
-            }
+            let flush_result = if let Some(mapping) = mapping.as_ref() {
+                flush_page(&mapping, &page)
+            } else {
+                Ok(())
+            };
             PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
-            return true;
+            return if flush_result.is_ok() {
+                ReclaimStep::Deferred
+            } else {
+                ReclaimStep::Skipped
+            };
         }
         page_guard.state.insert(CachePageState::EVICTING);
     }
@@ -1321,7 +1391,7 @@ fn reclaim_one() -> bool {
     let Some(mapping) = page.lock().owner.upgrade() else {
         let mut manager = PAGE_CACHE_MANAGER.lock();
         manager.cached_pages = manager.cached_pages.saturating_sub(1);
-        return true;
+        return ReclaimStep::Reclaimed;
     };
     let page_idx = page.lock().index;
     let removed = {
@@ -1340,16 +1410,12 @@ fn reclaim_one() -> bool {
     if removed.is_some() {
         let mut manager = PAGE_CACHE_MANAGER.lock();
         manager.cached_pages = manager.cached_pages.saturating_sub(1);
-        debug!(
-            "[page_cache] evict page: page_idx={} cached_pages={}",
-            page_idx,
-            manager.cached_pages
-        );
+        ReclaimStep::Reclaimed
     } else {
         page.lock().state.remove(CachePageState::EVICTING);
         PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
+        ReclaimStep::Skipped
     }
-    true
 }
 
 /// 按当前物理内存剩余情况刷新 page cache 水位。
@@ -1405,7 +1471,42 @@ fn alloc_cache_frame() -> Option<FrameTracker> {
     }
     let _ = sync_all();
     // 分配失败时再主动推进回收，避免 cache 尚未超过高水位时错过可回收页。
-    while reclaim_one() {
+    let mut pass = 0usize;
+    let mut deferred_only_passes = 0usize;
+    loop {
+        let (cached_before, low_watermark, high_watermark, inactive_before) = {
+            let manager = PAGE_CACHE_MANAGER.lock();
+            (
+                manager.cached_pages,
+                manager.low_watermark,
+                manager.high_watermark,
+                manager.inactive.len(),
+            )
+        };
+        if inactive_before == 0 {
+            break;
+        }
+
+        pass += 1;
+        let stats = run_reclaim_pass(inactive_before);
+
+        if stats.reclaimed > 0 {
+            deferred_only_passes = 0;
+            if let Some(frame) = frame_alloc() {
+                return Some(frame);
+            }
+            continue;
+        }
+
+        if stats.deferred == 0 {
+            break;
+        }
+
+        deferred_only_passes += 1;
+        if deferred_only_passes >= MAX_DEFERRED_ONLY_PASSES {
+            break;
+        }
+
         if let Some(frame) = frame_alloc() {
             return Some(frame);
         }
