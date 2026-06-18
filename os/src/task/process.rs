@@ -1006,7 +1006,7 @@ impl ProcessControlBlock {
         child_set_tid: Option<usize>,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
-        warn_heap_state("fork_begin", self.getpid());
+        // warn_heap_state("fork_begin", self.getpid());
         let mut parent = self.inner_exclusive_access();
         // assert_eq!(parent.thread_count(), 1);
         if parent.thread_count() != 1 {
@@ -1025,7 +1025,7 @@ impl ProcessControlBlock {
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let (memory_set, parent_tlb_needs_flush) =
             MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
-        warn_heap_state("fork_after_memory_set_clone", self.getpid());
+        // warn_heap_state("fork_after_memory_set_clone", self.getpid());
         let parent_token = parent.memory_set.token();
         let parent_mask = if parent_tlb_needs_flush {
             parent.memory_set.loaded_user_harts()
@@ -1095,7 +1095,7 @@ impl ProcessControlBlock {
                 }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
-        warn_heap_state("fork_after_pcb_create", self.getpid());
+        // warn_heap_state("fork_after_pcb_create", self.getpid());
         // add child
         parent.children.push(Arc::clone(&child));
         let parent_task = parent.get_task(0);
@@ -1133,7 +1133,7 @@ impl ProcessControlBlock {
                 .retain(|candidate| !Arc::ptr_eq(candidate, &child));
             mm_error_to_errno(err)
         })?;
-        warn_heap_state("fork_after_create_task", child.getpid());
+        // warn_heap_state("fork_after_create_task", child.getpid());
         {
             let mut task_inner = task.inner_exclusive_access();
             task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
@@ -1179,7 +1179,7 @@ impl ProcessControlBlock {
         );
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
-        warn_heap_state("fork_end", child.getpid());
+        // warn_heap_state("fork_end", child.getpid());
         Ok(child)
     }
 

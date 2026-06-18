@@ -28,7 +28,7 @@ use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{futex_wake_addr, cleanup_futex_wait_for_task};
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
 use crate::mm::{warn_heap_state, warn_heap_state_lockfree, DeferredUserReclaim, MapPermission, VirtAddr};
-use crate::timer::get_time;
+use crate::timer::{get_time, get_time_us};
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use lazy_static::*;
@@ -69,6 +69,47 @@ pub fn exit_group_current_and_run_next(reason: ExitReason) {
     exit_current_and_run_next_inner(reason, true);
 }
 
+fn reap_clear_child_tid_thread(
+    process: &Arc<ProcessControlBlock>,
+    task: &Arc<TaskControlBlock>,
+    tid: usize,
+) {
+    let detached_task = {
+        let mut process_inner = process.inner_exclusive_access();
+        process_inner.mutex_detector.clear_thread(tid);
+        process_inner.semaphore_detector.clear_thread(tid);
+
+        let slot_matches = process_inner
+            .tasks
+            .get(tid)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|registered| Arc::ptr_eq(registered, task));
+        if slot_matches {
+            process_inner.tasks[tid].take()
+        } else {
+            warn!(
+                "exit_current_and_run_next: pid={} tid={} clear_child_tid task was already detached",
+                process.getpid(),
+                tid
+            );
+            None
+        }
+    };
+
+    // The PCB no longer owns this zombie. Its kernel stack remains protected by
+    // the current hart's stop_task reference until the context switch completes.
+    let user_res = task.inner_exclusive_access().res.take();
+    if user_res.is_none() {
+        warn!(
+            "exit_current_and_run_next: pid={} tid={} clear_child_tid resources were already reclaimed",
+            process.getpid(),
+            tid
+        );
+    }
+    drop(detached_task);
+    drop(user_res);
+}
+
 fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool) {
     let exit_reason = reason;
     let task_exit_code = match exit_reason {
@@ -83,7 +124,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
     process.pause_cpu_accounting(get_time());
-    warn_heap_state("exit_begin", process.getpid());
     let mut task_inner = task.inner_exclusive_access();
     let (tid, thread_id) = match task_inner.res.as_ref() {
         Some(res) => (Some(res.tid), Some(res.thread_id())),
@@ -103,8 +143,9 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     task_inner.sched.on_rq = false;
     task_inner.sched.resched_reason = None;
     task_inner.clear_child_tid = 0;
-    // here we do not remove the thread since we are still using the kstack
-    // it will be deallocated when sys_waittid is called
+    // The current kernel stack must stay alive until after the context switch.
+    // Legacy threads remain attached for sys_waittid; clear_child_tid threads
+    // are detached below while stop_task keeps their TCB alive.
     drop(task_inner);
     if clear_child_tid != 0 {
         debug!(
@@ -276,24 +317,24 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             let token = process_inner.memory_set.token();
             let mask = process_inner.memory_set.loaded_user_harts();
             let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
-            warn_heap_state_lockfree("exit_after_vmas_clear", pid);
+            // warn_heap_state_lockfree("exit_after_vmas_clear", pid);
             let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
             let closed_fds = process_inner.take_all_fds();
             process_inner.fd_table.clear();
-            warn_heap_state_lockfree("exit_after_fd_take", pid);
+            // warn_heap_state_lockfree("exit_after_fd_take", pid);
             // remove all tasks
             process_inner.tasks.clear();
-            warn_heap_state_lockfree("exit_after_tasks_clear", pid);
+            // warn_heap_state_lockfree("exit_after_tasks_clear", pid);
 
             let parent_weak = process_inner.parent.clone();
             let shm_attachments = core::mem::take(&mut process_inner.shm_attachments);
             (closed_fds, parent_weak, reclaim, shm_attachments)
         };
         reclaim.flush_then_release();
-        warn_heap_state("exit_after_user_reclaim", pid);
+        // warn_heap_state("exit_after_user_reclaim", pid);
         drop(closed_fds);
-        warn_heap_state("exit_after_fd_drop", pid);
+        // warn_heap_state("exit_after_fd_drop", pid);
         for attachment in shm_attachments {
             ipc::detach_segment(attachment.shmid);
         }
@@ -302,12 +343,16 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             add_signal_to_process(&parent, SignalBit::SIGCHLD);
             parent.wait_exit_queue.wake_one();
         }
-        warn_heap_state("exit_end", pid);
+        // warn_heap_state("exit_end", pid);
     } else {
-        let mut process_inner = process.inner_exclusive_access();
         if let Some(tid) = tid {
-            process_inner.mutex_detector.clear_thread(tid);
-            process_inner.semaphore_detector.clear_thread(tid);
+            if clear_child_tid != 0 {
+                reap_clear_child_tid_thread(&process, &exiting_task, tid);
+            } else {
+                let mut process_inner = process.inner_exclusive_access();
+                process_inner.mutex_detector.clear_thread(tid);
+                process_inner.semaphore_detector.clear_thread(tid);
+            }
         }
     }
     let exit_pid = process.getpid();
@@ -318,12 +363,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // kernel stack is no longer in use (after __switch completes).
     add_stopping_task(exiting_task);
     drop(process);
-    warn!(
-        "[heap_trace] exit_tcb_cleaned pid={} tcb_strong={} tcb_weak={}",
-        exit_pid,
-        tcb_strong,
-        tcb_weak,
-    );
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);

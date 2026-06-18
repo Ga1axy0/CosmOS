@@ -1298,7 +1298,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             if let Some(idx) = zombie_idx {
                 let child = inner.children.remove(idx);
                 let found_pid = child.getpid();
-                warn_heap_state("reap_begin", found_pid);
+                // warn_heap_state("reap_begin", found_pid);
                 let child_inner = child.inner_exclusive_access();
                 // 编码为wstatus
                let exit_status = match child_inner.exit_reason {
@@ -1341,7 +1341,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     write_pod_to_user(exit_status_ptr, &exit_status)?;
                 }
 
-                warn_heap_state("reap_end", found_pid);
+                // warn_heap_state("reap_end", found_pid);
                 return Ok(found_pid as isize);
             }
 

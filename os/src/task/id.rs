@@ -39,7 +39,7 @@ impl RecycleAllocator {
     /// deallocate an item
     pub fn dealloc(&mut self, id: usize) {
         assert!(id < self.current);
-        assert!(
+        debug_assert!(
             !self.recycled.iter().any(|i| *i == id),
             "id {} has been deallocated!",
             id
@@ -67,7 +67,7 @@ lazy_static! {
 }
 
 /// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
-const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 128;
+const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 256;
 /// deferred 物理页超过该水位时触发一次全局 flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
 
