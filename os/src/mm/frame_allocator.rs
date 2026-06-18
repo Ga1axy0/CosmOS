@@ -261,13 +261,18 @@ impl BuddyFrameAllocator {
         let pages = 1usize << order;
         if !self.is_managed_range(ppn, pages)
             || ppn & (pages - 1) != 0
-            || self.contains_free_block(ppn)
         {
             panic!(
                 "Frame ppn={:#x}, pages={} has not been allocated!",
                 ppn, pages
             );
         }
+        debug_assert!(
+            !self.contains_free_block(ppn),
+            "frame ppn={:#x}, pages={} was already freed",
+            ppn,
+            pages
+        );
 
         let mut current_order = order;
         while current_order + 1 < MAX_ORDER {
