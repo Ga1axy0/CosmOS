@@ -302,6 +302,54 @@ fn ensure_virtual_dir(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
     Ok(new_vdir)
 }
 
+/// Install a mount wrapper at `abs_path` and make `overlay` reachable through it.
+///
+/// The wrapper is the actual namespace node bound at `abs_path`; the mounted
+/// filesystem becomes its overlay.  This lets later bind mounts alias the same
+/// wrapper so that nested submounts remain visible through every alias.
+fn install_mount_wrapper(
+    abs_path: &str,
+    overlay: Arc<dyn VfsNode>,
+    persistent: bool,
+) -> Result<Arc<VirtualDirNode>, ERRNO> {
+    if abs_path == "/" {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let (parent_path, name) = split_for_mount(abs_path);
+    let parent_vdir = ensure_virtual_dir(parent_path)?;
+    let new_vdir = VirtualDirNode::new();
+    new_vdir.set_overlay(overlay);
+    if persistent {
+        new_vdir.mark_persistent_mount_wrapper();
+    }
+
+    parent_vdir.bind(name, Arc::clone(&new_vdir) as Arc<dyn VfsNode>);
+    VIRT_DIRS
+        .lock()
+        .insert(String::from(abs_path), Arc::clone(&new_vdir));
+    Ok(new_vdir)
+}
+
+/// Ensure `abs_path` is backed by a mount wrapper and return that wrapper.
+///
+/// This is used to turn a plain directory into a bind-mount source so that
+/// later recursive mounts can propagate through the same namespace node.
+fn ensure_bind_source_wrapper(abs_path: &str) -> Result<Arc<VirtualDirNode>, ERRNO> {
+    let abs = canonicalize("/", abs_path);
+    if abs == "/" {
+        return Err(ERRNO::EBUSY);
+    }
+
+    if let Some(existing) = VIRT_DIRS.lock().get(abs.as_str()).cloned() {
+        return Ok(existing);
+    }
+
+    let inode = lookup_inode_follow("/", abs.as_str(), true)?;
+    let overlay = inode.vfs_node();
+    install_mount_wrapper(abs.as_str(), overlay, true)
+}
+
 /// Mount `fs_root` at the absolute path `path`.
 ///
 /// - `path = "/"`: installs `fs_root` as the *overlay* of the virtual root
@@ -324,11 +372,84 @@ pub fn do_mount(path: &str, fs_root: Arc<Inode>) -> Result<(), ERRNO> {
         return Ok(());
     }
 
-    // For sub-paths: ensure parent virtual dir exists, then bind at leaf name.
-    let (parent_path, name) = split_for_mount(&abs);
-    let parent_vdir = ensure_virtual_dir(parent_path)?;
-    parent_vdir.bind(name, vfs_node);
+    // For sub-paths, expose the mount through a wrapper so later bind mounts
+    // can alias the same namespace node and share nested submounts.
+    install_mount_wrapper(abs.as_str(), vfs_node, true)?;
     info!("[kernel] mounted fs at {}", abs);
+    Ok(())
+}
+
+/// Bind the namespace node at `source_path` onto `target_path`.
+pub fn do_bind_mount(source_path: &str, target_path: &str) -> Result<(), ERRNO> {
+    let src_abs = canonicalize("/", source_path);
+    let dst_abs = canonicalize("/", target_path);
+
+    if src_abs == "/" || dst_abs == "/" {
+        return Err(ERRNO::EBUSY);
+    }
+
+    let src_wrapper = ensure_bind_source_wrapper(src_abs.as_str())?;
+    if src_abs == dst_abs {
+        return Ok(());
+    }
+
+    let dst_vfs_node: Arc<dyn VfsNode> = Arc::clone(&src_wrapper) as Arc<dyn VfsNode>;
+    let (parent_path, name) = split_for_mount(dst_abs.as_str());
+    let parent_vdir = ensure_virtual_dir(parent_path)?;
+    parent_vdir.bind(name, dst_vfs_node);
+    VIRT_DIRS
+        .lock()
+        .insert(dst_abs.clone(), Arc::clone(&src_wrapper));
+    info!("[kernel] bind-mounted {} at {}", src_abs, dst_abs);
+    Ok(())
+}
+
+/// Move an existing mount wrapper from `source_path` to `target_path`.
+pub fn do_move_mount(source_path: &str, target_path: &str) -> Result<(), ERRNO> {
+    let src_abs = canonicalize("/", source_path);
+    let dst_abs = canonicalize("/", target_path);
+
+    if src_abs == "/" || dst_abs == "/" {
+        return Err(ERRNO::EBUSY);
+    }
+    if src_abs == dst_abs {
+        return Ok(());
+    }
+    if dst_abs.starts_with(&(src_abs.clone() + "/")) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let src_wrapper = {
+        let map = VIRT_DIRS.lock();
+        map.get(src_abs.as_str()).cloned().ok_or(ERRNO::EINVAL)?
+    };
+
+    let (src_parent_path, src_name) = split_for_mount(src_abs.as_str());
+    let src_parent = if src_parent_path == "/" {
+        Arc::clone(&VIRT_ROOT)
+    } else {
+        VIRT_DIRS
+            .lock()
+            .get(src_parent_path)
+            .cloned()
+            .ok_or(ERRNO::EINVAL)?
+    };
+    if !src_parent.unbind(src_name) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let (dst_parent_path, dst_name) = split_for_mount(dst_abs.as_str());
+    let dst_parent = ensure_virtual_dir(dst_parent_path)?;
+    dst_parent.bind(dst_name, Arc::clone(&src_wrapper) as Arc<dyn VfsNode>);
+
+    {
+        let mut map = VIRT_DIRS.lock();
+        map.remove(src_abs.as_str());
+        map.insert(dst_abs.clone(), Arc::clone(&src_wrapper));
+    }
+
+    prune_unused_virtual_dirs(src_parent_path);
+    info!("[kernel] moved mount {} -> {}", src_abs, dst_abs);
     Ok(())
 }
 

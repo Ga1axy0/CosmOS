@@ -3,7 +3,7 @@ use crate::fs::{
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
     inode_stat, linkat_with_flags, lookup_inode_follow, make_pipe, mkdir_at_with_inode, mount_device,
     mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
-    sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat,
+    sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat, do_bind_mount, do_move_mount,
 };
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::fs::Pipe;
@@ -85,8 +85,13 @@ const SENDFILE_CHUNK_SIZE: usize = 16 * 1024;
 const PATH_MAX: usize = 4096;
 const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
+const MS_BIND: usize = 4096;
+const MS_MOVE: usize = 8192;
 const MS_REC: usize = 16384;
+const MS_SHARED: usize = 1 << 20;
+const MS_SLAVE: usize = 1 << 19;
 const MS_PRIVATE: usize = 1 << 18;
+const MS_UNBINDABLE: usize = 1 << 17;
 const SUSPICIOUS_STAT_BLKSIZE: u32 = 1 << 20;
 const SUSPICIOUS_RW_LEN: usize = 1 << 20;
 const O_NONBLOCK: i32 = 0x800;
@@ -3863,13 +3868,20 @@ pub fn sys_mount(
             _flags,
             _data
         );
-        if (_flags & MS_PRIVATE) != 0 {
-            let _ = _flags & MS_REC;
+        if (_flags & MS_MOVE) != 0 {
+            let source = if dev_name.is_empty() { return Err(ERRNO::EINVAL) } else { dev_name.as_str() };
+            do_move_mount(source, abs_mnt.as_str())?;
             return Ok(0);
         }
         if remount {
             let source = if dev_name.is_empty() { "tmpfs" } else { dev_name.as_str() };
             remount_path(&abs_mnt, source, fs_type.as_str(), readonly)?;
+        } else if (_flags & MS_BIND) != 0 {
+            let source = if dev_name.is_empty() { return Err(ERRNO::EINVAL) } else { dev_name.as_str() };
+            do_bind_mount(source, abs_mnt.as_str())?;
+        } else if (_flags & (MS_PRIVATE | MS_SHARED | MS_SLAVE | MS_UNBINDABLE)) != 0 {
+            let _ = _flags & MS_REC;
+            return Ok(0);
         } else if fs_type == "tmpfs" {
             mount_tmpfs(&abs_mnt, readonly)?;
         } else if fs_type == "sysfs" {
