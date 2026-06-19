@@ -47,6 +47,17 @@ const ECODE_ADE: usize = 0x8;
 const ECODE_SYS: usize = 0xb;
 const ECODE_INE: usize = 0xd;
 
+const ESTAT_ECODE_SHIFT: usize = 16;
+const ESTAT_ECODE_MASK: usize = 0x3f;
+const ESTAT_ESUBCODE_SHIFT: usize = 22;
+const ESTAT_ESUBCODE_MASK: usize = 0x1ff;
+
+/// Address error for instruction fetch.
+const ESUBCODE_ADEF: usize = 0;
+/// Address error for data-memory access. The subcode does not distinguish
+/// between a load and a store, so keep that ambiguity in the common cause.
+const ESUBCODE_ADEM: usize = 1;
+
 /// LoongArch64 implementation of [`InterruptControl`](crate::hal::traits::InterruptControl).
 pub struct LoongArchInterruptControl;
 
@@ -232,14 +243,19 @@ impl TrapMachine for LoongArchTrapMachine {
         let estat = read_estat();
         let ecfg = read_ecfg();
         let badv = read_badv();
-        let ecode = (estat >> 16) & 0x3f;
+        let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
+        let esubcode = (estat >> ESTAT_ESUBCODE_SHIFT) & ESTAT_ESUBCODE_MASK;
         let cause = match ecode {
             ECODE_SYS => TrapCause::UserSyscall,
             ECODE_PIS | ECODE_PME => TrapCause::StorePageFault,
             ECODE_PIL => TrapCause::LoadPageFault,
             ECODE_PIF => TrapCause::InstructionPageFault,
             ECODE_INE => TrapCause::IllegalInstruction,
-            ECODE_ADE => TrapCause::InstructionFault,
+            ECODE_ADE => match esubcode {
+                ESUBCODE_ADEF => TrapCause::InstructionFault,
+                ESUBCODE_ADEM => TrapCause::DataAddressFault,
+                _ => TrapCause::Unknown,
+            },
             ECODE_INT => {
                 decode_interrupt_cause(estat, ecfg)
             }

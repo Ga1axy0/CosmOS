@@ -347,7 +347,10 @@ pub fn trap_handler() -> ! {
                 }
             }
         }
-        TrapCause::StoreFault | TrapCause::InstructionFault | TrapCause::LoadFault => {
+        TrapCause::StoreFault
+        | TrapCause::InstructionFault
+        | TrapCause::LoadFault
+        | TrapCause::DataAddressFault => {
             log_user_fault("access fault", "unknown", trap_info.fault_addr, "SIGSEGV");
             current_add_signal(SignalBit::SIGSEGV);
         }
