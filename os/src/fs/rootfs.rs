@@ -28,6 +28,7 @@
 //! `syscall/fs.rs` that translate user arguments and call these functions.
 
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -60,7 +61,12 @@ struct VirtDirInner {
     /// Optional real-FS directory that handles names not present in `mounts`.
     overlay: Option<Arc<dyn VfsNode>>,
     /// Explicit child bindings (mount points / virtual sub-dirs).
-    mounts: BTreeMap<String, Arc<dyn VfsNode>>,
+    ///
+    /// Linux allows multiple mounts to be stacked on the same mountpoint; the
+    /// last one mounted is visible until it is unmounted again.  Keep a small
+    /// per-name stack so repeated bind/self-bind mounts can be peeled one by
+    /// one by `umount`.
+    mounts: BTreeMap<String, Vec<Arc<dyn VfsNode>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,22 +112,34 @@ impl VirtualDirNode {
 
     /// Bind `name` → `node` as an explicit child of this directory.
     ///
-    /// Takes priority over the overlay at the same name.  Overwrites any
-    /// previous binding.
+    /// Takes priority over the overlay at the same name.  Multiple mounts on
+    /// the same name are stacked; the newest binding becomes visible.
     pub fn bind(&self, name: &str, node: Arc<dyn VfsNode>) {
         self.inner
             .lock()
             .mounts
-            .insert(String::from(name), node);
+            .entry(String::from(name))
+            .or_default()
+            .push(node);
         // Invalidate cached overlay dentry at this name.
         remove_dentry(u64::MAX, self.ino, name);
     }
 
     /// Remove the explicit binding for `name`.
     ///
-    /// Returns `true` if the binding existed and was removed.
+    /// Returns `true` if one stacked binding existed and was removed.
     pub fn unbind(&self, name: &str) -> bool {
-        let existed = self.inner.lock().mounts.remove(name).is_some();
+        let existed = {
+            let mut inner = self.inner.lock();
+            let Some(stack) = inner.mounts.get_mut(name) else {
+                return false;
+            };
+            let popped = stack.pop().is_some();
+            if stack.is_empty() {
+                inner.mounts.remove(name);
+            }
+            popped
+        };
         if existed {
             // Invalidate cached mount dentry at this name.
             remove_dentry(u64::MAX, self.ino, name);
@@ -150,7 +168,7 @@ impl VirtualDirNode {
     pub(crate) fn namespace_child_dir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         {
             let inner = self.inner.lock();
-            if let Some(node) = inner.mounts.get(name) {
+            if let Some(node) = inner.mounts.get(name).and_then(|stack| stack.last()) {
                 if node.is_dir() {
                     return Some(Arc::clone(node));
                 }
@@ -161,11 +179,21 @@ impl VirtualDirNode {
     }
 
     pub(crate) fn has_mount(&self, name: &str) -> bool {
-        self.inner.lock().mounts.contains_key(name)
+        self.inner
+            .lock()
+            .mounts
+            .get(name)
+            .map(|stack| !stack.is_empty())
+            .unwrap_or(false)
     }
 
     pub(crate) fn mount_count(&self) -> usize {
-        self.inner.lock().mounts.len()
+        self.inner
+            .lock()
+            .mounts
+            .values()
+            .map(|stack| stack.len())
+            .sum()
     }
 
     pub(crate) fn mark_persistent_mount_wrapper(&self) {
@@ -185,7 +213,11 @@ impl VirtualDirNode {
 impl fmt::Debug for VirtualDirNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.inner.lock();
-        let mount_names: Vec<String> = inner.mounts.keys().cloned().collect();
+        let mount_names: Vec<String> = inner
+            .mounts
+            .iter()
+            .map(|(name, stack)| format!("{}({})", name, stack.len()))
+            .collect();
         f.debug_struct("VirtualDirNode")
             .field("ino", &self.ino)
             .field("overlay_present", &inner.overlay.is_some())
@@ -238,7 +270,7 @@ impl VfsNode for VirtualDirNode {
             inner
                 .mounts
                 .iter()
-                .map(|(name, node)| (name.clone(), node.file_type()))
+                .filter_map(|(name, stack)| stack.last().map(|node| (name.clone(), node.file_type())))
                 .collect()
         };
 
@@ -258,7 +290,7 @@ impl VfsNode for VirtualDirNode {
         // Step 1: explicit mounts take priority.
         {
             let inner = self.inner.lock();
-            if let Some(node) = inner.mounts.get(name) {
+            if let Some(node) = inner.mounts.get(name).and_then(|stack| stack.last()) {
                 return Some(Arc::clone(node));
             }
         }

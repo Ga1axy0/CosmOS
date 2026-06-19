@@ -389,10 +389,6 @@ pub fn do_bind_mount(source_path: &str, target_path: &str) -> Result<(), ERRNO> 
     }
 
     let src_wrapper = ensure_bind_source_wrapper(src_abs.as_str())?;
-    if src_abs == dst_abs {
-        return Ok(());
-    }
-
     let dst_vfs_node: Arc<dyn VfsNode> = Arc::clone(&src_wrapper) as Arc<dyn VfsNode>;
     let (parent_path, name) = split_for_mount(dst_abs.as_str());
     let parent_vdir = ensure_virtual_dir(parent_path)?;
