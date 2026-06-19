@@ -52,6 +52,8 @@ pub enum TrapCause {
     StoreFault,
     InstructionFault,
     LoadFault,
+    /// Data-memory address error whose direction (load/store) is not encoded.
+    DataAddressFault,
     IllegalInstruction,
     TimerInterrupt,
     SoftwareInterrupt,
