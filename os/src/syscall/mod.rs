@@ -900,7 +900,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_IO_URING_SETUP => sys_io_uring_setup(args[0] as u32, args[1]),
-        SYSCALL_OPEN_TREE => sys_open_tree(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        // SYSCALL_OPEN_TREE => sys_open_tree(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_FSOPEN => sys_fsopen(args[0] as *const u8, args[1] as u32),
         SYSCALL_FSPICK => sys_fspick(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_PIDFD_OPEN => sys_pidfd_open(args[0] as isize, args[1] as u32),
