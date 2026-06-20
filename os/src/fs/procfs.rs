@@ -555,8 +555,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
 }
 
 /// Render the permission column (`rwxp`) for a `/proc/<pid>/maps` line.
-/// CosmOS has no per-VMA shared/private bit on anonymous regions, so file
-/// mappings report `s` when shared and everything else reports `p`.
+/// File mappings and `MAP_SHARED|MAP_ANONYMOUS` both report `s`.
 fn maps_perm_string(perm: MapPermission, shared: bool) -> [u8; 4] {
     [
         if perm.contains(MapPermission::R) { b'r' } else { b'-' },
@@ -579,7 +578,7 @@ fn build_pid_maps(pid: usize) -> Result<String, FS_ERRNO> {
         }
         let start = usize::from(vma.start_vpn()) * PAGE_SIZE;
         let end = usize::from(vma.end_vpn()) * PAGE_SIZE;
-        let shared = vma.file.as_ref().map(|f| f.shared).unwrap_or(false);
+        let shared = vma.file.as_ref().map(|f| f.shared).unwrap_or(false) || vma.shared_anon;
         let pgoff = vma.file.as_ref().map(|f| f.pgoff * PAGE_SIZE).unwrap_or(0);
         let perms = maps_perm_string(vma.map_perm, shared);
         let perms = core::str::from_utf8(&perms).unwrap_or("----");

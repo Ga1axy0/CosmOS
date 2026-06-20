@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 
 use crate::block_cache::get_block_cache;
 use crate::block_dev::BlockDevice;
+use crate::errno::FS_ERRNO;
 use crate::BLOCK_SZ;
 
 /// Parsed FAT32 BIOS Parameter Block (BPB) with derived fields.
@@ -24,7 +25,7 @@ pub struct Fat32Bpb {
 }
 
 impl Fat32Bpb {
-    pub fn read_from(block_device: &Arc<dyn BlockDevice>) -> Self {
+    pub fn read_from(block_device: &Arc<dyn BlockDevice>) -> Result<Self, FS_ERRNO> {
         let mut sector = [0u8; BLOCK_SZ];
         get_block_cache(0, Arc::clone(block_device))
             .lock()
@@ -49,23 +50,35 @@ impl Fat32Bpb {
 
         let root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
 
-        assert_eq!(bytes_per_sector as usize, BLOCK_SZ, "FAT32: bytes_per_sector != BLOCK_SZ");
-        assert!(sectors_per_cluster != 0, "FAT32: invalid sectors_per_cluster");
-        assert!(num_fats >= 1, "FAT32: invalid num_fats");
-        assert!(fat_sectors != 0, "FAT32: invalid fat size");
-        assert!(root_cluster >= 2, "FAT32: invalid root cluster");
+        if bytes_per_sector as usize != BLOCK_SZ {
+            return Err(FS_ERRNO::EINVAL);
+        }
+        if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+            return Err(FS_ERRNO::EINVAL);
+        }
+        if num_fats < 1 || fat_sectors == 0 {
+            return Err(FS_ERRNO::EINVAL);
+        }
 
         let fat_start_lba = reserved_sectors as u32;
-        let data_start_lba = fat_start_lba + num_fats as u32 * fat_sectors;
+        let fat_span = (num_fats as u32)
+            .checked_mul(fat_sectors)
+            .ok_or(FS_ERRNO::EINVAL)?;
+        let data_start_lba = fat_start_lba
+            .checked_add(fat_span)
+            .ok_or(FS_ERRNO::EINVAL)?;
 
         let data_sectors = total_sectors
             .checked_sub(data_start_lba)
-            .expect("FAT32: total_sectors too small");
+            .ok_or(FS_ERRNO::EINVAL)?;
         let total_clusters = data_sectors / sectors_per_cluster as u32;
         // Cluster numbers start at 2.
-        let max_cluster = total_clusters + 1;
+        let max_cluster = total_clusters.checked_add(1).ok_or(FS_ERRNO::EINVAL)?;
+        if root_cluster < 2 || root_cluster > max_cluster {
+            return Err(FS_ERRNO::EINVAL);
+        }
 
-        Self {
+        Ok(Self {
             bytes_per_sector,
             sectors_per_cluster,
             reserved_sectors,
@@ -76,7 +89,7 @@ impl Fat32Bpb {
             fat_start_lba,
             data_start_lba,
             max_cluster,
-        }
+        })
     }
 
     #[inline]

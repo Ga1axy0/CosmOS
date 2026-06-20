@@ -32,8 +32,23 @@ pub fn render_perf_counters() -> String {
     virtio_blk::render_perf_counters()
 }
 
-fn virtio_blk_name(idx: usize) -> String {
+/// Return the discovered block-device name for `idx`.
+///
+/// Default naming follows Linux-style partition numbering used by this tree:
+/// `vda`, `vda2`, `vda3`, ...
+/// With `legacy-vdb-names`, the names remain `vda`, `vdb`, `vdc`, ...
+#[cfg(feature = "legacy-vdb-names")]
+pub(crate) fn block_device_name(idx: usize) -> String {
     alloc::format!("vd{}", (b'a' + idx as u8) as char)
+}
+
+#[cfg(not(feature = "legacy-vdb-names"))]
+pub(crate) fn block_device_name(idx: usize) -> String {
+    if idx == 0 {
+        String::from("vda")
+    } else {
+        alloc::format!("vda{}", idx + 1)
+    }
 }
 
 #[inline]
@@ -60,7 +75,7 @@ fn mmio_slot_device_type(header: NonNull<VirtIOHeader>) -> Option<DeviceType> {
 }
 
 lazy_static! {
-    /// Registry of all discovered block devices, keyed by name (`"vda"`, `"vdb"`, …).
+    /// Registry of all discovered block devices, keyed by name (`"vda"`, `"vda2"`, … by default).
     ///
     /// Must be populated by [`probe_block_devices`] before any FS initialisation.
     pub static ref BLOCK_DEVICES: SpinNoIrqLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
@@ -74,8 +89,8 @@ lazy_static! {
 /// Scan the VirtIO MMIO bus slots and register every block device found.
 ///
 /// QEMU's `virt` machine maps up to 8 VirtIO devices starting at `0x1000_1000`,
-/// each occupying `0x1000` bytes.  Devices are named `vda`, `vdb`, … in the
-/// order they are discovered.
+/// each occupying `0x1000` bytes.  Devices are named `vda`, `vda2`, … by
+/// default, or `vda`, `vdb`, … with `legacy-vdb-names`.
 ///
 /// Must be called **before** `fs::init_rootfs` and `fs::init_dev`.
 pub fn probe_block_devices() {
@@ -103,8 +118,7 @@ pub fn probe_block_devices() {
 
         if let Some(dev) = VirtIOBlock::try_new(SomeTransport::from(transport)) {
             let dev = Arc::new(dev);
-            // let name = alloc::format!("vd{}", (b'a' + idx as u8) as char);
-            let name = virtio_blk_name(idx);
+            let name = block_device_name(idx);
             debug!("[kernel] block device {} idx {} at {:#x}", name, idx, addr);
             map.insert(name, dev.clone());
             irq_map.insert(VIRTIO_MMIO_IRQ_BASE + slot as u32, dev);
@@ -129,7 +143,7 @@ lazy_static! {
     /// [`probe_block_devices`] must be called before this is first accessed.
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = BLOCK_DEVICES
         .lock()
-        .get("vda")
+        .get(&block_device_name(0))
         .cloned()
         .expect("[kernel] BLOCK_DEVICE: vda not found");
 }

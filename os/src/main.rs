@@ -272,7 +272,9 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     print_boot_stage("devices", "virtio buses enumerated");
     net::init();
     print_boot_stage("network", "smoltcp stack synchronized");
-    fs::init();
+    if let Err(err) = fs::init() {
+        panic!("[kernel] filesystem init failed: {:?}", err);
+    }
     print_boot_stage("storage", "root filesystem mounted");
     timer::init_realtime_offset_from_rtc();
     print_boot_stage("clock", "realtime source calibrated");

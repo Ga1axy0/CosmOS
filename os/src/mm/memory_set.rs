@@ -18,6 +18,7 @@ use crate::hal::traits::{AddressSpaceToken, TrapMachine};
 use crate::sync::SpinNoIrqLock;
 use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
+use crate::timer::get_time_ns;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -57,6 +58,7 @@ pub struct ElfLoadInfo {
 
 /// `R_RISCV_RELATIVE` relocation used by static PIE executables.
 const R_RISCV_RELATIVE: u32 = 3;
+const FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
 
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
@@ -1076,10 +1078,17 @@ impl MemorySet {
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &mut Self) -> Result<(Self, bool), MmError> {
+        let clone_start_ns = get_time_ns();
         let mut memory_set = Self::new_bare()?;
         // map trampoline
         memory_set.map_trampoline()?;
         let mut parent_tlb_needs_flush = false;
+        let mut shared_anon_vmas = 0usize;
+        let mut shared_private_vmas = 0usize;
+        let mut copied_private_pages = 0usize;
+        let mut shared_private_pages = 0usize;
+        let mut shared_anon_pages = 0usize;
+        let mut inherited_direct_cache_pages = 0usize;
         debug!(
             "[cow] fork clone address space: parent_vmas={}",
             user_space.vmas.len()
@@ -1092,6 +1101,11 @@ impl MemorySet {
             };
             let share_private_pages = area.supports_private_page_sharing();
             let new_area = area.clone_metadata();
+            if area.shared_anon {
+                shared_anon_vmas += 1;
+            } else if share_private_pages {
+                shared_private_vmas += 1;
+            }
             // debug!(
             //     "[cow] fork inspect VMA: start={:#x} end={:#x} kind={:?} share_private_pages={} private_pages={} direct_cache_pages={}",
             //     area.start_vpn().0,
@@ -1101,7 +1115,9 @@ impl MemorySet {
             //     area.data_frames.len(),
             //     area.direct_cache_pages.len()
             // );
-            if share_private_pages {
+            if area.shared_anon {
+                memory_set.register_vma_metadata(new_area)?;
+            } else if share_private_pages {
                 memory_set.register_vma_metadata(new_area)?;
             } else {
                 memory_set.insert_vma(new_area, None)?;
@@ -1122,7 +1138,15 @@ impl MemorySet {
                 .collect();
             let inherit_direct_cache_pages = area.file.is_some();
             for (vpn, page) in private_pages {
+                if area.shared_anon {
+                    shared_anon_pages += 1;
+                    let mut child_flags = user_space.translate(vpn).unwrap().flags();
+                    child_flags.remove(PTEFlags::D);
+                    memory_set.map_existing_private_page(vpn, page, child_flags)?;
+                    continue;
+                }
                 if share_private_pages {
+                    shared_private_pages += 1;
                     let mut child_flags = user_space.translate(vpn).unwrap().flags();
                     child_flags.remove(PTEFlags::D);
                     if map_perm.contains(MapPermission::W) {
@@ -1146,6 +1170,7 @@ impl MemorySet {
                 if memory_set.translate(vpn).is_none() {
                     memory_set.map_private_page_in_vma(vpn)?;
                 }
+                copied_private_pages += 1;
                 let src_ppn = user_space.translate(vpn).unwrap().ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
                 dst_ppn
@@ -1165,6 +1190,7 @@ impl MemorySet {
                     if memory_set.translate(vpn).is_some() {
                         continue;
                     }
+                    inherited_direct_cache_pages += 1;
                     let mut child_flags = user_space.translate(vpn).unwrap().flags();
                     child_flags.remove(PTEFlags::D);
                     if !file_shared {
@@ -1186,6 +1212,21 @@ impl MemorySet {
                 crate::hal::flush_tlb();
             }
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
+        }
+        let total_ns = get_time_ns() - clone_start_ns;
+        if total_ns >= FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] from_existed_user total_ns={} parent_vmas={} shared_anon_vmas={} shared_private_vmas={} copied_private_pages={} shared_private_pages={} shared_anon_pages={} inherited_direct_cache_pages={} parent_tlb_needs_flush={}",
+                total_ns,
+                user_space.vmas.len(),
+                shared_anon_vmas,
+                shared_private_vmas,
+                copied_private_pages,
+                shared_private_pages,
+                shared_anon_pages,
+                inherited_direct_cache_pages,
+                parent_tlb_needs_flush
+            );
         }
         Ok((memory_set, parent_tlb_needs_flush))
     }
@@ -1373,14 +1414,20 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
+        shared: bool,
     ) -> Result<(), MmError> {
         debug!(
-            "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} eager=false",
+            "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} shared={} eager={}",
             usize::from(start_va),
             usize::from(end_va),
-            permission
+            permission,
+            shared,
+            shared
         );
-        self.register_vma_metadata(Vma::new_anonymous(start_va, end_va, permission))?;
+        self.insert_vma(
+            Vma::new_anonymous(start_va, end_va, permission, shared),
+            None,
+        )?;
         unsafe {
             crate::hal::flush_tlb();
         }
@@ -2061,6 +2108,7 @@ impl MemorySet {
                     map_perm: area.map_perm,
                     kind: area.kind.clone(),
                     file: area.file.clone(),
+                    shared_anon: area.shared_anon,
                     direct_cache_pages: area.direct_cache_pages,
                 };
                 area.data_frames = left_data_frames;
@@ -2091,6 +2139,7 @@ impl MemorySet {
                     map_perm: area.map_perm,
                     kind: area.kind.clone(),
                     file: right_file,
+                    shared_anon: area.shared_anon,
                     direct_cache_pages: right_direct_cache_pages,
                 };
 
@@ -2253,6 +2302,8 @@ pub struct Vma {
     pub kind: VmaKind,
     /// 文件映射附带的底层对象信息；匿名区域为 `None`。
     pub file: Option<FileVma>,
+    /// 匿名映射是否带有 `MAP_SHARED` 语义。
+    pub shared_anon: bool,
     /// 当前直接映射到用户页表的 page cache 页。
     /// `MAP_SHARED` 与首次只读接入的 `MAP_PRIVATE` 都会使用这里记录映射关系。
     pub direct_cache_pages: BTreeMap<VirtPageNum, Arc<SpinNoIrqLock<CachePage>>>,
@@ -2276,6 +2327,7 @@ impl Vma {
             map_perm,
             kind,
             file: None,
+            shared_anon: false,
             direct_cache_pages: BTreeMap::new(),
         }
     }
@@ -2320,14 +2372,21 @@ impl Vma {
         )
     }
     /// 为匿名映射场景生成一段普通用户区域。
-    pub fn new_anonymous(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
-        Self::new(
+    pub fn new_anonymous(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_perm: MapPermission,
+        shared: bool,
+    ) -> Self {
+        let mut vma = Self::new(
             start_va,
             end_va,
             MapType::Framed,
             map_perm,
             VmaKind::Anonymous,
-        )
+        );
+        vma.shared_anon = shared;
+        vma
     }
     /// 为文件映射场景保留文件偏移等来源信息。
     pub fn new_file(
@@ -2361,6 +2420,7 @@ impl Vma {
             map_perm: self.map_perm,
             kind: self.kind.clone(),
             file: self.file.clone(),
+            shared_anon: self.shared_anon,
             direct_cache_pages: BTreeMap::new(),
         }
     }
@@ -2402,6 +2462,7 @@ impl Vma {
             && self.map_type == other.map_type
             && self.map_perm == other.map_perm
             && self.kind == other.kind
+            && self.shared_anon == other.shared_anon
             && self.file.is_none()
             && other.file.is_none()
     }
@@ -2417,6 +2478,9 @@ impl Vma {
             return false;
         }
         if matches!(self.kind, VmaKind::TrapContext { .. }) {
+            return false;
+        }
+        if self.shared_anon {
             return false;
         }
         !matches!(self.file.as_ref(), Some(file) if file.shared)
@@ -2439,6 +2503,7 @@ impl Vma {
     pub fn supports_lazy_user_fault(&self) -> bool {
         self.map_type == MapType::Framed
             && self.is_user_accessible()
+            && !self.shared_anon
             && matches!(
                 self.kind,
                 VmaKind::Anonymous | VmaKind::Heap | VmaKind::UserStack { .. }
@@ -2474,6 +2539,7 @@ impl Vma {
             map_perm: self.map_perm,
             kind: self.kind.clone(),
             file: right_file,
+            shared_anon: self.shared_anon,
             direct_cache_pages: right_direct_cache_pages,
         })
     }

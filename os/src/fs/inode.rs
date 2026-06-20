@@ -10,7 +10,7 @@ use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
 use crate::fs::tty::TtyDeviceNode;
 use crate::fs::procfs::ProcRootNode;
 use crate::fs::sysfs::SysRootNode;
-use crate::drivers::block::BLOCK_DEVICES;
+use crate::drivers::block::{block_device_name, BLOCK_DEVICES};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -494,27 +494,35 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
 /// Must be called **after** `mm::init()` (heap allocator required for `Arc`
 /// and filesystem initialisation) and before any file-system operations.
 /// Invoked from `rust_main` in `main.rs`.
-pub fn init_rootfs() {
+pub fn init_rootfs() -> Result<(), ERRNO> {
     let (root_dev_name, root_dev, extra_dev) = {
+        let primary_name = block_device_name(0);
+        let secondary_name = block_device_name(1);
+        let primary_path = alloc::format!("/dev/{}", primary_name);
+        let secondary_path = alloc::format!("/dev/{}", secondary_name);
         let map = BLOCK_DEVICES.lock();
-        if let Some(dev) = map.get("vdb").cloned() {
-            ("/dev/vdb", dev, map.get("vda").cloned().map(|dev| ("/dev/vda", dev)))
+        if let Some(dev) = map.get(&secondary_name).cloned() {
+            let extra_dev = map
+                .get(&primary_name)
+                .cloned()
+                .map(|dev| (primary_path.clone(), dev));
+            (secondary_path, dev, extra_dev)
         } else {
             let dev = map
-                .get("vda")
+                .get(&primary_name)
                 .cloned()
-                .expect("[kernel] rootfs device vda not found");
-            ("/dev/vda", dev, None)
+                .expect("[kernel] rootfs primary block device not found");
+            (primary_path, dev, None)
         }
     };
 
     #[cfg(feature = "fat32")]
     {
         use fs::Fat32FileSystem;
-        let vfs = Fat32FileSystem::open(root_dev.clone());
+        let vfs = Fat32FileSystem::open(root_dev.clone()).map_err(ERRNO::from)?;
         let root = Fat32FileSystem::root_inode(&vfs);
-        do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount fat32 at /"));
-        record_mount("/", root_dev_name, "fat32", "rw");
+        do_mount("/", root)?;
+        record_mount("/", root_dev_name.as_str(), "fat32", "rw");
     }
     #[cfg(feature = "easyfs")]
     {
@@ -522,7 +530,7 @@ pub fn init_rootfs() {
         let efs = EasyFileSystem::open(root_dev.clone());
         let root = EasyFileSystem::root_inode(&efs);
         do_mount("/", root).unwrap_or_else(|_| panic!("[kernel] failed to mount easyfs at /"));
-        record_mount("/", root_dev_name, "easyfs", "rw");
+        record_mount("/", root_dev_name.as_str(), "easyfs", "rw");
     }
     #[cfg(feature = "ext4")]
     {
@@ -530,13 +538,13 @@ pub fn init_rootfs() {
         let efs = Ext4FileSystem::open(root_dev.clone());
         let root = Ext4FileSystem::root_inode(&efs);
         do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
-        record_mount("/", root_dev_name, "ext4", "rw");
+        record_mount("/", root_dev_name.as_str(), "ext4", "rw");
         if let Some((extra_dev_name, extra_dev)) = extra_dev {
             let extra_fs = Ext4FileSystem::open(extra_dev);
             let extra_root = Ext4FileSystem::root_inode(&extra_fs);
             do_mount("/mnt", extra_root)
                 .unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt"));
-            record_mount("/mnt", extra_dev_name, "ext4", "rw");
+            record_mount("/mnt", extra_dev_name.as_str(), "ext4", "rw");
             info!("[kernel] mounted extra ext4 at /mnt from {}", extra_dev_name);
         }
     }
@@ -547,6 +555,7 @@ pub fn init_rootfs() {
     record_mount("/tmp", "tmpfs", "tmpfs", "rw");
 
     info!("[kernel] rootfs initialised");
+    Ok(())
 }
 
 /// List all apps in the root directory
@@ -1229,7 +1238,7 @@ pub fn init_dev() {
     dev_dir.bind("tty", tty_node);
     info!("[kernel] /dev/console and /dev/tty registered");
 
-    // Register discovered block devices (e.g. /dev/vda)
+    // Register discovered block devices (e.g. /dev/vda, /dev/vda2, /dev/vdb).
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
         let minor = super::devfs::blkdev_minor_from_name(dev_name);
@@ -1305,7 +1314,7 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str, readonly: bool
         "vfat" | "fat32" => {
             use fs::Fat32FileSystem;
             debug!("mount_device: opening FAT32 filesystem on {}", dev_path);
-            let vfs = Fat32FileSystem::open(block_dev);
+            let vfs = Fat32FileSystem::open(block_dev).map_err(ERRNO::from)?;
             Fat32FileSystem::root_inode(&vfs)
         }
         #[cfg(feature = "ext4")]

@@ -192,6 +192,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                         VirtAddr::from(chosen),
                         VirtAddr::from(chosen_end),
                         perm,
+                        is_shared,
                     )
                 };
                 mapped.map_err(|_| ERRNO::ENOMEM)?;
@@ -226,7 +227,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
                     is_shared,
                 )
             } else {
-                process.mmap(VirtAddr::from(addr), VirtAddr::from(end), perm)
+                process.mmap(VirtAddr::from(addr), VirtAddr::from(end), perm, is_shared)
             };
             mapped?;
             debug!(

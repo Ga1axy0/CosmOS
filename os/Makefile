@@ -2,7 +2,7 @@
 ARCH ?= riscv64
 # EXTRA_FEATURES ?=
 # EXTRA_FEATURES ?= --features io_perf_counters --features net_perf_counters
-EXTRA_FEATURES ?= --features oom_diagnostics
+EXTRA_FEATURES ?= --features legacy-vdb-names
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 

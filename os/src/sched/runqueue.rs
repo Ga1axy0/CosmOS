@@ -11,6 +11,7 @@ use crate::task::{
     ProcessControlBlock, ReschedReason, SchedPolicy, TaskControlBlock, TaskControlBlockInner,
     TaskStatus, SCHED_RT_PRIO_MAX,
 };
+use crate::timer::get_time_ns;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -25,6 +26,19 @@ struct EnqueuedTaskInfo {
     policy: SchedPolicy,
     rt_priority: u8,
     vruntime_ns: u64,
+}
+
+fn running_cfs_vruntime_snapshot(hart: usize) -> Option<u64> {
+    let task = processor_for_hart(normalize_hart(hart)).lock().current()?;
+    let mut task_inner = task.inner_exclusive_access();
+    if !task_inner.sched.on_cpu
+        || !matches!(task_inner.task_status, TaskStatus::Running)
+        || !matches!(task_inner.sched.policy, SchedPolicy::Other)
+    {
+        return None;
+    }
+    task_inner.account_cfs_runtime(get_time_ns());
+    Some(task_inner.sched.vruntime_ns)
 }
 
 /// Local runnable queues owned by one hart.
@@ -59,6 +73,7 @@ impl RunQueue {
         &mut self,
         task: Arc<TaskControlBlock>,
         task_inner: &mut TaskControlBlockInner,
+        current_vruntime_hint: Option<u64>,
     ) -> EnqueuedTaskInfo {
         match task_inner.sched.policy {
             SchedPolicy::Fifo | SchedPolicy::Rr => {
@@ -82,6 +97,7 @@ impl RunQueue {
                 let (placed_vruntime, initialized) = self.place_cfs_entity(
                     task_inner.sched.vruntime_ns,
                     task_inner.sched.cfs_initialized,
+                    current_vruntime_hint,
                 );
                 task_inner.sched.vruntime_ns = placed_vruntime;
                 task_inner.sched.cfs_initialized = initialized;
@@ -103,13 +119,21 @@ impl RunQueue {
         }
     }
 
-    fn place_cfs_entity(&self, vruntime_ns: u64, initialized: bool) -> (u64, bool) {
+    fn place_cfs_entity(
+        &self,
+        vruntime_ns: u64,
+        initialized: bool,
+        current_vruntime_hint: Option<u64>,
+    ) -> (u64, bool) {
+        let effective_min_vruntime = match current_vruntime_hint {
+            Some(current_vruntime) if self.cfs_nr_running == 0 => current_vruntime,
+            Some(current_vruntime) => self.min_vruntime_ns.min(current_vruntime),
+            None => self.min_vruntime_ns,
+        };
         if !initialized {
-            return (self.min_vruntime_ns, true);
+            return (effective_min_vruntime, true);
         }
-        let sleeper_floor = self
-            .min_vruntime_ns
-            .saturating_sub(CFS_WAKEUP_GRANULARITY_NS);
+        let sleeper_floor = effective_min_vruntime.saturating_sub(CFS_WAKEUP_GRANULARITY_NS);
         let placed_vruntime = vruntime_ns.max(sleeper_floor);
         (placed_vruntime, true)
     }
@@ -314,14 +338,22 @@ fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
     let Some(task) = current_task() else {
         return;
     };
-    let task_inner = task.inner_exclusive_access();
+    let mut task_inner = task.inner_exclusive_access();
     if !task_inner.sched.on_cpu || !matches!(task_inner.task_status, TaskStatus::Running) {
         return;
     }
+    let current_policy = task_inner.sched.policy;
+    let current_rt_priority = task_inner.sched.rt_priority;
+    // Wakeup preemption should compare against the current task's vruntime as
+    // of "now", not the last tick or context-switch accounting point.
+    if matches!(current_policy, SchedPolicy::Other) {
+        task_inner.account_cfs_runtime(get_time_ns());
+    }
+    let current_vruntime_after = task_inner.sched.vruntime_ns;
     let reason = preempt_reason_for_current(
-        task_inner.sched.policy,
-        task_inner.sched.rt_priority,
-        task_inner.sched.vruntime_ns,
+        current_policy,
+        current_rt_priority,
+        current_vruntime_after,
         incoming,
     );
     drop(task_inner);
@@ -401,6 +433,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         (task_inner.sched.cpu_affinity_mask, task_inner.sched.policy)
     };
     let target_hart = select_target_hart(hart, affinity_mask, policy);
+    let current_vruntime_hint = running_cfs_vruntime_snapshot(target_hart);
     let incoming = {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
@@ -414,12 +447,13 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         task_inner.wait_reason = None;
         task_inner.sched.last_cpu = target_hart;
         task_inner.sched.on_rq = true;
-        rq.enqueue_locked(Arc::clone(&task), &mut task_inner)
+        rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint)
     };
     notify_enqueued_task(target_hart, incoming);
 }
 
 fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool {
+    let current_vruntime_hint = running_cfs_vruntime_snapshot(target_hart);
     let incoming = {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
@@ -441,7 +475,7 @@ fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool 
         }
         task_inner.sched.on_rq = true;
         task_inner.sched.last_cpu = target_hart;
-        rq.enqueue_locked(Arc::clone(&task), &mut task_inner)
+        rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint)
     };
     notify_enqueued_task(target_hart, incoming);
     true

@@ -1,6 +1,6 @@
 use crate::sync::{
-    futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar, Mutex, MutexBlocking,
-    MutexSpin, Semaphore,
+    futex_cmp_requeue_addr, futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar,
+    Mutex, MutexBlocking, MutexSpin, Semaphore,
 };
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
@@ -15,6 +15,7 @@ const DEADLOCK_DETECTED: isize = -0xDEAD;
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
 const FUTEX_REQUEUE: i32 = 3;
+const FUTEX_CMP_REQUEUE: i32 = 4;
 const FUTEX_WAIT_BITSET: i32 = 9;
 const FUTEX_WAKE_BITSET: i32 = 10;
 const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -178,6 +179,36 @@ pub fn sys_futex(
                     timeout,
                     private,
                 )?;
+                Ok(ret)
+            }
+            FUTEX_CMP_REQUEUE => {
+                let flags = op & !FUTEX_CMD_MASK;
+                if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0 {
+                    warn!(
+                        "Unsupported futex CMP_REQUEUE target: op={:#x} uaddr2={:#x}",
+                        op,
+                        uaddr2
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if flags & !FUTEX_PRIVATE_FLAG != 0 {
+                    warn!(
+                        "Unsupported futex CMP_REQUEUE flags: op={:#x} flags={:#x}",
+                        op,
+                        flags
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                let ret = futex_cmp_requeue_addr(
+                    uaddr,
+                    uaddr2,
+                    val.max(0) as usize,
+                    timeout,
+                    val3,
+                    private,
+                );
+                let ret = ret?;
                 Ok(ret)
             }
             FUTEX_WAIT_BITSET => {

@@ -17,8 +17,8 @@ mod task;
 
 use self::id::TaskUserRes;
 use crate::sched::{
-    add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
-    take_current_task, TaskContext,
+    add_stopping_task, list_pids, pid2process, remove_task, schedule, take_current_task,
+    TaskContext,
 };
 use crate::fs::{open_file_at, OpenFlags};
 use crate::syscall::write_process_accounting_on_exit;
@@ -27,8 +27,8 @@ use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{cleanup_futex_wait_for_task, futex_wake_addr_in_process};
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
-use crate::mm::{warn_heap_state, warn_heap_state_lockfree, DeferredUserReclaim, MapPermission, VirtAddr};
-use crate::timer::{get_time, get_time_us};
+use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
+use crate::timer::get_time;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use lazy_static::*;
@@ -40,6 +40,10 @@ pub use crate::sched::{
     suspend_current_and_run_next, suspend_current_and_run_next_with_slice_reset, wakeup_task,
     yield_current_and_run_next,
 };
+
+fn should_remove_non_futex_timers_on_exit(task: &Arc<TaskControlBlock>) -> bool {
+    task.inner_exclusive_access().may_have_non_futex_timer
+}
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MAX_SIG, SaFlags, SigInfo, SignalAction,
     SignalActions, SignalBit, SIG_DFL, SIG_IGN,
@@ -193,7 +197,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     }
     cleanup_signal_wait_for_task(&task);
     cleanup_futex_wait_for_task(&task);
-    remove_timer(Arc::clone(&task));
+    let remove_non_futex_timers = should_remove_non_futex_timers_on_exit(&task);
+    if remove_non_futex_timers {
+        remove_timer(Arc::clone(&task));
+    }
     if let Some(thread_id) = thread_id {
         remove_from_tid2task(thread_id);
     }
@@ -652,7 +659,10 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     cleanup_signal_wait_for_task(&task);
     cleanup_futex_wait_for_task(&task);
     trace!("kernel: remove_inactive_task .. remove_timer");
-    remove_timer(Arc::clone(&task));
+    let remove_non_futex_timers = should_remove_non_futex_timers_on_exit(&task);
+    if remove_non_futex_timers {
+        remove_timer(Arc::clone(&task));
+    }
 }
 
 /// Map an anonymous area in current process with given permission.
@@ -661,7 +671,7 @@ pub fn mmap_current_process(
     end: VirtAddr,
     perm: MapPermission,
 ) -> Result<(), crate::syscall::errno::ERRNO> {
-    current_process().mmap(start, end, perm)
+    current_process().mmap(start, end, perm, false)
 }
 
 /// Unmap an anonymous area in current process.

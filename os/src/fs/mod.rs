@@ -789,9 +789,10 @@ pub use stdio::new_stdio_files;
 pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize, CONSOLE_TTY};
 
 /// Initialize the filesystem, including rootfs and devfs.
-pub fn init() {
-    init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
-    init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+pub fn init() -> Result<(), ERRNO> {
+    init_rootfs()?;  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
+    init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda, /dev/vdb) for block devices.
     init_sysfs();  // Initialize sysfs for /sys/class/net entries.
     init_procfs();  // Initialize procfs for /proc entries.
+    Ok(())
 }

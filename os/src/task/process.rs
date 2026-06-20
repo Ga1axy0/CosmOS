@@ -12,15 +12,15 @@ use crate::config::{CLOCK_FREQ, PAGE_SIZE};
 use crate::fs::{canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription, OpenFlags};
 use crate::ipc;
 use crate::mm::{
-    register_file_mapping, shootdown, translated_refmut, warn_heap_state, DeferredUserReclaim,
-    InodeKey, MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled,
-    ShootdownKind, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
+    register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
+    MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
+    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::hal::traits::AddressSpaceToken;
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
-use crate::timer::get_realtime_ns;
+use crate::timer::{get_realtime_ns, get_time_ns};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -37,6 +37,7 @@ const INIT_CWD: &str = "/root";
 const INIT_INTERPRETER_MAX_DEPTH: usize = 4;
 const INIT_PROBE_SIZE: usize = 256;
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+const CLONE_PROCESS_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
 const INIT_ENV: &[&str] = &[
     "HOME=/root",
     "INPUTRC=/etc/inputrc",
@@ -1006,6 +1007,7 @@ impl ProcessControlBlock {
         child_set_tid: Option<usize>,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
+        let clone_start_ns = get_time_ns();
         // warn_heap_state("fork_begin", self.getpid());
         let mut parent = self.inner_exclusive_access();
         // assert_eq!(parent.thread_count(), 1);
@@ -1023,8 +1025,10 @@ impl ProcessControlBlock {
             parent.thread_count()
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
+        let addr_space_start_ns = get_time_ns();
         let (memory_set, parent_tlb_needs_flush) =
             MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
+        let addr_space_ns = get_time_ns() - addr_space_start_ns;
         // warn_heap_state("fork_after_memory_set_clone", self.getpid());
         let parent_token = parent.memory_set.token();
         let parent_mask = if parent_tlb_needs_flush {
@@ -1040,9 +1044,11 @@ impl ProcessControlBlock {
         let parent_umask = parent.umask;
         let parent_keyrings = parent.keyrings;
         let parent_shm_attachments = parent.shm_attachments.clone();
+        let parent_fd_count = parent.fd_table.len();
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
+        let fd_copy_start_ns = get_time_ns();
         let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
             if let Some(entry) = fd {
@@ -1051,7 +1057,9 @@ impl ProcessControlBlock {
                 new_fd_table.push(None);
             }
         }
+        let fd_copy_ns = get_time_ns() - fd_copy_start_ns;
         // create child process pcb
+        let child_pcb_start_ns = get_time_ns();
         let child = Arc::new(Self {
             pid,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
@@ -1092,9 +1100,10 @@ impl ProcessControlBlock {
                     itimer_prof: ItimerState::default(),
                     robust_list: RobustList { head: 0, len: 0 },
                     shm_attachments: parent_shm_attachments.clone(),
-                }),
+            }),
             wait_exit_queue: Arc::new(WaitQueue::new())
         });
+        let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
         // add child
         parent.children.push(Arc::clone(&child));
@@ -1102,10 +1111,13 @@ impl ProcessControlBlock {
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_sched_attr = parent_task_inner.sched_attr();
+        let parent_vruntime_ns = parent_task_inner.sched.vruntime_ns;
+        let parent_cfs_initialized = parent_task_inner.sched.cfs_initialized;
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         let parent_signal_mask = parent_task_inner.signal_mask;
         drop(parent_task_inner);
         drop(parent);
+        let tlb_shootdown_start_ns = get_time_ns();
         if parent_mask != 0 {
             debug!(
                 "[tlb] fork shootdown parent mm: parent_pid={} token={:#x} mask={:#b}",
@@ -1115,12 +1127,14 @@ impl ProcessControlBlock {
             );
             shootdown(parent_mask, ShootdownKind::AddressSpace { token: parent_token });
         }
+        let tlb_shootdown_ns = get_time_ns() - tlb_shootdown_start_ns;
         debug!(
             "[cow] clone_process created child process: parent_pid={} child_pid={}",
             self.getpid(),
             child.getpid()
         );
         // create main thread of child process
+        let task_create_start_ns = get_time_ns();
         let task = child.create_task(
             parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
@@ -1133,9 +1147,13 @@ impl ProcessControlBlock {
                 .retain(|candidate| !Arc::ptr_eq(candidate, &child));
             mm_error_to_errno(err)
         })?;
+        let task_create_ns = get_time_ns() - task_create_start_ns;
         // warn_heap_state("fork_after_create_task", child.getpid());
+        let finalize_start_ns = get_time_ns();
         {
             let mut task_inner = task.inner_exclusive_access();
+            task_inner.sched.vruntime_ns = parent_vruntime_ns;
+            task_inner.sched.cfs_initialized = parent_cfs_initialized;
             task_inner.sched.cpu_affinity_mask = parent_affinity_mask;
             task_inner.signal_mask = parent_signal_mask;
         }
@@ -1171,14 +1189,38 @@ impl ProcessControlBlock {
         for attachment in parent_shm_attachments {
             ipc::retain_attached_segment(attachment.shmid);
         }
+        let file_map_start_ns = get_time_ns();
         child.register_existing_file_mappings();
+        let file_map_ns = get_time_ns() - file_map_start_ns;
+        let finalize_ns = get_time_ns() - finalize_start_ns;
         debug!(
             "[cow] clone_process complete: parent_pid={} child_pid={}",
             self.getpid(),
             child.getpid()
         );
+        let publish_start_ns = get_time_ns();
+        task.mark_clone_ready(publish_start_ns);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        let publish_ns = get_time_ns() - publish_start_ns;
+        let total_ns = get_time_ns() - clone_start_ns;
+        if total_ns >= CLONE_PROCESS_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] clone_process parent_pid={} child_pid={} total_ns={} addr_space_ns={} fd_copy_ns={} child_pcb_ns={} tlb_shootdown_ns={} task_create_ns={} finalize_ns={} file_map_ns={} publish_ns={} parent_fd_count={}",
+                self.getpid(),
+                child.getpid(),
+                total_ns,
+                addr_space_ns,
+                fd_copy_ns,
+                child_pcb_ns,
+                tlb_shootdown_ns,
+                task_create_ns,
+                finalize_ns,
+                file_map_ns,
+                publish_ns,
+                parent_fd_count
+            );
+        }
         // warn_heap_state("fork_end", child.getpid());
         Ok(child)
     }
@@ -1350,11 +1392,20 @@ impl ProcessControlBlock {
     }
 
     /// map an anonymous area with given permission, return true if success
-    pub fn mmap(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> Result<(), ERRNO> {
+    pub fn mmap(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        perm: MapPermission,
+        shared: bool,
+    ) -> Result<(), ERRNO> {
         let len = usize::from(end).saturating_sub(usize::from(start));
         let mut inner = self.inner.lock();
         inner.ensure_address_space_capacity(len)?;
-        inner.memory_set.mmap_anonymous(start, end, perm).map_err(mm_error_to_errno)
+        inner
+            .memory_set
+            .mmap_anonymous(start, end, perm, shared)
+            .map_err(mm_error_to_errno)
     }
     /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
     pub fn mmap_file(
