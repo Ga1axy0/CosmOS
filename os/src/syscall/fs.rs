@@ -1620,8 +1620,8 @@ fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
 /// 校验 fd 并返回可写打开文件描述。
 fn get_writable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let desc = get_file_description(fd)?;
-    if !desc.writable() {
-        return Err(ERRNO::EACCES);
+    if desc.is_path() || !desc.writable() {
+        return Err(ERRNO::EBADF);
     }
     Ok(desc)
 }
@@ -1640,8 +1640,8 @@ fn get_any_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
 /// 校验 fd 并返回可读打开文件描述。
 fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     let desc = get_file_description(fd)?;
-    if !desc.readable() {
-        return Err(ERRNO::EACCES);
+    if desc.is_path() || !desc.readable() {
+        return Err(ERRNO::EBADF);
     }
     Ok(desc)
 }
@@ -2396,6 +2396,12 @@ pub fn sys_splice(
 
         let in_desc = get_readable_file(fd_in as usize)?;
         let out_desc = get_writable_file(fd_out as usize)?;
+        let in_is_pipe = in_desc.as_any().is::<Pipe>();
+        let out_is_pipe = out_desc.as_any().is::<Pipe>();
+
+        if !in_is_pipe && !out_is_pipe {
+            return Err(ERRNO::EINVAL);
+        }
 
         // GNU grep probes splice on pipe input. Until the pipe fast path can
         // preserve grep's buffered-output semantics, report the combination as
