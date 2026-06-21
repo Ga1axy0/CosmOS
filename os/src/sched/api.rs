@@ -15,6 +15,7 @@ fn suspend_current_and_run_next_inner(
     reset_slice: bool,
     rt_enqueue_head: Option<bool>,
 ) {
+    crate::trap::assert_can_sleep("suspend_current_and_run_next");
     current_process().pause_cpu_accounting(get_time());
     let task = take_current_task().unwrap();
     let task_cx_ptr = {
@@ -67,6 +68,7 @@ pub fn suspend_current_and_run_next_with_slice_reset(reset_slice: bool) {
 
 /// Make current task blocked and switch to the next task.
 pub fn block_current_and_run_next(reason: WaitReason) {
+    crate::trap::assert_can_sleep("block_current_and_run_next");
     let task = take_current_task().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();

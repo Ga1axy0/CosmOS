@@ -221,10 +221,17 @@ pub(crate) fn current_kstack_top() -> usize {
 
 /// Return to idle control flow for new scheduling
 pub(crate) fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    let irqs_were_enabled = crate::hal::local_irqs_enabled();
+    if irqs_were_enabled {
+        unsafe { crate::hal::disable_local_irqs() };
+    }
     let mut processor = current_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
+    }
+    if irqs_were_enabled {
+        unsafe { crate::hal::enable_local_irqs() };
     }
 }

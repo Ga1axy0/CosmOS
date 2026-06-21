@@ -3,15 +3,18 @@
 mod condvar;
 mod mutex;
 mod semaphore;
+mod sleep_mutex;
 mod spin;
 mod up;
 mod deadlock;
+mod fs_sleep_mutex;
 mod futex;
 
 pub use condvar::Condvar;
 pub use deadlock::DeadlockDetector;
 pub use mutex::{Mutex, MutexBlocking, MutexSpin};
 pub use semaphore::Semaphore;
+pub use sleep_mutex::{SleepMutex, SleepMutexGuard};
 pub use spin::{SpinLock, SpinLockGuard, SpinNoIrqLock, SpinNoIrqLockGuard};
 pub use up::{UPSafeCell, UPSafeCellGuard, UPIntrFreeCell};
 pub use futex::{

@@ -12,7 +12,8 @@ use core::fmt::Write;
 #[cfg(feature = "io_perf_counters")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
-use spin::Mutex;
+
+use crate::sleep_mutex::SleepMutex as Mutex;
 
 #[cfg(feature = "io_perf_counters")]
 static GET_CALLS: AtomicUsize = AtomicUsize::new(0);

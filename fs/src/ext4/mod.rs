@@ -7,7 +7,6 @@ use core::fmt::Write;
 #[cfg(feature = "io_perf_counters")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use log::{debug, info};
-use spin::Mutex;
 
 use crate::block_cache::{
     get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges,
@@ -15,6 +14,7 @@ use crate::block_cache::{
 use crate::block_dev::{BlockDevice as OsBlockDevice, BlockWrite as OsBlockWrite};
 use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
+use crate::sleep_mutex::SleepMutex as Mutex;
 use crate::{STATFS_MAGIC_EXT4, STATFS_NAMELEN_DEFAULT, VfsStatFs};
 use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsFileType, VfsNode};
 use crate::BLOCK_SZ;

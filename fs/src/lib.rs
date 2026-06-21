@@ -22,6 +22,7 @@ pub mod block_cache;
 pub mod block_dev;
 mod dentry_cache;
 mod inode_cache;
+pub mod sleep_mutex;
 pub mod vfs;
 pub mod easyfs;
 pub mod fat32;

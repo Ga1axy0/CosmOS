@@ -741,21 +741,34 @@ fn replace_fd_socket(
     spec: SocketSpec,
 ) -> Result<(), ERRNO> {
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let entry = inner
-        .fd_table
-        .get_mut(fd)
-        .and_then(|entry| entry.as_mut())
-        .ok_or(ERRNO::EBADF)?;
-    let status_flags = entry.desc.status_flags();
-    let fd_flags = entry.flags;
-    entry.desc = Arc::new(FileDescription::new_socket(
+    let (old_desc, fd_flags) = {
+        let inner = process.inner_exclusive_access();
+        let entry = inner
+            .fd_table
+            .get(fd)
+            .and_then(|entry| entry.as_ref())
+            .ok_or(ERRNO::EBADF)?;
+        (Arc::clone(&entry.desc), entry.flags)
+    };
+    let status_flags = old_desc.status_flags();
+    let new_desc = Arc::new(FileDescription::new_socket(
         file,
         AccessMode::ReadWrite,
         status_flags,
         0,
         spec,
     ));
+
+    let mut inner = process.inner_exclusive_access();
+    let entry = inner
+        .fd_table
+        .get_mut(fd)
+        .and_then(|entry| entry.as_mut())
+        .ok_or(ERRNO::EBADF)?;
+    if !Arc::ptr_eq(&entry.desc, &old_desc) {
+        return Err(ERRNO::EBADF);
+    }
+    entry.desc = new_desc;
     entry.flags = fd_flags;
     Ok(())
 }

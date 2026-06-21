@@ -129,6 +129,7 @@ impl<T> SpinNoIrqLock<T> {
             // might take the same or nested locks.
             core::hint::spin_loop();
         }
+        crate::trap::enter_noirq_lock();
 
         SpinNoIrqLockGuard {
             lock: self,
@@ -168,6 +169,7 @@ impl<T> DerefMut for SpinNoIrqLockGuard<'_, T> {
 
 impl<T> Drop for SpinNoIrqLockGuard<'_, T> {
     fn drop(&mut self) {
+        crate::trap::exit_noirq_lock();
         self.lock.locked.store(false, Ordering::Release);
         if self.sie_was_enabled {
             unsafe { crate::hal::enable_local_irqs() };

@@ -2,6 +2,7 @@ use super::BlockDevice;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueueKeyed, WaitReason};
 use alloc::{boxed::Box, string::String, vec::Vec};
+use core::error;
 use core::fmt::Write;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -70,8 +71,11 @@ impl BlockDevice for VirtIOBlock {
     /// Read contiguous blocks from the virtio_blk device.
     fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
         assert!(buf.len() % ::fs::BLOCK_SZ == 0);
-        READ_OPS.fetch_add(1, Ordering::Relaxed);
-        READ_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+        #[cfg(feature = "io_perf_counters")]
+        {
+            READ_OPS.fetch_add(1, Ordering::Relaxed);
+            READ_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+        }
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         
@@ -143,8 +147,11 @@ impl BlockDevice for VirtIOBlock {
     /// Write contiguous blocks to the virtio_blk device.
     fn write_blocks(&self, block_id: usize, buf: &[u8]) {
         assert!(buf.len() % ::fs::BLOCK_SZ == 0);
-        WRITE_OPS.fetch_add(1, Ordering::Relaxed);
-        WRITE_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+        #[cfg(feature = "io_perf_counters")]
+        {
+            WRITE_OPS.fetch_add(1, Ordering::Relaxed);
+            WRITE_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+        }
         let mut req = BlkReq::default();
         let mut resp = BlkResp::default();
         let token = unsafe {
@@ -315,17 +322,20 @@ impl VirtIOBlock {
     }
 
     fn wait_token(&self, token: u16) {
-        // TODO Enable kernel interrupt in more cases.
         let irq_disabled = !crate::hal::local_irqs_enabled();
         if current_task().is_none() || irq_disabled {
             while !self.token_ready(token) {
+                #[cfg(feature = "io_perf_counters")]
                 WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
+                error!("spin_loop");
                 spin_loop();
             }
             return;
         }
 
         // Task context path: park current task and wait for precise token wakeup.
+        crate::trap::assert_can_sleep("virtio_blk::wait_token");
+        #[cfg(feature = "io_perf_counters")]
         TASK_WAITS.fetch_add(1, Ordering::Relaxed);
         self.wait_queue
             .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
@@ -345,6 +355,7 @@ impl VirtIOBlock {
                     return token;
                 }
             }
+            #[cfg(feature = "io_perf_counters")]
             WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
             spin_loop();
         }

@@ -15,7 +15,7 @@ bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
 # fs = { path = "../fs" }
-fs = { path = "../fs", default-features = false, features = ["io_perf_counters"] }
+fs = { path = "../fs", default-features = false, features = ["io_perf_counters", "kernel_sleep_mutex"] }
 hashbrown = "0.12.3"
 smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
 	"alloc",
@@ -39,4 +39,4 @@ io_perf_counters = []
 net_perf_counters = []
 oom_diagnostics = []
 legacy-vdb-names = []
-default = ["ext4", "platform-qemu-virt", "io_perf_counters", "net_perf_counters", "legacy-vdb-names"]
+default = ["ext4", "platform-qemu-virt", "net_perf_counters", "legacy-vdb-names"]

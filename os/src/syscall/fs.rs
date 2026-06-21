@@ -2135,12 +2135,14 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 Ok(new_fd as isize)
             }
             F_GETFL => {
-                let entry = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?;
-                Ok(entry.desc.status_bits() as isize)
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                drop(inner);
+                Ok(desc.status_bits() as isize)
             }
             F_SETFL => {
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
                 let status_flags = parse_setfl_status(arg)?;
+                drop(inner);
                 desc.set_status_flags(status_flags);
                 Ok(0)
             }

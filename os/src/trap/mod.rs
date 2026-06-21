@@ -12,6 +12,7 @@
 //! to [`syscall()`].
 
 mod context;
+mod irq;
 
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
@@ -201,6 +202,7 @@ pub fn trap_handler() -> ! {
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::UserSyscall => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
             let syscall_id = cx.syscall_nr();
@@ -216,6 +218,7 @@ pub fn trap_handler() -> ! {
             cx.in_syscall = true;
         }
         TrapCause::StorePageFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             debug!(
                 "[mmap] trap store page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
@@ -276,6 +279,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::LoadPageFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // debug!(
             //     "[mmap] trap load page fault: bad_addr={:#x} sepc={:#x}",
             //     trap_info.fault_addr,
@@ -312,6 +316,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::InstructionPageFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             debug!(
                 "[mmap] trap instruction page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
@@ -359,6 +364,7 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalBit::SIGILL);
         }
         TrapCause::TimerInterrupt => {
+            let _hardirq = irq::HardIrqGuard::enter();
             // trace!("hart {} timer tick", hartid());
             if handle_timer_interrupt() {
                 let now_raw = get_time();
@@ -368,9 +374,11 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::SoftwareInterrupt => {
+            let _hardirq = irq::HardIrqGuard::enter();
             handle_reschedule_ipi();
         }
         TrapCause::ExternalInterrupt => {
+            let _hardirq = irq::HardIrqGuard::enter();
             crate::platform::handle_external_irq();
             crate::net::poll();
         }
@@ -419,6 +427,7 @@ pub fn trap_return() -> ! {
 /// handle trap from kernel
 #[no_mangle]
 pub fn trap_from_kernel() {
+    let _hardirq = irq::HardIrqGuard::enter();
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::ExternalInterrupt => {
@@ -453,3 +462,6 @@ pub fn trap_from_kernel() {
 }
 
 pub use context::TrapContext;
+pub use irq::{
+    assert_can_sleep, enter_noirq_lock, exit_noirq_lock, HardIrqGuard, KernelIrqEnableGuard,
+};
