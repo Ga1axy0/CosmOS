@@ -5,10 +5,12 @@ mod virtio_blk;
 pub use virtio_blk::VirtIOBlock;
 
 use crate::sync::SpinNoIrqLock;
+use crate::task::{yield_current_and_run_next, SchedAttr, WaitQueue, WaitReason};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::convert::TryFrom;
+use core::sync::atomic::{AtomicBool, Ordering};
 use fs::BlockDevice;
 use lazy_static::*;
 use core::ptr::NonNull;
@@ -84,7 +86,10 @@ lazy_static! {
         /// VirtIO MMIO IRQ to block device mapping.
         pub static ref BLOCK_DEVICES_BY_IRQ: SpinNoIrqLock<BTreeMap<u32, Arc<VirtIOBlock>>> =
         SpinNoIrqLock::new(BTreeMap::new());
+        static ref BLOCK_WORKER_WAIT: WaitQueue = WaitQueue::new();
 }
+
+static BLOCK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Scan the VirtIO MMIO bus slots and register every block device found.
 ///
@@ -138,6 +143,57 @@ pub fn handle_irq(irq: u32) -> bool {
     } else {
         false
     }
+}
+
+fn block_devices_snapshot() -> alloc::vec::Vec<Arc<VirtIOBlock>> {
+    BLOCK_DEVICES_BY_IRQ.lock().values().cloned().collect()
+}
+
+fn block_worker_has_work() -> bool {
+    block_devices_snapshot()
+        .into_iter()
+        .any(|dev| dev.has_pending_requests() || dev.has_used_completions())
+}
+
+fn block_worker_pump_once() -> (bool, bool) {
+    let mut completed_any = false;
+    let mut pending_any = false;
+    for dev in block_devices_snapshot() {
+        completed_any |= dev.pump_completions();
+        pending_any |= dev.has_pending_requests();
+    }
+    (completed_any, pending_any)
+}
+
+fn block_io_worker_main() -> ! {
+    warn!("[virtio_blk] worker started");
+    loop {
+        let (completed_any, pending_any) = block_worker_pump_once();
+        if completed_any {
+            continue;
+        }
+        // Yield-based polling
+        // if pending_any {
+        //     yield_current_and_run_next();
+        //     continue;
+        // }
+        BLOCK_WORKER_WAIT.wait_with_reason_or_skip(WaitReason::Unknown, block_worker_has_work);
+    }
+}
+ 
+/// Start the global block I/O completion worker.
+pub fn start_workers() {
+    if BLOCK_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    crate::task::spawn_kernel_thread(block_io_worker_main, SchedAttr::other(0));
+}
+
+pub(crate) fn wake_worker() {
+    BLOCK_WORKER_WAIT.wake_all();
 }
 
 lazy_static! {

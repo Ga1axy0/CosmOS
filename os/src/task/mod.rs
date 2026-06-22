@@ -415,6 +415,16 @@ pub fn add_initproc() {
     let _initproc = INITPROC.clone();
 }
 
+/// Spawn a scheduler-visible kernel thread owned by the init process context.
+pub fn spawn_kernel_thread(entry: fn() -> !, sched_attr: SchedAttr) -> Arc<TaskControlBlock> {
+    let task = Arc::new(
+        TaskControlBlock::new_kernel_thread(INITPROC.clone(), entry, sched_attr)
+            .expect("failed to allocate kernel thread"),
+    );
+    crate::sched::add_task(Arc::clone(&task));
+    task
+}
+
 /// Look up a live task by its Linux-visible thread id.
 pub fn thread_id2task(thread_id: usize) -> Option<Arc<TaskControlBlock>> {
     let mut map = TID2TASK.lock();

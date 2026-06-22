@@ -83,6 +83,19 @@ pub struct InodeKey {
 }
 
 impl InodeKey {
+    /// 构造某个文件系统范围内的最小 key。
+    pub const fn fs_range_start(fs_id: u64) -> Self {
+        Self { fs_id, ino: 0 }
+    }
+
+    /// 构造某个文件系统范围内的最大 key。
+    pub const fn fs_range_end(fs_id: u64) -> Self {
+        Self {
+            fs_id,
+            ino: u64::MAX,
+        }
+    }
+
     /// 从 inode 中提取稳定 key。
     pub fn from_inode(inode: &Arc<Inode>) -> Self {
         Self {

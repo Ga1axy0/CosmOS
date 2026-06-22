@@ -309,6 +309,37 @@ impl TaskControlBlock {
         Ok(task)
     }
 
+    /// Create a kernel thread task that starts at `entry` and never returns to userspace.
+    pub fn new_kernel_thread(
+        process: Arc<ProcessControlBlock>,
+        entry: fn() -> !,
+        sched_attr: SchedAttr,
+    ) -> Result<Self, MmError> {
+        let kstack = kstack_alloc()?;
+        let kstack_top = kstack.get_top();
+        Ok(Self {
+            process: Arc::downgrade(&process),
+            kstack,
+            inner: SpinNoIrqLock::new(TaskControlBlockInner {
+                res: None,
+                trap_cx_ppn: PhysPageNum(0),
+                task_cx: TaskContext::goto_kernel_entry(entry, kstack_top),
+                task_status: TaskStatus::Runnable,
+                wait_reason: None,
+                exit_code: None,
+                sched: TaskSchedState::new(sched_attr),
+                current_wq_handle: None,
+                clear_child_tid: 0,
+                pending_signals: SignalBit::empty(),
+                pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
+                signal_mask: SignalBit::empty(),
+                signal_mask_backup: None,
+                may_have_non_futex_timer: false,
+                fork_chain_timing: None,
+            }),
+        })
+    }
+
     /// Record the timestamp at which a freshly cloned child becomes runnable.
     pub fn mark_clone_ready(&self, now_ns: u64) {
         let mut inner = self.inner_exclusive_access();

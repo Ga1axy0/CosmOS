@@ -1,4 +1,5 @@
 use super::BlockDevice;
+use crate::hal::hartid;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueue, WaitReason};
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
@@ -314,6 +315,7 @@ impl VirtIOBlock {
         data.token = token;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        super::wake_worker();
         Ok(request)
     }
 
@@ -335,6 +337,7 @@ impl VirtIOBlock {
         data.token = token;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        super::wake_worker();
         Ok(request)
     }
 
@@ -351,6 +354,11 @@ impl VirtIOBlock {
                 }
                 #[cfg(feature = "io_perf_counters")]
                 TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+                if self.has_used_completions() {
+                    super::wake_worker();
+                    continue;
+                }
+                super::wake_worker();
                 request
                     .wait_queue
                     .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || request.done());
@@ -376,10 +384,14 @@ impl VirtIOBlock {
                 }
                 #[cfg(feature = "io_perf_counters")]
                 TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+                if self.has_used_completions() {
+                    super::wake_worker();
+                    continue;
+                }
+                super::wake_worker();
                 self.batch_wait_queue
                     .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
                         in_flight.iter().any(|request| request.done())
-                            || self.inner.lock().peek_used().is_some()
                     });
                 continue;
             }
@@ -392,14 +404,15 @@ impl VirtIOBlock {
 
     fn wait_for_device_progress(&self) {
         if current_task().is_some() && crate::hal::local_irqs_enabled() {
-            if self.adaptive_pump_until(|| self.inner.lock().peek_used().is_some()) {
+            if self.adaptive_pump_until(|| self.has_used_completions()) {
                 return;
             }
             #[cfg(feature = "io_perf_counters")]
             TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+            super::wake_worker();
             self.batch_wait_queue
                 .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
-                    self.inner.lock().peek_used().is_some()
+                    self.has_used_completions() || !self.has_pending_requests()
                 });
             return;
         }
@@ -425,7 +438,18 @@ impl VirtIOBlock {
         false
     }
 
-    fn pump_completions(&self) {
+    /// Returns whether this device has requests waiting for completion.
+    pub fn has_pending_requests(&self) -> bool {
+        !self.pending.lock().is_empty()
+    }
+
+    /// Returns whether the virtqueue currently exposes at least one used entry.
+    pub fn has_used_completions(&self) -> bool {
+        self.inner.lock().peek_used().is_some()
+    }
+
+    /// Drain completed virtqueue entries and wake the corresponding waiters.
+    pub fn pump_completions(&self) -> bool {
         let mut completed_any = false;
         loop {
             let mut device = self.inner.lock();
@@ -481,10 +505,11 @@ impl VirtIOBlock {
         if completed_any {
             self.wake_batch_waiters();
         }
+        completed_any
     }
 
-    fn wake_batch_waiters(&self) {
-        self.batch_wait_queue.wake_all();
+    fn wake_batch_waiters(&self) -> usize {
+        self.batch_wait_queue.wake_all()
     }
 
     /// Called from external interrupt path for this block device.
@@ -494,7 +519,7 @@ impl VirtIOBlock {
             return;
         }
         drop(inner);
-        self.pump_completions();
+        super::wake_worker();
     }
 }
 

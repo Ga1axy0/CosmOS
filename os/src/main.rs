@@ -282,6 +282,7 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     init_local_hart(hart_id);
     print_boot_stage("scheduler", "bootstrap hart entering run queue");
     task::add_initproc();
+    drivers::block::start_workers();
     BOOT_DONE.store(true, Ordering::Release);
     println!("{glow}[kernel] Hello, world! Welcome to CosmOS.{reset}", glow = ANSI_GLOW, reset = ANSI_RESET);
     info!("hart {} entered scheduler", hart_id);

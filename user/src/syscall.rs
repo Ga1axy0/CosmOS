@@ -1,6 +1,6 @@
 use crate::SignalAction;
 
-use super::{Itimerval, Stat, TimeVal};
+use super::{Itimerval, Stat, Timespec, TimeVal};
 
 pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_DUP: usize = 23;
@@ -33,6 +33,7 @@ pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_SLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
 pub const SYSCALL_SETITIMER: usize = 103;
+pub const SYSCALL_CLOCK_GETTIME: usize = 113;
 pub const SYSCALL_YIELD: usize = 124;
 pub const SYSCALL_KILL: usize = 129;
 pub const SYSCALL_SIGACTION: usize = 134;
@@ -45,6 +46,7 @@ pub const SYSCALL_SCHED_GETSCHEDULER: usize = 120;
 pub const SYSCALL_SCHED_GETPARAM: usize = 121;
 pub const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 pub const SYSCALL_SCHED_GETAFFINITY: usize = 123;
+pub const SYSCALL_GETCPU: usize = 168;
 pub const SYSCALL_SETPGID: usize = 154;
 pub const SYSCALL_GETPGID: usize = 155;
 pub const SYSCALL_GETSID: usize = 156;
@@ -412,8 +414,30 @@ pub fn sys_sched_getparam(pid: isize, param: &mut SchedParam) -> isize {
     )
 }
 
+pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: *const u8) -> isize {
+    syscall(
+        SYSCALL_SCHED_SETAFFINITY,
+        [pid as usize, cpusetsize, mask as usize],
+    )
+}
+
+pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> isize {
+    syscall(
+        SYSCALL_SCHED_GETAFFINITY,
+        [pid as usize, cpusetsize, mask as usize],
+    )
+}
+
 pub fn sys_get_time(time: &mut TimeVal, tz: usize) -> isize {
     syscall(SYSCALL_GETTIMEOFDAY, [time as *const _ as usize, tz, 0])
+}
+
+pub fn sys_clock_gettime(clockid: i32, tp: *mut Timespec) -> isize {
+    syscall(SYSCALL_CLOCK_GETTIME, [clockid as usize, tp as usize, 0])
+}
+
+pub fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> isize {
+    syscall(SYSCALL_GETCPU, [cpu as usize, node as usize, 0])
 }
 
 pub fn sys_getpid() -> isize {
