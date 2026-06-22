@@ -13,6 +13,7 @@ use lazy_static::lazy_static;
 
 use crate::bootinfo;
 use crate::config::PAGE_SIZE;
+use crate::hal::hartid;
 use crate::mm::{
     frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
     InodeKey, MmError, PhysPageNum,
@@ -21,15 +22,25 @@ use crate::syscall::errno::ERRNO;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{WaitQueue, WaitReason};
 
+#[cfg(feature = "io_perf_counters")]
 static READ_PAGE_LOADS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static READ_PAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static WRITE_MAPPING_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static WRITE_MAPPING_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static SYNC_MAPPING_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static SYNC_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static WRITEBACK_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static WRITEBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
 static WRITEBACK_BATCH_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
@@ -366,6 +377,7 @@ fn perf_load(counter: &AtomicUsize) -> usize {
     counter.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "io_perf_counters")]
 pub fn reset_perf_counters() {
     READ_PAGE_LOADS.store(0, Ordering::Relaxed);
     READ_PAGE_BYTES.store(0, Ordering::Relaxed);
@@ -379,6 +391,7 @@ pub fn reset_perf_counters() {
     WRITEBACK_BATCH_PAGES.store(0, Ordering::Relaxed);
 }
 
+#[cfg(feature = "io_perf_counters")]
 pub fn render_perf_counters() -> String {
     let mut out = String::new();
     let _ = writeln!(&mut out, "page_cache:");
@@ -567,7 +580,10 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
     if buf.is_empty() {
         return 0;
     }
+
+    #[cfg(feature = "io_perf_counters")]
     WRITE_MAPPING_CALLS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "io_perf_counters")]
     WRITE_MAPPING_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
 
     let old_size = mapping.lock().size;
@@ -895,7 +911,9 @@ fn ensure_page_uptodate(
             );
             // TODO：后续接入通用 truncate 后，需要避免装页与截断并发时把旧数据重新提交回 cache。
             let read = inode.read_at(page_start_off, &mut bytes[..valid_bytes]);
+            #[cfg(feature = "io_perf_counters")]
             READ_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "io_perf_counters")]
             READ_PAGE_BYTES.fetch_add(read, Ordering::Relaxed);
             read
         };
@@ -925,6 +943,7 @@ fn mark_page_dirty(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page_guard: &mut C
 
 /// 同步单个 mapping 的全部脏页。
 fn sync_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>) -> Result<(), ERRNO> {
+    #[cfg(feature = "io_perf_counters")]
     SYNC_MAPPING_CALLS.fetch_add(1, Ordering::Relaxed);
     let dirty_pages: Vec<_> = mapping.lock().dirty_pages.iter().copied().collect();
     flush_dirty_pages(mapping, &dirty_pages)
@@ -936,6 +955,7 @@ fn sync_mapping_range(
     offset: usize,
     len: usize,
 ) -> Result<(), ERRNO> {
+    #[cfg(feature = "io_perf_counters")]
     SYNC_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
     if len == 0 {
         return Ok(());
@@ -1093,11 +1113,13 @@ fn flush_writeback_batch(
     let start_page_idx = batch.pages[0].page_idx;
     let expected = batch.data.len();
     let mut write_ok = true;
-
-    WRITEBACK_PAGES.fetch_add(batch.pages.len(), Ordering::Relaxed);
-    WRITEBACK_BYTES.fetch_add(expected, Ordering::Relaxed);
-    WRITEBACK_BATCHES.fetch_add(1, Ordering::Relaxed);
-    WRITEBACK_BATCH_PAGES.fetch_add(batch.pages.len(), Ordering::Relaxed);
+    #[cfg(feature = "io_perf_counters")]
+    {
+        WRITEBACK_PAGES.fetch_add(batch.pages.len(), Ordering::Relaxed);
+        WRITEBACK_BYTES.fetch_add(expected, Ordering::Relaxed);
+        WRITEBACK_BATCHES.fetch_add(1, Ordering::Relaxed);
+        WRITEBACK_BATCH_PAGES.fetch_add(batch.pages.len(), Ordering::Relaxed);
+    }
 
     debug!(
         "[page_cache] writeback batch: start_page_idx={} pages={} bytes={}",
@@ -1209,8 +1231,11 @@ fn flush_page(
         let mut write_ok = true;
         if valid_bytes != 0 {
             let bytes = ppn.get_bytes_array();
-            WRITEBACK_PAGES.fetch_add(1, Ordering::Relaxed);
-            WRITEBACK_BYTES.fetch_add(valid_bytes, Ordering::Relaxed);
+            #[cfg(feature = "io_perf_counters")]
+            {
+                WRITEBACK_PAGES.fetch_add(1, Ordering::Relaxed);
+                WRITEBACK_BYTES.fetch_add(valid_bytes, Ordering::Relaxed);
+            }
             debug!(
                 "[page_cache] writeback page: page_idx={} valid_bytes={}",
                 page_idx,
@@ -1538,19 +1563,39 @@ fn page_valid_bytes_for_size(size: usize, page_idx: u64) -> usize {
 fn collect_mappings(fs_id: Option<u64>) -> alloc::vec::Vec<Arc<SpinNoIrqLock<PageMapping>>> {
     let mut manager = PAGE_CACHE_MANAGER.lock();
     let mut collected = alloc::vec::Vec::new();
-    manager.mappings.retain(|key, weak| {
-        if let Some(target_fs) = fs_id {
-            if key.fs_id() != target_fs {
-                return weak.strong_count() > 0;
+
+    match fs_id {
+        Some(target_fs) => {
+            warn!("[page_cache] collecting mappings for fs_id={}", target_fs);
+            let start = InodeKey::fs_range_start(target_fs);
+            let end = InodeKey::fs_range_end(target_fs);
+            let mut stale_keys = alloc::vec::Vec::new();
+
+            for (key, weak) in manager.mappings.range(start..=end) {
+                if let Some(mapping) = weak.upgrade() {
+                    collected.push(mapping);
+                } else {
+                    stale_keys.push(*key);
+                }
+            }
+
+            for key in stale_keys {
+                manager.mappings.remove(&key);
             }
         }
-        if let Some(mapping) = weak.upgrade() {
-            collected.push(mapping);
-            true
-        } else {
-            false
+        None => {
+            warn!("[page_cache] collecting mappings for all");
+            manager.mappings.retain(|_, weak| {
+                if let Some(mapping) = weak.upgrade() {
+                    collected.push(mapping);
+                    true
+                } else {
+                    false
+                }
+            });
         }
-    });
+    }
+
     collected
 }
 

@@ -20,5 +20,6 @@ debug = true
 board_qemu = []
 board_k210 = []
 io_perf_counters = []
+kernel_sleep_mutex = []
 
 default = ["io_perf_counters"]

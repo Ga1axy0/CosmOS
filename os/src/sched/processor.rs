@@ -91,6 +91,7 @@ pub(crate) fn run_tasks() {
         // Drop any stopped-task reference left by the previous exit on this hart.
         // The previous task's kernel stack is now guaranteed unused.
         super::clear_stopping_task();
+        crate::task::maybe_dump_pending_debug_pgrp_tasks();
         if let Some(task) = pick_next_task(hartid()) {
             // debug!(
             //     "kernel: hart {} run_tasks, pid[{}]",
@@ -109,8 +110,16 @@ pub(crate) fn run_tasks() {
             task_inner.sched.on_cpu = true;
             task_inner.sched.on_rq = false;
             task_inner.sched.resched_reason = None;
+            let now_ns = get_time_ns();
+            if let Some(timing) = task_inner.fork_chain_timing.as_mut() {
+                if timing.first_run_ns == 0 {
+                    timing.first_run_ns = now_ns;
+                }
+                if timing.first_futex_wake_ns != 0 && timing.first_post_futex_run_ns == 0 {
+                    timing.first_post_futex_run_ns = now_ns;
+                }
+            }
             if matches!(task_inner.sched.policy, SchedPolicy::Other) {
-                let now_ns = get_time_ns();
                 task_inner.sched.exec_start_ns = now_ns;
                 task_inner.sched.cfs_slice_start_ns = now_ns;
             }
@@ -213,10 +222,17 @@ pub(crate) fn current_kstack_top() -> usize {
 
 /// Return to idle control flow for new scheduling
 pub(crate) fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    let irqs_were_enabled = crate::hal::local_irqs_enabled();
+    if irqs_were_enabled {
+        unsafe { crate::hal::disable_local_irqs() };
+    }
     let mut processor = current_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
+    }
+    if irqs_were_enabled {
+        unsafe { crate::hal::enable_local_irqs() };
     }
 }

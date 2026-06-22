@@ -161,8 +161,8 @@ impl WaitQueue {
     }
 
     /// Wake all waiters.
-    pub fn wake_all(&self) {
-        self.wake_up_to(usize::MAX);
+    pub fn wake_all(&self) -> usize {
+        self.wake_up_to(usize::MAX)
     }
 
     pub(crate) fn debug_waiter_count(&self) -> usize {

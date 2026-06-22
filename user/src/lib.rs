@@ -141,6 +141,8 @@ pub struct MMapProt: usize {
 pub const IPC_CREAT: i32 = 0o1000;
 pub const IPC_EXCL: i32 = 0o2000;
 pub const IPC_RMID: i32 = 0;
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -152,6 +154,25 @@ pub struct TimeVal {
 impl TimeVal {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Timespec {
+    pub sec: usize,
+    pub nsec: usize,
+}
+
+impl Timespec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn as_ns(&self) -> u64 {
+        (self.sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(self.nsec as u64)
     }
 }
 
@@ -470,11 +491,46 @@ pub fn sched_getparam(pid: isize, param: &mut SchedParam) -> isize {
     sys_sched_getparam(pid, param)
 }
 
+pub fn sched_setaffinity(pid: isize, mask: usize) -> isize {
+    let mask = mask.to_le_bytes();
+    sys_sched_setaffinity(pid, mask.len(), mask.as_ptr())
+}
+
+pub fn sched_getaffinity(pid: isize) -> isize {
+    let mut mask = [0u8; core::mem::size_of::<usize>()];
+    let ret = sys_sched_getaffinity(pid, mask.len(), mask.as_mut_ptr());
+    if ret < 0 {
+        ret
+    } else {
+        usize::from_le_bytes(mask) as isize
+    }
+}
+
 pub fn get_time() -> isize {
     let mut time = TimeVal::new();
     match sys_get_time(&mut time, 0) {
         0 => ((time.sec & 0xffff) * 1000 + time.usec / 1000) as isize,
         _ => -1,
+    }
+}
+
+pub fn clock_gettime(clockid: i32, ts: &mut Timespec) -> isize {
+    sys_clock_gettime(clockid, ts as *mut _)
+}
+
+pub fn clock_gettime_ns(clockid: i32) -> isize {
+    let mut ts = Timespec::new();
+    match clock_gettime(clockid, &mut ts) {
+        0 => ts.as_ns() as isize,
+        err => err,
+    }
+}
+
+pub fn getcpu() -> isize {
+    let mut cpu = 0u32;
+    match sys_getcpu(&mut cpu as *mut _, core::ptr::null_mut()) {
+        0 => cpu as isize,
+        err => err,
     }
 }
 

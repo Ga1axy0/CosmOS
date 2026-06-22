@@ -16,6 +16,7 @@ use alloc::sync::Arc;
 use spin::Mutex;
 
 use crate::block_dev::BlockDevice;
+use crate::errno::FS_ERRNO;
 use crate::vfs::{Inode, VfsNode};
 
 pub use bpb::Fat32Bpb;
@@ -29,14 +30,14 @@ pub struct Fat32FileSystem {
 
 impl Fat32FileSystem {
     /// Open an existing FAT32 volume.
-    pub fn open(block_device: Arc<dyn BlockDevice>) -> Arc<Self> {
-        let bpb = Fat32Bpb::read_from(&block_device);
+    pub fn open(block_device: Arc<dyn BlockDevice>) -> Result<Arc<Self>, FS_ERRNO> {
+        let bpb = Fat32Bpb::read_from(&block_device)?;
         let inner = fat::Fat32Inner::new(&bpb);
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             block_device,
             bpb,
             inner: Mutex::new(inner),
-        })
+        }))
     }
 
     pub fn bpb(&self) -> &Fat32Bpb {

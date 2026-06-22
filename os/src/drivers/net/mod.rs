@@ -89,18 +89,21 @@ pub fn probe_net_devices() {
     info!("[kernel] no VirtIO network device found");
 }
 
-/// Handle one virtio-mmio IRQ for network devices.
-pub fn handle_irq(irq: u32) {
+/// Handle one IRQ for the registered network device.
+pub fn handle_irq(irq: u32) -> bool {
     let dev = {
         let guard = NET_DEVICE.lock();
         guard.as_ref().cloned()
     };
     if let Some(dev) = dev {
         if dev.irq() != irq {
-            return;
+            return false;
         }
         dev.handle_irq();
         crate::net::notify_irq();
+        true
+    } else {
+        false
     }
 }
 

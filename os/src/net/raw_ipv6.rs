@@ -392,7 +392,9 @@ impl RawIpv6SocketFile {
                 return Err(ERRNO::EINTR);
             }
             self.read_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+                .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                    self.recv_ready() || crate::signal::has_unmasked_pending_signal()
+                });
         }
     }
 

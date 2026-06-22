@@ -15,7 +15,7 @@ use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
     current_process, current_task, current_user_token, ExitReason, FdEntry, ProcessControlBlock,
-    FdFlags, WaitReason, SIG_DFL, SIG_IGN,
+    FdFlags, TaskStatus, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
@@ -1336,6 +1336,13 @@ where
                 } else {
                     now_ns.saturating_add(PPOLL_FALLBACK_POLL_NS)
                 };
+                // Match nanosleep-style timer arming so an immediate timeout
+                // cannot consume the timer before we actually block.
+                {
+                    let mut task_inner = task.inner_exclusive_access();
+                    task_inner.task_status = TaskStatus::Interruptible;
+                    task_inner.wait_reason = Some(WaitReason::Poll);
+                }
                 add_timer_ns(sleep_until_ns, Arc::clone(&task));
                 block_current_and_run_next(WaitReason::Poll);
                 continue;
@@ -2135,12 +2142,14 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 Ok(new_fd as isize)
             }
             F_GETFL => {
-                let entry = inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?;
-                Ok(entry.desc.status_bits() as isize)
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                drop(inner);
+                Ok(desc.status_bits() as isize)
             }
             F_SETFL => {
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
                 let status_flags = parse_setfl_status(arg)?;
+                drop(inner);
                 desc.set_status_flags(status_flags);
                 Ok(0)
             }

@@ -7,7 +7,6 @@ use core::fmt::Write;
 #[cfg(feature = "io_perf_counters")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use log::{debug, info};
-use spin::Mutex;
 
 use crate::block_cache::{
     get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges,
@@ -15,6 +14,7 @@ use crate::block_cache::{
 use crate::block_dev::{BlockDevice as OsBlockDevice, BlockWrite as OsBlockWrite};
 use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
+use crate::sleep_mutex::SleepMutex as Mutex;
 use crate::{STATFS_MAGIC_EXT4, STATFS_NAMELEN_DEFAULT, VfsStatFs};
 use crate::vfs::{Inode, InodeTime, VfsAttrs, VfsFileType, VfsNode};
 use crate::BLOCK_SZ;
@@ -667,6 +667,30 @@ impl VfsNode for Ext4Inode {
 
     /// ext4 写入需要保留 ENOSPC/ENOTSUP，供 page cache 回写路径处理失败页。
     fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        let prepared = {
+            let ext4 = self.fs.ext4.lock();
+            let block_device = Arc::clone(&ext4.block_device);
+            match ext4
+                .prepare_aligned_write_at(self.inode_num, offset, buf.len())
+                .map_err(FS_ERRNO::from)?
+            {
+                Some((written, runs)) => Some((block_device, written, runs)),
+                None => None,
+            }
+        };
+
+        if let Some((block_device, written, runs)) = prepared {
+            let mut writes = Vec::new();
+            for (disk_offset, buf_offset, len) in runs {
+                writes.push(Ext4BlockWrite {
+                    offset: disk_offset,
+                    data: &buf[buf_offset..buf_offset + len],
+                });
+            }
+            block_device.write_offsets_many(&writes);
+            return Ok(written);
+        }
+
         let ext4 = self.fs.ext4.lock();
         ext4.write_at(self.inode_num, offset, buf).map_err(FS_ERRNO::from)
     }

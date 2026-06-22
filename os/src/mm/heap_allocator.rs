@@ -167,7 +167,8 @@ impl KernelHeapAllocator {
         };
         unsafe {
             let _irq = HeapIrqGuard::new();
-            self.heap.lock().add_to_heap(start, start + bytes);
+            let mut heap = self.heap.lock();
+            heap.add_to_heap(start, start + bytes);
         }
         true
     }
@@ -177,7 +178,8 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         {
             let _irq = HeapIrqGuard::new();
-            if let Ok(allocation) = self.heap.lock().alloc(layout) {
+            let mut heap = self.heap.lock();
+            if let Ok(allocation) = heap.alloc(layout) {
                 KERNEL_HEAP_USED_BYTES.fetch_add(layout.size(), Ordering::AcqRel);
                 return allocation.as_ptr();
             }
@@ -191,7 +193,8 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
                 return null_mut();
             }
             let _irq = HeapIrqGuard::new();
-            if let Ok(allocation) = self.heap.lock().alloc(layout) {
+            let mut heap = self.heap.lock();
+            if let Ok(allocation) = heap.alloc(layout) {
                 KERNEL_HEAP_USED_BYTES.fetch_add(layout.size(), Ordering::AcqRel);
                 return allocation.as_ptr();
             }
@@ -200,9 +203,8 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let _irq = HeapIrqGuard::new();
-        self.heap
-            .lock()
-            .dealloc(core::ptr::NonNull::new_unchecked(ptr), layout);
+        let mut heap = self.heap.lock();
+        heap.dealloc(core::ptr::NonNull::new_unchecked(ptr), layout);
         KERNEL_HEAP_USED_BYTES.fetch_sub(layout.size(), Ordering::AcqRel);
     }
 }

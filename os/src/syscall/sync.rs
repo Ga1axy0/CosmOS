@@ -1,11 +1,11 @@
 use crate::sync::{
-    futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar, Mutex, MutexBlocking,
-    MutexSpin, Semaphore,
+    futex_cmp_requeue_addr, futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar,
+    Mutex, MutexBlocking, MutexSpin, Semaphore,
 };
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
-use crate::task::{current_process, current_task, WaitReason};
+use crate::task::{current_process, current_task, TaskStatus, WaitReason};
 use crate::timer::{add_timer_ns, get_realtime_ns, get_time_ns};
 use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
@@ -15,6 +15,7 @@ const DEADLOCK_DETECTED: isize = -0xDEAD;
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
 const FUTEX_REQUEUE: i32 = 3;
+const FUTEX_CMP_REQUEUE: i32 = 4;
 const FUTEX_WAIT_BITSET: i32 = 9;
 const FUTEX_WAKE_BITSET: i32 = 10;
 const FUTEX_CMD_MASK: i32 = 0x7f;
@@ -180,6 +181,36 @@ pub fn sys_futex(
                 )?;
                 Ok(ret)
             }
+            FUTEX_CMP_REQUEUE => {
+                let flags = op & !FUTEX_CMD_MASK;
+                if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0 {
+                    warn!(
+                        "Unsupported futex CMP_REQUEUE target: op={:#x} uaddr2={:#x}",
+                        op,
+                        uaddr2
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                if flags & !FUTEX_PRIVATE_FLAG != 0 {
+                    warn!(
+                        "Unsupported futex CMP_REQUEUE flags: op={:#x} flags={:#x}",
+                        op,
+                        flags
+                    );
+                    return Err(ERRNO::EINVAL);
+                }
+                let private = flags & FUTEX_PRIVATE_FLAG != 0;
+                let ret = futex_cmp_requeue_addr(
+                    uaddr,
+                    uaddr2,
+                    val.max(0) as usize,
+                    timeout,
+                    val3,
+                    private,
+                );
+                let ret = ret?;
+                Ok(ret)
+            }
             FUTEX_WAIT_BITSET => {
                 let flags = op & !FUTEX_CMD_MASK;
                 if val3 != FUTEX_BITSET_MATCH_ANY {
@@ -277,6 +308,14 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
             expire_ns,
         );
         let task = current_task().unwrap();
+        // Publish the sleep state before arming the timer so an immediately
+        // expiring interrupt can convert this task back to Runnable instead of
+        // consuming the timer while the task still looks Running.
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.task_status = TaskStatus::Interruptible;
+            task_inner.wait_reason = Some(WaitReason::Nanosleep);
+        }
         add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
         Ok(0)

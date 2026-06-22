@@ -1,8 +1,9 @@
 //! Block-device VFS nodes for `/dev`.
 //!
 //! [`BlockDevNode`] wraps an `Arc<dyn BlockDevice>` and exposes it as a VFS
-//! node so that `sys_mount` can resolve `/dev/vda` (or `/dev/vdb`, etc.) into
-//! the underlying block-device driver without a separate devfs daemon.
+//! node so that `sys_mount` can resolve `/dev/vda`, `/dev/vda2`, `/dev/vdb`,
+//! etc. into the underlying block-device driver without a separate devfs
+//! daemon.
 //!
 //! The nodes are purely in-memory and are registered under the virtual `/dev`
 //! directory by [`super::inode::init_dev`] at boot time.
@@ -45,13 +46,31 @@ const fn makedev(major: u64, minor: u64) -> u64 {
     (major << 8) | minor
 }
 
-/// Derive minor device number from a block device name (e.g. "vda" → 0, "vdb" → 1).
+/// Derive minor device number from a block device name.
+///
+/// Supports both naming schemes used by this tree:
+/// - `vda`, `vda2`, `vda3`, ... → `0`, `1`, `2`, ...
+/// - `vda`, `vdb`, `vdc`, ... → `0`, `1`, `2`, ...
 pub fn blkdev_minor_from_name(name: &str) -> u64 {
-    let name = name.strip_prefix("vd").unwrap_or(name);
-    name.bytes()
-        .next()
-        .map(|b| (b.wrapping_sub(b'a')) as u64)
-        .unwrap_or(0)
+    if let Some(rest) = name.strip_prefix("vda") {
+        if rest.is_empty() {
+            return 0;
+        }
+        if let Ok(index) = rest.parse::<u64>() {
+            return index.saturating_sub(1);
+        }
+    }
+
+    if let Some(rest) = name.strip_prefix("vd") {
+        let mut chars = rest.chars();
+        if let (Some(letter), None) = (chars.next(), chars.next()) {
+            if letter.is_ascii_lowercase() {
+                return (letter as u8).wrapping_sub(b'a') as u64;
+            }
+        }
+    }
+
+    0
 }
 
 /// Linux `struct rtc_time` ABI.

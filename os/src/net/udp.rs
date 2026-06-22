@@ -323,7 +323,9 @@ impl UdpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 self.st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
-                    self.can_send_now() || socket_wait_should_skip(handle)
+                    self.can_send_now()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -349,7 +351,9 @@ impl UdpSocketFile {
             } else {
                 self.st
                     .write_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.can_send_now());
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                        self.can_send_now() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }
@@ -433,7 +437,9 @@ impl UdpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 self.st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.can_recv_now() || socket_wait_should_skip(handle)
+                    self.can_recv_now()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -459,7 +465,9 @@ impl UdpSocketFile {
             } else {
                 self.st
                     .read_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.can_recv_now() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }
@@ -561,7 +569,9 @@ impl File for UdpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 self.st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.can_recv_now() || socket_wait_should_skip(handle)
+                    self.can_recv_now()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -587,7 +597,9 @@ impl File for UdpSocketFile {
             } else {
                 self.st
                     .read_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.can_recv_now());
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.can_recv_now() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }

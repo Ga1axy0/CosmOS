@@ -25,7 +25,7 @@
 #![feature(panic_info_message)]
 #![feature(alloc_error_handler)]
 
- 
+
 #[macro_use]
 extern crate log;
 
@@ -272,7 +272,9 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     print_boot_stage("devices", "virtio buses enumerated");
     net::init();
     print_boot_stage("network", "smoltcp stack synchronized");
-    fs::init();
+    if let Err(err) = fs::init() {
+        panic!("[kernel] filesystem init failed: {:?}", err);
+    }
     print_boot_stage("storage", "root filesystem mounted");
     timer::init_realtime_offset_from_rtc();
     print_boot_stage("clock", "realtime source calibrated");
@@ -280,6 +282,7 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     init_local_hart(hart_id);
     print_boot_stage("scheduler", "bootstrap hart entering run queue");
     task::add_initproc();
+    drivers::block::start_workers();
     BOOT_DONE.store(true, Ordering::Release);
     println!("{glow}[kernel] Hello, world! Welcome to CosmOS.{reset}", glow = ANSI_GLOW, reset = ANSI_RESET);
     info!("hart {} entered scheduler", hart_id);

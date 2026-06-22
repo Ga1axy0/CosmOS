@@ -17,7 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use fs::{Inode, errno::FS_ERRNO};
 use crate::mm::UserBuffer;
-use crate::sync::SpinNoIrqLock;
+use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use core::any::Any;
@@ -198,7 +198,7 @@ pub struct FileDescription {
     /// 套接字 fd 的固定元信息；非套接字为 `None`。
     socket_spec: Option<SocketSpec>,
     /// 共享的偏移与状态位。
-    inner: SpinNoIrqLock<FileDescriptionInner>,
+    inner: SleepMutex<FileDescriptionInner>,
 }
 
 impl FileDescription {
@@ -214,7 +214,7 @@ impl FileDescription {
             access_mode,
             status_fixed_bits,
             socket_spec: None,
-            inner: SpinNoIrqLock::new(FileDescriptionInner {
+            inner: SleepMutex::new(FileDescriptionInner {
                     offset: 0,
                     status_flags,
                     dirent_snapshot: None,
@@ -236,7 +236,7 @@ impl FileDescription {
             access_mode,
             status_fixed_bits,
             socket_spec: Some(socket_spec),
-            inner: SpinNoIrqLock::new(FileDescriptionInner {
+            inner: SleepMutex::new(FileDescriptionInner {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
@@ -789,9 +789,10 @@ pub use stdio::new_stdio_files;
 pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize, CONSOLE_TTY};
 
 /// Initialize the filesystem, including rootfs and devfs.
-pub fn init() {
-    init_rootfs();  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
-    init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda) for block devices.
+pub fn init() -> Result<(), ERRNO> {
+    init_rootfs()?;  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
+    init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda, /dev/vdb) for block devices.
     init_sysfs();  // Initialize sysfs for /sys/class/net entries.
     init_procfs();  // Initialize procfs for /proc entries.
+    Ok(())
 }

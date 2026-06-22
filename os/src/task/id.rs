@@ -7,6 +7,7 @@ use crate::mm::{
     DeferredUserReclaim, MapPermission, MmError, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sync::{SpinNoIrqLock};
+use crate::timer::get_time_ns;
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -64,12 +65,18 @@ lazy_static! {
     };
     /// Global allocator for kernel stack
     static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
+    /// Cache of fully mapped kernel stacks that can be reused without a global TLB flush.
+    static ref KSTACK_CACHE: SpinNoIrqLock<Vec<usize>> = SpinNoIrqLock::new(Vec::new());
 }
 
 /// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
 const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 256;
 /// deferred 物理页超过该水位时触发一次全局 flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
+/// Keep a bounded pool of mapped kernel stacks to avoid tearing them down in fork/exit storms.
+const KSTACK_CACHE_LIMIT: usize = 512;
+const TASK_USER_RES_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
+const KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
 /// The init process runs as pid 1 (Linux-style); pid 0 is the reserved
 /// idle/swapper pid. The kernel shuts down when the process with this pid exits.
@@ -114,25 +121,96 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 /// Kernel stack for a task
 pub struct KernelStack(pub usize);
 
+fn cached_kstack_count() -> usize {
+    KSTACK_CACHE.lock().len()
+}
+
+fn try_take_cached_kstack() -> Option<usize> {
+    KSTACK_CACHE.lock().pop()
+}
+
+fn try_cache_kstack(kstack_id: usize) -> bool {
+    let mut cache = KSTACK_CACHE.lock();
+    if cache.len() >= KSTACK_CACHE_LIMIT {
+        return false;
+    }
+    cache.push(kstack_id);
+    true
+}
+
 /// Allocate a kernel stack for a task
 pub fn kstack_alloc() -> Result<KernelStack, MmError> {
-    if deferred_kstack_id_count() > KSTACK_DEFERRED_RECYCLE_WATERMARK
-        || deferred_frame_count() > DEFERRED_FRAME_RECYCLE_WATERMARK
-    {
+    let total_start_ns = get_time_ns();
+    let cached_before = cached_kstack_count();
+    let cache_take_start_ns = get_time_ns();
+    if let Some(kstack_id) = try_take_cached_kstack() {
+        let cache_take_ns = get_time_ns() - cache_take_start_ns;
+        let total_ns = get_time_ns() - total_start_ns;
+        if total_ns >= KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] kstack_alloc kstack_id={} total_ns={} cache_hit=true cache_take_ns={} cached_before={} cached_after={} flush_triggered=false flush_ns=0 alloc_id_ns=0 map_ns=0 deferred_kstacks_before=0 deferred_frames_before=0 stack_pages={}",
+                kstack_id,
+                total_ns,
+                cache_take_ns,
+                cached_before,
+                cached_kstack_count(),
+                KERNEL_STACK_SIZE / PAGE_SIZE,
+            );
+        }
+        return Ok(KernelStack(kstack_id));
+    }
+    let cache_take_ns = get_time_ns() - cache_take_start_ns;
+    let deferred_kstack_before = deferred_kstack_id_count();
+    let deferred_frames_before = deferred_frame_count();
+    let flush_triggered = deferred_kstack_before > KSTACK_DEFERRED_RECYCLE_WATERMARK
+        || deferred_frames_before > DEFERRED_FRAME_RECYCLE_WATERMARK;
+    let flush_start_ns = get_time_ns();
+    if flush_triggered {
         flush_deferred(online_mask());
     }
+    let flush_ns = get_time_ns() - flush_start_ns;
+    let alloc_id_start_ns = get_time_ns();
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
+    let alloc_id_ns = get_time_ns() - alloc_id_start_ns;
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
+    let map_start_ns = get_time_ns();
     KERNEL_SPACE.lock().insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
     )?;
+    let map_ns = get_time_ns() - map_start_ns;
+    let total_ns = get_time_ns() - total_start_ns;
+    if total_ns >= KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS {
+        debug!(
+            "[clone-timing] kstack_alloc kstack_id={} total_ns={} cache_hit=false cache_take_ns={} cached_before={} cached_after={} flush_triggered={} flush_ns={} alloc_id_ns={} map_ns={} deferred_kstacks_before={} deferred_frames_before={} stack_pages={}",
+            kstack_id,
+            total_ns,
+            cache_take_ns,
+            cached_before,
+            cached_kstack_count(),
+            flush_triggered,
+            flush_ns,
+            alloc_id_ns,
+            map_ns,
+            deferred_kstack_before,
+            deferred_frames_before,
+            KERNEL_STACK_SIZE / PAGE_SIZE,
+        );
+    }
     Ok(KernelStack(kstack_id))
 }
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
+        if try_cache_kstack(self.0) {
+            debug!(
+                "[tlb] kstack cached for reuse: id={}, cached={}",
+                self.0,
+                cached_kstack_count()
+            );
+            return;
+        }
         let (kernel_stack_bottom, _) = kernel_stack_position(self.0);
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         let deferred_frames = KERNEL_SPACE
@@ -216,12 +294,17 @@ impl TaskUserRes {
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Result<Self, MmError> {
+        let total_start_ns = get_time_ns();
+        let alloc_tid_start_ns = get_time_ns();
         let tid = process.inner_exclusive_access().alloc_tid();
+        let alloc_tid_ns = get_time_ns() - alloc_tid_start_ns;
+        let alloc_thread_id_start_ns = get_time_ns();
         let thread_id_handle = if tid == 0 {
             None
         } else {
             Some(thread_id_alloc())
         };
+        let alloc_thread_id_ns = get_time_ns() - alloc_thread_id_start_ns;
         let thread_id = thread_id_handle
             .as_ref()
             .map(|handle| handle.0)
@@ -233,8 +316,24 @@ impl TaskUserRes {
             ustack_base,
             process: Arc::downgrade(&process),
         };
+        let alloc_user_res_start_ns = get_time_ns();
         if alloc_user_res {
             task_user_res.alloc_user_res()?;
+        }
+        let alloc_user_res_ns = get_time_ns() - alloc_user_res_start_ns;
+        let total_ns = get_time_ns() - total_start_ns;
+        if total_ns >= TASK_USER_RES_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] task_user_res_new pid={} tid={} thread_id={} alloc_user_res={} total_ns={} alloc_tid_ns={} alloc_thread_id_ns={} alloc_user_res_ns={}",
+                process.getpid(),
+                tid,
+                thread_id,
+                alloc_user_res,
+                total_ns,
+                alloc_tid_ns,
+                alloc_thread_id_ns,
+                alloc_user_res_ns,
+            );
         }
         Ok(task_user_res)
     }

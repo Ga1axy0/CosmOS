@@ -16,6 +16,7 @@ static UART_IRQ_READY: AtomicBool = AtomicBool::new(false);
 const PCH_PIC_BASE: usize = super::IO_ADDR_OFFSET | 0x1000_0000;
 const PCH_PIC_INT_MASK: usize = 0x20;
 const PCH_PIC_HTMSI_VEC: usize = 0x200;
+const PCH_PIC_IRQS: u32 = 32;
 
 const EXTIOI_BASE: usize = 0x1400;
 const EXTIOI_IPMAP_START: usize = 0x0c0;
@@ -60,20 +61,20 @@ fn iocsr_write32(addr: usize, value: u32) {
     }
 }
 
-fn init_uart_pch_pic() {
-    let irq = UART0_PCH_IRQ as usize;
+fn enable_pch_pic_irq(irq: u32) {
+    let irq = irq as usize;
     let vec_reg = PCH_PIC_BASE + PCH_PIC_HTMSI_VEC + (irq & !7);
     let vec_shift = (irq & 7) * 8;
     let mut vectors = mmio_read64(vec_reg);
     vectors &= !(0xffu64 << vec_shift);
-    vectors |= (UART0_PCH_IRQ as u64) << vec_shift;
+    vectors |= (irq as u64) << vec_shift;
     mmio_write64(vec_reg, vectors);
 
     let mask = mmio_read64(PCH_PIC_BASE + PCH_PIC_INT_MASK);
     mmio_write64(PCH_PIC_BASE + PCH_PIC_INT_MASK, mask & !(1u64 << irq));
 }
 
-fn init_uart_extioi() {
+fn init_extioi_routing() {
     let target_hart = bootstrap_hart_id().min(3);
     let cpu_bit = 1u32 << target_hart;
 
@@ -85,19 +86,30 @@ fn init_uart_extioi() {
     for reg in 0..64 {
         iocsr_write32(EXTIOI_BASE + EXTIOI_COREMAP_START + reg * 4, coremap_word);
     }
+}
 
-    iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START, 1u32 << UART0_PCH_IRQ);
-    let enable = iocsr_read32(EXTIOI_BASE + EXTIOI_ENABLE_START);
+pub(crate) fn enable_pch_irq(irq: u32) -> bool {
+    if irq >= PCH_PIC_IRQS {
+        warn!("[irq] loongarch PCH IRQ {} out of range", irq);
+        return false;
+    }
+
+    let word = (irq / 32) as usize;
+    let bit = 1u32 << (irq % 32);
+    iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, bit);
+    let enable = iocsr_read32(EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4);
     iocsr_write32(
-        EXTIOI_BASE + EXTIOI_ENABLE_START,
-        enable | (1u32 << UART0_PCH_IRQ),
+        EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4,
+        enable | bit,
     );
+    enable_pch_pic_irq(irq);
+    true
 }
 
 /// Initialize platform external interrupt routing on the bootstrap hart.
 pub fn init_external_irq() {
-    init_uart_extioi();
-    init_uart_pch_pic();
+    init_extioi_routing();
+    enable_pch_irq(UART0_PCH_IRQ);
     UART_IRQ_READY.store(true, Ordering::Release);
     info!(
         "[irq] loongarch uart IRQ enabled on hart {}",
@@ -119,23 +131,34 @@ pub fn handle_external_irq() {
         return;
     }
 
-    let pending = iocsr_read32(EXTIOI_BASE + EXTIOI_COREISR_START);
-    let uart_mask = 1u32 << UART0_PCH_IRQ;
-    let mut clear_mask = 0u32;
+    for word in 0..((PCH_PIC_IRQS as usize + 31) / 32) {
+        let mut pending = iocsr_read32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4);
+        let mut clear_mask = 0u32;
 
-    if pending & uart_mask != 0 {
-        UART.handle_irq();
-        crate::fs::console_receive();
-        clear_mask |= uart_mask;
-    }
+        while pending != 0 {
+            let bit_idx = pending.trailing_zeros();
+            let bit = 1u32 << bit_idx;
+            let irq = (word as u32) * 32 + bit_idx;
+            let mut handled = false;
 
-    let unexpected = pending & !clear_mask;
-    if unexpected != 0 {
-        warn!("[irq] loongarch unexpected EXTIOI pending bits {:#x}", unexpected);
-        clear_mask |= unexpected;
-    }
+            if irq == UART0_PCH_IRQ {
+                UART.handle_irq();
+                crate::fs::console_receive();
+                handled = true;
+            }
+            handled |= crate::drivers::block::handle_irq(irq);
+            handled |= crate::drivers::net::handle_irq(irq);
 
-    if clear_mask != 0 {
-        iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START, clear_mask);
+            if !handled {
+                warn!("[irq] loongarch unexpected EXTIOI IRQ {}", irq);
+            }
+
+            clear_mask |= bit;
+            pending &= !bit;
+        }
+
+        if clear_mask != 0 {
+            iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, clear_mask);
+        }
     }
 }

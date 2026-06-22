@@ -9,8 +9,11 @@ use crate::hal::traits::AddressSpaceToken;
 use crate::mm::PhysPageNum;
 use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
+use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
+
+const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
 /// Return a mask containing all online harts supported by the kernel.
 pub const fn all_cpu_affinity_mask() -> usize {
@@ -184,6 +187,21 @@ pub struct TaskControlBlockInner {
     pub signal_mask: SignalBit,
     /// Backup of the pre-sigsuspend mask, restored by rt_sigreturn or when no handler runs.
     pub signal_mask_backup: Option<SignalBit>,
+    /// Whether this task may still have non-futex timers that require eager removal on exit.
+    pub may_have_non_futex_timer: bool,
+    /// One-shot fork/clone latency trace points used to study "clone -> run -> user -> futex wait".
+    pub fork_chain_timing: Option<ForkChainTiming>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ForkChainTiming {
+    pub clone_ready_ns: u64,
+    pub first_run_ns: u64,
+    pub first_user_return_ns: u64,
+    pub first_futex_wait_ns: u64,
+    pub first_futex_wake_ns: u64,
+    pub first_post_futex_run_ns: u64,
+    pub first_futex_wait_done_ns: u64,
 }
 
 impl TaskControlBlockInner {
@@ -240,11 +258,19 @@ impl TaskControlBlock {
         alloc_user_res: bool,
         sched_attr: SchedAttr,
     ) -> Result<Self, MmError> {
+        let new_start_ns = get_time_ns();
+        let task_user_res_start_ns = get_time_ns();
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res)?;
+        let task_user_res_ns = get_time_ns() - task_user_res_start_ns;
         let trap_cx_ppn = res.trap_cx_ppn();
+        let tid = res.tid;
+        let thread_id = res.thread_id();
+        let kstack_alloc_start_ns = get_time_ns();
         let kstack = kstack_alloc()?;
+        let kstack_alloc_ns = get_time_ns() - kstack_alloc_start_ns;
         let kstack_top = kstack.get_top();
-        Ok(Self {
+        let build_start_ns = get_time_ns();
+        let task = Self {
             process: Arc::downgrade(&process),
             kstack,
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
@@ -261,8 +287,120 @@ impl TaskControlBlock {
                 pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
+                may_have_non_futex_timer: false,
+                fork_chain_timing: None,
+            }),
+        };
+        let build_ns = get_time_ns() - build_start_ns;
+        let total_ns = get_time_ns() - new_start_ns;
+        if total_ns >= TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] task_control_block_new pid={} tid={} thread_id={} alloc_user_res={} total_ns={} task_user_res_ns={} kstack_alloc_ns={} build_ns={}",
+                process.getpid(),
+                tid,
+                thread_id,
+                alloc_user_res,
+                total_ns,
+                task_user_res_ns,
+                kstack_alloc_ns,
+                build_ns,
+            );
+        }
+        Ok(task)
+    }
+
+    /// Create a kernel thread task that starts at `entry` and never returns to userspace.
+    pub fn new_kernel_thread(
+        process: Arc<ProcessControlBlock>,
+        entry: fn() -> !,
+        sched_attr: SchedAttr,
+    ) -> Result<Self, MmError> {
+        let kstack = kstack_alloc()?;
+        let kstack_top = kstack.get_top();
+        Ok(Self {
+            process: Arc::downgrade(&process),
+            kstack,
+            inner: SpinNoIrqLock::new(TaskControlBlockInner {
+                res: None,
+                trap_cx_ppn: PhysPageNum(0),
+                task_cx: TaskContext::goto_kernel_entry(entry, kstack_top),
+                task_status: TaskStatus::Runnable,
+                wait_reason: None,
+                exit_code: None,
+                sched: TaskSchedState::new(sched_attr),
+                current_wq_handle: None,
+                clear_child_tid: 0,
+                pending_signals: SignalBit::empty(),
+                pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
+                signal_mask: SignalBit::empty(),
+                signal_mask_backup: None,
+                may_have_non_futex_timer: false,
+                fork_chain_timing: None,
             }),
         })
+    }
+
+    /// Record the timestamp at which a freshly cloned child becomes runnable.
+    pub fn mark_clone_ready(&self, now_ns: u64) {
+        let mut inner = self.inner_exclusive_access();
+        inner.fork_chain_timing = Some(ForkChainTiming {
+            clone_ready_ns: now_ns,
+            ..ForkChainTiming::default()
+        });
+    }
+
+    /// Record the first time this task is selected to run on a CPU.
+    pub fn note_first_run(&self, now_ns: u64) {
+        let mut inner = self.inner_exclusive_access();
+        if let Some(timing) = inner.fork_chain_timing.as_mut() {
+            if timing.first_run_ns == 0 {
+                timing.first_run_ns = now_ns;
+            }
+        }
+    }
+
+    /// Record the first return from kernel to user mode after clone.
+    pub fn note_first_user_return(&self, now_ns: u64) {
+        let mut inner = self.inner_exclusive_access();
+        if let Some(timing) = inner.fork_chain_timing.as_mut() {
+            if timing.first_user_return_ns == 0 {
+                timing.first_user_return_ns = now_ns;
+            }
+        }
+    }
+
+    /// Record the first observed futex wait entry and return the timing snapshot once.
+    pub fn note_first_futex_wait(&self, now_ns: u64) -> Option<ForkChainTiming> {
+        let mut inner = self.inner_exclusive_access();
+        let timing = inner.fork_chain_timing.as_mut()?;
+        if timing.first_futex_wait_ns != 0 {
+            return None;
+        }
+        timing.first_futex_wait_ns = now_ns;
+        Some(*timing)
+    }
+
+    /// Record the first wakeup/timeout event that should resume the first futex wait.
+    pub fn note_first_futex_wake(&self, now_ns: u64) {
+        let mut inner = self.inner_exclusive_access();
+        let Some(timing) = inner.fork_chain_timing.as_mut() else {
+            return;
+        };
+        if timing.first_futex_wait_ns == 0 || timing.first_futex_wake_ns != 0 {
+            return;
+        }
+        timing.first_futex_wake_ns = now_ns;
+    }
+
+    /// Record the timestamp when the first futex wait path finishes running again.
+    pub fn note_first_futex_wait_done(&self, now_ns: u64) -> Option<ForkChainTiming> {
+        let mut inner = self.inner_exclusive_access();
+        let timing = inner.fork_chain_timing.as_mut()?;
+        if timing.first_futex_wait_ns == 0 || timing.first_futex_wait_done_ns != 0 {
+            return None;
+        }
+        timing.first_futex_wait_done_ns = now_ns;
+        Some(*timing)
     }
 }
 

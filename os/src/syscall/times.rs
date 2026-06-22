@@ -5,7 +5,7 @@ use crate::timer::set_realtime_offset_from_time_ns;
 use crate::{
     config::CLOCK_FREQ,
     sched::block_current_and_run_next,
-    task::{current_process, current_task, WaitReason},
+    task::{current_process, current_task, TaskStatus, WaitReason},
     timer::{
         add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks, time_to_ticks,
         TICKS_PER_SEC,
@@ -522,6 +522,13 @@ pub fn sys_clock_nanosleep(
         // `usleep` 走 `nanosleep` 用单调时钟，故不受影响）。
         let expire_ns = monotonic_now_ns.saturating_add(sleep_ns.max(1));
         let task = current_task().unwrap();
+        // Publish the sleep state before arming the timer so an immediate
+        // expiry cannot drop the timer while this task is still marked Running.
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.task_status = TaskStatus::Interruptible;
+            task_inner.wait_reason = Some(WaitReason::Nanosleep);
+        }
         add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
 

@@ -12,6 +12,7 @@
 //! to [`syscall()`].
 
 mod context;
+mod irq;
 
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
@@ -21,11 +22,11 @@ use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
     ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
-    current_add_signal, current_process, current_process_is_zombie, current_trap_cx,
+    current_add_signal, current_process, current_process_is_zombie, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
     exit_group_current_and_run_next,
 };
-use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+use crate::timer::{get_realtime_ns, get_time, get_time_ns, handle_timer_interrupt};
 use crate::hal::{ArchInterrupt, ArchTrapMachine};
 use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine};
 
@@ -201,6 +202,7 @@ pub fn trap_handler() -> ! {
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::UserSyscall => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
             let syscall_id = cx.syscall_nr();
@@ -216,6 +218,7 @@ pub fn trap_handler() -> ! {
             cx.in_syscall = true;
         }
         TrapCause::StorePageFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             debug!(
                 "[mmap] trap store page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
@@ -276,6 +279,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::LoadPageFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // debug!(
             //     "[mmap] trap load page fault: bad_addr={:#x} sepc={:#x}",
             //     trap_info.fault_addr,
@@ -312,6 +316,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::InstructionPageFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
             debug!(
                 "[mmap] trap instruction page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
@@ -359,6 +364,7 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalBit::SIGILL);
         }
         TrapCause::TimerInterrupt => {
+            let _hardirq = irq::HardIrqGuard::enter();
             // trace!("hart {} timer tick", hartid());
             if handle_timer_interrupt() {
                 let now_raw = get_time();
@@ -368,9 +374,11 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::SoftwareInterrupt => {
+            let _hardirq = irq::HardIrqGuard::enter();
             handle_reschedule_ipi();
         }
         TrapCause::ExternalInterrupt => {
+            let _hardirq = irq::HardIrqGuard::enter();
             crate::platform::handle_external_irq();
             crate::net::poll();
         }
@@ -407,6 +415,8 @@ pub fn trap_handler() -> ! {
 #[no_mangle]
 pub fn trap_return() -> ! {
     set_user_trap_entry();
+    let now_ns = get_time_ns();
+    current_task().unwrap().note_first_user_return(now_ns);
     let trap_cx_user_va = current_trap_cx_user_va();
     current_trap_cx().set_kernel_hartid(hartid());
     let user_token = current_user_token();
@@ -417,6 +427,7 @@ pub fn trap_return() -> ! {
 /// handle trap from kernel
 #[no_mangle]
 pub fn trap_from_kernel() {
+    let _hardirq = irq::HardIrqGuard::enter();
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::ExternalInterrupt => {
@@ -451,3 +462,6 @@ pub fn trap_from_kernel() {
 }
 
 pub use context::TrapContext;
+pub use irq::{
+    enter_noirq_lock, exit_noirq_lock, HardIrqGuard, KernelIrqEnableGuard,
+};

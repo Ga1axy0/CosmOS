@@ -168,6 +168,21 @@ fn timer_hart_for_task(task: &Arc<TaskControlBlock>) -> usize {
     normalize_hart(task_inner.sched.last_cpu)
 }
 
+fn timer_task_ids(task: &Arc<TaskControlBlock>) -> (usize, usize, usize) {
+    let pid = task
+        .process
+        .upgrade()
+        .map(|process| process.getpid())
+        .unwrap_or(usize::MAX);
+    let task_inner = task.inner_exclusive_access();
+    let (tid, thread_id) = task_inner
+        .res
+        .as_ref()
+        .map(|res| (res.tid, res.thread_id()))
+        .unwrap_or((usize::MAX, usize::MAX));
+    (pid, tid, thread_id)
+}
+
 /// Add a timer with an absolute monotonic deadline in nanoseconds.
 pub fn add_timer_ns(expire_ns: u64, task: Arc<TaskControlBlock>) {
     add_timer_with_tag(expire_ns, task, None);
@@ -218,6 +233,9 @@ fn add_timer_with_tag(
         "kernel:pid[{}] add_timer",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
+    if !matches!(timer_tag, Some(TimerTagKind::Futex(_))) {
+        task.inner_exclusive_access().may_have_non_futex_timer = true;
+    }
     let target_hart = timer_hart_for_task(&task);
     let mut timers = PER_CPU_TIMERS[target_hart].lock();
     timers.push(TimerCondVar {
@@ -233,20 +251,50 @@ fn add_timer_with_tag(
 
 /// Remove a timer
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
-    //trace!("kernel:pid[{}] remove_timer", current_task().unwrap().process.upgrade().unwrap().getpid());
-    trace!("kernel: remove_timer");
+    let start_ns = get_time_ns();
+    let (pid, tid, thread_id) = timer_task_ids(&task);
+    let mut scanned = 0usize;
+    let mut removed = 0usize;
+    let mut removed_futex = 0usize;
+    let mut removed_other = 0usize;
+    let mut touched_harts = 0usize;
     for timers in PER_CPU_TIMERS.iter() {
         let mut timers = timers.lock();
+        if !timers.is_empty() {
+            touched_harts += 1;
+        }
         let mut temp = BinaryHeap::<TimerCondVar>::new();
         for condvar in timers.drain() {
+            scanned += 1;
             if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
                 temp.push(condvar);
+            } else {
+                removed += 1;
+                if matches!(condvar.timer_tag, Some(TimerTagKind::Futex(_))) {
+                    removed_futex += 1;
+                } else {
+                    removed_other += 1;
+                }
             }
         }
         timers.clear();
         timers.append(&mut temp);
     }
-    trace!("kernel: remove_timer END");
+    let total_ns = get_time_ns().saturating_sub(start_ns);
+    if total_ns >= 100_000 || removed != 0 {
+        debug!(
+            "[timer-remove] pid={} tid={} thread_id={} total_ns={} scanned={} removed={} removed_futex={} removed_other={} touched_harts={}",
+            pid,
+            tid,
+            thread_id,
+            total_ns,
+            scanned,
+            removed,
+            removed_futex,
+            removed_other,
+            touched_harts,
+        );
+    }
 }
 
 fn next_timer_deadline_ns_for_hart(hart: usize) -> Option<u64> {

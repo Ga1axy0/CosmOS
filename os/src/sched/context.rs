@@ -33,4 +33,14 @@ impl TaskContext {
             fs: [0; 12],
         }
     }
+
+    /// Create a task context that starts directly at a kernel entry point.
+    pub fn goto_kernel_entry(entry: fn() -> !, kstack_ptr: usize) -> Self {
+        Self {
+            ra: entry as usize,
+            sp: kstack_ptr,
+            s: [0; 12],
+            fs: [0; 12],
+        }
+    }
 }
