@@ -463,5 +463,5 @@ pub fn trap_from_kernel() {
 
 pub use context::TrapContext;
 pub use irq::{
-    assert_can_sleep, enter_noirq_lock, exit_noirq_lock, HardIrqGuard, KernelIrqEnableGuard,
+    enter_noirq_lock, exit_noirq_lock, HardIrqGuard, KernelIrqEnableGuard,
 };

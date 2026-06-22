@@ -667,6 +667,30 @@ impl VfsNode for Ext4Inode {
 
     /// ext4 写入需要保留 ENOSPC/ENOTSUP，供 page cache 回写路径处理失败页。
     fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        let prepared = {
+            let ext4 = self.fs.ext4.lock();
+            let block_device = Arc::clone(&ext4.block_device);
+            match ext4
+                .prepare_aligned_write_at(self.inode_num, offset, buf.len())
+                .map_err(FS_ERRNO::from)?
+            {
+                Some((written, runs)) => Some((block_device, written, runs)),
+                None => None,
+            }
+        };
+
+        if let Some((block_device, written, runs)) = prepared {
+            let mut writes = Vec::new();
+            for (disk_offset, buf_offset, len) in runs {
+                writes.push(Ext4BlockWrite {
+                    offset: disk_offset,
+                    data: &buf[buf_offset..buf_offset + len],
+                });
+            }
+            block_device.write_offsets_many(&writes);
+            return Ok(written);
+        }
+
         let ext4 = self.fs.ext4.lock();
         ext4.write_at(self.inode_num, offset, buf).map_err(FS_ERRNO::from)
     }

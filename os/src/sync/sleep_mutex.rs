@@ -4,7 +4,10 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::task::{current_task, WaitQueue, WaitReason};
+use crate::task::{
+    check_fatal_signals_of_current, current_task, exit_current_and_run_next, ExitReason, WaitQueue,
+    WaitReason,
+};
 
 /// A small sleepable mutex.
 ///
@@ -36,7 +39,6 @@ impl<T> SleepMutex<T> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            crate::trap::assert_can_sleep("SleepMutex::lock");
             assert!(
                 current_task().is_some(),
                 "SleepMutex::lock attempted to sleep without a current task"
@@ -45,6 +47,11 @@ impl<T> SleepMutex<T> {
                 .wait_with_reason_or_skip(WaitReason::Mutex, || {
                     !self.locked.load(Ordering::Acquire)
                 });
+            if self.locked.load(Ordering::Acquire) {
+                if let Some((signum, _)) = check_fatal_signals_of_current() {
+                    exit_current_and_run_next(ExitReason::Signal(signum as u32));
+                }
+            }
         }
         SleepMutexGuard { lock: self }
     }

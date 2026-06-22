@@ -1,10 +1,10 @@
 use super::BlockDevice;
 use crate::sync::SpinNoIrqLock;
-use crate::task::{current_task, WaitQueueKeyed, WaitReason};
-use alloc::{boxed::Box, string::String, vec::Vec};
-use core::error;
+use crate::task::{current_task, WaitQueue, WaitReason};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 use core::hint::spin_loop;
+use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use fs::BlockWrite;
 use virtio_drivers::{
@@ -18,7 +18,8 @@ use crate::drivers::virtio::VirtioHal;
 /// VirtIOBlock device driver strcuture for virtio_blk device
 pub struct VirtIOBlock {
     inner: SpinNoIrqLock<VirtIOBlk<VirtioHal, SomeTransport<'static>>>,
-    wait_queue: WaitQueueKeyed<u16>,
+    pending: SpinNoIrqLock<BTreeMap<u16, Arc<RequestState>>>,
+    batch_wait_queue: WaitQueue,
 }
 
 // static mut READ_RECORDS: SpinNoIrqLock<([usize; 512], usize)> = SpinNoIrqLock::new(([0; 512], 0));
@@ -29,6 +30,8 @@ static WRITE_OPS: AtomicUsize = AtomicUsize::new(0);
 static WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static WAIT_POLLS: AtomicUsize = AtomicUsize::new(0);
 static TASK_WAITS: AtomicUsize = AtomicUsize::new(0);
+static COMPLETE_RECHECK_MISSES: AtomicUsize = AtomicUsize::new(0);
+static COMPLETE_WRONG_TOKENS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITE_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -41,24 +44,77 @@ static WRITE_MANY_QUEUE_FULL_WAITS: AtomicUsize = AtomicUsize::new(0);
 const VIRTIO_BLK_QUEUE_SIZE: usize = 16;
 const VIRTIO_BLK_WRITE_DESCS: usize = 3;
 const MAX_WRITE_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_WRITE_DESCS;
+const ADAPTIVE_COMPLETION_SPINS: usize = 32;
 
-struct PendingWrite<'a> {
-    token: u16,
-    block_id: usize,
-    data: &'a [u8],
-    req: BlkReq,
-    resp: BlkResp,
+#[derive(Clone, Copy, Debug)]
+enum RequestKind {
+    Read { ptr: usize, len: usize },
+    Write { ptr: usize, len: usize },
 }
 
-impl<'a> PendingWrite<'a> {
-    fn new(block_id: usize, data: &'a [u8]) -> Self {
-        Self {
-            token: 0,
-            block_id,
-            data,
-            req: BlkReq::default(),
-            resp: BlkResp::default(),
+impl RequestKind {
+    fn len(self) -> usize {
+        match self {
+            Self::Read { len, .. } | Self::Write { len, .. } => len,
         }
+    }
+}
+
+struct RequestData {
+    token: u16,
+    block_id: usize,
+    kind: RequestKind,
+    req: BlkReq,
+    resp: BlkResp,
+    done: bool,
+}
+
+struct RequestState {
+    inner: SpinNoIrqLock<RequestData>,
+    wait_queue: WaitQueue,
+}
+
+impl RequestState {
+    fn new_read(block_id: usize, buf: &mut [u8]) -> Arc<Self> {
+        Arc::new(Self::new(
+            block_id,
+            RequestKind::Read {
+                ptr: buf.as_mut_ptr() as usize,
+                len: buf.len(),
+            },
+        ))
+    }
+
+    fn new_write(block_id: usize, data: &[u8]) -> Arc<Self> {
+        Arc::new(Self::new(
+            block_id,
+            RequestKind::Write {
+                ptr: data.as_ptr() as usize,
+                len: data.len(),
+            },
+        ))
+    }
+
+    fn new(block_id: usize, kind: RequestKind) -> Self {
+        Self {
+            inner: SpinNoIrqLock::new(RequestData {
+                token: 0,
+                block_id,
+                kind,
+                req: BlkReq::default(),
+                resp: BlkResp::default(),
+                done: false,
+            }),
+            wait_queue: WaitQueue::new(),
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.inner.lock().done
+    }
+
+    fn status(&self) -> RespStatus {
+        self.inner.lock().resp.status()
     }
 }
 
@@ -76,66 +132,29 @@ impl BlockDevice for VirtIOBlock {
             READ_OPS.fetch_add(1, Ordering::Relaxed);
             READ_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
         }
-        let mut req = BlkReq::default();
-        let mut resp = BlkResp::default();
-        
-        // unsafe {
-        //     let mut records = READ_RECORDS.lock();
-        //     let idx = records.1 % 512;
-        //     records.0[idx] = block_id;
-        //     records.1 += 1;
-        //     if idx.is_multiple_of(512) {
-        //         // Debug-print the inner array, not the lock guard (which doesn't implement Debug).
-        //         warn!(
-        //             "Recent 512 VirtIOBlk read block_ids: {:?}",
-        //             &records.0
-        //         );
-        //     }
-        // }
-
-        // debug!("Submitting VirtIOBlk read for block_id {}", block_id);
-        let token = unsafe {
-            self.inner
-                .lock()
-                .read_blocks_nb(block_id, &mut req, buf, &mut resp)
-                .unwrap_or_else(|err| {
-                    let capacity = self.inner.lock().capacity();
-                    panic!(
-                        "Error when submitting VirtIOBlk read: block_id={} buf_len={} capacity={} err={:?}",
-                        block_id,
-                        buf.len(),
-                        capacity,
-                        err
-                    )
-                })
-        };
-        self.wait_token(token);
-        let result = unsafe {
-            self.inner
-                .lock()
-                .complete_read_blocks(token, &req, buf, &mut resp)
-        };
-        if let Err(err) = result {
+        let request = self
+            .submit_read_request(block_id, buf)
+            .unwrap_or_else(|err| {
+                let capacity = self.inner.lock().capacity();
+                panic!(
+                    "Error when submitting VirtIOBlk read: block_id={} buf_len={} capacity={} err={:?}",
+                    block_id,
+                    buf.len(),
+                    capacity,
+                    err
+                )
+            });
+        self.wait_request(&request);
+        if request.status() != RespStatus::OK {
             let capacity = self.inner.lock().capacity();
-            panic!(
-                "Error when completing VirtIOBlk read: block_id={} token={} buf_len={} capacity={} resp_status={:?} err={:?}",
-                block_id,
-                token,
-                buf.len(),
-                capacity,
-                resp.status(),
-                err
-            );
-        }
-        if resp.status() != RespStatus::OK {
-            let capacity = self.inner.lock().capacity();
+            let token = request.inner.lock().token;
             panic!(
                 "VirtIOBlk read response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
                 block_id,
                 token,
                 buf.len(),
                 capacity,
-                resp.status()
+                request.status()
             );
         }
     }
@@ -152,50 +171,29 @@ impl BlockDevice for VirtIOBlock {
             WRITE_OPS.fetch_add(1, Ordering::Relaxed);
             WRITE_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
         }
-        let mut req = BlkReq::default();
-        let mut resp = BlkResp::default();
-        let token = unsafe {
-            self.inner
-                .lock()
-                .write_blocks_nb(block_id, &mut req, buf, &mut resp)
-                .unwrap_or_else(|err| {
-                    let capacity = self.inner.lock().capacity();
-                    panic!(
-                        "Error when submitting VirtIOBlk write: block_id={} buf_len={} capacity={} err={:?}",
-                        block_id,
-                        buf.len(),
-                        capacity,
-                        err
-                    )
-                })
-        };
-        self.wait_token(token);
-        let result = unsafe {
-            self.inner
-                .lock()
-                .complete_write_blocks(token, &req, buf, &mut resp)
-        };
-        if let Err(err) = result {
+        let request = self
+            .submit_write_request(block_id, buf)
+            .unwrap_or_else(|err| {
+                let capacity = self.inner.lock().capacity();
+                panic!(
+                    "Error when submitting VirtIOBlk write: block_id={} buf_len={} capacity={} err={:?}",
+                    block_id,
+                    buf.len(),
+                    capacity,
+                    err
+                )
+            });
+        self.wait_request(&request);
+        if request.status() != RespStatus::OK {
             let capacity = self.inner.lock().capacity();
-            panic!(
-                "Error when completing VirtIOBlk write: block_id={} token={} buf_len={} capacity={} resp_status={:?} err={:?}",
-                block_id,
-                token,
-                buf.len(),
-                capacity,
-                resp.status(),
-                err
-            );
-        }
-        if resp.status() != RespStatus::OK {
-            let capacity = self.inner.lock().capacity();
+            let token = request.inner.lock().token;
             panic!(
                 "VirtIOBlk write response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
                 block_id,
                 token,
                 buf.len(),
                 capacity,
-                resp.status()
+                request.status()
             );
         }
     }
@@ -212,7 +210,6 @@ impl BlockDevice for VirtIOBlock {
             }
             return;
         }
-
         #[cfg(feature = "io_perf_counters")]
         {
             WRITE_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -220,7 +217,7 @@ impl BlockDevice for VirtIOBlock {
         }
 
         let mut next = 0usize;
-        let mut in_flight: Vec<Box<PendingWrite<'_>>> = Vec::new();
+        let mut in_flight: Vec<Arc<RequestState>> = Vec::new();
         while next < writes.len() || !in_flight.is_empty() {
             while next < writes.len() && in_flight.len() < MAX_WRITE_IN_FLIGHT {
                 let write = &writes[next];
@@ -229,84 +226,61 @@ impl BlockDevice for VirtIOBlock {
                     continue;
                 }
                 assert!(write.data.len() % ::fs::BLOCK_SZ == 0);
-                let mut pending = Box::new(PendingWrite::new(write.start_block, write.data));
                 WRITE_OPS.fetch_add(1, Ordering::Relaxed);
                 WRITE_BYTES.fetch_add(write.data.len(), Ordering::Relaxed);
-                let token = unsafe {
-                    let mut inner = self.inner.lock();
-                    match inner.write_blocks_nb(
-                        pending.block_id,
-                        &mut pending.req,
-                        pending.data,
-                        &mut pending.resp,
-                    ) {
-                        Ok(token) => token,
-                        Err(VirtIoError::QueueFull) => {
-                            #[cfg(feature = "io_perf_counters")]
-                            WRITE_MANY_QUEUE_FULL_WAITS.fetch_add(1, Ordering::Relaxed);
-                            WRITE_OPS.fetch_sub(1, Ordering::Relaxed);
-                            WRITE_BYTES.fetch_sub(write.data.len(), Ordering::Relaxed);
-                            next -= 1;
-                            break;
-                        }
-                        Err(err) => {
-                            let capacity = inner.capacity();
-                            panic!(
-                                "Error when submitting VirtIOBlk batched write: block_id={} buf_len={} capacity={} err={:?}",
-                                pending.block_id,
-                                pending.data.len(),
-                                capacity,
-                                err
-                            )
-                        }
+                match self.submit_write_request(write.start_block, write.data) {
+                    Ok(request) => {
+                        in_flight.push(request);
+                        update_max_write_in_flight(in_flight.len());
                     }
-                };
-                pending.token = token;
-                in_flight.push(pending);
-                update_max_write_in_flight(in_flight.len());
+                    Err(VirtIoError::QueueFull) => {
+                        #[cfg(feature = "io_perf_counters")]
+                        WRITE_MANY_QUEUE_FULL_WAITS.fetch_add(1, Ordering::Relaxed);
+                        WRITE_OPS.fetch_sub(1, Ordering::Relaxed);
+                        WRITE_BYTES.fetch_sub(write.data.len(), Ordering::Relaxed);
+                        next -= 1;
+                        break;
+                    }
+                    Err(err) => {
+                        let capacity = self.inner.lock().capacity();
+                        panic!(
+                            "Error when submitting VirtIOBlk batched write: block_id={} buf_len={} capacity={} err={:?}",
+                            write.start_block,
+                            write.data.len(),
+                            capacity,
+                            err
+                        )
+                    }
+                }
             }
 
             if !in_flight.is_empty() {
-                let token = self.wait_owned_used_token(&in_flight);
-                let idx = in_flight
-                    .iter()
-                    .position(|pending| pending.token == token)
-                    .expect("ready token missing from batched write set");
-                let mut pending = in_flight.swap_remove(idx);
-                let result = unsafe {
-                    self.inner.lock().complete_write_blocks(
-                        pending.token,
-                        &pending.req,
-                        pending.data,
-                        &mut pending.resp,
-                    )
-                };
-                if let Err(err) = result {
-                    let capacity = self.inner.lock().capacity();
-                    panic!(
-                        "Error when completing VirtIOBlk batched write: block_id={} token={} buf_len={} capacity={} resp_status={:?} err={:?}",
-                        pending.block_id,
-                        pending.token,
-                        pending.data.len(),
-                        capacity,
-                        pending.resp.status(),
-                        err
-                    );
+                self.pump_completions();
+                let mut idx = 0;
+                while idx < in_flight.len() {
+                    if !in_flight[idx].done() {
+                        idx += 1;
+                        continue;
+                    }
+                    let request = in_flight.swap_remove(idx);
+                    if request.status() != RespStatus::OK {
+                        let data = request.inner.lock();
+                        let capacity = self.inner.lock().capacity();
+                        panic!(
+                            "VirtIOBlk batched write response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
+                            data.block_id,
+                            data.token,
+                            data.kind.len(),
+                            capacity,
+                            data.resp.status()
+                        );
+                    }
                 }
-                if pending.resp.status() != RespStatus::OK {
-                    let capacity = self.inner.lock().capacity();
-                    panic!(
-                        "VirtIOBlk batched write response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
-                        pending.block_id,
-                        pending.token,
-                        pending.data.len(),
-                        capacity,
-                        pending.resp.status()
-                    );
+                if !in_flight.is_empty() {
+                    self.wait_for_batch_progress(&in_flight);
                 }
             } else if next < writes.len() {
-                WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
-                spin_loop();
+                self.wait_for_device_progress();
             }
         }
     }
@@ -317,48 +291,200 @@ impl VirtIOBlock {
     pub fn try_new(transport: SomeTransport<'static>) -> Option<Self> {
         VirtIOBlk::<VirtioHal, _>::new(transport).ok().map(|blk| Self {
             inner: SpinNoIrqLock::new(blk),
-            wait_queue: WaitQueueKeyed::new(),
+            pending: SpinNoIrqLock::new(BTreeMap::new()),
+            batch_wait_queue: WaitQueue::new(),
         })
     }
 
-    fn wait_token(&self, token: u16) {
-        let irq_disabled = !crate::hal::local_irqs_enabled();
-        if current_task().is_none() || irq_disabled {
-            while !self.token_ready(token) {
-                #[cfg(feature = "io_perf_counters")]
-                WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
-                error!("spin_loop");
-                spin_loop();
+    fn submit_read_request(
+        &self,
+        block_id: usize,
+        buf: &mut [u8],
+    ) -> Result<Arc<RequestState>, VirtIoError> {
+        let request = RequestState::new_read(block_id, buf);
+        let mut device = self.inner.lock();
+        let mut data = request.inner.lock();
+        let RequestKind::Read { ptr, len } = data.kind else {
+            unreachable!();
+        };
+        let buf = unsafe { slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        let req = &mut data.req as *mut BlkReq;
+        let resp = &mut data.resp as *mut BlkResp;
+        let token = unsafe { device.read_blocks_nb(block_id, &mut *req, buf, &mut *resp)? };
+        data.token = token;
+        drop(data);
+        self.pending.lock().insert(token, Arc::clone(&request));
+        Ok(request)
+    }
+
+    fn submit_write_request(
+        &self,
+        block_id: usize,
+        buf: &[u8],
+    ) -> Result<Arc<RequestState>, VirtIoError> {
+        let request = RequestState::new_write(block_id, buf);
+        let mut device = self.inner.lock();
+        let mut data = request.inner.lock();
+        let RequestKind::Write { ptr, len } = data.kind else {
+            unreachable!();
+        };
+        let buf = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
+        let req = &mut data.req as *mut BlkReq;
+        let resp = &mut data.resp as *mut BlkResp;
+        let token = unsafe { device.write_blocks_nb(block_id, &mut *req, buf, &mut *resp)? };
+        data.token = token;
+        drop(data);
+        self.pending.lock().insert(token, Arc::clone(&request));
+        Ok(request)
+    }
+
+    fn wait_request(&self, request: &Arc<RequestState>) {
+        loop {
+            self.pump_completions();
+            if request.done() {
+                return;
             }
+
+            if current_task().is_some() && crate::hal::local_irqs_enabled() {
+                if self.adaptive_pump_until(|| request.done()) {
+                    return;
+                }
+                #[cfg(feature = "io_perf_counters")]
+                TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+                request
+                    .wait_queue
+                    .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || request.done());
+                continue;
+            }
+
+            #[cfg(feature = "io_perf_counters")]
+            WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
+            spin_loop();
+        }
+    }
+
+    fn wait_for_batch_progress(&self, in_flight: &[Arc<RequestState>]) {
+        loop {
+            self.pump_completions();
+            if in_flight.iter().any(|request| request.done()) {
+                return;
+            }
+
+            if current_task().is_some() && crate::hal::local_irqs_enabled() {
+                if self.adaptive_pump_until(|| in_flight.iter().any(|request| request.done())) {
+                    return;
+                }
+                #[cfg(feature = "io_perf_counters")]
+                TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+                self.batch_wait_queue
+                    .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
+                        in_flight.iter().any(|request| request.done())
+                            || self.inner.lock().peek_used().is_some()
+                    });
+                continue;
+            }
+
+            #[cfg(feature = "io_perf_counters")]
+            WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
+            spin_loop();
+        }
+    }
+
+    fn wait_for_device_progress(&self) {
+        if current_task().is_some() && crate::hal::local_irqs_enabled() {
+            if self.adaptive_pump_until(|| self.inner.lock().peek_used().is_some()) {
+                return;
+            }
+            #[cfg(feature = "io_perf_counters")]
+            TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+            self.batch_wait_queue
+                .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
+                    self.inner.lock().peek_used().is_some()
+                });
             return;
         }
 
-        // Task context path: park current task and wait for precise token wakeup.
-        crate::trap::assert_can_sleep("virtio_blk::wait_token");
         #[cfg(feature = "io_perf_counters")]
-        TASK_WAITS.fetch_add(1, Ordering::Relaxed);
-        self.wait_queue
-            .wait_selected_with_reason_or_skip(token, WaitReason::BlockDeviceIo, || {
-                self.token_ready(token)
-            });
+        WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
+        spin_loop();
     }
 
-    fn token_ready(&self, token: u16) -> bool {
-        let mut inner = self.inner.lock();
-        matches!(inner.peek_used(), Some(ready) if ready == token)
-    }
-
-    fn wait_owned_used_token(&self, in_flight: &[Box<PendingWrite<'_>>]) -> u16 {
-        loop {
-            if let Some(token) = self.inner.lock().peek_used() {
-                if in_flight.iter().any(|pending| pending.token == token) {
-                    return token;
-                }
+    fn adaptive_pump_until(&self, is_ready: impl Fn() -> bool) -> bool {
+        for _ in 0..ADAPTIVE_COMPLETION_SPINS {
+            if is_ready() {
+                return true;
+            }
+            self.pump_completions();
+            if is_ready() {
+                return true;
             }
             #[cfg(feature = "io_perf_counters")]
             WAIT_POLLS.fetch_add(1, Ordering::Relaxed);
             spin_loop();
         }
+        false
+    }
+
+    fn pump_completions(&self) {
+        let mut completed_any = false;
+        loop {
+            let mut device = self.inner.lock();
+            let Some(token) = device.peek_used() else {
+                break;
+            };
+            let Some(request) = self.pending.lock().remove(&token) else {
+                warn!(
+                    "[virtio_blk] used token {} has no pending request; stop completion pump",
+                    token
+                );
+                break;
+            };
+
+            let mut data = request.inner.lock();
+            let kind = data.kind;
+            let req = &data.req as *const BlkReq;
+            let resp = &mut data.resp as *mut BlkResp;
+            let result = unsafe {
+                match kind {
+                    RequestKind::Read { ptr, len } => {
+                        let buf = slice::from_raw_parts_mut(ptr as *mut u8, len);
+                        device.complete_read_blocks(token, &*req, buf, &mut *resp)
+                    }
+                    RequestKind::Write { ptr, len } => {
+                        let buf = slice::from_raw_parts(ptr as *const u8, len);
+                        device.complete_write_blocks(token, &*req, buf, &mut *resp)
+                    }
+                }
+            };
+            if let Err(err) = result {
+                if matches!(err, VirtIoError::WrongToken) {
+                    COMPLETE_WRONG_TOKENS.fetch_add(1, Ordering::Relaxed);
+                }
+                let capacity = device.capacity();
+                panic!(
+                    "Error when completing VirtIOBlk request: block_id={} token={} kind={:?} buf_len={} capacity={} resp_status={:?} err={:?}",
+                    data.block_id,
+                    token,
+                    data.kind,
+                    data.kind.len(),
+                    capacity,
+                    data.resp.status(),
+                    err
+                );
+            }
+            data.done = true;
+            drop(data);
+            drop(device);
+            completed_any = true;
+            request.wait_queue.wake_all();
+        }
+        if completed_any {
+            self.wake_batch_waiters();
+        }
+    }
+
+    fn wake_batch_waiters(&self) {
+        self.batch_wait_queue.wake_all();
     }
 
     /// Called from external interrupt path for this block device.
@@ -367,11 +493,8 @@ impl VirtIOBlock {
         if inner.ack_interrupt().is_empty() {
             return;
         }
-        let ready = inner.peek_used();
         drop(inner);
-        if let Some(token) = ready {
-            self.wait_queue.wake_selected(token);
-        }
+        self.pump_completions();
     }
 }
 
@@ -386,6 +509,8 @@ pub fn reset_perf_counters() {
     WRITE_BYTES.store(0, Ordering::Relaxed);
     WAIT_POLLS.store(0, Ordering::Relaxed);
     TASK_WAITS.store(0, Ordering::Relaxed);
+    COMPLETE_RECHECK_MISSES.store(0, Ordering::Relaxed);
+    COMPLETE_WRONG_TOKENS.store(0, Ordering::Relaxed);
     #[cfg(feature = "io_perf_counters")]
     {
         WRITE_MANY_CALLS.store(0, Ordering::Relaxed);
@@ -404,6 +529,16 @@ pub fn render_perf_counters() -> String {
     let _ = writeln!(&mut out, "  write_bytes {}", load(&WRITE_BYTES));
     let _ = writeln!(&mut out, "  wait_polls {}", load(&WAIT_POLLS));
     let _ = writeln!(&mut out, "  task_waits {}", load(&TASK_WAITS));
+    let _ = writeln!(
+        &mut out,
+        "  complete_recheck_misses {}",
+        load(&COMPLETE_RECHECK_MISSES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  complete_wrong_tokens {}",
+        load(&COMPLETE_WRONG_TOKENS)
+    );
     #[cfg(feature = "io_perf_counters")]
     {
         let _ = writeln!(

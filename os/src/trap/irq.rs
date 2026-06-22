@@ -63,18 +63,6 @@ pub fn can_sleep() -> bool {
     !in_hardirq() && noirq_lock_depth() == 0
 }
 
-/// Assert that the current context may block and switch away.
-#[inline]
-pub fn assert_can_sleep(context: &str) {
-    assert!(
-        can_sleep(),
-        "{} attempted to sleep in hardirq/noirq context: hardirq_depth={} noirq_lock_depth={}",
-        context,
-        slot(&HARDIRQ_DEPTH).load(Ordering::Relaxed),
-        slot(&NOIRQ_LOCK_DEPTH).load(Ordering::Relaxed)
-    );
-}
-
 /// Temporarily enable local interrupts while executing ordinary kernel code.
 ///
 /// This guard is intentionally inert in hardirq or irq-off lock context. It is

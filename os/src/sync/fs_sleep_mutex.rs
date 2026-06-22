@@ -1,7 +1,9 @@
 //! Wait/wake hooks for the filesystem crate's sleepable mutex shim.
 
 use crate::sync::SpinNoIrqLock;
-use crate::task::{WaitQueue, WaitReason};
+use crate::task::{
+    check_fatal_signals_of_current, exit_current_and_run_next, ExitReason, WaitQueue, WaitReason,
+};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +29,16 @@ fn wait_queue_for(key: usize) -> Arc<WaitQueue> {
 /// Sleep until a filesystem mutex becomes unlocked.
 #[no_mangle]
 pub extern "C" fn fs_sleep_mutex_wait(key: usize, locked: *const AtomicBool) {
-    crate::trap::assert_can_sleep("fs_sleep_mutex_wait");
     let is_unlocked = || unsafe { !(*locked).load(Ordering::Acquire) };
     if is_unlocked() {
         return;
     }
     wait_queue_for(key).wait_with_reason_or_skip(WaitReason::Mutex, is_unlocked);
+    if !is_unlocked() {
+        if let Some((signum, _)) = check_fatal_signals_of_current() {
+            exit_current_and_run_next(ExitReason::Signal(signum as u32));
+        }
+    }
 }
 
 /// Wake one waiter for a filesystem mutex.

@@ -700,7 +700,9 @@ impl TcpSocketFile {
 
             listener
                 .accept_wait
-                .wait_with_reason_or_skip(WaitReason::SocketReadable, || listener.has_pending());
+                .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                    listener.has_pending() || crate::signal::has_unmasked_pending_signal()
+                });
             if crate::signal::has_unmasked_pending_signal() {
                 return Err(ERRNO::EINTR);
             }
@@ -796,7 +798,9 @@ impl TcpSocketFile {
                 }
             }
             st.write_wait
-                .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.connect_done());
+                .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                    self.connect_done() || crate::signal::has_unmasked_pending_signal()
+                });
             if crate::signal::has_unmasked_pending_signal() {
                 return Err(ERRNO::EINTR);
             }
@@ -912,7 +916,9 @@ impl TcpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.recv_ready() || socket_wait_should_skip(handle)
+                    self.recv_ready()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -937,7 +943,9 @@ impl TcpSocketFile {
                 }
             } else {
                 st.read_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.recv_ready() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }
@@ -1029,7 +1037,9 @@ impl TcpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
-                    self.send_ready() || socket_wait_should_skip(handle)
+                    self.send_ready()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -1054,7 +1064,9 @@ impl TcpSocketFile {
                 }
             } else {
                 st.write_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                        self.send_ready() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }
@@ -1186,7 +1198,9 @@ impl File for TcpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.recv_ready() || socket_wait_should_skip(handle)
+                    self.recv_ready()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -1211,7 +1225,9 @@ impl File for TcpSocketFile {
                 }
             } else {
                 st.read_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || self.recv_ready());
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.recv_ready() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }
@@ -1293,7 +1309,9 @@ impl File for TcpSocketFile {
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
                 st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
-                    self.send_ready() || socket_wait_should_skip(handle)
+                    self.send_ready()
+                        || socket_wait_should_skip(handle)
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
@@ -1318,7 +1336,9 @@ impl File for TcpSocketFile {
                 }
             } else {
                 st.write_wait
-                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || self.send_ready());
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                        self.send_ready() || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     return Err(ERRNO::EINTR);
                 }

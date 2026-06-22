@@ -525,6 +525,9 @@ impl TtyCore {
         let pgrp = self.state.lock().fg_pgrp;
         if pgrp != 0 {
             send_signal_to_pgrp(pgrp, signal, SigInfo::for_kernel(signum));
+            if signal == SignalBit::SIGINT {
+                crate::task::arm_debug_pgrp_task_dump(pgrp);
+            }
         }
     }
 
@@ -551,7 +554,9 @@ impl TtyCore {
             }
             // 3. 阻塞，直到中断路径补满输入或有信号到来。
             self.read_wq
-                .wait_with_reason_or_skip(WaitReason::UartRx, || self.read_ready());
+                .wait_with_reason_or_skip(WaitReason::UartRx, || {
+                    self.read_ready() || has_interrupting_signal()
+                });
             // 4. 被唤醒：数据优先于信号；否则上报 EINTR。
             if !self.read_ready() && has_interrupting_signal() {
                 return Err(ERRNO::EINTR);

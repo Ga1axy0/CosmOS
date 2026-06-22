@@ -1,6 +1,7 @@
 //! LoongArch64 QEMU `virt` PCI/ECAM probing for VirtIO PCI devices.
 
-use alloc::{string::String, sync::Arc};
+use alloc::sync::Arc;
+use core::ptr::read_volatile;
 use virtio_drivers::transport::{
     pci::{
         bus::{
@@ -13,7 +14,7 @@ use virtio_drivers::transport::{
 };
 
 use crate::drivers::{
-    block::{BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ, VirtIOBlock},
+    block::{block_device_name, BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ, VirtIOBlock},
     net::{self, VirtIONetDevice},
 };
 
@@ -22,7 +23,9 @@ const PCI_ECAM_SIZE: usize = 0x1000_0000;
 const PCI_RANGE_BASE: usize = 0x4000_0000;
 const PCI_RANGE_SIZE: usize = 0x4000_0000;
 const PCI_BUS_END: u8 = 0x7f;
-const LEGACY_VIRTIO_NET_IRQ: u32 = 1;
+const PCI_INTERRUPT_LINE_PIN_OFFSET: usize = 0x3c;
+const GPEX_INTX_IRQ_BASE: u32 = 16;
+const GPEX_INTX_IRQ_COUNT: u32 = 4;
 
 /// Probe the LA64 PCIe ECAM bus and register VirtIO PCI devices.
 pub fn probe_platform_devices() {
@@ -63,16 +66,25 @@ pub fn probe_platform_devices() {
                         continue;
                     };
                     let dev = Arc::new(dev);
-                    let name: String = alloc::format!("vd{}", (b'a' + block_idx as u8) as char);
-                    info!("[pci] virtio-blk {} at {}", name, bdf);
+                    let name = block_device_name(block_idx);
+                    let irq = gpex_intx_irq(bdf);
+                    info!("[pci] virtio-blk {} at {} irq {:?}", name, bdf, irq);
                     map.insert(name, dev.clone());
-                    let _ = &mut irq_map;
+                    if let Some(irq) = irq {
+                        if super::irq::enable_pch_irq(irq) {
+                            irq_map.insert(irq, dev);
+                        }
+                    }
                     block_idx += 1;
                 }
                 DeviceType::Network => {
+                    let Some(irq) = gpex_intx_irq(bdf) else {
+                        warn!("[pci] virtio-net at {} has no INTx pin", bdf);
+                        continue;
+                    };
                     let Some(dev) = VirtIONetDevice::try_new(
                         SomeTransport::from(transport),
-                        LEGACY_VIRTIO_NET_IRQ,
+                        irq,
                     ) else {
                         warn!("[pci] failed to create virtio-net for {}", bdf);
                         continue;
@@ -81,7 +93,7 @@ pub fn probe_platform_devices() {
                     info!(
                         "[pci] virtio-net at {} irq {} mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                         bdf,
-                        LEGACY_VIRTIO_NET_IRQ,
+                        irq,
                         mac[0],
                         mac[1],
                         mac[2],
@@ -89,6 +101,7 @@ pub fn probe_platform_devices() {
                         mac[4],
                         mac[5]
                     );
+                    super::irq::enable_pch_irq(irq);
                     net::register_device(Arc::new(dev));
                 }
                 other => {
@@ -167,9 +180,34 @@ fn configure_pci_device(
     let (_status, cmd) = root.get_status_command(bdf);
     root.set_command(
         bdf,
-        cmd | Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER,
+        (cmd | Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER)
+            & !Command::INTERRUPT_DISABLE,
     );
     Ok(())
+}
+
+fn pci_config_read_word(bdf: DeviceFunction, offset: usize) -> u32 {
+    debug_assert!(offset % core::mem::size_of::<u32>() == 0);
+    let addr = (PCI_ECAM_BASE | super::IO_ADDR_OFFSET)
+        + ((bdf.bus as usize) << 20)
+        + ((bdf.device as usize) << 15)
+        + ((bdf.function as usize) << 12)
+        + offset;
+    unsafe { read_volatile(addr as *const u32) }
+}
+
+fn gpex_intx_irq(bdf: DeviceFunction) -> Option<u32> {
+    let line_pin = pci_config_read_word(bdf, PCI_INTERRUPT_LINE_PIN_OFFSET);
+    let interrupt_pin = ((line_pin >> 8) & 0xff) as u8;
+    if interrupt_pin == 0 {
+        return None;
+    }
+
+    // QEMU GPEX maps INTx as `(slot + zero_based_pin) % 4` and the
+    // LoongArch virt machine wires those four outputs to PCH IRQs 16..19.
+    let zero_based_pin = u32::from(interrupt_pin - 1);
+    let intx = (u32::from(bdf.device) + zero_based_pin) % GPEX_INTX_IRQ_COUNT;
+    Some(GPEX_INTX_IRQ_BASE + intx)
 }
 
 fn probe_virtio_pci_device(

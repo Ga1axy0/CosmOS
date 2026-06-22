@@ -91,6 +91,7 @@ pub(crate) fn run_tasks() {
         // Drop any stopped-task reference left by the previous exit on this hart.
         // The previous task's kernel stack is now guaranteed unused.
         super::clear_stopping_task();
+        crate::task::maybe_dump_pending_debug_pgrp_tasks();
         if let Some(task) = pick_next_task(hartid()) {
             // debug!(
             //     "kernel: hart {} run_tasks, pid[{}]",

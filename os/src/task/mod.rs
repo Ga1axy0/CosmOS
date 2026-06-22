@@ -29,8 +29,10 @@ use crate::sync::{cleanup_futex_wait_for_task, futex_wake_addr_in_process};
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
+use crate::timer::get_time_ns;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 pub(crate) use id::recycle_deferred_kstack_ids;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
@@ -44,6 +46,11 @@ pub use crate::sched::{
 fn should_remove_non_futex_timers_on_exit(task: &Arc<TaskControlBlock>) -> bool {
     task.inner_exclusive_access().may_have_non_futex_timer
 }
+
+static DEBUG_DUMP_PGRP: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_DUMP_REMAINING: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_DUMP_DEADLINE_NS: AtomicUsize = AtomicUsize::new(0);
+const DEBUG_DUMP_INTERVAL_NS: usize = 1_000_000_000;
 pub use crate::signal::{
     check_signals_of_current, handle_signals, MAX_SIG, SaFlags, SigInfo, SignalAction,
     SignalActions, SignalBit, SIG_DFL, SIG_IGN,
@@ -500,8 +507,9 @@ fn first_signum_in_set(signal: SignalBit) -> Option<usize> {
 
 /// Add signal to target process.
 ///
-/// When the delivered signal introduces a **newly pending and unmasked** bit,
-/// proactively wake poll waiters of this process so `ppoll` can return `EINTR`.
+/// Wake interruptible waiters whenever the delivered signal is currently
+/// unmasked for them, even if that signal bit was already pending. Repeated
+/// terminal-generated SIGINT must still be able to kick tasks out of sleep.
 pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalBit) {
     let signum = first_signum_in_set(signal).map(|num| num as i32).unwrap_or_default();
     add_signal_to_process_with_siginfo(process, signal, SigInfo::for_kernel(signum));
@@ -513,7 +521,7 @@ pub fn add_signal_to_process_with_siginfo(
     signal: SignalBit,
     siginfo: SigInfo,
 ) {
-    let (pid, newly_pending, tasks) = {
+    let (pid, _newly_pending, tasks) = {
         let mut process_inner = process.inner_exclusive_access();
         let tasks = process_inner
             .tasks
@@ -534,7 +542,7 @@ pub fn add_signal_to_process_with_siginfo(
         .into_iter()
         .filter(|task| {
             let task_inner = task.inner_exclusive_access();
-            !(newly_pending & !task_inner.signal_mask.without_unblockable()).is_empty()
+            !(signal & !task_inner.signal_mask.without_unblockable()).is_empty()
         })
         .collect::<Vec<_>>();
 
@@ -613,6 +621,105 @@ pub fn send_signal_to_pgrp(pgrp: u32, signal: SignalBit, siginfo: SigInfo) -> us
         add_signal_to_process_with_siginfo(&process, signal, siginfo);
     }
     count
+}
+
+/// Dump a compact process-group task snapshot for diagnosing stuck foreground jobs.
+///
+/// This is intentionally log-only and low-frequency: callers should invoke it
+/// at meaningful control points such as terminal-generated SIGINT, not on every
+/// wait/wake operation.
+pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
+    if pgrp == 0 {
+        return;
+    }
+    let targets: Vec<Arc<ProcessControlBlock>> = list_pids()
+        .into_iter()
+        .filter_map(pid2process)
+        .filter(|process| process.getpgid() == pgrp)
+        .collect();
+    warn!(
+        "[task-dump] reason={} pgrp={} process_count={}",
+        reason,
+        pgrp,
+        targets.len()
+    );
+    for process in targets {
+        let pid = process.getpid();
+        let exec_path = process.exec_path();
+        let process_inner = process.inner_exclusive_access();
+        warn!(
+            "[task-dump] pid={} pgid={} zombie={} pending_signals={:#x} exec={}",
+            pid,
+            process_inner.cred.pgid,
+            process_inner.is_zombie,
+            process_inner.pending_signals.bits(),
+            exec_path
+        );
+        for (tid, task) in process_inner.tasks.iter().enumerate() {
+            let Some(task) = task.as_ref() else {
+                continue;
+            };
+            let task_inner = task.inner_exclusive_access();
+            warn!(
+                "[task-dump]   pid={} tid={} status={:?} wait={:?} on_cpu={} on_rq={} last_cpu={} has_wq={} task_pending={:#x} mask={:#x} resched={:?}",
+                pid,
+                tid,
+                task_inner.task_status,
+                task_inner.wait_reason,
+                task_inner.sched.on_cpu,
+                task_inner.sched.on_rq,
+                task_inner.sched.last_cpu,
+                task_inner.current_wq_handle.is_some(),
+                task_inner.pending_signals.bits(),
+                task_inner.signal_mask.bits(),
+                task_inner.sched.resched_reason
+            );
+        }
+    }
+}
+
+/// Request a few task snapshots from scheduler context after a terminal signal.
+pub fn arm_debug_pgrp_task_dump(pgrp: u32) {
+    if pgrp == 0 {
+        return;
+    }
+    DEBUG_DUMP_PGRP.store(pgrp as usize, Ordering::Release);
+    DEBUG_DUMP_DEADLINE_NS.store(get_time_ns() as usize, Ordering::Release);
+    DEBUG_DUMP_REMAINING.store(3, Ordering::Release);
+}
+
+/// Emit pending debug snapshots from a non-IRQ scheduler safe point.
+pub fn maybe_dump_pending_debug_pgrp_tasks() {
+    let remaining = DEBUG_DUMP_REMAINING.load(Ordering::Acquire);
+    if remaining == 0 {
+        return;
+    }
+    let now_ns = get_time_ns() as usize;
+    let deadline = DEBUG_DUMP_DEADLINE_NS.load(Ordering::Acquire);
+    if now_ns < deadline {
+        return;
+    }
+    if DEBUG_DUMP_REMAINING
+        .compare_exchange(
+            remaining,
+            remaining - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let pgrp = DEBUG_DUMP_PGRP.load(Ordering::Acquire) as u32;
+    debug_dump_pgrp_tasks(pgrp, "tty-sigint-followup");
+    if remaining > 1 {
+        DEBUG_DUMP_DEADLINE_NS.store(
+            now_ns.saturating_add(DEBUG_DUMP_INTERVAL_NS),
+            Ordering::Release,
+        );
+    } else {
+        DEBUG_DUMP_PGRP.store(0, Ordering::Release);
+    }
 }
 
 /// Add signal to the current task

@@ -130,10 +130,13 @@ pub fn probe_block_devices() {
     }
 }
 
-/// Handle one virtio-mmio IRQ for block devices.
-pub fn handle_irq(irq: u32) {
+/// Handle one IRQ for a registered block device.
+pub fn handle_irq(irq: u32) -> bool {
     if let Some(dev) = BLOCK_DEVICES_BY_IRQ.lock().get(&irq).cloned() {
         dev.handle_irq();
+        true
+    } else {
+        false
     }
 }
 

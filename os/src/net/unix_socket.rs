@@ -576,7 +576,7 @@ impl UnixDatagramSocketFile {
             }
             let wait_queue = Arc::clone(&self.wait_queue);
             wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
-                !self.state.lock().queue.is_empty()
+                !self.state.lock().queue.is_empty() || crate::signal::has_unmasked_pending_signal()
             });
             if crate::signal::has_unmasked_pending_signal() {
                 return Err(ERRNO::EINTR);

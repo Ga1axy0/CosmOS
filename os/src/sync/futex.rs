@@ -626,7 +626,7 @@ pub fn futex_wait_addr(
             .map(|current| *current != expected)
             .unwrap_or(true);
         let handle_ready = handle.is_some_and(futex_wait_should_skip);
-        value_changed || handle_ready
+        value_changed || handle_ready || crate::signal::has_unmasked_pending_signal()
     });
     if let Some(handle) = handle {
         let wake_state = futex_wait_state(handle);

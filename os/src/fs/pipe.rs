@@ -239,7 +239,9 @@ impl File for Pipe {
                 drop(ring_buffer);
                 read_wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
                     let ring_buffer = self.buffer.lock();
-                    ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
+                    ring_buffer.available_read() > 0
+                        || ring_buffer.all_write_ends_closed()
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     return if already_read > 0 {
@@ -290,7 +292,9 @@ impl File for Pipe {
                 drop(ring_buffer);
                 read_wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
                     let ring_buffer = self.buffer.lock();
-                    ring_buffer.available_read() > 0 || ring_buffer.all_write_ends_closed()
+                    ring_buffer.available_read() > 0
+                        || ring_buffer.all_write_ends_closed()
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     return if already_read > 0 {
@@ -335,7 +339,9 @@ impl File for Pipe {
                 drop(ring_buffer);
                 write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
                     let ring_buffer = self.buffer.lock();
-                    ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
+                    ring_buffer.available_write() > 0
+                        || ring_buffer.all_read_ends_closed()
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     return if already_write > 0 {
@@ -379,7 +385,9 @@ impl File for Pipe {
                 drop(ring_buffer);
                 write_wait_queue.wait_with_reason_or_skip(WaitReason::PipeWritable, || {
                     let ring_buffer = self.buffer.lock();
-                    ring_buffer.available_write() > 0 || ring_buffer.all_read_ends_closed()
+                    ring_buffer.available_write() > 0
+                        || ring_buffer.all_read_ends_closed()
+                        || crate::signal::has_unmasked_pending_signal()
                 });
                 if crate::signal::has_unmasked_pending_signal() {
                     return if already_write > 0 {

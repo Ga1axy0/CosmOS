@@ -15,7 +15,7 @@ use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
     current_process, current_task, current_user_token, ExitReason, FdEntry, ProcessControlBlock,
-    FdFlags, WaitReason, SIG_DFL, SIG_IGN,
+    FdFlags, TaskStatus, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
@@ -1336,6 +1336,13 @@ where
                 } else {
                     now_ns.saturating_add(PPOLL_FALLBACK_POLL_NS)
                 };
+                // Match nanosleep-style timer arming so an immediate timeout
+                // cannot consume the timer before we actually block.
+                {
+                    let mut task_inner = task.inner_exclusive_access();
+                    task_inner.task_status = TaskStatus::Interruptible;
+                    task_inner.wait_reason = Some(WaitReason::Poll);
+                }
                 add_timer_ns(sleep_until_ns, Arc::clone(&task));
                 block_current_and_run_next(WaitReason::Poll);
                 continue;
