@@ -1635,7 +1635,7 @@ pub fn sys_kill(pid: isize, signal: u32) -> isize {
                 .collect()
         };
 
-        let targets: Vec<Arc<ProcessControlBlock>> = if pid > 0 {
+        let mut targets: Vec<Arc<ProcessControlBlock>> = if pid > 0 {
             alloc::vec![pid2process(pid as usize).or_errno(ERRNO::ESRCH)?]
         } else if pid == 0 {
             collect_pgrp(sender.getpgid())
@@ -1651,6 +1651,16 @@ pub fn sys_kill(pid: isize, signal: u32) -> isize {
 
         if targets.is_empty() {
             return Err(ERRNO::ESRCH);
+        }
+        // Linux keeps PID 1 special: it must not be terminated by `kill(2)`.
+        // We still allow `signal == 0` existence checks, but drop initproc from
+        // real deliveries so other valid targets can still receive the signal.
+        if flag.is_some() {
+            let init_pid = crate::task::INITPROC.getpid();
+            targets.retain(|process| process.getpid() != init_pid);
+            if targets.is_empty() {
+                return Err(ERRNO::EPERM);
+            }
         }
         if let Some(flag) = flag {
             for process in &targets {
