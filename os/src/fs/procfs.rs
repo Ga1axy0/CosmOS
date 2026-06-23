@@ -56,6 +56,27 @@ fn build_meminfo() -> String {
     out
 }
 
+fn build_cpuinfo() -> String {
+    let mut out = String::new();
+    for hart in 0..MAX_HARTS {
+        let _ = writeln!(&mut out, "processor\t: {}", hart);
+        let _ = writeln!(&mut out, "model name\t: QEMU Virtual CPU");
+        #[cfg(target_arch = "riscv64")]
+        {
+            let _ = writeln!(&mut out, "hart\t\t: {}", hart);
+            let _ = writeln!(&mut out, "isa\t\t: rv64imafdc");
+            let _ = writeln!(&mut out, "mmu\t\t: sv39");
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let _ = writeln!(&mut out, "CPU Family\t: LoongArch");
+            let _ = writeln!(&mut out, "Model Name\t: CosmOS virtual CPU");
+        }
+        let _ = writeln!(&mut out);
+    }
+    out
+}
+
 fn escape_mount_field(input: &str) -> String {
     let mut out = String::new();
     for ch in input.chars() {
@@ -626,6 +647,7 @@ impl VfsNode for ProcRootNode {
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         let mut entries = Vec::new();
         entries.push((String::from("self"), VfsFileType::Symlink));
+        entries.push((String::from("cpuinfo"), VfsFileType::Regular));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
@@ -643,6 +665,7 @@ impl VfsNode for ProcRootNode {
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
         match name {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
+            "cpuinfo" => Some(Arc::new(ProcCpuinfoNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
@@ -695,6 +718,12 @@ enum ProcStaticDirKind {
     Sys,
     Kernel,
     Keys,
+    Net,
+    NetIpv4,
+    NetIpv4Conf,
+    NetIpv4ConfAll,
+    NetIpv4ConfDefault,
+    NetIpv4ConfLo,
 }
 
 #[derive(Debug)]
@@ -719,9 +748,13 @@ impl VfsNode for ProcStaticDirNode {
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         match self.kind {
-            ProcStaticDirKind::Sys => alloc::vec![(String::from("kernel"), VfsFileType::Directory)],
+            ProcStaticDirKind::Sys => alloc::vec![
+                (String::from("kernel"), VfsFileType::Directory),
+                (String::from("net"), VfsFileType::Directory),
+            ],
             ProcStaticDirKind::Kernel => alloc::vec![
                 (String::from("keys"), VfsFileType::Directory),
+                (String::from("pid_max"), VfsFileType::Regular),
                 (String::from("sched_autogroup_enabled"), VfsFileType::Regular),
                 (String::from("tainted"), VfsFileType::Regular),
             ],
@@ -730,6 +763,22 @@ impl VfsNode for ProcStaticDirNode {
                 (String::from("maxkeys"), VfsFileType::Regular),
                 (String::from("maxbytes"), VfsFileType::Regular),
             ],
+            ProcStaticDirKind::Net => {
+                alloc::vec![(String::from("ipv4"), VfsFileType::Directory)]
+            }
+            ProcStaticDirKind::NetIpv4 => {
+                alloc::vec![(String::from("conf"), VfsFileType::Directory)]
+            }
+            ProcStaticDirKind::NetIpv4Conf => alloc::vec![
+                (String::from("all"), VfsFileType::Directory),
+                (String::from("default"), VfsFileType::Directory),
+                (String::from("lo"), VfsFileType::Directory),
+            ],
+            ProcStaticDirKind::NetIpv4ConfAll
+            | ProcStaticDirKind::NetIpv4ConfDefault
+            | ProcStaticDirKind::NetIpv4ConfLo => {
+                alloc::vec![(String::from("tag"), VfsFileType::Regular)]
+            }
         }
     }
 
@@ -738,8 +787,14 @@ impl VfsNode for ProcStaticDirNode {
             (ProcStaticDirKind::Sys, "kernel") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Kernel)) as Arc<dyn VfsNode>)
             }
+            (ProcStaticDirKind::Sys, "net") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Net)) as Arc<dyn VfsNode>)
+            }
             (ProcStaticDirKind::Kernel, "keys") => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Keys)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::Kernel, "pid_max") => {
+                Some(Arc::new(ProcKernelPidMaxNode::new()) as Arc<dyn VfsNode>)
             }
             (ProcStaticDirKind::Kernel, "sched_autogroup_enabled") => Some(
                 Arc::new(ProcKernelSysctlNode::new(ProcKernelSysctlKind::SchedAutogroupEnabled))
@@ -757,6 +812,33 @@ impl VfsNode for ProcStaticDirNode {
             (ProcStaticDirKind::Keys, "maxbytes") => {
                 Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxBytes)) as Arc<dyn VfsNode>)
             }
+            (ProcStaticDirKind::Net, "ipv4") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4, "conf") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4Conf)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4Conf, "all") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfAll)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4Conf, "default") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfDefault)) as Arc<dyn VfsNode>)
+            }
+            (ProcStaticDirKind::NetIpv4Conf, "lo") => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfLo)) as Arc<dyn VfsNode>)
+            }
+            (
+                ProcStaticDirKind::NetIpv4ConfAll
+                | ProcStaticDirKind::NetIpv4ConfDefault
+                | ProcStaticDirKind::NetIpv4ConfLo,
+                "tag",
+            ) => {
+                let kind = match self.kind {
+                    ProcStaticDirKind::NetIpv4ConfDefault => ProcNetIpv4ConfTagKind::Default,
+                    _ => ProcNetIpv4ConfTagKind::Loopback,
+                };
+                Some(Arc::new(ProcNetIpv4ConfTagNode::new(kind)) as Arc<dyn VfsNode>)
+            }
             _ => None,
         }
     }
@@ -773,6 +855,68 @@ impl VfsNode for ProcStaticDirNode {
 
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
         0
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Default, Debug)]
+struct ProcKernelPidMaxNode;
+
+impl ProcKernelPidMaxNode {
+    fn new() -> Self {
+        Self
+    }
+
+    fn render(&self) -> String {
+        alloc::format!("{}\n", crate::task::PID_MAX)
+    }
+}
+
+impl VfsNode for ProcKernelPidMaxNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
@@ -924,6 +1068,97 @@ impl VfsNode for ProcKernelSysctlNode {
     }
 }
 
+#[derive(Debug)]
+struct ProcNetIpv4ConfTagNode {
+    kind: ProcNetIpv4ConfTagKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProcNetIpv4ConfTagKind {
+    Loopback,
+    Default,
+}
+
+impl ProcNetIpv4ConfTagNode {
+    fn new(kind: ProcNetIpv4ConfTagKind) -> Self {
+        Self { kind }
+    }
+
+    fn render(&self) -> String {
+        let tag = match self.kind {
+            ProcNetIpv4ConfTagKind::Loopback => current_process().netns_loopback_tag(),
+            ProcNetIpv4ConfTagKind::Default => current_process().netns_default_tag(),
+        };
+        alloc::format!("{}\n", tag)
+    }
+}
+
+impl VfsNode for ProcNetIpv4ConfTagNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        match parse_proc_u32(buf) {
+            Ok(tag) => {
+                match self.kind {
+                    ProcNetIpv4ConfTagKind::Loopback => {
+                        current_process().set_netns_loopback_tag(tag);
+                    }
+                    ProcNetIpv4ConfTagKind::Default => {
+                        current_process().set_netns_default_tag(tag);
+                    }
+                }
+                buf.len()
+            }
+            Err(_) => 0,
+        }
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
 #[derive(Default, Debug)]
 struct ProcKeyUsersNode;
 
@@ -1058,6 +1293,66 @@ impl VfsNode for ProcKeySysctlNode {
         } else {
             0
         }
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/cpuinfo` node.
+#[derive(Default, Debug)]
+pub struct ProcCpuinfoNode;
+
+impl ProcCpuinfoNode {
+    /// Create a new cpuinfo node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcCpuinfoNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_cpuinfo().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_cpuinfo(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
@@ -1434,6 +1729,7 @@ impl VfsNode for ProcPidDirNode {
             (String::from("ns"), VfsFileType::Directory),
             (String::from("stat"), VfsFileType::Regular),
             (String::from("status"), VfsFileType::Regular),
+            (String::from("timens_offsets"), VfsFileType::Regular),
             (String::from("setgroups"), VfsFileType::Regular),
             (String::from("uid_map"), VfsFileType::Regular),
             (String::from("gid_map"), VfsFileType::Regular),
@@ -1449,6 +1745,7 @@ impl VfsNode for ProcPidDirNode {
             "ns" => Some(Arc::new(ProcPidNsDirNode::new(self.pid)) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "timens_offsets" => Some(Arc::new(ProcPidTimensOffsetsNode::new(self.pid)) as Arc<dyn VfsNode>),
             "setgroups" => {
                 Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::Setgroups)) as Arc<dyn VfsNode>)
             }
@@ -1474,6 +1771,117 @@ impl VfsNode for ProcPidDirNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct ProcPidTimensOffsetsNode {
+    pid: usize,
+}
+
+impl ProcPidTimensOffsetsNode {
+    fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+
+    fn content(&self) -> String {
+        let (monotonic_ns, boottime_ns) = pid2process(self.pid)
+            .map(|process| {
+                (
+                    process.child_timens_monotonic_offset_ns(),
+                    process.child_timens_boottime_offset_ns(),
+                )
+            })
+            .unwrap_or((0, 0));
+        let monotonic_sec = monotonic_ns.div_euclid(1_000_000_000);
+        let monotonic_nsec = monotonic_ns.rem_euclid(1_000_000_000);
+        let boottime_sec = boottime_ns.div_euclid(1_000_000_000);
+        let boottime_nsec = boottime_ns.rem_euclid(1_000_000_000);
+        alloc::format!(
+            "monotonic {} {}\nboottime {} {}\n",
+            monotonic_sec,
+            monotonic_nsec,
+            boottime_sec,
+            boottime_nsec
+        )
+    }
+}
+
+impl VfsNode for ProcPidTimensOffsetsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.content().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.content(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let Ok(text) = core::str::from_utf8(buf) else {
+            return 0;
+        };
+        let mut parts = text.split_whitespace();
+        let Some(clock) = parts.next().and_then(|part| part.parse::<i32>().ok()) else {
+            return 0;
+        };
+        let Some(sec) = parts.next().and_then(|part| part.parse::<i128>().ok()) else {
+            return 0;
+        };
+        let Some(nsec) = parts.next().and_then(|part| part.parse::<i128>().ok()) else {
+            return 0;
+        };
+        if !(0..1_000_000_000).contains(&nsec) {
+            return 0;
+        }
+        let Some(process) = pid2process(self.pid) else {
+            return 0;
+        };
+        let offset_ns = sec.saturating_mul(1_000_000_000).saturating_add(nsec);
+        match clock {
+            1 => process.set_child_timens_monotonic_offset_ns(offset_ns),
+            7 => process.set_child_timens_boottime_offset_ns(offset_ns),
+            _ => return 0,
+        }
+        buf.len()
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
@@ -1605,6 +2013,7 @@ impl VfsNode for ProcPidNsDirNode {
         alloc::vec![
             (String::from("mnt"), VfsFileType::Regular),
             (String::from("net"), VfsFileType::Regular),
+            (String::from("time_for_children"), VfsFileType::Regular),
         ]
     }
 
@@ -1613,6 +2022,9 @@ impl VfsNode for ProcPidNsDirNode {
         match name {
             "mnt" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "mnt")) as Arc<dyn VfsNode>),
             "net" => Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "net")) as Arc<dyn VfsNode>),
+            "time_for_children" => {
+                Some(Arc::new(ProcPidNsEntryNode::new(self.pid, "time")) as Arc<dyn VfsNode>)
+            }
             _ => None,
         }
     }

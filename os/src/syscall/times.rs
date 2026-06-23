@@ -1,7 +1,12 @@
 use crate::syscall::errno::ERRNO;
 use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
-use crate::timer::set_realtime_offset_from_time_ns;
+use crate::signal::{has_interrupting_signal, SignalBit};
+use crate::sync::SpinNoIrqLock;
+use crate::timer::{add_timer_with_posix_signal_tag, set_realtime_offset_from_time_ns};
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicI32, Ordering};
+use lazy_static::lazy_static;
 use crate::{
     config::CLOCK_FREQ,
     sched::block_current_and_run_next,
@@ -19,14 +24,27 @@ pub type ClockId = i32;
 pub const CLOCK_REALTIME: ClockId = 0;
 /// Linux 兼容的单调时钟 ID。
 pub const CLOCK_MONOTONIC: ClockId = 1;
+/// Linux compatible per-process CPU-time clock.
+pub const CLOCK_PROCESS_CPUTIME_ID: ClockId = 2;
+/// Linux compatible per-thread CPU-time clock.
+pub const CLOCK_THREAD_CPUTIME_ID: ClockId = 3;
 /// Linux compatible `CLOCK_MONOTONIC_RAW`.
 pub const CLOCK_MONOTONIC_RAW: ClockId = 4;
 /// Linux 兼容的 `CLOCK_REALTIME_COARSE`。
 pub const CLOCK_REALTIME_COARSE: ClockId = 5;
 /// Linux 兼容的 `CLOCK_MONOTONIC_COARSE`。
 pub const CLOCK_MONOTONIC_COARSE: ClockId = 6;
+/// Linux compatible `CLOCK_BOOTTIME`.
+pub const CLOCK_BOOTTIME: ClockId = 7;
+/// Linux compatible `CLOCK_REALTIME_ALARM`.
+pub const CLOCK_REALTIME_ALARM: ClockId = 8;
+/// Linux compatible `CLOCK_BOOTTIME_ALARM`.
+pub const CLOCK_BOOTTIME_ALARM: ClockId = 9;
 /// `clock_nanosleep(2)` absolute-deadline flag.
 pub const TIMER_ABSTIME: i32 = 1;
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGALRM: i32 = 14;
 
 /// Linux `getrusage(2)` 的当前进程选择器。
 pub const RUSAGE_SELF: i32 = 0;
@@ -57,6 +75,17 @@ const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
 const ADJ_OFFSET_SS_READ: u32 = 0xa001;
 
 const TIME_OK: isize = 0;
+const TIME_INS: isize = 1;
+const TIME_DEL: isize = 2;
+const STA_INS: i32 = 0x0010;
+const STA_DEL: i32 = 0x0020;
+
+static ADJTIMEX_STATUS: AtomicI32 = AtomicI32::new(0);
+
+lazy_static! {
+    static ref POSIX_TIMER_SIGNALS: SpinNoIrqLock<BTreeMap<(usize, i32), i32>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+}
 
 const ADJTIMEX_ALLOWED_MODES: u32 = ADJ_OFFSET
     | ADJ_FREQUENCY
@@ -115,7 +144,7 @@ impl Pod for RUsage {}
 
 /// Linux 风格的 `timespec` 结构。
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Timespec {
     /// second
     pub tv_sec: usize,
@@ -124,6 +153,25 @@ pub struct Timespec {
 }
 
 impl Pod for Timespec {}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ItimerSpec {
+    pub it_interval: Timespec,
+    pub it_value: Timespec,
+}
+
+impl Pod for ItimerSpec {}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SigeventCompat {
+    pub sigev_value: usize,
+    pub sigev_signo: i32,
+    pub sigev_notify: i32,
+}
+
+impl Pod for SigeventCompat {}
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -190,6 +238,27 @@ fn timespec_from_ns(time_ns: u64) -> Timespec {
     }
 }
 
+fn timespec_from_signed_ns(time_ns: i128) -> Timespec {
+    let sec = time_ns.div_euclid(1_000_000_000);
+    let nsec = time_ns.rem_euclid(1_000_000_000);
+    Timespec {
+        tv_sec: (sec as i64) as usize,
+        tv_nsec: nsec as usize,
+    }
+}
+
+fn current_monotonic_timespec() -> Timespec {
+    timespec_from_signed_ns(current_process().monotonic_time_ns_signed(get_time_ns()))
+}
+
+fn current_boottime_timespec() -> Timespec {
+    timespec_from_signed_ns(current_process().boottime_ns_signed(get_time_ns()))
+}
+
+fn timespec_from_raw_ticks(raw_time: usize) -> Timespec {
+    timespec_from_ns(((raw_time as u128) * 1_000_000_000u128 / (CLOCK_FREQ as u128)) as u64)
+}
+
 /// 将内核 CPU 账户的原始时间计数转换为 `timeval`。
 fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
     let raw_time = raw_time as u128;
@@ -204,9 +273,14 @@ fn clock_resolution(clockid: ClockId) -> Result<Timespec, ERRNO> {
     match clockid {
         CLOCK_REALTIME
         | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
         | CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
-        | CLOCK_MONOTONIC_COARSE => {
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_BOOTTIME_ALARM => {
             // Expose the timer ABI as high-resolution so Linux RT userland
             // enables hrtimer paths such as cyclictest.
             Ok(Timespec {
@@ -243,7 +317,7 @@ fn timeval_to_ns(tv: &TimeVal) -> Result<u64, ERRNO> {
 
 /// 将 `timespec` 转为纳秒时间长度。
 fn timespec_to_ns(ts: &Timespec) -> Result<u64, ERRNO> {
-    if ts.tv_nsec >= 1_000_000_000 {
+    if ts.tv_sec > i64::MAX as usize || ts.tv_nsec >= 1_000_000_000 {
         return Err(ERRNO::EINVAL);
     }
     let sec_ns = (ts.tv_sec as u128) * 1_000_000_000u128;
@@ -269,7 +343,9 @@ fn adjtimex_tick_bounds() -> (i64, i64) {
 
 fn current_adjtimex_snapshot() -> Timex {
     let realtime_us = get_realtime_ns() / 1_000;
+    let status = ADJTIMEX_STATUS.load(Ordering::Relaxed);
     Timex {
+        status,
         precision: 1,
         time: TimexTimeVal {
             tv_sec: (realtime_us / 1_000_000) as i64,
@@ -298,9 +374,20 @@ fn do_adjtimex(buf: *mut Timex) -> Result<isize, ERRNO> {
         }
     }
 
+    if timex.modes & ADJ_STATUS != 0 {
+        ADJTIMEX_STATUS.store(timex.status, Ordering::Relaxed);
+    }
+
     let snapshot = current_adjtimex_snapshot();
+    let state = if snapshot.status & STA_INS != 0 {
+        TIME_INS
+    } else if snapshot.status & STA_DEL != 0 {
+        TIME_DEL
+    } else {
+        TIME_OK
+    };
     write_pod_to_user(buf, &snapshot)?;
-    Ok(TIME_OK)
+    Ok(state)
 }
 
 /// get_time syscall
@@ -434,11 +521,31 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
     );
     syscall_body!({
         let timespec = match clockid {
-            CLOCK_REALTIME => timespec_from_ns(get_realtime_ns()),
-            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => timespec_from_ns(get_time_ns()),
+            CLOCK_REALTIME | CLOCK_REALTIME_ALARM => timespec_from_ns(get_realtime_ns()),
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+                current_monotonic_timespec()
+            }
+            CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => current_boottime_timespec(),
             CLOCK_REALTIME_COARSE => timespec_from_ns(get_realtime_ns()),
-            CLOCK_MONOTONIC_COARSE => timespec_from_ns(get_time_ns()),
-            // TODO：后续按 Linux 语义继续补充其它 clock id。
+            CLOCK_PROCESS_CPUTIME_ID => {
+                let (utime, stime, _, _) = current_process().times_snapshot(get_time());
+                timespec_from_raw_ticks(utime.saturating_add(stime))
+            }
+            CLOCK_THREAD_CPUTIME_ID => {
+                let now_ns = get_time_ns();
+                let task = current_task().unwrap();
+                let inner = task.inner_exclusive_access();
+                let active_delta = if inner.sched.exec_start_ns == 0 {
+                    0
+                } else {
+                    now_ns.saturating_sub(inner.sched.exec_start_ns)
+                };
+                let runtime = inner
+                    .sched
+                    .sum_exec_runtime_ns
+                    .saturating_add(active_delta);
+                timespec_from_ns(runtime)
+            }
             _ => return Err(ERRNO::EINVAL),
         };
         // debug!("sys_clock_gettime: clockid={}, timespec={:?}", clockid, timespec);
@@ -485,6 +592,7 @@ pub fn sys_clock_nanosleep(
         }
         match clockid {
             CLOCK_REALTIME | CLOCK_MONOTONIC => {}
+            CLOCK_THREAD_CPUTIME_ID => return Err(ERRNO::EOPNOTSUPP),
             _ => return Err(ERRNO::EINVAL),
         }
 
@@ -493,7 +601,8 @@ pub fn sys_clock_nanosleep(
         // 单调时钟现值：定时器队列（`add_timer_ns` / `check_timer`）只按
         // CLOCK_MONOTONIC 的 `get_time_ns()` 判定到期，因此最终的到期时刻必须
         // 落在单调时间轴上。我们这里把它取一次并复用，避免读两次时钟产生缝隙。
-        let monotonic_now_ns = get_time_ns();
+        let raw_monotonic_now_ns = get_time_ns();
+        let monotonic_now_ns = current_process().monotonic_time_ns(raw_monotonic_now_ns);
         let now_ns = match clockid {
             CLOCK_REALTIME => get_realtime_ns(),
             CLOCK_MONOTONIC => monotonic_now_ns,
@@ -520,7 +629,13 @@ pub fn sys_clock_nanosleep(
         // 数十年，定时器永远不会触发——glibc 的 `usleep` 走
         // `clock_nanosleep(CLOCK_REALTIME, 0, …)`，于是阻塞至天荒地老（musl 的
         // `usleep` 走 `nanosleep` 用单调时钟，故不受影响）。
-        let expire_ns = monotonic_now_ns.saturating_add(sleep_ns.max(1));
+        let expire_ns = raw_monotonic_now_ns.saturating_add(sleep_ns.max(1));
+        if has_interrupting_signal() {
+            if !rem.is_null() && flags & TIMER_ABSTIME == 0 {
+                write_pod_to_user(rem, &timespec_from_ns(sleep_ns))?;
+            }
+            return Err(ERRNO::EINTR);
+        }
         let task = current_task().unwrap();
         // Publish the sleep state before arming the timer so an immediate
         // expiry cannot drop the timer while this task is still marked Running.
@@ -532,6 +647,14 @@ pub fn sys_clock_nanosleep(
         add_timer_ns(expire_ns, task);
         block_current_and_run_next(WaitReason::Nanosleep);
 
+        if has_interrupting_signal() {
+            if !rem.is_null() && flags & TIMER_ABSTIME == 0 {
+                let remaining_ns = expire_ns.saturating_sub(get_time_ns());
+                write_pod_to_user(rem, &timespec_from_ns(remaining_ns))?;
+            }
+            return Err(ERRNO::EINTR);
+        }
+
         if !rem.is_null() {
             write_pod_to_user(rem, &Timespec { tv_sec: 0, tv_nsec: 0 })?;
         }
@@ -539,7 +662,7 @@ pub fn sys_clock_nanosleep(
     })
 }
 
-pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
+pub fn sys_clock_settime(clockid: ClockId, tp: *const Timespec) -> isize {
     trace!(
         "kernel:pid[{}] sys_clock_settime clockid={}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -549,13 +672,102 @@ pub fn sys_clock_settime(clockid: ClockId, _tp: *const Timespec) -> isize {
         // TODO：后续按 Linux 语义继续补充其它 clock id 的设置。
         match clockid {
             CLOCK_REALTIME => {
-                let timespec = read_pod_from_user(_tp)?;
-                let time_ns = (timespec.tv_sec as u64) * 1_000_000_000 + (timespec.tv_nsec as u64);
+                let timespec = read_pod_from_user(tp)?;
+                let time_ns = timespec_to_ns(&timespec)?;
                 set_realtime_offset_from_time_ns(time_ns);
                 Ok(0)
             }
             _ => Err(ERRNO::EINVAL),
         }
+    })
+}
+
+pub fn sys_timer_create(
+    clockid: ClockId,
+    sevp: *const SigeventCompat,
+    timerid: *mut i32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_timer_create clockid={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        clockid
+    );
+    syscall_body!({
+        if clockid != CLOCK_REALTIME {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let (notify, signum) = if sevp.is_null() {
+            (SIGEV_SIGNAL, SIGALRM)
+        } else {
+            let event = read_pod_from_user(sevp)?;
+            (event.sigev_notify, event.sigev_signo)
+        };
+
+        if notify != SIGEV_SIGNAL && notify != SIGEV_NONE {
+            return Err(ERRNO::EINVAL);
+        }
+        if notify == SIGEV_SIGNAL && SignalBit::from_signum(signum as u32).is_none() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let process = current_process();
+        let pid = process.getpid();
+        let id = 0;
+        POSIX_TIMER_SIGNALS.lock().insert(
+            (pid, id),
+            if notify == SIGEV_SIGNAL { signum } else { 0 },
+        );
+        write_pod_to_user(timerid, &id)?;
+        Ok(0)
+    })
+}
+
+pub fn sys_timer_settime(
+    timerid: i32,
+    flags: i32,
+    new_value: *const ItimerSpec,
+    old_value: *mut ItimerSpec,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_timer_settime timerid={} flags={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        timerid,
+        flags
+    );
+    syscall_body!({
+        if flags & !TIMER_ABSTIME != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let process = current_process();
+        let pid = process.getpid();
+        let signum = POSIX_TIMER_SIGNALS
+            .lock()
+            .get(&(pid, timerid))
+            .copied()
+            .ok_or(ERRNO::EINVAL)?;
+
+        let new_timer = read_pod_from_user(new_value)?;
+        let value_ns = timespec_to_ns(&new_timer.it_value)?;
+        let _interval_ns = timespec_to_ns(&new_timer.it_interval)?;
+
+        if !old_value.is_null() {
+            write_pod_to_user(old_value, &ItimerSpec::default())?;
+        }
+
+        if value_ns == 0 || signum == 0 {
+            return Ok(0);
+        }
+
+        let sleep_ns = if flags & TIMER_ABSTIME != 0 {
+            value_ns.saturating_sub(get_realtime_ns())
+        } else {
+            value_ns
+        };
+        let expire_ns = get_time_ns().saturating_add(sleep_ns.max(1));
+        add_timer_with_posix_signal_tag(expire_ns, current_task().unwrap(), signum);
+        Ok(0)
     })
 }
 

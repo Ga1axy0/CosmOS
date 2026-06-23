@@ -54,6 +54,8 @@ pub const SYSCALL_FALLOCATE: usize = 47;
 pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 pub const SYSCALL_CHDIR: usize = 49;
+/// chroot syscall
+pub const SYSCALL_CHROOT: usize = 51;
 /// fchmod syscall
 pub const SYSCALL_FCHMOD: usize = 52;
 /// fchmodat syscall
@@ -140,6 +142,10 @@ pub const SYSCALL_NANOSLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
 /// setitimer syscall
 pub const SYSCALL_SETITIMER: usize = 103;
+/// timer_create syscall
+pub const SYSCALL_TIMER_CREATE: usize = 107;
+/// timer_settime syscall
+pub const SYSCALL_TIMER_SETTIME: usize = 110;
 /// clock_settime syscall
 pub const SYSCALL_CLOCK_SETTIME: usize = 112;
 /// clock_gettime syscall
@@ -206,6 +212,10 @@ pub const SYSCALL_GETPGID: usize = 155;
 pub const SYSCALL_GETSID: usize = 156;
 /// setsid syscall
 pub const SYSCALL_SETSID: usize = 157;
+/// getgroups syscall
+pub const SYSCALL_GETGROUPS: usize = 158;
+/// setgroups syscall
+pub const SYSCALL_SETGROUPS: usize = 159;
 /// uname syscall
 pub const SYSCALL_UNAME: usize = 160;
 /// getrlimit syscall
@@ -216,6 +226,8 @@ pub const SYSCALL_SETRLIMIT: usize = 164;
 pub const SYSCALL_GETRUSAGE: usize = 165;
 /// umask syscall
 pub const SYSCALL_UMASK: usize = 166;
+/// prctl syscall
+pub const SYSCALL_PRCTL: usize = 167;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
 /// gettimeofday syscall
@@ -675,6 +687,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_SYNC => sys_sync(),
         SYSCALL_FSYNC => sys_fsync(args[0] as u32),
@@ -698,6 +711,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as i32,
             args[1] as *const OldItimerval,
             args[2] as *mut OldItimerval,
+        ),
+        SYSCALL_TIMER_CREATE => sys_timer_create(
+            args[0] as ClockId,
+            args[1] as *const SigeventCompat,
+            args[2] as *mut i32,
+        ),
+        SYSCALL_TIMER_SETTIME => sys_timer_settime(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as *const ItimerSpec,
+            args[3] as *mut ItimerSpec,
         ),
         SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as ClockId, args[1] as *const Timespec),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as ClockId, args[1] as *mut Timespec),
@@ -806,12 +830,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_SETRESGID => sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
+        SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_CAPGET => sys_capget(args[0] as *mut UserCapHeader, args[1] as *mut UserCapData),
         SYSCALL_CAPSET => sys_capset(args[0] as *const UserCapHeader, args[1] as *const UserCapData),
+        SYSCALL_PRCTL => sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
         SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut SysInfo),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_SHMGET => sys_shmget(args[0] as i32, args[1], args[2] as i32),

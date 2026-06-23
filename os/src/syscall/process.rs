@@ -18,7 +18,7 @@ use crate::{
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
-        ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
+        CloneResourceFlags, ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
@@ -29,6 +29,11 @@ const UID_NO_CHANGE: u32 = u32::MAX;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_SETPCAP: usize = 8;
+const CAP_LAST_CAP: usize = 63;
+const NGROUPS_MAX: usize = 32;
+const PR_CAPBSET_READ: i32 = 23;
+const PR_CAPBSET_DROP: i32 = 24;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -266,12 +271,79 @@ pub fn sys_getegid() -> isize {
     process.getegid() as isize
 }
 
+/// getgroups syscall
+pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        let cred = process.inner_exclusive_access().cred;
+        let count = cred.supplementary_group_count;
+        if size == 0 {
+            return Ok(count as isize);
+        }
+        if size < count {
+            return Err(ERRNO::EINVAL);
+        }
+        for i in 0..count {
+            write_pod_to_user(unsafe { list.add(i) }, &cred.supplementary_groups[i])?;
+        }
+        Ok(count as isize)
+    })
+}
+
+/// setgroups syscall
+pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        if size > NGROUPS_MAX {
+            return Err(ERRNO::EINVAL);
+        }
+        let mut groups = [0u32; NGROUPS_MAX];
+        for i in 0..size {
+            groups[i] = read_pod_from_user(unsafe { list.add(i) })?;
+        }
+        let mut inner = process.inner_exclusive_access();
+        if inner.cred.euid != 0 {
+            return Err(ERRNO::EPERM);
+        }
+        inner.cred.supplementary_groups = groups;
+        inner.cred.supplementary_group_count = size;
+        Ok(0)
+    })
+}
+
 fn cap_data_words(version: u32) -> Result<usize, ERRNO> {
     match version {
         LINUX_CAPABILITY_VERSION_1 => Ok(1),
         LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Ok(2),
         _ => Err(ERRNO::EINVAL),
     }
+}
+
+fn cap_bit(cap: usize) -> Result<(usize, u32), ERRNO> {
+    if cap > CAP_LAST_CAP {
+        return Err(ERRNO::EINVAL);
+    }
+    Ok((cap / 32, 1u32 << (cap % 32)))
+}
+
+fn cap_has(set: &[u32; 2], cap: usize) -> bool {
+    cap_bit(cap)
+        .map(|(word, bit)| (set[word] & bit) != 0)
+        .unwrap_or(false)
+}
+
+fn cap_subset(candidate: &[u32; 2], allowed: &[u32; 2], words: usize) -> bool {
+    (0..words).all(|idx| (candidate[idx] & !allowed[idx]) == 0)
+}
+
+fn cap_union(lhs: &[u32; 2], rhs: &[u32; 2]) -> [u32; 2] {
+    [lhs[0] | rhs[0], lhs[1] | rhs[1]]
+}
+
+fn cap_drop(set: &mut [u32; 2], cap: usize) -> Result<(), ERRNO> {
+    let (word, bit) = cap_bit(cap)?;
+    set[word] &= !bit;
+    Ok(())
 }
 
 /// capget syscall
@@ -289,25 +361,33 @@ pub fn sys_capget(header: *mut UserCapHeader, data: *mut UserCapData) -> isize {
                 return Err(errno);
             }
         };
-        let pid = current_process().getpid() as i32;
-        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+        if hdr.pid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let process = if hdr.pid == 0 {
+            current_process()
+        } else {
+            pid2process(hdr.pid as usize).ok_or(ERRNO::ESRCH)?
+        };
+        if hdr.pid != 0 && hdr.pid as usize != process.getpid() {
             return Err(ERRNO::ESRCH);
         }
         if data.is_null() {
             return Ok(0);
         }
 
+        let cred = process.inner_exclusive_access().cred;
         let word0 = UserCapData {
-            effective: u32::MAX,
-            permitted: u32::MAX,
-            inheritable: 0,
+            effective: cred.cap_effective[0],
+            permitted: cred.cap_permitted[0],
+            inheritable: cred.cap_inheritable[0],
         };
         write_pod_to_user(data, &word0)?;
         if words > 1 {
             let word1 = UserCapData {
-                effective: u32::MAX,
-                permitted: u32::MAX,
-                inheritable: 0,
+                effective: cred.cap_effective[1],
+                permitted: cred.cap_permitted[1],
+                inheritable: cred.cap_inheritable[1],
             };
             write_pod_to_user(unsafe { data.add(1) }, &word1)?;
         }
@@ -321,17 +401,95 @@ pub fn sys_capset(header: *const UserCapHeader, data: *const UserCapData) -> isi
         if header.is_null() || data.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        let hdr = read_pod_from_user(header)?;
-        let words = cap_data_words(hdr.version)?;
-        let pid = current_process().getpid() as i32;
-        if hdr.pid < 0 || (hdr.pid != 0 && hdr.pid != pid) {
+        let mut hdr = read_pod_from_user(header)?;
+        let words = match cap_data_words(hdr.version) {
+            Ok(words) => words,
+            Err(errno) => {
+                hdr.version = LINUX_CAPABILITY_VERSION_3;
+                write_pod_to_user(header as *mut UserCapHeader, &hdr)?;
+                return Err(errno);
+            }
+        };
+        if hdr.pid < 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let process = current_process();
+        let pid = process.getpid() as i32;
+        if hdr.pid != 0 && hdr.pid != pid {
+            if pid2process(hdr.pid as usize).is_some() {
+                return Err(ERRNO::EPERM);
+            }
             return Err(ERRNO::ESRCH);
         }
-        let _ = read_pod_from_user(data)?;
+        let word0 = read_pod_from_user(data)?;
+        let word1 = if words > 1 {
+            read_pod_from_user(unsafe { data.add(1) })?
+        } else {
+            UserCapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }
+        };
+        let mut inner = process.inner_exclusive_access();
+        let old_effective = inner.cred.cap_effective;
+        let old_permitted = inner.cred.cap_permitted;
+        let old_inheritable = inner.cred.cap_inheritable;
+        let mut new_effective = old_effective;
+        let mut new_permitted = old_permitted;
+        let mut new_inheritable = old_inheritable;
+
+        new_effective[0] = word0.effective;
+        new_permitted[0] = word0.permitted;
+        new_inheritable[0] = word0.inheritable;
         if words > 1 {
-            let _ = read_pod_from_user(unsafe { data.add(1) })?;
+            new_effective[1] = word1.effective;
+            new_permitted[1] = word1.permitted;
+            new_inheritable[1] = word1.inheritable;
         }
+
+        if !cap_subset(&new_effective, &new_permitted, words) {
+            return Err(ERRNO::EPERM);
+        }
+        if !cap_subset(&new_permitted, &old_permitted, words) {
+            return Err(ERRNO::EPERM);
+        }
+        let mut allowed_inheritable = cap_union(&old_inheritable, &old_permitted);
+        if cap_has(&old_effective, CAP_SETPCAP) {
+            allowed_inheritable = cap_union(&allowed_inheritable, &inner.cred.cap_bounding);
+        }
+        if !cap_subset(&new_inheritable, &allowed_inheritable, words) {
+            return Err(ERRNO::EPERM);
+        }
+
+        inner.cred.cap_effective = new_effective;
+        inner.cred.cap_permitted = new_permitted;
+        inner.cred.cap_inheritable = new_inheritable;
         Ok(0)
+    })
+}
+
+/// prctl syscall
+pub fn sys_prctl(option: i32, arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+    syscall_body!({
+        match option {
+            PR_CAPBSET_READ => {
+                let (word, bit) = cap_bit(arg2)?;
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                Ok(((inner.cred.cap_bounding[word] & bit) != 0) as isize)
+            }
+            PR_CAPBSET_DROP => {
+                let process = current_process();
+                let mut inner = process.inner_exclusive_access();
+                if !cap_has(&inner.cred.cap_effective, CAP_SETPCAP) {
+                    return Err(ERRNO::EPERM);
+                }
+                cap_drop(&mut inner.cred.cap_bounding, arg2)?;
+                Ok(0)
+            }
+            _ => Err(ERRNO::ENOSYS),
+        }
     })
 }
 
@@ -865,6 +1023,8 @@ bitflags! {
         const CLONE_SIGHAND = 0x0000_0800;
         /// vfork 语义标志，当前暂不支持。
         const CLONE_VFORK = 0x0000_4000;
+        /// 让新进程与调用者拥有同一个父进程。
+        const CLONE_PARENT = 0x0000_8000;
         /// 线程组标志，当前暂不支持。
         const CLONE_THREAD = 0x0001_0000;
         /// 共享 SysV semaphore undo 状态；当前没有 SysV semaphore，线程路径中按 no-op 处理。
@@ -945,14 +1105,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             return Err(ERRNO::EINVAL);
         }
         let vfork_clone = flags.contains(CloneFlags::CLONE_VFORK);
-        let thread_clone = flags.contains(CloneFlags::CLONE_VM) && !vfork_clone;
-        if flags.contains(CloneFlags::CLONE_VM)
-            && !flags.contains(CloneFlags::CLONE_THREAD)
-            && !vfork_clone
-        {
-            warn!("kernel: sys_clone CLONE_VM without CLONE_THREAD is unsupported");
-            return Err(ERRNO::EINVAL);
-        }
+        let thread_clone = flags.contains(CloneFlags::CLONE_THREAD) && !vfork_clone;
         if vfork_clone && !flags.contains(CloneFlags::CLONE_VM) {
             warn!("kernel: sys_clone CLONE_VFORK without CLONE_VM is unsupported");
             return Err(ERRNO::EINVAL);
@@ -963,18 +1116,6 @@ fn sys_clone_request(req: CloneRequest) -> isize {
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_SYSVSEM) {
             warn!("kernel: sys_clone unsupported process flag CLONE_SYSVSEM");
-            return Err(ERRNO::EINVAL);
-        }
-        if !thread_clone && flags.contains(CloneFlags::CLONE_FS) {
-            warn!("kernel: sys_clone unsupported flag CLONE_FS");
-            return Err(ERRNO::EINVAL);
-        }
-        if !thread_clone && flags.contains(CloneFlags::CLONE_FILES) {
-            warn!("kernel: sys_clone unsupported flag CLONE_FILES");
-            return Err(ERRNO::EINVAL);
-        }
-        if !thread_clone && flags.contains(CloneFlags::CLONE_SIGHAND) {
-            warn!("kernel: sys_clone unsupported flag CLONE_SIGHAND");
             return Err(ERRNO::EINVAL);
         }
         if !thread_clone && flags.contains(CloneFlags::CLONE_THREAD) {
@@ -1073,7 +1214,27 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                     "kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone"
                 );
             }
-            let new_process = current_process.clone_process(stack, child_tls, child_set_tid)?;
+            let mut shared_resources = CloneResourceFlags::empty();
+            if flags.contains(CloneFlags::CLONE_VM) {
+                shared_resources.insert(CloneResourceFlags::VM);
+            }
+            if flags.contains(CloneFlags::CLONE_FS) {
+                shared_resources.insert(CloneResourceFlags::FS);
+            }
+            if flags.contains(CloneFlags::CLONE_FILES) {
+                shared_resources.insert(CloneResourceFlags::FILES);
+            }
+            if flags.contains(CloneFlags::CLONE_SIGHAND) {
+                shared_resources.insert(CloneResourceFlags::SIGHAND);
+            }
+            if flags.contains(CloneFlags::CLONE_PARENT) {
+                shared_resources.insert(CloneResourceFlags::PARENT);
+            }
+            if flags.contains(CloneFlags::CLONE_NEWNET) {
+                shared_resources.insert(CloneResourceFlags::NEWNET);
+            }
+            let new_process =
+                current_process.clone_process(stack, child_tls, parent_set_tid, child_set_tid, shared_resources)?;
             let child_pid = new_process.getpid() as i32;
             debug!(
                 "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
@@ -1082,8 +1243,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_tid,
                 child_pid
             );
-            if let Some(ptr) = parent_set_tid {
-                write_pod_to_user(ptr as *mut i32, &child_pid)?;
+            if vfork_clone {
+                current_process.wait_exit_queue.wait_with_reason_or_skip(
+                    WaitReason::ProcessWaitExit,
+                    || new_process.is_zombie(),
+                );
             }
             Ok(child_pid as isize)
         }
@@ -1115,10 +1279,12 @@ pub fn sys_clone3(uargs: *const Clone3Args, size: usize) -> isize {
 
 /// `setns` 兼容实现。
 ///
-/// 当前内核尚未提供独立 namespace 隔离，但 LTP 的网络 helper 需要
-/// `/proc/<pid>/ns/*` 可打开且 `setns()` 可成功返回，才能继续构造本地
-/// 双端口拓扑。这里先校验 fd 有效，再按 no-op 成功处理。
-pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
+/// 当前内核尚未提供完整 namespace 隔离，但 LTP helper 需要
+/// `/proc/<pid>/ns/*` 可打开且 `setns()` 可成功返回。这里先校验 fd 有效；
+/// 对 time namespace，切回初始 namespace 的零 offset 视图。
+pub fn sys_setns(fd: i32, nstype: i32) -> isize {
+    const CLONE_NEWTIME: i32 = 0x0000_0080;
+
     syscall_body!({
         if fd < 0 {
             return Err(ERRNO::EBADF);
@@ -1128,6 +1294,10 @@ pub fn sys_setns(fd: i32, _nstype: i32) -> isize {
         let fd = fd as usize;
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
             return Err(ERRNO::EBADF);
+        }
+        drop(inner);
+        if nstype == CLONE_NEWTIME {
+            process.reset_timens_offsets();
         }
         Ok(0)
     })
@@ -1145,8 +1315,9 @@ pub fn sys_unshare(flags: usize) -> isize {
     const CLONE_NEWUSER: usize = 0x1000_0000;
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
+    const CLONE_NEWTIME: usize = 0x0000_0080;
     const SUPPORTED_FLAGS: usize =
-        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME;
 
     syscall_body!({
         if flags & !SUPPORTED_FLAGS != 0 {
@@ -1276,15 +1447,28 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
         if (options & 0xffff_ffff) & !WAIT_RECOGNIZED != 0 {
             return Err(ERRNO::EINVAL);
         }
+        let current_pgid = process.getpgid();
 
         loop {
             let mut inner = process.inner_exclusive_access();
+            let matches_wait_pid = |child: &Arc<ProcessControlBlock>| -> bool {
+                if pid == -1 {
+                    return true;
+                }
+                if pid == 0 {
+                    return child.getpgid() == current_pgid;
+                }
+                if pid > 0 {
+                    return child.getpid() == pid as usize;
+                }
+                child.getpgid() == (-pid) as u32
+            };
 
             // 1) 没有任何匹配的子进程
             let has_target_child = inner
                 .children
                 .iter()
-                .any(|p| pid == -1 || pid as usize == p.getpid());
+                .any(|p| matches_wait_pid(p));
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
@@ -1292,7 +1476,19 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             // 2) 查找已经退出的目标子进程
             let zombie_idx = inner.children.iter().position(|p| {
                 let p_inner = p.inner_exclusive_access();
-                p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+                if !p_inner.is_zombie {
+                    return false;
+                }
+                if pid == -1 {
+                    return true;
+                }
+                if pid == 0 {
+                    return p_inner.cred.pgid == current_pgid;
+                }
+                if pid > 0 {
+                    return p.getpid() == pid as usize;
+                }
+                p_inner.cred.pgid == (-pid) as u32
             });
 
             if let Some(idx) = zombie_idx {
@@ -1360,10 +1556,22 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     let has_target_child = inner
                         .children
                         .iter()
-                        .any(|p| pid == -1 || pid as usize == p.getpid());
+                        .any(|p| matches_wait_pid(p));
                     let has_target_zombie = inner.children.iter().any(|p| {
                         let p_inner = p.inner_exclusive_access();
-                        p_inner.is_zombie && (pid == -1 || pid as usize == p.getpid())
+                        if !p_inner.is_zombie {
+                            return false;
+                        }
+                        if pid == -1 {
+                            return true;
+                        }
+                        if pid == 0 {
+                            return p_inner.cred.pgid == current_pgid;
+                        }
+                        if pid > 0 {
+                            return p.getpid() == pid as usize;
+                        }
+                        p_inner.cred.pgid == (-pid) as u32
                     });
                     !has_target_child || has_target_zombie
                 });
