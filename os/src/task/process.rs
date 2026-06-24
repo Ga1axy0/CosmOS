@@ -156,6 +156,8 @@ enum Auxv {
 pub struct ProcessControlBlock {
     /// immutable
     pub pid: PidHandle,
+    /// Signal delivered to the parent when this process exits.
+    pub clone_exit_signal: u32,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
     /// wait queue for wait4/waitpid
@@ -994,6 +996,7 @@ impl ProcessControlBlock {
         cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,
+            clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
                 memory_set,
@@ -1198,6 +1201,7 @@ impl ProcessControlBlock {
         parent_set_tid: Option<usize>,
         child_set_tid: Option<usize>,
         shared_resources: CloneResourceFlags,
+        exit_signal: u32,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
         let clone_start_ns = get_time_ns();
@@ -1280,6 +1284,7 @@ impl ProcessControlBlock {
         let child_pcb_start_ns = get_time_ns();
         let child = Arc::new(Self {
             pid,
+            clone_exit_signal: exit_signal,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
                 memory_set,
@@ -1544,6 +1549,7 @@ impl ProcessControlBlock {
         }
         let child = Arc::new(Self {
             pid,
+            clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
                 memory_set,

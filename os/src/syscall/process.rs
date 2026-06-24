@@ -11,19 +11,24 @@ use crate::syscall_body;
 use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
-    fs::{canonicalize, open_file, open_file_at, File, OpenFlags},
+    fs::{
+        canonicalize, open_file, open_file_at, AccessMode, File, FileDescription, FileStatusFlags,
+        OpenFlags, Stat, StatMode,
+    },
     hal::hartid,
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
-        CloneResourceFlags, ProcessControlBlock, ShmAttachment, SigInfo, SignalBit, WaitReason,
+        CloneResourceFlags, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo, SignalBit,
+        WaitReason,
     },
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 
 const UID_NO_CHANGE: u32 = u32::MAX;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
@@ -926,14 +931,115 @@ pub fn sys_setsid() -> isize {
     })
 }
 
-/// `clone` 支持的退出信号：当前仅实现 basic 测试需要的 SIGCHLD。
-const CLONE_EXIT_SIGNAL_SIGCHLD: usize = 17;
 /// Linux clone flags 中低 8 位保存退出信号。
 const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
 /// Oldest Linux `struct clone_args` layout accepted by clone3().
 const CLONE3_ARGS_MIN_SIZE: usize = 64;
 /// `CLONE_PIDFD` is validated before feature fallback so bad pointers report EFAULT.
 const CLONE_PIDFD_FLAG: usize = 0x0000_1000;
+
+struct PidFdFile {
+    pid: usize,
+}
+
+impl File for PidFdFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: self as *const _ as u64,
+            mode: StatMode::FILE,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            pad0: 0,
+            size: 0,
+            blksize: 0,
+            pad1: 0,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            unused: [0; 2],
+        }
+    }
+}
+
+fn alloc_pidfd(pid: usize) -> Result<i32, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(PidFdFile { pid }),
+        AccessMode::ReadWrite,
+        FileStatusFlags::empty(),
+        0,
+    ));
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    inner.fd_table[fd] = Some(FdEntry::new(desc));
+    Ok(fd as i32)
+}
+
+pub fn sys_pidfd_send_signal(
+    pidfd: i32,
+    signal: u32,
+    siginfo_ptr: *const SigInfo,
+    flags: u32,
+) -> isize {
+    syscall_body!({
+        if flags != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let signal = SignalBit::from_signum(signal).or_errno(ERRNO::EINVAL)?;
+        let siginfo = if siginfo_ptr.is_null() {
+            let sender = current_process();
+            SigInfo::for_kill(
+                first_signum_in_signal(signal).unwrap_or_default() as i32,
+                sender.getpid(),
+                sender.getuid(),
+            )
+        } else {
+            read_pod_from_user(siginfo_ptr)?
+        };
+        let desc = {
+            let process = current_process();
+            let inner = process.inner_exclusive_access();
+            let fd = pidfd as usize;
+            inner
+                .fd_table
+                .get(fd)
+                .and_then(|entry| entry.as_ref())
+                .map(|entry| Arc::clone(&entry.desc))
+                .ok_or(ERRNO::EBADF)?
+        };
+        let pidfd_file = desc.as_any().downcast_ref::<PidFdFile>().ok_or(ERRNO::EBADF)?;
+        let target = pid2process(pidfd_file.pid).or_errno(ERRNO::ESRCH)?;
+        crate::task::add_signal_to_process_with_siginfo(&target, signal, siginfo);
+        Ok(0)
+    })
+}
+
+fn first_signum_in_signal(signal: SignalBit) -> Option<u32> {
+    (1..=crate::task::MAX_SIG as u32).find(|signum| {
+        SignalBit::from_signum(*signum)
+            .map(|flag| signal.contains(flag))
+            .unwrap_or(false)
+    })
+}
 
 /// Linux `clone3` 的用户态参数布局。
 #[repr(C)]
@@ -958,6 +1064,7 @@ const CLONE3_ARGS_SIZE: usize = core::mem::size_of::<Clone3Args>();
 struct CloneRequest {
     flags: usize,
     exit_signal: usize,
+    pidfd: Option<usize>,
     stack: usize,
     stack_size: usize,
     parent_tid: usize,
@@ -969,7 +1076,8 @@ impl CloneRequest {
     fn from_legacy(args: CloneArgs) -> Self {
         Self {
             flags: args.flags,
-            exit_signal: args.flags & CLONE_EXIT_SIGNAL_MASK,
+            exit_signal: 17,
+            pidfd: None,
             stack: args.stack,
             stack_size: 0,
             parent_tid: args.parent_tid,
@@ -990,14 +1098,14 @@ impl CloneRequest {
             warn!("kernel: sys_clone3 flags may not contain an exit signal");
             return Err(ERRNO::EINVAL);
         }
-        if flags & CLONE_PIDFD_FLAG != 0 {
+        let pidfd = if flags & CLONE_PIDFD_FLAG != 0 {
             if args.pidfd == 0 {
                 return Err(ERRNO::EFAULT);
             }
-            write_pod_to_user(args.pidfd as *mut i32, &0)?;
-            warn!("kernel: sys_clone3 unsupported CLONE_PIDFD");
-            return Err(ERRNO::ENOSYS);
-        }
+            Some(args.pidfd as usize)
+        } else {
+            None
+        };
         // The pidfd field is meaningful only when CLONE_PIDFD is set. Some libc
         // clone3 callers leave a non-zero value here while requesting only
         // parent/child TID handling, so ignore it on the normal thread path.
@@ -1028,16 +1136,13 @@ impl CloneRequest {
             return Err(ERRNO::EINVAL);
         }
         let exit_signal = args.exit_signal as usize;
-        if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
-            warn!(
-                "kernel: sys_clone3 unsupported exit signal {}, only SIGCHLD/0 is implemented",
-                exit_signal
-            );
+        if exit_signal > crate::task::MAX_SIG {
             return Err(ERRNO::EINVAL);
         }
         Ok(Self {
             flags,
             exit_signal,
+            pidfd,
             stack: args.stack as usize,
             stack_size: args.stack_size as usize,
             parent_tid: args.parent_tid as usize,
@@ -1058,6 +1163,8 @@ bitflags! {
         const CLONE_FILES = 0x0000_0400;
         /// 共享信号处理表标志，当前暂不支持。
         const CLONE_SIGHAND = 0x0000_0800;
+        /// Return a pidfd referring to the child process.
+        const CLONE_PIDFD = 0x0000_1000;
         /// vfork 语义标志，当前暂不支持。
         const CLONE_VFORK = 0x0000_4000;
         /// 让新进程与调用者拥有同一个父进程。
@@ -1103,6 +1210,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
         let CloneRequest {
             flags,
             exit_signal,
+            pidfd,
             stack,
             stack_size,
             parent_tid,
@@ -1134,11 +1242,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             );
             return Err(ERRNO::EINVAL);
         }
-        if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
-            warn!(
-                "kernel: sys_clone unsupported exit signal {}, only SIGCHLD/0 is implemented",
-                exit_signal
-            );
+        if exit_signal > crate::task::MAX_SIG {
             return Err(ERRNO::EINVAL);
         }
         let vfork_clone = flags.contains(CloneFlags::CLONE_VFORK);
@@ -1270,9 +1374,19 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             if flags.contains(CloneFlags::CLONE_NEWNET) {
                 shared_resources.insert(CloneResourceFlags::NEWNET);
             }
-            let new_process =
-                current_process.clone_process(stack, child_tls, parent_set_tid, child_set_tid, shared_resources)?;
+            let new_process = current_process.clone_process(
+                stack,
+                child_tls,
+                parent_set_tid,
+                child_set_tid,
+                shared_resources,
+                exit_signal as u32,
+            )?;
             let child_pid = new_process.getpid() as i32;
+            if let Some(pidfd_ptr) = pidfd {
+                let fd = alloc_pidfd(child_pid as usize)?;
+                write_pod_to_user(pidfd_ptr as *mut i32, &fd)?;
+            }
             debug!(
                 "kernel: sys_clone result flags={:#x} parent_tid={:#x} child_tid={:#x} child_pid={}",
                 clone_flags_arg,
@@ -1626,25 +1740,9 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     !has_target_child || has_target_zombie
                 });
 
-            // If woken by a deliverable user-handled signal, return EINTR so the trap handler can dispatch it.
-            {
-                let task = current_task().unwrap();
-                let inner = process.inner_exclusive_access();
-                let task_inner = task.inner_exclusive_access();
-                let pending_unmasked = (task_inner.pending_signals | inner.pending_signals)
-                    & !task_inner.signal_mask.without_unblockable();
-                let has_user_handler = (1..=crate::task::MAX_SIG).any(|signum| {
-                    let Some(flag) = SignalBit::from_signum(signum as u32) else { return false; };
-                    if !pending_unmasked.contains(flag) {
-                        return false;
-                    }
-                    let handler = inner.signal_actions.table[signum].handler;
-                    handler != crate::task::SIG_DFL && handler != crate::task::SIG_IGN
-                });
-                if has_user_handler {
-                    return Err(ERRNO::EINTR);
-                }
-            }
+            // Re-scan child state after every wake. A child exit can also queue
+            // a user-handled signal, but wait status must win over EINTR.
+            continue;
         }
     })
 }

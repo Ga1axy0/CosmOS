@@ -363,6 +363,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
         recycle_res.clear();
 
+        let exit_signal = process.clone_exit_signal;
         let (closed_fds, parent_weak, reclaim, shm_attachments, keyrings_to_release) = {
             let mut process_inner = process.inner_exclusive_access();
             process_inner.children.clear();
@@ -401,7 +402,11 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
-            add_signal_to_process(&parent, SignalBit::SIGCHLD);
+            if exit_signal != 0 {
+                if let Some(signal) = SignalBit::from_signum(exit_signal) {
+                    add_signal_to_process(&parent, signal);
+                }
+            }
             parent.wait_exit_queue.wake_one();
         }
         // warn_heap_state("exit_end", pid);

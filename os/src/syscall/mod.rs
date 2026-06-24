@@ -362,6 +362,8 @@ pub const SYSCALL_SPAWN: usize = 400;
 pub const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 /// io_uring_setup syscall
 pub const SYSCALL_IO_URING_SETUP: usize = 425;
+/// pidfd_send_signal syscall
+pub const SYSCALL_PIDFD_SEND_SIGNAL: usize = 424;
 /// open_tree syscall
 pub const SYSCALL_OPEN_TREE: usize = 428;
 /// fsopen syscall
@@ -927,6 +929,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_IO_URING_SETUP => sys_io_uring_setup(args[0] as u32, args[1]),
+        SYSCALL_PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(
+            args[0] as i32,
+            args[1] as u32,
+            args[2] as *const crate::task::SigInfo,
+            args[3] as u32,
+        ),
         // SYSCALL_OPEN_TREE => sys_open_tree(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_FSOPEN => sys_fsopen(args[0] as *const u8, args[1] as u32),
         SYSCALL_FSPICK => sys_fspick(args[0] as isize, args[1] as *const u8, args[2] as u32),
