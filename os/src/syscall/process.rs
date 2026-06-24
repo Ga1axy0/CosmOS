@@ -998,9 +998,9 @@ impl CloneRequest {
             warn!("kernel: sys_clone3 unsupported CLONE_PIDFD");
             return Err(ERRNO::ENOSYS);
         }
-        if args.pidfd != 0 {
-            return Err(ERRNO::EINVAL);
-        }
+        // The pidfd field is meaningful only when CLONE_PIDFD is set. Some libc
+        // clone3 callers leave a non-zero value here while requesting only
+        // parent/child TID handling, so ignore it on the normal thread path.
         if args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
             warn!("kernel: sys_clone3 unsupported set_tid/cgroup fields");
             return Err(ERRNO::ENOSYS);

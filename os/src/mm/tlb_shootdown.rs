@@ -276,11 +276,20 @@ pub fn online_mask() -> usize {
 /// 调用方需要保证自己当前不持有会长时间关中断的锁，否则可能放大等待时间。
 pub fn shootdown(hart_mask: usize, kind: ShootdownKind) {
     let _launch_guard = TLB_SHOOTDOWN_LAUNCH_LOCK.lock();
-    shootdown_inner(hart_mask, kind);
+    shootdown_inner(hart_mask, kind, true);
+}
+
+/// 对指定 hart 掩码发起一次同步 TLB shootdown，但不在发起路径打印日志。
+///
+/// 这用于 kernel heap grow 等分配器内部路径：普通 `debug!` 日志会格式化并写
+/// klog ring buffer，可能再次触发 heap 分配，造成递归 grow 卡死。
+pub fn shootdown_quiet(hart_mask: usize, kind: ShootdownKind) {
+    let _launch_guard = TLB_SHOOTDOWN_LAUNCH_LOCK.lock();
+    shootdown_inner(hart_mask, kind, false);
 }
 
 /// 在已持有发起锁的前提下执行一次同步 TLB shootdown。
-fn shootdown_inner(hart_mask: usize, kind: ShootdownKind) {
+fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     let self_bit = 1usize << hartid();
     let online_mask = online_mask();
     let target_mask = hart_mask & online_mask & !self_bit;
@@ -301,28 +310,35 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind) {
         .store(0, Ordering::Release);
     TLB_SHOOTDOWN_STATE.seq.fetch_add(1, Ordering::AcqRel);
     TLB_SHOOTDOWN_STATE.active.store(true, Ordering::Release);
-    debug!(
-        "[tlb] launch shootdown seq={} self={} online={:#b} req={:#b} target={:#b} kind={}",
-        seq,
-        hartid(),
-        online_mask,
-        hart_mask,
-        target_mask,
-        shootdown_kind_name(kind)
-    );
+    if emit_logs {
+        debug!(
+            "[tlb] launch shootdown seq={} self={} online={:#b} req={:#b} target={:#b} kind={}",
+            seq,
+            hartid(),
+            online_mask,
+            hart_mask,
+            target_mask,
+            shootdown_kind_name(kind)
+        );
+    }
 
     // 先刷新发起方本地 TLB，再通知其他 hart。
     perform_local_tlb_shootdown(kind);
     if target_mask != 0 {
         send_ipi_mask(target_mask);
-        trace!(
-            "[tlb] seq={} ipi sent to mask={:#b}, waiting ack",
-            seq, target_mask
-        );
+        if emit_logs {
+            trace!(
+                "[tlb] seq={} ipi sent to mask={:#b}, waiting ack",
+                seq,
+                target_mask
+            );
+        }
         while TLB_SHOOTDOWN_STATE.ack_mask.load(Ordering::Acquire) != target_mask {
             spin_loop();
         }
-        debug!("[tlb] seq={} all remote ack received", seq);
+        if emit_logs {
+            debug!("[tlb] seq={} all remote ack received", seq);
+        }
     }
 
     TLB_SHOOTDOWN_STATE.active.store(false, Ordering::Release);
@@ -332,12 +348,19 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind) {
     TLB_SHOOTDOWN_STATE
         .ack_mask
         .store(0, Ordering::Release);
-    debug!("[tlb] seq={} shootdown complete", seq);
+    if emit_logs {
+        debug!("[tlb] seq={} shootdown complete", seq);
+    }
 }
 
 /// 对所有已上线 hart 发起一次全局 TLB shootdown。
 pub fn shootdown_global() {
     shootdown(usize::MAX, ShootdownKind::Global);
+}
+
+/// 对所有已上线 hart 发起一次全局 TLB shootdown，但不打印日志。
+pub fn shootdown_global_quiet() {
+    shootdown_quiet(usize::MAX, ShootdownKind::Global);
 }
 
 /// 完成一次“刷新后提交 deferred 回收”的同步点。

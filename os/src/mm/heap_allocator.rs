@@ -427,7 +427,7 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         mapped_all
     };
     if mapped_pages > 0 {
-        crate::mm::shootdown_global();
+        crate::mm::shootdown_global_quiet();
     }
     mapped_all
 }

@@ -60,7 +60,7 @@ pub use oom::{log_oom, warn_heap_state, warn_heap_state_lockfree};
 pub use tlb_shootdown::{
     clear_deferred, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
     defer_release, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush, online_mask, shootdown,
-    shootdown_global, take_deferred, DeferredBatch, ShootdownKind,
+    shootdown_global, shootdown_global_quiet, take_deferred, DeferredBatch, ShootdownKind,
 };
 pub use page_table::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
