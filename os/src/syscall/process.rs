@@ -13,7 +13,7 @@ use crate::{
     config::PAGE_SIZE,
     fs::{
         canonicalize, open_file, open_file_at, AccessMode, File, FileDescription, FileStatusFlags,
-        OpenFlags, Stat, StatMode,
+        OpenFlags, OSInode, Stat, StatMode,
     },
     hal::hartid,
     ipc::{self, IPC_RMID},
@@ -937,6 +937,7 @@ const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
 const CLONE3_ARGS_MIN_SIZE: usize = 64;
 /// `CLONE_PIDFD` is validated before feature fallback so bad pointers report EFAULT.
 const CLONE_PIDFD_FLAG: usize = 0x0000_1000;
+const CLONE_INTO_CGROUP_FLAG: usize = 0x2_0000_0000;
 
 struct PidFdFile {
     pid: usize,
@@ -992,6 +993,24 @@ fn alloc_pidfd(pid: usize) -> Result<i32, ERRNO> {
     let fd = inner.alloc_fd()?;
     inner.fd_table[fd] = Some(FdEntry::new(desc));
     Ok(fd as i32)
+}
+
+fn attach_pid_to_cgroup(fd: i32, pid: usize) -> Result<(), ERRNO> {
+    if fd < 0 {
+        return Err(ERRNO::EBADF);
+    }
+    let desc = {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        inner
+            .fd_table
+            .get(fd as usize)
+            .and_then(|entry| entry.as_ref())
+            .map(|entry| Arc::clone(&entry.desc))
+            .ok_or(ERRNO::EBADF)?
+    };
+    let inode = desc.as_any().downcast_ref::<OSInode>().ok_or(ERRNO::EINVAL)?;
+    inode.add_pid_to_cgroup(pid)
 }
 
 pub fn sys_pidfd_send_signal(
@@ -1065,6 +1084,7 @@ struct CloneRequest {
     flags: usize,
     exit_signal: usize,
     pidfd: Option<usize>,
+    cgroup: Option<i32>,
     stack: usize,
     stack_size: usize,
     parent_tid: usize,
@@ -1078,6 +1098,7 @@ impl CloneRequest {
             flags: args.flags,
             exit_signal: 17,
             pidfd: None,
+            cgroup: None,
             stack: args.stack,
             stack_size: 0,
             parent_tid: args.parent_tid,
@@ -1106,11 +1127,22 @@ impl CloneRequest {
         } else {
             None
         };
+        let cgroup = if flags & CLONE_INTO_CGROUP_FLAG != 0 {
+            if args.cgroup > i32::MAX as u64 {
+                return Err(ERRNO::EBADF);
+            }
+            Some(args.cgroup as i32)
+        } else {
+            if args.cgroup != 0 {
+                return Err(ERRNO::EINVAL);
+            }
+            None
+        };
         // The pidfd field is meaningful only when CLONE_PIDFD is set. Some libc
         // clone3 callers leave a non-zero value here while requesting only
         // parent/child TID handling, so ignore it on the normal thread path.
-        if args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
-            warn!("kernel: sys_clone3 unsupported set_tid/cgroup fields");
+        if args.set_tid != 0 || args.set_tid_size != 0 {
+            warn!("kernel: sys_clone3 unsupported set_tid fields");
             return Err(ERRNO::ENOSYS);
         }
         if (flags & CloneFlags::CLONE_SIGHAND.bits()) != 0
@@ -1143,6 +1175,7 @@ impl CloneRequest {
             flags,
             exit_signal,
             pidfd,
+            cgroup,
             stack: args.stack as usize,
             stack_size: args.stack_size as usize,
             parent_tid: args.parent_tid as usize,
@@ -1195,6 +1228,8 @@ bitflags! {
         const CLONE_NEWPID = 0x2000_0000;
         /// 创建新的 network namespace；当前先按兼容 no-op 处理。
         const CLONE_NEWNET = 0x4000_0000;
+        /// Place the child into a cgroup v2 directory fd.
+        const CLONE_INTO_CGROUP = 0x2_0000_0000;
     }
 }
 
@@ -1211,6 +1246,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             flags,
             exit_signal,
             pidfd,
+            cgroup,
             stack,
             stack_size,
             parent_tid,
@@ -1304,6 +1340,10 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 .create_task(ustack_base, true, sched_attr)
                 .map_err(|_| ERRNO::ENOMEM)?;
             let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
+            if cgroup.is_some() {
+                warn!("kernel: sys_clone CLONE_INTO_CGROUP with CLONE_THREAD is unsupported");
+                return Err(ERRNO::EINVAL);
+            }
             let new_inner_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().tid;
             let child_user_sp = if stack_size != 0 {
                 if stack == 0 {
@@ -1383,6 +1423,9 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 exit_signal as u32,
             )?;
             let child_pid = new_process.getpid() as i32;
+            if let Some(cgroup_fd) = cgroup {
+                attach_pid_to_cgroup(cgroup_fd, child_pid as usize)?;
+            }
             if let Some(pidfd_ptr) = pidfd {
                 let fd = alloc_pidfd(child_pid as usize)?;
                 write_pod_to_user(pidfd_ptr as *mut i32, &fd)?;

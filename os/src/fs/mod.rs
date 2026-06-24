@@ -5,6 +5,7 @@ mod page_cache;
 mod pipe;
 mod stdio;
 mod tty;
+pub mod cgroupfs;
 pub mod rootfs;
 pub mod devfs;
 pub mod procfs;
@@ -779,7 +780,7 @@ pub use inode::{
     canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs, init_rootfs,
     init_sysfs, inode_stat, linkat,
     linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, lookup_inode_follow_with_path, mkdir_at,
-    mkdir_at_with_inode, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
+    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
     open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
     OpenFlags, OSInode,

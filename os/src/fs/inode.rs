@@ -2,6 +2,7 @@ use super::{discard_inode, page_cache, File, Stat, StatFs64, StatMode};
 use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use super::tmpfs::new_tmpfs_root;
+use super::cgroupfs::{new_cgroup2_root, CgroupDirNode};
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -36,6 +37,17 @@ impl OSInode {
     pub fn new(inode: Arc<Inode>, path: String) -> Self {
         trace!("kernel: OSInode::new");
         Self { path, inode }
+    }
+
+    /// Add `pid` to this inode when it is a cgroup v2 directory.
+    pub fn add_pid_to_cgroup(&self, pid: usize) -> Result<(), ERRNO> {
+        let node = self.inode.vfs_node();
+        let cgroup = node
+            .as_any()
+            .downcast_ref::<CgroupDirNode>()
+            .ok_or(ERRNO::EINVAL)?;
+        cgroup.add_proc(pid);
+        Ok(())
     }
 
     /// 返回当前普通文件对应的 page mapping；目录或不可缓存对象返回 `None`。
@@ -1359,6 +1371,14 @@ pub fn mount_sysfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
     let fs_root = Inode::from_vfs_node(Arc::new(SysRootNode::new()) as Arc<dyn VfsNode>);
     do_mount(abs_mnt, fs_root)?;
     record_mount(abs_mnt, "sysfs", "sysfs", if readonly { "ro" } else { "rw" });
+    Ok(())
+}
+
+/// Mount a minimal cgroup v2 hierarchy at `abs_mnt`.
+pub fn mount_cgroup2(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
+    let fs_root = Inode::from_vfs_node(new_cgroup2_root());
+    do_mount(abs_mnt, fs_root)?;
+    record_mount(abs_mnt, "cgroup2", "cgroup2", if readonly { "ro" } else { "rw" });
     Ok(())
 }
 

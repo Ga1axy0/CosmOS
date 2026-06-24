@@ -1,7 +1,7 @@
 use crate::fs::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
     FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    inode_stat, linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, make_pipe, mkdir_at_with_inode, mount_device,
+    discard_inode, inode_stat, linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device,
     mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
     sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat, do_bind_mount, do_move_mount,
 };
@@ -1906,6 +1906,20 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     desc.path().ok_or(ERRNO::ENOTDIR)
 }
 
+fn resolve_simple_dirfd_inode(dirfd: isize, path: &str) -> Result<Option<Arc<::fs::vfs::Inode>>, ERRNO> {
+    if dirfd == AT_FDCWD || path.starts_with('/') || path.contains('/') {
+        return Ok(None);
+    }
+    if dirfd < 0 {
+        return Err(ERRNO::EBADF);
+    }
+    let desc = get_file_description(dirfd as usize)?;
+    if !desc.is_dir() {
+        return Err(ERRNO::ENOTDIR);
+    }
+    desc.as_inode().map(Some).ok_or(ERRNO::ENOTDIR)
+}
+
 const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
@@ -3601,8 +3615,25 @@ pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
         if name.is_empty() {
             return Err(ERRNO::ENOENT);
         }
-        let cwd = resolve_dirfd_base(dirfd, name.as_str())?;
-        unlinkat(cwd.as_str(), &name, flags)?;
+        if let Some(parent) = resolve_simple_dirfd_inode(dirfd, name.as_str())? {
+            if flags & AT_REMOVEDIR == 0 {
+                let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
+                if inode.is_dir() {
+                    return Err(ERRNO::EISDIR);
+                }
+                discard_inode(&inode);
+                parent.unlink(name.as_str())?;
+            } else {
+                let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
+                if !inode.is_dir() {
+                    return Err(ERRNO::ENOTDIR);
+                }
+                parent.rmdir(name.as_str())?;
+            }
+        } else {
+            let cwd = resolve_dirfd_base(dirfd, name.as_str())?;
+            unlinkat(cwd.as_str(), &name, flags)?;
+        }
         Ok(0)
     })
 }
@@ -3652,8 +3683,15 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
-        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let dir_inode = mkdir_at_with_inode(cwd.as_str(), path.as_str())?;
+        let dir_inode = if let Some(parent) = resolve_simple_dirfd_inode(dirfd, path.as_str())? {
+            if parent.find(path.as_str()).is_some() {
+                return Err(ERRNO::EEXIST);
+            }
+            parent.mkdir(path.as_str()).ok_or(ERRNO::EIO)?
+        } else {
+            let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
+            mkdir_at_with_inode(cwd.as_str(), path.as_str())?
+        };
         let process = current_process();
         dir_inode.set_owner(process.geteuid(), process.getegid())?;
         let requested = mode & StatMode::PERM_MASK.bits();
@@ -4006,6 +4044,8 @@ pub fn sys_mount(
             return Ok(0);
         } else if fs_type == "tmpfs" {
             mount_tmpfs(&abs_mnt, readonly)?;
+        } else if fs_type == "cgroup2" {
+            mount_cgroup2(&abs_mnt, readonly)?;
         } else if fs_type == "sysfs" {
             if abs_mnt == "/sys" {
                 remount_path(&abs_mnt, "sysfs", "sysfs", readonly).or_else(|_| {
