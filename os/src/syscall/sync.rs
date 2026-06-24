@@ -6,7 +6,7 @@ use crate::syscall_body;
 use crate::syscall::{read_pod_from_user, write_pod_to_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
 use crate::task::{current_process, current_task, TaskStatus, WaitReason};
-use crate::timer::{add_timer_ns, get_realtime_ns, get_time_ns};
+use crate::timer::{add_current_timer_ns_preflagged, get_realtime_ns, get_time_ns};
 use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
 
@@ -319,12 +319,14 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
         // Publish the sleep state before arming the timer so an immediately
         // expiring interrupt can convert this task back to Runnable instead of
         // consuming the timer while the task still looks Running.
-        {
+        crate::probe!("sys.nanosleep_arm", {
             let mut task_inner = task.inner_exclusive_access();
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(WaitReason::Nanosleep);
-        }
-        add_timer_ns(expire_ns, task);
+            task_inner.may_have_non_futex_timer = true;
+            drop(task_inner);
+            add_current_timer_ns_preflagged(expire_ns, Arc::clone(&task));
+        });
         block_current_and_run_next(WaitReason::Nanosleep);
         if crate::signal::has_interrupting_signal() {
             if !rem.is_null() {
