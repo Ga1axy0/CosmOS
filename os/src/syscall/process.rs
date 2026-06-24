@@ -930,6 +930,10 @@ pub fn sys_setsid() -> isize {
 const CLONE_EXIT_SIGNAL_SIGCHLD: usize = 17;
 /// Linux clone flags 中低 8 位保存退出信号。
 const CLONE_EXIT_SIGNAL_MASK: usize = 0xff;
+/// Oldest Linux `struct clone_args` layout accepted by clone3().
+const CLONE3_ARGS_MIN_SIZE: usize = 64;
+/// `CLONE_PIDFD` is validated before feature fallback so bad pointers report EFAULT.
+const CLONE_PIDFD_FLAG: usize = 0x0000_1000;
 
 /// Linux `clone3` 的用户态参数布局。
 #[repr(C)]
@@ -978,17 +982,50 @@ impl CloneRequest {
         if size == 0 {
             return Err(ERRNO::EINVAL);
         }
-        if size > CLONE3_ARGS_SIZE {
-            return Err(ERRNO::E2BIG);
+        if size < CLONE3_ARGS_MIN_SIZE {
+            return Err(ERRNO::EINVAL);
         }
         let flags = args.flags as usize;
         if flags & CLONE_EXIT_SIGNAL_MASK != 0 {
             warn!("kernel: sys_clone3 flags may not contain an exit signal");
             return Err(ERRNO::EINVAL);
         }
-        if args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
-            warn!("kernel: sys_clone3 unsupported pidfd/set_tid/cgroup fields");
+        if flags & CLONE_PIDFD_FLAG != 0 {
+            if args.pidfd == 0 {
+                return Err(ERRNO::EFAULT);
+            }
+            write_pod_to_user(args.pidfd as *mut i32, &0)?;
+            warn!("kernel: sys_clone3 unsupported CLONE_PIDFD");
             return Err(ERRNO::ENOSYS);
+        }
+        if args.pidfd != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
+            warn!("kernel: sys_clone3 unsupported set_tid/cgroup fields");
+            return Err(ERRNO::ENOSYS);
+        }
+        if (flags & CloneFlags::CLONE_SIGHAND.bits()) != 0
+            && (flags & CloneFlags::CLONE_VM.bits()) == 0
+        {
+            warn!("kernel: sys_clone3 CLONE_SIGHAND without CLONE_VM");
+            return Err(ERRNO::EINVAL);
+        }
+        if (flags & CloneFlags::CLONE_THREAD.bits()) != 0
+            && (flags & CloneFlags::CLONE_SIGHAND.bits()) == 0
+        {
+            warn!("kernel: sys_clone3 CLONE_THREAD without CLONE_SIGHAND");
+            return Err(ERRNO::EINVAL);
+        }
+        if (flags & CloneFlags::CLONE_FS.bits()) != 0
+            && (flags & CloneFlags::CLONE_NEWNS.bits()) != 0
+        {
+            warn!("kernel: sys_clone3 CLONE_FS with CLONE_NEWNS");
+            return Err(ERRNO::EINVAL);
+        }
+        if (args.stack == 0) != (args.stack_size == 0) {
+            warn!("kernel: sys_clone3 stack and stack_size must be set together");
+            return Err(ERRNO::EINVAL);
         }
         let exit_signal = args.exit_signal as usize;
         if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
@@ -1260,6 +1297,9 @@ pub fn sys_clone3(uargs: *const Clone3Args, size: usize) -> isize {
         if uargs.is_null() {
             return Err(ERRNO::EFAULT);
         }
+        if size > PAGE_SIZE {
+            return Err(ERRNO::E2BIG);
+        }
         let mut args = Clone3Args::default();
         let copy_len = size.min(CLONE3_ARGS_SIZE);
         if copy_len != 0 {
@@ -1270,6 +1310,16 @@ pub fn sys_clone3(uargs: *const Clone3Args, size: usize) -> isize {
                     &mut args as *mut Clone3Args as *mut u8,
                     copy_len,
                 );
+            }
+        }
+        if size > CLONE3_ARGS_SIZE {
+            let extra_len = size - CLONE3_ARGS_SIZE;
+            let extra = read_bytes_from_user(
+                unsafe { (uargs as *const u8).add(CLONE3_ARGS_SIZE) },
+                extra_len,
+            )?;
+            if extra.iter().any(|byte| *byte != 0) {
+                return Err(ERRNO::E2BIG);
             }
         }
         let req = CloneRequest::from_clone3(args, size)?;
