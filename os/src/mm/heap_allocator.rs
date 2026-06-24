@@ -1,7 +1,7 @@
 //! The heap allocator.
 
 use super::frame_allocator::{frame_alloc, frame_alloc_contiguous, frame_dealloc};
-use super::{phys_to_virt, PageTableEntry, PhysPageNum, PTEFlags, VirtAddr, KERNEL_SPACE};
+use super::{phys_to_virt, PTEFlags, PageTableEntry, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, PAGE_SIZE, PAGE_SIZE_BITS};
 use crate::sync::SpinNoIrqLock;
 use buddy_system_allocator::LockedHeap;
@@ -373,52 +373,63 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
     if crate::platform::heap_debug_enabled() {
         crate::platform::early_console_write("[heap] locking HEAP_PT_LOCK\r\n");
     }
-    let _guard = HEAP_PT_LOCK.lock();
-    if crate::platform::heap_debug_enabled() {
-        crate::platform::early_console_write("[heap] HEAP_PT_LOCK locked\r\n");
-    }
-    for page in 0..pages {
-        let va = start_va + page * PAGE_SIZE;
-        let vpn = VirtAddr::from(va).floor();
-        let Some(pte) = heap_leaf_pte(subtree_root_ppn, vpn) else {
-            rollback_heap_pages(subtree_root_ppn, start_va, page);
-            return false;
-        };
-        // SAFETY: `pte` points into a leaf table reachable only through
-        // `HEAP_PT_LOCK`; concurrent grows hand out disjoint VA ranges via
-        // `reserve_virtual_heap_bytes`, so no two writers target the same slot.
-        let entry = unsafe { &mut *pte };
-        if entry.is_valid() {
-            rollback_heap_pages(subtree_root_ppn, start_va, page);
-            return false;
+    let mut mapped_pages = 0;
+    let mapped_all = {
+        let _guard = HEAP_PT_LOCK.lock();
+        if crate::platform::heap_debug_enabled() {
+            crate::platform::early_console_write("[heap] HEAP_PT_LOCK locked\r\n");
         }
-        let Some(frame) = frame_alloc() else {
-            rollback_heap_pages(subtree_root_ppn, start_va, page);
-            return false;
-        };
-        *entry = PageTableEntry::new(
-            frame.ppn,
-            PTEFlags::R | PTEFlags::W | PTEFlags::V | PTEFlags::A | PTEFlags::D,
-        );
-        core::mem::forget(frame);
+        let mut mapped_all = true;
+        for page in 0..pages {
+            let va = start_va + page * PAGE_SIZE;
+            let vpn = VirtAddr::from(va).floor();
+            let Some(pte) = heap_leaf_pte(subtree_root_ppn, vpn) else {
+                rollback_heap_pages(subtree_root_ppn, start_va, mapped_pages);
+                mapped_all = false;
+                break;
+            };
+            // SAFETY: `pte` points into a leaf table reachable only through
+            // `HEAP_PT_LOCK`; concurrent grows hand out disjoint VA ranges via
+            // `reserve_virtual_heap_bytes`, so no two writers target the same slot.
+            let entry = unsafe { &mut *pte };
+            if entry.is_valid() {
+                rollback_heap_pages(subtree_root_ppn, start_va, mapped_pages);
+                mapped_all = false;
+                break;
+            }
+            let Some(frame) = frame_alloc() else {
+                rollback_heap_pages(subtree_root_ppn, start_va, mapped_pages);
+                mapped_all = false;
+                break;
+            };
+            *entry = PageTableEntry::new(
+                frame.ppn,
+                PTEFlags::R | PTEFlags::W | PTEFlags::V | PTEFlags::A | PTEFlags::D,
+            );
+            core::mem::forget(frame);
+            mapped_pages += 1;
+        }
+        if crate::platform::heap_debug_enabled() && pages > 0 {
+            let vpn = VirtAddr::from(start_va).floor();
+            let root_idx = crate::hal::vpn_index(vpn.0, 0);
+            let mid_idx = crate::hal::vpn_index(vpn.0, 1);
+            let leaf_idx = crate::hal::vpn_index(vpn.0, 2);
+            let root = PhysPageNum(crate::hal::root_ppn_from_token(crate::mm::kernel_token()));
+            let root_pte = root.get_pte_array()[root_idx].bits;
+            let mid_ppn = PhysPageNum(crate::hal::pte_ppn(root_pte));
+            let mid_pte = mid_ppn.get_pte_array()[mid_idx].bits;
+            let leaf_ppn = PhysPageNum(crate::hal::pte_ppn(mid_pte));
+            let leaf_pte = leaf_ppn.get_pte_array()[leaf_idx].bits;
+            early_put_hex("[heap] root_pte=", root_pte);
+            early_put_hex("[heap] mid_pte=", mid_pte);
+            early_put_hex("[heap] leaf_pte=", leaf_pte);
+        }
+        mapped_all
+    };
+    if mapped_pages > 0 {
+        crate::mm::shootdown_global_quiet();
     }
-    if crate::platform::heap_debug_enabled() && pages > 0 {
-        let vpn = VirtAddr::from(start_va).floor();
-        let root_idx = crate::hal::vpn_index(vpn.0, 0);
-        let mid_idx = crate::hal::vpn_index(vpn.0, 1);
-        let leaf_idx = crate::hal::vpn_index(vpn.0, 2);
-        let root = PhysPageNum(crate::hal::root_ppn_from_token(crate::mm::kernel_token()));
-        let root_pte = root.get_pte_array()[root_idx].bits;
-        let mid_ppn = PhysPageNum(crate::hal::pte_ppn(root_pte));
-        let mid_pte = mid_ppn.get_pte_array()[mid_idx].bits;
-        let leaf_ppn = PhysPageNum(crate::hal::pte_ppn(mid_pte));
-        let leaf_pte = leaf_ppn.get_pte_array()[leaf_idx].bits;
-        early_put_hex("[heap] root_pte=", root_pte);
-        early_put_hex("[heap] mid_pte=", mid_pte);
-        early_put_hex("[heap] leaf_pte=", leaf_pte);
-    }
-    unsafe { crate::hal::flush_tlb() };
-    true
+    mapped_all
 }
 
 /// Tear down a partially-mapped run after a failure. Caller holds [`HEAP_PT_LOCK`].
@@ -434,7 +445,6 @@ fn rollback_heap_pages(l1_ppn: PhysPageNum, start_va: usize, pages: usize) {
             }
         }
     }
-    unsafe { crate::hal::flush_tlb() };
 }
 
 #[allow(unused)]

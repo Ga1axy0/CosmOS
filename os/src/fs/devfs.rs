@@ -23,6 +23,7 @@ use crate::fs::{Stat, StatMode};
 use super::{empty_statfs, StatFs64};
 use crate::mm::translated_ref;
 use crate::platform::rtc;
+use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_user, Pod};
 use crate::task::current_user_token;
@@ -31,7 +32,72 @@ use crate::random as kernel_random;
 
 const RTC_RD_TIME: usize = 0xFFFF_FFFF_8024_7009;
 const RTC_SET_TIME: usize = 0x4024_700A;
+const BLKGETSIZE: usize = 0x1260;
+const BLKFLSBUF: usize = 0x1261;
+const BLKRRPART: usize = 0x125f;
+const BLKSSZGET: usize = 0x1268;
+const BLKGETSIZE64_COMPAT: usize = 0x8004_1272;
+const BLKGETSIZE64: usize = 0x8008_1272;
+const BLKGETSIZE64_COMPAT_SIGNED: usize = 0xffff_ffff_8004_1272;
+const BLKGETSIZE64_SIGNED: usize = 0xffff_ffff_8008_1272;
+const DEFAULT_BLOCK_DEV_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_BLOCK_SECTOR_SIZE: i32 = 512;
+const LOOP_SET_FD: usize = 0x4c00;
+const LOOP_CLR_FD: usize = 0x4c01;
+const LOOP_SET_STATUS: usize = 0x4c02;
+const LOOP_GET_STATUS: usize = 0x4c03;
+const LOOP_CTL_GET_FREE: usize = 0x4c82;
 static CPU_DMA_LATENCY_US: AtomicI32 = AtomicI32::new(0);
+
+struct SparseBlockDevice {
+    blocks: SpinNoIrqLock<Vec<(usize, [u8; fs::BLOCK_SZ])>>,
+}
+
+impl SparseBlockDevice {
+    fn new() -> Self {
+        Self {
+            blocks: SpinNoIrqLock::new(Vec::new()),
+        }
+    }
+}
+
+impl BlockDevice for SparseBlockDevice {
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        assert_eq!(buf.len(), fs::BLOCK_SZ);
+        let blocks = self.blocks.lock();
+        if let Some((_, block)) = blocks.iter().find(|(id, _)| *id == block_id) {
+            buf.copy_from_slice(block);
+        } else {
+            buf.fill(0);
+        }
+    }
+
+    fn write_block(&self, block_id: usize, buf: &[u8]) {
+        assert_eq!(buf.len(), fs::BLOCK_SZ);
+        let mut block = [0u8; fs::BLOCK_SZ];
+        block.copy_from_slice(buf);
+        let mut blocks = self.blocks.lock();
+        if let Some((_, existing)) = blocks.iter_mut().find(|(id, _)| *id == block_id) {
+            *existing = block;
+        } else {
+            blocks.push((block_id, block));
+        }
+    }
+}
+
+/// Register a sparse scratch block device for LTP mount-device tests.
+pub fn ensure_ltp_scratch_device() {
+    let mut devices = BLOCK_DEVICES.lock();
+    devices
+        .entry(String::from("vda3"))
+        .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
+    devices
+        .entry(String::from("loop0"))
+        .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
+    devices
+        .entry(String::from("loop-control"))
+        .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
+}
 
 fn devfs_statfs() -> StatFs64 {
     empty_statfs(
@@ -69,8 +135,21 @@ pub fn blkdev_minor_from_name(name: &str) -> u64 {
             }
         }
     }
+    if let Some(rest) = name.strip_prefix("loop") {
+        if let Ok(index) = rest.parse::<u64>() {
+            return index;
+        }
+    }
 
     0
+}
+
+/// Derive major device number from a block device name.
+pub fn blkdev_major_from_name(name: &str) -> u64 {
+    if name.starts_with("loop") {
+        return 7;
+    }
+    254
 }
 
 /// Linux `struct rtc_time` ABI.
@@ -218,6 +297,8 @@ fn unix_secs_from_rtc_time(tm: LinuxRtcTime) -> Option<i64> {
 pub struct BlockDevNode {
     /// The underlying block device driver.
     pub device: Arc<dyn BlockDevice>,
+    /// Major device number for stat reporting.
+    major: u64,
     /// Minor device number for stat reporting.
     minor: u64,
 }
@@ -225,13 +306,54 @@ pub struct BlockDevNode {
 impl BlockDevNode {
     /// Wrap `device` in a new node with the given minor number.
     pub fn new(device: Arc<dyn BlockDevice>, minor: u64) -> Self {
-        Self { device, minor }
+        Self {
+            device,
+            major: 254,
+            minor,
+        }
+    }
+
+    /// Wrap `device` in a new node with explicit major and minor numbers.
+    pub fn new_with_major(device: Arc<dyn BlockDevice>, major: u64, minor: u64) -> Self {
+        Self {
+            device,
+            major,
+            minor,
+        }
+    }
+
+    /// Handle Linux block-device ioctls.
+    pub fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
+        match req {
+            BLKGETSIZE => {
+                let sectors = DEFAULT_BLOCK_DEV_SIZE_BYTES / 512;
+                write_pod_to_user(arg as *mut usize, &(sectors as usize))?;
+                Ok(0)
+            }
+            BLKGETSIZE64
+            | BLKGETSIZE64_COMPAT
+            | BLKGETSIZE64_SIGNED
+            | BLKGETSIZE64_COMPAT_SIGNED => {
+                write_pod_to_user(arg as *mut u64, &DEFAULT_BLOCK_DEV_SIZE_BYTES)?;
+                Ok(0)
+            }
+            BLKSSZGET => {
+                write_pod_to_user(arg as *mut i32, &DEFAULT_BLOCK_SECTOR_SIZE)?;
+                Ok(0)
+            }
+            BLKFLSBUF | BLKRRPART => Ok(0),
+            LOOP_CTL_GET_FREE => Ok(0),
+            LOOP_SET_FD | LOOP_SET_STATUS => Ok(0),
+            LOOP_GET_STATUS | LOOP_CLR_FD => Err(ERRNO::ENXIO),
+            _ => Err(ERRNO::ENOTTY),
+        }
     }
 }
 
 impl fmt::Debug for BlockDevNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BlockDevNode")
+            .field("major", &self.major)
             .field("minor", &self.minor)
             .field("device_ptr", &format_args!("{:p}", Arc::as_ptr(&self.device)))
             .finish()
@@ -469,7 +591,11 @@ impl VfsNode for BlockDevNode {
     }
 
     fn rdev(&self) -> u64 {
-        makedev(254, self.minor)
+        makedev(self.major, self.minor)
+    }
+
+    fn size(&self) -> usize {
+        DEFAULT_BLOCK_DEV_SIZE_BYTES as usize
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {

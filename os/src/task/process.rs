@@ -2,21 +2,24 @@
 #![allow(deprecated)]
 
 use super::id::RecycleAllocator;
-use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
-use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
-use crate::sched::add_task;
-use crate::sched::insert_into_pid2process;
-use super::{pid_alloc, PidHandle};
 use super::WaitQueue;
+use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
+use super::{pid_alloc, PidHandle};
+use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
 use crate::config::{CLOCK_FREQ, PAGE_SIZE};
-use crate::fs::{canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription, OpenFlags};
+use crate::fs::{
+    canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription,
+    OpenFlags,
+};
+use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
     MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
     UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
-use crate::hal::traits::AddressSpaceToken;
+use crate::sched::add_task;
+use crate::sched::insert_into_pid2process;
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
@@ -135,24 +138,31 @@ impl CloneResourceFlags {
     pub fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
+
+    /// Remove sharing bits from this set.
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy)]
 enum Auxv {
-    Phdr = 3,     // program headers for program
-    Phent = 4,    // size of program header entry
-    Phnum = 5,    // number of program header entries
-    Pagesz = 6,   // system page size
-    Base = 7,     // base address of interpreter
-    Entry = 9,    // entry point of program
-    Random = 25,  // address of 16 random bytes
+    Phdr = 3,    // program headers for program
+    Phent = 4,   // size of program header entry
+    Phnum = 5,   // number of program header entries
+    Pagesz = 6,  // system page size
+    Base = 7,    // base address of interpreter
+    Entry = 9,   // entry point of program
+    Random = 25, // address of 16 random bytes
 }
 
 /// Process Control Block
 pub struct ProcessControlBlock {
     /// immutable
     pub pid: PidHandle,
+    /// Signal delivered to the parent when this process exits.
+    pub clone_exit_signal: u32,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
     /// wait queue for wait4/waitpid
@@ -261,6 +271,8 @@ pub struct ProcessControlBlockInner {
     pub environment: Vec<String>,
     /// process file creation mask (`umask`)
     pub umask: u32,
+    /// Linux-compatible OOM killer score adjustment exposed via `/proc/<pid>/oom_score_adj`.
+    pub oom_score_adj: i32,
     /// process credentials
     pub cred: Credentials,
     /// lazily created special keyrings visible through `add_key/keyctl`
@@ -554,7 +566,12 @@ fn parse_shebang_line(file_data: &[u8]) -> Result<Option<ShebangInfo>, ERRNO> {
     }))
 }
 
-fn resolve_init_image(cwd: &str, path: &str, argv: Vec<String>, depth: usize) -> Result<ResolvedInitImage, ERRNO> {
+fn resolve_init_image(
+    cwd: &str,
+    path: &str,
+    argv: Vec<String>,
+    depth: usize,
+) -> Result<ResolvedInitImage, ERRNO> {
     if depth >= INIT_INTERPRETER_MAX_DEPTH {
         return Err(ERRNO::ELOOP);
     }
@@ -608,7 +625,10 @@ fn load_process_image(
         MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
 
     let (final_entry, auxv_extra) = if let Some(interp_path) = &app_load_info.interp_path {
-        debug!("Dynamic linking required, loading interpreter: {}", interp_path);
+        debug!(
+            "Dynamic linking required, loading interpreter: {}",
+            interp_path
+        );
         let interp_inode = match open_file_at(cwd, interp_path.as_str(), OpenFlags::RDONLY) {
             Ok(inode) => inode,
             Err(_) => {
@@ -657,8 +677,8 @@ fn load_process_image(
 
                 let vma = Vma::new_elf(start_va, end_va, map_perm);
                 let page_off = start_va.page_offset();
-                let raw = &interp_data[ph.offset() as usize
-                    ..(ph.offset() + ph.file_size()) as usize];
+                let raw =
+                    &interp_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
                 let padded: Vec<u8>;
                 let seg_data: &[u8] = if page_off != 0 {
                     let mut buf = alloc::vec![0u8; page_off + raw.len()];
@@ -678,8 +698,7 @@ fn load_process_image(
         debug!("Interpreter relocated entry: {:#x}", relocated_entry);
         debug!(
             "App PHDR vaddr: {:#x}, phnum: {}",
-            app_load_info.phdr_vaddr,
-            app_load_info.phnum
+            app_load_info.phdr_vaddr, app_load_info.phnum
         );
 
         let auxv_extra = vec![
@@ -696,8 +715,7 @@ fn load_process_image(
         debug!("Static linking, using application entry directly");
         debug!(
             "App PHDR vaddr: {:#x}, phnum: {}",
-            app_load_info.phdr_vaddr,
-            app_load_info.phnum
+            app_load_info.phdr_vaddr, app_load_info.phnum
         );
         let auxv_extra = vec![
             (Auxv::Phdr, app_load_info.phdr_vaddr),
@@ -714,7 +732,7 @@ fn load_process_image(
 
 impl ProcessControlBlockInner {
     #[allow(unused)]
-/// get the current user address-space token
+    /// get the current user address-space token
     pub fn get_user_token(&self) -> AddressSpaceToken {
         self.memory_set.token()
     }
@@ -748,7 +766,9 @@ impl ProcessControlBlockInner {
         if min_fd >= limit {
             return Err(ERRNO::EMFILE);
         }
-        if let Some(fd) = (min_fd..self.fd_table.len().min(limit)).find(|fd| self.fd_table[*fd].is_none()) {
+        if let Some(fd) =
+            (min_fd..self.fd_table.len().min(limit)).find(|fd| self.fd_table[*fd].is_none())
+        {
             return Ok(fd);
         }
         if self.fd_table.len() < limit {
@@ -769,7 +789,9 @@ impl ProcessControlBlockInner {
             return Ok(());
         }
         let current = self.address_space_bytes() as u128;
-        let required = current.checked_add(additional as u128).ok_or(ERRNO::ENOMEM)?;
+        let required = current
+            .checked_add(additional as u128)
+            .ok_or(ERRNO::ENOMEM)?;
         if required > limit as u128 {
             Err(ERRNO::ENOMEM)
         } else {
@@ -897,6 +919,16 @@ impl ProcessControlBlock {
         self.inner.lock().timens_child_boottime_offset_ns
     }
 
+    /// Read the Linux-compatible OOM score adjustment.
+    pub fn oom_score_adj(&self) -> i32 {
+        self.inner.lock().oom_score_adj
+    }
+
+    /// Update the Linux-compatible OOM score adjustment.
+    pub fn set_oom_score_adj(&self, value: i32) {
+        self.inner.lock().oom_score_adj = value;
+    }
+
     /// Read the lightweight loopback network namespace tag.
     pub fn netns_loopback_tag(&self) -> u32 {
         self.inner.lock().netns_loopback_tag
@@ -956,7 +988,8 @@ impl ProcessControlBlock {
         let resolved = resolve_init_image("/", exec_path.as_str(), init_argv, 0)
             .expect("failed to resolve init image");
         let (memory_set, user_layout, entry_point, auxv_extra) =
-            load_process_image(resolved.elf_data.as_slice(), "/").expect("failed to build init process address space");
+            load_process_image(resolved.elf_data.as_slice(), "/")
+                .expect("failed to build init process address space");
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // allocate a pid
@@ -968,53 +1001,55 @@ impl ProcessControlBlock {
         cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,
+            clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
-                    is_zombie: false,
-                    memory_set,
-                    vm_layout,
-                    parent: None,
-                    children: Vec::new(),
-                    exit_reason: ExitReason::Exit(0),
-                    clone_shared_resources: CloneResourceFlags::empty(),
-                    fd_table: new_stdio_files(),
-                    resource_limits: ResourceLimits::default(),
-                    pending_signals: SignalBit::empty(),
-                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
-                    signal_actions: SignalActions::default(),
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                    deadlock_enabled: false,
-                    mutex_detector: DeadlockDetector::new(),
-                    semaphore_detector: DeadlockDetector::new(),
-                    cwd: String::from(INIT_CWD),
-                    root: String::from("/"),
-                    exec_path,
-                    environment: init_envs.clone(),
-                    umask: DEFAULT_UMASK,
-                    cred,
-                    keyrings: ProcessKeyrings::default(),
-                    user_time: 0,
-                    kernel_time: 0,
-                    child_user_time: 0,
-                    child_kernel_time: 0,
-                    accounting_state: CpuAccountingState::Inactive,
-                    accounting_timestamp: 0,
-                    accounting_start_time_ns: get_realtime_ns(),
-                    timens_monotonic_offset_ns: 0,
-                    timens_child_monotonic_offset_ns: 0,
-                    timens_boottime_offset_ns: 0,
-                    timens_child_boottime_offset_ns: 0,
-                    netns_loopback_tag: 0,
-                    netns_default_tag: 0,
-                    itimer_real: ItimerState::default(),
-                    itimer_virtual: ItimerState::default(),
-                    itimer_prof: ItimerState::default(),
-                    robust_list: RobustList { head: 0, len: 0 },
-                    shm_attachments: Vec::new(),
-                }),
+                is_zombie: false,
+                memory_set,
+                vm_layout,
+                parent: None,
+                children: Vec::new(),
+                exit_reason: ExitReason::Exit(0),
+                clone_shared_resources: CloneResourceFlags::empty(),
+                fd_table: new_stdio_files(),
+                resource_limits: ResourceLimits::default(),
+                pending_signals: SignalBit::empty(),
+                pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
+                signal_actions: SignalActions::default(),
+                tasks: Vec::new(),
+                task_res_allocator: RecycleAllocator::new(),
+                mutex_list: Vec::new(),
+                semaphore_list: Vec::new(),
+                condvar_list: Vec::new(),
+                deadlock_enabled: false,
+                mutex_detector: DeadlockDetector::new(),
+                semaphore_detector: DeadlockDetector::new(),
+                cwd: String::from(INIT_CWD),
+                root: String::from("/"),
+                exec_path,
+                environment: init_envs.clone(),
+                umask: DEFAULT_UMASK,
+                oom_score_adj: 0,
+                cred,
+                keyrings: ProcessKeyrings::default(),
+                user_time: 0,
+                kernel_time: 0,
+                child_user_time: 0,
+                child_kernel_time: 0,
+                accounting_state: CpuAccountingState::Inactive,
+                accounting_timestamp: 0,
+                accounting_start_time_ns: get_realtime_ns(),
+                timens_monotonic_offset_ns: 0,
+                timens_child_monotonic_offset_ns: 0,
+                timens_boottime_offset_ns: 0,
+                timens_child_boottime_offset_ns: 0,
+                netns_loopback_tag: 0,
+                netns_default_tag: 0,
+                itimer_real: ItimerState::default(),
+                itimer_virtual: ItimerState::default(),
+                itimer_prof: ItimerState::default(),
+                robust_list: RobustList { head: 0, len: 0 },
+                shm_attachments: Vec::new(),
+            }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         // create a main thread, we should allocate ustack and trap_cx here
@@ -1091,7 +1126,13 @@ impl ProcessControlBlock {
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
             let old_shm_attachments = core::mem::take(&mut inner.shm_attachments);
-            (old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments)
+            (
+                old_memory_set,
+                old_token,
+                old_mask,
+                cloexec_entries,
+                old_shm_attachments,
+            )
         };
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
@@ -1131,7 +1172,10 @@ impl ProcessControlBlock {
         );
 
         // initialize trap_cx
-        trace!("kernel: exec .. initialize trap_cx with entry={:#x}", final_entry);
+        trace!(
+            "kernel: exec .. initialize trap_cx with entry={:#x}",
+            final_entry
+        );
         let mut trap_cx = TrapContext::app_init_context(
             final_entry,
             user_sp,
@@ -1162,6 +1206,7 @@ impl ProcessControlBlock {
         parent_set_tid: Option<usize>,
         child_set_tid: Option<usize>,
         shared_resources: CloneResourceFlags,
+        exit_signal: u32,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
         let clone_start_ns = get_time_ns();
@@ -1174,7 +1219,7 @@ impl ProcessControlBlock {
                 self.getpid(),
                 parent.thread_count()
             );
-            return Err(ERRNO::EINVAL)
+            return Err(ERRNO::EINVAL);
         }
         debug!(
             "[cow] clone_process begin: parent_pid={} parent_threads={}",
@@ -1186,9 +1231,8 @@ impl ProcessControlBlock {
         let (memory_set, parent_token, parent_mask) = if shared_resources
             .contains(CloneResourceFlags::VM)
         {
-            let memory_set =
-                MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
-                    .map_err(mm_error_to_errno)?;
+            let memory_set = MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
+                .map_err(mm_error_to_errno)?;
             (memory_set, parent.memory_set.token(), 0)
         } else {
             let (memory_set, parent_tlb_needs_flush) =
@@ -1210,7 +1254,11 @@ impl ProcessControlBlock {
         let parent_root = parent.root.clone();
         let parent_exec_path = parent.exec_path.clone();
         let parent_umask = parent.umask;
-        let parent_keyrings = parent.keyrings;
+        let parent_keyrings = ProcessKeyrings {
+            thread: None,
+            process: parent.keyrings.process,
+            session: parent.keyrings.session,
+        };
         let parent_netns_loopback_tag = parent.netns_loopback_tag;
         let parent_netns_default_tag = parent.netns_default_tag;
         let clone_parent_target = if shared_resources.contains(CloneResourceFlags::PARENT) {
@@ -1241,58 +1289,60 @@ impl ProcessControlBlock {
         let child_pcb_start_ns = get_time_ns();
         let child = Arc::new(Self {
             pid,
+            clone_exit_signal: exit_signal,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
-                    is_zombie: false,
-                    memory_set,
-                    vm_layout,
-                    parent: Some(child_parent),
-                    children: Vec::new(),
-                    exit_reason: ExitReason::Exit(0),
-                    clone_shared_resources: shared_resources,
-                    fd_table: new_fd_table,
-                    resource_limits: parent.resource_limits,
-                    pending_signals: SignalBit::empty(),
-                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
-                    signal_actions: parent_signal_actions,
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                    deadlock_enabled: false,
-                    mutex_detector: DeadlockDetector::new(),
-                    semaphore_detector: DeadlockDetector::new(),
-                    cwd: parent_cwd,
-                    root: parent_root,
-                    exec_path: parent_exec_path,
-                    environment: parent.environment.clone(),
-                    umask: parent_umask,
-                    cred,
-                    keyrings: parent_keyrings,
-                    user_time: 0,
-                    kernel_time: 0,
-                    child_user_time: 0,
-                    child_kernel_time: 0,
-                    accounting_state: CpuAccountingState::Inactive,
-                    accounting_timestamp: 0,
-                    accounting_start_time_ns: get_realtime_ns(),
-                    timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
-                    timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
-                    timens_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
-                    timens_child_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
-                    netns_loopback_tag: if shared_resources.contains(CloneResourceFlags::NEWNET) {
-                        parent_netns_default_tag
-                    } else {
-                        parent_netns_loopback_tag
-                    },
-                    netns_default_tag: parent_netns_default_tag,
-                    itimer_real: ItimerState::default(),
-                    itimer_virtual: ItimerState::default(),
-                    itimer_prof: ItimerState::default(),
-                    robust_list: RobustList { head: 0, len: 0 },
-                    shm_attachments: parent_shm_attachments.clone(),
+                is_zombie: false,
+                memory_set,
+                vm_layout,
+                parent: Some(child_parent),
+                children: Vec::new(),
+                exit_reason: ExitReason::Exit(0),
+                clone_shared_resources: shared_resources,
+                fd_table: new_fd_table,
+                resource_limits: parent.resource_limits,
+                pending_signals: SignalBit::empty(),
+                pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
+                signal_actions: parent_signal_actions,
+                tasks: Vec::new(),
+                task_res_allocator: RecycleAllocator::new(),
+                mutex_list: Vec::new(),
+                semaphore_list: Vec::new(),
+                condvar_list: Vec::new(),
+                deadlock_enabled: false,
+                mutex_detector: DeadlockDetector::new(),
+                semaphore_detector: DeadlockDetector::new(),
+                cwd: parent_cwd,
+                root: parent_root,
+                exec_path: parent_exec_path,
+                environment: parent.environment.clone(),
+                umask: parent_umask,
+                oom_score_adj: parent.oom_score_adj,
+                cred,
+                keyrings: parent_keyrings,
+                user_time: 0,
+                kernel_time: 0,
+                child_user_time: 0,
+                child_kernel_time: 0,
+                accounting_state: CpuAccountingState::Inactive,
+                accounting_timestamp: 0,
+                accounting_start_time_ns: get_realtime_ns(),
+                timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
+                timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
+                timens_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
+                timens_child_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
+                netns_loopback_tag: if shared_resources.contains(CloneResourceFlags::NEWNET) {
+                    parent_netns_default_tag
+                } else {
+                    parent_netns_loopback_tag
+                },
+                netns_default_tag: parent_netns_default_tag,
+                itimer_real: ItimerState::default(),
+                itimer_virtual: ItimerState::default(),
+                itimer_prof: ItimerState::default(),
+                robust_list: RobustList { head: 0, len: 0 },
+                shm_attachments: parent_shm_attachments.clone(),
             }),
-            wait_exit_queue: Arc::new(WaitQueue::new())
+            wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
@@ -1323,7 +1373,12 @@ impl ProcessControlBlock {
                 parent_token,
                 parent_mask
             );
-            shootdown(parent_mask, ShootdownKind::AddressSpace { token: parent_token });
+            shootdown(
+                parent_mask,
+                ShootdownKind::AddressSpace {
+                    token: parent_token,
+                },
+            );
         }
         let tlb_shootdown_ns = get_time_ns() - tlb_shootdown_start_ns;
         debug!(
@@ -1333,25 +1388,27 @@ impl ProcessControlBlock {
         );
         // create main thread of child process
         let task_create_start_ns = get_time_ns();
-        let task = child.create_task(
-            parent_ustack_base,
-            // here we do not allocate trap_cx or ustack again
-            // but mention that we allocate a new kstack here
-            false,
-            parent_sched_attr,
-        ).map_err(|err| {
-            if let Some(target_parent) = clone_parent_target.as_ref() {
-                target_parent
-                    .inner_exclusive_access()
-                    .children
-                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
-            } else {
-                self.inner_exclusive_access()
-                    .children
-                    .retain(|candidate| !Arc::ptr_eq(candidate, &child));
-            }
-            mm_error_to_errno(err)
-        })?;
+        let task = child
+            .create_task(
+                parent_ustack_base,
+                // here we do not allocate trap_cx or ustack again
+                // but mention that we allocate a new kstack here
+                false,
+                parent_sched_attr,
+            )
+            .map_err(|err| {
+                if let Some(target_parent) = clone_parent_target.as_ref() {
+                    target_parent
+                        .inner_exclusive_access()
+                        .children
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                } else {
+                    self.inner_exclusive_access()
+                        .children
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &child));
+                }
+                mm_error_to_errno(err)
+            })?;
         let task_create_ns = get_time_ns() - task_create_start_ns;
         // warn_heap_state("fork_after_create_task", child.getpid());
         let finalize_start_ns = get_time_ns();
@@ -1481,7 +1538,11 @@ impl ProcessControlBlock {
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         let mut parent = self.inner_exclusive_access();
         let cred = parent.cred;
-        let parent_keyrings = parent.keyrings;
+        let parent_keyrings = ProcessKeyrings {
+            thread: None,
+            process: parent.keyrings.process,
+            session: parent.keyrings.session,
+        };
         let pid = pid_alloc();
         let mut new_fd_table: Vec<Option<FdEntry>> = Vec::new();
         for fd in parent.fd_table.iter() {
@@ -1493,54 +1554,56 @@ impl ProcessControlBlock {
         }
         let child = Arc::new(Self {
             pid,
+            clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
-                    is_zombie: false,
-                    memory_set,
-                    vm_layout,
-                    parent: Some(Arc::downgrade(self)),
-                    children: Vec::new(),
-                    exit_reason: ExitReason::Exit(0),
-                    clone_shared_resources: CloneResourceFlags::empty(),
-                    fd_table: new_fd_table,
-                    resource_limits: parent.resource_limits,
-                    pending_signals: SignalBit::empty(),
-                    pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
-                    signal_actions: parent.signal_actions.clone(),
-                    tasks: Vec::new(),
-                    task_res_allocator: RecycleAllocator::new(),
-                    mutex_list: Vec::new(),
-                    semaphore_list: Vec::new(),
-                    condvar_list: Vec::new(),
-                    deadlock_enabled: false,
-                    mutex_detector: DeadlockDetector::new(),
-                    semaphore_detector: DeadlockDetector::new(),
-                    cwd: parent.cwd.clone(), // 同fork，继承自父进程
-                    root: parent.root.clone(),
-                    exec_path,
-                    environment: parent.environment.clone(),
-                    umask: parent.umask,
-                    cred,
-                    keyrings: parent_keyrings,
-                    user_time: 0,
-                    kernel_time: 0,
-                    child_user_time: 0,
-                    child_kernel_time: 0,
-                    accounting_state: CpuAccountingState::Inactive,
-                    accounting_timestamp: 0,
-                    accounting_start_time_ns: get_realtime_ns(),
-                    timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
-                    timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
-                    timens_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
-                    timens_child_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
-                    netns_loopback_tag: parent.netns_loopback_tag,
-                    netns_default_tag: parent.netns_default_tag,
-                    itimer_real: ItimerState::default(),
-                    itimer_virtual: ItimerState::default(),
-                    itimer_prof: ItimerState::default(),
-                    robust_list: RobustList { head: 0, len: 0 },
-                    shm_attachments: Vec::new(),
-                }),
-            wait_exit_queue: Arc::new(WaitQueue::new())
+                is_zombie: false,
+                memory_set,
+                vm_layout,
+                parent: Some(Arc::downgrade(self)),
+                children: Vec::new(),
+                exit_reason: ExitReason::Exit(0),
+                clone_shared_resources: CloneResourceFlags::empty(),
+                fd_table: new_fd_table,
+                resource_limits: parent.resource_limits,
+                pending_signals: SignalBit::empty(),
+                pending_siginfo: [SigInfo::default(); MAX_SIG + 1],
+                signal_actions: parent.signal_actions.clone(),
+                tasks: Vec::new(),
+                task_res_allocator: RecycleAllocator::new(),
+                mutex_list: Vec::new(),
+                semaphore_list: Vec::new(),
+                condvar_list: Vec::new(),
+                deadlock_enabled: false,
+                mutex_detector: DeadlockDetector::new(),
+                semaphore_detector: DeadlockDetector::new(),
+                cwd: parent.cwd.clone(), // 同fork，继承自父进程
+                root: parent.root.clone(),
+                exec_path,
+                environment: parent.environment.clone(),
+                umask: parent.umask,
+                oom_score_adj: parent.oom_score_adj,
+                cred,
+                keyrings: parent_keyrings,
+                user_time: 0,
+                kernel_time: 0,
+                child_user_time: 0,
+                child_kernel_time: 0,
+                accounting_state: CpuAccountingState::Inactive,
+                accounting_timestamp: 0,
+                accounting_start_time_ns: get_realtime_ns(),
+                timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
+                timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
+                timens_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
+                timens_child_boottime_offset_ns: parent.timens_child_boottime_offset_ns,
+                netns_loopback_tag: parent.netns_loopback_tag,
+                netns_default_tag: parent.netns_default_tag,
+                itimer_real: ItimerState::default(),
+                itimer_virtual: ItimerState::default(),
+                itimer_prof: ItimerState::default(),
+                robust_list: RobustList { head: 0, len: 0 },
+                shm_attachments: Vec::new(),
+            }),
+            wait_exit_queue: Arc::new(WaitQueue::new()),
         });
         parent.children.push(Arc::clone(&child));
         let parent_task = parent.get_task(0);
@@ -1569,7 +1632,11 @@ impl ProcessControlBlock {
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
-        let user_sp = init_user_stack(child.inner_exclusive_access().get_user_token(), ustack_top, &["spawn"]);
+        let user_sp = init_user_stack(
+            child.inner_exclusive_access().get_user_token(),
+            ustack_top,
+            &["spawn"],
+        );
         *trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
@@ -1746,7 +1813,10 @@ impl ProcessControlBlock {
     /// Remove the attachment whose mapping starts at `addr`.
     pub fn remove_shm_attachment_by_addr(&self, addr: usize) -> Option<ShmAttachment> {
         let mut inner = self.inner.lock();
-        let idx = inner.shm_attachments.iter().position(|entry| entry.addr == addr)?;
+        let idx = inner
+            .shm_attachments
+            .iter()
+            .position(|entry| entry.addr == addr)?;
         Some(inner.shm_attachments.remove(idx))
     }
 
@@ -1763,10 +1833,7 @@ impl ProcessControlBlock {
     }
 
     /// 处理当前进程的私有页写时复制缺页。
-    pub fn handle_private_cow_fault(
-        &self,
-        fault_addr: usize,
-    ) -> Result<PageFaultHandled, MmError> {
+    pub fn handle_private_cow_fault(&self, fault_addr: usize) -> Result<PageFaultHandled, MmError> {
         let (handled, reclaim) = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
@@ -2231,5 +2298,4 @@ impl ProcessControlBlock {
 
         pending
     }
-
 }
