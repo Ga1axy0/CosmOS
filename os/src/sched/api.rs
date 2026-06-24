@@ -10,6 +10,7 @@ use crate::sched::CFS_YIELD_PENALTY_NS;
 use crate::task::{ReschedReason, SchedPolicy, TaskStatus, WaitReason};
 use crate::timer::{get_time, get_time_ns};
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 fn suspend_current_and_run_next_inner(
     apply_cfs_yield_penalty: bool,
@@ -76,7 +77,16 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         if matches!(task_inner.task_status, TaskStatus::Runnable) {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
-            task_inner.sched.on_cpu = true;
+            task.on_cpu.store(true, Ordering::Relaxed);
+            #[cfg(feature = "sched_invariant_checks")]
+            assert!(
+                !task_inner.sched.on_rq,
+                "[sched-inv] block_current race on hart {}: task is Runnable here but on_rq=true \
+                 — a remote wakeup enqueued us while we were still current, because \
+                 take_current_task() had already cleared processor.current before we committed \
+                 to not switching. This is the SMP wake/block race.",
+                crate::hal::hartid(),
+            );
             task_inner.sched.on_rq = false;
             task_inner.sched.resched_reason = None;
             None

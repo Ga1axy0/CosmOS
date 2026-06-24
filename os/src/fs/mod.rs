@@ -21,20 +21,83 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-pub use fs::vfs::{InodeTime, VfsFileType};
-use fs::{errno::FS_ERRNO, Inode};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::timer::get_time_us;
+use fs::{
+    dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode,
+    InodeCacheStats,
+};
 use lazy_static::*;
+pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
-    discard_inode, mapping_for_inode, mark_cached_page_dirty, reclaim_if_needed,
-    release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
-    sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PAGE_CACHE_MANAGER,
+    discard_inode, mapping_for_inode, reclaim_if_needed,
+    page_cache_stats,
+    sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
+    sync_inode_range, truncate_inode, CachePage, PageCacheStats, mark_cached_page_dirty,
+    release_mapped_page, retain_mapped_page, PAGE_CACHE_MANAGER,
 };
 
-fn encode_dirent64_records(
-    entries: &[(String, VfsFileType)],
-    offset: usize,
-    buf: &mut [u8],
-) -> usize {
+/// Cumulative directory-iteration counters used by `/proc/mm_perf`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetdentsPerfCounters {
+    /// Number of `getdents64` calls serviced by the kernel.
+    pub calls: usize,
+    /// Total bytes returned across all `getdents64` calls.
+    pub bytes: usize,
+    /// Total time spent inside kernel-side directory iteration paths.
+    pub total_us: usize,
+    /// Number of times a full directory snapshot (`inode.ls()`) was rebuilt.
+    pub dir_snapshots: usize,
+    /// Sum of directory entry counts observed across those rebuilds.
+    pub dir_snapshot_entries: usize,
+    /// Total time spent rebuilding directory snapshots.
+    pub dir_snapshot_us: usize,
+}
+
+static GETDENTS_CALLS: AtomicUsize = AtomicUsize::new(0);
+static GETDENTS_BYTES: AtomicUsize = AtomicUsize::new(0);
+static GETDENTS_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+static DIR_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DIR_SNAPSHOT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static DIR_SNAPSHOT_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn record_getdents_perf(bytes: usize, elapsed_us: usize) {
+    GETDENTS_CALLS.fetch_add(1, Ordering::Relaxed);
+    GETDENTS_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    GETDENTS_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_dir_snapshot_perf(entries: usize, elapsed_us: usize) {
+    DIR_SNAPSHOT_CALLS.fetch_add(1, Ordering::Relaxed);
+    DIR_SNAPSHOT_ENTRIES.fetch_add(entries, Ordering::Relaxed);
+    DIR_SNAPSHOT_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
+
+/// Return cumulative directory-iteration counters for `/proc/mm_perf`.
+pub fn getdents_perf_counters() -> GetdentsPerfCounters {
+    GetdentsPerfCounters {
+        calls: GETDENTS_CALLS.load(Ordering::Relaxed),
+        bytes: GETDENTS_BYTES.load(Ordering::Relaxed),
+        total_us: GETDENTS_TOTAL_US.load(Ordering::Relaxed),
+        dir_snapshots: DIR_SNAPSHOT_CALLS.load(Ordering::Relaxed),
+        dir_snapshot_entries: DIR_SNAPSHOT_ENTRIES.load(Ordering::Relaxed),
+        dir_snapshot_us: DIR_SNAPSHOT_TOTAL_US.load(Ordering::Relaxed),
+    }
+}
+
+/// Return the current global dentry-cache footprint for `/proc/mm_perf`.
+pub fn dentry_perf_counters() -> DentryCacheStats {
+    dentry_cache_stats()
+}
+
+/// Return the current global inode-cache footprint for `/proc/mm_perf`.
+pub fn inode_perf_counters() -> InodeCacheStats {
+    inode_cache_stats()
+}
+
+fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {
     let mut written = 0usize;
 
     for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
@@ -473,11 +536,18 @@ impl FileDescription {
 
     /// 读取目录项并推进共享目录位置。
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
+        let start_us = get_time_us();
         let mut inner = self.inner.lock();
         let read_size = if self.file.is_dir() {
             if let Some(inode) = self.as_inode() {
                 if inner.offset == 0 || inner.dirent_snapshot.is_none() {
-                    inner.dirent_snapshot = Some(inode.ls());
+                    let snapshot_start_us = get_time_us();
+                    let snapshot = inode.ls();
+                    record_dir_snapshot_perf(
+                        snapshot.len(),
+                        get_time_us().saturating_sub(snapshot_start_us),
+                    );
+                    inner.dirent_snapshot = Some(snapshot);
                 }
                 encode_dirent64_records(
                     inner.dirent_snapshot.as_ref().unwrap().as_slice(),
@@ -490,6 +560,7 @@ impl FileDescription {
         } else {
             self.file.getdents64(inner.offset, buf)
         };
+        record_getdents_perf(read_size, get_time_us().saturating_sub(start_us));
         if read_size == 0 {
             return 0;
         }

@@ -47,6 +47,19 @@ impl InodeCacheManager {
     }
 }
 
+/// Snapshot of the global inode cache state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InodeCacheStats {
+    /// Number of live stable in-memory inode entries.
+    pub entries: usize,
+    /// Number of queued CLOCK candidates, including duplicate keys.
+    pub inactive_entries: usize,
+    /// Entry-count threshold that starts eviction.
+    pub high_watermark: usize,
+    /// Entry-count threshold that stops eviction.
+    pub low_watermark: usize,
+}
+
 lazy_static! {
     /// 全局 inode cache，强持有近期使用过的稳定内存 inode。
     static ref INODE_CACHE: Mutex<InodeCacheManager> = Mutex::new(InodeCacheManager::new());
@@ -188,5 +201,16 @@ fn cache_key_of(node: &dyn VfsNode) -> Option<InodeCacheKey> {
         None
     } else {
         Some(InodeCacheKey { fs_id, ino })
+    }
+}
+
+/// Return the current global inode-cache footprint and queue depths.
+pub fn inode_cache_stats() -> InodeCacheStats {
+    let cache = INODE_CACHE.lock();
+    InodeCacheStats {
+        entries: cache.table.len(),
+        inactive_entries: cache.inactive.len(),
+        high_watermark: cache.high_watermark,
+        low_watermark: cache.low_watermark,
     }
 }

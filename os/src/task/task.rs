@@ -12,6 +12,7 @@ use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicBool;
 
 const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
@@ -30,8 +31,6 @@ pub const fn all_cpu_affinity_mask() -> usize {
 pub struct TaskSchedState {
     /// Last hart that ran this task.
     pub last_cpu: usize,
-    /// Whether the task is currently running on a CPU.
-    pub on_cpu: bool,
     /// Whether the task is currently queued on a runqueue.
     pub on_rq: bool,
     /// Current scheduling policy.
@@ -85,7 +84,6 @@ impl TaskSchedState {
     pub fn new(sched_attr: SchedAttr) -> Self {
         Self {
             last_cpu: 0,
-            on_cpu: false,
             on_rq: false,
             policy: sched_attr.policy,
             linux_policy: sched_attr.linux_policy,
@@ -144,6 +142,12 @@ pub struct TaskControlBlock {
     pub kstack: KernelStack,
     /// mutable
     inner: SpinNoIrqLock<TaskControlBlockInner>,
+    /// Whether this task is currently running on a CPU. A lock-free atomic so a
+    /// remote waker can observe the post-context-switch clear without taking the
+    /// inner lock. Written `Release` by the post-switch cleanup after the task's
+    /// registers are saved; a remote waker spins on it with `Acquire`. All other
+    /// accesses are under the inner lock and use `Relaxed`.
+    pub on_cpu: AtomicBool,
 }
 
 impl TaskControlBlock {
@@ -260,6 +264,7 @@ impl TaskControlBlock {
         let task = Self {
             process: Arc::downgrade(&process),
             kstack,
+            on_cpu: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -306,6 +311,7 @@ impl TaskControlBlock {
         Ok(Self {
             process: Arc::downgrade(&process),
             kstack,
+            on_cpu: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: None,
                 trap_cx_ppn: PhysPageNum(0),

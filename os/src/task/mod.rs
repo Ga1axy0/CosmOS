@@ -215,7 +215,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
     task_inner.task_status = TaskStatus::Zombie;
-    task_inner.sched.on_cpu = false;
+    task.on_cpu.store(false, Ordering::Relaxed);
     task_inner.sched.on_rq = false;
     task_inner.sched.resched_reason = None;
     task_inner.clear_child_tid = 0;
@@ -384,7 +384,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 task_inner.sched.resched_reason = Some(ReschedReason::HigherRtPriority);
                 (
                     task_inner.res.as_ref().map(|res| res.thread_id()),
-                    task_inner.sched.on_cpu,
+                    task.on_cpu.load(Ordering::Relaxed),
                     task_inner.sched.last_cpu,
                     task_inner.current_wq_handle.take(),
                 )
@@ -409,7 +409,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             trace!("kernel: exit_current_and_run_next .. remove_inactive_task");
             remove_inactive_task(Arc::clone(&task));
             let mut task_inner = task.inner_exclusive_access();
-            task_inner.sched.on_cpu = false;
+            task.on_cpu.store(false, Ordering::Relaxed);
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
@@ -423,7 +423,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
         while running_tasks
             .iter()
-            .any(|task| task.inner_exclusive_access().sched.on_cpu)
+            .any(|task| task.on_cpu.load(Ordering::Acquire))
         {
             core::hint::spin_loop();
         }
@@ -434,7 +434,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 if let Some(res) = task_inner.res.take() {
                     recycle_res.push(res);
                 }
-                task_inner.sched.on_cpu = false;
+                task.on_cpu.store(false, Ordering::Relaxed);
                 task_inner.sched.on_rq = false;
             }
         }
@@ -786,7 +786,7 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
                 tid,
                 task_inner.task_status,
                 task_inner.wait_reason,
-                task_inner.sched.on_cpu,
+                task.on_cpu.load(Ordering::Relaxed),
                 task_inner.sched.on_rq,
                 task_inner.sched.last_cpu,
                 task_inner.current_wq_handle.is_some(),

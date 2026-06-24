@@ -14,6 +14,7 @@ use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus
 use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use core::array;
 use lazy_static::*;
 
@@ -54,6 +55,13 @@ impl Processor {
         self.current = Some(task);
     }
 
+    /// Identity of the current task on this hart for the debug invariant
+    /// checker (raw pointer value, no refcount bump).
+    #[cfg(feature = "sched_invariant_checks")]
+    pub(super) fn current_ptr(&self) -> Option<usize> {
+        self.current.as_ref().map(|t| Arc::as_ptr(t) as usize)
+    }
+
     fn set_pending_task_release(&mut self, task: Arc<TaskControlBlock>) {
         assert!(self.pending_task_release.is_none());
         self.pending_task_release = Some(task);
@@ -88,6 +96,10 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
 pub(crate) fn run_tasks() {
     loop {
+        #[cfg(feature = "sched_invariant_checks")]
+        if crate::hal::hartid() == 0 {
+            crate::sched::check_sched_invariants();
+        }
         // Drop any stopped-task reference left by the previous exit on this hart.
         // The previous task's kernel stack is now guaranteed unused.
         super::clear_stopping_task();
@@ -107,7 +119,7 @@ pub(crate) fn run_tasks() {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
             task_inner.sched.last_cpu = hartid();
-            task_inner.sched.on_cpu = true;
+            task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.on_rq = false;
             task_inner.sched.resched_reason = None;
             if matches!(task_inner.sched.policy, SchedPolicy::Other) {
@@ -156,7 +168,10 @@ fn finish_pending_task_release() {
     };
     let should_requeue = {
         let mut task_inner = task.inner_exclusive_access();
-        task_inner.sched.on_cpu = false;
+        // Post-switch: the task's registers are now safely saved. Publish
+        // on_cpu=false with Release so any remote waker that observes it via
+        // an Acquire load can safely enqueue and switch into this task.
+        task.on_cpu.store(false, Ordering::Release);
         task_inner.sched.on_rq = false;
         matches!(task_inner.task_status, TaskStatus::Runnable)
     };

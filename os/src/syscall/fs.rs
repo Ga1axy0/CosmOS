@@ -3915,15 +3915,7 @@ pub fn sys_getdents64(fd: u32, buf: *mut u8, count: usize) -> isize {
         let desc = get_file_description(fd)?;
         // Fill a kernel-side temporary buffer …
         let mut tmp: Vec<u8> = vec![0; count];
-        let start = get_time_us();
         let bytes = desc.getdents64(&mut tmp);
-        let end = get_time_us();
-        debug!(
-            "sys_getdents64: fd={}, count={}, time_us={}",
-            fd,
-            count,
-            end - start
-        );
         if bytes == 0 {
             return Ok(0);
         }

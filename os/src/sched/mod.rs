@@ -37,4 +37,6 @@ pub(crate) use runqueue::{
     enqueue_task_on, has_runnable_task_at_or_above, insert_into_pid2process, list_pids,
     pick_next_task, pid2process, remove_from_pid2process, remove_task, resched_hart, PID2PCB,
 };
+#[cfg(feature = "sched_invariant_checks")]
+pub(crate) use runqueue::check_sched_invariants;
 pub use switch::__switch;

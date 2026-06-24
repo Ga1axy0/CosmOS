@@ -125,6 +125,19 @@ impl DentryCache {
     }
 }
 
+/// Snapshot of the global dentry cache state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DentryCacheStats {
+    /// Number of live `(parent, name) -> child` cache entries.
+    pub entries: usize,
+    /// Number of queued CLOCK candidates, including stale duplicates.
+    pub inactive_entries: usize,
+    /// Entry-count threshold that starts eviction.
+    pub high_watermark: usize,
+    /// Entry-count threshold that stops eviction.
+    pub low_watermark: usize,
+}
+
 lazy_static! {
     static ref DENTRY_CACHE: Mutex<DentryCache> = Mutex::new(DentryCache::new());
 }
@@ -146,4 +159,15 @@ pub fn insert_dentry(fs_id: u64, parent_ino: u64, name: &str, child: &Arc<Inode>
 /// Explicitly invalidate a dentry (unlink / rmdir / rename).
 pub fn remove_dentry(fs_id: u64, parent_ino: u64, name: &str) {
     DENTRY_CACHE.lock().remove(fs_id, parent_ino, name)
+}
+
+/// Return the current global dentry-cache footprint and queue depths.
+pub fn dentry_cache_stats() -> DentryCacheStats {
+    let cache = DENTRY_CACHE.lock();
+    DentryCacheStats {
+        entries: cache.table.len(),
+        inactive_entries: cache.inactive.len(),
+        high_watermark: cache.high_watermark,
+        low_watermark: cache.low_watermark,
+    }
 }
