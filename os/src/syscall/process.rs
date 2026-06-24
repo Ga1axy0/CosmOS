@@ -988,7 +988,7 @@ impl CloneRequest {
         }
         if args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
             warn!("kernel: sys_clone3 unsupported pidfd/set_tid/cgroup fields");
-            return Err(ERRNO::EINVAL);
+            return Err(ERRNO::ENOSYS);
         }
         let exit_signal = args.exit_signal as usize;
         if exit_signal != 0 && exit_signal != CLONE_EXIT_SIGNAL_SIGCHLD {
