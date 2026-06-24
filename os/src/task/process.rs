@@ -261,6 +261,8 @@ pub struct ProcessControlBlockInner {
     pub environment: Vec<String>,
     /// process file creation mask (`umask`)
     pub umask: u32,
+    /// Linux-compatible OOM killer score adjustment exposed via `/proc/<pid>/oom_score_adj`.
+    pub oom_score_adj: i32,
     /// process credentials
     pub cred: Credentials,
     /// lazily created special keyrings visible through `add_key/keyctl`
@@ -897,6 +899,16 @@ impl ProcessControlBlock {
         self.inner.lock().timens_child_boottime_offset_ns
     }
 
+    /// Read the Linux-compatible OOM score adjustment.
+    pub fn oom_score_adj(&self) -> i32 {
+        self.inner.lock().oom_score_adj
+    }
+
+    /// Update the Linux-compatible OOM score adjustment.
+    pub fn set_oom_score_adj(&self, value: i32) {
+        self.inner.lock().oom_score_adj = value;
+    }
+
     /// Read the lightweight loopback network namespace tag.
     pub fn netns_loopback_tag(&self) -> u32 {
         self.inner.lock().netns_loopback_tag
@@ -994,6 +1006,7 @@ impl ProcessControlBlock {
                     exec_path,
                     environment: init_envs.clone(),
                     umask: DEFAULT_UMASK,
+                    oom_score_adj: 0,
                     cred,
                     keyrings: ProcessKeyrings::default(),
                     user_time: 0,
@@ -1267,6 +1280,7 @@ impl ProcessControlBlock {
                     exec_path: parent_exec_path,
                     environment: parent.environment.clone(),
                     umask: parent_umask,
+                    oom_score_adj: parent.oom_score_adj,
                     cred,
                     keyrings: parent_keyrings,
                     user_time: 0,
@@ -1519,6 +1533,7 @@ impl ProcessControlBlock {
                     exec_path,
                     environment: parent.environment.clone(),
                     umask: parent.umask,
+                    oom_score_adj: parent.oom_score_adj,
                     cred,
                     keyrings: parent_keyrings,
                     user_time: 0,

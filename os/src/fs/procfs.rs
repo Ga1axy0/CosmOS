@@ -134,6 +134,11 @@ fn parse_proc_usize(buf: &[u8]) -> Result<usize, FS_ERRNO> {
     text.parse::<usize>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
+fn parse_proc_i32(buf: &[u8]) -> Result<i32, FS_ERRNO> {
+    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    text.parse::<i32>().map_err(|_| FS_ERRNO::EINVAL)
+}
+
 fn parse_proc_bool(buf: &[u8]) -> Result<bool, FS_ERRNO> {
     match parse_proc_u32(buf)? {
         0 => Ok(false),
@@ -1733,6 +1738,7 @@ impl VfsNode for ProcPidDirNode {
             (String::from("setgroups"), VfsFileType::Regular),
             (String::from("uid_map"), VfsFileType::Regular),
             (String::from("gid_map"), VfsFileType::Regular),
+            (String::from("oom_score_adj"), VfsFileType::Regular),
         ]
     }
 
@@ -1751,6 +1757,7 @@ impl VfsNode for ProcPidDirNode {
             }
             "uid_map" => Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::UidMap)) as Arc<dyn VfsNode>),
             "gid_map" => Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::GidMap)) as Arc<dyn VfsNode>),
+            "oom_score_adj" => Some(Arc::new(ProcPidOomScoreAdjNode::new(self.pid)) as Arc<dyn VfsNode>),
             _ => None,
         }
     }
@@ -1882,6 +1889,88 @@ impl VfsNode for ProcPidTimensOffsetsNode {
             _ => return 0,
         }
         buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/<pid>/oom_score_adj` node.
+#[derive(Debug)]
+struct ProcPidOomScoreAdjNode {
+    pid: usize,
+}
+
+impl ProcPidOomScoreAdjNode {
+    fn new(pid: usize) -> Self {
+        Self { pid }
+    }
+
+    fn content(&self) -> Result<String, FS_ERRNO> {
+        let process = pid2process(self.pid).ok_or(FS_ERRNO::ENOENT)?;
+        Ok(alloc::format!("{}\n", process.oom_score_adj()))
+    }
+}
+
+impl VfsNode for ProcPidOomScoreAdjNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        self.content().map(|data| data.len()).unwrap_or(0)
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.content()
+            .map(|data| read_string_at(data, offset, buf))
+            .unwrap_or(0)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        self.write_at_result(offset, buf).unwrap_or(0)
+    }
+
+    fn write_at_result(&self, _offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        let value = parse_proc_i32(buf)?;
+        if !(-1000..=1000).contains(&value) {
+            return Err(FS_ERRNO::EINVAL);
+        }
+        let process = pid2process(self.pid).ok_or(FS_ERRNO::ENOENT)?;
+        process.set_oom_score_adj(value);
+        Ok(buf.len())
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
