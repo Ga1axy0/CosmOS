@@ -49,9 +49,18 @@ pub fn get_time_us() -> usize {
     get_time() * MICRO_PER_SEC / CLOCK_FREQ
 }
 
+/// Convert a raw platform timer counter value to nanoseconds.
+pub fn raw_time_to_ns(raw_time: usize) -> u64 {
+    if NSEC_PER_SEC as usize % CLOCK_FREQ == 0 {
+        (raw_time as u64).saturating_mul((NSEC_PER_SEC as usize / CLOCK_FREQ) as u64)
+    } else {
+        ((raw_time as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+    }
+}
+
 /// 获取当前单调时间，单位为纳秒。
 pub fn get_time_ns() -> u64 {
-    ((get_time() as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+    raw_time_to_ns(get_time())
 }
 
 /// 使用“当前单调时间 + 实时时钟偏移”得到 `CLOCK_REALTIME`，单位为纳秒。
@@ -192,7 +201,14 @@ fn timer_task_ids(task: &Arc<TaskControlBlock>) -> (usize, usize, usize) {
 
 /// Add a timer with an absolute monotonic deadline in nanoseconds.
 pub fn add_timer_ns(expire_ns: u64, task: Arc<TaskControlBlock>) {
-    add_timer_with_tag(expire_ns, task, None);
+    add_timer_with_tag_inner(expire_ns, task, None, true);
+}
+
+/// Add a non-futex timer for the currently running task after the caller has
+/// already published the sleep state. This skips the generic target-hart lookup
+/// because the current task must arm its sleep timer on the current hart.
+pub(crate) fn add_current_timer_ns_preflagged(expire_ns: u64, task: Arc<TaskControlBlock>) {
+    add_timer_with_tag_on_hart(expire_ns, task, None, false, normalize_hart(hartid()));
 }
 
 /// Add a timer with an optional poll timeout identity.
@@ -245,72 +261,100 @@ fn add_timer_with_tag(
     task: Arc<TaskControlBlock>,
     timer_tag: Option<TimerTagKind>,
 ) {
-    trace!(
-        "kernel:pid[{}] add_timer",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    if !matches!(timer_tag, Some(TimerTagKind::Futex(_))) {
-        task.inner_exclusive_access().may_have_non_futex_timer = true;
-    }
-    let target_hart = timer_hart_for_task(&task);
-    let mut timers = PER_CPU_TIMERS[target_hart].lock();
-    timers.push(TimerCondVar {
+    add_timer_with_tag_inner(
         expire_ns,
         task,
         timer_tag,
+        !matches!(timer_tag, Some(TimerTagKind::Futex(_))),
+    );
+}
+
+fn add_timer_with_tag_inner(
+    expire_ns: u64,
+    task: Arc<TaskControlBlock>,
+    timer_tag: Option<TimerTagKind>,
+    mark_non_futex_timer: bool,
+) {
+    let target_hart = timer_hart_for_task(&task);
+    add_timer_with_tag_on_hart(expire_ns, task, timer_tag, mark_non_futex_timer, target_hart);
+}
+
+fn add_timer_with_tag_on_hart(
+    expire_ns: u64,
+    task: Arc<TaskControlBlock>,
+    timer_tag: Option<TimerTagKind>,
+    mark_non_futex_timer: bool,
+    target_hart: usize,
+) {
+    crate::probe!("timer.add", {
+        trace!(
+            "kernel:pid[{}] add_timer",
+            current_task().unwrap().process.upgrade().unwrap().getpid()
+        );
+        if mark_non_futex_timer {
+            task.inner_exclusive_access().may_have_non_futex_timer = true;
+        }
+        let mut timers = PER_CPU_TIMERS[target_hart].lock();
+        timers.push(TimerCondVar {
+            expire_ns,
+            task,
+            timer_tag,
+        });
+        drop(timers);
+        if target_hart == normalize_hart(hartid()) {
+            program_next_trigger_for_hart(target_hart, get_time());
+        }
     });
-    drop(timers);
-    if target_hart == normalize_hart(hartid()) {
-        program_next_trigger_for_hart(target_hart, get_time());
-    }
 }
 
 /// Remove a timer
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
-    let start_ns = get_time_ns();
-    let (pid, tid, thread_id) = timer_task_ids(&task);
-    let mut scanned = 0usize;
-    let mut removed = 0usize;
-    let mut removed_futex = 0usize;
-    let mut removed_other = 0usize;
-    let mut touched_harts = 0usize;
-    for timers in PER_CPU_TIMERS.iter() {
-        let mut timers = timers.lock();
-        if !timers.is_empty() {
-            touched_harts += 1;
-        }
-        let mut temp = BinaryHeap::<TimerCondVar>::new();
-        for condvar in timers.drain() {
-            scanned += 1;
-            if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
-                temp.push(condvar);
-            } else {
-                removed += 1;
-                if matches!(condvar.timer_tag, Some(TimerTagKind::Futex(_))) {
-                    removed_futex += 1;
+    crate::probe!("timer.remove", {
+        let start_ns = get_time_ns();
+        let (pid, tid, thread_id) = timer_task_ids(&task);
+        let mut scanned = 0usize;
+        let mut removed = 0usize;
+        let mut removed_futex = 0usize;
+        let mut removed_other = 0usize;
+        let mut touched_harts = 0usize;
+        for timers in PER_CPU_TIMERS.iter() {
+            let mut timers = timers.lock();
+            if !timers.is_empty() {
+                touched_harts += 1;
+            }
+            let mut temp = BinaryHeap::<TimerCondVar>::new();
+            for condvar in timers.drain() {
+                scanned += 1;
+                if Arc::as_ptr(&task) != Arc::as_ptr(&condvar.task) {
+                    temp.push(condvar);
                 } else {
-                    removed_other += 1;
+                    removed += 1;
+                    if matches!(condvar.timer_tag, Some(TimerTagKind::Futex(_))) {
+                        removed_futex += 1;
+                    } else {
+                        removed_other += 1;
+                    }
                 }
             }
+            timers.clear();
+            timers.append(&mut temp);
         }
-        timers.clear();
-        timers.append(&mut temp);
-    }
-    let total_ns = get_time_ns().saturating_sub(start_ns);
-    if total_ns >= 100_000 || removed != 0 {
-        debug!(
-            "[timer-remove] pid={} tid={} thread_id={} total_ns={} scanned={} removed={} removed_futex={} removed_other={} touched_harts={}",
-            pid,
-            tid,
-            thread_id,
-            total_ns,
-            scanned,
-            removed,
-            removed_futex,
-            removed_other,
-            touched_harts,
-        );
-    }
+        let total_ns = get_time_ns().saturating_sub(start_ns);
+        if total_ns >= 100_000 || removed != 0 {
+            debug!(
+                "[timer-remove] pid={} tid={} thread_id={} total_ns={} scanned={} removed={} removed_futex={} removed_other={} touched_harts={}",
+                pid,
+                tid,
+                thread_id,
+                total_ns,
+                scanned,
+                removed,
+                removed_futex,
+                removed_other,
+                touched_harts,
+            );
+        }
+    });
 }
 
 fn next_timer_deadline_ns_for_hart(hart: usize) -> Option<u64> {
@@ -345,52 +389,54 @@ pub fn check_timer() {
 }
 
 fn check_timer_expired(current_ns: u64) {
-    let mut timers = PER_CPU_TIMERS[normalize_hart(hartid())].lock();
-    while let Some(timer) = timers.peek() {
-        if timer.expire_ns <= current_ns {
-            if let Some(tag) = timer.timer_tag {
-                match tag {
-                    TimerTagKind::Poll(poll_tag) => {
-                        if poll::handle_poll_timeout(poll_tag, &timer.task) {
-                            timers.pop();
-                        }
-                    }
-                    TimerTagKind::Signal(signal_tag) => {
-                        if handle_signal_wait_timeout(signal_tag, &timer.task) {
-                            timers.pop();
-                        }
-                    }
-                    TimerTagKind::Futex(futex_tag) => {
-                        if handle_futex_wait_timeout(futex_tag, &timer.task) {
-                            timers.pop();
-                        }
-                    }
-                    TimerTagKind::Socket(socket_tag) => {
-                        if handle_socket_wait_timeout(socket_tag, &timer.task) {
-                            timers.pop();
-                        }
-                    }
-                    TimerTagKind::PosixSignal(signum) => {
-                        if let Some(signal) = SignalBit::from_signum(signum as u32) {
-                            if let Some(process) = timer.task.process.upgrade() {
-                                add_signal_to_process(&process, signal);
+    crate::probe!("timer.check_expired", {
+        let mut timers = PER_CPU_TIMERS[normalize_hart(hartid())].lock();
+        while let Some(timer) = timers.peek() {
+            if timer.expire_ns <= current_ns {
+                if let Some(tag) = timer.timer_tag {
+                    match tag {
+                        TimerTagKind::Poll(poll_tag) => {
+                            if poll::handle_poll_timeout(poll_tag, &timer.task) {
+                                timers.pop();
                             }
                         }
-                        timers.pop();
+                        TimerTagKind::Signal(signal_tag) => {
+                            if handle_signal_wait_timeout(signal_tag, &timer.task) {
+                                timers.pop();
+                            }
+                        }
+                        TimerTagKind::Futex(futex_tag) => {
+                            if handle_futex_wait_timeout(futex_tag, &timer.task) {
+                                timers.pop();
+                            }
+                        }
+                        TimerTagKind::Socket(socket_tag) => {
+                            if handle_socket_wait_timeout(socket_tag, &timer.task) {
+                                timers.pop();
+                            }
+                        }
+                        TimerTagKind::PosixSignal(signum) => {
+                            if let Some(signal) = SignalBit::from_signum(signum as u32) {
+                                if let Some(process) = timer.task.process.upgrade() {
+                                    add_signal_to_process(&process, signal);
+                                }
+                            }
+                            timers.pop();
+                        }
                     }
+                    continue;
                 }
-                continue;
+                // 如果任务还没真正进入睡眠态（例如仍处于 Running），跨 hart 的提前检查可能先看到它。
+                // 此时唤醒不成功，但仍然要保留 timer，等下一次 tick 再尝试。
+                // 这种情形应该较少，且最多损失一个时间片，是可以接受的。
+                if wakeup_task(Arc::clone(&timer.task)) {
+                    timers.pop();
+                }
+            } else {
+                break;
             }
-            // 如果任务还没真正进入睡眠态（例如仍处于 Running），跨 hart 的提前检查可能先看到它。
-            // 此时唤醒不成功，但仍然要保留 timer，等下一次 tick 再尝试。
-            // 这种情形应该较少，且最多损失一个时间片，是可以接受的。
-            if wakeup_task(Arc::clone(&timer.task)) {
-                timers.pop();
-            }
-        } else {
-            break;
         }
-    }
+    });
 }
 
 /// Handle one supervisor timer interrupt on the current hart.
@@ -398,24 +444,26 @@ fn check_timer_expired(current_ns: u64) {
 /// Returns whether the periodic scheduler/accounting tick fired as part of
 /// this interrupt.
 pub fn handle_timer_interrupt() -> bool {
-    let hart = normalize_hart(hartid());
-    let now_raw = get_time() as u64;
-    let current_ns = get_time_ns();
-    check_timer_expired(current_ns);
+    crate::probe!("timer.interrupt", {
+        let hart = normalize_hart(hartid());
+        let now_raw = get_time() as u64;
+        let current_ns = get_time_ns();
+        check_timer_expired(current_ns);
 
-    let periodic_fired = {
-        let mut next_periodic = PER_CPU_NEXT_PERIODIC_TICK[hart].lock();
-        if now_raw < *next_periodic {
-            false
-        } else {
-            let interval = PERIODIC_TICK_INTERVAL.max(1);
-            while now_raw >= *next_periodic {
-                *next_periodic = next_periodic.saturating_add(interval);
+        let periodic_fired = {
+            let mut next_periodic = PER_CPU_NEXT_PERIODIC_TICK[hart].lock();
+            if now_raw < *next_periodic {
+                false
+            } else {
+                let interval = PERIODIC_TICK_INTERVAL.max(1);
+                while now_raw >= *next_periodic {
+                    *next_periodic = next_periodic.saturating_add(interval);
+                }
+                true
             }
-            true
-        }
-    };
+        };
 
-    program_next_trigger_for_hart(hart, now_raw as usize);
-    periodic_fired
+        program_next_trigger_for_hart(hart, now_raw as usize);
+        periodic_fired
+    })
 }

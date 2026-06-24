@@ -6,7 +6,7 @@ use super::WaitQueue;
 use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
 use super::{pid_alloc, PidHandle};
 use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
-use crate::config::{CLOCK_FREQ, PAGE_SIZE};
+use crate::config::PAGE_SIZE;
 use crate::fs::{
     canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription,
     OpenFlags,
@@ -23,7 +23,7 @@ use crate::sched::insert_into_pid2process;
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
-use crate::timer::{get_realtime_ns, get_time_ns};
+use crate::timer::{get_realtime_ns, get_time_ns, raw_time_to_ns};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -31,8 +31,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// 每秒对应的纳秒数。
-const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
 
@@ -378,7 +376,7 @@ fn itimer_account_disarm() {
 
 #[inline]
 fn raw_counter_to_ns(raw: usize) -> u64 {
-    ((raw as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+    raw_time_to_ns(raw)
 }
 
 #[inline]

@@ -41,7 +41,7 @@ fn pte_allows_user_access(pte: crate::mm::PageTableEntry, access: PageFaultAcces
 ///
 /// 同时检查最终 PTE 是否具备用户态访问权限，避免内核 copyin/copyout 绕过
 /// 用户页保护语义。
-fn prefault_user_pages(
+pub(crate) fn prefault_user_pages(
     process: &Arc<ProcessControlBlock>,
     token: usize,
     ptr: *const u8,

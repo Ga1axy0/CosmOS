@@ -19,7 +19,10 @@ use crate::task::{
 };
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
-use crate::timer::{add_timer_ns, add_timer_with_poll_tag, get_realtime_ns, get_time_ns, get_time_us};
+use crate::timer::{
+    add_current_timer_ns_preflagged, add_timer_with_poll_tag, get_realtime_ns, get_time_ns,
+    get_time_us,
+};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec::Vec, vec};
@@ -1343,8 +1346,9 @@ where
                     let mut task_inner = task.inner_exclusive_access();
                     task_inner.task_status = TaskStatus::Interruptible;
                     task_inner.wait_reason = Some(WaitReason::Poll);
+                    task_inner.may_have_non_futex_timer = true;
                 }
-                add_timer_ns(sleep_until_ns, Arc::clone(&task));
+                add_current_timer_ns_preflagged(sleep_until_ns, Arc::clone(&task));
                 block_current_and_run_next(WaitReason::Poll);
                 continue;
             }

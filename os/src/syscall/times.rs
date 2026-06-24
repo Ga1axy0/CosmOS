@@ -5,6 +5,7 @@ use crate::signal::{has_interrupting_signal, SignalBit};
 use crate::sync::SpinNoIrqLock;
 use crate::timer::{add_timer_with_posix_signal_tag, set_realtime_offset_from_time_ns};
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, Ordering};
 use lazy_static::lazy_static;
 use crate::{
@@ -12,8 +13,8 @@ use crate::{
     sched::block_current_and_run_next,
     task::{current_process, current_task, TaskStatus, WaitReason},
     timer::{
-        add_timer_ns, get_realtime_ns, get_time, get_time_ns, get_time_ticks, time_to_ticks,
-        TICKS_PER_SEC,
+        add_current_timer_ns_preflagged, get_realtime_ns, get_time, get_time_ns, get_time_ticks,
+        raw_time_to_ns, time_to_ticks, TICKS_PER_SEC,
     },
 };
 
@@ -256,7 +257,7 @@ fn current_boottime_timespec() -> Timespec {
 }
 
 fn timespec_from_raw_ticks(raw_time: usize) -> Timespec {
-    timespec_from_ns(((raw_time as u128) * 1_000_000_000u128 / (CLOCK_FREQ as u128)) as u64)
+    timespec_from_ns(raw_time_to_ns(raw_time))
 }
 
 /// 将内核 CPU 账户的原始时间计数转换为 `timeval`。
@@ -639,12 +640,14 @@ pub fn sys_clock_nanosleep(
         let task = current_task().unwrap();
         // Publish the sleep state before arming the timer so an immediate
         // expiry cannot drop the timer while this task is still marked Running.
-        {
+        crate::probe!("sys.clock_nanosleep_arm", {
             let mut task_inner = task.inner_exclusive_access();
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(WaitReason::Nanosleep);
-        }
-        add_timer_ns(expire_ns, task);
+            task_inner.may_have_non_futex_timer = true;
+            drop(task_inner);
+            add_current_timer_ns_preflagged(expire_ns, Arc::clone(&task));
+        });
         block_current_and_run_next(WaitReason::Nanosleep);
 
         if has_interrupting_signal() {

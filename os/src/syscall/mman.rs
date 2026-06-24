@@ -1,8 +1,8 @@
 use crate::{
     config::{PAGE_SIZE, PAGE_SIZE_BITS},
-    mm::{MapPermission, USER_SPACE_END, VirtAddr},
+    mm::{MapPermission, PageFaultAccess, VirtAddr, USER_SPACE_END},
     syscall::errno::ERRNO,
-    syscall::{write_bytes_to_user, write_pod_to_user},
+    syscall::{prefault_user_pages, write_bytes_to_user, write_pod_to_user},
     syscall_body,
     task::{
         current_process, current_task, current_trap_cx, mprotect_current_process,
@@ -22,6 +22,43 @@ const MCL_CURRENT: i32 = 1;
 const MCL_FUTURE: i32 = 2;
 const MCL_ONFAULT: i32 = 4;
 const MLOCKALL_SUPPORTED_FLAGS: i32 = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+
+fn mlock_prefault_access(perm: MapPermission) -> Option<PageFaultAccess> {
+    if perm.contains(MapPermission::W) {
+        Some(PageFaultAccess::Write)
+    } else if perm.contains(MapPermission::R) {
+        Some(PageFaultAccess::Read)
+    } else if perm.contains(MapPermission::X) {
+        Some(PageFaultAccess::Exec)
+    } else {
+        None
+    }
+}
+
+fn prefault_current_mappings() -> Result<(), ERRNO> {
+    let process = current_process();
+    let (token, ranges) = {
+        let inner = process.inner_exclusive_access();
+        let token = inner.memory_set.token();
+        let ranges = inner
+            .memory_set
+            .vmas
+            .values()
+            .filter(|vma| vma.is_user_accessible())
+            .filter_map(|vma| {
+                let access = mlock_prefault_access(vma.map_perm)?;
+                let start = usize::from(VirtAddr::from(vma.start_vpn()));
+                let end = usize::from(VirtAddr::from(vma.end_vpn()));
+                (end > start).then_some((start, end - start, access))
+            })
+            .collect::<Vec<_>>();
+        (token, ranges)
+    };
+    for (start, len, access) in ranges {
+        prefault_user_pages(&process, token, start as *const u8, len, access)?;
+    }
+    Ok(())
+}
 
 fn write_ulong_mask_to_user(mask_ptr: *mut u8, maxnode: usize, mask: usize) -> Result<(), ERRNO> {
     if mask_ptr.is_null() || maxnode == 0 {
@@ -346,6 +383,9 @@ pub fn sys_mlockall(flags: i32) -> isize {
     syscall_body!({
         if flags & !MLOCKALL_SUPPORTED_FLAGS != 0 {
             return Err(ERRNO::EINVAL);
+        }
+        if flags & MCL_CURRENT != 0 && flags & MCL_ONFAULT == 0 {
+            prefault_current_mappings()?;
         }
         Ok(0)
     })
