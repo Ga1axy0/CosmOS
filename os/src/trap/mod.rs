@@ -367,10 +367,12 @@ pub fn trap_handler() -> ! {
             let _hardirq = irq::HardIrqGuard::enter();
             // trace!("hart {} timer tick", hartid());
             if handle_timer_interrupt() {
-                let now_raw = get_time();
-                check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                crate::net::poll();
-                on_timer_tick();
+                crate::probe!("trap.user_timer_periodic", {
+                    let now_raw = get_time();
+                    check_itimers_of_all_processes(now_raw, get_realtime_ns());
+                    crate::net::poll_timer_tick();
+                    on_timer_tick();
+                });
             }
         }
         TrapCause::SoftwareInterrupt => {
@@ -437,14 +439,16 @@ pub fn trap_from_kernel() {
         TrapCause::TimerInterrupt => {
             // trace!("hart {} timer tick", hartid());
             if handle_timer_interrupt() {
-                let now_raw = get_time();
-                check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                crate::net::poll();
-                // Account CPU time spent while the current task executes in kernel
-                // context as part of its RR quantum as well. This matches Linux's
-                // "running on CPU" notion more closely than charging only
-                // user-mode ticks.
-                on_timer_tick();
+                crate::probe!("trap.kernel_timer_periodic", {
+                    let now_raw = get_time();
+                    check_itimers_of_all_processes(now_raw, get_realtime_ns());
+                    crate::net::poll_timer_tick();
+                    // Account CPU time spent while the current task executes in kernel
+                    // context as part of its RR quantum as well. This matches Linux's
+                    // "running on CPU" notion more closely than charging only
+                    // user-mode ticks.
+                    on_timer_tick();
+                });
             }
         }
         TrapCause::SoftwareInterrupt => {
