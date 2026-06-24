@@ -360,6 +360,7 @@ pub(crate) struct TcpSocketFile {
     listening: AtomicBool,
     listener: SpinNoIrqLock<Option<Arc<TcpListenerShared>>>,
     ipv6_only: AtomicBool,
+    close_on_drop: AtomicBool,
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
     /// IPv4 multicast groups this socket has joined (per-socket membership).
@@ -378,6 +379,7 @@ impl TcpSocketFile {
             listening: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
             ipv6_only: AtomicBool::new(false),
+            close_on_drop: AtomicBool::new(true),
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             mcast_groups: SpinNoIrqLock::new(Vec::new()),
@@ -425,6 +427,66 @@ impl TcpSocketFile {
 
     pub(crate) fn is_listening(&self) -> bool {
         self.listening.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_connected(&self) -> Result<bool, ERRNO> {
+        let st = self.state();
+        let mut guard = NET_STACK.lock();
+        let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+        let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        Ok(matches!(
+            socket.state(),
+            tcp_socket::State::Established | tcp_socket::State::CloseWait
+        ))
+    }
+
+    pub(crate) fn disconnect(&self) -> Result<(), ERRNO> {
+        if self.listening.load(Ordering::Acquire) {
+            return Err(ERRNO::EISCONN);
+        }
+
+        let st = self.state();
+        {
+            let mut guard = NET_STACK.lock();
+            let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+            socket.abort();
+            stack.poll();
+        }
+        *self.bound_endpoint.lock() = None;
+        st.read_wait.wake_all();
+        st.write_wait.wake_all();
+        notify_poll_source(st.source_id(), POLLIN | POLLOUT | POLLHUP);
+        NEED_POLL.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn ipv6_addrform_to_ipv4(&self) -> Result<Arc<TcpSocketFile>, ERRNO> {
+        if self.family != super::AF_INET6 as i32 || self.listening.load(Ordering::Acquire) {
+            return Err(ERRNO::ENOPROTOOPT);
+        }
+
+        let local = self.local_endpoint().ok_or(ERRNO::ENOTCONN)?;
+        let remote = self.remote_endpoint().ok_or(ERRNO::ENOTCONN)?;
+        if !matches!(local.addr, IpAddress::Ipv4(_))
+            || !matches!(remote.addr, IpAddress::Ipv4(_))
+        {
+            return Err(ERRNO::EADDRNOTAVAIL);
+        }
+
+        self.close_on_drop.store(false, Ordering::Release);
+        Ok(Arc::new(TcpSocketFile {
+            family: super::AF_INET as i32,
+            st: SpinNoIrqLock::new(self.state()),
+            bound_endpoint: SpinNoIrqLock::new(Some(listen_endpoint_from_bind(local))),
+            listening: AtomicBool::new(false),
+            listener: SpinNoIrqLock::new(None),
+            ipv6_only: AtomicBool::new(false),
+            close_on_drop: AtomicBool::new(true),
+            recv_timeout_ns: AtomicU64::new(self.recv_timeout_ns()),
+            send_timeout_ns: AtomicU64::new(self.send_timeout_ns()),
+            mcast_groups: SpinNoIrqLock::new(Vec::new()),
+        }))
     }
 
     pub(crate) fn set_recv_timeout_ns(&self, timeout_ns: u64) {
@@ -686,6 +748,7 @@ impl TcpSocketFile {
                     listening: AtomicBool::new(false),
                     listener: SpinNoIrqLock::new(None),
                     ipv6_only: AtomicBool::new(self.ipv6_only()),
+                    close_on_drop: AtomicBool::new(true),
                     recv_timeout_ns: AtomicU64::new(self.recv_timeout_ns()),
                     send_timeout_ns: AtomicU64::new(self.send_timeout_ns()),
                     // A freshly accepted socket must NOT inherit the listening
@@ -709,10 +772,20 @@ impl TcpSocketFile {
         }
     }
 
-    pub(crate) fn connect(&self, ep: IpEndpoint) -> Result<(), ERRNO> {
+    pub(crate) fn connect(&self, mut ep: IpEndpoint) -> Result<(), ERRNO> {
         if self.listening.load(Ordering::Acquire) {
             info!("Tcp connect failed: socket is listening");
             return Err(ERRNO::EINVAL);
+        }
+        if self.is_connected()? {
+            return Err(ERRNO::EISCONN);
+        }
+        if ep.addr.is_unspecified() {
+            ep.addr = if self.family == super::AF_INET6 as i32 {
+                IpAddress::Ipv6(Ipv6Address::LOCALHOST)
+            } else {
+                IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
+            };
         }
         
         info!("Tcp connect: {}", ep);
@@ -1441,6 +1514,9 @@ impl File for TcpSocketFile {
 
 impl Drop for TcpSocketFile {
     fn drop(&mut self) {
+        if !self.close_on_drop.load(Ordering::Acquire) {
+            return;
+        }
         if self.listening.load(Ordering::Acquire) {
             self.listening.store(false, Ordering::Release);
             if let Some(listener) = self.listener.lock().take() {

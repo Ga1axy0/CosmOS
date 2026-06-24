@@ -28,6 +28,7 @@ use crate::syscall::errno::{ERRNO, OrErrno};
 use crate::syscall_body;
 use crate::task::{current_process, current_user_token, FdEntry, FdFlags};
 
+const AF_UNSPEC: u16 = 0;
 const AF_UNIX: i32 = 1;
 const AF_INET: u16 = 2;
 const AF_NETLINK: i32 = 16;
@@ -48,6 +49,7 @@ const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const IPPROTO_SCTP: i32 = 132;
 const IPPROTO_UDPLITE: i32 = 136;
+const IPV6_ADDRFORM: i32 = 1;
 const IPV6_V6ONLY: i32 = 26;
 
 // IP-level (SOL_IP) multicast group membership options. These use a
@@ -1480,6 +1482,15 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         let fd = fd as usize;
         match socket_backend(fd)? {
             SocketBackendKind::Udp | SocketBackendKind::Tcp => {
+                let family = read_sockaddr_family(addr as *const u8, addrlen)?;
+                if family == AF_UNSPEC {
+                    match socket_backend(fd)? {
+                        SocketBackendKind::Tcp => with_tcp_socket(fd, |tcp| tcp.disconnect())?,
+                        SocketBackendKind::Udp => return Err(ERRNO::EAFNOSUPPORT),
+                        _ => unreachable!(),
+                    }
+                    return Ok(0);
+                }
                 let spec = socket_spec(fd)?;
                 let ep = sockaddr_to_socket_endpoint(spec, addr, addrlen)?;
                 match socket_backend(fd)? {
@@ -2039,6 +2050,24 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                     return Err(ERRNO::ENOPROTOOPT);
                 }
                 match optname {
+                    IPV6_ADDRFORM => {
+                        let token = current_user_token();
+                        let family = read_sockopt_i32(token, optval, optlen)?;
+                        if family != AF_INET as i32 {
+                            return Err(ERRNO::EINVAL);
+                        }
+                        if backend != SocketBackendKind::Tcp {
+                            return Err(ERRNO::ENOPROTOOPT);
+                        }
+                        let converted = with_tcp_socket(fd, |tcp| tcp.ipv6_addrform_to_ipv4())?;
+                        let new_spec = SocketSpec {
+                            family: AF_INET as i32,
+                            socket_type: spec.socket_type,
+                            protocol: spec.protocol,
+                        };
+                        replace_fd_socket(fd, converted as Arc<dyn File + Send + Sync>, new_spec)?;
+                        Ok(0)
+                    }
                     IPV6_V6ONLY => {
                         let token = current_user_token();
                         let enabled = read_sockopt_i32(token, optval, optlen)? != 0;

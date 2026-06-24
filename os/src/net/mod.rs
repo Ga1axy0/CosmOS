@@ -82,6 +82,7 @@ const UDP_TX_BUF: usize = 64 * 1024;
 const TCP_RX_BUF: usize = 512 * 1024;
 const TCP_TX_BUF: usize = 512 * 1024;
 
+pub(crate) const AF_INET: u16 = 2;
 const EPHEMERAL_PORT_START: u16 = 49152;
 const EPHEMERAL_PORT_END: u16 = 65535;
 const MAX_IMMEDIATE_POLLS: usize = 64;
