@@ -11,37 +11,36 @@
 
 mod id;
 mod process;
-mod wait_queue;
 #[allow(clippy::module_inception)]
 mod task;
+mod wait_queue;
 
 use self::id::TaskUserRes;
+use crate::fs::{open_file_at, OpenFlags};
+use crate::ipc;
+use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
+use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::sched::{
     add_stopping_task, list_pids, pid2process, remove_task, schedule, take_current_task,
     TaskContext,
 };
-use crate::fs::{open_file_at, OpenFlags};
-use crate::syscall::write_process_accounting_on_exit;
-use crate::ipc;
-use crate::poll::task_has_inflight_keyed_poll_wait;
+pub use crate::sched::{
+    block_current_and_run_next, current_process, current_task, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, schedule_if_needed, suspend_current_and_run_next,
+    suspend_current_and_run_next_with_slice_reset, wakeup_task, yield_current_and_run_next,
+};
 use crate::signal::cleanup_signal_wait_for_task;
 use crate::sync::{cleanup_futex_wait_for_task, futex_wake_addr_in_process};
+use crate::syscall::write_process_accounting_on_exit;
 use crate::syscall::{read_pod_from_process_user, write_pod_to_process_user};
-use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::timer::get_time;
 use crate::timer::get_time_ns;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use lazy_static::*;
 pub(crate) use id::recycle_deferred_kstack_ids;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID, PID_MAX};
-pub use crate::sched::{
-    block_current_and_run_next, current_process, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, schedule_if_needed,
-    suspend_current_and_run_next, suspend_current_and_run_next_with_slice_reset, wakeup_task,
-    yield_current_and_run_next,
-};
+use lazy_static::*;
 
 fn should_remove_non_futex_timers_on_exit(task: &Arc<TaskControlBlock>) -> bool {
     task.inner_exclusive_access().may_have_non_futex_timer
@@ -51,21 +50,21 @@ static DEBUG_DUMP_PGRP: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_REMAINING: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_DEADLINE_NS: AtomicUsize = AtomicUsize::new(0);
 const DEBUG_DUMP_INTERVAL_NS: usize = 1_000_000_000;
-pub use crate::signal::{
-    check_signals_of_current, handle_signals, MAX_SIG, SaFlags, SigInfo, SignalAction,
-    SignalActions, SignalBit, SIG_DFL, SIG_IGN,
-};
-pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
-pub use process::{CloneResourceFlags, ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment};
-pub(crate) use process::ProcessControlBlock;
 pub use crate::sched::{
-    clamp_nice, nice_to_weight, DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD,
-    ReschedReason, SchedAttr, SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
+    clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, DEFAULT_TIME_SLICE_TICKS,
+    MAX_NICE, MIN_NICE, NICE_0_LOAD, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
 };
-pub use task::{
-    all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason,
+pub use crate::signal::{
+    check_signals_of_current, handle_signals, SaFlags, SigInfo, SignalAction, SignalActions,
+    SignalBit, MAX_SIG, SIG_DFL, SIG_IGN,
+};
+pub(crate) use process::ProcessControlBlock;
+pub use process::{
+    CloneResourceFlags, ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment,
 };
 pub(crate) use task::TaskControlBlockInner;
+pub use task::{all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason};
+pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 
 use crate::platform::QEMUExit;
 use alloc::string::String;
@@ -171,15 +170,13 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 let read_back = read_pod_from_process_user(&process, clear_child_tid as *const i32);
                 debug!(
                     "exit_current_and_run_next: cleared child_tid at {:#x}, read_back={:?}",
-                    clear_child_tid,
-                    read_back
+                    clear_child_tid, read_back
                 );
             }
             Err(err) => {
                 warn!(
                     "exit_current_and_run_next: failed to clear child_tid at {:#x}: {:?}",
-                    clear_child_tid,
-                    err
+                    clear_child_tid, err
                 );
             }
         }
@@ -189,8 +186,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             Ok(woke) => {
                 debug!(
                     "exit_current_and_run_next: futex_wake_addr({:#x}, 1) -> {}",
-                    clear_child_tid,
-                    woke
+                    clear_child_tid, woke
                 );
             }
             Err(err) => {
@@ -348,7 +344,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         for hart in running_harts {
             crate::sched::resched_hart(hart);
         }
-        while running_tasks.iter().any(|task| task.inner_exclusive_access().sched.on_cpu) {
+        while running_tasks
+            .iter()
+            .any(|task| task.inner_exclusive_access().sched.on_cpu)
+        {
             core::hint::spin_loop();
         }
         {
@@ -364,7 +363,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
         recycle_res.clear();
 
-        let (closed_fds, parent_weak, reclaim, shm_attachments) = {
+        let (closed_fds, parent_weak, reclaim, shm_attachments, keyrings_to_release) = {
             let mut process_inner = process.inner_exclusive_access();
             process_inner.children.clear();
             // deallocate other data in user space i.e. program code/data section
@@ -383,12 +382,20 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
 
             let parent_weak = process_inner.parent.clone();
             let shm_attachments = core::mem::take(&mut process_inner.shm_attachments);
-            (closed_fds, parent_weak, reclaim, shm_attachments)
+            let keyrings_to_release = core::mem::take(&mut process_inner.keyrings);
+            (
+                closed_fds,
+                parent_weak,
+                reclaim,
+                shm_attachments,
+                keyrings_to_release,
+            )
         };
         reclaim.flush_then_release();
         // warn_heap_state("exit_after_user_reclaim", pid);
         drop(closed_fds);
         // warn_heap_state("exit_after_fd_drop", pid);
+        crate::keys::release_process_thread_keyring(keyrings_to_release);
         for attachment in shm_attachments {
             ipc::detach_segment(attachment.shmid);
         }
@@ -519,8 +526,6 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     None
 }
 
-
-
 /// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
 pub fn current_process_is_zombie() -> bool {
     let process = current_process();
@@ -546,7 +551,9 @@ fn first_signum_in_set(signal: SignalBit) -> Option<usize> {
 /// unmasked for them, even if that signal bit was already pending. Repeated
 /// terminal-generated SIGINT must still be able to kick tasks out of sleep.
 pub fn add_signal_to_process(process: &Arc<ProcessControlBlock>, signal: SignalBit) {
-    let signum = first_signum_in_set(signal).map(|num| num as i32).unwrap_or_default();
+    let signum = first_signum_in_set(signal)
+        .map(|num| num as i32)
+        .unwrap_or_default();
     add_signal_to_process_with_siginfo(process, signal, SigInfo::for_kernel(signum));
 }
 
@@ -595,7 +602,9 @@ pub fn add_signal_to_process_with_siginfo(
 
 /// Add one pending signal directly to a specific thread.
 pub fn add_signal_to_task(task: &Arc<TaskControlBlock>, signal: SignalBit) {
-    let signum = first_signum_in_set(signal).map(|num| num as i32).unwrap_or_default();
+    let signum = first_signum_in_set(signal)
+        .map(|num| num as i32)
+        .unwrap_or_default();
     add_signal_to_task_with_siginfo(task, signal, SigInfo::for_kernel(signum));
 }
 
@@ -822,7 +831,10 @@ pub fn munmap_current_process(start: VirtAddr, end: VirtAddr) -> bool {
 }
 
 /// Sync a mapped range in current process.
-pub fn msync_current_process(start: VirtAddr, end: VirtAddr) -> Result<(), crate::syscall::errno::ERRNO> {
+pub fn msync_current_process(
+    start: VirtAddr,
+    end: VirtAddr,
+) -> Result<(), crate::syscall::errno::ERRNO> {
     current_process().msync(start, end)
 }
 

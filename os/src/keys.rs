@@ -112,7 +112,9 @@ impl KeyState {
             Key {
                 uid,
                 description,
-                kind: KeyKind::Keyring { entries: Vec::new() },
+                kind: KeyKind::Keyring {
+                    entries: Vec::new(),
+                },
                 quota_bytes: 0,
                 quota_counted: false,
             },
@@ -153,17 +155,30 @@ impl KeyState {
         }
     }
 
+    fn release_key_recursive(&mut self, serial: i32) {
+        let Some(key) = self.keys.remove(&serial) else {
+            return;
+        };
+        if key.quota_counted {
+            let usage = self.user_usage_mut(key.uid);
+            usage.used_keys = usage.used_keys.saturating_sub(1);
+            usage.used_bytes = usage.used_bytes.saturating_sub(key.quota_bytes);
+        }
+        if let KeyKind::Keyring { entries } = key.kind {
+            for entry in entries {
+                self.release_key_recursive(entry);
+            }
+        }
+    }
+
     fn ensure_user_special_keyring(&mut self, uid: u32, session: bool) -> i32 {
-        let existing = self
-            .users
-            .get(&uid)
-            .and_then(|usage| {
-                if session {
-                    usage.user_session_keyring
-                } else {
-                    usage.user_keyring
-                }
-            });
+        let existing = self.users.get(&uid).and_then(|usage| {
+            if session {
+                usage.user_session_keyring
+            } else {
+                usage.user_keyring
+            }
+        });
         if let Some(serial) = existing {
             return serial;
         }
@@ -247,7 +262,9 @@ impl KeyState {
                 if plen != 0 {
                     return Err(ERRNO::EINVAL);
                 }
-                Ok(KeyKind::Keyring { entries: Vec::new() })
+                Ok(KeyKind::Keyring {
+                    entries: Vec::new(),
+                })
             }
             "user" => {
                 if plen > USER_PAYLOAD_LIMIT {
@@ -342,7 +359,13 @@ pub fn add_key(
     let dest_keyring = state.resolve_destination_keyring(uid, &mut inner.keyrings, ringid, true)?;
     let serial = match kind {
         KeyKind::Keyring { .. } => state.insert_keyring(uid, description.to_string()),
-        other => state.insert_payload_key(uid, description.to_string(), other, quota_bytes, quota_counted),
+        other => state.insert_payload_key(
+            uid,
+            description.to_string(),
+            other,
+            quota_bytes,
+            quota_counted,
+        ),
     };
     state.link_key(dest_keyring, serial)?;
 
@@ -353,6 +376,13 @@ pub fn add_key(
     }
 
     Ok(serial)
+}
+
+/// Drop the per-thread keyring attached to a process context.
+pub fn release_process_thread_keyring(keyrings: ProcessKeyrings) {
+    if let Some(serial) = keyrings.thread {
+        KEY_STATE.lock().release_key_recursive(serial);
+    }
 }
 
 /// `keyctl(KEYCTL_GET_KEYRING_ID, ...)`
