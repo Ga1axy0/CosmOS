@@ -14,8 +14,8 @@ use crate::syscall::{read_bytes_from_user, read_cstring_from_user, read_pod_from
 use crate::syscall_body;
 use crate::poll::{self, PollWakeState};
 use crate::task::{
-    current_process, current_task, current_user_token, ExitReason, FdEntry, ProcessControlBlock,
-    FdFlags, TaskStatus, WaitReason, SIG_DFL, SIG_IGN,
+    current_process, current_task, current_user_token, CloneResourceFlags, ExitReason, FdEntry,
+    ProcessControlBlock, FdFlags, TaskStatus, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
@@ -425,9 +425,8 @@ pub fn sys_acct(filename: *const u8) -> isize {
 
         let path = read_cstring_from_user(filename, PATH_MAX)?;
         let cwd = process.inner_exclusive_access().cwd.clone();
-        let lookup_path = rooted_lookup_path(path.as_str());
-        let abs_path = canonicalize(cwd.as_str(), lookup_path);
-        let inode = lookup_inode_follow(cwd.as_str(), lookup_path, true)?;
+        let abs_path = canonicalize(cwd.as_str(), path.as_str());
+        let inode = lookup_inode_follow(cwd.as_str(), path.as_str(), true)?;
 
         if path.ends_with('/') && !inode.is_dir() {
             return Err(ERRNO::ENOTDIR);
@@ -2752,6 +2751,17 @@ pub fn sys_lseek(fd: u32, offset: usize, whence: u32) -> isize {
     })
 }
 
+const BLKGETSIZE: usize = 0x1260;
+const BLKFLSBUF: usize = 0x1261;
+const BLKRRPART: usize = 0x125f;
+const BLKSSZGET: usize = 0x1268;
+const BLKGETSIZE64_COMPAT: usize = 0x8004_1272;
+const BLKGETSIZE64: usize = 0x8008_1272;
+const BLKGETSIZE64_COMPAT_SIGNED: usize = 0xffff_ffff_8004_1272;
+const BLKGETSIZE64_SIGNED: usize = 0xffff_ffff_8008_1272;
+const DEFAULT_BLOCK_DEV_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_BLOCK_SECTOR_SIZE: i32 = 512;
+
 /// ioctl 系统调用：校验 fd 后转发到具体文件对象。
 pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     trace!(
@@ -2761,6 +2771,36 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
+        let is_block_device = desc.stat().mode.contains(StatMode::BLOCK)
+            || desc
+                .path()
+                .as_deref()
+                .is_some_and(|path| {
+                    path.strip_prefix("/dev/")
+                        .is_some_and(|name| name.starts_with("vd"))
+                });
+        if is_block_device {
+            match req {
+                BLKGETSIZE => {
+                    let sectors = DEFAULT_BLOCK_DEV_SIZE_BYTES / 512;
+                    write_pod_to_user(arg as *mut usize, &(sectors as usize))?;
+                    return Ok(0);
+                }
+                BLKGETSIZE64
+                | BLKGETSIZE64_COMPAT
+                | BLKGETSIZE64_SIGNED
+                | BLKGETSIZE64_COMPAT_SIGNED => {
+                    write_pod_to_user(arg as *mut u64, &DEFAULT_BLOCK_DEV_SIZE_BYTES)?;
+                    return Ok(0);
+                }
+                BLKSSZGET => {
+                    write_pod_to_user(arg as *mut i32, &DEFAULT_BLOCK_SECTOR_SIZE)?;
+                    return Ok(0);
+                }
+                BLKFLSBUF | BLKRRPART => return Ok(0),
+                _ => {}
+            }
+        }
         // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。
         // TODO: tty 实现 `TCGETS/TIOCGWINSZ` 后，这里会开始承载真实终端控制语义。
         // debug!("sys_ioctl: fd = {}, req = {:#x}, arg = {:#x}", fd, req, arg);
@@ -3096,6 +3136,65 @@ pub fn sys_close(fd: u32) -> isize {
         closed_entry
     };
     drop(closed_entry);
+    0
+}
+
+const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+const CLOSE_RANGE_SUPPORTED_FLAGS: u32 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
+
+/// close_range syscall
+pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_close_range",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    let mut closed_entries = Vec::new();
+    let mut shared_fd_table_update = None;
+    let result = {
+        let mut inner = process.inner_exclusive_access();
+        syscall_body!({
+            if first > last || flags & !CLOSE_RANGE_SUPPORTED_FLAGS != 0 {
+                return Err(ERRNO::EINVAL);
+            }
+
+            if flags & CLOSE_RANGE_UNSHARE != 0 {
+                if inner.clone_shared_resources.contains(CloneResourceFlags::FILES) {
+                    shared_fd_table_update = Some((inner.parent.clone(), inner.fd_table.clone()));
+                }
+                inner.clone_shared_resources.remove(CloneResourceFlags::FILES);
+            }
+
+            let first = first as usize;
+            if first >= inner.fd_table.len() {
+                return Ok(0);
+            }
+            let last = (last as usize).min(inner.fd_table.len() - 1);
+
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                for entry in inner.fd_table[first..=last].iter_mut().flatten() {
+                    entry.flags |= FdFlags::CLOEXEC;
+                }
+            } else {
+                for fd in first..=last {
+                    if let Some(entry) = inner.take_fd(fd) {
+                        closed_entries.push(entry);
+                    }
+                }
+            }
+            Ok(0)
+        })
+    };
+    if result != 0 {
+        return result;
+    }
+    if let Some((parent, fd_table)) = shared_fd_table_update {
+        if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
+            parent.inner_exclusive_access().fd_table = fd_table;
+        }
+    }
+    drop(closed_entries);
     0
 }
 

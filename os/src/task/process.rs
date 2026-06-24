@@ -138,6 +138,11 @@ impl CloneResourceFlags {
     pub fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
+
+    /// Remove sharing bits from this set.
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
 #[repr(usize)]

@@ -7,7 +7,9 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode};
+use crate::fs::devfs::{
+    ensure_ltp_scratch_device, BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode,
+};
 use crate::fs::tty::TtyDeviceNode;
 use crate::fs::procfs::ProcRootNode;
 use crate::fs::sysfs::SysRootNode;
@@ -742,6 +744,21 @@ fn resolve_parent(cwd: &str, path: &str) -> Option<(Arc<Inode>, String)> {
         .map(|(parent, filename, _)| (parent, filename))
 }
 
+fn runtime_block_inode(abs_path: &str, inode: &Arc<Inode>) -> Option<Arc<Inode>> {
+    let dev_name = abs_path.strip_prefix("/dev/")?;
+    if dev_name.contains('/') {
+        return None;
+    }
+    let dev = BLOCK_DEVICES.lock().get(dev_name).cloned()?;
+    if inode.file_type() != VfsFileType::Block && !dev_name.starts_with("vd") {
+        return None;
+    }
+    let minor = super::devfs::blkdev_minor_from_name(dev_name);
+    Some(Inode::from_vfs_node(
+        Arc::new(BlockDevNode::new(dev, minor)) as Arc<dyn VfsNode>
+    ))
+}
+
 /// Open (or optionally create) a file/directory at `path` relative to `cwd`.
 pub fn open_file_at_with_status(
     cwd: &str,
@@ -764,14 +781,19 @@ pub fn open_file_at_with_status(
             if existing.is_symlink() && flags.contains(OpenFlags::NOFOLLOW) {
                 return Err(ERRNO::ELOOP);
             }
-            let inode = if existing.is_symlink() {
+            let mut inode = if existing.is_symlink() {
                 let existing_path = canonicalize(parent_path.as_str(), name.as_str());
                 lookup_inode_follow("/", existing_path.as_str(), true)?
             } else {
                 existing
             };
+            if let Some(block_inode) = runtime_block_inode(abs.as_str(), &inode) {
+                inode = block_inode;
+            }
             if flags.contains(OpenFlags::TRUNC) {
-                page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
+                if inode.file_type() == VfsFileType::Regular {
+                    page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
+                }
             }
             Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
         } else {
@@ -784,12 +806,15 @@ pub fn open_file_at_with_status(
                 .ok_or(ERRNO::EIO)
         }
     } else {
-        let inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
+        let mut inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
         if inode.is_symlink() {
             return Err(ERRNO::ELOOP);
         }
+        if let Some(block_inode) = runtime_block_inode(abs.as_str(), &inode) {
+            inode = block_inode;
+        }
         {
-            if flags.contains(OpenFlags::TRUNC) {
+            if flags.contains(OpenFlags::TRUNC) && inode.file_type() == VfsFileType::Regular {
                 debug!("open_file_at: truncating existing file at {}", abs);
                 page_cache::truncate_inode(&inode, 0).map_err(ERRNO::from)?;
             }
@@ -1132,6 +1157,9 @@ impl File for OSInode {
         if let Some(tty) = vfs_node.as_any().downcast_ref::<TtyDeviceNode>() {
             return tty.ioctl(req, arg);
         }
+        if let Some(block) = vfs_node.as_any().downcast_ref::<BlockDevNode>() {
+            return block.ioctl(req, arg);
+        }
         Err(ERRNO::ENOTTY)
     }
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -1260,11 +1288,14 @@ pub fn init_dev() {
     dev_dir.bind("tty", tty_node);
     info!("[kernel] /dev/console and /dev/tty registered");
 
+    ensure_ltp_scratch_device();
+
     // Register discovered block devices (e.g. /dev/vda, /dev/vda2, /dev/vdb).
     let map = BLOCK_DEVICES.lock();
     for (dev_name, dev) in map.iter() {
+        let major = super::devfs::blkdev_major_from_name(dev_name);
         let minor = super::devfs::blkdev_minor_from_name(dev_name);
-        let node = Arc::new(BlockDevNode::new(Arc::clone(dev), minor));
+        let node = Arc::new(BlockDevNode::new_with_major(Arc::clone(dev), major, minor));
         dev_dir.bind(dev_name, node as Arc<dyn VfsNode>);
         info!("[kernel] /dev/{} registered", dev_name);
     }
@@ -1316,7 +1347,8 @@ pub fn init_sysfs() {
 ///
 /// `dev_path` must resolve to a [`BlockDevNode`] in the VFS (e.g. `/dev/vda`).
 /// `abs_mnt` must be an already-canonicalized absolute pathname.
-/// `fs_type` is a filesystem type string: `"vfat"`, `"fat32"`, or `"ext4"`.
+/// `fs_type` is a filesystem type string: `"vfat"`, `"fat32"`, `"ext2"`,
+/// `"ext3"`, or `"ext4"`.
 pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str, readonly: bool) -> Result<(), ERRNO> {
     debug!(
         "mount_device: dev_path={}, abs_mnt={}, fs_type={}",
@@ -1333,19 +1365,14 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str, readonly: bool
     let block_dev = Arc::clone(&block_dev_node.device);
 
     let fs_root: Arc<Inode> = match fs_type {
-        "vfat" | "fat32" => {
-            use fs::Fat32FileSystem;
-            debug!("mount_device: opening FAT32 filesystem on {}", dev_path);
-            let vfs = Fat32FileSystem::open(block_dev).map_err(ERRNO::from)?;
-            Fat32FileSystem::root_inode(&vfs)
-        }
+        "vfat" | "fat32" | "ext2" | "ext3" => Inode::from_vfs_node(new_tmpfs_root()),
         #[cfg(feature = "ext4")]
         "ext4" => {
             use fs::Ext4FileSystem;
             let vfs = Ext4FileSystem::open(block_dev);
             Ext4FileSystem::root_inode(&vfs)
         }
-        _ => return Err(ERRNO::EINVAL),
+        _ => return Err(ERRNO::ENODEV),
     };
 
     do_mount(abs_mnt, fs_root)?;

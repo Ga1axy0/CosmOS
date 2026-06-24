@@ -372,6 +372,8 @@ pub const SYSCALL_FSOPEN: usize = 430;
 pub const SYSCALL_FSPICK: usize = 433;
 /// pidfd_open syscall
 pub const SYSCALL_PIDFD_OPEN: usize = 434;
+/// close_range syscall
+pub const SYSCALL_CLOSE_RANGE: usize = 436;
 /// faccessat2 syscall
 pub const SYSCALL_FACCESSAT2: usize = 439;
 /// memfd_secret syscall
@@ -600,6 +602,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCHOWN => sys_fchown(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_OPENAT => sys_open(args[0] as isize, args[1] as *const u8, args[2] as i32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0] as u32),
+        SYSCALL_CLOSE_RANGE => sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut i32, args[1] as i32),
         SYSCALL_LSEEK => sys_lseek(args[0] as u32, args[1], args[2] as u32),
         SYSCALL_READ => sys_read(args[0] as u32, args[1] as *const u8, args[2]),

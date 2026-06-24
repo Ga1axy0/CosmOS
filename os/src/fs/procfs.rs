@@ -17,8 +17,10 @@ use fs::errno::FS_ERRNO;
 use fs::vfs::{VfsFileType, VfsNode};
 
 use crate::config::{MAX_HARTS, PAGE_SIZE};
+use crate::drivers::block::BLOCK_DEVICES;
 #[cfg(feature = "io_perf_counters")]
 use crate::drivers::block as block_drivers;
+use crate::fs::devfs::{blkdev_major_from_name, blkdev_minor_from_name};
 use crate::fs::inode::snapshot_mount_table;
 #[cfg(feature = "io_perf_counters")]
 use crate::fs::page_cache;
@@ -101,6 +103,28 @@ fn build_mounts() -> String {
             escape_mount_field(&mount.target),
             escape_mount_field(&mount.fs_type),
             escape_mount_field(&mount.options),
+        );
+    }
+    out
+}
+
+fn build_filesystems() -> String {
+    String::from("nodev\ttmpfs\nnodev\tproc\nnodev\tsysfs\nnodev\tcgroup2\n\text4\n\tvfat\n")
+}
+
+fn build_partitions() -> String {
+    let mut out = String::from("major minor  #blocks  name\n\n");
+    for dev_name in BLOCK_DEVICES.lock().keys() {
+        if dev_name.as_str() == "loop-control" {
+            continue;
+        }
+        let _ = writeln!(
+            &mut out,
+            "{:>4} {:>7} {:>10} {}",
+            blkdev_major_from_name(dev_name),
+            blkdev_minor_from_name(dev_name),
+            524288,
+            dev_name,
         );
     }
     out
@@ -653,8 +677,10 @@ impl VfsNode for ProcRootNode {
         let mut entries = Vec::new();
         entries.push((String::from("self"), VfsFileType::Symlink));
         entries.push((String::from("cpuinfo"), VfsFileType::Regular));
+        entries.push((String::from("filesystems"), VfsFileType::Regular));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
+        entries.push((String::from("partitions"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
         entries.push((String::from("io_perf"), VfsFileType::Regular));
         #[cfg(feature = "net_perf_counters")]
@@ -671,8 +697,10 @@ impl VfsNode for ProcRootNode {
         match name {
             "self" => Some(Arc::new(ProcSelfLinkNode::new()) as Arc<dyn VfsNode>),
             "cpuinfo" => Some(Arc::new(ProcCpuinfoNode::new()) as Arc<dyn VfsNode>),
+            "filesystems" => Some(Arc::new(ProcFilesystemsNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
+            "partitions" => Some(Arc::new(ProcPartitionsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
             "io_perf" => Some(Arc::new(ProcIoPerfNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "net_perf_counters")]
@@ -1370,6 +1398,66 @@ impl VfsNode for ProcCpuinfoNode {
     }
 }
 
+/// `/proc/filesystems` node.
+#[derive(Default, Debug)]
+pub struct ProcFilesystemsNode;
+
+impl ProcFilesystemsNode {
+    /// Create a new filesystems node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcFilesystemsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_filesystems().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_filesystems(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
 /// `/proc/meminfo` node.
 #[derive(Default, Debug)]
 pub struct ProcMeminfoNode;
@@ -1474,6 +1562,66 @@ impl VfsNode for ProcMountsNode {
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         read_string_at(build_mounts(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/partitions` node.
+#[derive(Default, Debug)]
+pub struct ProcPartitionsNode;
+
+impl ProcPartitionsNode {
+    /// Create a new partitions node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcPartitionsNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_partitions().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_partitions(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
