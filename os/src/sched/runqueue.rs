@@ -19,6 +19,8 @@ use core::array;
 use lazy_static::*;
 
 const RT_QUEUE_LEVELS: usize = SCHED_RT_PRIO_MAX as usize + 1;
+const RT_SLEEP_CFS_BOOST_MIN_RUNNING: usize = 128;
+const RT_SLEEP_CFS_BOOST_MAX_TASKS: usize = 8;
 type CfsKey = (u64, usize);
 
 #[derive(Copy, Clone)]
@@ -162,6 +164,54 @@ impl RunQueue {
         self.cfs_nr_running = self.cfs_nr_running.saturating_sub(1);
         self.refresh_min_vruntime(Some(accounted_vruntime));
         Some(task)
+    }
+
+    fn boost_process_cfs_tasks(&mut self, tasks: &[Arc<TaskControlBlock>]) -> usize {
+        if self.cfs_nr_running < RT_SLEEP_CFS_BOOST_MIN_RUNNING {
+            return 0;
+        }
+        let boosted_vruntime = self
+            .min_vruntime_ns
+            .saturating_sub(CFS_WAKEUP_GRANULARITY_NS);
+        let mut boosted = 0usize;
+        for task in tasks {
+            if boosted >= RT_SLEEP_CFS_BOOST_MAX_TASKS {
+                break;
+            }
+            let key = {
+                let task_inner = task.inner_exclusive_access();
+                if !matches!(task_inner.sched.policy, SchedPolicy::Other)
+                    || !task_inner.sched.on_rq
+                    || !matches!(task_inner.task_status, TaskStatus::Runnable)
+                {
+                    continue;
+                }
+                let Some(key) = task_inner.sched.cfs_rq_key else {
+                    continue;
+                };
+                key
+            };
+            let Some(queued_task) = self.cfs_tasks.remove(&key) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&queued_task, task) {
+                self.cfs_tasks.insert(key, queued_task);
+                continue;
+            }
+            let new_key = {
+                let mut task_inner = queued_task.inner_exclusive_access();
+                task_inner.sched.vruntime_ns = boosted_vruntime;
+                let new_key = (boosted_vruntime, Arc::as_ptr(&queued_task) as usize);
+                task_inner.sched.cfs_rq_key = Some(new_key);
+                new_key
+            };
+            self.cfs_tasks.insert(new_key, queued_task);
+            boosted += 1;
+        }
+        if boosted != 0 {
+            self.refresh_min_vruntime(None);
+        }
+        boosted
     }
 
     fn remove_task(&mut self, task: &Arc<TaskControlBlock>) -> bool {
@@ -375,6 +425,12 @@ pub fn has_runnable_task_at_or_above(hart: usize, prio: u8) -> bool {
     RUN_QUEUES[normalize_hart(hart)]
         .lock()
         .has_same_or_higher_rt(prio)
+}
+
+pub(crate) fn boost_process_cfs_tasks(hart: usize, tasks: &[Arc<TaskControlBlock>]) -> usize {
+    RUN_QUEUES[normalize_hart(hart)]
+        .lock()
+        .boost_process_cfs_tasks(tasks)
 }
 
 /// Returns the highest runnable RT priority on the selected hart.

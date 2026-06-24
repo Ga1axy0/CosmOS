@@ -1,7 +1,7 @@
 //! Scheduling control-flow entry points.
 
 use super::{
-    cfs_should_preempt, current_process, current_processor, current_task,
+    boost_process_cfs_tasks, cfs_should_preempt, current_process, current_processor, current_task,
     defer_task_release_after_switch, has_runnable_task_at_or_above, schedule, take_current_task,
     TaskContext,
 };
@@ -9,6 +9,7 @@ use crate::hal::hartid;
 use crate::sched::CFS_YIELD_PENALTY_NS;
 use crate::task::{ReschedReason, SchedPolicy, TaskStatus, WaitReason};
 use crate::timer::{get_time, get_time_ns};
+use alloc::vec::Vec;
 
 fn suspend_current_and_run_next_inner(
     apply_cfs_yield_penalty: bool,
@@ -68,6 +69,7 @@ pub fn suspend_current_and_run_next_with_slice_reset(reset_slice: bool) {
 /// Make current task blocked and switch to the next task.
 pub fn block_current_and_run_next(reason: WaitReason) {
     let task = take_current_task().unwrap();
+    let mut boost_same_process_cfs = false;
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.account_cfs_runtime(get_time_ns());
@@ -83,6 +85,8 @@ pub fn block_current_and_run_next(reason: WaitReason) {
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
             task_inner.sched.resched_reason = None;
+            boost_same_process_cfs =
+                task_inner.sched.policy.is_rt() && matches!(reason, WaitReason::Nanosleep);
             Some(&mut task_inner.task_cx as *mut TaskContext)
         }
     };
@@ -91,6 +95,17 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         return;
     }
     let process = task.process.upgrade().unwrap();
+    if boost_same_process_cfs {
+        let boost_candidates = {
+            let process_inner = process.inner_exclusive_access();
+            process_inner
+                .tasks
+                .iter()
+                .filter_map(|task| task.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        boost_process_cfs_tasks(hartid(), boost_candidates.as_slice());
+    }
     process.pause_cpu_accounting(get_time());
     defer_task_release_after_switch(task);
     schedule(task_cx_ptr.unwrap());
