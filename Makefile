@@ -32,8 +32,10 @@ USER_BUILD_STAMP_LA := $(USER_BIN_DIR_LA)/.xxos-build.stamp
 KERNEL_BUILD_STAMP_RV := $(STAMP_DIR)/kernel-build-rv.stamp
 KERNEL_BUILD_STAMP_LA := $(STAMP_DIR)/kernel-build-la.stamp
 KERNEL_LOG_KEY := $(if $(strip $(LOG)),$(strip $(LOG)),OFF)
-KERNEL_LOG_STAMP_RV := $(STAMP_DIR)/kernel-log-rv-$(KERNEL_LOG_KEY).stamp
-KERNEL_LOG_STAMP_LA := $(STAMP_DIR)/kernel-log-la-$(KERNEL_LOG_KEY).stamp
+KERNEL_PERF_PROBE_KEY := $(if $(filter 1,$(PERF_PROBE)),ON,OFF)
+KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY)
+KERNEL_CONFIG_STAMP_RV := $(STAMP_DIR)/kernel-config-rv.stamp
+KERNEL_CONFIG_STAMP_LA := $(STAMP_DIR)/kernel-config-la.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
 KERNEL_BUILD_DEPS := os/Makefile os/Cargo.toml os/build.rs $(shell find os/src fs/src -type f | sort)
 LA_BOOTLOADER_DIR ?= bootloader/loongarch64-direct
@@ -143,17 +145,23 @@ $(USER_BUILD_STAMP_LA): $(USER_BUILD_DEPS)
 user-apps: $(USER_BUILD_STAMP_RV)
 user-apps-la: $(USER_BUILD_STAMP_LA)
 
-$(KERNEL_LOG_STAMP_RV): | $(STAMP_DIR)
-	touch $@
+$(KERNEL_CONFIG_STAMP_RV): force | $(STAMP_DIR)
+	@key='$(KERNEL_CONFIG_KEY)'; \
+	if [ ! -f $@ ] || [ "$$(cat $@)" != "$$key" ]; then \
+		printf '%s\n' "$$key" > $@; \
+	fi
 
-$(KERNEL_LOG_STAMP_LA): | $(STAMP_DIR)
-	touch $@
+$(KERNEL_CONFIG_STAMP_LA): force | $(STAMP_DIR)
+	@key='$(KERNEL_CONFIG_KEY)'; \
+	if [ ! -f $@ ] || [ "$$(cat $@)" != "$$key" ]; then \
+		printf '%s\n' "$$key" > $@; \
+	fi
 
-$(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) $(KERNEL_LOG_STAMP_RV) | $(STAMP_DIR)
+$(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) $(KERNEL_CONFIG_STAMP_RV) | $(STAMP_DIR)
 	$(MAKE) -C os kernel ARCH=riscv64
 	touch $@
 
-$(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) $(KERNEL_LOG_STAMP_LA) | $(STAMP_DIR)
+$(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) $(KERNEL_CONFIG_STAMP_LA) | $(STAMP_DIR)
 	$(MAKE) -C os kernel ARCH=loongarch64
 	touch $@
 

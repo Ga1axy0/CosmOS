@@ -52,6 +52,7 @@ pub mod mm;
 pub mod net;
 pub mod signal;
 mod poll;
+pub(crate) mod perf_probe;
 pub mod random;
 pub mod sbi;
 pub mod sched;

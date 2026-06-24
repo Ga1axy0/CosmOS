@@ -29,6 +29,8 @@ use crate::keys;
 use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
+#[cfg(feature = "perf_probe")]
+use crate::perf_probe;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
 use crate::task::{current_process, TaskStatus};
@@ -685,6 +687,10 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("io_perf"), VfsFileType::Regular));
         #[cfg(feature = "net_perf_counters")]
         entries.push((String::from("net_perf"), VfsFileType::Regular));
+        #[cfg(feature = "perf_probe")]
+        entries.push((String::from("perf_probe"), VfsFileType::Regular));
+        #[cfg(feature = "perf_probe")]
+        entries.push((String::from("perf_probe_enable"), VfsFileType::Regular));
         entries.push((String::from("key-users"), VfsFileType::Regular));
         entries.push((String::from("sys"), VfsFileType::Directory));
         for pid in list_pids() {
@@ -705,6 +711,12 @@ impl VfsNode for ProcRootNode {
             "io_perf" => Some(Arc::new(ProcIoPerfNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "net_perf_counters")]
             "net_perf" => Some(Arc::new(ProcNetPerfNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "perf_probe")]
+            "perf_probe" => Some(Arc::new(ProcPerfProbeNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "perf_probe")]
+            "perf_probe_enable" => {
+                Some(Arc::new(ProcPerfProbeEnableNode::new()) as Arc<dyn VfsNode>)
+            }
             "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
             "sys" => Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>),
             _ => {
@@ -1767,6 +1779,156 @@ impl VfsNode for ProcNetPerfNode {
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
         net::reset_perf_counters();
+        buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/perf_probe` node.
+#[derive(Default, Debug)]
+#[cfg(feature = "perf_probe")]
+pub struct ProcPerfProbeNode;
+
+#[cfg(feature = "perf_probe")]
+impl ProcPerfProbeNode {
+    /// Create a new `/proc/perf_probe` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "perf_probe")]
+impl VfsNode for ProcPerfProbeNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        perf_probe::render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        perf_probe::reset();
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        perf_probe::reset();
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(perf_probe::render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        perf_probe::reset();
+        buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/perf_probe_enable` node.
+#[derive(Default, Debug)]
+#[cfg(feature = "perf_probe")]
+pub struct ProcPerfProbeEnableNode;
+
+#[cfg(feature = "perf_probe")]
+impl ProcPerfProbeEnableNode {
+    /// Create a new `/proc/perf_probe_enable` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "perf_probe")]
+impl VfsNode for ProcPerfProbeEnableNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        2
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        perf_probe::set_enabled(false);
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let value = if perf_probe::enabled() { "1\n" } else { "0\n" };
+        read_string_at(String::from(value), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let Ok(text) = core::str::from_utf8(buf) else {
+            return buf.len();
+        };
+        match text.trim() {
+            "0" => perf_probe::set_enabled(false),
+            "1" => perf_probe::set_enabled(true),
+            "" => {}
+            _ => {}
+        }
         buf.len()
     }
 

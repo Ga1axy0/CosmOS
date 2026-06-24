@@ -3,6 +3,9 @@ ARCH ?= riscv64
 # EXTRA_FEATURES ?=
 # EXTRA_FEATURES ?= --features io_perf_counters --features net_perf_counters
 EXTRA_FEATURES ?= --features legacy-vdb-names
+ifeq ($(PERF_PROBE),1)
+EXTRA_FEATURES += --features perf_probe
+endif
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 
