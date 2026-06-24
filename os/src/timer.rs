@@ -49,9 +49,18 @@ pub fn get_time_us() -> usize {
     get_time() * MICRO_PER_SEC / CLOCK_FREQ
 }
 
+/// Convert a raw platform timer counter value to nanoseconds.
+pub fn raw_time_to_ns(raw_time: usize) -> u64 {
+    if NSEC_PER_SEC as usize % CLOCK_FREQ == 0 {
+        (raw_time as u64).saturating_mul((NSEC_PER_SEC as usize / CLOCK_FREQ) as u64)
+    } else {
+        ((raw_time as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+    }
+}
+
 /// 获取当前单调时间，单位为纳秒。
 pub fn get_time_ns() -> u64 {
-    ((get_time() as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+    raw_time_to_ns(get_time())
 }
 
 /// 使用“当前单调时间 + 实时时钟偏移”得到 `CLOCK_REALTIME`，单位为纳秒。
