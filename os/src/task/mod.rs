@@ -425,9 +425,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             }
         }
     }
-    let exit_pid = process.getpid();
-    let tcb_strong = Arc::strong_count(&exiting_task);
-    let tcb_weak = Arc::weak_count(&exiting_task);
     // Move the exiting task reference off the stack into stop_task so that
     // the idle loop's `finish_pending_task_release` can drop it once the
     // kernel stack is no longer in use (after __switch completes).

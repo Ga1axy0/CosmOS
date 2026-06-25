@@ -1734,6 +1734,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 
             // 1) 没有任何匹配的子进程
             let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
+
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
