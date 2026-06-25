@@ -2,16 +2,16 @@
 
 ## TLDR
 
-命名耗时探针已经可用：用 `crate::probe!("注册名", { 一段代码 })` 包住热点代码；用 `PERF_PROBE=1` 构建；guest 内 `echo 1 > /proc/perf_probe_enable` 开启，`cat /proc/perf_probe` 读取 `calls/total_ns/avg_ns/max_ns`。默认构建不启用统计，不用于正式性能对比。
+命名耗时探针已经可用：用 `crate::probe!({ 一段代码 }, "注册名")` 包住热点代码；用 `PERF_PROBE=1` 构建；guest 内 `echo 1 > /proc/perf_probe_enable` 开启，`cat /proc/perf_probe` 读取 `calls/total_ns/avg_ns/max_ns`。默认构建不启用统计，不用于正式性能对比。
 
 ## 接口
 
 代码侧使用块式宏：
 
 ```rust
-crate::probe!("timer.add", {
+crate::probe!({
     add_timer_inner();
-});
+}, "timer.add");
 ```
 
 宏的行为：
@@ -65,7 +65,7 @@ timer.check_expired 108 968800 8970 339200
 
 ```bash
 SMP=1 PERF_PROBE=1 RUN_TIMEOUT=600 \
-  bash .codex/skills/ltp-fix/scripts/drive_qemu.sh \
+  bash .codex/skills/perf-opt/scripts/drive_cosmos_qemu.sh \
   'echo reset > /proc/perf_probe; echo 1 > /proc/perf_probe_enable; cd /mnt/glibc && ./cyclictest_testcode.sh; echo 0 > /proc/perf_probe_enable; cat /proc/perf_probe; echo RC_$?'
 ```
 
@@ -92,9 +92,9 @@ SMP=1 PERF_PROBE=1 RUN_TIMEOUT=600 \
 命名建议用 `模块.动作`，例如：
 
 ```rust
-crate::probe!("sched.pick_next", {
+crate::probe!({
     self.pick_next_task()
-})
+}, "sched.pick_next")
 ```
 
 如果要测一个函数的全体耗时，可以把函数体整体放进宏块；如果函数返回值不是 `()`，让宏块最后一行返回原值即可。
