@@ -18,6 +18,7 @@ use lazy_static::*;
 pub struct RecycleAllocator {
     current: usize,
     recycled: Vec<usize>,
+    recycled_flags: Vec<bool>,
 }
 
 impl RecycleAllocator {
@@ -26,25 +27,25 @@ impl RecycleAllocator {
         RecycleAllocator {
             current: 0,
             recycled: Vec::new(),
+            recycled_flags: Vec::new(),
         }
     }
     /// allocate a new item
     pub fn alloc(&mut self) -> usize {
         if let Some(id) = self.recycled.pop() {
+            self.recycled_flags[id] = false;
             id
         } else {
             self.current += 1;
+            self.recycled_flags.push(false);
             self.current - 1
         }
     }
     /// deallocate an item
     pub fn dealloc(&mut self, id: usize) {
         assert!(id < self.current);
-        debug_assert!(
-            !self.recycled.iter().any(|i| *i == id),
-            "id {} has been deallocated!",
-            id
-        );
+        debug_assert!(!self.recycled_flags[id], "id {} has been deallocated!", id);
+        self.recycled_flags[id] = true;
         self.recycled.push(id);
     }
 }
