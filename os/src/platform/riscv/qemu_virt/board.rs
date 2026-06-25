@@ -7,17 +7,17 @@ pub const USER_MMAP_BASE: usize = 0x1_0000_0000;
 pub const USER_STACK_BASE: usize = 0x0800_0000;
 
 /// base address for loading dynamic linker (interpreter)
-pub const INTERP_BASE: usize = 0x2_0000_0000; 
+pub const INTERP_BASE: usize = 0x2_0000_0000;
 
 /// Clock frequency.
 pub const CLOCK_FREQ: usize = 12_500_000;
 
 /// MMIO windows exposed by the machine.
 pub const MMIO: &[(usize, usize)] = &[
-    (0x0C00_0000, 0x400000), // PLIC
+    (0x0C00_0000, 0x400000),  // PLIC
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC
-    (0x1000_0000, 0x100),    // UART0 (NS16550a)
-    (0x1000_1000, 0x8000),   // VirtIO MMIO devices, 8 slots, each slot occupies 0x1000 bytes
+    (0x1000_0000, 0x100),     // UART0 (NS16550a)
+    (0x1000_1000, 0x8000),    // VirtIO MMIO devices, 8 slots, each slot occupies 0x1000 bytes
 ];
 
 /// UART0 MMIO base address.

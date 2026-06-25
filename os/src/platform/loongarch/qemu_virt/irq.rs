@@ -98,10 +98,7 @@ pub(crate) fn enable_pch_irq(irq: u32) -> bool {
     let bit = 1u32 << (irq % 32);
     iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, bit);
     let enable = iocsr_read32(EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4);
-    iocsr_write32(
-        EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4,
-        enable | bit,
-    );
+    iocsr_write32(EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4, enable | bit);
     enable_pch_pic_irq(irq);
     true
 }

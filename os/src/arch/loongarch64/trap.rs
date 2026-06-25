@@ -7,7 +7,7 @@ use crate::hal::traits::{
     CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
     TrapMachine,
 };
-use crate::signal::{SignalAbi, SignalAction, SignalBit, SigSetT, StackT};
+use crate::signal::{SigSetT, SignalAbi, SignalAction, SignalBit, StackT};
 use crate::syscall::Pod;
 use crate::trap::TrapContext;
 
@@ -256,12 +256,13 @@ impl TrapMachine for LoongArchTrapMachine {
                 ESUBCODE_ADEM => TrapCause::DataAddressFault,
                 _ => TrapCause::Unknown,
             },
-            ECODE_INT => {
-                decode_interrupt_cause(estat, ecfg)
-            }
+            ECODE_INT => decode_interrupt_cause(estat, ecfg),
             _ => TrapCause::Unknown,
         };
-        TrapInfo { cause, fault_addr: badv }
+        TrapInfo {
+            cause,
+            fault_addr: badv,
+        }
     }
 
     unsafe fn return_to_user(trap_cx_user_va: usize, user_token: usize) -> ! {
@@ -446,7 +447,9 @@ impl TrapContextAbi for LoongArchTrapContextAbi {
     }
 
     fn syscall_args(frame: &Self::Frame) -> [usize; 6] {
-        [frame.r[4], frame.r[5], frame.r[6], frame.r[7], frame.r[8], frame.r[9]]
+        [
+            frame.r[4], frame.r[5], frame.r[6], frame.r[7], frame.r[8], frame.r[9],
+        ]
     }
 
     fn syscall_ret(frame: &Self::Frame) -> usize {
@@ -497,37 +500,115 @@ impl TrapContextAbi for LoongArchTrapContextAbi {
 
     fn fault_dump_summary(frame: &Self::Frame) -> [NamedReg; 7] {
         [
-            NamedReg { name: "ra", value: frame.r[1] },
-            NamedReg { name: "sp", value: frame.r[3] },
-            NamedReg { name: "fp", value: frame.r[22] },
-            NamedReg { name: "tp", value: frame.r[2] },
-            NamedReg { name: "a0", value: frame.r[4] },
-            NamedReg { name: "a1", value: frame.r[5] },
-            NamedReg { name: "a7", value: frame.r[11] },
+            NamedReg {
+                name: "ra",
+                value: frame.r[1],
+            },
+            NamedReg {
+                name: "sp",
+                value: frame.r[3],
+            },
+            NamedReg {
+                name: "fp",
+                value: frame.r[22],
+            },
+            NamedReg {
+                name: "tp",
+                value: frame.r[2],
+            },
+            NamedReg {
+                name: "a0",
+                value: frame.r[4],
+            },
+            NamedReg {
+                name: "a1",
+                value: frame.r[5],
+            },
+            NamedReg {
+                name: "a7",
+                value: frame.r[11],
+            },
         ]
     }
 
     fn fault_dump_detail(frame: &Self::Frame) -> [NamedReg; 19] {
         [
-            NamedReg { name: "a2", value: frame.r[6] },
-            NamedReg { name: "a3", value: frame.r[7] },
-            NamedReg { name: "a4", value: frame.r[8] },
-            NamedReg { name: "a5", value: frame.r[9] },
-            NamedReg { name: "a6", value: frame.r[10] },
-            NamedReg { name: "t0", value: frame.r[12] },
-            NamedReg { name: "t1", value: frame.r[13] },
-            NamedReg { name: "t2", value: frame.r[14] },
-            NamedReg { name: "t3", value: frame.r[15] },
-            NamedReg { name: "t4", value: frame.r[16] },
-            NamedReg { name: "t5", value: frame.r[17] },
-            NamedReg { name: "t6", value: frame.r[18] },
-            NamedReg { name: "t7", value: frame.r[19] },
-            NamedReg { name: "t8", value: frame.r[20] },
-            NamedReg { name: "u0", value: frame.r[21] },
-            NamedReg { name: "s0", value: frame.r[23] },
-            NamedReg { name: "s1", value: frame.r[24] },
-            NamedReg { name: "s2", value: frame.r[25] },
-            NamedReg { name: "s3", value: frame.r[26] },
+            NamedReg {
+                name: "a2",
+                value: frame.r[6],
+            },
+            NamedReg {
+                name: "a3",
+                value: frame.r[7],
+            },
+            NamedReg {
+                name: "a4",
+                value: frame.r[8],
+            },
+            NamedReg {
+                name: "a5",
+                value: frame.r[9],
+            },
+            NamedReg {
+                name: "a6",
+                value: frame.r[10],
+            },
+            NamedReg {
+                name: "t0",
+                value: frame.r[12],
+            },
+            NamedReg {
+                name: "t1",
+                value: frame.r[13],
+            },
+            NamedReg {
+                name: "t2",
+                value: frame.r[14],
+            },
+            NamedReg {
+                name: "t3",
+                value: frame.r[15],
+            },
+            NamedReg {
+                name: "t4",
+                value: frame.r[16],
+            },
+            NamedReg {
+                name: "t5",
+                value: frame.r[17],
+            },
+            NamedReg {
+                name: "t6",
+                value: frame.r[18],
+            },
+            NamedReg {
+                name: "t7",
+                value: frame.r[19],
+            },
+            NamedReg {
+                name: "t8",
+                value: frame.r[20],
+            },
+            NamedReg {
+                name: "u0",
+                value: frame.r[21],
+            },
+            NamedReg {
+                name: "s0",
+                value: frame.r[23],
+            },
+            NamedReg {
+                name: "s1",
+                value: frame.r[24],
+            },
+            NamedReg {
+                name: "s2",
+                value: frame.r[25],
+            },
+            NamedReg {
+                name: "s3",
+                value: frame.r[26],
+            },
         ]
     }
 }

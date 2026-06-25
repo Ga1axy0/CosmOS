@@ -1,15 +1,8 @@
 /// Keyed wait queue supporting wakeup by selected key.
-use super::{
-    current_task, wakeup_task, TaskControlBlock, TaskStatus,
-    WaitReason,
-};
+use super::{current_task, wakeup_task, TaskControlBlock, TaskStatus, WaitReason};
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
-use alloc::{
-    collections::VecDeque,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 
 /// Type-erased handle used by signal delivery to properly wake a task
@@ -51,13 +44,16 @@ pub trait NextKey: Default + Eq + core::hash::Hash + Copy {
 }
 
 impl NextKey for u16 {
-    fn next(&self) -> Self { self.wrapping_add(1) }
+    fn next(&self) -> Self {
+        self.wrapping_add(1)
+    }
 }
 
 impl NextKey for () {
-    fn next(&self) -> Self { *self }
+    fn next(&self) -> Self {
+        *self
+    }
 }
-
 
 /// Simple FIFO wait queue without key-based targeting.
 pub struct WaitQueue {
@@ -294,7 +290,9 @@ impl WaitQueue {
 
     fn remove_waiter_by_ptr(&self, task: &Arc<TaskControlBlock>) {
         let task_ptr = Arc::as_ptr(task);
-        self.queue.lock().retain(|queued| Arc::as_ptr(queued) != task_ptr);
+        self.queue
+            .lock()
+            .retain(|queued| Arc::as_ptr(queued) != task_ptr);
     }
 
     fn is_current_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
@@ -330,7 +328,6 @@ impl WaitQueue {
     }
 }
 
-
 /// Keyed wait queue supporting wakeup by selected key.
 pub struct WaitQueueKeyed<T>
 where
@@ -343,7 +340,6 @@ where
     /// Next auto-generated key used by non-selected waits.
     next_key: SpinNoIrqLock<T>,
 }
-
 
 impl<T> WaitQueueKeyed<T>
 where
@@ -517,24 +513,14 @@ where
     pub fn to_handle(&self) -> WaitQueueHandle {
         fn wake_fn<T>(ptr: *const (), task: &Arc<TaskControlBlock>)
         where
-            T: Default
-                + Eq
-                + core::hash::Hash
-                + core::fmt::Display
-                + Copy
-                + NextKey,
+            T: Default + Eq + core::hash::Hash + core::fmt::Display + Copy + NextKey,
         {
             let wq = unsafe { &*(ptr as *const WaitQueueKeyed<T>) };
             wq.wake_waiter_by_ptr(task);
         }
         fn remove_fn<T>(ptr: *const (), task: &Arc<TaskControlBlock>)
         where
-            T: Default
-                + Eq
-                + core::hash::Hash
-                + core::fmt::Display
-                + Copy
-                + NextKey,
+            T: Default + Eq + core::hash::Hash + core::fmt::Display + Copy + NextKey,
         {
             let wq = unsafe { &*(ptr as *const WaitQueueKeyed<T>) };
             wq.remove_waiter_by_ptr(task);

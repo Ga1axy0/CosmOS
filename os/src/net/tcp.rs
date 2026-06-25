@@ -62,7 +62,10 @@ fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
     } else {
         Some(ep.addr)
     };
-    IpListenEndpoint { addr, port: ep.port }
+    IpListenEndpoint {
+        addr,
+        port: ep.port,
+    }
 }
 
 pub(crate) struct TcpListenerShared {
@@ -333,7 +336,10 @@ pub(crate) fn queue_listener_connection_if_ready(
     st: &Arc<TcpSocketState>,
     state: tcp_socket::State,
 ) -> Option<usize> {
-    if !matches!(state, tcp_socket::State::Established | tcp_socket::State::CloseWait) {
+    if !matches!(
+        state,
+        tcp_socket::State::Established | tcp_socket::State::CloseWait
+    ) {
         return None;
     }
     let listener = st.listener_shared()?;
@@ -468,9 +474,7 @@ impl TcpSocketFile {
 
         let local = self.local_endpoint().ok_or(ERRNO::ENOTCONN)?;
         let remote = self.remote_endpoint().ok_or(ERRNO::ENOTCONN)?;
-        if !matches!(local.addr, IpAddress::Ipv4(_))
-            || !matches!(remote.addr, IpAddress::Ipv4(_))
-        {
+        if !matches!(local.addr, IpAddress::Ipv4(_)) || !matches!(remote.addr, IpAddress::Ipv4(_)) {
             return Err(ERRNO::EADDRNOTAVAIL);
         }
 
@@ -516,7 +520,9 @@ impl TcpSocketFile {
         }
         let bound = *self.bound_endpoint.lock();
         bound.map(|bound| {
-            let addr = bound.addr.unwrap_or(unspecified_addr_for_family(self.family));
+            let addr = bound
+                .addr
+                .unwrap_or(unspecified_addr_for_family(self.family));
             IpEndpoint::new(addr, bound.port)
         })
     }
@@ -602,9 +608,7 @@ impl TcpSocketFile {
             let listen_endpoint = self.choose_refill_endpoint(listener);
             {
                 let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                socket
-                    .listen(listen_endpoint)
-                    .map_err(|_| ERRNO::EIO)?;
+                socket.listen(listen_endpoint).map_err(|_| ERRNO::EIO)?;
             }
             debug!(
                 "Tcp listener refill: passive_handle={:?} endpoint={:?} slots={}/{}",
@@ -634,7 +638,8 @@ impl TcpSocketFile {
         } else {
             ep.port
         };
-        *self.bound_endpoint.lock() = Some(listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port)));
+        *self.bound_endpoint.lock() =
+            Some(listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port)));
         debug!(
             "Tcp bind: requested={} effective={:?}",
             ep,
@@ -655,7 +660,7 @@ impl TcpSocketFile {
             },
             backlog
         );
-        
+
         let backlog = normalize_backlog(backlog);
         let was_listening = self.listening.load(Ordering::Acquire);
 
@@ -685,8 +690,7 @@ impl TcpSocketFile {
                 if socket.listen(listen_endpoint).is_ok() {
                     debug!(
                         "Tcp listen armed primary passive socket: handle={:?} endpoint={:?}",
-                        st.handle,
-                        listen_endpoint
+                        st.handle, listen_endpoint
                     );
                     st.set_listener(Some(Arc::downgrade(&listener)));
                     st.set_listener_endpoint(listen_endpoint);
@@ -725,8 +729,10 @@ impl TcpSocketFile {
                     let mut guard = NET_STACK.lock();
                     let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
                     let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-                    if matches!(socket.state(), tcp_socket::State::Closed | tcp_socket::State::TimeWait)
-                    {
+                    if matches!(
+                        socket.state(),
+                        tcp_socket::State::Closed | tcp_socket::State::TimeWait
+                    ) {
                         was_closed = true;
                         (None, None)
                     } else {
@@ -734,7 +740,10 @@ impl TcpSocketFile {
                     }
                 };
                 if was_closed {
-                    debug!("Tcp accept: pending handle={:?} was already closed", st.handle);
+                    debug!(
+                        "Tcp accept: pending handle={:?} was already closed",
+                        st.handle
+                    );
                     st.orphaned.store(true, Ordering::Release);
                     continue;
                 }
@@ -756,7 +765,10 @@ impl TcpSocketFile {
                     mcast_groups: SpinNoIrqLock::new(Vec::new()),
                 });
 
-                debug!("Tcp accept: accepted handle={:?} peer={:?}", st.handle, peer);
+                debug!(
+                    "Tcp accept: accepted handle={:?} peer={:?}",
+                    st.handle, peer
+                );
                 NEED_POLL.store(true, Ordering::Release);
                 return Ok((accepted, peer));
             }
@@ -787,9 +799,9 @@ impl TcpSocketFile {
                 IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
             };
         }
-        
+
         info!("Tcp connect: {}", ep);
-        
+
         {
             let mut guard = NET_STACK.lock();
             let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
@@ -865,7 +877,7 @@ impl TcpSocketFile {
                             socket.remote_endpoint(),
                             tcp_state_name(socket.state())
                         );
-                        return Err(ERRNO::ECONNREFUSED)
+                        return Err(ERRNO::ECONNREFUSED);
                     }
                     _ => {}
                 }
@@ -955,7 +967,11 @@ impl TcpSocketFile {
                     return Ok(total);
                 }
                 if !socket.may_recv() {
-                    debug!("tcp recv eof: source_id={} buf_len={}", st.source_id(), buf.len());
+                    debug!(
+                        "tcp recv eof: source_id={} buf_len={}",
+                        st.source_id(),
+                        buf.len()
+                    );
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);
                     }
@@ -975,7 +991,11 @@ impl TcpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -988,11 +1008,12 @@ impl TcpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.recv_ready()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                st.read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.recv_ready()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);
@@ -1096,7 +1117,11 @@ impl TcpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -1109,11 +1134,12 @@ impl TcpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
-                    self.send_ready()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                st.write_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                        self.send_ready()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);
@@ -1257,7 +1283,11 @@ impl File for TcpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -1270,11 +1300,12 @@ impl File for TcpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.recv_ready()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                st.read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.recv_ready()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);
@@ -1368,7 +1399,11 @@ impl File for TcpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -1381,11 +1416,12 @@ impl File for TcpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
-                    self.send_ready()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                st.write_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                        self.send_ready()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);

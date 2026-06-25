@@ -66,9 +66,7 @@ impl MutexBlocking {
     pub fn new() -> Self {
         trace!("kernel: MutexBlocking::new");
         Self {
-            inner: SpinNoIrqLock::new(MutexBlockingInner {
-                locked: false,
-            }),
+            inner: SpinNoIrqLock::new(MutexBlockingInner { locked: false }),
             wait_queue: WaitQueue::new(),
         }
     }

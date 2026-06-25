@@ -5,8 +5,9 @@ pub mod rtc;
 pub mod sbi;
 
 pub use board::{
-    BlockDeviceImpl, CharDeviceImpl, USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, MMIO, QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC,
-    VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+    BlockDeviceImpl, CharDeviceImpl, QEMUExit, CLOCK_FREQ, INTERP_BASE, MMIO, QEMU_EXIT_HANDLE,
+    USER_MMAP_BASE, USER_STACK_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS,
+    VIRTIO_MMIO_STRIDE, VIRT_RTC, VIRT_UART,
 };
 pub use sbi::SbiPlatform;
 
@@ -86,10 +87,7 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     const SBI_ERR_INVALID_PARAM: isize = -3;
     const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
 
-    info!(
-        "hart {} entering HSM probe/start loop",
-        bootstrap_hart_id
-    );
+    info!("hart {} entering HSM probe/start loop", bootstrap_hart_id);
 
     for target_hart in 0..crate::config::MAX_HARTS {
         let status = sbi::hart_get_status(target_hart);

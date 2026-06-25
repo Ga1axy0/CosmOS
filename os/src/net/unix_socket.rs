@@ -158,12 +158,16 @@ impl UnixSocketPairEnd {
         if create_path {
             let path = unix_path_from_addr(&addr)?;
             let cwd = current_process().inner_exclusive_access().cwd.clone();
-            open_file_at(cwd.as_str(), path.as_str(), OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::RDWR)
-                .map_err(|err| match err {
-                    ERRNO::EIO => ERRNO::ENOTDIR,
-                    ERRNO::EEXIST => ERRNO::EADDRINUSE,
-                    other => other,
-                })?;
+            open_file_at(
+                cwd.as_str(),
+                path.as_str(),
+                OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::RDWR,
+            )
+            .map_err(|err| match err {
+                ERRNO::EIO => ERRNO::ENOTDIR,
+                ERRNO::EEXIST => ERRNO::EADDRINUSE,
+                other => other,
+            })?;
         }
 
         let mut registry = UNIX_REGISTRY.lock();
@@ -176,7 +180,9 @@ impl UnixSocketPairEnd {
             }
             return Err(ERRNO::EADDRINUSE);
         }
-        registry.stream.insert(addr.clone(), self as *const Self as usize);
+        registry
+            .stream
+            .insert(addr.clone(), self as *const Self as usize);
         self.state.lock().bound_addr = Some(addr);
         Ok(())
     }
@@ -502,12 +508,16 @@ impl UnixDatagramSocketFile {
         if create_path {
             let path = unix_path_from_addr(&addr)?;
             let cwd = current_process().inner_exclusive_access().cwd.clone();
-            open_file_at(cwd.as_str(), path.as_str(), OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::RDWR)
-                .map_err(|err| match err {
-                    ERRNO::EIO => ERRNO::ENOTDIR,
-                    ERRNO::EEXIST => ERRNO::EADDRINUSE,
-                    other => other,
-                })?;
+            open_file_at(
+                cwd.as_str(),
+                path.as_str(),
+                OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::RDWR,
+            )
+            .map_err(|err| match err {
+                ERRNO::EIO => ERRNO::ENOTDIR,
+                ERRNO::EEXIST => ERRNO::EADDRINUSE,
+                other => other,
+            })?;
         }
 
         let mut registry = UNIX_REGISTRY.lock();
@@ -520,7 +530,9 @@ impl UnixDatagramSocketFile {
             }
             return Err(ERRNO::EADDRINUSE);
         }
-        registry.datagram.insert(addr.clone(), self as *const Self as usize);
+        registry
+            .datagram
+            .insert(addr.clone(), self as *const Self as usize);
         self.state.lock().bound_addr = Some(addr);
         Ok(())
     }
@@ -540,7 +552,9 @@ impl UnixDatagramSocketFile {
     pub(crate) fn send_to(&self, data: &[u8], addr: Option<Vec<u8>>) -> Result<usize, ERRNO> {
         let (dst, src) = {
             let state = self.state.lock();
-            let dst = addr.or_else(|| state.peer_addr.clone()).ok_or(ERRNO::ENOTCONN)?;
+            let dst = addr
+                .or_else(|| state.peer_addr.clone())
+                .ok_or(ERRNO::ENOTCONN)?;
             (dst, state.bound_addr.clone())
         };
         let peer_ptr = UNIX_REGISTRY

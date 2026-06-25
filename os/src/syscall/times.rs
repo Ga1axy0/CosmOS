@@ -1,13 +1,9 @@
-use crate::syscall::errno::ERRNO;
-use crate::syscall_body;
-use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
 use crate::signal::{has_interrupting_signal, SignalBit};
 use crate::sync::SpinNoIrqLock;
+use crate::syscall::errno::ERRNO;
+use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
+use crate::syscall_body;
 use crate::timer::{add_timer_with_posix_signal_tag, set_realtime_offset_from_time_ns};
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI32, Ordering};
-use lazy_static::lazy_static;
 use crate::{
     config::CLOCK_FREQ,
     sched::block_current_and_run_next,
@@ -17,6 +13,10 @@ use crate::{
         raw_time_to_ns, time_to_ticks, TICKS_PER_SEC,
     },
 };
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicI32, Ordering};
+use lazy_static::lazy_static;
 
 /// Linux 兼容的 `clockid_t` 类型。
 pub type ClockId = i32;
@@ -266,7 +266,7 @@ fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
     let freq = CLOCK_FREQ as u128;
     TimeVal {
         sec: (raw_time / freq) as usize,
-        usec: ((raw_time % freq) * 1_000_000 / freq) as usize,  
+        usec: ((raw_time % freq) * 1_000_000 / freq) as usize,
     }
 }
 /// 返回当前内核可提供的时钟分辨率。
@@ -471,11 +471,7 @@ pub fn sys_getitimer(which: i32, value: *mut OldItimerval) -> isize {
 }
 
 /// `setitimer(2)` 系统调用。
-pub fn sys_setitimer(
-    which: i32,
-    value: *const OldItimerval,
-    ovalue: *mut OldItimerval,
-) -> isize {
+pub fn sys_setitimer(which: i32, value: *const OldItimerval, ovalue: *mut OldItimerval) -> isize {
     trace!(
         "kernel:pid[{}] sys_setitimer which={}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -541,10 +537,7 @@ pub fn sys_clock_gettime(clockid: ClockId, tp: *mut Timespec) -> isize {
                 } else {
                     now_ns.saturating_sub(inner.sched.exec_start_ns)
                 };
-                let runtime = inner
-                    .sched
-                    .sum_exec_runtime_ns
-                    .saturating_add(active_delta);
+                let runtime = inner.sched.sum_exec_runtime_ns.saturating_add(active_delta);
                 timespec_from_ns(runtime)
             }
             _ => return Err(ERRNO::EINVAL),
@@ -620,7 +613,13 @@ pub fn sys_clock_nanosleep(
 
         if sleep_ns == 0 {
             if !rem.is_null() {
-                write_pod_to_user(rem, &Timespec { tv_sec: 0, tv_nsec: 0 })?;
+                write_pod_to_user(
+                    rem,
+                    &Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    },
+                )?;
             }
             return Ok(0);
         }
@@ -657,7 +656,13 @@ pub fn sys_clock_nanosleep(
         }
 
         if !rem.is_null() {
-            write_pod_to_user(rem, &Timespec { tv_sec: 0, tv_nsec: 0 })?;
+            write_pod_to_user(
+                rem,
+                &Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            )?;
         }
         Ok(0)
     })
@@ -683,11 +688,7 @@ pub fn sys_clock_settime(clockid: ClockId, tp: *const Timespec) -> isize {
     })
 }
 
-pub fn sys_timer_create(
-    clockid: ClockId,
-    sevp: *const SigeventCompat,
-    timerid: *mut i32,
-) -> isize {
+pub fn sys_timer_create(clockid: ClockId, sevp: *const SigeventCompat, timerid: *mut i32) -> isize {
     trace!(
         "kernel:pid[{}] sys_timer_create clockid={}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
@@ -715,10 +716,9 @@ pub fn sys_timer_create(
         let process = current_process();
         let pid = process.getpid();
         let id = 0;
-        POSIX_TIMER_SIGNALS.lock().insert(
-            (pid, id),
-            if notify == SIGEV_SIGNAL { signum } else { 0 },
-        );
+        POSIX_TIMER_SIGNALS
+            .lock()
+            .insert((pid, id), if notify == SIGEV_SIGNAL { signum } else { 0 });
         write_pod_to_user(timerid, &id)?;
         Ok(0)
     })

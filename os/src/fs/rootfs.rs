@@ -227,7 +227,6 @@ impl fmt::Debug for VirtualDirNode {
     }
 }
 
-
 impl VfsNode for VirtualDirNode {
     fn as_any(&self) -> &dyn Any {
         self
@@ -270,7 +269,9 @@ impl VfsNode for VirtualDirNode {
             inner
                 .mounts
                 .iter()
-                .filter_map(|(name, stack)| stack.last().map(|node| (name.clone(), node.file_type())))
+                .filter_map(|(name, stack)| {
+                    stack.last().map(|node| (name.clone(), node.file_type()))
+                })
                 .collect()
         };
 

@@ -3,20 +3,20 @@
 //! This module owns CPU-local scheduling state and context switching
 //! primitives. Task and process object definitions remain under `task`.
 
-mod autogroup;
 mod api;
+mod autogroup;
 mod context;
 mod policy;
 mod processor;
 mod runqueue;
 mod switch;
 
-pub use autogroup::{autogroup_enabled, set_autogroup_enabled};
 pub use api::{
     block_current_and_run_next, current_task_need_resched, mark_current_task_need_resched,
     on_timer_tick, request_current_task_resched, schedule_if_needed, suspend_current_and_run_next,
     suspend_current_and_run_next_with_slice_reset, yield_current_and_run_next,
 };
+pub use autogroup::{autogroup_enabled, set_autogroup_enabled};
 pub use context::TaskContext;
 pub use policy::{
     clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, CFS_MIN_GRANULARITY_NS,
@@ -33,9 +33,8 @@ pub use processor::{
 };
 pub use runqueue::wakeup_task;
 pub(crate) use runqueue::{
-    add_stopping_task, add_task, boost_process_cfs_tasks, cfs_should_preempt,
-    clear_stopping_task, enqueue_task_on, has_runnable_task_at_or_above, insert_into_pid2process,
-    list_pids, pick_next_task, pid2process, remove_from_pid2process, remove_task, resched_hart,
-    PID2PCB,
+    add_stopping_task, add_task, boost_process_cfs_tasks, cfs_should_preempt, clear_stopping_task,
+    enqueue_task_on, has_runnable_task_at_or_above, insert_into_pid2process, list_pids,
+    pick_next_task, pid2process, remove_from_pid2process, remove_task, resched_hart, PID2PCB,
 };
 pub use switch::__switch;

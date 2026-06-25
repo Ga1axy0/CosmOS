@@ -158,7 +158,11 @@ pub(crate) fn find_iface_by_ipv4(ip: [u8; 4]) -> Option<CompatNetIfInfo> {
 
 pub(crate) fn create_veth_pair(left: &str, right: &str) -> Result<(), ERRNO> {
     let mut state = COMPAT_NET_STATE.lock();
-    if state.ifaces.iter().any(|iface| iface.name == left || iface.name == right) {
+    if state
+        .ifaces
+        .iter()
+        .any(|iface| iface.name == left || iface.name == right)
+    {
         return Err(ERRNO::EEXIST);
     }
     let left_idx = state.next_ifindex;

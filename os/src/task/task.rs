@@ -3,9 +3,9 @@
 use super::id::TaskUserRes;
 use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
-use crate::mm::MmError;
 use crate::config::MAX_HARTS;
 use crate::hal::traits::AddressSpaceToken;
+use crate::mm::MmError;
 use crate::mm::PhysPageNum;
 use crate::sched::{ReschedReason, SchedAttr, SchedPolicy, TaskContext, NICE_0_LOAD};
 use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};

@@ -1,15 +1,15 @@
 use crate::hal::ArchSignalAbi;
 use crate::signal::{register_signal_wait, SigInfo, SignalAbi, SignalWaitHandle, SignalWakeState};
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
+use crate::timer::{add_timer_with_signal_tag, get_time_ns};
 use crate::{
-    mm::{PageFaultAccess, VirtAddr, translated_ref},
+    mm::{translated_ref, PageFaultAccess, VirtAddr},
     syscall_body,
     task::{
-        block_current_and_run_next, current_process, current_task, current_user_token,
-        SignalBit, TaskStatus, WaitReason,
+        block_current_and_run_next, current_process, current_task, current_user_token, SignalBit,
+        TaskStatus, WaitReason,
     },
 };
-use crate::timer::{add_timer_with_signal_tag, get_time_ns};
 
 use crate::syscall::OldTimespec32;
 
@@ -76,7 +76,11 @@ fn read_user_sigset(mask: *const u64, sigsetsize: usize) -> Result<SignalBit, ER
     }
 }
 
-fn write_user_sigset(mask: *mut u64, sigsetsize: usize, signal_set: SignalBit) -> Result<(), ERRNO> {
+fn write_user_sigset(
+    mask: *mut u64,
+    sigsetsize: usize,
+    signal_set: SignalBit,
+) -> Result<(), ERRNO> {
     if mask.is_null() {
         return Ok(());
     }
@@ -89,9 +93,7 @@ fn write_user_sigset(mask: *mut u64, sigsetsize: usize, signal_set: SignalBit) -
     }
 }
 
-fn parse_sigtimedwait_timeout_ns(
-    uts: *const OldTimespec32,
-) -> Result<Option<u64>, ERRNO> {
+fn parse_sigtimedwait_timeout_ns(uts: *const OldTimespec32) -> Result<Option<u64>, ERRNO> {
     if uts.is_null() {
         return Ok(None);
     }
@@ -128,7 +130,11 @@ fn read_signal_wait_set(uthese: *const u64, sigsetsize: usize) -> Result<SignalB
 fn signal_wait_sleep(handle: SignalWaitHandle, signal_set: SignalBit) {
     let task = current_task().unwrap();
     {
-        debug!("signal_wait_sleep: blocking task of pid {} for signals {:#x}", task.process.upgrade().unwrap().getpid(), signal_set.bits());
+        debug!(
+            "signal_wait_sleep: blocking task of pid {} for signals {:#x}",
+            task.process.upgrade().unwrap().getpid(),
+            signal_set.bits()
+        );
         let mut task_inner = task.inner_exclusive_access();
         debug_assert!(matches!(task_inner.task_status, TaskStatus::Running));
         task_inner.task_status = TaskStatus::Interruptible;
@@ -214,28 +220,23 @@ pub fn sys_sigaction(
         } else {
             let user_action = read_pod_from_user(action)?;
             for i in 0..3 {
-                let word_ptr = (action as usize + i * core::mem::size_of::<usize>()) as *const usize;
+                let word_ptr =
+                    (action as usize + i * core::mem::size_of::<usize>()) as *const usize;
                 match translated_ref(token, word_ptr) {
                     Some(word) => debug!(
                         "sys_sigaction signum={} raw action[{}] addr={:#x} value={:#x}",
-                        signum,
-                        i,
-                        word_ptr as usize,
-                        *word
+                        signum, i, word_ptr as usize, *word
                     ),
                     None => warn!(
                         "sys_sigaction raw action[{}] addr={:#x} unreadable",
-                        i,
-                        word_ptr as usize
+                        i, word_ptr as usize
                     ),
                 }
             }
             let new_action = ArchSignalAbi::decode_user_sigaction(user_action);
             debug!(
                 "sys_sigaction parsed action: handler={:#x}, flags={:#x}, mask={:#x}",
-                new_action.handler,
-                new_action.sa_flags,
-                new_action.sa_mask
+                new_action.handler, new_action.sa_flags, new_action.sa_mask
             );
             // Validate handler address: SIG_DFL/SIG_IGN are always accepted;
             // user handlers must land in an executable user VMA.
@@ -342,16 +343,15 @@ pub fn sys_sigreturn() -> isize {
         // Read ucontext from user stack at sp. The frame can cross a page boundary,
         // so this must use the byte-wise copy helper instead of translated_ref.
         let ucontext_ptr = user_sp;
-        let ucontext = read_pod_from_user(
-            ucontext_ptr as *const <ArchSignalAbi as SignalAbi>::UContext,
-        )
-        .map_err(|err| {
-            error!(
-                "sys_sigreturn: failed to read ucontext at {:#x}: {:?}",
-                ucontext_ptr, err
-            );
-            err
-        })?;
+        let ucontext =
+            read_pod_from_user(ucontext_ptr as *const <ArchSignalAbi as SignalAbi>::UContext)
+                .map_err(|err| {
+                    error!(
+                        "sys_sigreturn: failed to read ucontext at {:#x}: {:?}",
+                        ucontext_ptr, err
+                    );
+                    err
+                })?;
 
         debug!(
             "sys_sigreturn: restoring context from {:#x}, sigmask={:#x}",
@@ -496,8 +496,7 @@ pub fn sys_rt_sigtimedwait_time32(
         let deadline_ns = timeout_ns_to_deadline_ns(timeout_ns)?;
 
         loop {
-            if let Some((signum, siginfo)) = crate::signal::take_pending_signal_in_set(signal_set)
-            {
+            if let Some((signum, siginfo)) = crate::signal::take_pending_signal_in_set(signal_set) {
                 if !uinfo.is_null() {
                     write_pod_to_user(uinfo, &siginfo)?;
                 }

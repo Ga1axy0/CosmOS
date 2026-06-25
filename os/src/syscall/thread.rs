@@ -128,7 +128,9 @@ pub fn sys_waittid(tid: usize) -> i32 {
         }
         // Extract user resources from the zombie task to avoid deadlock:
         // TaskUserRes::drop() needs the process lock, so we must drop it first.
-        let res = waited_task.as_ref().and_then(|t| t.inner_exclusive_access().res.take());
+        let res = waited_task
+            .as_ref()
+            .and_then(|t| t.inner_exclusive_access().res.take());
         drop(process_inner);
         drop(task_inner);
         drop(res);
@@ -138,7 +140,6 @@ pub fn sys_waittid(tid: usize) -> i32 {
         -(ERRNO::EAGAIN as i32) // thread has not exited yet
     }
 }
-
 
 /// 临时实现，只返回当前线程的 tid
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {

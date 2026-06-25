@@ -1,8 +1,8 @@
 //! LoongArch64 arch implementation of HAL traits.
 #![allow(missing_docs)]
 
-pub mod hart;
 mod entry;
+pub mod hart;
 pub mod paging;
 mod switch;
 pub mod trap;

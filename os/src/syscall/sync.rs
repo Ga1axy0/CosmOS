@@ -1,15 +1,14 @@
-use crate::sync::{
-    futex_cmp_requeue_addr, futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar,
-    Mutex, MutexBlocking, MutexSpin, Semaphore,
-};
-use crate::syscall_body;
-use crate::syscall::{read_pod_from_user, write_pod_to_user, times::Timespec};
 use crate::sched::block_current_and_run_next;
+use crate::sync::{
+    futex_cmp_requeue_addr, futex_requeue_addr, futex_wait_addr, futex_wake_addr, Condvar, Mutex,
+    MutexBlocking, MutexSpin, Semaphore,
+};
+use crate::syscall::errno::ERRNO;
+use crate::syscall::{read_pod_from_user, times::Timespec, write_pod_to_user};
+use crate::syscall_body;
 use crate::task::{current_process, current_task, TaskStatus, WaitReason};
 use crate::timer::{add_current_timer_ns_preflagged, get_realtime_ns, get_time_ns};
-use crate::syscall::errno::ERRNO;
 use alloc::sync::Arc;
-
 
 const DEADLOCK_DETECTED: isize = -0xDEAD;
 const FUTEX_WAIT: i32 = 0;
@@ -77,7 +76,6 @@ fn futex_deadline_mono_ns(
     Ok(Some(deadline))
 }
 
-
 /// Minimal Linux futex syscall implementation for pthread wait/wake paths.
 pub fn sys_futex(
     uaddr: *const i32,
@@ -113,8 +111,7 @@ pub fn sys_futex(
                 if flags & !(FUTEX_PRIVATE_FLAG) != 0 {
                     warn!(
                         "Unsupported futex WAIT flags: op={:#x} flags={:#x}",
-                        op,
-                        flags
+                        op, flags
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -142,8 +139,7 @@ pub fn sys_futex(
                 if flags & !FUTEX_PRIVATE_FLAG != 0 {
                     warn!(
                         "Unsupported futex WAKE flags: op={:#x} flags={:#x}",
-                        op,
-                        flags
+                        op, flags
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -154,20 +150,17 @@ pub fn sys_futex(
             }
             FUTEX_REQUEUE => {
                 let flags = op & !FUTEX_CMD_MASK;
-                if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0
-                {
+                if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0 {
                     warn!(
                         "Unsupported futex REQUEUE target: op={:#x} uaddr2={:#x}",
-                        op,
-                        uaddr2
+                        op, uaddr2
                     );
                     return Err(ERRNO::EINVAL);
                 }
                 if flags & !FUTEX_PRIVATE_FLAG != 0 {
                     warn!(
                         "Unsupported futex REQUEUE flags: op={:#x} flags={:#x}",
-                        op,
-                        flags
+                        op, flags
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -186,16 +179,14 @@ pub fn sys_futex(
                 if uaddr2 == 0 || uaddr2 & (core::mem::align_of::<i32>() - 1) != 0 {
                     warn!(
                         "Unsupported futex CMP_REQUEUE target: op={:#x} uaddr2={:#x}",
-                        op,
-                        uaddr2
+                        op, uaddr2
                     );
                     return Err(ERRNO::EINVAL);
                 }
                 if flags & !FUTEX_PRIVATE_FLAG != 0 {
                     warn!(
                         "Unsupported futex CMP_REQUEUE flags: op={:#x} flags={:#x}",
-                        op,
-                        flags
+                        op, flags
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -216,8 +207,7 @@ pub fn sys_futex(
                 if val3 != FUTEX_BITSET_MATCH_ANY {
                     warn!(
                         "Unsupported futex WAIT_BITSET mask: op={:#x} bitset={:#x}",
-                        op,
-                        val3
+                        op, val3
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -225,8 +215,7 @@ pub fn sys_futex(
                 if flags & !supported_flags != 0 {
                     warn!(
                         "Unsupported futex WAIT_BITSET flags: op={:#x} flags={:#x}",
-                        op,
-                        flags
+                        op, flags
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -249,16 +238,14 @@ pub fn sys_futex(
                 if val3 != FUTEX_BITSET_MATCH_ANY {
                     warn!(
                         "Unsupported futex WAKE_BITSET mask: op={:#x} bitset={:#x}",
-                        op,
-                        val3
+                        op, val3
                     );
                     return Err(ERRNO::EINVAL);
                 }
                 if flags & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0 {
                     warn!(
                         "Unsupported futex WAKE_BITSET flags: op={:#x} flags={:#x}",
-                        op,
-                        flags
+                        op, flags
                     );
                     return Err(ERRNO::EINVAL);
                 }
@@ -275,7 +262,7 @@ pub fn sys_futex(
                     op & !FUTEX_CMD_MASK
                 );
                 Err(ERRNO::EINVAL)
-            },
+            }
         }
     })
 }
@@ -312,8 +299,7 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
         }
         debug!(
             "nanosleep: current_time_ns = {}, expire_time_ns = {}",
-            current_time,
-            expire_ns,
+            current_time, expire_ns,
         );
         let task = current_task().unwrap();
         // Publish the sleep state before arming the timer so an immediately
@@ -478,7 +464,9 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
             .push(Some(Arc::new(Semaphore::new(res_count))));
         process_inner.semaphore_list.len() - 1
     };
-    process_inner.semaphore_detector.init_resource(id, res_count);
+    process_inner
+        .semaphore_detector
+        .init_resource(id, res_count);
     id as isize
 }
 /// semaphore up syscall

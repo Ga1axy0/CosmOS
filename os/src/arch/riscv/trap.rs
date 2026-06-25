@@ -1,20 +1,21 @@
 //! RISC-V interrupt control, implementing [`InterruptControl`](crate::hal::traits::InterruptControl).
 
-use core::arch::{asm, global_asm};
-use riscv::register::{
-    sstatus::{self, Sstatus, SPP},
-    mtvec::TrapMode,
-    scause::{self, Exception, Interrupt, Trap},
-    sie, stval, stvec,
-};
 use crate::config::TRAMPOLINE;
 use crate::hal::traits::{
     CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
     TrapMachine,
 };
-use crate::signal::{SignalAbi, SignalAction, SignalBit, SigSetT, StackT};
+use crate::signal::{SigSetT, SignalAbi, SignalAction, SignalBit, StackT};
 use crate::syscall::Pod;
 use crate::trap::TrapContext;
+use core::arch::{asm, global_asm};
+use riscv::register::{
+    mtvec::TrapMode,
+    scause::{self, Exception, Interrupt, Trap},
+    sie,
+    sstatus::{self, Sstatus, SPP},
+    stval, stvec,
+};
 
 global_asm!(include_str!("trap.S"));
 
@@ -132,18 +133,30 @@ const USER_VDSO_CODE: [u8; 8] = [
 ];
 
 impl InterruptControl for RiscvInterruptControl {
-    unsafe fn enable_timer() { sie::set_stimer(); }
-    unsafe fn disable_timer() { sie::clear_stimer(); }
-    unsafe fn enable_external() { sie::set_sext(); }
-    unsafe fn disable_external() { sie::clear_sext(); }
-    unsafe fn enable_software() { sie::set_ssoft(); }
+    unsafe fn enable_timer() {
+        sie::set_stimer();
+    }
+    unsafe fn disable_timer() {
+        sie::clear_stimer();
+    }
+    unsafe fn enable_external() {
+        sie::set_sext();
+    }
+    unsafe fn disable_external() {
+        sie::clear_sext();
+    }
+    unsafe fn enable_software() {
+        sie::set_ssoft();
+    }
 
     unsafe fn clear_software_pending() {
         asm!("csrc sip, {}", in(reg) 1usize << 1);
     }
 
     unsafe fn set_kernel_trap_entry() {
-        extern "C" { fn __trap_from_kernel(); }
+        extern "C" {
+            fn __trap_from_kernel();
+        }
         stvec::write(__trap_from_kernel as usize, TrapMode::Direct);
     }
 
@@ -350,7 +363,14 @@ impl TrapContextAbi for RiscvTrapContextAbi {
     }
 
     fn syscall_args(frame: &Self::Frame) -> [usize; 6] {
-        [frame.x[10], frame.x[11], frame.x[12], frame.x[13], frame.x[14], frame.x[15]]
+        [
+            frame.x[10],
+            frame.x[11],
+            frame.x[12],
+            frame.x[13],
+            frame.x[14],
+            frame.x[15],
+        ]
     }
 
     fn syscall_ret(frame: &Self::Frame) -> usize {
@@ -402,37 +422,115 @@ impl TrapContextAbi for RiscvTrapContextAbi {
 
     fn fault_dump_summary(frame: &Self::Frame) -> [NamedReg; 7] {
         [
-            NamedReg { name: "ra", value: frame.x[1] },
-            NamedReg { name: "sp", value: frame.x[2] },
-            NamedReg { name: "gp", value: frame.x[3] },
-            NamedReg { name: "tp", value: frame.x[4] },
-            NamedReg { name: "a0", value: frame.x[10] },
-            NamedReg { name: "a1", value: frame.x[11] },
-            NamedReg { name: "a7", value: frame.x[17] },
+            NamedReg {
+                name: "ra",
+                value: frame.x[1],
+            },
+            NamedReg {
+                name: "sp",
+                value: frame.x[2],
+            },
+            NamedReg {
+                name: "gp",
+                value: frame.x[3],
+            },
+            NamedReg {
+                name: "tp",
+                value: frame.x[4],
+            },
+            NamedReg {
+                name: "a0",
+                value: frame.x[10],
+            },
+            NamedReg {
+                name: "a1",
+                value: frame.x[11],
+            },
+            NamedReg {
+                name: "a7",
+                value: frame.x[17],
+            },
         ]
     }
 
     fn fault_dump_detail(frame: &Self::Frame) -> [NamedReg; 19] {
         [
-            NamedReg { name: "t0", value: frame.x[5] },
-            NamedReg { name: "t1", value: frame.x[6] },
-            NamedReg { name: "t2", value: frame.x[7] },
-            NamedReg { name: "s0", value: frame.x[8] },
-            NamedReg { name: "s1", value: frame.x[9] },
-            NamedReg { name: "s2", value: frame.x[18] },
-            NamedReg { name: "s3", value: frame.x[19] },
-            NamedReg { name: "s4", value: frame.x[20] },
-            NamedReg { name: "s5", value: frame.x[21] },
-            NamedReg { name: "s6", value: frame.x[22] },
-            NamedReg { name: "s7", value: frame.x[23] },
-            NamedReg { name: "s8", value: frame.x[24] },
-            NamedReg { name: "s9", value: frame.x[25] },
-            NamedReg { name: "s10", value: frame.x[26] },
-            NamedReg { name: "s11", value: frame.x[27] },
-            NamedReg { name: "t3", value: frame.x[28] },
-            NamedReg { name: "t4", value: frame.x[29] },
-            NamedReg { name: "t5", value: frame.x[30] },
-            NamedReg { name: "t6", value: frame.x[31] },
+            NamedReg {
+                name: "t0",
+                value: frame.x[5],
+            },
+            NamedReg {
+                name: "t1",
+                value: frame.x[6],
+            },
+            NamedReg {
+                name: "t2",
+                value: frame.x[7],
+            },
+            NamedReg {
+                name: "s0",
+                value: frame.x[8],
+            },
+            NamedReg {
+                name: "s1",
+                value: frame.x[9],
+            },
+            NamedReg {
+                name: "s2",
+                value: frame.x[18],
+            },
+            NamedReg {
+                name: "s3",
+                value: frame.x[19],
+            },
+            NamedReg {
+                name: "s4",
+                value: frame.x[20],
+            },
+            NamedReg {
+                name: "s5",
+                value: frame.x[21],
+            },
+            NamedReg {
+                name: "s6",
+                value: frame.x[22],
+            },
+            NamedReg {
+                name: "s7",
+                value: frame.x[23],
+            },
+            NamedReg {
+                name: "s8",
+                value: frame.x[24],
+            },
+            NamedReg {
+                name: "s9",
+                value: frame.x[25],
+            },
+            NamedReg {
+                name: "s10",
+                value: frame.x[26],
+            },
+            NamedReg {
+                name: "s11",
+                value: frame.x[27],
+            },
+            NamedReg {
+                name: "t3",
+                value: frame.x[28],
+            },
+            NamedReg {
+                name: "t4",
+                value: frame.x[29],
+            },
+            NamedReg {
+                name: "t5",
+                value: frame.x[30],
+            },
+            NamedReg {
+                name: "t6",
+                value: frame.x[31],
+            },
         ]
     }
 }

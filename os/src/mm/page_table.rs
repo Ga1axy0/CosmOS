@@ -1,11 +1,10 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{
-    frame_alloc, frame_alloc_with_reclaim, FrameTracker, MmError, PhysAddr, PhysPageNum,
-    StepByOne, USER_SPACE_END,
-    VirtAddr, VirtPageNum,
+    frame_alloc, frame_alloc_with_reclaim, FrameTracker, MmError, PhysAddr, PhysPageNum, StepByOne,
+    VirtAddr, VirtPageNum, USER_SPACE_END,
 };
 use crate::config::PAGE_SIZE;
-use crate::hal::traits::{AddressSpaceToken, PagingArch, PTEFlags};
+use crate::hal::traits::{AddressSpaceToken, PTEFlags, PagingArch};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -81,7 +80,10 @@ impl PageTable {
             frames: Vec::new(),
         }
     }
-    fn find_pte_create(&mut self, vpn: VirtPageNum) -> Result<Option<&mut PageTableEntry>, MmError> {
+    fn find_pte_create(
+        &mut self,
+        vpn: VirtPageNum,
+    ) -> Result<Option<&mut PageTableEntry>, MmError> {
         let levels = crate::hal::page_table_levels();
         let mut ppn = self.root_ppn;
         for level in 0..levels {
@@ -257,7 +259,11 @@ fn checked_user_range(start: usize, len: usize) -> Option<usize> {
 }
 
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
-pub fn translated_byte_buffer(token: AddressSpaceToken, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
+pub fn translated_byte_buffer(
+    token: AddressSpaceToken,
+    ptr: *const u8,
+    len: usize,
+) -> Option<Vec<&'static mut [u8]>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
     let end = checked_user_range(start, len)?;
@@ -318,9 +324,7 @@ pub fn translated_refmut<T>(token: AddressSpaceToken, ptr: *mut T) -> Option<&'s
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
     checked_user_range(va, core::mem::size_of::<T>().max(1))?;
-    page_table
-        .translate_va(VirtAddr(va))
-        .map(|pa| pa.get_mut())
+    page_table.translate_va(VirtAddr(va)).map(|pa| pa.get_mut())
 }
 
 /// An abstraction over a buffer passed from user space to kernel space

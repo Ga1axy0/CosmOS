@@ -290,11 +290,13 @@ impl BlockDevice for VirtIOBlock {
 impl VirtIOBlock {
     /// Build a wrapper from an initialized VirtIO transport.
     pub fn try_new(transport: SomeTransport<'static>) -> Option<Self> {
-        VirtIOBlk::<VirtioHal, _>::new(transport).ok().map(|blk| Self {
-            inner: SpinNoIrqLock::new(blk),
-            pending: SpinNoIrqLock::new(BTreeMap::new()),
-            batch_wait_queue: WaitQueue::new(),
-        })
+        VirtIOBlk::<VirtioHal, _>::new(transport)
+            .ok()
+            .map(|blk| Self {
+                inner: SpinNoIrqLock::new(blk),
+                pending: SpinNoIrqLock::new(BTreeMap::new()),
+                batch_wait_queue: WaitQueue::new(),
+            })
     }
 
     fn submit_read_request(
@@ -566,11 +568,7 @@ pub fn render_perf_counters() -> String {
     );
     #[cfg(feature = "io_perf_counters")]
     {
-        let _ = writeln!(
-            &mut out,
-            "  write_many_calls {}",
-            load(&WRITE_MANY_CALLS)
-        );
+        let _ = writeln!(&mut out, "  write_many_calls {}", load(&WRITE_MANY_CALLS));
         let _ = writeln!(&mut out, "  write_many_reqs {}", load(&WRITE_MANY_REQS));
         let _ = writeln!(
             &mut out,

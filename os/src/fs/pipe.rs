@@ -1,11 +1,11 @@
 use super::File;
+use crate::fs::{empty_statfs, Stat, StatFs64, StatMode};
 use crate::mm::UserBuffer;
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
-use alloc::sync::{Arc, Weak};
-use crate::fs::{empty_statfs, Stat, StatFs64, StatMode};
 use crate::task::{WaitQueue, WaitReason};
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use fs::{STATFS_MAGIC_PIPEFS, STATFS_NAMELEN_DEFAULT};
 

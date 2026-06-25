@@ -46,8 +46,12 @@ impl SysRootNode {
 }
 
 impl VfsNode for SysRootNode {
-    fn as_any(&self) -> &dyn Any { self }
-    fn file_type(&self) -> VfsFileType { VfsFileType::Directory }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         alloc::vec![(String::from("class"), VfsFileType::Directory)]
     }
@@ -57,13 +61,26 @@ impl VfsNode for SysRootNode {
             _ => None,
         }
     }
-    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
-    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
     fn clear(&self) {}
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize { 0 }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize { 0 }
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
-        Ok(crate::fs::empty_statfs(SYSFS_MAGIC, crate::config::PAGE_SIZE as u64, SYSFS_MAGIC, 255))
+        Ok(crate::fs::empty_statfs(
+            SYSFS_MAGIC,
+            crate::config::PAGE_SIZE as u64,
+            SYSFS_MAGIC,
+            255,
+        ))
     }
 }
 
@@ -71,8 +88,12 @@ impl VfsNode for SysRootNode {
 struct SysClassNode;
 
 impl VfsNode for SysClassNode {
-    fn as_any(&self) -> &dyn Any { self }
-    fn file_type(&self) -> VfsFileType { VfsFileType::Directory }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         alloc::vec![(String::from("net"), VfsFileType::Directory)]
     }
@@ -82,13 +103,26 @@ impl VfsNode for SysClassNode {
             _ => None,
         }
     }
-    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
-    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
     fn clear(&self) {}
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize { 0 }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize { 0 }
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
-        Ok(crate::fs::empty_statfs(SYSFS_MAGIC, crate::config::PAGE_SIZE as u64, SYSFS_MAGIC, 255))
+        Ok(crate::fs::empty_statfs(
+            SYSFS_MAGIC,
+            crate::config::PAGE_SIZE as u64,
+            SYSFS_MAGIC,
+            255,
+        ))
     }
 }
 
@@ -96,8 +130,12 @@ impl VfsNode for SysClassNode {
 struct SysNetClassNode;
 
 impl VfsNode for SysNetClassNode {
-    fn as_any(&self) -> &dyn Any { self }
-    fn file_type(&self) -> VfsFileType { VfsFileType::Directory }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         compat::list_ifaces()
             .into_iter()
@@ -108,13 +146,26 @@ impl VfsNode for SysNetClassNode {
         compat::get_iface_info(name)
             .map(|iface| Arc::new(SysNetIfaceNode { iface }) as Arc<dyn VfsNode>)
     }
-    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
-    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
     fn clear(&self) {}
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize { 0 }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize { 0 }
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
-        Ok(crate::fs::empty_statfs(SYSFS_MAGIC, crate::config::PAGE_SIZE as u64, SYSFS_MAGIC, 255))
+        Ok(crate::fs::empty_statfs(
+            SYSFS_MAGIC,
+            crate::config::PAGE_SIZE as u64,
+            SYSFS_MAGIC,
+            255,
+        ))
     }
 }
 
@@ -124,8 +175,12 @@ struct SysNetIfaceNode {
 }
 
 impl VfsNode for SysNetIfaceNode {
-    fn as_any(&self) -> &dyn Any { self }
-    fn file_type(&self) -> VfsFileType { VfsFileType::Directory }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Directory
+    }
     fn ls(&self) -> Vec<(String, VfsFileType)> {
         alloc::vec![
             (String::from("address"), VfsFileType::Regular),
@@ -139,13 +194,26 @@ impl VfsNode for SysNetIfaceNode {
             _ => None,
         }
     }
-    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
-    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
     fn clear(&self) {}
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize { 0 }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize { 0 }
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+        0
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
-        Ok(crate::fs::empty_statfs(SYSFS_MAGIC, crate::config::PAGE_SIZE as u64, SYSFS_MAGIC, 255))
+        Ok(crate::fs::empty_statfs(
+            SYSFS_MAGIC,
+            crate::config::PAGE_SIZE as u64,
+            SYSFS_MAGIC,
+            255,
+        ))
     }
 }
 
@@ -169,22 +237,48 @@ impl SysNetAttrNode {
 }
 
 impl VfsNode for SysNetAttrNode {
-    fn as_any(&self) -> &dyn Any { self }
-    fn file_type(&self) -> VfsFileType { VfsFileType::Regular }
-    fn size(&self) -> usize { self.render().len() }
-    fn ls(&self) -> Vec<(String, VfsFileType)> { Vec::new() }
-    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
-    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
-    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> { None }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+    fn size(&self) -> usize {
+        self.render().len()
+    }
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
     fn clear(&self) {}
-    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize { read_string_at(self.render(), offset, buf) }
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize { 0 }
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(self.render(), offset, buf)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
-        Ok(crate::fs::empty_statfs(SYSFS_MAGIC, crate::config::PAGE_SIZE as u64, SYSFS_MAGIC, 255))
+        Ok(crate::fs::empty_statfs(
+            SYSFS_MAGIC,
+            crate::config::PAGE_SIZE as u64,
+            SYSFS_MAGIC,
+            255,
+        ))
     }
 }
 
 fn cstr_to_string(bytes: &[u8]) -> String {
-    let len = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let len = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
     String::from(core::str::from_utf8(&bytes[..len]).unwrap_or(""))
 }

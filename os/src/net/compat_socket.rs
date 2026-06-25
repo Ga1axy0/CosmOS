@@ -173,7 +173,10 @@ fn write_user_buffer(dst: &mut UserBuffer, src: &[u8]) -> usize {
 }
 
 fn c_name(bytes: &[u8]) -> &str {
-    let len = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let len = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
     core::str::from_utf8(&bytes[..len]).unwrap_or("")
 }
 
@@ -201,10 +204,7 @@ fn build_done(seq: u32) -> Vec<u8> {
 }
 
 fn build_ack(req: &NlMsghdr, error: i32) -> Vec<u8> {
-    let payload = NlMsgErr {
-        error,
-        msg: *req,
-    };
+    let payload = NlMsgErr { error, msg: *req };
     let hdr = NlMsghdr {
         nlmsg_len: (size_of::<NlMsghdr>() + size_of::<NlMsgErr>()) as u32,
         nlmsg_type: NLMSG_ERROR,
@@ -586,9 +586,7 @@ impl PacketSocketFile {
     pub(crate) fn getsockname_raw(&self) -> Result<SockAddrLl, ERRNO> {
         let binding = self.binding.lock();
         let binding = binding.as_ref().ok_or(ERRNO::EINVAL)?;
-        let iface = binding
-            .ifindex
-            .and_then(compat::get_iface_by_ifindex);
+        let iface = binding.ifindex.and_then(compat::get_iface_by_ifindex);
         let mut out = SockAddrLl {
             sll_family: AF_PACKET_FAMILY,
             sll_protocol: binding.protocol.to_be(),
@@ -697,7 +695,12 @@ pub(crate) struct NetlinkRouteSocketFile {
 }
 
 impl NetlinkRouteSocketFile {
-    fn handle_newlink(&self, hdr: &NlMsghdr, buf: &[u8], replies: &mut Vec<u8>) -> Result<(), ERRNO> {
+    fn handle_newlink(
+        &self,
+        hdr: &NlMsghdr,
+        buf: &[u8],
+        replies: &mut Vec<u8>,
+    ) -> Result<(), ERRNO> {
         if buf.len() < size_of::<NlMsghdr>() + size_of::<IfInfoMsg>() {
             return Err(ERRNO::EINVAL);
         }
@@ -718,7 +721,8 @@ impl NetlinkRouteSocketFile {
         }
 
         if info.ifi_index > 0 {
-            let iface = compat::get_iface_by_ifindex(info.ifi_index as usize).ok_or(ERRNO::ENODEV)?;
+            let iface =
+                compat::get_iface_by_ifindex(info.ifi_index as usize).ok_or(ERRNO::ENODEV)?;
             if info.ifi_change & IFF_UP != 0 {
                 compat::set_link_up(c_name(&iface.name), (info.ifi_flags & IFF_UP) != 0)?;
             }
@@ -747,7 +751,12 @@ impl NetlinkRouteSocketFile {
         Ok(())
     }
 
-    fn handle_newaddr(&self, hdr: &NlMsghdr, buf: &[u8], replies: &mut Vec<u8>) -> Result<(), ERRNO> {
+    fn handle_newaddr(
+        &self,
+        hdr: &NlMsghdr,
+        buf: &[u8],
+        replies: &mut Vec<u8>,
+    ) -> Result<(), ERRNO> {
         if buf.len() < size_of::<NlMsghdr>() + size_of::<IfAddrMsg>() {
             return Err(ERRNO::EINVAL);
         }
@@ -766,7 +775,12 @@ impl NetlinkRouteSocketFile {
         Ok(())
     }
 
-    fn handle_deladdr(&self, hdr: &NlMsghdr, buf: &[u8], replies: &mut Vec<u8>) -> Result<(), ERRNO> {
+    fn handle_deladdr(
+        &self,
+        hdr: &NlMsghdr,
+        buf: &[u8],
+        replies: &mut Vec<u8>,
+    ) -> Result<(), ERRNO> {
         if buf.len() < size_of::<NlMsghdr>() + size_of::<IfAddrMsg>() {
             return Err(ERRNO::EINVAL);
         }

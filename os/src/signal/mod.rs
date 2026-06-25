@@ -2,7 +2,10 @@
 
 use crate::{
     config::USER_VDSO_RT_SIGRETURN,
-    hal::{ArchSignalAbi, ArchTrapContextAbi, ArchTrapMachine, traits::{TrapContextAbi, TrapMachine}},
+    hal::{
+        traits::{TrapContextAbi, TrapMachine},
+        ArchSignalAbi, ArchTrapContextAbi, ArchTrapMachine,
+    },
     syscall::write_pod_to_user,
     task::{current_task, current_trap_cx},
 };
@@ -104,8 +107,8 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction, SigInfo)> {
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
     let thread_pending = task_inner.pending_signals;
-    let pending =
-        (thread_pending | process_inner.pending_signals) & !task_inner.signal_mask.without_unblockable();
+    let pending = (thread_pending | process_inner.pending_signals)
+        & !task_inner.signal_mask.without_unblockable();
 
     // Find the first pending signal
     for signum in 1..=MAX_SIG {
@@ -281,7 +284,10 @@ pub fn handle_signals() -> Option<i32> {
     }
 
     // Write ucontext to user stack
-    if let Err(err) = write_pod_to_user(ucontext_ptr as *mut <ArchSignalAbi as SignalAbi>::UContext, &ucontext) {
+    if let Err(err) = write_pod_to_user(
+        ucontext_ptr as *mut <ArchSignalAbi as SignalAbi>::UContext,
+        &ucontext,
+    ) {
         warn!(
             "[kernel] handle_signals: failed to write ucontext for signal {}: {:?}",
             signum, err

@@ -158,7 +158,11 @@ impl DeferredKernelRecycleState {
         self.deferred_va_range_count = 0;
         let frames = self.deferred_frames.drain(..).collect();
         let kstack_ids = self.deferred_kstack_ids.drain(..).collect();
-        DeferredBatch { ranges, frames, kstack_ids }
+        DeferredBatch {
+            ranges,
+            frames,
+            kstack_ids,
+        }
     }
 }
 
@@ -201,9 +205,11 @@ pub fn defer_release(
     frames: Vec<FrameTracker>,
 ) {
     let frame_count = frames.len();
-    DEFERRED_KERNEL_RECYCLE_STATE
-        .lock()
-        .mark_va_range_deferred(DeferredVaRange { start, end }, frames, kstack_id);
+    DEFERRED_KERNEL_RECYCLE_STATE.lock().mark_va_range_deferred(
+        DeferredVaRange { start, end },
+        frames,
+        kstack_id,
+    );
     debug!(
         "[tlb] defer kernel va range [{:#x}, {:#x}), frames={}",
         start, end, frame_count
@@ -219,9 +225,7 @@ pub fn needs_flush(start: usize, end: usize) -> bool {
 
 /// 返回当前待 flush 的 deferred 内核虚拟地址区间数量。
 pub fn deferred_range_count() -> usize {
-    DEFERRED_KERNEL_RECYCLE_STATE
-        .lock()
-        .deferred_va_range_count
+    DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_va_range_count
 }
 
 /// 返回当前待 flush 的 deferred 页数统计。
@@ -231,7 +235,10 @@ pub fn deferred_frame_count() -> usize {
 
 /// 返回当前等待 flush 后回收的 kernel stack id 数量。
 pub fn deferred_kstack_id_count() -> usize {
-    DEFERRED_KERNEL_RECYCLE_STATE.lock().deferred_kstack_ids.len()
+    DEFERRED_KERNEL_RECYCLE_STATE
+        .lock()
+        .deferred_kstack_ids
+        .len()
 }
 
 /// 判断当前是否存在待后续全局 flush 处理的内核态延迟回收状态。
@@ -266,9 +273,7 @@ pub fn mark_online(hart_id: usize) {
 
 /// 返回当前已上线 hart 掩码。
 pub fn online_mask() -> usize {
-    TLB_SHOOTDOWN_STATE
-        .online_hart_mask
-        .load(Ordering::Acquire)
+    TLB_SHOOTDOWN_STATE.online_hart_mask.load(Ordering::Acquire)
 }
 
 /// 对指定 hart 掩码发起一次同步 TLB shootdown。
@@ -305,9 +310,7 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     TLB_SHOOTDOWN_STATE
         .target_mask
         .store(target_mask, Ordering::Release);
-    TLB_SHOOTDOWN_STATE
-        .ack_mask
-        .store(0, Ordering::Release);
+    TLB_SHOOTDOWN_STATE.ack_mask.store(0, Ordering::Release);
     TLB_SHOOTDOWN_STATE.seq.fetch_add(1, Ordering::AcqRel);
     TLB_SHOOTDOWN_STATE.active.store(true, Ordering::Release);
     if emit_logs {
@@ -342,12 +345,8 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     }
 
     TLB_SHOOTDOWN_STATE.active.store(false, Ordering::Release);
-    TLB_SHOOTDOWN_STATE
-        .target_mask
-        .store(0, Ordering::Release);
-    TLB_SHOOTDOWN_STATE
-        .ack_mask
-        .store(0, Ordering::Release);
+    TLB_SHOOTDOWN_STATE.target_mask.store(0, Ordering::Release);
+    TLB_SHOOTDOWN_STATE.ack_mask.store(0, Ordering::Release);
     if emit_logs {
         debug!("[tlb] seq={} shootdown complete", seq);
     }
@@ -436,7 +435,9 @@ fn decode_shootdown_kind(kind_bits: usize, arg_token: usize) -> ShootdownKind {
 fn perform_local_tlb_shootdown(kind: ShootdownKind) {
     match kind {
         ShootdownKind::Global => local_sfence_vma_all(),
-        ShootdownKind::AddressSpace { token: target_token } => {
+        ShootdownKind::AddressSpace {
+            token: target_token,
+        } => {
             // 目标 hart 可能是在用户态收到 IPI 后刚切入内核，因此当前 satp
             // 可能已经是 kernel_token；此时仍然要完成本地 flush 并回 ack。
             // TODO：引入 ASID 后，应避免把 kernel_token 情况退化成全量 flush。

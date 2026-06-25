@@ -1,6 +1,6 @@
 //! Implementation of [`TrapContext`]
-use crate::hal::ArchTrapContextAbi;
 use crate::hal::traits::{NamedReg, TrapContextAbi};
+use crate::hal::ArchTrapContextAbi;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

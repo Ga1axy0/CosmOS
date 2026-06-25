@@ -8,8 +8,8 @@ use alloc::sync::Arc;
 use lazy_static::lazy_static;
 
 use crate::fs::{
-    canonicalize, open_file_at, unlinkat, AccessMode, FileDescription, FileStatusFlags, OpenFlags,
-    OSInode,
+    canonicalize, open_file_at, unlinkat, AccessMode, FileDescription, FileStatusFlags, OSInode,
+    OpenFlags,
 };
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -49,7 +49,14 @@ pub struct ShmSegment {
 }
 
 impl ShmSegment {
-    fn new(id: usize, key: ShmKey, size: usize, flags: i32, desc: Arc<FileDescription>, path: String) -> Self {
+    fn new(
+        id: usize,
+        key: ShmKey,
+        size: usize,
+        flags: i32,
+        desc: Arc<FileDescription>,
+        path: String,
+    ) -> Self {
         Self {
             id,
             key,
@@ -171,7 +178,9 @@ pub fn shmget(key: ShmKey, size: usize, flags: i32) -> Result<usize, ERRNO> {
         let inode = open_backing_file(path.as_str(), true)?;
         let desc = new_backing_desc(inode);
         desc.truncate(size)?;
-        let segment = Arc::new(SpinNoIrqLock::new(ShmSegment::new(id, key, size, flags, desc, path)));
+        let segment = Arc::new(SpinNoIrqLock::new(ShmSegment::new(
+            id, key, size, flags, desc, path,
+        )));
         manager.by_id.insert(id, Arc::clone(&segment));
         manager.by_key.insert(key, segment);
         return Ok(id);
@@ -183,7 +192,9 @@ pub fn shmget(key: ShmKey, size: usize, flags: i32) -> Result<usize, ERRNO> {
     let inode = open_backing_file(path.as_str(), true)?;
     let desc = new_backing_desc(inode);
     desc.truncate(size)?;
-    let segment = Arc::new(SpinNoIrqLock::new(ShmSegment::new(id, key, size, flags, desc, path)));
+    let segment = Arc::new(SpinNoIrqLock::new(ShmSegment::new(
+        id, key, size, flags, desc, path,
+    )));
     manager.by_id.insert(id, segment);
     Ok(id)
 }

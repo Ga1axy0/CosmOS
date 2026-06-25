@@ -48,13 +48,17 @@ impl Device for Loopback {
                 buffer.len()
             );
             let rx = RxToken { buffer };
-            let tx = TxToken { queue: &mut self.queue };
+            let tx = TxToken {
+                queue: &mut self.queue,
+            };
             (rx, tx)
         })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxToken { queue: &mut self.queue })
+        Some(TxToken {
+            queue: &mut self.queue,
+        })
     }
 }
 

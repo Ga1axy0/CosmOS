@@ -20,7 +20,9 @@ pub const PAGE_SIZE_BITS: usize = 0xc;
 pub const USER_PIE_BASE: usize = 0x0020_0000;
 
 /// qemu board info
-pub use crate::platform::{USER_MMAP_BASE, USER_STACK_BASE, INTERP_BASE, CLOCK_FREQ, KERNEL_HEAP_BASE, MMIO, TRAMPOLINE};
+pub use crate::platform::{
+    CLOCK_FREQ, INTERP_BASE, KERNEL_HEAP_BASE, MMIO, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE,
+};
 
 /// the virtual addr of trap context
 pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;

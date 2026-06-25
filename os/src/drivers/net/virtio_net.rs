@@ -5,11 +5,7 @@ use alloc::vec::Vec;
 use core::array;
 use core::hint::spin_loop;
 
-use virtio_drivers::{
-    device::net::VirtIONetRaw,
-    transport::SomeTransport,
-    Error,
-};
+use virtio_drivers::{device::net::VirtIONetRaw, transport::SomeTransport, Error};
 
 use crate::drivers::virtio::VirtioHal;
 use crate::sync::SpinNoIrqLock;
@@ -114,7 +110,8 @@ impl VirtIONetDevice {
         let mut rx_slots = self.rx_slots.lock();
         let mut rx_buf = rx_slots.get_mut(token as usize)?.take()?;
         // SAFETY: `rx_buf` is exactly the one passed to `receive_begin` for this `token`.
-        let (hdr_len, pkt_len) = unsafe { inner.receive_complete(token, rx_buf.as_mut_slice()) }.ok()?;
+        let (hdr_len, pkt_len) =
+            unsafe { inner.receive_complete(token, rx_buf.as_mut_slice()) }.ok()?;
         let copy_len = pkt_len.min(out.len());
         if hdr_len + copy_len > rx_buf.len() {
             warn!(
@@ -206,7 +203,11 @@ impl VirtIONetDevice {
             let token = unsafe { inner.transmit_begin(tx_buf.as_slice()) }?;
 
             let idx = token as usize;
-            assert!(idx < QUEUE_SIZE, "virtio-net: tx token {} out of range", token);
+            assert!(
+                idx < QUEUE_SIZE,
+                "virtio-net: tx token {} out of range",
+                token
+            );
             let mut tx_slots = self.tx_slots.lock();
             assert!(
                 tx_slots[idx].is_none(),
@@ -237,8 +238,7 @@ impl VirtIONetDevice {
                     if let Err(e) = unsafe { inner.transmit_complete(token, tx_buf.as_slice()) } {
                         warn!(
                             "virtio-net: non-blocking transmit_complete failed token {}: {:?}",
-                            token,
-                            e
+                            token, e
                         );
                     }
                     None
@@ -281,10 +281,11 @@ impl VirtIONetDevice {
                 return;
             }
             if current_task().is_some() {
-                self.tx_wait_queue
-                    .wait_selected_with_reason_or_skip(token, WaitReason::NetDeviceTx, || {
-                        self.tx_token_ready(token)
-                    });
+                self.tx_wait_queue.wait_selected_with_reason_or_skip(
+                    token,
+                    WaitReason::NetDeviceTx,
+                    || self.tx_token_ready(token),
+                );
                 return;
             }
 

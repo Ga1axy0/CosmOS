@@ -89,7 +89,6 @@ impl<T> Drop for UPSafeCellGuard<'_, T> {
     }
 }
 
-
 /// A multicore-safe cell that provides exclusive access by disabling
 /// supervisor interrupts and spinning.
 ///

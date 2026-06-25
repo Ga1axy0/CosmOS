@@ -1,31 +1,29 @@
 use crate::hal::traits::CloneArgs;
 use crate::mm::{
     frame_allocator_stats, unregister_file_mappings_for_process, warn_heap_state, MapPermission,
-    USER_SPACE_END, VirtAddr,
+    VirtAddr, USER_SPACE_END,
 };
+use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{
-    read_bytes_from_user, read_pod_from_user, write_pod_to_user, Pod,
-};
+use crate::syscall::{read_bytes_from_user, read_pod_from_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{
         canonicalize, open_file, open_file_at, AccessMode, File, FileDescription, FileStatusFlags,
-        OpenFlags, OSInode, Stat, StatMode,
+        OSInode, OpenFlags, Stat, StatMode,
     },
     hal::hartid,
     ipc::{self, IPC_RMID},
     mm::{translated_ref, translated_str},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task, ExitReason,
-        CloneResourceFlags, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo, SignalBit,
-        WaitReason,
+        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task,
+        CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo,
+        SignalBit, WaitReason,
     },
 };
-use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
@@ -59,11 +57,21 @@ pub struct UserCapData {
 
 impl Pod for UserCapData {}
 
-fn unprivileged_uid_change_allowed(current_uid: u32, current_euid: u32, current_suid: u32, new_uid: u32) -> bool {
+fn unprivileged_uid_change_allowed(
+    current_uid: u32,
+    current_euid: u32,
+    current_suid: u32,
+    new_uid: u32,
+) -> bool {
     new_uid == current_uid || new_uid == current_euid || new_uid == current_suid
 }
 
-fn unprivileged_gid_change_allowed(current_gid: u32, current_egid: u32, current_sgid: u32, new_gid: u32) -> bool {
+fn unprivileged_gid_change_allowed(
+    current_gid: u32,
+    current_egid: u32,
+    current_sgid: u32,
+    new_gid: u32,
+) -> bool {
     new_gid == current_gid || new_gid == current_egid || new_gid == current_sgid
 }
 /// `execve` 在解析脚本后得到的最终执行目标。
@@ -92,13 +100,11 @@ const EXEC_PROBE_SIZE: usize = 256;
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 
 fn should_trace_exec(path: &str, argv: &[String]) -> bool {
-    path.contains("acct02")
-        || argv.iter().any(|arg| arg.contains("acct02"))
+    path.contains("acct02") || argv.iter().any(|arg| arg.contains("acct02"))
 }
 
 fn path_env_from_envs(envs: &[String]) -> Option<&str> {
-    envs.iter()
-        .find_map(|env| env.strip_prefix("PATH="))
+    envs.iter().find_map(|env| env.strip_prefix("PATH="))
 }
 
 /// 判断当前文件是否为 ELF 映像。
@@ -148,7 +154,10 @@ fn resolve_exec_image(
     argv: Vec<String>,
     depth: usize,
 ) -> Result<ResolvedExecImage, ERRNO> {
-    debug!("Resolving exec image: path='{}', argv={:?}, depth={}", path, argv, depth);
+    debug!(
+        "Resolving exec image: path='{}', argv={:?}, depth={}",
+        path, argv, depth
+    );
 
     if depth >= EXEC_INTERPRETER_MAX_DEPTH {
         return Err(ERRNO::ELOOP);
@@ -506,7 +515,9 @@ pub fn sys_setuid(uid: u32) -> isize {
         let current_uid = process.getuid();
         let current_euid = process.geteuid();
         let current_suid = process.getsuid();
-        if current_euid != 0 && !unprivileged_uid_change_allowed(current_uid, current_euid, current_suid, uid) {
+        if current_euid != 0
+            && !unprivileged_uid_change_allowed(current_uid, current_euid, current_suid, uid)
+        {
             return Err(ERRNO::EPERM);
         }
         process.setuid_cred(uid);
@@ -517,7 +528,12 @@ pub fn sys_setuid(uid: u32) -> isize {
 /// setreuid syscall
 pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
     let process = current_process();
-    trace!("kernel: sys_setreuid pid:{} ruid={} euid={}", process.getpid(), ruid, euid);
+    trace!(
+        "kernel: sys_setreuid pid:{} ruid={} euid={}",
+        process.getpid(),
+        ruid,
+        euid
+    );
     syscall_body!({
         let mut inner = process.inner_exclusive_access();
         let cred = &mut inner.cred;
@@ -539,8 +555,16 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
             }
         }
 
-        let new_ruid = if ruid == UID_NO_CHANGE { old_ruid } else { ruid };
-        let new_euid = if euid == UID_NO_CHANGE { old_euid } else { euid };
+        let new_ruid = if ruid == UID_NO_CHANGE {
+            old_ruid
+        } else {
+            ruid
+        };
+        let new_euid = if euid == UID_NO_CHANGE {
+            old_euid
+        } else {
+            euid
+        };
         cred.uid = new_ruid;
         cred.euid = new_euid;
         if ruid != UID_NO_CHANGE || (euid != UID_NO_CHANGE && new_euid != old_ruid) {
@@ -612,7 +636,12 @@ pub fn sys_setgid(gid: u32) -> isize {
 /// setregid syscall
 pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
     let process = current_process();
-    trace!("kernel: sys_setregid pid:{} rgid={} egid={}", process.getpid(), rgid, egid);
+    trace!(
+        "kernel: sys_setregid pid:{} rgid={} egid={}",
+        process.getpid(),
+        rgid,
+        egid
+    );
     syscall_body!({
         let mut inner = process.inner_exclusive_access();
         let cred = &mut inner.cred;
@@ -634,8 +663,16 @@ pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
             }
         }
 
-        let new_rgid = if rgid == UID_NO_CHANGE { old_rgid } else { rgid };
-        let new_egid = if egid == UID_NO_CHANGE { old_egid } else { egid };
+        let new_rgid = if rgid == UID_NO_CHANGE {
+            old_rgid
+        } else {
+            rgid
+        };
+        let new_egid = if egid == UID_NO_CHANGE {
+            old_egid
+        } else {
+            egid
+        };
         cred.gid = new_rgid;
         cred.egid = new_egid;
         if rgid != UID_NO_CHANGE || (egid != UID_NO_CHANGE && new_egid != old_rgid) {
@@ -747,7 +784,9 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: i32) -> isize {
                 let mapped = inner.memory_set.mmap_file(
                     crate::mm::VirtAddr::from(chosen),
                     crate::mm::VirtAddr::from(chosen_end),
-                    crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+                    crate::mm::MapPermission::R
+                        | crate::mm::MapPermission::W
+                        | crate::mm::MapPermission::U,
                     Arc::clone(&desc),
                     0,
                     true,
@@ -807,7 +846,12 @@ pub fn sys_shmdt(shmaddr: usize) -> isize {
             .ok_or(ERRNO::EINVAL)?;
         if !process.munmap(
             crate::mm::VirtAddr::from(attachment.addr),
-            crate::mm::VirtAddr::from(attachment.addr.checked_add(attachment.size).ok_or(ERRNO::EOVERFLOW)?),
+            crate::mm::VirtAddr::from(
+                attachment
+                    .addr
+                    .checked_add(attachment.size)
+                    .ok_or(ERRNO::EOVERFLOW)?,
+            ),
         ) {
             process.add_shm_attachment(attachment);
             return Err(ERRNO::EINVAL);
@@ -846,7 +890,9 @@ pub fn sys_getpgid(pid: isize) -> isize {
         if pid < 0 {
             return Err(ERRNO::EINVAL);
         }
-        let process = if pid == 0 { current_process() } else {
+        let process = if pid == 0 {
+            current_process()
+        } else {
             pid2process(pid as usize).or_errno(ERRNO::ESRCH)?
         };
         Ok(process.getpgid() as isize)
@@ -862,7 +908,9 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
 
         let current = current_process();
         let current_pid = current.getpid();
-        let target = if pid == 0 { current.clone() } else {
+        let target = if pid == 0 {
+            current.clone()
+        } else {
             pid2process(pid as usize).or_errno(ERRNO::ESRCH)?
         };
         let target_pid = target.getpid();
@@ -888,11 +936,7 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
             return Err(ERRNO::EPERM);
         }
 
-        let new_pgid = if pgid == 0 {
-            target_pid
-        } else {
-            pgid as usize
-        };
+        let new_pgid = if pgid == 0 { target_pid } else { pgid as usize };
         if new_pgid > u32::MAX as usize {
             return Err(ERRNO::EINVAL);
         }
@@ -1009,7 +1053,10 @@ fn attach_pid_to_cgroup(fd: i32, pid: usize) -> Result<(), ERRNO> {
             .map(|entry| Arc::clone(&entry.desc))
             .ok_or(ERRNO::EBADF)?
     };
-    let inode = desc.as_any().downcast_ref::<OSInode>().ok_or(ERRNO::EINVAL)?;
+    let inode = desc
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .ok_or(ERRNO::EINVAL)?;
     inode.add_pid_to_cgroup(pid)
 }
 
@@ -1045,7 +1092,10 @@ pub fn sys_pidfd_send_signal(
                 .map(|entry| Arc::clone(&entry.desc))
                 .ok_or(ERRNO::EBADF)?
         };
-        let pidfd_file = desc.as_any().downcast_ref::<PidFdFile>().ok_or(ERRNO::EBADF)?;
+        let pidfd_file = desc
+            .as_any()
+            .downcast_ref::<PidFdFile>()
+            .ok_or(ERRNO::EBADF)?;
         let target = pid2process(pidfd_file.pid).or_errno(ERRNO::ESRCH)?;
         crate::task::add_signal_to_process_with_siginfo(&target, signal, siginfo);
         Ok(0)
@@ -1263,9 +1313,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
         );
         debug!(
             "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
-            clone_flags_arg,
-            parent_tid,
-            child_tid
+            clone_flags_arg, parent_tid, child_tid
         );
 
         let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
@@ -1339,7 +1387,12 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             let new_task = current_process
                 .create_task(ustack_base, true, sched_attr)
                 .map_err(|_| ERRNO::ENOMEM)?;
-            let new_tid = new_task.inner_exclusive_access().res.as_ref().unwrap().thread_id() as i32;
+            let new_tid = new_task
+                .inner_exclusive_access()
+                .res
+                .as_ref()
+                .unwrap()
+                .thread_id() as i32;
             if cgroup.is_some() {
                 warn!("kernel: sys_clone CLONE_INTO_CGROUP with CLONE_THREAD is unsupported");
                 return Err(ERRNO::EINVAL);
@@ -1391,9 +1444,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             Ok(new_tid as isize)
         } else {
             if vfork_clone {
-                debug!(
-                    "kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone"
-                );
+                debug!("kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone");
             }
             let mut shared_resources = CloneResourceFlags::empty();
             if flags.contains(CloneFlags::CLONE_VM) {
@@ -1438,10 +1489,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_pid
             );
             if vfork_clone {
-                current_process.wait_exit_queue.wait_with_reason_or_skip(
-                    WaitReason::ProcessWaitExit,
-                    || new_process.is_zombie(),
-                );
+                current_process
+                    .wait_exit_queue
+                    .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
+                        new_process.is_zombie()
+                    });
             }
             Ok(child_pid as isize)
         }
@@ -1523,8 +1575,13 @@ pub fn sys_unshare(flags: usize) -> isize {
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
     const CLONE_NEWTIME: usize = 0x0000_0080;
-    const SUPPORTED_FLAGS: usize =
-        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME;
+    const SUPPORTED_FLAGS: usize = CLONE_NEWNS
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_NEWNET
+        | CLONE_NEWTIME;
 
     syscall_body!({
         if flags & !SUPPORTED_FLAGS != 0 {
@@ -1672,10 +1729,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             };
 
             // 1) 没有任何匹配的子进程
-            let has_target_child = inner
-                .children
-                .iter()
-                .any(|p| matches_wait_pid(p));
+            let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
@@ -1704,7 +1758,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 // warn_heap_state("reap_begin", found_pid);
                 let child_inner = child.inner_exclusive_access();
                 // 编码为wstatus
-               let exit_status = match child_inner.exit_reason {
+                let exit_status = match child_inner.exit_reason {
                     ExitReason::Exit(code) => (code & 0xff) << 8,
                     ExitReason::Signal(signum) => {
                         // 低 7 位为终止信号；若该信号默认动作会转储核心，
@@ -1760,10 +1814,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 .wait_exit_queue
                 .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
                     let inner = process.inner_exclusive_access();
-                    let has_target_child = inner
-                        .children
-                        .iter()
-                        .any(|p| matches_wait_pid(p));
+                    let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
                     let has_target_zombie = inner.children.iter().any(|p| {
                         let p_inner = p.inner_exclusive_access();
                         if !p_inner.is_zombie {

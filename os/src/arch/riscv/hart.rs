@@ -1,8 +1,11 @@
 //! RISC-V hart-local register access, implementing [`HartId`](crate::hal::traits::HartId).
 
-use core::arch::asm;
 use crate::hal::traits::HartId;
-use riscv::{asm::wfi, register::{mstatus::FS, sstatus}};
+use core::arch::asm;
+use riscv::{
+    asm::wfi,
+    register::{mstatus::FS, sstatus},
+};
 
 /// RISC-V implementation of [`HartId`](crate::hal::traits::HartId) via the `tp` register.
 pub struct RiscvHartId;

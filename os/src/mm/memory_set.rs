@@ -1,8 +1,10 @@
 //! Address Space [`MemorySet`] management of Process
 
-use super::{frame_alloc_with_reclaim, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind};
-use super::{PageTable, PageTableEntry, PTEFlags};
-use super::{PhysAddr, PhysPageNum, USER_SPACE_END, VirtAddr, VirtPageNum};
+use super::{
+    frame_alloc_with_reclaim, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind,
+};
+use super::{PTEFlags, PageTable, PageTableEntry};
+use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
 use crate::config::{
@@ -13,11 +15,11 @@ use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
     FileDescription,
 };
-use crate::hal::ArchTrapMachine;
 use crate::hal::traits::{AddressSpaceToken, TrapMachine};
+use crate::hal::ArchTrapMachine;
 use crate::sync::SpinNoIrqLock;
-use crate::task::ProcessControlBlock;
 use crate::syscall::errno::ERRNO;
+use crate::task::ProcessControlBlock;
 use crate::timer::get_time_ns;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -285,7 +287,11 @@ fn read_dynsym_value(
     }
     let symtab_offset = file_offset_for_vaddr(elf, symtab_vaddr).ok_or(MmError::InvalidElf)?;
     let sym_offset = symtab_offset
-        .checked_add(sym_ent.checked_mul(sym_index as usize).ok_or(MmError::InvalidElf)?)
+        .checked_add(
+            sym_ent
+                .checked_mul(sym_index as usize)
+                .ok_or(MmError::InvalidElf)?,
+        )
         .ok_or(MmError::InvalidElf)?;
     let sym_end = sym_offset.checked_add(sym_ent).ok_or(MmError::InvalidElf)?;
     let sym = elf
@@ -364,21 +370,9 @@ fn apply_static_pie_relocations(
     }
 
     for chunk in rela_bytes.chunks_exact(rela_ent) {
-        let offset = usize::from_le_bytes(
-            chunk[0..8]
-                .try_into()
-                .map_err(|_| MmError::InvalidElf)?,
-        );
-        let info = u64::from_le_bytes(
-            chunk[8..16]
-                .try_into()
-                .map_err(|_| MmError::InvalidElf)?,
-        );
-        let addend = i64::from_le_bytes(
-            chunk[16..24]
-                .try_into()
-                .map_err(|_| MmError::InvalidElf)?,
-        );
+        let offset = usize::from_le_bytes(chunk[0..8].try_into().map_err(|_| MmError::InvalidElf)?);
+        let info = u64::from_le_bytes(chunk[8..16].try_into().map_err(|_| MmError::InvalidElf)?);
+        let addend = i64::from_le_bytes(chunk[16..24].try_into().map_err(|_| MmError::InvalidElf)?);
         let rel_type = info as u32;
         let sym_index = (info >> 32) as u32;
         let target = add_load_bias(offset, load_bias)?;
@@ -391,8 +385,7 @@ fn apply_static_pie_relocations(
             }
             2 => {
                 let symtab_vaddr = symtab_vaddr.ok_or(MmError::InvalidElf)?;
-                let (sym_value, shndx) =
-                    read_dynsym_value(elf, symtab_vaddr, sym_ent, sym_index)?;
+                let (sym_value, shndx) = read_dynsym_value(elf, symtab_vaddr, sym_ent, sym_index)?;
                 if shndx == 0 {
                     return Err(MmError::InvalidElf);
                 }
@@ -506,8 +499,7 @@ impl DeferredUserReclaim {
         if self.mask != 0 && !self.batch.is_empty() {
             debug!(
                 "[tlb] deferred user reclaim shootdown: token={:#x} mask={:#b}",
-                self.token,
-                self.mask
+                self.token, self.mask
             );
             shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
         }
@@ -608,7 +600,12 @@ impl MemorySet {
             self.token(),
             mask
         );
-        shootdown(mask, ShootdownKind::AddressSpace { token: self.token() });
+        shootdown(
+            mask,
+            ShootdownKind::AddressSpace {
+                token: self.token(),
+            },
+        );
     }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
@@ -618,7 +615,13 @@ impl MemorySet {
         permission: MapPermission,
     ) -> Result<(), MmError> {
         self.insert_vma(
-            Vma::new(start_va, end_va, MapType::Framed, permission, VmaKind::Anonymous),
+            Vma::new(
+                start_va,
+                end_va,
+                MapType::Framed,
+                permission,
+                VmaKind::Anonymous,
+            ),
             None,
         )
     }
@@ -813,14 +816,13 @@ impl MemorySet {
     pub fn find_free_mmap_area(&self, hint: usize, base: usize, len: usize) -> Option<usize> {
         let upper = USER_SPACE_END;
         let start = align_up(hint.max(base), PAGE_SIZE)?;
-        self.find_free_area_in_range(start, upper, len)
-            .or_else(|| {
-                if start > base {
-                    self.find_free_area_in_range(base, start, len)
-                } else {
-                    None
-                }
-            })
+        self.find_free_area_in_range(start, upper, len).or_else(|| {
+            if start > base {
+                self.find_free_area_in_range(base, start, len)
+            } else {
+                None
+            }
+        })
     }
     fn find_free_area_in_range(&self, start: usize, upper: usize, len: usize) -> Option<usize> {
         if len == 0 || start >= upper || len > upper.checked_sub(start)? {
@@ -863,8 +865,7 @@ impl MemorySet {
     fn map_trampoline(&mut self) -> Result<(), MmError> {
         let trampoline_pa = crate::platform::direct_map_virt_to_phys(strampoline as usize);
 
-        self.page_table
-            .map(
+        self.page_table.map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(trampoline_pa).into(),
             PTEFlags::R | PTEFlags::X,
@@ -884,90 +885,90 @@ impl MemorySet {
         // low-half page-table space and are mapped explicitly.
         #[cfg(not(target_arch = "loongarch64"))]
         {
-        // map kernel sections
-        info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
-        info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
-        info!(".data [{:#x}, {:#x})", sdata as usize, edata as usize);
-        info!(
-            ".bss [{:#x}, {:#x})",
-            sbss_with_stack as usize, ebss as usize
-        );
-        info!("mapping .text section");
-        memory_set
-            .insert_vma(
-            Vma::new(
-                (stext as usize).into(),
-                (etext as usize).into(),
-                MapType::Identical,
-                MapPermission::R | MapPermission::X,
-                VmaKind::Kernel,
-            ),
-            None,
-        )
-            .expect("failed to map kernel text");
-        info!("mapping .rodata section");
-        memory_set
-            .insert_vma(
-            Vma::new(
-                (srodata as usize).into(),
-                (erodata as usize).into(),
-                MapType::Identical,
-                MapPermission::R,
-                VmaKind::Kernel,
-            ),
-            None,
-        )
-            .expect("failed to map kernel rodata");
-        info!("mapping .data section");
-        memory_set
-            .insert_vma(
-            Vma::new(
-                (sdata as usize).into(),
-                (edata as usize).into(),
-                MapType::Identical,
-                MapPermission::R | MapPermission::W,
-                VmaKind::Kernel,
-            ),
-            None,
-        )
-            .expect("failed to map kernel data");
-        info!("mapping .bss section");
-        memory_set
-            .insert_vma(
-            Vma::new(
-                (sbss_with_stack as usize).into(),
-                (ebss as usize).into(),
-                MapType::Identical,
-                MapPermission::R | MapPermission::W,
-                VmaKind::Kernel,
-            ),
-            None,
-        )
-            .expect("failed to map kernel bss");
-        info!("mapping physical memory");
-        let kernel_start = skernel as usize;
-        let kernel_end = ekernel as usize;
-        bootinfo::for_each_usable_memory_region(|region| {
-            let start = align_up_to_page(region.start);
-            let end = align_down_to_page(region.end);
-            map_kernel_ram_fragment(&mut memory_set, start, kernel_start.min(end));
-            map_kernel_ram_fragment(&mut memory_set, kernel_end.max(start), end);
-        });
-        info!("mapping memory-mapped registers");
-        for pair in MMIO {
+            // map kernel sections
+            info!(".text [{:#x}, {:#x})", stext as usize, etext as usize);
+            info!(".rodata [{:#x}, {:#x})", srodata as usize, erodata as usize);
+            info!(".data [{:#x}, {:#x})", sdata as usize, edata as usize);
+            info!(
+                ".bss [{:#x}, {:#x})",
+                sbss_with_stack as usize, ebss as usize
+            );
+            info!("mapping .text section");
             memory_set
                 .insert_vma(
-                Vma::new(
-                    (*pair).0.into(),
-                    ((*pair).0 + (*pair).1).into(),
-                    MapType::Identical,
-                    MapPermission::R | MapPermission::W,
-                    VmaKind::Kernel,
-                ),
-                None,
-            )
-                .expect("failed to map mmio window");
-        }
+                    Vma::new(
+                        (stext as usize).into(),
+                        (etext as usize).into(),
+                        MapType::Identical,
+                        MapPermission::R | MapPermission::X,
+                        VmaKind::Kernel,
+                    ),
+                    None,
+                )
+                .expect("failed to map kernel text");
+            info!("mapping .rodata section");
+            memory_set
+                .insert_vma(
+                    Vma::new(
+                        (srodata as usize).into(),
+                        (erodata as usize).into(),
+                        MapType::Identical,
+                        MapPermission::R,
+                        VmaKind::Kernel,
+                    ),
+                    None,
+                )
+                .expect("failed to map kernel rodata");
+            info!("mapping .data section");
+            memory_set
+                .insert_vma(
+                    Vma::new(
+                        (sdata as usize).into(),
+                        (edata as usize).into(),
+                        MapType::Identical,
+                        MapPermission::R | MapPermission::W,
+                        VmaKind::Kernel,
+                    ),
+                    None,
+                )
+                .expect("failed to map kernel data");
+            info!("mapping .bss section");
+            memory_set
+                .insert_vma(
+                    Vma::new(
+                        (sbss_with_stack as usize).into(),
+                        (ebss as usize).into(),
+                        MapType::Identical,
+                        MapPermission::R | MapPermission::W,
+                        VmaKind::Kernel,
+                    ),
+                    None,
+                )
+                .expect("failed to map kernel bss");
+            info!("mapping physical memory");
+            let kernel_start = skernel as usize;
+            let kernel_end = ekernel as usize;
+            bootinfo::for_each_usable_memory_region(|region| {
+                let start = align_up_to_page(region.start);
+                let end = align_down_to_page(region.end);
+                map_kernel_ram_fragment(&mut memory_set, start, kernel_start.min(end));
+                map_kernel_ram_fragment(&mut memory_set, kernel_end.max(start), end);
+            });
+            info!("mapping memory-mapped registers");
+            for pair in MMIO {
+                memory_set
+                    .insert_vma(
+                        Vma::new(
+                            (*pair).0.into(),
+                            ((*pair).0 + (*pair).1).into(),
+                            MapType::Identical,
+                            MapPermission::R | MapPermission::W,
+                            VmaKind::Kernel,
+                        ),
+                        None,
+                    )
+                    .expect("failed to map mmio window");
+            }
         } // end #[cfg(not(loongarch64))]
         memory_set
     }
@@ -1009,7 +1010,10 @@ impl MemorySet {
                 if size > 0 && offset + size <= elf_data.len() {
                     let interp_bytes = &elf_data[offset..offset + size];
                     // INTERP 段内容是以 null 结尾的字符串
-                    let end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+                    let end = interp_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(interp_bytes.len());
                     if let Ok(path) = core::str::from_utf8(&interp_bytes[..end]) {
                         interp_path = Some(String::from(path));
                         debug!("Found INTERP segment: {}", path);
@@ -1018,7 +1022,8 @@ impl MemorySet {
             }
 
             if ph_type == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = add_load_bias(ph.virtual_addr() as usize, load_bias)?.into();
+                let start_va: VirtAddr =
+                    add_load_bias(ph.virtual_addr() as usize, load_bias)?.into();
                 let end_va: VirtAddr =
                     add_load_bias((ph.virtual_addr() + ph.mem_size()) as usize, load_bias)?.into();
 
@@ -1029,8 +1034,10 @@ impl MemorySet {
                     if phdr_vaddr >= seg_file_start && phdr_vaddr < seg_file_end {
                         // 程序头表在此段内，计算其虚拟地址
                         let offset_in_seg = phdr_vaddr - seg_file_start;
-                        phdr_load_vaddr =
-                            Some(add_load_bias(ph.virtual_addr() as usize + offset_in_seg, load_bias)?);
+                        phdr_load_vaddr = Some(add_load_bias(
+                            ph.virtual_addr() as usize + offset_in_seg,
+                            load_bias,
+                        )?);
                     }
                 }
 
@@ -1045,8 +1052,12 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                debug!("mapping ELF segment: [{:#x}, {:#x}) with flags {:?}",
-                    &(usize::from(start_va)), &(usize::from(end_va)), map_perm);
+                debug!(
+                    "mapping ELF segment: [{:#x}, {:#x}) with flags {:?}",
+                    &(usize::from(start_va)),
+                    &(usize::from(end_va)),
+                    map_perm
+                );
                 let vma = Vma::new_elf(start_va, end_va, map_perm);
                 max_end_vpn = vma.end_vpn();
                 // start_va may not be page-aligned (p_vaddr % p_align == p_offset % p_align).
@@ -1195,9 +1206,7 @@ impl MemorySet {
                     .copy_from_slice(src_ppn.get_bytes_array());
                 debug!(
                     "[cow] fork copy private page directly: vpn={:#x} src_ppn={:#x} dst_ppn={:#x}",
-                    vpn.0,
-                    src_ppn.0,
-                    dst_ppn.0
+                    vpn.0, src_ppn.0, dst_ppn.0
                 );
             }
             // 对于已经直接映到 page cache 的文件页，子进程也直接继承当前映射。
@@ -1743,8 +1752,7 @@ impl MemorySet {
         self.finish_deferred_page_table_edit();
         debug!(
             "[munmap] complete teardown: start_vpn={:#x} end_vpn={:#x}",
-            start_vpn.0,
-            end_vpn.0
+            start_vpn.0, end_vpn.0
         );
         Some(batch)
     }
@@ -1850,9 +1858,7 @@ impl MemorySet {
         let Some(area) = self.find_vma_containing(vpn) else {
             return Ok(PageFaultHandled::NotHandled);
         };
-        if !area.supports_lazy_user_fault()
-            || !area.allows_fault_access(access)
-        {
+        if !area.supports_lazy_user_fault() || !area.allows_fault_access(access) {
             return Ok(PageFaultHandled::NotHandled);
         }
         self.map_private_page_in_vma(vpn)?;
@@ -2053,7 +2059,9 @@ impl MemorySet {
             let Some(area) = self.find_vma_containing(vpn) else {
                 return Ok((PageFaultHandled::NotHandled, None));
             };
-            if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
+            if !area.supports_private_page_sharing()
+                || !area.allows_fault_access(PageFaultAccess::Write)
+            {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
             match area.file.as_ref() {
@@ -2099,7 +2107,9 @@ impl MemorySet {
             let Some(area) = self.find_vma_containing(vpn) else {
                 return Ok((PageFaultHandled::NotHandled, None));
             };
-            if !area.supports_private_page_sharing() || !area.allows_fault_access(PageFaultAccess::Write) {
+            if !area.supports_private_page_sharing()
+                || !area.allows_fault_access(PageFaultAccess::Write)
+            {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
             let Some(page) = area.data_frames.get(&vpn).cloned() else {
@@ -2217,7 +2227,10 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) -> bool {
-        debug!("mprotect_range: [{:#x}, {:#x}) with permission {:?}", start_va.0, end_va.0, permission);
+        debug!(
+            "mprotect_range: [{:#x}, {:#x}) with permission {:?}",
+            start_va.0, end_va.0, permission
+        );
 
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
@@ -2238,8 +2251,16 @@ impl MemorySet {
                 // No overlap with requested range.
                 continue;
             }
-            let overlap_start = if area_start > start_vpn { area_start } else { start_vpn };
-            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+            let overlap_start = if area_start > start_vpn {
+                area_start
+            } else {
+                start_vpn
+            };
+            let overlap_end = if area_end < end_vpn {
+                area_end
+            } else {
+                end_vpn
+            };
             if overlap_start >= overlap_end {
                 continue;
             }
@@ -2286,8 +2307,16 @@ impl MemorySet {
         for mut area in old_vmas.into_values() {
             let area_start = area.start_vpn();
             let area_end = area.end_vpn();
-            let overlap_start = if area_start > start_vpn { area_start } else { start_vpn };
-            let overlap_end = if area_end < end_vpn { area_end } else { end_vpn };
+            let overlap_start = if area_start > start_vpn {
+                area_start
+            } else {
+                start_vpn
+            };
+            let overlap_end = if area_end < end_vpn {
+                area_end
+            } else {
+                end_vpn
+            };
 
             if overlap_start >= overlap_end {
                 new_areas.push(area);
@@ -2588,7 +2617,11 @@ impl Vma {
         vma
     }
     /// 为 `MAP_SHARED | MAP_ANONYMOUS` 创建一段可跨 fork 共享的匿名区域。
-    pub fn new_shared_anonymous(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
+    pub fn new_shared_anonymous(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_perm: MapPermission,
+    ) -> Self {
         let mut vma = Self::new(
             start_va,
             end_va,
@@ -2608,13 +2641,7 @@ impl Vma {
         pgoff: usize,
         shared: bool,
     ) -> Self {
-        let mut vma = Self::new(
-            start_va,
-            end_va,
-            MapType::Framed,
-            map_perm,
-            VmaKind::File,
-        );
+        let mut vma = Self::new(start_va, end_va, MapType::Framed, map_perm, VmaKind::File);
         vma.file = Some(FileVma {
             file,
             pgoff,
@@ -2721,7 +2748,10 @@ impl Vma {
             && !self.shared_anon
             && matches!(
                 self.kind,
-                VmaKind::Anonymous | VmaKind::SharedAnonymous | VmaKind::Heap | VmaKind::UserStack { .. }
+                VmaKind::Anonymous
+                    | VmaKind::SharedAnonymous
+                    | VmaKind::Heap
+                    | VmaKind::UserStack { .. }
             )
     }
     /// 判断当前区域是否需要在建 VMA 时立即分配并建立页表映射。
@@ -2769,8 +2799,7 @@ impl Vma {
             let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
             debug!(
                 "[munmap] defer file cache mapping release: vpn={:#x} shared={}",
-                vpn.0,
-                shared_file_mapping
+                vpn.0, shared_file_mapping
             );
             if let Some(old_pte) = page_table.clear(vpn) {
                 if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
@@ -2833,7 +2862,8 @@ impl Vma {
         let shared_vpns: alloc::vec::Vec<_> = self.direct_cache_pages.keys().copied().collect();
         for vpn in shared_vpns {
             if let Some(page) = self.direct_cache_pages.remove(&vpn) {
-                let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
+                let shared_file_mapping =
+                    self.file.as_ref().map(|file| file.shared).unwrap_or(false);
                 if let Some(old_pte) = page_table.clear(vpn) {
                     if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
                         mark_cached_page_dirty(&page);

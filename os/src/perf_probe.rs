@@ -138,10 +138,12 @@ mod enabled {
         probe.total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         let mut max = probe.max_ns.load(Ordering::Relaxed);
         while elapsed_ns > max {
-            match probe
-                .max_ns
-                .compare_exchange_weak(max, elapsed_ns, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match probe.max_ns.compare_exchange_weak(
+                max,
+                elapsed_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(observed) => max = observed,
             }

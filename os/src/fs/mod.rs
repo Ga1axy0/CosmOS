@@ -1,37 +1,40 @@
 //! File trait & inode(dir, file, pipe, stdin, stdout)
 
+pub mod cgroupfs;
+pub mod devfs;
 mod inode;
 mod page_cache;
 mod pipe;
-mod stdio;
-mod tty;
-pub mod cgroupfs;
-pub mod rootfs;
-pub mod devfs;
 pub mod procfs;
+pub mod rootfs;
+mod stdio;
 pub mod sysfs;
 /// In-memory tmpfs backend that can be mounted into the virtual namespace.
 pub mod tmpfs;
+mod tty;
 
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use fs::{Inode, errno::FS_ERRNO};
 use crate::mm::UserBuffer;
 use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
-use lazy_static::*;
 pub use fs::vfs::{InodeTime, VfsFileType};
+use fs::{errno::FS_ERRNO, Inode};
+use lazy_static::*;
 pub use page_cache::{
-    discard_inode, mapping_for_inode, reclaim_if_needed,
-    sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
-    sync_inode_range, truncate_inode, CachePage, mark_cached_page_dirty, release_mapped_page,
-    retain_mapped_page, PAGE_CACHE_MANAGER,
+    discard_inode, mapping_for_inode, mark_cached_page_dirty, reclaim_if_needed,
+    release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
+    sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PAGE_CACHE_MANAGER,
 };
 
-fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {
+fn encode_dirent64_records(
+    entries: &[(String, VfsFileType)],
+    offset: usize,
+    buf: &mut [u8],
+) -> usize {
     let mut written = 0usize;
 
     for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
@@ -216,10 +219,10 @@ impl FileDescription {
             status_fixed_bits,
             socket_spec: None,
             inner: SleepMutex::new(FileDescriptionInner {
-                    offset: 0,
-                    status_flags,
-                    dirent_snapshot: None,
-                }),
+                offset: 0,
+                status_flags,
+                dirent_snapshot: None,
+            }),
         }
     }
 
@@ -549,8 +552,8 @@ impl FileDescription {
         }
         let mut inner = self.inner.lock();
         let new_offset = match whence {
-            0 => offset,                      // SEEK_SET
-            1 => inner.offset as i64 + offset,        // SEEK_CUR
+            0 => offset,                         // SEEK_SET
+            1 => inner.offset as i64 + offset,   // SEEK_CUR
             2 => self.file.stat().size + offset, // SEEK_END
             _ => return Err(ERRNO::EINVAL),
         };
@@ -777,23 +780,25 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs, init_rootfs,
-    init_sysfs, inode_stat, linkat,
-    linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow, lookup_inode_follow_with_path, mkdir_at,
-    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
-    open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
-    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
-    OpenFlags, OSInode,
+    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs,
+    init_rootfs, init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps, lookup_inode,
+    lookup_inode_follow, lookup_inode_follow_with_path, mkdir_at, mkdir_at_with_inode,
+    mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file,
+    open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, OSInode,
+    OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::new_stdio_files;
-pub use tty::{console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize, CONSOLE_TTY};
+pub use tty::{
+    console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize,
+    CONSOLE_TTY,
+};
 
 /// Initialize the filesystem, including rootfs and devfs.
 pub fn init() -> Result<(), ERRNO> {
-    init_rootfs()?;  // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
-    init_dev();  // Initialize devfs, which provides device files (e.g. /dev/vda, /dev/vdb) for block devices.
-    init_sysfs();  // Initialize sysfs for /sys/class/net entries.
-    init_procfs();  // Initialize procfs for /proc entries.
+    init_rootfs()?; // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
+    init_dev(); // Initialize devfs, which provides device files (e.g. /dev/vda, /dev/vdb) for block devices.
+    init_sysfs(); // Initialize sysfs for /sys/class/net entries.
+    init_procfs(); // Initialize procfs for /proc entries.
     Ok(())
 }

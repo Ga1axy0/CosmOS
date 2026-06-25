@@ -5,10 +5,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::config::MAX_HARTS;
 use crate::hal::hartid;
 
-static HARDIRQ_DEPTH: [AtomicUsize; MAX_HARTS] =
-    [const { AtomicUsize::new(0) }; MAX_HARTS];
-static NOIRQ_LOCK_DEPTH: [AtomicUsize; MAX_HARTS] =
-    [const { AtomicUsize::new(0) }; MAX_HARTS];
+static HARDIRQ_DEPTH: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
+static NOIRQ_LOCK_DEPTH: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
 
 #[inline]
 fn slot(counters: &[AtomicUsize; MAX_HARTS]) -> &AtomicUsize {

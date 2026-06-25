@@ -14,14 +14,14 @@ mod tcp;
 mod udp;
 mod unix_socket;
 
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 #[cfg(feature = "net_perf_counters")]
 use alloc::string::String;
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 #[cfg(feature = "net_perf_counters")]
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "net_perf_counters")]
 use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use smoltcp::{
@@ -29,7 +29,9 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken},
     socket::{tcp as tcp_socket, udp as udp_socket},
     time::Instant,
-    wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address},
+    wire::{
+        EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+    },
 };
 
 use crate::{
@@ -41,8 +43,8 @@ use crate::{
 
 pub(crate) use af_alg::{
     create_alg_socket_file, AlgRequestFile, AlgSendMsgParams, AlgSocketFile, AF_ALG,
-    ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV, ALG_SET_KEY,
-    ALG_SET_OP, SOCK_SEQPACKET, SOL_ALG,
+    ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_IV, ALG_SET_KEY, ALG_SET_OP,
+    SOCK_SEQPACKET, SOL_ALG,
 };
 pub(crate) use compat_socket::{
     compat_ifreq_ioctl, create_compat_ifreq_socket_file, create_netlink_route_socket_file,
@@ -51,26 +53,24 @@ pub(crate) use compat_socket::{
 };
 pub(crate) use raw_ipv6::{
     create_raw_ipv6_socket_file, In6PktInfo, RawIpv6ControlMessage, RawIpv6SendMeta,
-    RawIpv6SocketFile, SockAddrIn6, AF_INET6, ICMP6_FILTER, IPPROTO_ICMPV6,
-    IPV6_2292DSTOPTS, IPV6_2292HOPOPTS, IPV6_2292HOPLIMIT, IPV6_2292PKTINFO, IPV6_2292RTHDR,
-    IPV6_CHECKSUM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPOPTS,
-    IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS,
-    SOL_IPV6,
+    RawIpv6SocketFile, SockAddrIn6, AF_INET6, ICMP6_FILTER, IPPROTO_ICMPV6, IPV6_2292DSTOPTS,
+    IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR, IPV6_CHECKSUM,
+    IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVDSTOPTS, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
+    IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS, IPV6_TCLASS, SOL_IPV6,
 };
-pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
-pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
 pub(crate) use socket_timeout::{
     cleanup_socket_wait, handle_socket_wait_timeout, register_socket_wait, socket_wait_mark_ready,
     socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketTimerTag,
     SocketWakeState,
 };
+pub(crate) use tcp::{create_tcp_socket_file, TcpSocketFile, TcpSocketState};
+pub(crate) use udp::{create_udp_socket_file, UdpSocketFile, UdpSocketState};
 pub(crate) use unix_socket::{
     create_unix_datagram_socket_file, create_unix_stream_socket_file, unix_stream_listener,
     UnixDatagramSocketFile,
 };
 pub use unix_socket::{
-    UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS,
-    SocketLevel,
+    SocketLevel, UnixSocketAncillaryData, UnixSocketPairEnd, UnixUcred, SCM_CREDENTIALS, SCM_RIGHTS,
 };
 
 const RX_BUF_LEN: usize = 32 * 1024;
@@ -91,8 +91,9 @@ const MAX_SOCKET_CATCHUP_POLLS: usize = 32;
 const MAX_PASSIVE_LISTEN_SOCKETS: usize = 16;
 
 const NO_POLL_DEADLINE_US: u64 = u64::MAX;
-const IPV6_LOOPBACK_SOLICITED_NODE: [u8; 16] =
-    [0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x00, 0x00, 0x01];
+const IPV6_LOOPBACK_SOLICITED_NODE: [u8; 16] = [
+    0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x00, 0x00, 0x01,
+];
 
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
@@ -322,36 +323,112 @@ pub(crate) fn render_perf_counters() -> String {
         "  poll_socket_work_active_max {}",
         perf_load(&PERF_POLL_SOCKET_WORK_ACTIVE_MAX)
     );
-    let _ = writeln!(&mut out, "  poll_once_calls {}", perf_load(&PERF_POLL_ONCE_CALLS));
+    let _ = writeln!(
+        &mut out,
+        "  poll_once_calls {}",
+        perf_load(&PERF_POLL_ONCE_CALLS)
+    );
     let _ = writeln!(
         &mut out,
         "  poll_budget_exhausted {}",
         perf_load(&PERF_POLL_BUDGET_EXHAUSTED)
     );
     let _ = writeln!(&mut out, "loopback:");
-    let _ = writeln!(&mut out, "  tx_frames {}", perf_load(&PERF_LOOPBACK_TX_FRAMES));
-    let _ = writeln!(&mut out, "  tx_bytes {}", perf_load(&PERF_LOOPBACK_TX_BYTES));
-    let _ = writeln!(&mut out, "  rx_frames {}", perf_load(&PERF_LOOPBACK_RX_FRAMES));
-    let _ = writeln!(&mut out, "  rx_bytes {}", perf_load(&PERF_LOOPBACK_RX_BYTES));
-    let _ = writeln!(&mut out, "  max_queue_len {}", perf_load(&PERF_LOOPBACK_MAX_QUEUE));
+    let _ = writeln!(
+        &mut out,
+        "  tx_frames {}",
+        perf_load(&PERF_LOOPBACK_TX_FRAMES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  tx_bytes {}",
+        perf_load(&PERF_LOOPBACK_TX_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  rx_frames {}",
+        perf_load(&PERF_LOOPBACK_RX_FRAMES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  rx_bytes {}",
+        perf_load(&PERF_LOOPBACK_RX_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  max_queue_len {}",
+        perf_load(&PERF_LOOPBACK_MAX_QUEUE)
+    );
     let _ = writeln!(&mut out, "virtio:");
-    let _ = writeln!(&mut out, "  tx_frames {}", perf_load(&PERF_VIRTIO_TX_FRAMES));
+    let _ = writeln!(
+        &mut out,
+        "  tx_frames {}",
+        perf_load(&PERF_VIRTIO_TX_FRAMES)
+    );
     let _ = writeln!(&mut out, "  tx_bytes {}", perf_load(&PERF_VIRTIO_TX_BYTES));
-    let _ = writeln!(&mut out, "  rx_frames {}", perf_load(&PERF_VIRTIO_RX_FRAMES));
+    let _ = writeln!(
+        &mut out,
+        "  rx_frames {}",
+        perf_load(&PERF_VIRTIO_RX_FRAMES)
+    );
     let _ = writeln!(&mut out, "  rx_bytes {}", perf_load(&PERF_VIRTIO_RX_BYTES));
     let _ = writeln!(&mut out, "udp:");
-    let _ = writeln!(&mut out, "  direct_packets {}", perf_load(&PERF_UDP_DIRECT_PKTS));
-    let _ = writeln!(&mut out, "  direct_bytes {}", perf_load(&PERF_UDP_DIRECT_BYTES));
-    let _ = writeln!(&mut out, "  direct_drops {}", perf_load(&PERF_UDP_DIRECT_DROPS));
-    let _ = writeln!(&mut out, "  user_send_calls {}", perf_load(&PERF_UDP_USER_SEND_CALLS));
-    let _ = writeln!(&mut out, "  user_send_bytes {}", perf_load(&PERF_UDP_USER_SEND_BYTES));
-    let _ = writeln!(&mut out, "  user_recv_calls {}", perf_load(&PERF_UDP_USER_RECV_CALLS));
-    let _ = writeln!(&mut out, "  user_recv_bytes {}", perf_load(&PERF_UDP_USER_RECV_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  direct_packets {}",
+        perf_load(&PERF_UDP_DIRECT_PKTS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  direct_bytes {}",
+        perf_load(&PERF_UDP_DIRECT_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  direct_drops {}",
+        perf_load(&PERF_UDP_DIRECT_DROPS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_send_calls {}",
+        perf_load(&PERF_UDP_USER_SEND_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_send_bytes {}",
+        perf_load(&PERF_UDP_USER_SEND_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_recv_calls {}",
+        perf_load(&PERF_UDP_USER_RECV_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_recv_bytes {}",
+        perf_load(&PERF_UDP_USER_RECV_BYTES)
+    );
     let _ = writeln!(&mut out, "tcp:");
-    let _ = writeln!(&mut out, "  user_send_calls {}", perf_load(&PERF_TCP_USER_SEND_CALLS));
-    let _ = writeln!(&mut out, "  user_send_bytes {}", perf_load(&PERF_TCP_USER_SEND_BYTES));
-    let _ = writeln!(&mut out, "  user_recv_calls {}", perf_load(&PERF_TCP_USER_RECV_CALLS));
-    let _ = writeln!(&mut out, "  user_recv_bytes {}", perf_load(&PERF_TCP_USER_RECV_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  user_send_calls {}",
+        perf_load(&PERF_TCP_USER_SEND_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_send_bytes {}",
+        perf_load(&PERF_TCP_USER_SEND_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_recv_calls {}",
+        perf_load(&PERF_TCP_USER_RECV_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  user_recv_bytes {}",
+        perf_load(&PERF_TCP_USER_RECV_BYTES)
+    );
     render_tcp_state_snapshot(&mut out);
     out
 }
@@ -550,8 +627,9 @@ impl NetStack {
             .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
         info!("[kernel] net: iface addresses = {:?}", iface.ip_addrs());
 
-        let storage_vec: Vec<smoltcp::iface::SocketStorage<'static>> =
-            (0..MAX_SOCKETS).map(|_| smoltcp::iface::SocketStorage::EMPTY).collect();
+        let storage_vec: Vec<smoltcp::iface::SocketStorage<'static>> = (0..MAX_SOCKETS)
+            .map(|_| smoltcp::iface::SocketStorage::EMPTY)
+            .collect();
         let storage = Box::leak(storage_vec.into_boxed_slice());
         let sockets = SocketSet::new(storage);
 
@@ -570,17 +648,21 @@ impl NetStack {
             let (h, _st) = stack.create_udp_socket();
             let bound = {
                 let socket = stack.sockets.get_mut::<udp_socket::Socket>(h);
-                socket
-                    .bind(KERNEL_UDP_ECHO_PORT)
-                    .is_ok()
+                socket.bind(KERNEL_UDP_ECHO_PORT).is_ok()
             };
             if bound {
                 stack.echo_udp = Some(h);
-                info!("[kernel] net: UDP echo enabled on port {}", KERNEL_UDP_ECHO_PORT);
+                info!(
+                    "[kernel] net: UDP echo enabled on port {}",
+                    KERNEL_UDP_ECHO_PORT
+                );
             } else {
                 // binding failed (port in use) — remove the socket we created.
                 stack.remove_udp_socket(h);
-                info!("[kernel] net: UDP echo disabled, port {} unavailable", KERNEL_UDP_ECHO_PORT);
+                info!(
+                    "[kernel] net: UDP echo disabled, port {} unavailable",
+                    KERNEL_UDP_ECHO_PORT
+                );
             }
         }
 
@@ -978,8 +1060,14 @@ impl MultiDevice {
 }
 
 impl Device for MultiDevice {
-    type RxToken<'a> = MultiRxToken where Self: 'a;
-    type TxToken<'a> = MultiTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = MultiRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = MultiTxToken<'a>
+    where
+        Self: 'a;
 
     fn capabilities(&self) -> DeviceCapabilities {
         self.virtio.capabilities()
@@ -1111,7 +1199,6 @@ impl<'a> TxToken for MultiTxToken<'a> {
             false
         };
 
-
         if is_loopback {
             // Directly push to loopback queue (our custom Loopback has a public queue field)
             debug!(
@@ -1126,7 +1213,10 @@ impl<'a> TxToken for MultiTxToken<'a> {
             perf_add(&PERF_LOOPBACK_TX_BYTES, len);
             #[cfg(feature = "net_perf_counters")]
             perf_update_max(&PERF_LOOPBACK_MAX_QUEUE, self.loopback.queue.len());
-            debug!("net tx routed to loopback queue: after_len={}", self.loopback.queue.len());
+            debug!(
+                "net tx routed to loopback queue: after_len={}",
+                self.loopback.queue.len()
+            );
         } else {
             // Send to VirtIO using the standard path
             match self.virtio.dev.try_send(&buf) {

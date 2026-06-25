@@ -12,8 +12,9 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Ad
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
 use crate::net::{
-    cleanup_socket_wait, compat_ifreq_ioctl, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
-    socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState, NEED_POLL, NET_STACK,
+    cleanup_socket_wait, compat_ifreq_ioctl, register_socket_wait, socket_wait_mark_ready,
+    socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState,
+    NEED_POLL, NET_STACK,
 };
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
@@ -30,7 +31,10 @@ fn listen_endpoint_from_bind(ep: IpEndpoint) -> IpListenEndpoint {
     } else {
         Some(ep.addr)
     };
-    IpListenEndpoint { addr, port: ep.port }
+    IpListenEndpoint {
+        addr,
+        port: ep.port,
+    }
 }
 
 #[inline]
@@ -135,12 +139,16 @@ impl UdpSocketFile {
             let stack = guard.as_mut()?;
             let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
             let listen = socket.endpoint();
-            let addr = listen.addr.unwrap_or(unspecified_addr_for_family(self.family));
+            let addr = listen
+                .addr
+                .unwrap_or(unspecified_addr_for_family(self.family));
             return Some(IpEndpoint::new(addr, listen.port));
         }
 
         if let Some(bound) = *self.bound_endpoint.lock() {
-            let addr = bound.addr.unwrap_or(unspecified_addr_for_family(self.family));
+            let addr = bound
+                .addr
+                .unwrap_or(unspecified_addr_for_family(self.family));
             return Some(IpEndpoint::new(addr, bound.port));
         }
 
@@ -151,7 +159,9 @@ impl UdpSocketFile {
         if listen.port == 0 {
             return None;
         }
-        let addr = listen.addr.unwrap_or(unspecified_addr_for_family(self.family));
+        let addr = listen
+            .addr
+            .unwrap_or(unspecified_addr_for_family(self.family));
         Some(IpEndpoint::new(addr, listen.port))
     }
 
@@ -188,9 +198,7 @@ impl UdpSocketFile {
         };
         debug!(
             "UDP socket {:?} binding to {:?} stack_ep={:?}",
-            self.st.handle,
-            bind_ep,
-            stack_ep
+            self.st.handle, bind_ep, stack_ep
         );
         let socket = stack.sockets.get_mut::<udp_socket::Socket>(self.st.handle);
         match socket.bind(stack_ep) {
@@ -244,7 +252,12 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
-        trace!("udp send_to: data_len={} ep={} handle={:?}", data.len(), ep, self.st.handle);
+        trace!(
+            "udp send_to: data_len={} ep={} handle={:?}",
+            data.len(),
+            ep,
+            self.st.handle
+        );
         let timeout_ns = timeout_ns_to_deadline_ns(self.send_timeout_ns())?;
         let mut timeout_handle = None;
         let mut deadline_ns = None;
@@ -274,11 +287,18 @@ impl UdpSocketFile {
             if can_send {
                 match socket.send_slice(data, ep) {
                     Ok(()) => {
-                        trace!("udp send_slice succeeded for socket {:?}, calling poll", self.st.handle);
+                        trace!(
+                            "udp send_slice succeeded for socket {:?}, calling poll",
+                            self.st.handle
+                        );
 
                         // Check socket state after send
                         let has_data = socket.can_send(); // This checks if there's room, not if there's data to send
-                        trace!("udp socket {:?} state after send: can_send={}", self.st.handle, has_data);
+                        trace!(
+                            "udp socket {:?} state after send: can_send={}",
+                            self.st.handle,
+                            has_data
+                        );
 
                         stack.poll();
                         NEED_POLL.store(true, Ordering::Release);
@@ -290,7 +310,10 @@ impl UdpSocketFile {
                         return Ok(data.len());
                     }
                     Err(e) => {
-                        error!("udp send_slice failed for socket {:?}: {:?}, ep = {}", self.st.handle, e, ep);
+                        error!(
+                            "udp send_slice failed for socket {:?}: {:?}, ep = {}",
+                            self.st.handle, e, ep
+                        );
                         if let Some(handle) = timeout_handle.take() {
                             cleanup_socket_wait(handle);
                         }
@@ -309,7 +332,11 @@ impl UdpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -322,11 +349,13 @@ impl UdpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                self.st.write_wait.wait_with_reason_or_skip(WaitReason::SocketWritable, || {
-                    self.can_send_now()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                self.st
+                    .write_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketWritable, || {
+                        self.can_send_now()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);
@@ -361,7 +390,11 @@ impl UdpSocketFile {
         }
     }
 
-    pub(crate) fn send_user_buffer_to(&self, buf: &UserBuffer, ep: IpEndpoint) -> Result<usize, ERRNO> {
+    pub(crate) fn send_user_buffer_to(
+        &self,
+        buf: &UserBuffer,
+        ep: IpEndpoint,
+    ) -> Result<usize, ERRNO> {
         let total = buf.len();
         if total == 0 {
             return Ok(0);
@@ -383,7 +416,10 @@ impl UdpSocketFile {
         self.send_user_buffer_to(buf, ep)
     }
 
-    pub(crate) fn recv_from_user_buffer(&self, out: &mut UserBuffer) -> Result<(usize, IpEndpoint), ERRNO> {
+    pub(crate) fn recv_from_user_buffer(
+        &self,
+        out: &mut UserBuffer,
+    ) -> Result<(usize, IpEndpoint), ERRNO> {
         let timeout_ns = timeout_ns_to_deadline_ns(self.recv_timeout_ns())?;
         let mut timeout_handle = None;
         let mut deadline_ns = None;
@@ -423,7 +459,11 @@ impl UdpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -436,11 +476,13 @@ impl UdpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                self.st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.can_recv_now()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                self.st
+                    .read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.can_recv_now()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);
@@ -555,7 +597,11 @@ impl File for UdpSocketFile {
                     let handle = register_socket_wait(&task).ok_or(ERRNO::EAGAIN)?;
                     let now_ns = get_time_ns();
                     let deadline = now_ns.checked_add(timeout_ns).ok_or(ERRNO::EINVAL)?;
-                    add_timer_with_socket_tag(deadline, Arc::clone(&task), Some(handle.timer_tag()));
+                    add_timer_with_socket_tag(
+                        deadline,
+                        Arc::clone(&task),
+                        Some(handle.timer_tag()),
+                    );
                     timeout_handle = Some(handle);
                     deadline_ns = Some(deadline);
                 }
@@ -568,11 +614,13 @@ impl File for UdpSocketFile {
                     }
                 }
                 let handle = timeout_handle.expect("socket wait handle must exist");
-                self.st.read_wait.wait_with_reason_or_skip(WaitReason::SocketReadable, || {
-                    self.can_recv_now()
-                        || socket_wait_should_skip(handle)
-                        || crate::signal::has_unmasked_pending_signal()
-                });
+                self.st
+                    .read_wait
+                    .wait_with_reason_or_skip(WaitReason::SocketReadable, || {
+                        self.can_recv_now()
+                            || socket_wait_should_skip(handle)
+                            || crate::signal::has_unmasked_pending_signal()
+                    });
                 if crate::signal::has_unmasked_pending_signal() {
                     if let Some(handle) = timeout_handle.take() {
                         cleanup_socket_wait(handle);

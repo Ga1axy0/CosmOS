@@ -1,8 +1,7 @@
-
 use crate::config::USER_STACK_SIZE;
 use crate::sched::pid2process;
-use crate::syscall::{Pod, read_pod_from_user, write_pod_to_user};
 use crate::syscall::errno::ERRNO;
+use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod};
 use crate::syscall_body;
 use crate::task::current_process;
 
@@ -55,7 +54,7 @@ impl Resource {
             _ => {
                 warn!("Unsupported resource type: {}", raw);
                 None
-            },
+            }
         }
     }
 }
@@ -151,7 +150,12 @@ pub fn sys_setrlimit(resource: usize, rlim: *const rlimit) -> isize {
     })
 }
 
-pub fn sys_prlimit64(pid: i32, resource: usize, new_limit: *const rlimit, old_limit: *mut rlimit) -> isize {
+pub fn sys_prlimit64(
+    pid: i32,
+    resource: usize,
+    new_limit: *const rlimit,
+    old_limit: *mut rlimit,
+) -> isize {
     syscall_body!({
         if pid < 0 {
             return Err(ERRNO::EINVAL);

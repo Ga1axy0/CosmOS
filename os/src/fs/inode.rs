@@ -1,28 +1,28 @@
-use super::{discard_inode, page_cache, File, Stat, StatFs64, StatMode};
+use super::cgroupfs::{new_cgroup2_root, CgroupDirNode};
 use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use super::tmpfs::new_tmpfs_root;
-use super::cgroupfs::{new_cgroup2_root, CgroupDirNode};
+use super::{discard_inode, page_cache, File, Stat, StatFs64, StatMode};
+use crate::drivers::block::{block_device_name, BLOCK_DEVICES};
+use crate::fs::devfs::{
+    ensure_ltp_scratch_device, BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode,
+};
+use crate::fs::procfs::ProcRootNode;
+use crate::fs::sysfs::SysRootNode;
+use crate::fs::tty::TtyDeviceNode;
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::get_realtime_ns;
-use crate::fs::devfs::{
-    ensure_ltp_scratch_device, BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode,
-};
-use crate::fs::tty::TtyDeviceNode;
-use crate::fs::procfs::ProcRootNode;
-use crate::fs::sysfs::SysRootNode;
-use crate::drivers::block::{block_device_name, BLOCK_DEVICES};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::any::Any;
 use fs::vfs::{VfsFileType, VfsNode};
 use fs::Inode;
 use lazy_static::*;
-use core::any::Any;
 
 // Compile-time check: exactly one filesystem backend must be selected.
 #[cfg(not(any(feature = "ext4", feature = "easyfs", feature = "fat32")))]
@@ -74,7 +74,11 @@ impl OSInode {
                 break;
             }
             offset += len;
-            trace!("OSInode::read_all: read {} bytes, offset now {}", len, offset);
+            trace!(
+                "OSInode::read_all: read {} bytes, offset now {}",
+                len,
+                offset
+            );
             v.extend_from_slice(&buffer[..len]);
         }
         v
@@ -82,7 +86,10 @@ impl OSInode {
 
     /// 读取文件首行，返回 `(首行字节, 是否在限制内完整读到首行)`。
     pub fn read_first_line_limited(&self, max_len: usize) -> (Vec<u8>, bool) {
-        trace!("kernel: OSInode::read_first_line_limited, max_len={}", max_len);
+        trace!(
+            "kernel: OSInode::read_first_line_limited, max_len={}",
+            max_len
+        );
         let mut buf = alloc::vec![0; max_len];
         let read_len = if let Some(mapping) = self.page_mapping() {
             mapping.read(0, &mut buf)
@@ -179,7 +186,12 @@ fn remove_mount_record(target: &str) {
     MOUNT_TABLE.lock().remove(target);
 }
 
-fn update_mount_record(target: &str, source: &str, fs_type: &str, options: &str) -> Result<(), ERRNO> {
+fn update_mount_record(
+    target: &str,
+    source: &str,
+    fs_type: &str,
+    options: &str,
+) -> Result<(), ERRNO> {
     let mut table = MOUNT_TABLE.lock();
     let record = table.get_mut(target).ok_or(ERRNO::EINVAL)?;
     record.source = String::from(source);
@@ -551,7 +563,8 @@ pub fn init_rootfs() -> Result<(), ERRNO> {
         use fs::Ext4FileSystem;
         let efs = Ext4FileSystem::open(root_dev.clone());
         let root = Ext4FileSystem::root_inode(&efs);
-        do_mount("/", root.clone()).unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
+        do_mount("/", root.clone())
+            .unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /"));
         record_mount("/", root_dev_name.as_str(), "ext4", "rw");
         if let Some((extra_dev_name, extra_dev)) = extra_dev {
             let extra_fs = Ext4FileSystem::open(extra_dev);
@@ -559,7 +572,10 @@ pub fn init_rootfs() -> Result<(), ERRNO> {
             do_mount("/mnt", extra_root)
                 .unwrap_or_else(|_| panic!("[kernel] failed to mount ext4 at /mnt"));
             record_mount("/mnt", extra_dev_name.as_str(), "ext4", "rw");
-            info!("[kernel] mounted extra ext4 at /mnt from {}", extra_dev_name);
+            info!(
+                "[kernel] mounted extra ext4 at /mnt from {}",
+                extra_dev_name
+            );
         }
     }
 
@@ -755,7 +771,7 @@ fn runtime_block_inode(abs_path: &str, inode: &Arc<Inode>) -> Option<Arc<Inode>>
     }
     let minor = super::devfs::blkdev_minor_from_name(dev_name);
     Some(Inode::from_vfs_node(
-        Arc::new(BlockDevNode::new(dev, minor)) as Arc<dyn VfsNode>
+        Arc::new(BlockDevNode::new(dev, minor)) as Arc<dyn VfsNode>,
     ))
 }
 
@@ -765,7 +781,12 @@ pub fn open_file_at_with_status(
     path: &str,
     flags: OpenFlags,
 ) -> Result<(Arc<OSInode>, bool), ERRNO> {
-    trace!("kernel: open_file_at: cwd={}, path={}, flags={:?}", cwd, path, flags);
+    trace!(
+        "kernel: open_file_at: cwd={}, path={}, flags={:?}",
+        cwd,
+        path,
+        flags
+    );
     let abs = canonicalize(cwd, path);
     debug!("open_file_at: path = {} -> abs path = {}", path, abs);
 
@@ -958,8 +979,7 @@ pub fn linkat_with_flags(
     if new_parent.find(new_name.as_str()).is_some() {
         return Err(ERRNO::EEXIST);
     }
-    new_parent
-        .link_inode(&old_inode, new_name.as_str())?;
+    new_parent.link_inode(&old_inode, new_name.as_str())?;
     Ok(())
 }
 
@@ -1059,10 +1079,7 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
         if let Err(err) = parent.unlink(name.as_str()) {
             error!(
                 "[unlinkat] unlink regular file failed: cwd={} path={} name={} errno={}",
-                cwd,
-                path,
-                name,
-                err as i32
+                cwd, path, name, err as i32
             );
             return Err(err.into());
         }
@@ -1216,17 +1233,15 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
     // backends like ext4, instead of one per field).
     let attrs = inode.stat_attrs();
     let file_type = inode.file_type();
-    let mode = StatMode::from_bits_truncate(attrs.mode.unwrap_or(
-        match file_type {
-            VfsFileType::Directory => StatMode::DIR.bits() | 0o755,
-            VfsFileType::Symlink => StatMode::LINK.bits() | 0o777,
-            VfsFileType::Char => StatMode::CHAR.bits() | 0o666,
-            VfsFileType::Block => StatMode::BLOCK.bits() | 0o660,
-            VfsFileType::Fifo => StatMode::FIFO.bits() | 0o666,
-            VfsFileType::Socket => StatMode::SOCK.bits() | 0o777,
-            VfsFileType::Regular | VfsFileType::Unknown => StatMode::FILE.bits() | 0o644,
-        }
-    ));
+    let mode = StatMode::from_bits_truncate(attrs.mode.unwrap_or(match file_type {
+        VfsFileType::Directory => StatMode::DIR.bits() | 0o755,
+        VfsFileType::Symlink => StatMode::LINK.bits() | 0o777,
+        VfsFileType::Char => StatMode::CHAR.bits() | 0o666,
+        VfsFileType::Block => StatMode::BLOCK.bits() | 0o660,
+        VfsFileType::Fifo => StatMode::FIFO.bits() | 0o666,
+        VfsFileType::Socket => StatMode::SOCK.bits() | 0o777,
+        VfsFileType::Regular | VfsFileType::Unknown => StatMode::FILE.bits() | 0o644,
+    }));
     // Prefer the page-cache size for regular files that have dirty mappings;
     // fall back to the batched attribute read otherwise.
     let size = if file_type == VfsFileType::Regular {
@@ -1267,8 +1282,8 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
 /// and [`init_rootfs`].  The `/dev` directory is provided by a dedicated
 /// devfs mount.
 pub fn init_dev() {
-    let dev_dir = ensure_virtual_dir("/dev")
-        .unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
+    let dev_dir =
+        ensure_virtual_dir("/dev").unwrap_or_else(|_| panic!("[kernel] failed to create /dev"));
     let tmpfs_root = Inode::from_vfs_node(new_tmpfs_root());
     do_mount("/dev/shm", tmpfs_root)
         .unwrap_or_else(|_| panic!("[kernel] failed to mount tmpfs at /dev/shm"));
@@ -1282,9 +1297,15 @@ pub fn init_dev() {
     dev_dir.bind("cpu_dma_latency", cpu_dma_latency_node as Arc<dyn VfsNode>);
     info!("[kernel] /dev/cpu_dma_latency registered");
 
-    let console_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(crate::fs::TtyDeviceKind::Console, 0x0501));
+    let console_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(
+        crate::fs::TtyDeviceKind::Console,
+        0x0501,
+    ));
     dev_dir.bind("console", Arc::clone(&console_node));
-    let tty_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(crate::fs::TtyDeviceKind::Tty, 0x0500));
+    let tty_node: Arc<dyn VfsNode> = Arc::new(crate::fs::TtyDeviceNode::new(
+        crate::fs::TtyDeviceKind::Tty,
+        0x0500,
+    ));
     dev_dir.bind("tty", tty_node);
     info!("[kernel] /dev/console and /dev/tty registered");
 
@@ -1349,12 +1370,15 @@ pub fn init_sysfs() {
 /// `abs_mnt` must be an already-canonicalized absolute pathname.
 /// `fs_type` is a filesystem type string: `"vfat"`, `"fat32"`, `"ext2"`,
 /// `"ext3"`, or `"ext4"`.
-pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str, readonly: bool) -> Result<(), ERRNO> {
+pub fn mount_device(
+    dev_path: &str,
+    abs_mnt: &str,
+    fs_type: &str,
+    readonly: bool,
+) -> Result<(), ERRNO> {
     debug!(
         "mount_device: dev_path={}, abs_mnt={}, fs_type={}",
-        dev_path,
-        abs_mnt,
-        fs_type,
+        dev_path, abs_mnt, fs_type,
     );
     let dev_inode = lookup_inode_follow("/", dev_path, true).or(Err(ERRNO::ENODEV))?;
     let vfs_node = dev_inode.vfs_node();
@@ -1389,7 +1413,12 @@ pub fn mount_device(dev_path: &str, abs_mnt: &str, fs_type: &str, readonly: bool
 pub fn mount_tmpfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
     let fs_root = Inode::from_vfs_node(new_tmpfs_root());
     do_mount(abs_mnt, fs_root)?;
-    record_mount(abs_mnt, "tmpfs", "tmpfs", if readonly { "ro" } else { "rw" });
+    record_mount(
+        abs_mnt,
+        "tmpfs",
+        "tmpfs",
+        if readonly { "ro" } else { "rw" },
+    );
     Ok(())
 }
 
@@ -1397,7 +1426,12 @@ pub fn mount_tmpfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
 pub fn mount_sysfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
     let fs_root = Inode::from_vfs_node(Arc::new(SysRootNode::new()) as Arc<dyn VfsNode>);
     do_mount(abs_mnt, fs_root)?;
-    record_mount(abs_mnt, "sysfs", "sysfs", if readonly { "ro" } else { "rw" });
+    record_mount(
+        abs_mnt,
+        "sysfs",
+        "sysfs",
+        if readonly { "ro" } else { "rw" },
+    );
     Ok(())
 }
 
@@ -1405,7 +1439,12 @@ pub fn mount_sysfs(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
 pub fn mount_cgroup2(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
     let fs_root = Inode::from_vfs_node(new_cgroup2_root());
     do_mount(abs_mnt, fs_root)?;
-    record_mount(abs_mnt, "cgroup2", "cgroup2", if readonly { "ro" } else { "rw" });
+    record_mount(
+        abs_mnt,
+        "cgroup2",
+        "cgroup2",
+        if readonly { "ro" } else { "rw" },
+    );
     Ok(())
 }
 
@@ -1413,7 +1452,12 @@ pub fn mount_cgroup2(abs_mnt: &str, readonly: bool) -> Result<(), ERRNO> {
 ///
 /// CosmOS currently tracks remount state in mount metadata so path-based checks
 /// can observe `ro` versus `rw` without rebuilding the mounted filesystem.
-pub fn remount_path(abs_mnt: &str, dev_path: &str, fs_type: &str, readonly: bool) -> Result<(), ERRNO> {
+pub fn remount_path(
+    abs_mnt: &str,
+    dev_path: &str,
+    fs_type: &str,
+    readonly: bool,
+) -> Result<(), ERRNO> {
     update_mount_record(
         abs_mnt,
         dev_path,

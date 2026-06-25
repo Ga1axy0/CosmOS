@@ -1,10 +1,12 @@
 use crate::config::PAGE_SIZE;
-use crate::mm::{translated_byte_buffer, MmError, PageFaultAccess, PageFaultHandled, PageTable, VirtAddr};
+use crate::mm::{
+    translated_byte_buffer, MmError, PageFaultAccess, PageFaultHandled, PageTable, VirtAddr,
+};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::task::{current_process, current_user_token, ProcessControlBlock};
 
-use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::mem::{size_of, MaybeUninit};
@@ -152,11 +154,8 @@ pub fn translated_process_byte_buffer_with_access(
 
 /// 将一段字节序列写回到用户地址空间。
 pub fn write_bytes_to_user(ptr: *mut u8, src: &[u8]) -> Result<(), ERRNO> {
-    let mut buffers = translated_byte_buffer_with_access(
-        ptr as *const u8,
-        src.len(),
-        PageFaultAccess::Write,
-    )?;
+    let mut buffers =
+        translated_byte_buffer_with_access(ptr as *const u8, src.len(), PageFaultAccess::Write)?;
     let mut copied = 0usize;
     for buffer in buffers.iter_mut() {
         let len = buffer.len();
@@ -211,7 +210,8 @@ pub fn read_bytes_from_process_user(
     ptr: *const u8,
     len: usize,
 ) -> Result<Vec<u8>, ERRNO> {
-    let buffers = translated_process_byte_buffer_with_access(process, ptr, len, PageFaultAccess::Read)?;
+    let buffers =
+        translated_process_byte_buffer_with_access(process, ptr, len, PageFaultAccess::Read)?;
     let mut bytes = Vec::with_capacity(len);
     for buffer in buffers.iter() {
         bytes.extend_from_slice(buffer);
@@ -254,7 +254,7 @@ pub fn read_pod_from_user<T: Pod>(ptr: *const T) -> Result<T, ERRNO> {
     let bytes = read_bytes_from_user(ptr as *const u8, size_of::<T>())?;
     let mut value = MaybeUninit::<T>::uninit();
     let value_bytes =
-    unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
+        unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
     value_bytes.copy_from_slice(&bytes);
     Ok(unsafe { value.assume_init() })
 }

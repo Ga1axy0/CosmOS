@@ -209,9 +209,16 @@ fn write_linux_sched_attr(
     if user_size < SCHED_ATTR_SIZE_VER0 {
         return Err(ERRNO::EINVAL);
     }
-    let value_bytes =
-        unsafe { slice::from_raw_parts(value as *const LinuxSchedAttr as *const u8, size_of::<LinuxSchedAttr>()) };
-    write_bytes_to_user(ptr as *mut u8, &value_bytes[..user_size.min(value_bytes.len())])
+    let value_bytes = unsafe {
+        slice::from_raw_parts(
+            value as *const LinuxSchedAttr as *const u8,
+            size_of::<LinuxSchedAttr>(),
+        )
+    };
+    write_bytes_to_user(
+        ptr as *mut u8,
+        &value_bytes[..user_size.min(value_bytes.len())],
+    )
 }
 
 fn validate_sched_attr(attr: &LinuxSchedAttr) -> Result<(SchedPolicy, u8, i32, u64), ERRNO> {
@@ -220,10 +227,16 @@ fn validate_sched_attr(attr: &LinuxSchedAttr) -> Result<(SchedPolicy, u8, i32, u
     }
     match attr.sched_policy as i32 {
         SCHED_OTHER => {
-            if attr.sched_priority != 0 || attr.sched_nice < MIN_NICE || attr.sched_nice > MAX_NICE {
+            if attr.sched_priority != 0 || attr.sched_nice < MIN_NICE || attr.sched_nice > MAX_NICE
+            {
                 return Err(ERRNO::EINVAL);
             }
-            Ok((SchedPolicy::Other, 0, attr.sched_nice, nice_to_weight(attr.sched_nice)))
+            Ok((
+                SchedPolicy::Other,
+                0,
+                attr.sched_nice,
+                nice_to_weight(attr.sched_nice),
+            ))
         }
         SCHED_FIFO | SCHED_RR => {
             let priority = attr.sched_priority as i32;
@@ -271,8 +284,7 @@ fn apply_sched_attr_to_task(
             task_inner.sched.rt_priority,
         )
     };
-    let enqueue_at_head =
-        old_policy.is_rt() && new_policy.is_rt() && new_priority < old_priority;
+    let enqueue_at_head = old_policy.is_rt() && new_policy.is_rt() && new_priority < old_priority;
     if was_on_rq {
         remove_task(task.clone());
     }
@@ -463,11 +475,7 @@ pub fn sys_sched_getparam(pid: isize, param: *mut SchedParam) -> isize {
     })
 }
 
-pub fn sys_sched_setattr(
-    pid: isize,
-    attr: *const LinuxSchedAttr,
-    flags: u32,
-) -> isize {
+pub fn sys_sched_setattr(pid: isize, attr: *const LinuxSchedAttr, flags: u32) -> isize {
     syscall_body!({
         if pid < 0 || flags != 0 {
             return Err(ERRNO::EINVAL);
@@ -483,12 +491,7 @@ pub fn sys_sched_setattr(
     })
 }
 
-pub fn sys_sched_getattr(
-    pid: isize,
-    attr: *mut LinuxSchedAttr,
-    size: u32,
-    flags: u32,
-) -> isize {
+pub fn sys_sched_getattr(pid: isize, attr: *mut LinuxSchedAttr, size: u32, flags: u32) -> isize {
     syscall_body!({
         if pid < 0 || flags != 0 {
             return Err(ERRNO::EINVAL);

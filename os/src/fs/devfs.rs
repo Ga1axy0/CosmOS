@@ -18,9 +18,9 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use fs::vfs::{VfsFileType, VfsNode};
 use fs::{BlockDevice, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT};
 
+use super::{empty_statfs, StatFs64};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::fs::{Stat, StatMode};
-use super::{empty_statfs, StatFs64};
 use crate::mm::translated_ref;
 use crate::platform::rtc;
 use crate::sync::SpinNoIrqLock;
@@ -186,7 +186,13 @@ fn is_leap_year(year: i32) -> bool {
 fn days_in_month(year: i32, month0: i32) -> Option<i32> {
     let d = match month0 {
         0 => 31,
-        1 => if is_leap_year(year) { 29 } else { 28 },
+        1 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
         2 => 31,
         3 => 30,
         4 => 31,
@@ -355,7 +361,10 @@ impl fmt::Debug for BlockDevNode {
         f.debug_struct("BlockDevNode")
             .field("major", &self.major)
             .field("minor", &self.minor)
-            .field("device_ptr", &format_args!("{:p}", Arc::as_ptr(&self.device)))
+            .field(
+                "device_ptr",
+                &format_args!("{:p}", Arc::as_ptr(&self.device)),
+            )
             .finish()
     }
 }
@@ -420,13 +429,12 @@ impl VfsNode for NullDevNode {
     }
 
     fn truncate(&self, _new_size: usize) -> Result<(), fs::errno::FS_ERRNO> {
-        Ok(())   
+        Ok(())
     }
 
     fn statfs(&self) -> Result<StatFs64, fs::errno::FS_ERRNO> {
         Ok(devfs_statfs())
     }
-
 }
 
 /// VFS node representing the special `/dev/zero` device.
@@ -838,7 +846,8 @@ impl RtcDevNode {
             }
             _ => {
                 debug!("RTC ioctl: unknown req {:#x}", req);
-                Err(ERRNO::ENOTTY)},
+                Err(ERRNO::ENOTTY)
+            }
         }
     }
 

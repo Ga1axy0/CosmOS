@@ -14,7 +14,7 @@ use virtio_drivers::transport::{
 };
 
 use crate::drivers::{
-    block::{block_device_name, BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ, VirtIOBlock},
+    block::{block_device_name, VirtIOBlock, BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ},
     net::{self, VirtIONetDevice},
 };
 
@@ -82,10 +82,8 @@ pub fn probe_platform_devices() {
                         warn!("[pci] virtio-net at {} has no INTx pin", bdf);
                         continue;
                     };
-                    let Some(dev) = VirtIONetDevice::try_new(
-                        SomeTransport::from(transport),
-                        irq,
-                    ) else {
+                    let Some(dev) = VirtIONetDevice::try_new(SomeTransport::from(transport), irq)
+                    else {
                         warn!("[pci] failed to create virtio-net for {}", bdf);
                         continue;
                     };
@@ -105,7 +103,10 @@ pub fn probe_platform_devices() {
                     net::register_device(Arc::new(dev));
                 }
                 other => {
-                    warn!("[pci] ignore unsupported virtio device {:?} at {}", other, bdf);
+                    warn!(
+                        "[pci] ignore unsupported virtio device {:?} at {}",
+                        other, bdf
+                    );
                 }
             }
         }

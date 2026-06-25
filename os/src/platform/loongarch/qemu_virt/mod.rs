@@ -6,9 +6,9 @@ mod pci;
 pub mod rtc;
 
 pub use board::{
-    BlockDeviceImpl, CharDeviceImpl, USER_STACK_BASE, USER_MMAP_BASE, INTERP_BASE, CLOCK_FREQ, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET, MMIO,
-    QEMUExit, QEMU_EXIT_HANDLE, VIRT_RTC, VIRT_UART, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE,
-    VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+    BlockDeviceImpl, CharDeviceImpl, QEMUExit, CLOCK_FREQ, INTERP_BASE, IO_ADDR_OFFSET,
+    KERNEL_ADDR_OFFSET, MMIO, QEMU_EXIT_HANDLE, USER_MMAP_BASE, USER_STACK_BASE, VIRTIO_MMIO_BASE,
+    VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE, VIRT_RTC, VIRT_UART,
 };
 pub use irq::{
     console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
@@ -94,7 +94,11 @@ fn mail_send_word(word: u32, hart_id: usize, slot: u64) {
 // into CORE_BUF_20 and CORE_BUF_24 separately.
 fn mail_send(data: u64, hart_id: usize, mailbox: u64) {
     mail_send_word(data as u32, hart_id, mailbox_word_slot(mailbox, false));
-    mail_send_word((data >> 32) as u32, hart_id, mailbox_word_slot(mailbox, true));
+    mail_send_word(
+        (data >> 32) as u32,
+        hart_id,
+        mailbox_word_slot(mailbox, true),
+    );
 }
 
 impl HartCtrl for LoongArchPlatform {

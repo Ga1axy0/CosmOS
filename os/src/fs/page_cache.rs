@@ -18,8 +18,8 @@ use crate::mm::{
     frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
     InodeKey, MmError, PhysPageNum,
 };
-use crate::syscall::errno::ERRNO;
 use crate::sync::SpinNoIrqLock;
+use crate::syscall::errno::ERRNO;
 use crate::task::{WaitQueue, WaitReason};
 
 #[cfg(feature = "io_perf_counters")]
@@ -395,8 +395,16 @@ pub fn reset_perf_counters() {
 pub fn render_perf_counters() -> String {
     let mut out = String::new();
     let _ = writeln!(&mut out, "page_cache:");
-    let _ = writeln!(&mut out, "  read_page_loads {}", perf_load(&READ_PAGE_LOADS));
-    let _ = writeln!(&mut out, "  read_page_bytes {}", perf_load(&READ_PAGE_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  read_page_loads {}",
+        perf_load(&READ_PAGE_LOADS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  read_page_bytes {}",
+        perf_load(&READ_PAGE_BYTES)
+    );
     let _ = writeln!(
         &mut out,
         "  write_mapping_calls {}",
@@ -412,9 +420,21 @@ pub fn render_perf_counters() -> String {
         "  sync_mapping_calls {}",
         perf_load(&SYNC_MAPPING_CALLS)
     );
-    let _ = writeln!(&mut out, "  sync_range_calls {}", perf_load(&SYNC_RANGE_CALLS));
-    let _ = writeln!(&mut out, "  writeback_pages {}", perf_load(&WRITEBACK_PAGES));
-    let _ = writeln!(&mut out, "  writeback_bytes {}", perf_load(&WRITEBACK_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  sync_range_calls {}",
+        perf_load(&SYNC_RANGE_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  writeback_pages {}",
+        perf_load(&WRITEBACK_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  writeback_bytes {}",
+        perf_load(&WRITEBACK_BYTES)
+    );
     let _ = writeln!(
         &mut out,
         "  writeback_batches {}",
@@ -452,7 +472,9 @@ pub fn discard_inode(inode: &Arc<Inode>) {
         for page in mapping_guard.pages.values() {
             let mut page_guard = page.lock();
             page_guard.owner = Weak::new();
-            page_guard.state.remove(CachePageState::DIRTY | CachePageState::WRITEBACK);
+            page_guard
+                .state
+                .remove(CachePageState::DIRTY | CachePageState::WRITEBACK);
             page_guard.pin_count = page_guard.pin_count.saturating_sub(1);
             page_guard.wait_queue.wake_all();
         }
@@ -564,7 +586,10 @@ fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &
             get_or_load_page(mapping, page_idx).expect("page cache OOM in buffered read path");
 
         let page_guard = page.lock();
-        let readable = min(page_guard.valid_bytes.saturating_sub(page_off), end - file_off);
+        let readable = min(
+            page_guard.valid_bytes.saturating_sub(page_off),
+            end - file_off,
+        );
         if readable == 0 {
             break;
         }
@@ -635,7 +660,10 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
 }
 
 /// 调整当前 mapping 长度，并同步更新已有缓存页。
-fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) -> Result<(), FS_ERRNO> {
+fn truncate_mapping(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    new_size: usize,
+) -> Result<(), FS_ERRNO> {
     let inode = {
         let mapping_guard = mapping.lock();
         mapping_guard
@@ -655,8 +683,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
 
     debug!(
         "[page_cache] truncate mapping: old_size={} new_size={}",
-        old_size,
-        new_size
+        old_size, new_size
     );
 
     // 先让底层 inode 调整成功，再修改 page cache 视图，避免失败时两边长度分离。
@@ -688,7 +715,11 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
         mapping_guard.size = new_size;
 
         if new_size < old_size {
-            let first_removed_idx = if new_size == 0 { 0 } else { new_tail_idx.saturating_add(1) };
+            let first_removed_idx = if new_size == 0 {
+                0
+            } else {
+                new_tail_idx.saturating_add(1)
+            };
             let removed_indices: alloc::vec::Vec<_> = mapping_guard
                 .pages
                 .range(first_removed_idx..)
@@ -697,8 +728,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
             let removed_cnt = removed_indices.len();
             debug!(
                 "[page_cache] truncate shrink: first_removed_idx={} removed_pages={}",
-                first_removed_idx,
-                removed_cnt
+                first_removed_idx, removed_cnt
             );
             for page_idx in removed_indices {
                 mapping_guard.pages.remove(&page_idx);
@@ -724,8 +754,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
             let bytes = page_guard.ppn().get_bytes_array();
             debug!(
                 "[page_cache] truncate shrink tail: page_idx={} keep_bytes={}",
-                new_tail_idx,
-                new_tail_valid
+                new_tail_idx, new_tail_valid
             );
             bytes[new_tail_valid..].fill(0);
             page_guard.valid_bytes = min(page_guard.valid_bytes, new_tail_valid);
@@ -744,9 +773,7 @@ fn truncate_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, new_size: usize) 
                     let bytes = page_guard.ppn().get_bytes_array();
                     debug!(
                         "[page_cache] truncate grow tail: page_idx={} zero_range=[{}..{})",
-                        old_tail_idx,
-                        old_tail_valid,
-                        new_valid
+                        old_tail_idx, old_tail_valid, new_valid
                     );
                     bytes[old_tail_valid..new_valid].fill(0);
                     page_guard.valid_bytes = max(page_guard.valid_bytes, new_valid);
@@ -937,7 +964,9 @@ fn mark_page_dirty(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page_guard: &mut C
     if page_guard.state.contains(CachePageState::DIRTY) {
         return;
     }
-    page_guard.state.insert(CachePageState::DIRTY | CachePageState::UPTODATE);
+    page_guard
+        .state
+        .insert(CachePageState::DIRTY | CachePageState::UPTODATE);
     mapping.lock().dirty_pages.insert(page_guard.index);
 }
 
@@ -1080,10 +1109,7 @@ fn collect_writeback_batch(
             valid_bytes
         };
 
-        pages.push(WritebackPage {
-            page_idx,
-            page,
-        });
+        pages.push(WritebackPage { page_idx, page });
         consumed += 1;
 
         if valid_bytes != PAGE_SIZE {
@@ -1136,18 +1162,14 @@ fn flush_writeback_batch(
         Ok(written) => {
             error!(
                 "[page_cache] short batch writeback: start_page_idx={} expected={} actual={}",
-                start_page_idx,
-                expected,
-                written
+                start_page_idx, expected, written
             );
             write_ok = false;
         }
         Err(err) => {
             error!(
                 "[page_cache] batch writeback failed: start_page_idx={} expected={} errno={}",
-                start_page_idx,
-                expected,
-                err as i32
+                start_page_idx, expected, err as i32
             );
             write_ok = false;
         }
@@ -1213,7 +1235,12 @@ fn flush_page(
                 };
                 (
                     None,
-                    Some((page_guard.index, page_guard.valid_bytes, page_guard.ppn(), inode)),
+                    Some((
+                        page_guard.index,
+                        page_guard.valid_bytes,
+                        page_guard.ppn(),
+                        inode,
+                    )),
                 )
             }
         };
@@ -1238,26 +1265,21 @@ fn flush_page(
             }
             debug!(
                 "[page_cache] writeback page: page_idx={} valid_bytes={}",
-                page_idx,
-                valid_bytes
+                page_idx, valid_bytes
             );
             match owner_inode.write_at_result(page_start(page_idx), &bytes[..valid_bytes]) {
                 Ok(written) if written == valid_bytes => {}
                 Ok(written) => {
                     error!(
                         "[page_cache] short writeback: page_idx={} expected={} actual={}",
-                        page_idx,
-                        valid_bytes,
-                        written
+                        page_idx, valid_bytes, written
                     );
                     write_ok = false;
                 }
                 Err(err) => {
                     error!(
                         "[page_cache] writeback failed: page_idx={} expected={} errno={}",
-                        page_idx,
-                        valid_bytes,
-                        err as i32
+                        page_idx, valid_bytes, err as i32
                     );
                     write_ok = false;
                 }
@@ -1376,19 +1398,25 @@ fn reclaim_one() -> ReclaimStep {
         let page_idx = page_guard.index;
         if page_guard.pin_count > 0
             || page_guard.map_count > 0
-            || page_guard
-                .state
-                .intersects(CachePageState::LOADING | CachePageState::WRITEBACK | CachePageState::EVICTING)
+            || page_guard.state.intersects(
+                CachePageState::LOADING | CachePageState::WRITEBACK | CachePageState::EVICTING,
+            )
         {
             let pin_count = page_guard.pin_count;
             let map_count = page_guard.map_count;
             let state_bits = page_guard.state.bits();
-            PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
+            PAGE_CACHE_MANAGER
+                .lock()
+                .inactive
+                .push_back(Arc::downgrade(&page));
             return ReclaimStep::Skipped;
         }
         if page_guard.ref_bit {
             page_guard.ref_bit = false;
-            PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
+            PAGE_CACHE_MANAGER
+                .lock()
+                .inactive
+                .push_back(Arc::downgrade(&page));
             return ReclaimStep::Deferred;
         }
         if page_guard.state.contains(CachePageState::DIRTY) {
@@ -1403,7 +1431,10 @@ fn reclaim_one() -> ReclaimStep {
             } else {
                 Ok(())
             };
-            PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
+            PAGE_CACHE_MANAGER
+                .lock()
+                .inactive
+                .push_back(Arc::downgrade(&page));
             return if flush_result.is_ok() {
                 ReclaimStep::Deferred
             } else {
@@ -1438,7 +1469,10 @@ fn reclaim_one() -> ReclaimStep {
         ReclaimStep::Reclaimed
     } else {
         page.lock().state.remove(CachePageState::EVICTING);
-        PAGE_CACHE_MANAGER.lock().inactive.push_back(Arc::downgrade(&page));
+        PAGE_CACHE_MANAGER
+            .lock()
+            .inactive
+            .push_back(Arc::downgrade(&page));
         ReclaimStep::Skipped
     }
 }
@@ -1451,9 +1485,7 @@ fn refresh_page_cache_watermarks() {
     manager.low_watermark = low_watermark;
     debug!(
         "[page_cache] refresh watermarks: high={} low={} cached_pages={}",
-        manager.high_watermark,
-        manager.low_watermark,
-        manager.cached_pages
+        manager.high_watermark, manager.low_watermark, manager.cached_pages
     );
 }
 

@@ -4,22 +4,22 @@ mod virtio_blk;
 
 pub use virtio_blk::VirtIOBlock;
 
+use crate::platform::{
+    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{yield_current_and_run_next, SchedAttr, WaitQueue, WaitReason};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::convert::TryFrom;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 use fs::BlockDevice;
 use lazy_static::*;
-use core::ptr::NonNull;
 use virtio_drivers::transport::{
-    DeviceType, SomeTransport,
     mmio::{MmioTransport, VirtIOHeader},
-};
-use crate::platform::{
-    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+    DeviceType, SomeTransport,
 };
 
 /// Reset block driver performance counters.
@@ -180,7 +180,7 @@ fn block_io_worker_main() -> ! {
         BLOCK_WORKER_WAIT.wait_with_reason_or_skip(WaitReason::Unknown, block_worker_has_work);
     }
 }
- 
+
 /// Start the global block I/O completion worker.
 pub fn start_workers() {
     if BLOCK_WORKER_STARTED

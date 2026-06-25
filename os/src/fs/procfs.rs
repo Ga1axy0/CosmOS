@@ -17,9 +17,9 @@ use fs::errno::FS_ERRNO;
 use fs::vfs::{VfsFileType, VfsNode};
 
 use crate::config::{MAX_HARTS, PAGE_SIZE};
-use crate::drivers::block::BLOCK_DEVICES;
 #[cfg(feature = "io_perf_counters")]
 use crate::drivers::block as block_drivers;
+use crate::drivers::block::BLOCK_DEVICES;
 use crate::fs::devfs::{blkdev_major_from_name, blkdev_minor_from_name};
 use crate::fs::inode::snapshot_mount_table;
 #[cfg(feature = "io_perf_counters")]
@@ -151,17 +151,23 @@ fn build_io_perf() -> String {
 }
 
 fn parse_proc_u32(buf: &[u8]) -> Result<u32, FS_ERRNO> {
-    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    let text = core::str::from_utf8(buf)
+        .map_err(|_| FS_ERRNO::EINVAL)?
+        .trim();
     text.parse::<u32>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
 fn parse_proc_usize(buf: &[u8]) -> Result<usize, FS_ERRNO> {
-    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    let text = core::str::from_utf8(buf)
+        .map_err(|_| FS_ERRNO::EINVAL)?
+        .trim();
     text.parse::<usize>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
 fn parse_proc_i32(buf: &[u8]) -> Result<i32, FS_ERRNO> {
-    let text = core::str::from_utf8(buf).map_err(|_| FS_ERRNO::EINVAL)?.trim();
+    let text = core::str::from_utf8(buf)
+        .map_err(|_| FS_ERRNO::EINVAL)?
+        .trim();
     text.parse::<i32>().map_err(|_| FS_ERRNO::EINVAL)
 }
 
@@ -296,7 +302,9 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
         let pgrp = inner.cred.pgid;
         let session = inner.cred.sid;
         let is_zombie = inner.is_zombie;
-        let num_threads = inner.thread_count().max(if inner.is_zombie { 1 } else { 0 });
+        let num_threads = inner
+            .thread_count()
+            .max(if inner.is_zombie { 1 } else { 0 });
         let vsize = inner.address_space_bytes();
         let start_stack = inner.vm_layout.start_stack;
         let start_brk = inner.vm_layout.start_brk;
@@ -351,26 +359,35 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
     let cutime = time_to_ticks(cutime_raw);
     let cstime = time_to_ticks(cstime_raw);
 
-    let (state, nice, priority, signal_mask, thread_pending, processor, rt_priority, policy, exit_code) =
-        if let Some(task) = main_task {
-            let task_inner = task.inner_exclusive_access();
-            let state = task_state_char(task_inner.task_status, is_zombie);
-            let nice = task_inner.sched.nice;
-            let priority = stat_priority(task_inner.sched.policy, nice, task_inner.sched.rt_priority);
-            (
-                state,
-                nice,
-                priority,
-                task_inner.signal_mask.bits(),
-                task_inner.pending_signals.bits(),
-                task_inner.sched.last_cpu,
-                task_inner.sched.rt_priority as u64,
-                task_inner.sched.policy as i32 as u64,
-                task_inner.exit_code.unwrap_or(0),
-            )
-        } else {
-            ('Z', 0, 20, 0, 0, 0, 0, 0, 0)
-        };
+    let (
+        state,
+        nice,
+        priority,
+        signal_mask,
+        thread_pending,
+        processor,
+        rt_priority,
+        policy,
+        exit_code,
+    ) = if let Some(task) = main_task {
+        let task_inner = task.inner_exclusive_access();
+        let state = task_state_char(task_inner.task_status, is_zombie);
+        let nice = task_inner.sched.nice;
+        let priority = stat_priority(task_inner.sched.policy, nice, task_inner.sched.rt_priority);
+        (
+            state,
+            nice,
+            priority,
+            task_inner.signal_mask.bits(),
+            task_inner.pending_signals.bits(),
+            task_inner.sched.last_cpu,
+            task_inner.sched.rt_priority as u64,
+            task_inner.sched.policy as i32 as u64,
+            task_inner.exit_code.unwrap_or(0),
+        )
+    } else {
+        ('Z', 0, 20, 0, 0, 0, 0, 0, 0)
+    };
 
     let signal = proc_pending | thread_pending;
     let blocked = signal_mask;
@@ -480,7 +497,9 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
         let session = inner.cred.sid;
         let proc_pending = inner.pending_signals.bits();
         let fd_size = inner.fd_table.len();
-        let num_threads = inner.thread_count().max(if inner.is_zombie { 1 } else { 0 });
+        let num_threads = inner
+            .thread_count()
+            .max(if inner.is_zombie { 1 } else { 0 });
         let vsize = inner.address_space_bytes();
         let start_brk = inner.vm_layout.start_brk;
         let current_brk = inner.vm_layout.brk;
@@ -576,9 +595,17 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     let _ = writeln!(&mut out, "RssAnon:\t0 kB");
     let _ = writeln!(&mut out, "RssFile:\t0 kB");
     let _ = writeln!(&mut out, "RssShmem:\t0 kB");
-    let _ = writeln!(&mut out, "VmData:\t{} kB", kb_string(current_brk.saturating_sub(start_brk)));
+    let _ = writeln!(
+        &mut out,
+        "VmData:\t{} kB",
+        kb_string(current_brk.saturating_sub(start_brk))
+    );
     let _ = writeln!(&mut out, "VmStk:\t0 kB");
-    let _ = writeln!(&mut out, "VmExe:\t{} kB", kb_string(text_end.saturating_sub(text_start)));
+    let _ = writeln!(
+        &mut out,
+        "VmExe:\t{} kB",
+        kb_string(text_end.saturating_sub(text_start))
+    );
     let _ = writeln!(&mut out, "VmLib:\t0 kB");
     let _ = writeln!(&mut out, "VmPTE:\t0 kB");
     let _ = writeln!(&mut out, "VmSwap:\t0 kB");
@@ -598,7 +625,11 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     let _ = writeln!(&mut out, "Seccomp:\t0");
     let _ = writeln!(&mut out, "Seccomp_filters:\t0");
     let _ = writeln!(&mut out, "Cpus_allowed:\t{:x}", affinity_mask);
-    let _ = writeln!(&mut out, "Cpus_allowed_list:\t{}", mask_to_cpu_list(affinity_mask));
+    let _ = writeln!(
+        &mut out,
+        "Cpus_allowed_list:\t{}",
+        mask_to_cpu_list(affinity_mask)
+    );
     let _ = writeln!(&mut out, "Mems_allowed:\t1");
     let _ = writeln!(&mut out, "Mems_allowed_list:\t0");
     let _ = writeln!(&mut out, "voluntary_ctxt_switches:\t0");
@@ -610,9 +641,21 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
 /// File mappings and `MAP_SHARED|MAP_ANONYMOUS` both report `s`.
 fn maps_perm_string(perm: MapPermission, shared: bool) -> [u8; 4] {
     [
-        if perm.contains(MapPermission::R) { b'r' } else { b'-' },
-        if perm.contains(MapPermission::W) { b'w' } else { b'-' },
-        if perm.contains(MapPermission::X) { b'x' } else { b'-' },
+        if perm.contains(MapPermission::R) {
+            b'r'
+        } else {
+            b'-'
+        },
+        if perm.contains(MapPermission::W) {
+            b'w'
+        } else {
+            b'-'
+        },
+        if perm.contains(MapPermission::X) {
+            b'x'
+        } else {
+            b'-'
+        },
         if shared { b's' } else { b'p' },
     ]
 }
@@ -653,7 +696,6 @@ fn build_pid_maps(pid: usize) -> Result<String, FS_ERRNO> {
     }
     Ok(out)
 }
-
 
 /// `/proc` root directory node.
 #[derive(Default, Debug)]
@@ -718,7 +760,9 @@ impl VfsNode for ProcRootNode {
                 Some(Arc::new(ProcPerfProbeEnableNode::new()) as Arc<dyn VfsNode>)
             }
             "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
-            "sys" => Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>),
+            "sys" => {
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>)
+            }
             _ => {
                 let pid = parse_pid(name)?;
                 if pid2process(pid).is_some() {
@@ -800,7 +844,10 @@ impl VfsNode for ProcStaticDirNode {
             ProcStaticDirKind::Kernel => alloc::vec![
                 (String::from("keys"), VfsFileType::Directory),
                 (String::from("pid_max"), VfsFileType::Regular),
-                (String::from("sched_autogroup_enabled"), VfsFileType::Regular),
+                (
+                    String::from("sched_autogroup_enabled"),
+                    VfsFileType::Regular
+                ),
                 (String::from("tainted"), VfsFileType::Regular),
             ],
             ProcStaticDirKind::Keys => alloc::vec![
@@ -841,37 +888,40 @@ impl VfsNode for ProcStaticDirNode {
             (ProcStaticDirKind::Kernel, "pid_max") => {
                 Some(Arc::new(ProcKernelPidMaxNode::new()) as Arc<dyn VfsNode>)
             }
-            (ProcStaticDirKind::Kernel, "sched_autogroup_enabled") => Some(
-                Arc::new(ProcKernelSysctlNode::new(ProcKernelSysctlKind::SchedAutogroupEnabled))
-                    as Arc<dyn VfsNode>,
-            ),
+            (ProcStaticDirKind::Kernel, "sched_autogroup_enabled") => Some(Arc::new(
+                ProcKernelSysctlNode::new(ProcKernelSysctlKind::SchedAutogroupEnabled),
+            )
+                as Arc<dyn VfsNode>),
             (ProcStaticDirKind::Kernel, "tainted") => {
                 Some(Arc::new(ProcKernelTaintedNode::new()) as Arc<dyn VfsNode>)
             }
             (ProcStaticDirKind::Keys, "gc_delay") => {
-                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::GcDelay)) as Arc<dyn VfsNode>)
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::GcDelay))
+                    as Arc<dyn VfsNode>)
             }
             (ProcStaticDirKind::Keys, "maxkeys") => {
-                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxKeys)) as Arc<dyn VfsNode>)
+                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxKeys))
+                    as Arc<dyn VfsNode>)
             }
-            (ProcStaticDirKind::Keys, "maxbytes") => {
-                Some(Arc::new(ProcKeySysctlNode::new(ProcKeySysctlKind::MaxBytes)) as Arc<dyn VfsNode>)
-            }
+            (ProcStaticDirKind::Keys, "maxbytes") => Some(Arc::new(ProcKeySysctlNode::new(
+                ProcKeySysctlKind::MaxBytes,
+            )) as Arc<dyn VfsNode>),
             (ProcStaticDirKind::Net, "ipv4") => {
-                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4)) as Arc<dyn VfsNode>)
+                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4))
+                    as Arc<dyn VfsNode>)
             }
-            (ProcStaticDirKind::NetIpv4, "conf") => {
-                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4Conf)) as Arc<dyn VfsNode>)
-            }
-            (ProcStaticDirKind::NetIpv4Conf, "all") => {
-                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfAll)) as Arc<dyn VfsNode>)
-            }
-            (ProcStaticDirKind::NetIpv4Conf, "default") => {
-                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfDefault)) as Arc<dyn VfsNode>)
-            }
-            (ProcStaticDirKind::NetIpv4Conf, "lo") => {
-                Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::NetIpv4ConfLo)) as Arc<dyn VfsNode>)
-            }
+            (ProcStaticDirKind::NetIpv4, "conf") => Some(Arc::new(ProcStaticDirNode::new(
+                ProcStaticDirKind::NetIpv4Conf,
+            )) as Arc<dyn VfsNode>),
+            (ProcStaticDirKind::NetIpv4Conf, "all") => Some(Arc::new(ProcStaticDirNode::new(
+                ProcStaticDirKind::NetIpv4ConfAll,
+            )) as Arc<dyn VfsNode>),
+            (ProcStaticDirKind::NetIpv4Conf, "default") => Some(Arc::new(ProcStaticDirNode::new(
+                ProcStaticDirKind::NetIpv4ConfDefault,
+            )) as Arc<dyn VfsNode>),
+            (ProcStaticDirKind::NetIpv4Conf, "lo") => Some(Arc::new(ProcStaticDirNode::new(
+                ProcStaticDirKind::NetIpv4ConfLo,
+            )) as Arc<dyn VfsNode>),
             (
                 ProcStaticDirKind::NetIpv4ConfAll
                 | ProcStaticDirKind::NetIpv4ConfDefault
@@ -2061,13 +2111,24 @@ impl VfsNode for ProcPidDirNode {
             "ns" => Some(Arc::new(ProcPidNsDirNode::new(self.pid)) as Arc<dyn VfsNode>),
             "stat" => Some(Arc::new(ProcPidStatNode::new(self.pid)) as Arc<dyn VfsNode>),
             "status" => Some(Arc::new(ProcPidStatusNode::new(self.pid)) as Arc<dyn VfsNode>),
-            "timens_offsets" => Some(Arc::new(ProcPidTimensOffsetsNode::new(self.pid)) as Arc<dyn VfsNode>),
-            "setgroups" => {
-                Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::Setgroups)) as Arc<dyn VfsNode>)
+            "timens_offsets" => {
+                Some(Arc::new(ProcPidTimensOffsetsNode::new(self.pid)) as Arc<dyn VfsNode>)
             }
-            "uid_map" => Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::UidMap)) as Arc<dyn VfsNode>),
-            "gid_map" => Some(Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::GidMap)) as Arc<dyn VfsNode>),
-            "oom_score_adj" => Some(Arc::new(ProcPidOomScoreAdjNode::new(self.pid)) as Arc<dyn VfsNode>),
+            "setgroups" => Some(Arc::new(ProcPidUsernsNode::new(
+                self.pid,
+                ProcPidUsernsKind::Setgroups,
+            )) as Arc<dyn VfsNode>),
+            "uid_map" => Some(
+                Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::UidMap))
+                    as Arc<dyn VfsNode>,
+            ),
+            "gid_map" => Some(
+                Arc::new(ProcPidUsernsNode::new(self.pid, ProcPidUsernsKind::GidMap))
+                    as Arc<dyn VfsNode>,
+            ),
+            "oom_score_adj" => {
+                Some(Arc::new(ProcPidOomScoreAdjNode::new(self.pid)) as Arc<dyn VfsNode>)
+            }
             _ => None,
         }
     }
@@ -2754,7 +2815,9 @@ impl VfsNode for ProcPidStatusNode {
     }
 
     fn size(&self) -> usize {
-        build_pid_status(self.pid).map(|data| data.len()).unwrap_or(0)
+        build_pid_status(self.pid)
+            .map(|data| data.len())
+            .unwrap_or(0)
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {

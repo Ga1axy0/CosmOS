@@ -6,7 +6,7 @@ use crate::mm::{
     defer_release, deferred_frame_count, deferred_kstack_id_count, flush_deferred, online_mask,
     DeferredUserReclaim, MapPermission, MmError, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
 };
-use crate::sync::{SpinNoIrqLock};
+use crate::sync::SpinNoIrqLock;
 use crate::timer::get_time_ns;
 use alloc::{
     sync::{Arc, Weak},
@@ -385,10 +385,7 @@ impl TaskUserRes {
             DeferredUserReclaim::new(token, mask, release_batch)
         };
         if !reclaim.is_empty() {
-            debug!(
-                "[tlb] task user resource reclaim: tid={}",
-                self.tid
-            );
+            debug!("[tlb] task user resource reclaim: tid={}", self.tid);
         }
         reclaim.flush_then_release();
     }

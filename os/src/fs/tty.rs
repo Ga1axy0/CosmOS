@@ -1,5 +1,4 @@
 use super::{File, Stat, StatMode};
-use fs::vfs::{VfsFileType, VfsNode};
 use crate::drivers::chardev::{CharDevice, UART};
 use crate::mm::{translated_ref, translated_refmut, UserBuffer};
 use crate::poll::{notify_poll_source, POLLIN};
@@ -7,10 +6,13 @@ use crate::signal::{has_interrupting_signal, SigInfo, SignalBit, SignalNum};
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_user, Pod};
-use crate::task::{current_process, current_user_token, send_signal_to_pgrp, WaitQueue, WaitReason};
+use crate::task::{
+    current_process, current_user_token, send_signal_to_pgrp, WaitQueue, WaitReason,
+};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::Any;
+use fs::vfs::{VfsFileType, VfsNode};
 use lazy_static::lazy_static;
 
 /// `ioctl(TCGETS)`：读取当前终端配置。
@@ -133,8 +135,7 @@ const INIT_C_CC: [u8; NCCS] = [
     0x17, // VWERASE  = ^W
     0x16, // VLNEXT   = ^V
     0x00, // VEOL2
-    0x00,
-    0x00,
+    0x00, 0x00,
 ];
 
 /// Returns whether `ch` matches the control character configured at `cc[idx]`.
@@ -921,7 +922,6 @@ impl File for TtyFile {
         Self::stat_impl()
     }
 }
-
 
 /// tty device node flavor exported under `/dev`.
 #[derive(Clone, Copy, Debug)]

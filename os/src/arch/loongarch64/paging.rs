@@ -59,11 +59,7 @@ impl PagingArch for LoongArchPaging {
     }
 
     unsafe fn flush_tlb() {
-        asm!(
-            "dbar 0",
-            "invtlb 0x00, $zero, $zero",
-            "ibar 0",
-        );
+        asm!("dbar 0", "invtlb 0x00, $zero, $zero", "ibar 0",);
     }
 
     fn make_pte(ppn: usize, flags: PTEFlags) -> usize {

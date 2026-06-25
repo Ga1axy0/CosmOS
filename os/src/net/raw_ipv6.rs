@@ -3,10 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{
-    any::Any,
-    cmp::min,
-};
+use core::{any::Any, cmp::min};
 
 use lazy_static::lazy_static;
 
@@ -347,7 +344,10 @@ impl RawIpv6SocketFile {
             control.push(Self::build_pktinfo_cmsg(IPV6_PKTINFO));
         }
         if options.recv.recv_hoplimit {
-            control.push(Self::build_i32_cmsg(IPV6_HOPLIMIT, meta.hoplimit.unwrap_or(64)));
+            control.push(Self::build_i32_cmsg(
+                IPV6_HOPLIMIT,
+                meta.hoplimit.unwrap_or(64),
+            ));
         }
         if options.recv.recv_tclass {
             control.push(Self::build_i32_cmsg(IPV6_TCLASS, meta.tclass.unwrap_or(0)));
@@ -562,7 +562,11 @@ fn finish_checksum(sum: u32) -> u16 {
         sum = (sum & 0xffff).wrapping_add(sum >> 16);
     }
     let value = !(sum as u16);
-    if value == 0 { 0xffff } else { value }
+    if value == 0 {
+        0xffff
+    } else {
+        value
+    }
 }
 
 fn compute_transport_checksum(dst: &[u8; 16], next_header: u8, payload: &[u8]) -> u16 {

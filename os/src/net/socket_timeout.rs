@@ -183,7 +183,10 @@ fn wake_task_via_wait_handle(task: &Arc<TaskControlBlock>) {
     wakeup_task(Arc::clone(task));
 }
 
-pub(crate) fn handle_socket_wait_timeout(tag: SocketTimerTag, task: &Arc<TaskControlBlock>) -> bool {
+pub(crate) fn handle_socket_wait_timeout(
+    tag: SocketTimerTag,
+    task: &Arc<TaskControlBlock>,
+) -> bool {
     let handle = SocketWaitHandle {
         slot_idx: tag.slot_idx,
         generation: tag.generation,

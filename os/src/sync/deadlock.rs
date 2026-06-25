@@ -24,8 +24,7 @@ impl DeadlockDetector {
     fn ensure_thread(&mut self, tid: usize) {
         if self.allocation.len() <= tid {
             let resource_n = self.available.len();
-            self.allocation
-                .resize_with(tid + 1, || vec![0; resource_n]);
+            self.allocation.resize_with(tid + 1, || vec![0; resource_n]);
             self.need.resize_with(tid + 1, || vec![0; resource_n]);
         }
     }

@@ -186,7 +186,9 @@ impl PhysPageNum {
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
         let entry_count = 1usize << crate::hal::page_table_index_bits();
-        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa.0) as *mut PageTableEntry, entry_count) }
+        unsafe {
+            core::slice::from_raw_parts_mut(phys_to_virt(pa.0) as *mut PageTableEntry, entry_count)
+        }
     }
     /// Get the reference of page(array of bytes)
     pub fn get_bytes_array(&self) -> &'static mut [u8] {

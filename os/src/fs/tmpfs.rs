@@ -4,7 +4,7 @@
 //! supports regular files, directories, `rename`, `unlink`, `rmdir`, and
 //! basic `statfs` reporting.
 
-use alloc::collections::{BTreeMap, btree_map::Entry};
+use alloc::collections::{btree_map::Entry, BTreeMap};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -406,12 +406,12 @@ impl VfsNode for TmpfsFileNode {
             let page = match inner.pages.entry(page_idx) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => entry.insert(
-                    frame_alloc_with_reclaim().expect("tmpfs page allocation failed while writing file"),
+                    frame_alloc_with_reclaim()
+                        .expect("tmpfs page allocation failed while writing file"),
                 ),
             };
             let bytes = page.ppn.get_bytes_array();
-            bytes[page_off..page_off + copy_len]
-                .copy_from_slice(&buf[written..written + copy_len]);
+            bytes[page_off..page_off + copy_len].copy_from_slice(&buf[written..written + copy_len]);
             written += copy_len;
         }
         buf.len()
@@ -815,7 +815,10 @@ impl VfsNode for TmpfsDirNode {
         }
 
         let mut src_inner = self.state.inner.lock();
-        let node = src_inner.children.remove(old_name).ok_or(FS_ERRNO::ENOENT)?;
+        let node = src_inner
+            .children
+            .remove(old_name)
+            .ok_or(FS_ERRNO::ENOENT)?;
         drop(src_inner);
 
         if let TmpfsNode::Dir(node_dir) = &node {

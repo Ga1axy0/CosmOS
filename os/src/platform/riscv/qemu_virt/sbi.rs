@@ -29,7 +29,11 @@ impl Timer for SbiPlatform {
 impl HartCtrl for SbiPlatform {
     fn start_hart(hart_id: usize, start_addr: usize, opaque: usize) -> Result<(), ()> {
         let ret = hart_start(hart_id, start_addr, opaque);
-        if ret.error == 0 { Ok(()) } else { Err(()) }
+        if ret.error == 0 {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
     fn send_ipi(hart_mask: usize) {

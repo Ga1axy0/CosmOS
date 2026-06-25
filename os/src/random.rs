@@ -10,9 +10,9 @@ use core::convert::TryInto;
 use lazy_static::lazy_static;
 
 use crate::sync::SpinNoIrqLock;
+use crate::syscall::errno::ERRNO;
 use crate::task::{WaitQueue, WaitReason};
 use crate::timer::get_time_ns;
-use crate::syscall::errno::ERRNO;
 
 /// ChaCha20 constants ("expand 32-byte k")
 const CHACHA_CONST: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
@@ -115,7 +115,8 @@ impl RandomState {
 
     fn fill_bytes(&mut self, mut out: &mut [u8]) {
         while !out.is_empty() {
-            let block = Self::chacha20_block(&self.key, (self.counter & 0xffff_ffff) as u32, &self.nonce);
+            let block =
+                Self::chacha20_block(&self.key, (self.counter & 0xffff_ffff) as u32, &self.nonce);
             self.counter = self.counter.wrapping_add(1);
             let take = core::cmp::min(out.len(), 64);
             out[..take].copy_from_slice(&block[..take]);

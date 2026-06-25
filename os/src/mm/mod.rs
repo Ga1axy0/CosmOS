@@ -44,7 +44,11 @@ pub enum PageFaultHandled {
     NotHandled,
 }
 
-pub use address::{phys_to_virt, virt_to_phys, PhysAddr, PhysPageNum, StepByOne, USER_SPACE_END, VirtAddr, VirtPageNum};
+pub use crate::hal::traits::PTEFlags;
+pub use address::{
+    phys_to_virt, virt_to_phys, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
+    USER_SPACE_END,
+};
 pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_alloc_with_reclaim, frame_allocator_stats,
     frame_dealloc, frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
@@ -57,16 +61,16 @@ pub use memory_set::{
     MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
 pub use oom::{log_oom, warn_heap_state, warn_heap_state_lockfree};
-pub use tlb_shootdown::{
-    clear_deferred, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
-    defer_release, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush, online_mask, shootdown,
-    shootdown_global, shootdown_global_quiet, take_deferred, DeferredBatch, ShootdownKind,
-};
 pub use page_table::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
     PageTableEntry, UserBuffer, UserBufferIterator,
 };
-pub use crate::hal::traits::PTEFlags;
+pub use tlb_shootdown::{
+    clear_deferred, defer_release, deferred_frame_count, deferred_kstack_id_count,
+    deferred_range_count, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush,
+    online_mask, shootdown, shootdown_global, shootdown_global_quiet, take_deferred, DeferredBatch,
+    ShootdownKind,
+};
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {

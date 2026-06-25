@@ -7,8 +7,8 @@ use core::convert::TryFrom;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
 use virtio_drivers::transport::{
-    DeviceType, SomeTransport,
     mmio::{MmioTransport, VirtIOHeader},
+    DeviceType, SomeTransport,
 };
 
 use crate::platform::{

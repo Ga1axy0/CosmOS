@@ -2,7 +2,7 @@ use crate::sync::SpinNoIrqLock;
 use crate::{
     config::PAGE_SIZE,
     mm::VirtAddr,
-    syscall::{read_pod_from_user, errno::ERRNO},
+    syscall::{errno::ERRNO, read_pod_from_user},
     task::{
         current_process, current_task, wakeup_task, ProcessControlBlock, TaskControlBlock,
         WaitQueue, WaitReason,
@@ -163,11 +163,17 @@ fn futex_waiter_list(queue: &WaitQueue) -> Vec<(usize, usize, usize)> {
         .collect()
 }
 
-fn futex_waiter_head(waiters: &[(usize, usize, usize)], limit: usize) -> Vec<(usize, usize, usize)> {
+fn futex_waiter_head(
+    waiters: &[(usize, usize, usize)],
+    limit: usize,
+) -> Vec<(usize, usize, usize)> {
     waiters.iter().copied().take(limit).collect()
 }
 
-fn futex_waiter_tail(waiters: &[(usize, usize, usize)], limit: usize) -> Vec<(usize, usize, usize)> {
+fn futex_waiter_tail(
+    waiters: &[(usize, usize, usize)],
+    limit: usize,
+) -> Vec<(usize, usize, usize)> {
     if waiters.len() <= limit {
         return Vec::new();
     }
@@ -334,11 +340,7 @@ pub fn handle_futex_wait_timeout(tag: FutexTimerTag, task: &Arc<TaskControlBlock
         if !registry.key_valid(handle) {
             debug!(
                 "[futex-warn] timeout_skip_invalid pid={} tid={} thread_id={} slot={} gen={}",
-                pid,
-                tid,
-                thread_id,
-                handle.slot_idx,
-                handle.generation
+                pid, tid, thread_id, handle.slot_idx, handle.generation
             );
             return true;
         }
@@ -359,11 +361,7 @@ pub fn handle_futex_wait_timeout(tag: FutexTimerTag, task: &Arc<TaskControlBlock
         if matches!(slot.state, FutexWaitState::Ready) {
             debug!(
                 "[futex-warn] timeout_skip_ready pid={} tid={} thread_id={} slot={} gen={}",
-                pid,
-                tid,
-                thread_id,
-                handle.slot_idx,
-                handle.generation
+                pid, tid, thread_id, handle.slot_idx, handle.generation
             );
             return true;
         }
@@ -440,11 +438,7 @@ fn futex_wake_key(key: FutexKey, uaddr: usize, max_count: usize) -> isize {
 }
 
 /// Wake tasks waiting on a futex in the current process.
-pub fn futex_wake_addr(
-    uaddr: usize,
-    max_count: usize,
-    private: bool,
-) -> Result<isize, ERRNO> {
+pub fn futex_wake_addr(uaddr: usize, max_count: usize, private: bool) -> Result<isize, ERRNO> {
     futex_wake_addr_in_process(&current_process(), uaddr, max_count, private)
 }
 
@@ -477,15 +471,10 @@ pub fn futex_requeue_addr(
     let src_before = src_before_waiters.len();
     let dst_before = dst_before_waiters.len();
     let mut woke_count = 0usize;
-    let moved = src.wake_and_requeue_with(
-        &dst,
-        wake_count,
-        requeue_count,
-        |task| {
-            woke_count += 1;
-            futex_wait_mark_ready(task);
-        },
-    );
+    let moved = src.wake_and_requeue_with(&dst, wake_count, requeue_count, |task| {
+        woke_count += 1;
+        futex_wait_mark_ready(task);
+    });
     let src_after_waiters = futex_waiter_list(&src);
     let dst_after_waiters = futex_waiter_list(&dst);
     let src_after = src_after_waiters.len();

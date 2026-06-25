@@ -119,8 +119,8 @@ unsafe impl Hal for VirtioHal {
 
         let pa: KernelPhysAddr = ppn_base.into();
         let paddr = pa.0 as VirtioPhysAddr;
-        let vaddr = NonNull::new(phys_to_virt(pa.0) as *mut u8)
-            .expect("virtio dma_alloc: null vaddr");
+        let vaddr =
+            NonNull::new(phys_to_virt(pa.0) as *mut u8).expect("virtio dma_alloc: null vaddr");
         QUEUE_FRAMES.lock().push(frames);
         (paddr, vaddr)
     }

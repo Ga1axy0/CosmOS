@@ -122,7 +122,12 @@ impl BuddyFrameAllocator {
         self.allocated_pages = 0;
     }
 
-    fn add_usable_region(&mut self, region: PhysMemoryRegion, kernel_start: usize, kernel_end: usize) {
+    fn add_usable_region(
+        &mut self,
+        region: PhysMemoryRegion,
+        kernel_start: usize,
+        kernel_end: usize,
+    ) {
         let start = phys_addr_ceil_ppn(region.start);
         let end = phys_addr_floor_ppn(region.end);
         if start >= end {
@@ -256,13 +261,14 @@ impl BuddyFrameAllocator {
 
     fn dealloc_order(&mut self, ppn: PhysPageNum, order: usize) {
         if order >= MAX_ORDER {
-            panic!("Frame ppn={:#x}, order={} has not been allocated!", ppn.0, order);
+            panic!(
+                "Frame ppn={:#x}, order={} has not been allocated!",
+                ppn.0, order
+            );
         }
         let mut ppn = ppn.0;
         let pages = 1usize << order;
-        if !self.is_managed_range(ppn, pages)
-            || ppn & (pages - 1) != 0
-        {
+        if !self.is_managed_range(ppn, pages) || ppn & (pages - 1) != 0 {
             panic!(
                 "Frame ppn={:#x}, pages={} has not been allocated!",
                 ppn, pages

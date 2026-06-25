@@ -115,7 +115,14 @@ fn prot_to_map_perm(prot: usize) -> MapPermission {
 }
 
 /// mmap syscall
-pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
+pub fn sys_mmap(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: usize,
+    offset: usize,
+) -> isize {
     trace!(
         "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -124,19 +131,18 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
         debug!(
             "[mmap] request: pid={} addr={:#x} len={} prot={:#x} flags={:#x} fd={} offset={:#x}",
-            pid,
-            addr,
-            len,
-            prot,
-            flags,
-            fd,
-            offset
+            pid, addr, len, prot, flags, fd, offset
         );
         if addr & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
             return Err(ERRNO::EINVAL); // addr not page-aligned
         }
         // PROT_* currently supports only R/W/X bits.
-        if prot & !(MMapProt::PROT_READ.bits() | MMapProt::PROT_WRITE.bits() | MMapProt::PROT_EXEC.bits()) != 0 {
+        if prot
+            & !(MMapProt::PROT_READ.bits()
+                | MMapProt::PROT_WRITE.bits()
+                | MMapProt::PROT_EXEC.bits())
+            != 0
+        {
             return Err(ERRNO::EINVAL); // unknown permission bits
         }
         if len == 0 {
@@ -158,13 +164,10 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
 
         let perm = prot_to_map_perm(prot);
 
-
         // if user did not specify addr.
         // 对齐前先检查溢出，避免超大长度把探测步长算错。
-        let len_aligned = len
-            .checked_add(PAGE_SIZE - 1)
-            .ok_or(ERRNO::EOVERFLOW)?
-            & !(PAGE_SIZE - 1);
+        let len_aligned =
+            len.checked_add(PAGE_SIZE - 1).ok_or(ERRNO::EOVERFLOW)? & !(PAGE_SIZE - 1);
         let end = addr.checked_add(len_aligned).ok_or(ERRNO::EOVERFLOW)?;
         if addr != 0 && (addr >= USER_SPACE_END || end > USER_SPACE_END) {
             return Err(ERRNO::ENOMEM);
@@ -281,10 +284,7 @@ pub fn sys_mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, o
 
         debug!(
             "[mmap] complete: pid={} mapped_addr={:#x} len_aligned={} native_compat={}",
-            pid,
-            map_addr,
-            len_aligned,
-            native_compat
+            pid, map_addr, len_aligned, native_compat
         );
 
         if native_compat {
@@ -320,9 +320,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
         debug!(
             "[munmap] request: pid={} start={:#x} len={}",
-            pid,
-            start,
-            len
+            pid, start, len
         );
         if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
             return Err(ERRNO::EINVAL); // start not page-aligned
@@ -334,9 +332,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         if munmap_current_process(VirtAddr::from(start), VirtAddr::from(end)) {
             debug!(
                 "[munmap-debug] complete pid={} start={:#x} end={:#x}",
-                pid,
-                start,
-                end
+                pid, start, end
             );
             Ok(0)
         } else {
@@ -488,16 +484,22 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
         }
         let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
         // PROT_* currently supports only R/W/X bits.
-        if prot & !(MMapProt::PROT_READ.bits() | MMapProt::PROT_WRITE.bits() | MMapProt::PROT_EXEC.bits()) != 0 {
+        if prot
+            & !(MMapProt::PROT_READ.bits()
+                | MMapProt::PROT_WRITE.bits()
+                | MMapProt::PROT_EXEC.bits())
+            != 0
+        {
             return Err(ERRNO::EINVAL); // unknown permission bits
         }
 
         // Translate user PROT_* flags into internal MapPermission.
         // If no R/W/X bits are set (e.g., PROT_NONE), keep the U bit so the
         // region remains a user VMA, but deny all actual accesses.
-        let perm = if prot & (MMapProt::PROT_READ.bits()
-            | MMapProt::PROT_WRITE.bits()
-            | MMapProt::PROT_EXEC.bits())
+        let perm = if prot
+            & (MMapProt::PROT_READ.bits()
+                | MMapProt::PROT_WRITE.bits()
+                | MMapProt::PROT_EXEC.bits())
             == 0
         {
             MapPermission::U
@@ -534,6 +536,5 @@ pub fn sys_madvise(start: usize, len: usize, advice: i32) -> isize {
             advice
         );
         Ok(0)
-    }
-)
+    })
 }

@@ -27,7 +27,7 @@ pub const SYSLOG_ACTION_CONSOLE_OFF: usize = 6;
 /// value that was saved by that command.
 pub const SYSLOG_ACTION_CONSOLE_ON: usize = 7;
 /// The call sets console_loglevel to the value given in size,
-/// which must be an integer between 1 and 8 (inclusive). 
+/// which must be an integer between 1 and 8 (inclusive).
 pub const SYSLOG_ACTION_CONSOLE_LEVEL: usize = 8;
 /// The call returns the number of bytes currently available to
 /// be read from the kernel log buffer via command 2
@@ -104,11 +104,8 @@ impl KernelLogBuffer {
     fn push_bytes(&mut self, data: &[u8]) {
         if data.len() >= KLOG_BUFFER_CAPACITY {
             self.bytes.clear();
-            self.bytes.extend(
-                data[data.len() - KLOG_BUFFER_CAPACITY..]
-                    .iter()
-                    .copied(),
-            );
+            self.bytes
+                .extend(data[data.len() - KLOG_BUFFER_CAPACITY..].iter().copied());
             self.unread = KLOG_BUFFER_CAPACITY;
             self.since_clear = KLOG_BUFFER_CAPACITY;
             return;
@@ -131,7 +128,10 @@ impl KernelLogBuffer {
         let available = self.unread.min(self.bytes.len());
         let to_read = dst.len().min(available);
         let start = self.bytes.len() - available;
-        for (slot, byte) in dst.iter_mut().zip(self.bytes.iter().skip(start).take(to_read)) {
+        for (slot, byte) in dst
+            .iter_mut()
+            .zip(self.bytes.iter().skip(start).take(to_read))
+        {
             *slot = *byte;
         }
         self.unread -= to_read;
@@ -145,7 +145,10 @@ impl KernelLogBuffer {
         }
         let to_read = dst.len().min(available - skip);
         let start = self.bytes.len() - available + skip;
-        for (slot, byte) in dst.iter_mut().zip(self.bytes.iter().skip(start).take(to_read)) {
+        for (slot, byte) in dst
+            .iter_mut()
+            .zip(self.bytes.iter().skip(start).take(to_read))
+        {
             *slot = *byte;
         }
         to_read
@@ -266,8 +269,11 @@ fn syslog_action_read_all(bufp: *mut u8, size: usize) -> isize {
                 break;
             }
             let chunk_len = (target_len - copied).min(slice.len());
-            copied +=
-                klog.copy_suffix_into(available, available - target_len + copied, &mut slice[..chunk_len]);
+            copied += klog.copy_suffix_into(
+                available,
+                available - target_len + copied,
+                &mut slice[..chunk_len],
+            );
         }
         Ok(copied as isize)
     })
@@ -290,8 +296,11 @@ fn syslog_action_read_clear(bufp: *mut u8, size: usize) -> isize {
                 break;
             }
             let chunk_len = (target_len - copied).min(slice.len());
-            copied +=
-                klog.copy_suffix_into(available, available - target_len + copied, &mut slice[..chunk_len]);
+            copied += klog.copy_suffix_into(
+                available,
+                available - target_len + copied,
+                &mut slice[..chunk_len],
+            );
         }
         klog.clear_since_marker();
         Ok(copied as isize)

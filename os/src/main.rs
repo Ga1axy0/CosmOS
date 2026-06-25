@@ -25,7 +25,6 @@
 #![feature(panic_info_message)]
 #![feature(alloc_error_handler)]
 
-
 #[macro_use]
 extern crate log;
 
@@ -46,16 +45,16 @@ pub mod drivers;
 pub mod fs;
 pub mod ipc;
 pub mod keys;
-pub mod lang_items;
 pub mod klog;
+pub mod lang_items;
 pub mod mm;
 pub mod net;
-pub mod signal;
-mod poll;
 pub(crate) mod perf_probe;
+mod poll;
 pub mod random;
 pub mod sbi;
 pub mod sched;
+pub mod signal;
 pub mod sync;
 pub mod syscall;
 pub mod task;
@@ -100,7 +99,6 @@ fn clear_bss() {
     }
 }
 
-
 macro_rules! ansi_fg_256 {
     ($n:literal) => {
         concat!("\x1b[38;5;", stringify!($n), "m")
@@ -115,14 +113,29 @@ const ANSI_FRAME: &str = if cfg!(target_arch = "loongarch64") {
 };
 
 #[allow(non_upper_case_globals)]
-const ANSI_GLOW: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(226) } else { ansi_fg_256!(117) };
-const ANSI_TITLE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(214) } else { ansi_fg_256!(159) };
-const ANSI_SUBTITLE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(11) } else { ansi_fg_256!(111) };
-const ANSI_STAGE: &str = if cfg!(target_arch = "loongarch64") { ansi_fg_256!(229) } else { ansi_fg_256!(81) };
+const ANSI_GLOW: &str = if cfg!(target_arch = "loongarch64") {
+    ansi_fg_256!(226)
+} else {
+    ansi_fg_256!(117)
+};
+const ANSI_TITLE: &str = if cfg!(target_arch = "loongarch64") {
+    ansi_fg_256!(214)
+} else {
+    ansi_fg_256!(159)
+};
+const ANSI_SUBTITLE: &str = if cfg!(target_arch = "loongarch64") {
+    ansi_fg_256!(11)
+} else {
+    ansi_fg_256!(111)
+};
+const ANSI_STAGE: &str = if cfg!(target_arch = "loongarch64") {
+    ansi_fg_256!(229)
+} else {
+    ansi_fg_256!(81)
+};
 const ANSI_DETAIL: &str = ansi_fg_256!(252);
 
 fn print_boot_splash(hart_id: usize, hart_count: usize) {
-
     const LOGO: [&str; 7] = [
         "        ______                    ____   _____                  ",
         "       / ____/___  _________ ___ / __ \\ / ___/                  ",
@@ -166,7 +179,11 @@ fn print_boot_splash(hart_id: usize, hart_count: usize) {
         "{frame}|{reset} {subtitle}{msg:<66}{reset} {frame}|{reset}",
         frame = ANSI_FRAME,
         subtitle = ANSI_SUBTITLE,
-        msg = format!("Target: {} - {}", crate::platform::machine_name(), crate::platform::platform_name()),
+        msg = format!(
+            "Target: {} - {}",
+            crate::platform::machine_name(),
+            crate::platform::platform_name()
+        ),
         reset = ANSI_RESET,
     );
     println!(
@@ -257,7 +274,7 @@ fn wait_for_bootstrap() {
 fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
-    bootinfo::init(fdt_ptr); 
+    bootinfo::init(fdt_ptr);
     // Install TLB refill handler and page-walker CSRs before activating page tables.
     trap::init();
     mm::init();
@@ -285,7 +302,11 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     task::add_initproc();
     drivers::block::start_workers();
     BOOT_DONE.store(true, Ordering::Release);
-    println!("{glow}[kernel] Hello, world! Welcome to CosmOS.{reset}", glow = ANSI_GLOW, reset = ANSI_RESET);
+    println!(
+        "{glow}[kernel] Hello, world! Welcome to CosmOS.{reset}",
+        glow = ANSI_GLOW,
+        reset = ANSI_RESET
+    );
     info!("hart {} entered scheduler", hart_id);
     sched::run_tasks();
     panic!("Unreachable in rust_main!");
@@ -297,7 +318,7 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
 /// 并加入全局调度器，参与任务执行。
 fn secondary_hart_main(hart_id: usize) -> ! {
     wait_for_bootstrap();
-    mm::activate_kernel_space();    // 激活内核页表：但 satp 是 per-hart 寄存器
+    mm::activate_kernel_space(); // 激活内核页表：但 satp 是 per-hart 寄存器
     info!("hart {} entered secondary_hart_main", hart_id);
     init_local_hart(hart_id);
     debug!("hart {} entered scheduler", hart_id);

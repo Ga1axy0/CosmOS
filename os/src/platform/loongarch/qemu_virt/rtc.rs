@@ -47,7 +47,10 @@ impl Rtc {
         } else {
             raw_year
         };
-        warn!("ls7a-rtc raw: TOY_READ0={:#010x} TOY_READ1={}", read0, raw_year);
+        warn!(
+            "ls7a-rtc raw: TOY_READ0={:#010x} TOY_READ1={}",
+            read0, raw_year
+        );
         let mon = ((read0 >> 26) & 0x3f) as u64;
         let day = ((read0 >> 21) & 0x1f) as u64;
         let hour = ((read0 >> 16) & 0x1f) as u64;

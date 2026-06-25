@@ -7,8 +7,8 @@
 use super::__switch;
 use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
-use crate::hal::{enable_irqs_and_wait, hartid};
 use crate::hal::traits::AddressSpaceToken;
+use crate::hal::{enable_irqs_and_wait, hartid};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
 use crate::timer::{get_time, get_time_ns};
@@ -155,9 +155,7 @@ pub(crate) fn run_tasks() {
 }
 
 pub(crate) fn defer_task_release_after_switch(task: Arc<TaskControlBlock>) {
-    current_processor()
-        .lock()
-        .set_pending_task_release(task);
+    current_processor().lock().set_pending_task_release(task);
 }
 
 fn finish_pending_task_release() {

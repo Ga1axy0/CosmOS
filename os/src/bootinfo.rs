@@ -196,8 +196,16 @@ fn subtract_region(
         push_temp_region(region, out, out_count);
         return;
     }
-    push_temp_region(PhysMemoryRegion::new(region.start, overlap_start), out, out_count);
-    push_temp_region(PhysMemoryRegion::new(overlap_end, region.end), out, out_count);
+    push_temp_region(
+        PhysMemoryRegion::new(region.start, overlap_start),
+        out,
+        out_count,
+    );
+    push_temp_region(
+        PhysMemoryRegion::new(overlap_end, region.end),
+        out,
+        out_count,
+    );
 }
 
 fn push_temp_region(region: PhysMemoryRegion, out: &mut [PhysMemoryRegion], out_count: &mut usize) {
@@ -341,9 +349,11 @@ impl Fdt {
                     while cursor < end && read_u8_at(cursor) != Some(0) {
                         cursor += 1;
                     }
-                    let name = bytes_at(name_start, cursor.saturating_sub(name_start)).unwrap_or(&[]);
+                    let name =
+                        bytes_at(name_start, cursor.saturating_sub(name_start)).unwrap_or(&[]);
                     cursor = align4(cursor.saturating_add(1));
-                    current = NodeState::for_child(stack.get(depth).copied().unwrap_or_default(), name);
+                    current =
+                        NodeState::for_child(stack.get(depth).copied().unwrap_or_default(), name);
                     depth += 1;
                 }
                 FDT_END_NODE => {
@@ -444,7 +454,9 @@ impl NodeState {
         match name {
             b"#address-cells" => self.child_address_cells = read_cells_usize(value, 1).unwrap_or(2),
             b"#size-cells" => self.child_size_cells = read_cells_usize(value, 1).unwrap_or(1),
-            b"status" => self.status_ok = value == b"okay\0" || value == b"ok\0" || value.is_empty(),
+            b"status" => {
+                self.status_ok = value == b"okay\0" || value == b"ok\0" || value.is_empty()
+            }
             b"device_type" if self.parent_is_cpus && value == b"cpu\0" => self.is_cpu = true,
             b"device_type" if value == b"memory\0" => self.is_memory = true,
             b"reg" if self.is_memory && self.status_ok => {
@@ -468,7 +480,12 @@ impl NodeState {
     }
 }
 
-fn parse_reg(mut value: &[u8], address_cells: usize, size_cells: usize, mut f: impl FnMut(usize, usize)) {
+fn parse_reg(
+    mut value: &[u8],
+    address_cells: usize,
+    size_cells: usize,
+    mut f: impl FnMut(usize, usize),
+) {
     let stride = (address_cells + size_cells) * 4;
     if stride == 0 {
         return;
@@ -478,7 +495,10 @@ fn parse_reg(mut value: &[u8], address_cells: usize, size_cells: usize, mut f: i
             break;
         };
         let size_offset = address_cells * 4;
-        let Some(size) = read_cells_usize(&value[size_offset..size_offset + size_cells * 4], size_cells) else {
+        let Some(size) = read_cells_usize(
+            &value[size_offset..size_offset + size_cells * 4],
+            size_cells,
+        ) else {
             break;
         };
         if size != 0 {
@@ -596,7 +616,10 @@ mod fw_cfg {
     }
 
     fn is_name(name: &[u8], expected: &[u8]) -> bool {
-        let len = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+        let len = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
         &name[..len] == expected
     }
 
@@ -620,6 +643,11 @@ mod fw_cfg {
     }
 
     fn read_be_u32() -> Option<u32> {
-        Some(u32::from_be_bytes([read_u8(), read_u8(), read_u8(), read_u8()]))
+        Some(u32::from_be_bytes([
+            read_u8(),
+            read_u8(),
+            read_u8(),
+            read_u8(),
+        ]))
     }
 }

@@ -4,8 +4,8 @@ use crate::keys;
 use crate::mm::{translated_str, PageFaultAccess};
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::translated_byte_buffer_with_access;
-use crate::task::current_process;
 use crate::syscall_body;
+use crate::task::current_process;
 
 /// `add_key(2)`
 pub fn sys_add_key(
@@ -38,7 +38,13 @@ pub fn sys_add_key(
             let _ = translated_byte_buffer_with_access(payload_ptr, plen, PageFaultAccess::Read)?;
         }
 
-        let serial = keys::add_key(&current_process(), key_type.as_str(), description.as_str(), plen, ringid)?;
+        let serial = keys::add_key(
+            &current_process(),
+            key_type.as_str(),
+            description.as_str(),
+            plen,
+            ringid,
+        )?;
         Ok(serial as isize)
     })
 }

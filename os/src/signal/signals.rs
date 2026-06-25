@@ -246,9 +246,15 @@ impl SignalBit {
         } else if self.contains(Self::SIGBUS) {
             Some((SignalNum::SIGBUS.number(), "Bus Error, SIGBUS=7"))
         } else if self.contains(Self::SIGFPE) {
-            Some((SignalNum::SIGFPE.number(), "Erroneous Arithmetic Operation, SIGFPE=8"))
+            Some((
+                SignalNum::SIGFPE.number(),
+                "Erroneous Arithmetic Operation, SIGFPE=8",
+            ))
         } else if self.contains(Self::SIGSEGV) {
-            Some((SignalNum::SIGSEGV.number(), "Segmentation Fault, SIGSEGV=11"))
+            Some((
+                SignalNum::SIGSEGV.number(),
+                "Segmentation Fault, SIGSEGV=11",
+            ))
         } else if self.contains(Self::SIGTERM) {
             Some((SignalNum::SIGTERM.number(), "Terminated, SIGTERM=15"))
         } else {

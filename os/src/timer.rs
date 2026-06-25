@@ -6,13 +6,13 @@ use core::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use crate::config::CLOCK_FREQ;
 use crate::config::MAX_HARTS;
 use crate::hal::hartid;
-use crate::hal::Plat;
 use crate::hal::traits::Timer as _;
+use crate::hal::Plat;
+use crate::net::{handle_socket_wait_timeout, SocketTimerTag};
 use crate::platform::rtc;
 use crate::poll::{self, PollTimerTag};
-use crate::net::{handle_socket_wait_timeout, SocketTimerTag};
 use crate::signal::{handle_signal_wait_timeout, SignalTimerTag};
-use crate::sync::{FutexTimerTag, SpinNoIrqLock, handle_futex_wait_timeout};
+use crate::sync::{handle_futex_wait_timeout, FutexTimerTag, SpinNoIrqLock};
 use crate::task::{add_signal_to_process, current_task, wakeup_task, SignalBit, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
@@ -276,7 +276,13 @@ fn add_timer_with_tag_inner(
     mark_non_futex_timer: bool,
 ) {
     let target_hart = timer_hart_for_task(&task);
-    add_timer_with_tag_on_hart(expire_ns, task, timer_tag, mark_non_futex_timer, target_hart);
+    add_timer_with_tag_on_hart(
+        expire_ns,
+        task,
+        timer_tag,
+        mark_non_futex_timer,
+        target_hart,
+    );
 }
 
 fn add_timer_with_tag_on_hart(

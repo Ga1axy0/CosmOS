@@ -16,19 +16,21 @@ mod irq;
 
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
+use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine};
+use crate::hal::{ArchInterrupt, ArchTrapMachine};
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
-use crate::signal::{SignalBit, SignalNum, handle_signals};
+use crate::sched::{
+    on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason,
+};
+use crate::signal::{handle_signals, SignalBit, SignalNum};
 use crate::syscall::{syscall, syscall_supports_sa_restart};
-use crate::sched::{on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason};
 use crate::task::{
-    ExitReason, check_fatal_signals_of_current, check_itimers_of_all_processes,
-    current_add_signal, current_process, current_process_is_zombie, current_task, current_trap_cx,
+    check_fatal_signals_of_current, check_itimers_of_all_processes, current_add_signal,
+    current_process, current_process_is_zombie, current_task, current_trap_cx,
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
-    exit_group_current_and_run_next,
+    exit_group_current_and_run_next, ExitReason,
 };
 use crate::timer::{get_realtime_ns, get_time, get_time_ns, handle_timer_interrupt};
-use crate::hal::{ArchInterrupt, ArchTrapMachine};
-use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine};
 
 /// 输出用户态致命异常现场，区分 fault 地址、用户 PC 与关键寄存器。
 fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
@@ -148,36 +150,50 @@ pub fn init_hart() {
 }
 /// set trap entry for traps happen in kernel(supervisor) mode
 pub fn set_kernel_trap_entry() {
-    unsafe { ArchInterrupt::set_kernel_trap_entry(); }
+    unsafe {
+        ArchInterrupt::set_kernel_trap_entry();
+    }
 }
 /// set trap entry for traps happen in user mode
 pub fn set_user_trap_entry() {
-    unsafe { ArchInterrupt::set_user_trap_entry(); }
+    unsafe {
+        ArchInterrupt::set_user_trap_entry();
+    }
 }
 
 /// 为当前 hart 开启 supervisor timer interrupt。
 pub fn enable_timer_interrupt() {
-    unsafe { ArchInterrupt::enable_timer(); }
+    unsafe {
+        ArchInterrupt::enable_timer();
+    }
 }
 
 /// 为当前 hart 关闭 supervisor timer interrupt。
 pub fn disable_timer_interrupt() {
-    unsafe { ArchInterrupt::disable_timer(); }
+    unsafe {
+        ArchInterrupt::disable_timer();
+    }
 }
 
 /// 为当前 hart 关闭 supervisor external interrupt。
 pub fn disable_external_interrupt() {
-    unsafe { ArchInterrupt::disable_external(); }
+    unsafe {
+        ArchInterrupt::disable_external();
+    }
 }
 
 /// 为当前 hart 开启 supervisor software interrupt。
 pub fn enable_software_interrupt() {
-    unsafe { ArchInterrupt::enable_software(); }
+    unsafe {
+        ArchInterrupt::enable_software();
+    }
 }
 
 /// 清除当前 hart 挂起的 supervisor software interrupt。
 pub fn clear_software_interrupt_pending() {
-    unsafe { ArchInterrupt::clear_software_pending(); }
+    unsafe {
+        ArchInterrupt::clear_software_pending();
+    }
 }
 
 /// Handle a scheduler reschedule IPI.
@@ -245,21 +261,38 @@ pub fn trap_handler() -> ! {
                 }
             }
             if !handled {
-                match current_process().handle_file_page_fault(trap_info.fault_addr, PageFaultAccess::Write) {
+                match current_process()
+                    .handle_file_page_fault(trap_info.fault_addr, PageFaultAccess::Write)
+                {
                     Ok(PageFaultHandled::Handled) => {}
                     Ok(PageFaultHandled::NotHandled) => {
-                        log_user_fault("store page fault", "write", trap_info.fault_addr, "SIGSEGV");
+                        log_user_fault(
+                            "store page fault",
+                            "write",
+                            trap_info.fault_addr,
+                            "SIGSEGV",
+                        );
                         current_add_signal(SignalBit::SIGSEGV);
                     }
                     Err(MmError::BeyondFileEnd) => {
-                        log_user_fault("store page fault beyond file EOF", "write", trap_info.fault_addr, "SIGBUS");
+                        log_user_fault(
+                            "store page fault beyond file EOF",
+                            "write",
+                            trap_info.fault_addr,
+                            "SIGBUS",
+                        );
                         current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(MmError::OutOfMemory) => {
                         handle_user_oom("file_mmap", "write", trap_info.fault_addr);
                     }
                     Err(_) => {
-                        log_user_fault("store page fault", "write", trap_info.fault_addr, "SIGSEGV");
+                        log_user_fault(
+                            "store page fault",
+                            "write",
+                            trap_info.fault_addr,
+                            "SIGSEGV",
+                        );
                         current_add_signal(SignalBit::SIGSEGV);
                     }
                 }
@@ -286,7 +319,9 @@ pub fn trap_handler() -> ! {
             //     current_trap_cx().user_pc()
             // );
             let mut handled = false;
-            match current_process().handle_lazy_user_fault(trap_info.fault_addr, PageFaultAccess::Read) {
+            match current_process()
+                .handle_lazy_user_fault(trap_info.fault_addr, PageFaultAccess::Read)
+            {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
@@ -295,14 +330,21 @@ pub fn trap_handler() -> ! {
                 Err(_) => {}
             }
             if !handled {
-                match current_process().handle_file_page_fault(trap_info.fault_addr, PageFaultAccess::Read) {
+                match current_process()
+                    .handle_file_page_fault(trap_info.fault_addr, PageFaultAccess::Read)
+                {
                     Ok(PageFaultHandled::Handled) => {}
                     Ok(PageFaultHandled::NotHandled) => {
                         log_user_fault("load page fault", "read", trap_info.fault_addr, "SIGSEGV");
                         current_add_signal(SignalBit::SIGSEGV);
                     }
                     Err(MmError::BeyondFileEnd) => {
-                        log_user_fault("load page fault beyond file EOF", "read", trap_info.fault_addr, "SIGBUS");
+                        log_user_fault(
+                            "load page fault beyond file EOF",
+                            "read",
+                            trap_info.fault_addr,
+                            "SIGBUS",
+                        );
                         current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(MmError::OutOfMemory) => {
@@ -323,7 +365,9 @@ pub fn trap_handler() -> ! {
                 current_trap_cx().user_pc()
             );
             let mut handled = false;
-            match current_process().handle_lazy_user_fault(trap_info.fault_addr, PageFaultAccess::Exec) {
+            match current_process()
+                .handle_lazy_user_fault(trap_info.fault_addr, PageFaultAccess::Exec)
+            {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
@@ -332,21 +376,38 @@ pub fn trap_handler() -> ! {
                 Err(_) => {}
             }
             if !handled {
-                match current_process().handle_file_page_fault(trap_info.fault_addr, PageFaultAccess::Exec) {
+                match current_process()
+                    .handle_file_page_fault(trap_info.fault_addr, PageFaultAccess::Exec)
+                {
                     Ok(PageFaultHandled::Handled) => {}
                     Ok(PageFaultHandled::NotHandled) => {
-                        log_user_fault("instruction page fault", "exec", trap_info.fault_addr, "SIGSEGV");
+                        log_user_fault(
+                            "instruction page fault",
+                            "exec",
+                            trap_info.fault_addr,
+                            "SIGSEGV",
+                        );
                         current_add_signal(SignalBit::SIGSEGV);
                     }
                     Err(MmError::BeyondFileEnd) => {
-                        log_user_fault("instruction page fault beyond file EOF", "exec", trap_info.fault_addr, "SIGBUS");
+                        log_user_fault(
+                            "instruction page fault beyond file EOF",
+                            "exec",
+                            trap_info.fault_addr,
+                            "SIGBUS",
+                        );
                         current_add_signal(SignalBit::SIGBUS);
                     }
                     Err(MmError::OutOfMemory) => {
                         handle_user_oom("file_mmap", "exec", trap_info.fault_addr);
                     }
                     Err(_) => {
-                        log_user_fault("instruction page fault", "exec", trap_info.fault_addr, "SIGSEGV");
+                        log_user_fault(
+                            "instruction page fault",
+                            "exec",
+                            trap_info.fault_addr,
+                            "SIGSEGV",
+                        );
                         current_add_signal(SignalBit::SIGSEGV);
                     }
                 }
@@ -360,7 +421,12 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalBit::SIGSEGV);
         }
         TrapCause::IllegalInstruction => {
-            log_user_fault("illegal instruction", "exec", trap_info.fault_addr, "SIGILL");
+            log_user_fault(
+                "illegal instruction",
+                "exec",
+                trap_info.fault_addr,
+                "SIGILL",
+            );
             current_add_signal(SignalBit::SIGILL);
         }
         TrapCause::TimerInterrupt => {
@@ -385,8 +451,7 @@ pub fn trap_handler() -> ! {
         _ => {
             panic!(
                 "Unsupported trap {:?}, fault_addr = {:#x}!",
-                trap_info.cause,
-                trap_info.fault_addr
+                trap_info.cause, trap_info.fault_addr
             );
         }
     }
@@ -453,8 +518,7 @@ pub fn trap_from_kernel() {
         _ => {
             panic!(
                 "Kernel trap: {:?}, fault_addr = {:#x}",
-                trap_info.cause,
-                trap_info.fault_addr
+                trap_info.cause, trap_info.fault_addr
             );
         }
     }
@@ -462,6 +526,4 @@ pub fn trap_from_kernel() {
 }
 
 pub use context::TrapContext;
-pub use irq::{
-    enter_noirq_lock, exit_noirq_lock, HardIrqGuard, KernelIrqEnableGuard,
-};
+pub use irq::{enter_noirq_lock, exit_noirq_lock, HardIrqGuard, KernelIrqEnableGuard};

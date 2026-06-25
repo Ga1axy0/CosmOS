@@ -6,7 +6,10 @@ use super::heap_allocator::{KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES};
 use crate::sched::PID2PCB;
 #[cfg(feature = "oom_diagnostics")]
 use crate::task::ProcessControlBlock;
-use crate::{fs::PAGE_CACHE_MANAGER, task::{current_task, current_trap_cx}};
+use crate::{
+    fs::PAGE_CACHE_MANAGER,
+    task::{current_task, current_trap_cx},
+};
 #[cfg(feature = "oom_diagnostics")]
 use alloc::{sync::Arc, vec::Vec};
 use core::{error, sync::atomic::Ordering};
@@ -89,7 +92,10 @@ pub fn log_oom(context: &str, access: Option<&str>, fault_addr: Option<usize>) {
     );
 
     let pcm = PAGE_CACHE_MANAGER.lock();
-    error!("[oom] Page cache: cached {}, low {}, high {}", pcm.cached_pages, pcm.low_watermark, pcm.high_watermark);
+    error!(
+        "[oom] Page cache: cached {}, low {}, high {}",
+        pcm.cached_pages, pcm.low_watermark, pcm.high_watermark
+    );
     log_detailed_oom();
 }
 
@@ -119,7 +125,11 @@ fn log_detailed_oom() {
             .and_then(|parent| parent.upgrade())
             .map(|parent| parent.getpid())
             .unwrap_or(0);
-        let fd_used = inner.fd_table.iter().filter(|entry| entry.is_some()).count();
+        let fd_used = inner
+            .fd_table
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
         let live_threads = inner.tasks.iter().filter(|task| task.is_some()).count();
         error!(
             "[oom] process pid={} ppid={} zombie={} threads={} fd_used={} fd_slots={} children={} user_vma_bytes={} vmas={} shm={} exec={}",

@@ -1,7 +1,7 @@
 //! Registry for tasks blocked in `sigtimedwait`.
 
-use crate::sync::SpinNoIrqLock;
 use crate::sched::pid2process;
+use crate::sync::SpinNoIrqLock;
 use crate::task::{current_process, wakeup_task, SigInfo, SignalBit, TaskControlBlock};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -211,7 +211,10 @@ pub(crate) fn notify_signal_wait_pid(pid: usize, pending_bits: u64) {
         }
     }
     for task in tasks {
-        debug!("notify_signal_wait_pid: waking up task of pid {}", task.process.upgrade().unwrap().getpid());
+        debug!(
+            "notify_signal_wait_pid: waking up task of pid {}",
+            task.process.upgrade().unwrap().getpid()
+        );
         wakeup_task(task);
     }
 }
@@ -283,7 +286,7 @@ pub(crate) fn has_unmasked_pending_signal() -> bool {
     let task_inner = task.inner_exclusive_access();
     !((task_inner.pending_signals | process_inner.pending_signals)
         & !task_inner.signal_mask.without_unblockable())
-        .is_empty()
+    .is_empty()
 }
 
 pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<(i32, SigInfo)> {

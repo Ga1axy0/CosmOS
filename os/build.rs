@@ -1,5 +1,6 @@
 fn target_path() -> String {
-    let target = std::env::var("TARGET").unwrap_or_else(|_| "riscv64gc-unknown-none-elf".to_string());
+    let target =
+        std::env::var("TARGET").unwrap_or_else(|_| "riscv64gc-unknown-none-elf".to_string());
     format!("../user/target/{}/release/", target)
 }
 
