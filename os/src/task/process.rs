@@ -1,7 +1,7 @@
 //! Implementation of  [`ProcessControlBlock`]
 #![allow(deprecated)]
 
-use super::id::RecycleAllocator;
+use super::id::{RecycleAllocator, TaskUserResAlloc};
 use super::WaitQueue;
 use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
 use super::{pid_alloc, PidHandle};
@@ -952,6 +952,21 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         ustack_base: usize,
         alloc_user_res: bool,
+        sched_attr: SchedAttr,
+    ) -> Result<Arc<TaskControlBlock>, MmError> {
+        let alloc = if alloc_user_res {
+            TaskUserResAlloc::Full
+        } else {
+            TaskUserResAlloc::None
+        };
+        self.create_task_with_user_res_alloc(ustack_base, alloc, sched_attr)
+    }
+
+    /// Construct a task with explicit per-task user-resource allocation mode.
+    pub fn create_task_with_user_res_alloc(
+        self: &Arc<Self>,
+        ustack_base: usize,
+        alloc_user_res: TaskUserResAlloc,
         sched_attr: SchedAttr,
     ) -> Result<Arc<TaskControlBlock>, MmError> {
         Ok(Arc::new(TaskControlBlock::new(

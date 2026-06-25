@@ -280,6 +280,18 @@ pub struct TaskUserRes {
     /// process belongs to
     pub process: Weak<ProcessControlBlock>,
 }
+
+/// Which per-task user mappings the kernel should allocate for a new task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskUserResAlloc {
+    /// Reuse mappings already present in the address space.
+    None,
+    /// Allocate both the kernel-managed user stack and trap context.
+    Full,
+    /// Allocate only the trap context; the user stack is supplied by userspace.
+    TrapOnly,
+}
+
 /// Return the bottom addr (low addr) of the trap context for a task
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
@@ -294,7 +306,7 @@ impl TaskUserRes {
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
-        alloc_user_res: bool,
+        alloc_user_res: TaskUserResAlloc,
     ) -> Result<Self, MmError> {
         let total_start_ns = get_time_ns();
         let alloc_tid_start_ns = get_time_ns();
@@ -319,14 +331,16 @@ impl TaskUserRes {
             process: Arc::downgrade(&process),
         };
         let alloc_user_res_start_ns = get_time_ns();
-        if alloc_user_res {
-            task_user_res.alloc_user_res()?;
+        match alloc_user_res {
+            TaskUserResAlloc::None => {}
+            TaskUserResAlloc::Full => task_user_res.alloc_user_res()?,
+            TaskUserResAlloc::TrapOnly => task_user_res.alloc_trap_cx()?,
         }
         let alloc_user_res_ns = get_time_ns() - alloc_user_res_start_ns;
         let total_ns = get_time_ns() - total_start_ns;
         if total_ns >= TASK_USER_RES_TIMING_WARN_THRESHOLD_NS {
             debug!(
-                "[clone-timing] task_user_res_new pid={} tid={} thread_id={} alloc_user_res={} total_ns={} alloc_tid_ns={} alloc_thread_id_ns={} alloc_user_res_ns={}",
+                "[clone-timing] task_user_res_new pid={} tid={} thread_id={} alloc_user_res={:?} total_ns={} alloc_tid_ns={} alloc_thread_id_ns={} alloc_user_res_ns={}",
                 process.getpid(),
                 tid,
                 thread_id,
@@ -354,6 +368,19 @@ impl TaskUserRes {
             process_inner.memory_set.insert_vma(ustack_vma, None)?;
         }
         // alloc trap_cx
+        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+        process_inner.memory_set.insert_vma(
+            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Allocate only the trap context mapping for a Linux `CLONE_VM` thread.
+    pub fn alloc_trap_cx(&self) -> Result<(), MmError> {
+        let process = self.process.upgrade().unwrap();
+        let mut process_inner = process.inner_exclusive_access();
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         process_inner.memory_set.insert_vma(

@@ -1,6 +1,6 @@
 //! Types related to task management & Functions for completely changing TCB
 
-use super::id::TaskUserRes;
+use super::id::{TaskUserRes, TaskUserResAlloc};
 use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
 use crate::config::MAX_HARTS;
@@ -255,7 +255,7 @@ impl TaskControlBlock {
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
-        alloc_user_res: bool,
+        alloc_user_res: TaskUserResAlloc,
         sched_attr: SchedAttr,
     ) -> Result<Self, MmError> {
         let new_start_ns = get_time_ns();
@@ -299,7 +299,7 @@ impl TaskControlBlock {
                 process.getpid(),
                 tid,
                 thread_id,
-                alloc_user_res,
+                alloc_user_res as u8,
                 total_ns,
                 task_user_res_ns,
                 kstack_alloc_ns,

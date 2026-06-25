@@ -21,7 +21,7 @@ use crate::{
         current_process, current_task, current_trap_cx, current_user_token,
         exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task,
         CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo,
-        SignalBit, WaitReason,
+        SignalBit, TaskUserResAlloc, WaitReason,
     },
 };
 
@@ -1385,7 +1385,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             };
             let inherited_cx = *current_trap_cx();
             let new_task = current_process
-                .create_task(ustack_base, true, sched_attr)
+                .create_task_with_user_res_alloc(
+                    ustack_base,
+                    TaskUserResAlloc::TrapOnly,
+                    sched_attr,
+                )
                 .map_err(|_| ERRNO::ENOMEM)?;
             let new_tid = new_task
                 .inner_exclusive_access()

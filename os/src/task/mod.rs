@@ -39,7 +39,9 @@ use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use id::recycle_deferred_kstack_ids;
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID, PID_MAX};
+pub use id::{
+    kstack_alloc, pid_alloc, KernelStack, PidHandle, TaskUserResAlloc, IDLE_PID, PID_MAX,
+};
 use lazy_static::*;
 
 fn should_remove_non_futex_timers_on_exit(task: &Arc<TaskControlBlock>) -> bool {
