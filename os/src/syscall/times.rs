@@ -640,14 +640,12 @@ pub fn sys_clock_nanosleep(
         let task = current_task().unwrap();
         // Publish the sleep state before arming the timer so an immediate
         // expiry cannot drop the timer while this task is still marked Running.
-        crate::probe!("sys.clock_nanosleep_arm", {
-            let mut task_inner = task.inner_exclusive_access();
-            task_inner.task_status = TaskStatus::Interruptible;
-            task_inner.wait_reason = Some(WaitReason::Nanosleep);
-            task_inner.may_have_non_futex_timer = true;
-            drop(task_inner);
-            add_current_timer_ns_preflagged(expire_ns, Arc::clone(&task));
-        });
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.task_status = TaskStatus::Interruptible;
+        task_inner.wait_reason = Some(WaitReason::Nanosleep);
+        task_inner.may_have_non_futex_timer = true;
+        drop(task_inner);
+        add_current_timer_ns_preflagged(expire_ns, Arc::clone(&task));
         block_current_and_run_next(WaitReason::Nanosleep);
 
         if has_interrupting_signal() {

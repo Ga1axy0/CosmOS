@@ -319,14 +319,12 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> isize {
         // Publish the sleep state before arming the timer so an immediately
         // expiring interrupt can convert this task back to Runnable instead of
         // consuming the timer while the task still looks Running.
-        crate::probe!("sys.nanosleep_arm", {
-            let mut task_inner = task.inner_exclusive_access();
-            task_inner.task_status = TaskStatus::Interruptible;
-            task_inner.wait_reason = Some(WaitReason::Nanosleep);
-            task_inner.may_have_non_futex_timer = true;
-            drop(task_inner);
-            add_current_timer_ns_preflagged(expire_ns, Arc::clone(&task));
-        });
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.task_status = TaskStatus::Interruptible;
+        task_inner.wait_reason = Some(WaitReason::Nanosleep);
+        task_inner.may_have_non_futex_timer = true;
+        drop(task_inner);
+        add_current_timer_ns_preflagged(expire_ns, Arc::clone(&task));
         block_current_and_run_next(WaitReason::Nanosleep);
         if crate::signal::has_interrupting_signal() {
             if !rem.is_null() {

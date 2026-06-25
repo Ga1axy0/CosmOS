@@ -179,13 +179,13 @@ pub(crate) use enabled::{enabled, render, reset, scope_registered, set_enabled};
 /// Measure the elapsed time of a block under a registered probe name.
 ///
 /// ```ignore
-/// crate::probe!("timer.add", {
+/// crate::probe!({
 ///     add_timer_inner();
-/// });
+/// }, "timer.add");
 /// ```
 #[macro_export]
 macro_rules! probe {
-    ($name:expr, $body:block) => {{
+    ($body:block, $name:expr) => {{
         #[cfg(feature = "perf_probe")]
         {
             static PROBE_SLOT: core::sync::atomic::AtomicUsize =
