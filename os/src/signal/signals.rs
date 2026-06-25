@@ -255,6 +255,8 @@ impl SignalBit {
                 SignalNum::SIGSEGV.number(),
                 "Segmentation Fault, SIGSEGV=11",
             ))
+        } else if self.contains(Self::SIGPIPE) {
+            Some((SignalNum::SIGPIPE.number(), "Broken pipe, SIGPIPE=13"))
         } else if self.contains(Self::SIGTERM) {
             Some((SignalNum::SIGTERM.number(), "Terminated, SIGTERM=15"))
         } else {

@@ -15,7 +15,7 @@ use crate::{
     poll::notify_poll_source,
     sync::{Mutex, MutexBlocking, SpinNoIrqLock},
     syscall::errno::ERRNO,
-    task::{current_process, WaitQueue, WaitReason},
+    task::{current_add_signal, current_process, SignalBit, WaitQueue, WaitReason},
 };
 
 const POLLIN: u16 = 0x001;
@@ -314,6 +314,7 @@ impl UnixSocketPairEnd {
         let written = tx.write_at(0, buf);
         if written == 0 && tx.write_peer_closed() {
             self.tx_seq_lock.unlock();
+            current_add_signal(SignalBit::SIGPIPE);
             return Err(ERRNO::EPIPE);
         }
         if written > 0 {
