@@ -1807,8 +1807,11 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 return Ok(0);
             }
 
-            // 4) 阻塞等待；这里必须先释放 inner，再睡眠
+            // 4) 阻塞等待；这里必须先释放 inner，再检查信号/睡眠。
             drop(inner);
+            if crate::signal::has_interrupting_signal() {
+                return Err(ERRNO::EINTR);
+            }
 
             process
                 .wait_exit_queue
