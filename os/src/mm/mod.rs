@@ -54,7 +54,7 @@ pub use frame_allocator::{
     frame_dealloc, frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
 };
 pub use heap_allocator::{
-    map_one_heap_page, reclaim_kernel_heap_if_needed, KERNEL_HEAP_USED_BYTES,
+    map_one_heap_page, reclaim_kernel_heap_if_needed, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
 };
 pub use memory_set::remap_test;
 pub use memory_set::{

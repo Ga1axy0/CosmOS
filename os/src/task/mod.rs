@@ -38,6 +38,7 @@ use crate::timer::get_time_ns;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use id::cached_kstack_count;
 pub(crate) use id::reclaim_cached_kstacks;
 pub(crate) use id::recycle_deferred_kstack_ids;
 pub use id::{
