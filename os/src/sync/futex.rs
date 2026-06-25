@@ -300,7 +300,6 @@ pub fn futex_wait_mark_ready(task: &Arc<TaskControlBlock>) {
     let (pid, tid, thread_id) = futex_task_ids(task);
     for (idx, slot) in registry.slots.iter_mut().enumerate() {
         if slot.task_ptr == task_ptr && matches!(slot.state, FutexWaitState::Active) {
-            task.note_first_futex_wake(get_time_ns());
             debug!(
                 "[futex-warn] mark_ready pid={} tid={} thread_id={} slot={} gen={} state={:?}->{:?}",
                 pid,
@@ -389,7 +388,6 @@ pub fn handle_futex_wait_timeout(tag: FutexTimerTag, task: &Arc<TaskControlBlock
         );
         slot.state = FutexWaitState::TimedOut;
     }
-    task.note_first_futex_wake(get_time_ns());
     wake_task_via_wait_handle(task);
     true
 }
@@ -555,7 +553,6 @@ pub fn futex_wait_addr(
     private: bool,
 ) -> Result<isize, ERRNO> {
     let task = current_task().unwrap();
-    let wait_entry_ns = get_time_ns();
     let current = read_pod_from_user(uaddr)?;
     if current != expected {
         return Err(ERRNO::EAGAIN);
@@ -569,26 +566,6 @@ pub fn futex_wait_addr(
     }
 
     let queue = futex_queue(uaddr as usize, private)?;
-    if let Some(timing) = task.note_first_futex_wait(wait_entry_ns) {
-        let (pid, tid, thread_id) = futex_task_ids(&task);
-        debug!(
-            "[clone-chain] pid={} tid={} thread_id={} expected={} clone_ready_ns={} first_run_ns={} first_user_return_ns={} first_futex_wait_ns={} clone_to_run_ns={} run_to_user_ns={} user_to_futex_ns={} clone_to_futex_ns={}",
-            pid,
-            tid,
-            thread_id,
-            expected,
-            timing.clone_ready_ns,
-            timing.first_run_ns,
-            timing.first_user_return_ns,
-            timing.first_futex_wait_ns,
-            timing.first_run_ns.saturating_sub(timing.clone_ready_ns),
-            timing.first_user_return_ns.saturating_sub(timing.first_run_ns),
-            timing.first_futex_wait_ns
-                .saturating_sub(timing.first_user_return_ns),
-            timing.first_futex_wait_ns
-                .saturating_sub(timing.clone_ready_ns),
-        );
-    }
     let handle = deadline_ns
         .map(|_| register_futex_wait(&task).ok_or(ERRNO::EAGAIN))
         .transpose()?;
@@ -619,7 +596,6 @@ pub fn futex_wait_addr(
     });
     if let Some(handle) = handle {
         let wake_state = futex_wait_state(handle);
-        let wait_done_ns = get_time_ns();
         let (pid, tid, thread_id) = futex_task_ids(&task);
         debug!(
             "[futex-warn] wait_done pid={} tid={} thread_id={} slot={} gen={} uaddr={:#x} expected={} wake_state={:?}",
@@ -632,33 +608,6 @@ pub fn futex_wait_addr(
             expected,
             wake_state
         );
-        if let Some(timing) = task.note_first_futex_wait_done(wait_done_ns) {
-            debug!(
-                "[futex-chain] pid={} tid={} thread_id={} expected={} wake_state={:?} clone_ready_ns={} first_run_ns={} first_user_return_ns={} first_futex_wait_ns={} first_futex_wake_ns={} first_post_futex_run_ns={} first_futex_wait_done_ns={} wait_to_wake_ns={} wake_to_run_ns={} run_to_wait_done_ns={} wake_to_wait_done_ns={} total_wait_roundtrip_ns={}",
-                pid,
-                tid,
-                thread_id,
-                expected,
-                wake_state,
-                timing.clone_ready_ns,
-                timing.first_run_ns,
-                timing.first_user_return_ns,
-                timing.first_futex_wait_ns,
-                timing.first_futex_wake_ns,
-                timing.first_post_futex_run_ns,
-                timing.first_futex_wait_done_ns,
-                timing.first_futex_wake_ns
-                    .saturating_sub(timing.first_futex_wait_ns),
-                timing.first_post_futex_run_ns
-                    .saturating_sub(timing.first_futex_wake_ns),
-                timing.first_futex_wait_done_ns
-                    .saturating_sub(timing.first_post_futex_run_ns),
-                timing.first_futex_wait_done_ns
-                    .saturating_sub(timing.first_futex_wake_ns),
-                timing.first_futex_wait_done_ns
-                    .saturating_sub(timing.first_futex_wait_ns),
-            );
-        }
         cleanup_futex_wait(handle);
         match wake_state {
             FutexWakeState::Ready => return Ok(0),

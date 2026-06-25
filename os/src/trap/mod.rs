@@ -26,11 +26,10 @@ use crate::signal::{handle_signals, SignalBit, SignalNum};
 use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::task::{
     check_fatal_signals_of_current, check_itimers_of_all_processes, current_add_signal,
-    current_process, current_process_is_zombie, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
-    exit_group_current_and_run_next, ExitReason,
+    current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va,
+    current_user_token, exit_current_and_run_next, exit_group_current_and_run_next, ExitReason,
 };
-use crate::timer::{get_realtime_ns, get_time, get_time_ns, handle_timer_interrupt};
+use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
 
 /// 输出用户态致命异常现场，区分 fault 地址、用户 PC 与关键寄存器。
 fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
@@ -480,8 +479,6 @@ pub fn trap_handler() -> ! {
 #[no_mangle]
 pub fn trap_return() -> ! {
     set_user_trap_entry();
-    let now_ns = get_time_ns();
-    current_task().unwrap().note_first_user_return(now_ns);
     let trap_cx_user_va = current_trap_cx_user_va();
     current_trap_cx().set_kernel_hartid(hartid());
     let user_token = current_user_token();

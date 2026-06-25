@@ -1516,7 +1516,6 @@ impl ProcessControlBlock {
             child.getpid()
         );
         let publish_start_ns = get_time_ns();
-        task.mark_clone_ready(publish_start_ns);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
         let publish_ns = get_time_ns() - publish_start_ns;
