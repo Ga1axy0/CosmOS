@@ -64,6 +64,10 @@ fn write_zero_is_broken_pipe(desc: &FileDescription) -> bool {
             .unwrap_or(false)
 }
 
+fn signal_broken_pipe() {
+    crate::task::current_add_signal(SignalBit::SIGPIPE);
+}
+
 /// `ppoll(2)` 使用的用户态文件描述符数组元素。
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -2319,6 +2323,7 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
             PageFaultAccess::Read,
         )?))?;
         if len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
+            signal_broken_pipe();
             return Err(ERRNO::EPIPE);
         }
         Ok(written as isize)
@@ -2691,6 +2696,7 @@ pub fn sys_writev(fd: usize, iov: *const IoVec, iovcnt: i32) -> isize {
             )?);
             let written = desc.write_result(user_buf)?;
             if iovec.iov_len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
+                signal_broken_pipe();
                 return Err(ERRNO::EPIPE);
             }
             completed += written;

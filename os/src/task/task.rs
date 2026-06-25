@@ -1,6 +1,6 @@
 //! Types related to task management & Functions for completely changing TCB
 
-use super::id::TaskUserRes;
+use super::id::{TaskUserRes, TaskUserResAlloc};
 use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
 use crate::config::MAX_HARTS;
@@ -189,19 +189,6 @@ pub struct TaskControlBlockInner {
     pub signal_mask_backup: Option<SignalBit>,
     /// Whether this task may still have non-futex timers that require eager removal on exit.
     pub may_have_non_futex_timer: bool,
-    /// One-shot fork/clone latency trace points used to study "clone -> run -> user -> futex wait".
-    pub fork_chain_timing: Option<ForkChainTiming>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ForkChainTiming {
-    pub clone_ready_ns: u64,
-    pub first_run_ns: u64,
-    pub first_user_return_ns: u64,
-    pub first_futex_wait_ns: u64,
-    pub first_futex_wake_ns: u64,
-    pub first_post_futex_run_ns: u64,
-    pub first_futex_wait_done_ns: u64,
 }
 
 impl TaskControlBlockInner {
@@ -255,7 +242,7 @@ impl TaskControlBlock {
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
-        alloc_user_res: bool,
+        alloc_user_res: TaskUserResAlloc,
         sched_attr: SchedAttr,
     ) -> Result<Self, MmError> {
         let new_start_ns = get_time_ns();
@@ -288,7 +275,6 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
                 may_have_non_futex_timer: false,
-                fork_chain_timing: None,
             }),
         };
         let build_ns = get_time_ns() - build_start_ns;
@@ -299,7 +285,7 @@ impl TaskControlBlock {
                 process.getpid(),
                 tid,
                 thread_id,
-                alloc_user_res,
+                alloc_user_res as u8,
                 total_ns,
                 task_user_res_ns,
                 kstack_alloc_ns,
@@ -335,72 +321,8 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
                 may_have_non_futex_timer: false,
-                fork_chain_timing: None,
             }),
         })
-    }
-
-    /// Record the timestamp at which a freshly cloned child becomes runnable.
-    pub fn mark_clone_ready(&self, now_ns: u64) {
-        let mut inner = self.inner_exclusive_access();
-        inner.fork_chain_timing = Some(ForkChainTiming {
-            clone_ready_ns: now_ns,
-            ..ForkChainTiming::default()
-        });
-    }
-
-    /// Record the first time this task is selected to run on a CPU.
-    pub fn note_first_run(&self, now_ns: u64) {
-        let mut inner = self.inner_exclusive_access();
-        if let Some(timing) = inner.fork_chain_timing.as_mut() {
-            if timing.first_run_ns == 0 {
-                timing.first_run_ns = now_ns;
-            }
-        }
-    }
-
-    /// Record the first return from kernel to user mode after clone.
-    pub fn note_first_user_return(&self, now_ns: u64) {
-        let mut inner = self.inner_exclusive_access();
-        if let Some(timing) = inner.fork_chain_timing.as_mut() {
-            if timing.first_user_return_ns == 0 {
-                timing.first_user_return_ns = now_ns;
-            }
-        }
-    }
-
-    /// Record the first observed futex wait entry and return the timing snapshot once.
-    pub fn note_first_futex_wait(&self, now_ns: u64) -> Option<ForkChainTiming> {
-        let mut inner = self.inner_exclusive_access();
-        let timing = inner.fork_chain_timing.as_mut()?;
-        if timing.first_futex_wait_ns != 0 {
-            return None;
-        }
-        timing.first_futex_wait_ns = now_ns;
-        Some(*timing)
-    }
-
-    /// Record the first wakeup/timeout event that should resume the first futex wait.
-    pub fn note_first_futex_wake(&self, now_ns: u64) {
-        let mut inner = self.inner_exclusive_access();
-        let Some(timing) = inner.fork_chain_timing.as_mut() else {
-            return;
-        };
-        if timing.first_futex_wait_ns == 0 || timing.first_futex_wake_ns != 0 {
-            return;
-        }
-        timing.first_futex_wake_ns = now_ns;
-    }
-
-    /// Record the timestamp when the first futex wait path finishes running again.
-    pub fn note_first_futex_wait_done(&self, now_ns: u64) -> Option<ForkChainTiming> {
-        let mut inner = self.inner_exclusive_access();
-        let timing = inner.fork_chain_timing.as_mut()?;
-        if timing.first_futex_wait_ns == 0 || timing.first_futex_wait_done_ns != 0 {
-            return None;
-        }
-        timing.first_futex_wait_done_ns = now_ns;
-        Some(*timing)
     }
 }
 

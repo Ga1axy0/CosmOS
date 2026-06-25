@@ -53,7 +53,9 @@ pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_alloc_with_reclaim, frame_allocator_stats,
     frame_dealloc, frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
 };
-pub use heap_allocator::{map_one_heap_page, KERNEL_HEAP_USED_BYTES};
+pub use heap_allocator::{
+    map_one_heap_page, reclaim_kernel_heap_if_needed, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
+};
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,

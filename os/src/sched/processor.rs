@@ -11,7 +11,7 @@ use crate::hal::traits::AddressSpaceToken;
 use crate::hal::{enable_irqs_and_wait, hartid};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
-use crate::timer::{get_time, get_time_ns};
+use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use core::array;
@@ -110,16 +110,8 @@ pub(crate) fn run_tasks() {
             task_inner.sched.on_cpu = true;
             task_inner.sched.on_rq = false;
             task_inner.sched.resched_reason = None;
-            let now_ns = get_time_ns();
-            if let Some(timing) = task_inner.fork_chain_timing.as_mut() {
-                if timing.first_run_ns == 0 {
-                    timing.first_run_ns = now_ns;
-                }
-                if timing.first_futex_wake_ns != 0 && timing.first_post_futex_run_ns == 0 {
-                    timing.first_post_futex_run_ns = now_ns;
-                }
-            }
             if matches!(task_inner.sched.policy, SchedPolicy::Other) {
+                let now_ns = crate::timer::get_time_ns();
                 task_inner.sched.exec_start_ns = now_ns;
                 task_inner.sched.cfs_slice_start_ns = now_ns;
             }

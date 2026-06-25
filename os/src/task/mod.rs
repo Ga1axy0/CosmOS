@@ -38,8 +38,12 @@ use crate::timer::get_time_ns;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use id::cached_kstack_count;
+pub(crate) use id::reclaim_cached_kstacks;
 pub(crate) use id::recycle_deferred_kstack_ids;
-pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID, PID_MAX};
+pub use id::{
+    kstack_alloc, pid_alloc, KernelStack, PidHandle, TaskUserResAlloc, IDLE_PID, PID_MAX,
+};
 use lazy_static::*;
 
 fn should_remove_non_futex_timers_on_exit(task: &Arc<TaskControlBlock>) -> bool {
@@ -421,9 +425,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             }
         }
     }
-    let exit_pid = process.getpid();
-    let tcb_strong = Arc::strong_count(&exiting_task);
-    let tcb_weak = Arc::weak_count(&exiting_task);
     // Move the exiting task reference off the stack into stop_task so that
     // the idle loop's `finish_pending_task_release` can drop it once the
     // kernel stack is no longer in use (after __switch completes).

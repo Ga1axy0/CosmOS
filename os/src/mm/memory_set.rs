@@ -812,6 +812,49 @@ impl MemorySet {
         }
         self.rebuild_vmas_from_vec(merged);
     }
+
+    /// Merge at most the direct neighbours around `key`.
+    fn merge_vma_around(&mut self, key: VirtPageNum) {
+        let Some(mut area) = self.vmas.remove(&key) else {
+            return;
+        };
+        if let Some(left_key) = self
+            .vmas
+            .range(..area.start_vpn())
+            .next_back()
+            .map(|(key, _)| *key)
+        {
+            let can_merge = self
+                .vmas
+                .get(&left_key)
+                .is_some_and(|left| left.can_merge_with(&area));
+            if can_merge {
+                let Some(mut merged) = self.vmas.remove(&left_key) else {
+                    return;
+                };
+                merged.absorb(area);
+                area = merged;
+            }
+        }
+        if let Some(right_key) = self
+            .vmas
+            .range(area.end_vpn()..)
+            .next()
+            .map(|(key, _)| *key)
+        {
+            let can_merge = self
+                .vmas
+                .get(&right_key)
+                .is_some_and(|right| area.can_merge_with(right));
+            if can_merge {
+                let Some(right) = self.vmas.remove(&right_key) else {
+                    return;
+                };
+                area.absorb(right);
+            }
+        }
+        self.insert_vma_unchecked(area);
+    }
     /// Find a free user mmap range using a hint first, then wrap to the base.
     pub fn find_free_mmap_area(&self, hint: usize, base: usize, len: usize) -> Option<usize> {
         let upper = USER_SPACE_END;
@@ -2235,168 +2278,71 @@ impl MemorySet {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
 
-        // Validation: every page must be mapped, user-accessible and belong to some user VMA.
-        //
-        // To avoid O(pages × vmas) behavior, first collect and merge all user-accessible
-        // VMA subranges that overlap [start_vpn, end_vpn), then validate pages against
-        // this compact list in a single linear pass.
-        let mut user_ranges: Vec<(VirtPageNum, VirtPageNum)> = Vec::new();
-        for area in self.vmas.values() {
-            if !area.is_user_accessible() {
-                continue;
-            }
-            let area_start = area.start_vpn();
-            let area_end = area.end_vpn();
-            if area_end <= start_vpn || area_start >= end_vpn {
-                // No overlap with requested range.
-                continue;
-            }
-            let overlap_start = if area_start > start_vpn {
-                area_start
-            } else {
-                start_vpn
+        let mut affected = Vec::new();
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let Some((area_key, area)) = self.vmas.range(..=cursor).next_back() else {
+                return false;
             };
-            let overlap_end = if area_end < end_vpn {
-                area_end
+            if !area.contains_vpn(cursor) || !area.is_user_accessible() {
+                return false;
+            }
+            let overlap_end = if area.end_vpn() < end_vpn {
+                area.end_vpn()
             } else {
                 end_vpn
             };
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            if let Some((_, last_end)) = user_ranges.last_mut() {
-                // Merge adjacent overlaps to keep the list compact.
-                if *last_end == overlap_start {
-                    *last_end = overlap_end;
-                    continue;
+            for vpn in VPNRange::new(cursor, overlap_end) {
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    if !pte.flags().contains(PTEFlags::U) {
+                        return false;
+                    }
                 }
             }
-            user_ranges.push((overlap_start, overlap_end));
+            affected.push((*area_key, cursor, overlap_end));
+            cursor = overlap_end;
         }
 
-        // Now walk pages once, checking that each page lies within a user-accessible VMA range.
-        let mut range_idx = 0usize;
-        let mut current_range = user_ranges.get(range_idx).cloned();
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            // Ensure there is a current range that may cover this vpn.
-            while let Some((_, range_end)) = current_range {
-                if vpn < range_end {
-                    break;
-                }
-                range_idx += 1;
-                current_range = user_ranges.get(range_idx).cloned();
-            }
-            let Some((range_start, range_end)) = current_range else {
-                // No more user-accessible ranges but still pages left to validate.
+        let pte_flags = Self::map_perm_to_pte_flags(permission);
+        let mut changed_keys = Vec::new();
+        for (area_key, overlap_start, overlap_end) in affected {
+            let Some(mut area) = self.vmas.remove(&area_key) else {
                 return false;
             };
-            if vpn < range_start || vpn >= range_end {
-                // Hole in user-accessible coverage.
-                return false;
-            }
-            if let Some(pte) = self.page_table.translate(vpn) {
-                if !pte.flags().contains(PTEFlags::U) {
-                    return false;
-                }
-            }
-        }
-
-        // Modification: split VMAs as needed and update page table flags.
-        let old_vmas = core::mem::take(&mut self.vmas);
-        let mut new_areas: Vec<Vma> = Vec::with_capacity(old_vmas.len() + 1);
-        for mut area in old_vmas.into_values() {
             let area_start = area.start_vpn();
-            let area_end = area.end_vpn();
-            let overlap_start = if area_start > start_vpn {
-                area_start
-            } else {
-                start_vpn
-            };
-            let overlap_end = if area_end < end_vpn {
-                area_end
-            } else {
-                end_vpn
-            };
+            let mut to_insert = Vec::new();
 
-            if overlap_start >= overlap_end {
-                new_areas.push(area);
-                continue;
-            }
-
-            // left part
             if area_start < overlap_start {
-                let left_data_frames = area.data_frames.split_off(&overlap_start);
-                let left_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_start);
-                let left_area = Vma {
-                    vpn_range: VPNRange::new(area_start, overlap_start),
-                    data_frames: area.data_frames,
-                    map_type: area.map_type,
-                    map_perm: area.map_perm,
-                    kind: area.kind.clone(),
-                    file: area.file.clone(),
-                    shared_anon: area.shared_anon,
-                    direct_cache_pages: area.direct_cache_pages,
+                let Some(right) = area.split_off(overlap_start) else {
+                    return false;
                 };
-                area.data_frames = left_data_frames;
-                area.direct_cache_pages = left_direct_cache_pages;
-                if let Some(file) = area.file.as_mut() {
-                    file.pgoff += overlap_start.0 - area_start.0;
-                }
-                new_areas.push(left_area);
+                to_insert.push(area);
+                area = right;
             }
 
-            // right part exists -> split and handle middle separately
-            if overlap_end < area_end {
-                let right_data_frames = area.data_frames.split_off(&overlap_end);
-                let right_direct_cache_pages = area.direct_cache_pages.split_off(&overlap_end);
-                let mut right_file = area.file.clone();
-                if let Some(file) = right_file.as_mut() {
-                    let middle_start = if area_start < overlap_start {
-                        overlap_start
-                    } else {
-                        area_start
-                    };
-                    file.pgoff += overlap_end.0 - middle_start.0;
-                }
-                let right_area = Vma {
-                    vpn_range: VPNRange::new(overlap_end, area_end),
-                    data_frames: right_data_frames,
-                    map_type: area.map_type,
-                    map_perm: area.map_perm,
-                    kind: area.kind.clone(),
-                    file: right_file,
-                    shared_anon: area.shared_anon,
-                    direct_cache_pages: right_direct_cache_pages,
+            if overlap_end < area.end_vpn() {
+                let Some(right) = area.split_off(overlap_end) else {
+                    return false;
                 };
+                to_insert.push(right);
+            }
 
-                // update middle pages' PTE flags
-                let pte_flags = Self::map_perm_to_pte_flags(permission);
-                for vpn in VPNRange::new(overlap_start, overlap_end) {
-                    if self.page_table.translate(vpn).is_some() {
-                        self.page_table.update_flags(vpn, pte_flags);
-                    }
+            for vpn in VPNRange::new(overlap_start, overlap_end) {
+                if self.page_table.translate(vpn).is_some() {
+                    self.page_table.update_flags(vpn, pte_flags);
                 }
+            }
+            area.map_perm = permission;
+            changed_keys.push(area.start_vpn());
+            to_insert.push(area);
 
-                area.vpn_range = VPNRange::new(overlap_start, overlap_end);
-                area.map_perm = permission;
-                new_areas.push(area);
-                new_areas.push(right_area);
-            } else {
-                // no right split, area becomes the middle area
-                let pte_flags = Self::map_perm_to_pte_flags(permission);
-                for vpn in VPNRange::new(overlap_start, overlap_end) {
-                    if self.page_table.translate(vpn).is_some() {
-                        self.page_table.update_flags(vpn, pte_flags);
-                    }
-                }
-                area.vpn_range = VPNRange::new(overlap_start, overlap_end);
-                area.map_perm = permission;
-                new_areas.push(area);
+            for area in to_insert {
+                self.insert_vma_unchecked(area);
             }
         }
-
-        self.rebuild_vmas_from_vec(new_areas);
-        self.merge_adjacent_vmas();
+        for key in changed_keys {
+            self.merge_vma_around(key);
+        }
         unsafe {
             crate::hal::flush_tlb();
         }

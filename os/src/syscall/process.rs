@@ -1,7 +1,7 @@
 use crate::hal::traits::CloneArgs;
 use crate::mm::{
-    frame_allocator_stats, unregister_file_mappings_for_process, warn_heap_state, MapPermission,
-    VirtAddr, USER_SPACE_END,
+    frame_allocator_stats, reclaim_kernel_heap_if_needed, unregister_file_mappings_for_process,
+    MapPermission, VirtAddr, USER_SPACE_END,
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use crate::syscall::errno::{OrErrno, ERRNO};
@@ -19,9 +19,9 @@ use crate::{
     mm::{translated_ref, translated_str},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task,
-        CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo,
-        SignalBit, WaitReason,
+        exit_current_and_run_next, exit_group_current_and_run_next, reclaim_cached_kstacks,
+        thread_id2task, CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock,
+        ShmAttachment, SigInfo, SignalBit, TaskUserResAlloc, WaitReason,
     },
 };
 
@@ -1385,7 +1385,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             };
             let inherited_cx = *current_trap_cx();
             let new_task = current_process
-                .create_task(ustack_base, true, sched_attr)
+                .create_task_with_user_res_alloc(
+                    ustack_base,
+                    TaskUserResAlloc::TrapOnly,
+                    sched_attr,
+                )
                 .map_err(|_| ERRNO::ENOMEM)?;
             let new_tid = new_task
                 .inner_exclusive_access()
@@ -1730,6 +1734,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
 
             // 1) 没有任何匹配的子进程
             let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
+
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
@@ -1781,14 +1786,16 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     .child_kernel_time
                     .saturating_add(child_inner.kernel_time)
                     .saturating_add(child_inner.child_kernel_time);
+                let no_remaining_children = inner.children.is_empty();
                 drop(child_inner);
                 drop(inner);
-                let strong_before = Arc::strong_count(&child);
-                let weak_before = Arc::weak_count(&child);
                 unregister_file_mappings_for_process(&child);
                 remove_from_pid2process(found_pid);
-                let strong_after_pid2pcb = Arc::strong_count(&child);
                 drop(child);
+                if no_remaining_children {
+                    reclaim_cached_kstacks(0);
+                    reclaim_kernel_heap_if_needed();
+                }
                 // warn!(
                 //     "[heap_trace] reap_pcb_dropped pid={} strong_before={} strong_after_pid2pcb={} weak={}",
                 //     found_pid, strong_before, strong_after_pid2pcb, weak_before,
@@ -1807,8 +1814,11 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 return Ok(0);
             }
 
-            // 4) 阻塞等待；这里必须先释放 inner，再睡眠
+            // 4) 阻塞等待；这里必须先释放 inner，再检查信号/睡眠。
             drop(inner);
+            if crate::signal::has_interrupting_signal() {
+                return Err(ERRNO::EINTR);
+            }
 
             process
                 .wait_exit_queue

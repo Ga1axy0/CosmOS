@@ -18,6 +18,7 @@ use lazy_static::*;
 pub struct RecycleAllocator {
     current: usize,
     recycled: Vec<usize>,
+    recycled_flags: Vec<bool>,
 }
 
 impl RecycleAllocator {
@@ -26,25 +27,25 @@ impl RecycleAllocator {
         RecycleAllocator {
             current: 0,
             recycled: Vec::new(),
+            recycled_flags: Vec::new(),
         }
     }
     /// allocate a new item
     pub fn alloc(&mut self) -> usize {
         if let Some(id) = self.recycled.pop() {
+            self.recycled_flags[id] = false;
             id
         } else {
             self.current += 1;
+            self.recycled_flags.push(false);
             self.current - 1
         }
     }
     /// deallocate an item
     pub fn dealloc(&mut self, id: usize) {
         assert!(id < self.current);
-        debug_assert!(
-            !self.recycled.iter().any(|i| *i == id),
-            "id {} has been deallocated!",
-            id
-        );
+        debug_assert!(!self.recycled_flags[id], "id {} has been deallocated!", id);
+        self.recycled_flags[id] = true;
         self.recycled.push(id);
     }
 }
@@ -70,11 +71,12 @@ lazy_static! {
 }
 
 /// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
-const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 256;
+const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 64;
 /// deferred 物理页超过该水位时触发一次全局 flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
-/// Keep a bounded pool of mapped kernel stacks to avoid tearing them down in fork/exit storms.
-const KSTACK_CACHE_LIMIT: usize = 512;
+/// Keep a small bounded pool of mapped kernel stacks for reuse without letting
+/// fork/exit storms permanently withhold large amounts of memory.
+const KSTACK_CACHE_LIMIT: usize = 64;
 const TASK_USER_RES_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 const KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
@@ -123,8 +125,38 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 /// Kernel stack for a task
 pub struct KernelStack(pub usize);
 
-fn cached_kstack_count() -> usize {
+pub(crate) fn cached_kstack_count() -> usize {
     KSTACK_CACHE.lock().len()
+}
+
+pub(crate) fn reclaim_cached_kstacks(target_cached: usize) -> usize {
+    let mut kstack_ids = Vec::new();
+    {
+        let mut cache = KSTACK_CACHE.lock();
+        while cache.len() > target_cached {
+            if let Some(kstack_id) = cache.pop() {
+                kstack_ids.push(kstack_id);
+            }
+        }
+    }
+    let reclaimed = kstack_ids.len();
+    for kstack_id in kstack_ids {
+        let (kernel_stack_bottom, _) = kernel_stack_position(kstack_id);
+        let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
+        let deferred_frames = KERNEL_SPACE
+            .lock()
+            .remove_vma_with_start_vpn_deferred(kernel_stack_bottom_va.into());
+        defer_release(
+            kernel_stack_bottom,
+            kernel_stack_bottom + KERNEL_STACK_SIZE,
+            Some(kstack_id),
+            deferred_frames,
+        );
+    }
+    if reclaimed != 0 {
+        flush_deferred(online_mask());
+    }
+    reclaimed
 }
 
 fn try_take_cached_kstack() -> Option<usize> {
@@ -143,25 +175,6 @@ fn try_cache_kstack(kstack_id: usize) -> bool {
 /// Allocate a kernel stack for a task
 pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     let total_start_ns = get_time_ns();
-    let cached_before = cached_kstack_count();
-    let cache_take_start_ns = get_time_ns();
-    if let Some(kstack_id) = try_take_cached_kstack() {
-        let cache_take_ns = get_time_ns() - cache_take_start_ns;
-        let total_ns = get_time_ns() - total_start_ns;
-        if total_ns >= KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS {
-            debug!(
-                "[clone-timing] kstack_alloc kstack_id={} total_ns={} cache_hit=true cache_take_ns={} cached_before={} cached_after={} flush_triggered=false flush_ns=0 alloc_id_ns=0 map_ns=0 deferred_kstacks_before=0 deferred_frames_before=0 stack_pages={}",
-                kstack_id,
-                total_ns,
-                cache_take_ns,
-                cached_before,
-                cached_kstack_count(),
-                KERNEL_STACK_SIZE / PAGE_SIZE,
-            );
-        }
-        return Ok(KernelStack(kstack_id));
-    }
-    let cache_take_ns = get_time_ns() - cache_take_start_ns;
     let deferred_kstack_before = deferred_kstack_id_count();
     let deferred_frames_before = deferred_frame_count();
     let flush_triggered = deferred_kstack_before > KSTACK_DEFERRED_RECYCLE_WATERMARK
@@ -171,6 +184,29 @@ pub fn kstack_alloc() -> Result<KernelStack, MmError> {
         flush_deferred(online_mask());
     }
     let flush_ns = get_time_ns() - flush_start_ns;
+    let cached_before = cached_kstack_count();
+    let cache_take_start_ns = get_time_ns();
+    if let Some(kstack_id) = try_take_cached_kstack() {
+        let cache_take_ns = get_time_ns() - cache_take_start_ns;
+        let total_ns = get_time_ns() - total_start_ns;
+        if total_ns >= KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] kstack_alloc kstack_id={} total_ns={} cache_hit=true cache_take_ns={} cached_before={} cached_after={} flush_triggered={} flush_ns={} alloc_id_ns=0 map_ns=0 deferred_kstacks_before={} deferred_frames_before={} stack_pages={}",
+                kstack_id,
+                total_ns,
+                cache_take_ns,
+                cached_before,
+                cached_kstack_count(),
+                flush_triggered,
+                flush_ns,
+                deferred_kstack_before,
+                deferred_frames_before,
+                KERNEL_STACK_SIZE / PAGE_SIZE,
+            );
+        }
+        return Ok(KernelStack(kstack_id));
+    }
+    let cache_take_ns = get_time_ns() - cache_take_start_ns;
     let alloc_id_start_ns = get_time_ns();
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let alloc_id_ns = get_time_ns() - alloc_id_start_ns;
@@ -280,6 +316,18 @@ pub struct TaskUserRes {
     /// process belongs to
     pub process: Weak<ProcessControlBlock>,
 }
+
+/// Which per-task user mappings the kernel should allocate for a new task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskUserResAlloc {
+    /// Reuse mappings already present in the address space.
+    None,
+    /// Allocate both the kernel-managed user stack and trap context.
+    Full,
+    /// Allocate only the trap context; the user stack is supplied by userspace.
+    TrapOnly,
+}
+
 /// Return the bottom addr (low addr) of the trap context for a task
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
@@ -294,7 +342,7 @@ impl TaskUserRes {
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
-        alloc_user_res: bool,
+        alloc_user_res: TaskUserResAlloc,
     ) -> Result<Self, MmError> {
         let total_start_ns = get_time_ns();
         let alloc_tid_start_ns = get_time_ns();
@@ -319,14 +367,16 @@ impl TaskUserRes {
             process: Arc::downgrade(&process),
         };
         let alloc_user_res_start_ns = get_time_ns();
-        if alloc_user_res {
-            task_user_res.alloc_user_res()?;
+        match alloc_user_res {
+            TaskUserResAlloc::None => {}
+            TaskUserResAlloc::Full => task_user_res.alloc_user_res()?,
+            TaskUserResAlloc::TrapOnly => task_user_res.alloc_trap_cx()?,
         }
         let alloc_user_res_ns = get_time_ns() - alloc_user_res_start_ns;
         let total_ns = get_time_ns() - total_start_ns;
         if total_ns >= TASK_USER_RES_TIMING_WARN_THRESHOLD_NS {
             debug!(
-                "[clone-timing] task_user_res_new pid={} tid={} thread_id={} alloc_user_res={} total_ns={} alloc_tid_ns={} alloc_thread_id_ns={} alloc_user_res_ns={}",
+                "[clone-timing] task_user_res_new pid={} tid={} thread_id={} alloc_user_res={:?} total_ns={} alloc_tid_ns={} alloc_thread_id_ns={} alloc_user_res_ns={}",
                 process.getpid(),
                 tid,
                 thread_id,
@@ -354,6 +404,19 @@ impl TaskUserRes {
             process_inner.memory_set.insert_vma(ustack_vma, None)?;
         }
         // alloc trap_cx
+        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+        process_inner.memory_set.insert_vma(
+            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Allocate only the trap context mapping for a Linux `CLONE_VM` thread.
+    pub fn alloc_trap_cx(&self) -> Result<(), MmError> {
+        let process = self.process.upgrade().unwrap();
+        let mut process_inner = process.inner_exclusive_access();
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         process_inner.memory_set.insert_vma(

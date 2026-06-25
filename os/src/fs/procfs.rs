@@ -26,15 +26,19 @@ use crate::fs::inode::snapshot_mount_table;
 use crate::fs::page_cache;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
-use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
+use crate::mm::{
+    deferred_frame_count, deferred_kstack_id_count, deferred_range_count, frame_allocator_stats,
+    MapPermission, VmaKind, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
+};
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
 #[cfg(feature = "perf_probe")]
 use crate::perf_probe;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
-use crate::task::{current_process, TaskStatus};
+use crate::task::{cached_kstack_count, current_process, TaskStatus};
 use crate::timer::{get_time, time_to_ticks};
+use core::sync::atomic::Ordering;
 
 fn parse_pid(name: &str) -> Option<usize> {
     if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_digit()) {
@@ -46,6 +50,8 @@ fn parse_pid(name: &str) -> Option<usize> {
 fn build_meminfo() -> String {
     let stats = frame_allocator_stats();
     let cached_pages = PAGE_CACHE_MANAGER.lock().cached_pages;
+    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire);
+    let heap_used = KERNEL_HEAP_USED_BYTES.load(Ordering::Acquire);
     let page_kb = (PAGE_SIZE as u64) / 1024;
     let mem_total = stats.total_pages as u64 * page_kb;
     let mem_free = stats.free_pages as u64 * page_kb;
@@ -57,6 +63,19 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "MemFree:        {} kB", mem_free);
     let _ = writeln!(&mut out, "MemAvailable:   {} kB", mem_available);
     let _ = writeln!(&mut out, "Cached:         {} kB", cached);
+    let _ = writeln!(&mut out, "FrameAllocated: {} pages", stats.allocated_pages);
+    let _ = writeln!(&mut out, "FrameOom:       {}", stats.oom_count);
+    let _ = writeln!(&mut out, "KernelHeapCommitted: {} bytes", heap_committed);
+    let _ = writeln!(&mut out, "KernelHeapUsed:      {} bytes", heap_used);
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapFree:      {} bytes",
+        heap_committed.saturating_sub(heap_used)
+    );
+    let _ = writeln!(&mut out, "KStackCached:   {}", cached_kstack_count());
+    let _ = writeln!(&mut out, "DeferredRanges: {}", deferred_range_count());
+    let _ = writeln!(&mut out, "DeferredFrames: {}", deferred_frame_count());
+    let _ = writeln!(&mut out, "DeferredKStacks: {}", deferred_kstack_id_count());
     out
 }
 
