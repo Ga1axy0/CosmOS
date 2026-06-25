@@ -484,19 +484,17 @@ pub fn poll() {
 
 /// Poll from the periodic timer path only when smoltcp has pending work.
 pub fn poll_timer_tick() {
-    crate::probe!("net.poll_timer_tick", {
-        if !NEED_POLL.load(Ordering::Acquire) {
-            let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
-            if deadline_us == NO_POLL_DEADLINE_US {
-                return;
-            }
-            if (get_time_us() as u64) < deadline_us {
-                return;
-            }
+    if !NEED_POLL.load(Ordering::Acquire) {
+        let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
+        if deadline_us == NO_POLL_DEADLINE_US {
+            return;
         }
+        if (get_time_us() as u64) < deadline_us {
+            return;
+        }
+    }
 
-        poll();
-    });
+    poll();
 }
 
 pub(crate) struct NetStack {
