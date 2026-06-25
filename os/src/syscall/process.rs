@@ -1,7 +1,7 @@
 use crate::hal::traits::CloneArgs;
 use crate::mm::{
-    frame_allocator_stats, unregister_file_mappings_for_process, warn_heap_state, MapPermission,
-    VirtAddr, USER_SPACE_END,
+    frame_allocator_stats, reclaim_kernel_heap_if_needed, unregister_file_mappings_for_process,
+    MapPermission, VirtAddr, USER_SPACE_END,
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use crate::syscall::errno::{OrErrno, ERRNO};
@@ -19,9 +19,9 @@ use crate::{
     mm::{translated_ref, translated_str},
     task::{
         current_process, current_task, current_trap_cx, current_user_token,
-        exit_current_and_run_next, exit_group_current_and_run_next, thread_id2task,
-        CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo,
-        SignalBit, TaskUserResAlloc, WaitReason,
+        exit_current_and_run_next, exit_group_current_and_run_next, reclaim_cached_kstacks,
+        thread_id2task, CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock,
+        ShmAttachment, SigInfo, SignalBit, TaskUserResAlloc, WaitReason,
     },
 };
 
@@ -1785,14 +1785,16 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                     .child_kernel_time
                     .saturating_add(child_inner.kernel_time)
                     .saturating_add(child_inner.child_kernel_time);
+                let no_remaining_children = inner.children.is_empty();
                 drop(child_inner);
                 drop(inner);
-                let strong_before = Arc::strong_count(&child);
-                let weak_before = Arc::weak_count(&child);
                 unregister_file_mappings_for_process(&child);
                 remove_from_pid2process(found_pid);
-                let strong_after_pid2pcb = Arc::strong_count(&child);
                 drop(child);
+                if no_remaining_children {
+                    reclaim_cached_kstacks(0);
+                    reclaim_kernel_heap_if_needed();
+                }
                 // warn!(
                 //     "[heap_trace] reap_pcb_dropped pid={} strong_before={} strong_after_pid2pcb={} weak={}",
                 //     found_pid, strong_before, strong_after_pid2pcb, weak_before,

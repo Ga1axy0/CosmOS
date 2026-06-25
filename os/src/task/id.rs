@@ -71,11 +71,12 @@ lazy_static! {
 }
 
 /// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
-const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 256;
+const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 64;
 /// deferred 物理页超过该水位时触发一次全局 flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
-/// Keep a bounded pool of mapped kernel stacks to avoid tearing them down in fork/exit storms.
-const KSTACK_CACHE_LIMIT: usize = 512;
+/// Keep a small bounded pool of mapped kernel stacks for reuse without letting
+/// fork/exit storms permanently withhold large amounts of memory.
+const KSTACK_CACHE_LIMIT: usize = 64;
 const TASK_USER_RES_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 const KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
@@ -124,8 +125,38 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 /// Kernel stack for a task
 pub struct KernelStack(pub usize);
 
-fn cached_kstack_count() -> usize {
+pub(crate) fn cached_kstack_count() -> usize {
     KSTACK_CACHE.lock().len()
+}
+
+pub(crate) fn reclaim_cached_kstacks(target_cached: usize) -> usize {
+    let mut kstack_ids = Vec::new();
+    {
+        let mut cache = KSTACK_CACHE.lock();
+        while cache.len() > target_cached {
+            if let Some(kstack_id) = cache.pop() {
+                kstack_ids.push(kstack_id);
+            }
+        }
+    }
+    let reclaimed = kstack_ids.len();
+    for kstack_id in kstack_ids {
+        let (kernel_stack_bottom, _) = kernel_stack_position(kstack_id);
+        let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
+        let deferred_frames = KERNEL_SPACE
+            .lock()
+            .remove_vma_with_start_vpn_deferred(kernel_stack_bottom_va.into());
+        defer_release(
+            kernel_stack_bottom,
+            kernel_stack_bottom + KERNEL_STACK_SIZE,
+            Some(kstack_id),
+            deferred_frames,
+        );
+    }
+    if reclaimed != 0 {
+        flush_deferred(online_mask());
+    }
+    reclaimed
 }
 
 fn try_take_cached_kstack() -> Option<usize> {
@@ -144,25 +175,6 @@ fn try_cache_kstack(kstack_id: usize) -> bool {
 /// Allocate a kernel stack for a task
 pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     let total_start_ns = get_time_ns();
-    let cached_before = cached_kstack_count();
-    let cache_take_start_ns = get_time_ns();
-    if let Some(kstack_id) = try_take_cached_kstack() {
-        let cache_take_ns = get_time_ns() - cache_take_start_ns;
-        let total_ns = get_time_ns() - total_start_ns;
-        if total_ns >= KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS {
-            debug!(
-                "[clone-timing] kstack_alloc kstack_id={} total_ns={} cache_hit=true cache_take_ns={} cached_before={} cached_after={} flush_triggered=false flush_ns=0 alloc_id_ns=0 map_ns=0 deferred_kstacks_before=0 deferred_frames_before=0 stack_pages={}",
-                kstack_id,
-                total_ns,
-                cache_take_ns,
-                cached_before,
-                cached_kstack_count(),
-                KERNEL_STACK_SIZE / PAGE_SIZE,
-            );
-        }
-        return Ok(KernelStack(kstack_id));
-    }
-    let cache_take_ns = get_time_ns() - cache_take_start_ns;
     let deferred_kstack_before = deferred_kstack_id_count();
     let deferred_frames_before = deferred_frame_count();
     let flush_triggered = deferred_kstack_before > KSTACK_DEFERRED_RECYCLE_WATERMARK
@@ -172,6 +184,29 @@ pub fn kstack_alloc() -> Result<KernelStack, MmError> {
         flush_deferred(online_mask());
     }
     let flush_ns = get_time_ns() - flush_start_ns;
+    let cached_before = cached_kstack_count();
+    let cache_take_start_ns = get_time_ns();
+    if let Some(kstack_id) = try_take_cached_kstack() {
+        let cache_take_ns = get_time_ns() - cache_take_start_ns;
+        let total_ns = get_time_ns() - total_start_ns;
+        if total_ns >= KSTACK_ALLOC_TIMING_WARN_THRESHOLD_NS {
+            debug!(
+                "[clone-timing] kstack_alloc kstack_id={} total_ns={} cache_hit=true cache_take_ns={} cached_before={} cached_after={} flush_triggered={} flush_ns={} alloc_id_ns=0 map_ns=0 deferred_kstacks_before={} deferred_frames_before={} stack_pages={}",
+                kstack_id,
+                total_ns,
+                cache_take_ns,
+                cached_before,
+                cached_kstack_count(),
+                flush_triggered,
+                flush_ns,
+                deferred_kstack_before,
+                deferred_frames_before,
+                KERNEL_STACK_SIZE / PAGE_SIZE,
+            );
+        }
+        return Ok(KernelStack(kstack_id));
+    }
+    let cache_take_ns = get_time_ns() - cache_take_start_ns;
     let alloc_id_start_ns = get_time_ns();
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let alloc_id_ns = get_time_ns() - alloc_id_start_ns;

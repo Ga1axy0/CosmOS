@@ -4,57 +4,26 @@ use super::frame_allocator::{frame_alloc, frame_alloc_contiguous, frame_dealloc}
 use super::{phys_to_virt, PTEFlags, PageTableEntry, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE, PAGE_SIZE, PAGE_SIZE_BITS};
 use crate::sync::SpinNoIrqLock;
-use buddy_system_allocator::LockedHeap;
+use buddy_system_allocator::linked_list::LinkedList;
 use core::alloc::{GlobalAlloc, Layout};
+use core::cmp::{max, min};
+use core::mem::size_of;
 use core::ptr::null_mut;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[global_allocator]
 static HEAP_ALLOCATOR: KernelHeapAllocator = KernelHeapAllocator::new();
 
-/// RAII guard that disables supervisor interrupts (`sstatus.SIE`) for the
-/// duration of a kernel-heap critical section, restoring the previous state on
-/// drop.
-///
-/// The global allocator's lock (`buddy_system_allocator::LockedHeap`) is a
-/// plain spinlock that does **not** mask interrupts. Kernel interrupt handlers
-/// allocate from this same heap (the timer tick runs
-/// `check_itimers_of_all_processes`, which collects a `Vec` of every process,
-/// and `net::poll`). If a timer interrupt fires on a hart that is *already*
-/// holding the heap lock in ordinary kernel code, the handler re-enters the
-/// allocator and spins forever on the non-reentrant lock — a same-hart
-/// self-deadlock that then wedges every other hart. Masking interrupts while
-/// the heap lock is held closes that window, exactly like `SpinNoIrqLock`.
-///
-/// Only the brief buddy-lock holds are wrapped; `grow`'s page-mapping / TLB
-/// shootdown work runs with interrupts in their normal state so cross-hart
-/// IPIs are still serviced.
-struct HeapIrqGuard {
-    sie_was_enabled: bool,
-}
-
-impl HeapIrqGuard {
-    #[inline]
-    fn new() -> Self {
-        let sie_was_enabled = crate::hal::local_irqs_enabled();
-        unsafe { crate::hal::disable_local_irqs() };
-        Self { sie_was_enabled }
-    }
-}
-
-impl Drop for HeapIrqGuard {
-    #[inline]
-    fn drop(&mut self) {
-        if self.sie_was_enabled {
-            unsafe { crate::hal::enable_local_irqs() };
-        }
-    }
-}
-
 const KERNEL_HEAP_GROW_PAGES: usize = 64;
 const KERNEL_HEAP_GROW_SIZE: usize = KERNEL_HEAP_GROW_PAGES * PAGE_SIZE;
 const KERNEL_HEAP_BOOTSTRAP_PAGES: usize = 64;
+const KERNEL_HEAP_RECLAIM_START_FREE: usize = 8 * 1024 * 1024;
+const KERNEL_HEAP_RECLAIM_TARGET_FREE: usize = 4 * 1024 * 1024;
+const KERNEL_HEAP_RECLAIM_MAX_PAGES_PER_CALL: usize = 4096;
+const HEAP_ORDER_COUNT: usize = 32;
 
+/// Bytes of virtual heap space currently backed by physical pages.
 pub static KERNEL_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Approximate live heap usage (sum of `Layout::size()` on alloc minus dealloc).
 /// Tracks application-level demand; compare with [`KERNEL_HEAP_BYTES`] to gauge
@@ -106,6 +75,141 @@ static KERNEL_HEAP_SUBTREE_ROOT_PPN: AtomicUsize = AtomicUsize::new(0);
 /// IRQ cannot re-enter the allocator on the same hart.
 static HEAP_PT_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
 
+struct ReclaimingHeap {
+    free_list: [LinkedList; HEAP_ORDER_COUNT],
+    user: usize,
+    allocated: usize,
+    total: usize,
+}
+
+impl ReclaimingHeap {
+    const fn empty() -> Self {
+        Self {
+            free_list: [LinkedList::new(); HEAP_ORDER_COUNT],
+            user: 0,
+            allocated: 0,
+            total: 0,
+        }
+    }
+
+    unsafe fn add_to_heap(&mut self, mut start: usize, mut end: usize) {
+        start = align_up_usize(start, size_of::<usize>());
+        end &= !(size_of::<usize>() - 1);
+        assert!(start <= end);
+
+        let mut total = 0;
+        let mut current_start = start;
+        while current_start + size_of::<usize>() <= end {
+            let lowbit = current_start & (!current_start + 1);
+            let size = min(lowbit, prev_power_of_two(end - current_start));
+            total += size;
+            self.free_list[size.trailing_zeros() as usize].push(current_start as *mut usize);
+            current_start += size;
+        }
+        self.total += total;
+    }
+
+    fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, ()> {
+        let size = max(
+            layout.size().next_power_of_two(),
+            max(layout.align(), size_of::<usize>()),
+        );
+        let class = size.trailing_zeros() as usize;
+        for i in class..self.free_list.len() {
+            if self.free_list[i].is_empty() {
+                continue;
+            }
+            for j in (class + 1..=i).rev() {
+                let Some(block) = self.free_list[j].pop() else {
+                    return Err(());
+                };
+                unsafe {
+                    self.free_list[j - 1].push((block as usize + (1 << (j - 1))) as *mut usize);
+                    self.free_list[j - 1].push(block);
+                }
+            }
+            let result = NonNull::new(
+                self.free_list[class]
+                    .pop()
+                    .expect("current block should have free space now") as *mut u8,
+            );
+            let Some(result) = result else {
+                return Err(());
+            };
+            self.user += layout.size();
+            self.allocated += size;
+            return Ok(result);
+        }
+        Err(())
+    }
+
+    fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        let size = max(
+            layout.size().next_power_of_two(),
+            max(layout.align(), size_of::<usize>()),
+        );
+        let class = size.trailing_zeros() as usize;
+
+        unsafe {
+            self.free_list[class].push(ptr.as_ptr() as *mut usize);
+
+            let mut current_ptr = ptr.as_ptr() as usize;
+            let mut current_class = class;
+            while current_class + 1 < self.free_list.len() {
+                let buddy = current_ptr ^ (1 << current_class);
+                let mut found_buddy = false;
+                for block in self.free_list[current_class].iter_mut() {
+                    if block.value() as usize == buddy {
+                        block.pop();
+                        found_buddy = true;
+                        break;
+                    }
+                }
+                if !found_buddy {
+                    break;
+                }
+                self.free_list[current_class].pop();
+                current_ptr = min(current_ptr, buddy);
+                current_class += 1;
+                self.free_list[current_class].push(current_ptr as *mut usize);
+            }
+        }
+
+        self.user -= layout.size();
+        self.allocated -= size;
+    }
+
+    fn free_actual_bytes(&self) -> usize {
+        self.total.saturating_sub(self.allocated)
+    }
+
+    fn release_one_free_block(
+        &mut self,
+        min_size: usize,
+        range_start: usize,
+        range_end: usize,
+    ) -> Option<(usize, usize)> {
+        let min_class = min_size.next_power_of_two().trailing_zeros() as usize;
+        for class in (min_class..self.free_list.len()).rev() {
+            let size = 1usize << class;
+            for block in self.free_list[class].iter_mut() {
+                let start = block.value() as usize;
+                let end = start.saturating_add(size);
+                if start >= range_start
+                    && end <= range_end
+                    && start & (PAGE_SIZE - 1) == 0
+                    && size >= PAGE_SIZE
+                {
+                    block.pop();
+                    self.total = self.total.saturating_sub(size);
+                    return Some((start, size));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Build the kernel-heap window's first-level subtree table and cache its PPN.
 ///
 /// Must run once, single-threaded, after `KERNEL_SPACE` is active and before the
@@ -123,13 +227,13 @@ pub fn init_kernel_heap_mapping() {
 }
 
 struct KernelHeapAllocator {
-    heap: LockedHeap,
+    heap: SpinNoIrqLock<ReclaimingHeap>,
 }
 
 impl KernelHeapAllocator {
     const fn new() -> Self {
         Self {
-            heap: LockedHeap::empty(),
+            heap: SpinNoIrqLock::new(ReclaimingHeap::empty()),
         }
     }
 
@@ -165,19 +269,47 @@ impl KernelHeapAllocator {
             };
             (start, bytes)
         };
-        unsafe {
-            let _irq = HeapIrqGuard::new();
-            let mut heap = self.heap.lock();
-            heap.add_to_heap(start, start + bytes);
-        }
+        unsafe { self.heap.lock().add_to_heap(start, start + bytes) };
         true
+    }
+
+    fn reclaim_free_pages_if_needed(&self) -> usize {
+        if !KERNEL_HEAP_VIRTUAL_READY.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut reclaimed_pages = 0usize;
+        loop {
+            if reclaimed_pages >= KERNEL_HEAP_RECLAIM_MAX_PAGES_PER_CALL {
+                break;
+            }
+            let virtual_end = KERNEL_HEAP_BASE + KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
+            let released = {
+                let mut heap = self.heap.lock();
+                if heap.free_actual_bytes() <= KERNEL_HEAP_RECLAIM_START_FREE {
+                    None
+                } else {
+                    heap.release_one_free_block(PAGE_SIZE, KERNEL_HEAP_BASE, virtual_end)
+                }
+            };
+            let Some((start, bytes)) = released else {
+                break;
+            };
+            let pages = bytes / PAGE_SIZE;
+            unmap_heap_pages(start, pages);
+            KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            reclaimed_pages += pages;
+            let free_after = self.heap.lock().free_actual_bytes();
+            if free_after <= KERNEL_HEAP_RECLAIM_TARGET_FREE {
+                break;
+            }
+        }
+        reclaimed_pages
     }
 }
 
 unsafe impl GlobalAlloc for KernelHeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         {
-            let _irq = HeapIrqGuard::new();
             let mut heap = self.heap.lock();
             if let Ok(allocation) = heap.alloc(layout) {
                 KERNEL_HEAP_USED_BYTES.fetch_add(layout.size(), Ordering::AcqRel);
@@ -192,7 +324,6 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
             if !self.grow(required_bytes) {
                 return null_mut();
             }
-            let _irq = HeapIrqGuard::new();
             let mut heap = self.heap.lock();
             if let Ok(allocation) = heap.alloc(layout) {
                 KERNEL_HEAP_USED_BYTES.fetch_add(layout.size(), Ordering::AcqRel);
@@ -202,7 +333,6 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let _irq = HeapIrqGuard::new();
         let mut heap = self.heap.lock();
         heap.dealloc(core::ptr::NonNull::new_unchecked(ptr), layout);
         KERNEL_HEAP_USED_BYTES.fetch_sub(layout.size(), Ordering::AcqRel);
@@ -235,6 +365,12 @@ pub fn init_heap_virtual_window() {
         HEAP_ALLOCATOR.grow(KERNEL_HEAP_GROW_SIZE),
         "failed to initialize virtual kernel heap"
     );
+}
+
+/// Return completely free virtual-heap pages to the frame allocator when the
+/// heap retained a large short-lived allocation spike.
+pub fn reclaim_kernel_heap_if_needed() -> usize {
+    HEAP_ALLOCATOR.reclaim_free_pages_if_needed()
 }
 
 /// Map a single heap VA page. Called from trap_from_kernel on LoongArch.
@@ -317,6 +453,14 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
     Some(value.checked_add(mask)? & !mask)
 }
 
+fn align_up_usize(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn prev_power_of_two(value: usize) -> usize {
+    1usize << (usize::BITS as usize - 1 - value.leading_zeros() as usize)
+}
+
 fn alloc_bootstrap_heap_pages(pages: usize) -> Option<usize> {
     let frames = frame_alloc_contiguous(pages, pages)?;
     let first = frames.start_ppn();
@@ -356,6 +500,26 @@ fn heap_leaf_pte(
             frame.ppn.get_bytes_array().fill(0);
             pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
+        }
+        ppn = pte.ppn();
+    }
+    None
+}
+
+fn existing_heap_leaf_pte(
+    subtree_root_ppn: PhysPageNum,
+    vpn: super::VirtPageNum,
+) -> Option<*mut PageTableEntry> {
+    let levels = crate::hal::page_table_levels();
+    let mut ppn = subtree_root_ppn;
+    for level in 1..levels {
+        let idx = crate::hal::vpn_index(vpn.0, level);
+        let pte = &mut ppn.get_pte_array()[idx];
+        if level + 1 == levels {
+            return Some(pte as *mut PageTableEntry);
+        }
+        if !pte.is_valid() {
+            return None;
         }
         ppn = pte.ppn();
     }
@@ -430,6 +594,37 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         crate::mm::shootdown_global_quiet();
     }
     mapped_all
+}
+
+fn unmap_heap_pages(start_va: usize, pages: usize) {
+    if pages == 0 {
+        return;
+    }
+    let subtree_root_ppn = PhysPageNum(KERNEL_HEAP_SUBTREE_ROOT_PPN.load(Ordering::Acquire));
+    if subtree_root_ppn.0 == 0 {
+        panic!("unmap_heap_pages: subtree root ppn is 0");
+    }
+    let mut unmapped_pages = 0usize;
+    {
+        let _guard = HEAP_PT_LOCK.lock();
+        for page in 0..pages {
+            let va = start_va + page * PAGE_SIZE;
+            let vpn = VirtAddr::from(va).floor();
+            let Some(pte) = existing_heap_leaf_pte(subtree_root_ppn, vpn) else {
+                continue;
+            };
+            let entry = unsafe { &mut *pte };
+            if !entry.is_valid() {
+                continue;
+            }
+            frame_dealloc(entry.ppn());
+            *entry = PageTableEntry::empty();
+            unmapped_pages += 1;
+        }
+    }
+    if unmapped_pages != 0 {
+        crate::mm::shootdown_global_quiet();
+    }
 }
 
 /// Tear down a partially-mapped run after a failure. Caller holds [`HEAP_PT_LOCK`].
