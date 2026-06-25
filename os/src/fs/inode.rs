@@ -13,7 +13,7 @@ use crate::fs::tty::TtyDeviceNode;
 use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
-use crate::timer::get_realtime_ns;
+use crate::timer::{get_realtime_ns, get_time_us};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -675,17 +675,20 @@ pub fn lookup_inode_follow_with_path(
     path: &str,
     follow_final: bool,
 ) -> Result<(Arc<Inode>, String), ERRNO> {
+    let start_us = get_time_us();
     let mut abs = canonicalize(cwd, path);
     let mut depth = 0usize;
+    let mut restarts = 0usize;
+    let mut components_walked = 0usize;
 
-    loop {
+    let result = 'walk: loop {
         let components: Vec<String> = abs
             .split('/')
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
         if components.is_empty() {
-            return Ok((Arc::clone(&ROOT_INODE), String::from("/")));
+            break 'walk Ok((Arc::clone(&ROOT_INODE), String::from("/")));
         }
 
         let mut cur = Arc::clone(&ROOT_INODE);
@@ -693,17 +696,23 @@ pub fn lookup_inode_follow_with_path(
         let mut restart: Option<String> = None;
 
         for (idx, component) in components.iter().enumerate() {
+            components_walked += 1;
             if !cur.is_dir() {
-                return Err(ERRNO::ENOTDIR);
+                break 'walk Err(ERRNO::ENOTDIR);
             }
-            let child = cur.find(component).ok_or(ERRNO::ENOENT)?;
+            let Some(child) = cur.find(component) else {
+                break 'walk Err(ERRNO::ENOENT);
+            };
             let is_final = idx + 1 == components.len();
             if child.is_symlink() && (!is_final || follow_final) {
                 depth += 1;
                 if depth > MAX_SYMLINK_DEPTH {
-                    return Err(ERRNO::ELOOP);
+                    break 'walk Err(ERRNO::ELOOP);
                 }
-                let target = child.read_link().map_err(ERRNO::from)?;
+                let target = match child.read_link().map_err(ERRNO::from) {
+                    Ok(target) => target,
+                    Err(err) => break 'walk Err(err),
+                };
                 let base = if target.starts_with('/') {
                     String::from("/")
                 } else {
@@ -711,6 +720,7 @@ pub fn lookup_inode_follow_with_path(
                 };
                 let combined = join_remaining(target.as_str(), &components[idx + 1..]);
                 restart = Some(canonicalize(base.as_str(), combined.as_str()));
+                restarts += 1;
                 break;
             }
 
@@ -724,9 +734,80 @@ pub fn lookup_inode_follow_with_path(
         if let Some(next_abs) = restart {
             abs = next_abs;
         } else {
-            return Ok((cur, abs));
+            break 'walk Ok((cur, abs));
         }
+    };
+    super::record_lookup_inode_follow_perf(
+        components_walked,
+        restarts,
+        result.is_ok(),
+        get_time_us().saturating_sub(start_us),
+    );
+    result
+}
+
+/// Resolve `path` relative to an already-resolved directory inode.
+///
+/// Fast path for `*at(dirfd, "child")` style lookups: when the caller already
+/// holds the parent directory inode, avoid reconstructing an absolute path and
+/// restarting the walk from the global root. Complex cases that require parent
+/// traversal (`..`) still fall back to the generic absolute resolver.
+pub fn lookup_inode_from(
+    base_inode: &Arc<Inode>,
+    base_path: &str,
+    path: &str,
+    follow_final: bool,
+) -> Result<Arc<Inode>, ERRNO> {
+    if path.is_empty() {
+        return Ok(Arc::clone(base_inode));
     }
+    if path.starts_with('/') {
+        return lookup_inode_follow("/", path, follow_final);
+    }
+
+    let components: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if components.is_empty() {
+        return Ok(Arc::clone(base_inode));
+    }
+    if components.iter().any(|component| component == "..") {
+        return lookup_inode_follow(base_path, path, follow_final);
+    }
+
+    let mut cur = Arc::clone(base_inode);
+    let mut cur_path = String::from(base_path);
+
+    for (idx, component) in components.iter().enumerate() {
+        if component == "." {
+            continue;
+        }
+        if !cur.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        let child = cur.find(component).ok_or(ERRNO::ENOENT)?;
+        let is_final = idx + 1 == components.len();
+        if child.is_symlink() && (!is_final || follow_final) {
+            let target = child.read_link().map_err(ERRNO::from)?;
+            let restart_base = if target.starts_with('/') {
+                String::from("/")
+            } else {
+                cur_path.clone()
+            };
+            let combined = join_remaining(target.as_str(), &components[idx + 1..]);
+            return lookup_inode_follow(restart_base.as_str(), combined.as_str(), true);
+        }
+
+        cur = child;
+        if cur_path != "/" {
+            cur_path.push('/');
+        }
+        cur_path.push_str(component);
+    }
+
+    Ok(cur)
 }
 
 /// Resolve a path and optionally leave the final symlink unresolved.
@@ -1229,6 +1310,7 @@ impl File for OSInode {
 
 /// 根据底层 inode 构造 `stat` 结果，供 `fstat` 与 `newfstatat` 共用。
 pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
+    let start_us = get_time_us();
     // Read all attributes in one batched call (single lock acquisition for
     // backends like ext4, instead of one per field).
     let attrs = inode.stat_attrs();
@@ -1249,7 +1331,7 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
     } else {
         attrs.size
     };
-    Stat {
+    let stat = Stat {
         dev: 0,
         ino: attrs.ino,
         mode,
@@ -1269,7 +1351,9 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         ctime_sec: attrs.ctime.map(|t| t.sec as isize).unwrap_or(0),
         ctime_nsec: attrs.ctime.map(|t| t.nsec as isize).unwrap_or(0),
         unused: [0; 2],
-    }
+    };
+    super::record_inode_stat_perf(get_time_us().saturating_sub(start_us));
+    stat
 }
 
 // ---------------------------------------------------------------------------

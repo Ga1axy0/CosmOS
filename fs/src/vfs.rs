@@ -1,5 +1,9 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt::Debug;
+#[cfg(feature = "io_perf_counters")]
+use core::fmt::Write;
+#[cfg(feature = "io_perf_counters")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use log::warn;
 use core::any::Any;
 use spin::Mutex;
@@ -7,6 +11,87 @@ use spin::Mutex;
 use crate::dentry_cache::{insert_dentry, lookup_dentry, remove_dentry};
 use crate::errno::FS_ERRNO;
 use crate::inode_cache::{get_or_create_inode, remove_cached_inode, remove_cached_node};
+
+#[cfg(feature = "io_perf_counters")]
+static FIND_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DENTRY_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DENTRY_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DENTRY_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BACKEND_FIND_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BACKEND_FIND_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STAT_ATTRS_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STAT_ATTRS_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STAT_ATTRS_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "io_perf_counters")]
+fn perf_load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn reset_perf_counters() {
+    FIND_CALLS.store(0, Ordering::Relaxed);
+    DENTRY_LOOKUPS.store(0, Ordering::Relaxed);
+    DENTRY_HITS.store(0, Ordering::Relaxed);
+    DENTRY_MISSES.store(0, Ordering::Relaxed);
+    BACKEND_FIND_HITS.store(0, Ordering::Relaxed);
+    BACKEND_FIND_MISSES.store(0, Ordering::Relaxed);
+    STAT_ATTRS_CALLS.store(0, Ordering::Relaxed);
+    STAT_ATTRS_CACHE_HITS.store(0, Ordering::Relaxed);
+    STAT_ATTRS_CACHE_MISSES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn render_perf_counters() -> String {
+    let mut out = String::new();
+    let dentry_lookups = perf_load(&DENTRY_LOOKUPS);
+    let stat_attrs_calls = perf_load(&STAT_ATTRS_CALLS);
+    let _ = writeln!(&mut out, "vfs:");
+    let _ = writeln!(&mut out, "  find_calls {}", perf_load(&FIND_CALLS));
+    let _ = writeln!(&mut out, "  dentry_lookups {}", dentry_lookups);
+    let _ = writeln!(&mut out, "  dentry_hits {}", perf_load(&DENTRY_HITS));
+    let _ = writeln!(&mut out, "  dentry_misses {}", perf_load(&DENTRY_MISSES));
+    let _ = writeln!(&mut out, "  backend_find_hits {}", perf_load(&BACKEND_FIND_HITS));
+    let _ = writeln!(&mut out, "  backend_find_misses {}", perf_load(&BACKEND_FIND_MISSES));
+    let _ = writeln!(
+        &mut out,
+        "  dentry_hit_rate_x100 {}",
+        if dentry_lookups == 0 {
+            0
+        } else {
+            perf_load(&DENTRY_HITS).saturating_mul(100) / dentry_lookups
+        }
+    );
+    let _ = writeln!(&mut out, "  stat_attrs_calls {}", stat_attrs_calls);
+    let _ = writeln!(
+        &mut out,
+        "  stat_attrs_cache_hits {}",
+        perf_load(&STAT_ATTRS_CACHE_HITS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  stat_attrs_cache_misses {}",
+        perf_load(&STAT_ATTRS_CACHE_MISSES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  stat_attrs_hit_rate_x100 {}",
+        if stat_attrs_calls == 0 {
+            0
+        } else {
+            perf_load(&STAT_ATTRS_CACHE_HITS).saturating_mul(100) / stat_attrs_calls
+        }
+    );
+    out
+}
 
 /// Linux-style inode timestamp snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +216,15 @@ pub trait VfsNode: Send + Sync + Any + Debug {
         }
 
         written
+    }
+    /// Return whether directory enumeration should prefer the backend's native
+    /// `getdents64` implementation over the VFS-level snapshot wrapper.
+    ///
+    /// Backends with stable `d_off` cookies and meaningful streaming behavior
+    /// (for example ext4) can opt in here to avoid materializing a full
+    /// directory listing on cold-cache walks.
+    fn prefer_native_getdents64(&self) -> bool {
+        false
     }
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
@@ -353,14 +447,37 @@ impl Inode {
         self.inner.getdents64(offset, buf)
     }
 
+    /// Return whether callers should bypass the VFS snapshot wrapper and rely
+    /// on the backend's native `getdents64` stream semantics.
+    pub fn prefer_native_getdents64(&self) -> bool {
+        self.inner.prefer_native_getdents64()
+    }
+
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
+        #[cfg(feature = "io_perf_counters")]
+        FIND_CALLS.fetch_add(1, Ordering::Relaxed);
         let fs_id = self.fs_id();
         if fs_id != 0 {
+            #[cfg(feature = "io_perf_counters")]
+            DENTRY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
             if let Some(child) = lookup_dentry(fs_id, self.ino(), name) {
+                #[cfg(feature = "io_perf_counters")]
+                DENTRY_HITS.fetch_add(1, Ordering::Relaxed);
                 return Some(child);
             }
+            #[cfg(feature = "io_perf_counters")]
+            DENTRY_MISSES.fetch_add(1, Ordering::Relaxed);
         }
-        let child = self.inner.find(name).map(Self::wrap)?;
+        let child = self.inner.find(name).map(Self::wrap);
+        #[cfg(feature = "io_perf_counters")]
+        {
+            if child.is_some() {
+                BACKEND_FIND_HITS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BACKEND_FIND_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let child = child?;
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), name, &child);
         }
@@ -487,9 +604,17 @@ impl Inode {
 
     /// Read all stat-relevant attributes in one call.
     pub fn stat_attrs(&self) -> VfsAttrs {
-        if let Some(attrs) = self.state.lock().stat_attrs.clone() {
+        #[cfg(feature = "io_perf_counters")]
+        STAT_ATTRS_CALLS.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.lock();
+        if let Some(attrs) = state.stat_attrs.clone() {
+            #[cfg(feature = "io_perf_counters")]
+            STAT_ATTRS_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return attrs;
         }
+        drop(state);
+        #[cfg(feature = "io_perf_counters")]
+        STAT_ATTRS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
         let attrs = self.inner.stat_attrs();
         self.state.lock().stat_attrs = Some(attrs.clone());
         attrs

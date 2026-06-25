@@ -1,14 +1,14 @@
-use crate::fs::Pipe;
 use crate::fs::{
-    canonicalize, discard_inode, do_bind_mount, do_move_mount, do_umount, inode_stat,
-    linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, make_pipe,
-    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
-    open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat,
-    sync_page_cache_all, sync_page_cache_fs, truncate_inode, unlinkat, AccessMode, File,
-    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatFs64, StatMode,
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
+    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
+    discard_inode, inode_stat, linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path,
+    lookup_inode_from, make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device,
+    mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
+    sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat, do_bind_mount, do_move_mount,
+    record_newfstatat_perf,
 };
-use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
+use crate::fs::Pipe;
+use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::net::UnixSocketPairEnd;
 use crate::poll::{self, PollWakeState};
 use crate::sched::block_current_and_run_next;
@@ -21,10 +21,9 @@ use crate::syscall::{
     translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod,
 };
 use crate::syscall_body;
-use crate::task::SignalBit;
 use crate::task::{
     current_process, current_task, current_user_token, CloneResourceFlags, ExitReason, FdEntry,
-    FdFlags, ProcessControlBlock, TaskStatus, WaitReason, SIG_DFL, SIG_IGN,
+    FdFlags, ProcessControlBlock, SignalBit, TaskStatus, WaitReason, SIG_DFL, SIG_IGN,
 };
 use crate::timer::{
     add_current_timer_ns_preflagged, add_timer_with_poll_tag, get_realtime_ns, get_time_ns,
@@ -1853,6 +1852,11 @@ enum ResolvedAtTarget {
     FileDesc(Arc<FileDescription>),
 }
 
+struct ResolvedLookupBase {
+    cwd: String,
+    inode: Option<Arc<fs::Inode>>,
+}
+
 /// Resolve `dirfd + path + flags` into either a filesystem inode or an
 /// open `FileDescription` when the fd does not correspond to an inode.
 ///
@@ -1890,19 +1894,28 @@ fn resolve_at_target(dirfd: isize, path: &str, flags: i32) -> Result<ResolvedAtT
         return Ok(ResolvedAtTarget::FileDesc(desc));
     }
 
-    let cwd = resolve_dirfd_base(dirfd, path)?;
+    let base = resolve_dirfd_lookup_base(dirfd, path)?;
     let follow_final = flags & AT_SYMLINK_NOFOLLOW as i32 == 0;
-    lookup_inode_follow(cwd.as_str(), rooted_lookup_path(path), follow_final)
-        .map(ResolvedAtTarget::Inode)
+    lookup_inode_from_base(&base, path, follow_final).map(ResolvedAtTarget::Inode)
 }
 
 fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
-    let process = current_process();
+    resolve_dirfd_lookup_base(dirfd, path).map(|base| base.cwd)
+}
+
+fn resolve_dirfd_lookup_base(dirfd: isize, path: &str) -> Result<ResolvedLookupBase, ERRNO> {
     if path.starts_with('/') {
-        return Ok(process.inner_exclusive_access().root.clone());
+        return Ok(ResolvedLookupBase {
+            cwd: String::from("/"),
+            inode: None,
+        });
     }
+    let process = current_process();
     if dirfd == AT_FDCWD {
-        return Ok(process.inner_exclusive_access().cwd.clone());
+        return Ok(ResolvedLookupBase {
+            cwd: process.inner_exclusive_access().cwd.clone(),
+            inode: None,
+        });
     }
     if dirfd < 0 {
         return Err(ERRNO::EBADF);
@@ -1918,7 +1931,23 @@ fn resolve_dirfd_base(dirfd: isize, path: &str) -> Result<String, ERRNO> {
     if !desc.is_dir() {
         return Err(ERRNO::ENOTDIR);
     }
-    desc.path().ok_or(ERRNO::ENOTDIR)
+    let cwd = desc.path().ok_or(ERRNO::ENOTDIR)?;
+    Ok(ResolvedLookupBase {
+        cwd,
+        inode: desc.as_inode(),
+    })
+}
+
+fn lookup_inode_from_base(
+    base: &ResolvedLookupBase,
+    path: &str,
+    follow_final: bool,
+) -> Result<Arc<fs::Inode>, ERRNO> {
+    if let Some(inode) = base.inode.as_ref() {
+        lookup_inode_from(inode, base.cwd.as_str(), path, follow_final)
+    } else {
+        lookup_inode_follow(base.cwd.as_str(), path, follow_final)
+    }
 }
 
 fn resolve_simple_dirfd_inode(
@@ -3412,6 +3441,7 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         } else {
             read_cstring_from_user(path, PATH_MAX)?
         };
+        let total_start_us = get_time_us();
         if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(ERRNO::ENOENT);
@@ -3420,7 +3450,9 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
             // open FileDescription (for non-inode descriptors like pipes).
             match resolve_at_target(dirfd, "", flags as i32)? {
                 ResolvedAtTarget::Inode(inode) => {
+                    let stat_start_us = get_time_us();
                     let stat = inode_stat(&inode);
+                    let inode_stat_us = get_time_us().saturating_sub(stat_start_us);
                     debug!(
                         "sys_newfstatat: empty-path inode dirfd={} flags={:#x} size={} blksize={} blocks={} mode={:#o}",
                         dirfd,
@@ -3430,11 +3462,23 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
                         stat.blocks,
                         stat.mode.bits()
                     );
+                    let copyout_start_us = get_time_us();
                     write_pod_to_user(st, &stat)?;
+                    let copyout_us = get_time_us().saturating_sub(copyout_start_us);
+                    record_newfstatat_perf(
+                        true,
+                        0,
+                        0,
+                        inode_stat_us,
+                        copyout_us,
+                        get_time_us().saturating_sub(total_start_us),
+                    );
                     return Ok(0);
                 }
                 ResolvedAtTarget::FileDesc(desc) => {
+                    let stat_start_us = get_time_us();
                     let stat = desc.stat();
+                    let inode_stat_us = get_time_us().saturating_sub(stat_start_us);
                     let desc_path = desc.path();
                     debug!(
                         "sys_newfstatat: empty-path fd dirfd={} flags={:#x} size={} blksize={} blocks={} mode={:#o} path={:?}",
@@ -3446,20 +3490,30 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
                         stat.mode.bits(),
                         desc_path
                     );
+                    let copyout_start_us = get_time_us();
                     write_pod_to_user(st, &stat)?;
+                    let copyout_us = get_time_us().saturating_sub(copyout_start_us);
+                    record_newfstatat_perf(
+                        true,
+                        0,
+                        0,
+                        inode_stat_us,
+                        copyout_us,
+                        get_time_us().saturating_sub(total_start_us),
+                    );
                     return Ok(0);
                 }
             }
         }
-        let time1 = get_time_us();
-        let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-        let time2 = get_time_us();
-        let lookup_path = rooted_lookup_path(path.as_str());
-        let inode =
-            lookup_inode_follow(cwd.as_str(), lookup_path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        let time3 = get_time_us();
+        let resolve_start_us = get_time_us();
+        let base = resolve_dirfd_lookup_base(dirfd, path.as_str())?;
+        let resolve_us = get_time_us().saturating_sub(resolve_start_us);
+        let lookup_start_us = get_time_us();
+        let inode = lookup_inode_from_base(&base, path.as_str(), flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        let lookup_us = get_time_us().saturating_sub(lookup_start_us);
+        let inode_stat_start_us = get_time_us();
         let stat = inode_stat(&inode);
-        let time4 = get_time_us();
+        let inode_stat_us = get_time_us().saturating_sub(inode_stat_start_us);
         debug!(
             "sys_newfstatat: dirfd={} path='{}' flags={:#x} size={} blksize={} blocks={} mode={:#o}",
             dirfd,
@@ -3476,10 +3530,13 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
                 dirfd, path, stat.blksize, stat.size
             );
         }
+        let copyout_start_us = get_time_us();
         write_pod_to_user(st, &stat)?;
-        let time5 = get_time_us();
+        let copyout_us = get_time_us().saturating_sub(copyout_start_us);
+        let total_us = get_time_us().saturating_sub(total_start_us);
+        record_newfstatat_perf(false, resolve_us, lookup_us, inode_stat_us, copyout_us, total_us);
         debug!("sys_newfstatat: resolve_dirfd_base & canonicalize = {}us, lookup_inode = {}us, inode_stat = {}us, write_pod_to_user = {}us",
-            time2 - time1, time3 - time2, time4 - time3, time5 - time4);
+            resolve_us, lookup_us, inode_stat_us, copyout_us);
         Ok(0)
     })
 }
@@ -3516,10 +3573,10 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, mask: u32, stx: *mut
                 ResolvedAtTarget::FileDesc(desc) => desc.stat(),
             }
         } else {
-            let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
-            let inode = lookup_inode_follow(
-                cwd.as_str(),
-                rooted_lookup_path(path.as_str()),
+            let base = resolve_dirfd_lookup_base(dirfd, path.as_str())?;
+            let inode = lookup_inode_from_base(
+                &base,
+                path.as_str(),
                 flags & AT_SYMLINK_NOFOLLOW == 0,
             )?;
             inode_stat(&inode)

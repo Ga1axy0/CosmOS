@@ -41,8 +41,8 @@ impl InodeCacheManager {
         Self {
             table: BTreeMap::new(),
             inactive: VecDeque::new(),
-            high_watermark: 256,
-            low_watermark: 192,
+            high_watermark: 2048,
+            low_watermark: 1536,
         }
     }
 }

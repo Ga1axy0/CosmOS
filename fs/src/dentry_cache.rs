@@ -40,8 +40,8 @@ impl DentryCache {
         Self {
             table: BTreeMap::new(),
             inactive: VecDeque::new(),
-            high_watermark: 512,
-            low_watermark: 384,
+            high_watermark: 4096,
+            low_watermark: 2304,
         }
     }
 
