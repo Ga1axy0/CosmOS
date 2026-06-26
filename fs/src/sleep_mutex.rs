@@ -2,38 +2,61 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
+#[cfg(not(feature = "kernel_sleep_mutex"))]
+use core::sync::atomic::Ordering;
 
 #[cfg(feature = "kernel_sleep_mutex")]
 extern "C" {
-    fn fs_sleep_mutex_wait(key: usize, locked: *const AtomicBool);
-    fn fs_sleep_mutex_wake(key: usize);
+    fn fs_sleep_mutex_try_lock(key: usize, locked: *const AtomicBool) -> bool;
+    fn fs_sleep_mutex_wait(key: usize, locked: *const AtomicBool) -> bool;
+    fn fs_sleep_mutex_unlock(key: usize, locked: *const AtomicBool);
 }
 
-fn wait_for_unlock(key: usize, locked: &AtomicBool) {
+fn try_lock(key: usize, locked: &AtomicBool) -> bool {
     #[cfg(feature = "kernel_sleep_mutex")]
     unsafe {
-        fs_sleep_mutex_wait(key, locked);
+        return fs_sleep_mutex_try_lock(key, locked);
     }
 
     #[cfg(not(feature = "kernel_sleep_mutex"))]
     {
         let _ = key;
-        while locked.load(Ordering::Acquire) {
+        locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+fn wait_for_lock(key: usize, locked: &AtomicBool) -> bool {
+    #[cfg(feature = "kernel_sleep_mutex")]
+    unsafe {
+        return fs_sleep_mutex_wait(key, locked);
+    }
+
+    #[cfg(not(feature = "kernel_sleep_mutex"))]
+    {
+        let _ = key;
+        while locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
+        true
     }
 }
 
-fn wake_waiters(key: usize) {
+fn unlock(key: usize, locked: &AtomicBool) {
     #[cfg(feature = "kernel_sleep_mutex")]
     unsafe {
-        fs_sleep_mutex_wake(key);
+        fs_sleep_mutex_unlock(key, locked);
     }
 
     #[cfg(not(feature = "kernel_sleep_mutex"))]
     {
         let _ = key;
+        locked.store(false, Ordering::Release);
     }
 }
 
@@ -57,12 +80,11 @@ impl<T> SleepMutex<T> {
 
     /// Lock the mutex, sleeping through the OS hook if it is contended.
     pub fn lock(&self) -> SleepMutexGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            wait_for_unlock(self as *const Self as usize, &self.locked);
+        let key = self as *const Self as usize;
+        while !try_lock(key, &self.locked) {
+            if wait_for_lock(key, &self.locked) {
+                break;
+            }
         }
         SleepMutexGuard { lock: self }
     }
@@ -89,7 +111,7 @@ impl<T> DerefMut for SleepMutexGuard<'_, T> {
 
 impl<T> Drop for SleepMutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
-        wake_waiters(self.lock as *const SleepMutex<T> as usize);
+        let key = self.lock as *const SleepMutex<T> as usize;
+        unlock(key, &self.lock.locked);
     }
 }
