@@ -18,11 +18,12 @@ mod wait_queue;
 use self::id::TaskUserRes;
 use crate::fs::{open_file_at, OpenFlags};
 use crate::ipc;
+use crate::mm::{reclaim_kernel_heap_if_needed, unregister_file_mappings_for_process};
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::sched::{
-    add_stopping_task, list_pids, pid2process, remove_task, schedule, take_current_task,
-    TaskContext,
+    add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
+    take_current_task, TaskContext,
 };
 pub use crate::sched::{
     block_current_and_run_next, current_process, current_task, current_trap_cx,
@@ -60,7 +61,7 @@ pub use crate::sched::{
 };
 pub use crate::signal::{
     check_signals_of_current, handle_signals, SaFlags, SigInfo, SignalAction, SignalActions,
-    SignalBit, MAX_SIG, SIG_DFL, SIG_IGN,
+    SignalBit, SignalNum, MAX_SIG, SIG_DFL, SIG_IGN,
 };
 pub(crate) use process::ProcessControlBlock;
 pub use process::{
@@ -72,6 +73,67 @@ pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 
 use crate::platform::QEMUExit;
 use alloc::string::String;
+
+fn child_exit_autoreap(parent: &Arc<ProcessControlBlock>, exit_signal: u32) -> bool {
+    if exit_signal != SignalNum::SIGCHLD as u32 {
+        return false;
+    }
+    let parent_inner = parent.inner_exclusive_access();
+    let action = parent_inner.signal_actions.table[SignalNum::SIGCHLD as usize];
+    action.handler == SIG_IGN || action.sa_flags & SaFlags::SA_NOCLDWAIT.bits() != 0
+}
+
+fn notify_parent_child_exit(parent: &Arc<ProcessControlBlock>, exit_signal: u32) -> bool {
+    let autoreap = child_exit_autoreap(parent, exit_signal);
+    if exit_signal != 0 {
+        if let Some(signal) = SignalBit::from_signum(exit_signal) {
+            add_signal_to_process(parent, signal);
+        }
+    }
+    parent.wait_exit_queue.wake_one();
+    autoreap
+}
+
+fn reap_zombie_child_from_parent(
+    parent: &Arc<ProcessControlBlock>,
+    child: &Arc<ProcessControlBlock>,
+) -> bool {
+    let removed_child = {
+        let mut parent_inner = parent.inner_exclusive_access();
+        let Some(idx) = parent_inner
+            .children
+            .iter()
+            .position(|candidate| Arc::ptr_eq(candidate, child))
+        else {
+            return false;
+        };
+        let removed_child = parent_inner.children.remove(idx);
+        {
+            let child_inner = removed_child.inner_exclusive_access();
+            if !child_inner.is_zombie {
+                parent_inner.children.push(Arc::clone(&removed_child));
+                return false;
+            }
+            parent_inner.child_user_time = parent_inner
+                .child_user_time
+                .saturating_add(child_inner.user_time)
+                .saturating_add(child_inner.child_user_time);
+            parent_inner.child_kernel_time = parent_inner
+                .child_kernel_time
+                .saturating_add(child_inner.kernel_time)
+                .saturating_add(child_inner.child_kernel_time);
+        }
+        removed_child
+    };
+
+    let found_pid = removed_child.getpid();
+    unregister_file_mappings_for_process(&removed_child);
+    remove_from_pid2process(found_pid);
+    drop(removed_child);
+    reclaim_cached_kstacks(0);
+    reclaim_kernel_heap_if_needed();
+    true
+}
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(reason: ExitReason) {
@@ -266,10 +328,15 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         let clone_shared_signal_actions = clone_shared_resources
             .contains(CloneResourceFlags::SIGHAND)
             .then(|| process_inner.signal_actions.clone());
-        let children_to_reparent = process_inner.children.clone();
+        let children_to_reparent = core::mem::take(&mut process_inner.children);
         for child in children_to_reparent.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
         }
+        let reparented_zombies = children_to_reparent
+            .iter()
+            .filter(|child| child.inner_exclusive_access().is_zombie)
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
         {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in children_to_reparent {
@@ -277,6 +344,12 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             }
         }
         drop(process_inner);
+        for child in reparented_zombies {
+            let autoreap = notify_parent_child_exit(&INITPROC, child.clone_exit_signal);
+            if autoreap {
+                reap_zombie_child_from_parent(&INITPROC, &child);
+            }
+        }
         if !clone_shared_resources.is_empty() {
             if let Some(parent) = clone_parent.and_then(|parent| parent.upgrade()) {
                 let mut parent_inner = parent.inner_exclusive_access();
@@ -370,7 +443,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         let exit_signal = process.clone_exit_signal;
         let (closed_fds, parent_weak, reclaim, shm_attachments, keyrings_to_release) = {
             let mut process_inner = process.inner_exclusive_access();
-            process_inner.children.clear();
             // deallocate other data in user space i.e. program code/data section
             let token = process_inner.memory_set.token();
             let mask = process_inner.memory_set.loaded_user_harts();
@@ -406,12 +478,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
 
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
-            if exit_signal != 0 {
-                if let Some(signal) = SignalBit::from_signum(exit_signal) {
-                    add_signal_to_process(&parent, signal);
-                }
+            let autoreap = notify_parent_child_exit(&parent, exit_signal);
+            if autoreap {
+                reap_zombie_child_from_parent(&parent, &process);
             }
-            parent.wait_exit_queue.wake_one();
         }
         // warn_heap_state("exit_end", pid);
     } else {

@@ -8,7 +8,7 @@ use crate::platform::{
     VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
 };
 use crate::sync::SpinNoIrqLock;
-use crate::task::{yield_current_and_run_next, SchedAttr, WaitQueue, WaitReason};
+use crate::task::{SchedAttr, WaitQueue, WaitReason};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -90,6 +90,7 @@ lazy_static! {
 }
 
 static BLOCK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static BLOCK_COMPLETION_WORK_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Scan the VirtIO MMIO bus slots and register every block device found.
 ///
@@ -149,35 +150,33 @@ fn block_devices_snapshot() -> alloc::vec::Vec<Arc<VirtIOBlock>> {
     BLOCK_DEVICES_BY_IRQ.lock().values().cloned().collect()
 }
 
-fn block_worker_has_work() -> bool {
+fn block_worker_has_completions() -> bool {
+    if BLOCK_COMPLETION_WORK_PENDING.load(Ordering::Acquire) {
+        return true;
+    }
     block_devices_snapshot()
         .into_iter()
-        .any(|dev| dev.has_pending_requests() || dev.has_used_completions())
+        .any(|dev| dev.has_used_completions())
 }
 
-fn block_worker_pump_once() -> (bool, bool) {
+fn block_worker_pump_once() -> bool {
     let mut completed_any = false;
-    let mut pending_any = false;
     for dev in block_devices_snapshot() {
         completed_any |= dev.pump_completions();
-        pending_any |= dev.has_pending_requests();
     }
-    (completed_any, pending_any)
+    completed_any
 }
 
 fn block_io_worker_main() -> ! {
     warn!("[virtio_blk] worker started");
     loop {
-        let (completed_any, pending_any) = block_worker_pump_once();
-        if completed_any {
+        let had_completion_event = BLOCK_COMPLETION_WORK_PENDING.swap(false, Ordering::AcqRel);
+        let completed_any = block_worker_pump_once();
+        if completed_any || had_completion_event {
             continue;
         }
-        // Yield-based polling
-        // if pending_any {
-        //     yield_current_and_run_next();
-        //     continue;
-        // }
-        BLOCK_WORKER_WAIT.wait_with_reason_or_skip(WaitReason::Unknown, block_worker_has_work);
+        BLOCK_WORKER_WAIT
+            .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, block_worker_has_completions);
     }
 }
 
@@ -193,6 +192,11 @@ pub fn start_workers() {
 }
 
 pub(crate) fn wake_worker() {
+    BLOCK_WORKER_WAIT.wake_all();
+}
+
+pub(crate) fn schedule_completion_work() {
+    BLOCK_COMPLETION_WORK_PENDING.store(true, Ordering::Release);
     BLOCK_WORKER_WAIT.wake_all();
 }
 

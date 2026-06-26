@@ -31,6 +31,7 @@ pub static KERNEL_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static KERNEL_HEAP_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_HEAP_VIRTUAL_BYTES: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_HEAP_VIRTUAL_READY: AtomicBool = AtomicBool::new(false);
+static KERNEL_HEAP_VIRTUAL_LOCK: SpinNoIrqLock<()> = SpinNoIrqLock::new(());
 
 const ROOT_ENTRY_SPAN: usize = 1usize
     << (PAGE_SIZE_BITS
@@ -183,7 +184,7 @@ impl ReclaimingHeap {
         self.total.saturating_sub(self.allocated)
     }
 
-    fn release_one_free_block(
+    fn release_one_tail_free_block(
         &mut self,
         min_size: usize,
         range_start: usize,
@@ -195,11 +196,7 @@ impl ReclaimingHeap {
             for block in self.free_list[class].iter_mut() {
                 let start = block.value() as usize;
                 let end = start.saturating_add(size);
-                if start >= range_start
-                    && end <= range_end
-                    && start & (PAGE_SIZE - 1) == 0
-                    && size >= PAGE_SIZE
-                {
+                if start >= range_start && end == range_end && start & (PAGE_SIZE - 1) == 0 {
                     block.pop();
                     self.total = self.total.saturating_sub(size);
                     return Some((start, size));
@@ -238,37 +235,41 @@ impl KernelHeapAllocator {
     }
 
     fn grow(&self, required_bytes: usize) -> bool {
-        let (start, bytes) = if KERNEL_HEAP_VIRTUAL_READY.load(Ordering::Acquire) {
-            let Some((virtual_offset, bytes)) = reserve_virtual_heap_bytes(required_bytes) else {
-                return false;
-            };
-            // debug!(
-            //     "Growing virtual kernel heap: {} KiB -> {} KiB",
-            //     virtual_offset / 1024,
-            //     (virtual_offset + bytes) / 1024
-            // );
-            let start = KERNEL_HEAP_BASE + virtual_offset;
-            if !map_heap_pages(start, bytes / PAGE_SIZE) {
-                KERNEL_HEAP_VIRTUAL_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                return false;
-            }
-            (start, bytes)
-        } else {
-            let Some(bytes) = reserve_bootstrap_heap_bytes(required_bytes) else {
-                return false;
-            };
-            // debug!(
-            //     "Growing bootstrap kernel heap: +{} KiB, total {} KiB",
-            //     bytes / 1024,
-            //     KERNEL_HEAP_BYTES.load(Ordering::Acquire) / 1024
-            // );
-            let Some(start) = alloc_bootstrap_heap_pages(bytes / PAGE_SIZE) else {
-                KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                return false;
-            };
-            (start, bytes)
+        if KERNEL_HEAP_VIRTUAL_READY.load(Ordering::Acquire) {
+            return self.grow_virtual(required_bytes);
+        }
+
+        let Some(bytes) = reserve_bootstrap_heap_bytes(required_bytes) else {
+            return false;
         };
+        // debug!(
+        //     "Growing bootstrap kernel heap: +{} KiB, total {} KiB",
+        //     bytes / 1024,
+        //     KERNEL_HEAP_BYTES.load(Ordering::Acquire) / 1024
+        // );
+        let Some(start) = alloc_bootstrap_heap_pages(bytes / PAGE_SIZE) else {
+            KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        };
+        unsafe { self.heap.lock().add_to_heap(start, start + bytes) };
+        true
+    }
+
+    fn grow_virtual(&self, required_bytes: usize) -> bool {
+        let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
+        let Some((virtual_offset, bytes)) = reserve_virtual_heap_bytes_locked(required_bytes) else {
+            return false;
+        };
+        // debug!(
+        //     "Growing virtual kernel heap: {} KiB -> {} KiB",
+        //     virtual_offset / 1024,
+        //     (virtual_offset + bytes) / 1024
+        // );
+        let start = KERNEL_HEAP_BASE + virtual_offset;
+        if !map_heap_pages(start, bytes / PAGE_SIZE) {
+            rollback_virtual_heap_reservation_locked(virtual_offset, bytes);
+            return false;
+        }
         unsafe { self.heap.lock().add_to_heap(start, start + bytes) };
         true
     }
@@ -282,13 +283,15 @@ impl KernelHeapAllocator {
             if reclaimed_pages >= KERNEL_HEAP_RECLAIM_MAX_PAGES_PER_CALL {
                 break;
             }
-            let virtual_end = KERNEL_HEAP_BASE + KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
+            let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
+            let virtual_bytes = KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
+            let virtual_end = KERNEL_HEAP_BASE + virtual_bytes;
             let released = {
                 let mut heap = self.heap.lock();
                 if heap.free_actual_bytes() <= KERNEL_HEAP_RECLAIM_START_FREE {
                     None
                 } else {
-                    heap.release_one_free_block(PAGE_SIZE, KERNEL_HEAP_BASE, virtual_end)
+                    heap.release_one_tail_free_block(PAGE_SIZE, KERNEL_HEAP_BASE, virtual_end)
                 }
             };
             let Some((start, bytes)) = released else {
@@ -296,7 +299,9 @@ impl KernelHeapAllocator {
             };
             let pages = bytes / PAGE_SIZE;
             unmap_heap_pages(start, pages);
+            KERNEL_HEAP_VIRTUAL_BYTES.store(virtual_bytes - bytes, Ordering::Release);
             KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            drop(_virtual_guard);
             reclaimed_pages += pages;
             let free_after = self.heap.lock().free_actual_bytes();
             if free_after <= KERNEL_HEAP_RECLAIM_TARGET_FREE {
@@ -427,25 +432,28 @@ fn reserve_bootstrap_heap_bytes(required_bytes: usize) -> Option<usize> {
     }
 }
 
-fn reserve_virtual_heap_bytes(required_bytes: usize) -> Option<(usize, usize)> {
+fn reserve_virtual_heap_bytes_locked(required_bytes: usize) -> Option<(usize, usize)> {
     let required_bytes = align_up_to_page(required_bytes)?;
-    loop {
-        let used = KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
-        let aligned_block_end = align_up(used, required_bytes)?.checked_add(required_bytes)?;
-        let normal_grow_end = used.checked_add(KERNEL_HEAP_GROW_SIZE.max(required_bytes))?;
-        let new_used = aligned_block_end.max(normal_grow_end);
-        if new_used > MAX_KERNEL_HEAP_SIZE {
-            return None;
-        }
-        let bytes = new_used - used;
-        if KERNEL_HEAP_VIRTUAL_BYTES
-            .compare_exchange(used, new_used, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            KERNEL_HEAP_BYTES.fetch_add(bytes, Ordering::AcqRel);
-            return Some((used, bytes));
+    let used = KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
+    let aligned_block_end = align_up(used, required_bytes)?.checked_add(required_bytes)?;
+    let normal_grow_end = used.checked_add(KERNEL_HEAP_GROW_SIZE.max(required_bytes))?;
+    let new_used = aligned_block_end.max(normal_grow_end);
+    if new_used > MAX_KERNEL_HEAP_SIZE {
+        return None;
+    }
+    let bytes = new_used - used;
+    KERNEL_HEAP_VIRTUAL_BYTES.store(new_used, Ordering::Release);
+    KERNEL_HEAP_BYTES.fetch_add(bytes, Ordering::AcqRel);
+    Some((used, bytes))
+}
+
+fn rollback_virtual_heap_reservation_locked(virtual_offset: usize, bytes: usize) {
+    if let Some(reservation_end) = virtual_offset.checked_add(bytes) {
+        if KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire) == reservation_end {
+            KERNEL_HEAP_VIRTUAL_BYTES.store(virtual_offset, Ordering::Release);
         }
     }
+    KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
@@ -553,8 +561,9 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
                 break;
             };
             // SAFETY: `pte` points into a leaf table reachable only through
-            // `HEAP_PT_LOCK`; concurrent grows hand out disjoint VA ranges via
-            // `reserve_virtual_heap_bytes`, so no two writers target the same slot.
+            // `HEAP_PT_LOCK`; virtual grow transactions hand out disjoint VA
+            // ranges under `KERNEL_HEAP_VIRTUAL_LOCK`, so no two writers
+            // target the same slot.
             let entry = unsafe { &mut *pte };
             if entry.is_valid() {
                 rollback_heap_pages(subtree_root_ppn, start_va, mapped_pages);

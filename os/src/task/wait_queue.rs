@@ -79,6 +79,20 @@ impl WaitQueue {
     where
         F: FnOnce() -> bool,
     {
+        let task = self.prepare_to_wait(reason);
+
+        // Re-check condition after enqueueing ourselves. If already ready,
+        // cancel the sleep transition and keep running on this hart.
+        if should_skip() {
+            self.cancel_prepared_wait(&task);
+            return;
+        }
+
+        self.block_prepared(task, reason);
+    }
+
+    /// Prepare the current task for sleeping on this queue.
+    pub(crate) fn prepare_to_wait(&self, reason: WaitReason) -> Arc<TaskControlBlock> {
         let task = current_task().unwrap();
         let mut queue = self.queue.lock();
         {
@@ -89,33 +103,33 @@ impl WaitQueue {
             task_inner.current_wq_handle = Some(self.to_handle());
         }
         queue.push_back(task.clone());
-        drop(queue);
+        task
+    }
 
-        // Re-check condition after enqueueing ourselves. If already ready,
-        // cancel the sleep transition and keep running on this hart.
-        if should_skip() {
-            self.queue
-                .lock()
-                .retain(|queued| Arc::as_ptr(queued) != Arc::as_ptr(&task));
-            if let Some(task) = current_task() {
-                let mut task_inner = task.inner_exclusive_access();
-                if matches!(task_inner.task_status, TaskStatus::Interruptible) {
-                    task_inner.task_status = TaskStatus::Running;
-                    task_inner.wait_reason = None;
-                    task_inner.current_wq_handle = None;
-                    task_inner.sched.on_cpu = true;
-                    task_inner.sched.on_rq = false;
-                }
-            }
-            return;
+    /// Cancel a prepared wait before the task actually switches out.
+    pub(crate) fn cancel_prepared_wait(&self, task: &Arc<TaskControlBlock>) {
+        self.remove_waiter_by_ptr(task);
+        let mut task_inner = task.inner_exclusive_access();
+        if matches!(task_inner.task_status, TaskStatus::Interruptible) {
+            task_inner.task_status = TaskStatus::Running;
+            task_inner.wait_reason = None;
+            task_inner.current_wq_handle = None;
+            task_inner.sched.on_cpu = true;
+            task_inner.sched.on_rq = false;
         }
+    }
 
+    /// Block after [`prepare_to_wait`] has enqueued the task.
+    pub(crate) fn block_prepared(&self, task: Arc<TaskControlBlock>, reason: WaitReason) {
         block_current_and_run_next(reason);
+        self.finish_wait(&task);
+    }
 
+    fn finish_wait(&self, task: &Arc<TaskControlBlock>) {
         // Wakers normally remove the task before scheduling it. Keep this
         // cleanup idempotent so forced exits and competing wake paths cannot
         // leave a stale strong reference in the queue.
-        self.remove_waiter_by_ptr(&task);
+        self.remove_waiter_by_ptr(task);
         let mut task_inner = task.inner_exclusive_access();
         if task_inner
             .current_wq_handle
@@ -123,6 +137,16 @@ impl WaitQueue {
             .is_some_and(|handle| handle.points_to(self as *const Self as *const ()))
         {
             task_inner.current_wq_handle = None;
+        }
+    }
+
+    /// Remove and return the next valid waiter without waking it.
+    pub(crate) fn take_one_waiter(&self) -> Option<Arc<TaskControlBlock>> {
+        loop {
+            let task = self.queue.lock().pop_front()?;
+            if self.is_current_waiter(&task) {
+                return Some(task);
+            }
         }
     }
 

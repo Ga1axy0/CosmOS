@@ -520,8 +520,9 @@ impl VirtIOBlock {
         if inner.ack_interrupt().is_empty() {
             return;
         }
+        crate::drivers::virtio::virtio_dma_rmb();
         drop(inner);
-        super::wake_worker();
+        super::schedule_completion_work();
     }
 }
 

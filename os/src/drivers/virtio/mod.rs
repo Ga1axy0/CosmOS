@@ -110,6 +110,17 @@ unsafe fn copy_from_bounce(src: usize, dst: usize, len: usize) {
 /// The HAL implementation used by `virtio-drivers` in CosmOS.
 pub struct VirtioHal;
 
+#[inline]
+pub(crate) fn virtio_dma_rmb() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags));
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 unsafe impl Hal for VirtioHal {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (VirtioPhysAddr, NonNull<u8>) {
         assert!(pages > 0);
