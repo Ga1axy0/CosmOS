@@ -130,12 +130,22 @@ pub fn handle_external_irq() {
 
     for word in 0..((PCH_PIC_IRQS as usize + 31) / 32) {
         let mut pending = iocsr_read32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4);
-        let mut clear_mask = 0u32;
 
         while pending != 0 {
             let bit_idx = pending.trailing_zeros();
             let bit = 1u32 << bit_idx;
             let irq = (word as u32) * 32 + bit_idx;
+
+            // Acknowledge (EOI) the EXTIOI source BEFORE running its handler.
+            // The previous "handle-then-clear" order could drop a virtio
+            // completion IRQ: a second completion landing between the device
+            // ACK (inside the handler) and the trailing write-1-to-clear would
+            // have its freshly-set COREISR bit wiped by `clear_mask`, leaving
+            // the block worker asleep in BLOCK_WORKER_WAIT for good. Clearing
+            // first means any re-assertion during the handler sets a fresh bit
+            // that survives and re-triggers after `ertn`.
+            iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, bit);
+
             let mut handled = false;
 
             if irq == UART0_PCH_IRQ {
@@ -150,12 +160,7 @@ pub fn handle_external_irq() {
                 warn!("[irq] loongarch unexpected EXTIOI IRQ {}", irq);
             }
 
-            clear_mask |= bit;
             pending &= !bit;
-        }
-
-        if clear_mask != 0 {
-            iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, clear_mask);
         }
     }
 }

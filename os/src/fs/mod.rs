@@ -13,28 +13,322 @@ pub mod sysfs;
 pub mod tmpfs;
 mod tty;
 
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+#[cfg(feature = "io_perf_counters")]
+use core::fmt::Write;
 use crate::mm::UserBuffer;
 use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::any::Any;
-pub use fs::vfs::{InodeTime, VfsFileType};
-use fs::{errno::FS_ERRNO, Inode};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::timer::get_time_us;
+use fs::{dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode, InodeCacheStats};
 use lazy_static::*;
+pub use fs::vfs::{InodeTime, VfsFileType};
 pub use page_cache::{
-    discard_inode, mapping_for_inode, mark_cached_page_dirty, reclaim_if_needed,
-    release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
-    sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PAGE_CACHE_MANAGER,
+    discard_inode, mapping_for_inode, reclaim_if_needed,
+    page_cache_stats,
+    sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
+    sync_inode_range, truncate_inode, CachePage, PageCacheStats, mark_cached_page_dirty,
+    release_mapped_page, retain_mapped_page, PAGE_CACHE_MANAGER,
 };
 
-fn encode_dirent64_records(
-    entries: &[(String, VfsFileType)],
-    offset: usize,
-    buf: &mut [u8],
-) -> usize {
+/// Cumulative directory-iteration counters used by `/proc/mm_perf`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetdentsPerfCounters {
+    /// Number of `getdents64` calls serviced by the kernel.
+    pub calls: usize,
+    /// Total bytes returned across all `getdents64` calls.
+    pub bytes: usize,
+    /// Total time spent inside kernel-side directory iteration paths.
+    pub total_us: usize,
+    /// Number of times a full directory snapshot (`inode.ls()`) was rebuilt.
+    pub dir_snapshots: usize,
+    /// Sum of directory entry counts observed across those rebuilds.
+    pub dir_snapshot_entries: usize,
+    /// Total time spent rebuilding directory snapshots.
+    pub dir_snapshot_us: usize,
+}
+
+static GETDENTS_CALLS: AtomicUsize = AtomicUsize::new(0);
+static GETDENTS_BYTES: AtomicUsize = AtomicUsize::new(0);
+static GETDENTS_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+static DIR_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DIR_SNAPSHOT_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static DIR_SNAPSHOT_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_INODE_FOLLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_INODE_FOLLOW_OK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_INODE_FOLLOW_ERR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_INODE_FOLLOW_COMPONENTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_INODE_FOLLOW_RESTARTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LOOKUP_INODE_FOLLOW_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static INODE_STAT_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static INODE_STAT_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_EMPTY_PATH_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_RESOLVE_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_LOOKUP_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_INODE_STAT_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static NEWFSTATAT_COPYOUT_US: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn record_getdents_perf(bytes: usize, elapsed_us: usize) {
+    GETDENTS_CALLS.fetch_add(1, Ordering::Relaxed);
+    GETDENTS_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    GETDENTS_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_dir_snapshot_perf(entries: usize, elapsed_us: usize) {
+    DIR_SNAPSHOT_CALLS.fetch_add(1, Ordering::Relaxed);
+    DIR_SNAPSHOT_ENTRIES.fetch_add(entries, Ordering::Relaxed);
+    DIR_SNAPSHOT_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
+
+/// Return cumulative directory-iteration counters for `/proc/mm_perf`.
+pub fn getdents_perf_counters() -> GetdentsPerfCounters {
+    GetdentsPerfCounters {
+        calls: GETDENTS_CALLS.load(Ordering::Relaxed),
+        bytes: GETDENTS_BYTES.load(Ordering::Relaxed),
+        total_us: GETDENTS_TOTAL_US.load(Ordering::Relaxed),
+        dir_snapshots: DIR_SNAPSHOT_CALLS.load(Ordering::Relaxed),
+        dir_snapshot_entries: DIR_SNAPSHOT_ENTRIES.load(Ordering::Relaxed),
+        dir_snapshot_us: DIR_SNAPSHOT_TOTAL_US.load(Ordering::Relaxed),
+    }
+}
+
+/// Return the current global dentry-cache footprint for `/proc/mm_perf`.
+pub fn dentry_perf_counters() -> DentryCacheStats {
+    dentry_cache_stats()
+}
+
+/// Return the current global inode-cache footprint for `/proc/mm_perf`.
+pub fn inode_perf_counters() -> InodeCacheStats {
+    inode_cache_stats()
+}
+
+#[cfg(feature = "io_perf_counters")]
+fn perf_load(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn record_lookup_inode_follow_perf(
+    components: usize,
+    restarts: usize,
+    ok: bool,
+    elapsed_us: usize,
+) {
+    LOOKUP_INODE_FOLLOW_CALLS.fetch_add(1, Ordering::Relaxed);
+    if ok {
+        LOOKUP_INODE_FOLLOW_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        LOOKUP_INODE_FOLLOW_ERR.fetch_add(1, Ordering::Relaxed);
+    }
+    LOOKUP_INODE_FOLLOW_COMPONENTS.fetch_add(components, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_RESTARTS.fetch_add(restarts, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+pub(crate) fn record_lookup_inode_follow_perf(
+    _components: usize,
+    _restarts: usize,
+    _ok: bool,
+    _elapsed_us: usize,
+) {
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn record_inode_stat_perf(elapsed_us: usize) {
+    INODE_STAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    INODE_STAT_TOTAL_US.fetch_add(elapsed_us, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+pub(crate) fn record_inode_stat_perf(_elapsed_us: usize) {}
+
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn record_newfstatat_perf(
+    empty_path: bool,
+    resolve_us: usize,
+    lookup_us: usize,
+    inode_stat_us: usize,
+    copyout_us: usize,
+    total_us: usize,
+) {
+    NEWFSTATAT_CALLS.fetch_add(1, Ordering::Relaxed);
+    if empty_path {
+        NEWFSTATAT_EMPTY_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    NEWFSTATAT_RESOLVE_US.fetch_add(resolve_us, Ordering::Relaxed);
+    NEWFSTATAT_LOOKUP_US.fetch_add(lookup_us, Ordering::Relaxed);
+    NEWFSTATAT_INODE_STAT_US.fetch_add(inode_stat_us, Ordering::Relaxed);
+    NEWFSTATAT_COPYOUT_US.fetch_add(copyout_us, Ordering::Relaxed);
+    NEWFSTATAT_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+pub(crate) fn record_newfstatat_perf(
+    _empty_path: bool,
+    _resolve_us: usize,
+    _lookup_us: usize,
+    _inode_stat_us: usize,
+    _copyout_us: usize,
+    _total_us: usize,
+) {
+}
+
+#[cfg(feature = "io_perf_counters")]
+/// Reset filesystem metadata counters exported through `/proc/io_perf`.
+pub fn reset_perf_counters() {
+    GETDENTS_CALLS.store(0, Ordering::Relaxed);
+    GETDENTS_BYTES.store(0, Ordering::Relaxed);
+    GETDENTS_TOTAL_US.store(0, Ordering::Relaxed);
+    DIR_SNAPSHOT_CALLS.store(0, Ordering::Relaxed);
+    DIR_SNAPSHOT_ENTRIES.store(0, Ordering::Relaxed);
+    DIR_SNAPSHOT_TOTAL_US.store(0, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_CALLS.store(0, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_OK.store(0, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_ERR.store(0, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_COMPONENTS.store(0, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_RESTARTS.store(0, Ordering::Relaxed);
+    LOOKUP_INODE_FOLLOW_TOTAL_US.store(0, Ordering::Relaxed);
+    INODE_STAT_CALLS.store(0, Ordering::Relaxed);
+    INODE_STAT_TOTAL_US.store(0, Ordering::Relaxed);
+    NEWFSTATAT_CALLS.store(0, Ordering::Relaxed);
+    NEWFSTATAT_EMPTY_PATH_CALLS.store(0, Ordering::Relaxed);
+    NEWFSTATAT_TOTAL_US.store(0, Ordering::Relaxed);
+    NEWFSTATAT_RESOLVE_US.store(0, Ordering::Relaxed);
+    NEWFSTATAT_LOOKUP_US.store(0, Ordering::Relaxed);
+    NEWFSTATAT_INODE_STAT_US.store(0, Ordering::Relaxed);
+    NEWFSTATAT_COPYOUT_US.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
+/// Render filesystem metadata counters for `/proc/io_perf`.
+pub fn render_perf_counters() -> String {
+    let mut out = String::new();
+    let getdents_calls = perf_load(&GETDENTS_CALLS);
+    let lookup_calls = perf_load(&LOOKUP_INODE_FOLLOW_CALLS);
+    let inode_stat_calls = perf_load(&INODE_STAT_CALLS);
+    let newfstatat_calls = perf_load(&NEWFSTATAT_CALLS);
+    let _ = writeln!(&mut out, "fs_meta:");
+    let _ = writeln!(&mut out, "  getdents_calls {}", getdents_calls);
+    let _ = writeln!(&mut out, "  getdents_bytes {}", perf_load(&GETDENTS_BYTES));
+    let _ = writeln!(&mut out, "  getdents_total_us {}", perf_load(&GETDENTS_TOTAL_US));
+    let _ = writeln!(&mut out, "  dir_snapshot_calls {}", perf_load(&DIR_SNAPSHOT_CALLS));
+    let _ = writeln!(
+        &mut out,
+        "  dir_snapshot_entries {}",
+        perf_load(&DIR_SNAPSHOT_ENTRIES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  dir_snapshot_total_us {}",
+        perf_load(&DIR_SNAPSHOT_TOTAL_US)
+    );
+    let _ = writeln!(&mut out, "  lookup_inode_follow_calls {}", lookup_calls);
+    let _ = writeln!(&mut out, "  lookup_inode_follow_ok {}", perf_load(&LOOKUP_INODE_FOLLOW_OK));
+    let _ = writeln!(
+        &mut out,
+        "  lookup_inode_follow_err {}",
+        perf_load(&LOOKUP_INODE_FOLLOW_ERR)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  lookup_inode_follow_components {}",
+        perf_load(&LOOKUP_INODE_FOLLOW_COMPONENTS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  lookup_inode_follow_restarts {}",
+        perf_load(&LOOKUP_INODE_FOLLOW_RESTARTS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  lookup_inode_follow_total_us {}",
+        perf_load(&LOOKUP_INODE_FOLLOW_TOTAL_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_lookup_inode_follow_us_x100 {}",
+        if lookup_calls == 0 {
+            0
+        } else {
+            perf_load(&LOOKUP_INODE_FOLLOW_TOTAL_US).saturating_mul(100) / lookup_calls
+        }
+    );
+    let _ = writeln!(&mut out, "  inode_stat_calls {}", inode_stat_calls);
+    let _ = writeln!(&mut out, "  inode_stat_total_us {}", perf_load(&INODE_STAT_TOTAL_US));
+    let _ = writeln!(
+        &mut out,
+        "  avg_inode_stat_us_x100 {}",
+        if inode_stat_calls == 0 {
+            0
+        } else {
+            perf_load(&INODE_STAT_TOTAL_US).saturating_mul(100) / inode_stat_calls
+        }
+    );
+    let _ = writeln!(&mut out, "  newfstatat_calls {}", newfstatat_calls);
+    let _ = writeln!(
+        &mut out,
+        "  newfstatat_empty_path_calls {}",
+        perf_load(&NEWFSTATAT_EMPTY_PATH_CALLS)
+    );
+    let _ = writeln!(&mut out, "  newfstatat_total_us {}", perf_load(&NEWFSTATAT_TOTAL_US));
+    let _ = writeln!(
+        &mut out,
+        "  newfstatat_resolve_us {}",
+        perf_load(&NEWFSTATAT_RESOLVE_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  newfstatat_lookup_us {}",
+        perf_load(&NEWFSTATAT_LOOKUP_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  newfstatat_inode_stat_us {}",
+        perf_load(&NEWFSTATAT_INODE_STAT_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  newfstatat_copyout_us {}",
+        perf_load(&NEWFSTATAT_COPYOUT_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_newfstatat_us_x100 {}",
+        if newfstatat_calls == 0 {
+            0
+        } else {
+            perf_load(&NEWFSTATAT_TOTAL_US).saturating_mul(100) / newfstatat_calls
+        }
+    );
+    out
+}
+
+fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {
     let mut written = 0usize;
 
     for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
@@ -473,23 +767,35 @@ impl FileDescription {
 
     /// 读取目录项并推进共享目录位置。
     pub fn getdents64(&self, buf: &mut [u8]) -> usize {
+        let start_us = get_time_us();
         let mut inner = self.inner.lock();
         let read_size = if self.file.is_dir() {
             if let Some(inode) = self.as_inode() {
-                if inner.offset == 0 || inner.dirent_snapshot.is_none() {
-                    inner.dirent_snapshot = Some(inode.ls());
+                if inode.prefer_native_getdents64() {
+                    self.file.getdents64(inner.offset, buf)
+                } else {
+                    if inner.offset == 0 || inner.dirent_snapshot.is_none() {
+                        let snapshot_start_us = get_time_us();
+                        let snapshot = inode.ls();
+                        record_dir_snapshot_perf(
+                            snapshot.len(),
+                            get_time_us().saturating_sub(snapshot_start_us),
+                        );
+                        inner.dirent_snapshot = Some(snapshot);
+                    }
+                    encode_dirent64_records(
+                        inner.dirent_snapshot.as_ref().unwrap().as_slice(),
+                        inner.offset,
+                        buf,
+                    )
                 }
-                encode_dirent64_records(
-                    inner.dirent_snapshot.as_ref().unwrap().as_slice(),
-                    inner.offset,
-                    buf,
-                )
             } else {
                 self.file.getdents64(inner.offset, buf)
             }
         } else {
             self.file.getdents64(inner.offset, buf)
         };
+        record_getdents_perf(read_size, get_time_us().saturating_sub(start_us));
         if read_size == 0 {
             return 0;
         }
@@ -780,12 +1086,12 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs,
-    init_rootfs, init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps, lookup_inode,
-    lookup_inode_follow, lookup_inode_follow_with_path, mkdir_at, mkdir_at_with_inode,
-    mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file,
-    open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, OSInode,
-    OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs, init_rootfs,
+    init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow,
+    lookup_inode_follow_with_path, lookup_inode_from, mkdir_at, mkdir_at_with_inode, mount_cgroup2,
+    mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
+    open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, OSInode, OpenFlags,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::new_stdio_files;
@@ -796,6 +1102,8 @@ pub use tty::{
 
 /// Initialize the filesystem, including rootfs and devfs.
 pub fn init() -> Result<(), ERRNO> {
+    #[cfg(all(feature = "ext4", feature = "io_perf_counters"))]
+    ::fs::ext4::set_perf_time_source(get_time_us);
     init_rootfs()?; // Virtual rootfs for booting system; meanwhile mount a real fs (e.g. ext4) to "/".
     init_dev(); // Initialize devfs, which provides device files (e.g. /dev/vda, /dev/vdb) for block devices.
     init_sysfs(); // Initialize sysfs for /sys/class/net entries.

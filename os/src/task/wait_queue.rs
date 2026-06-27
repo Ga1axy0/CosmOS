@@ -2,6 +2,7 @@
 use super::{current_task, wakeup_task, TaskControlBlock, TaskStatus, WaitReason};
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
+use core::sync::atomic::Ordering;
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use hashbrown::HashMap;
 
@@ -114,7 +115,7 @@ impl WaitQueue {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
             task_inner.current_wq_handle = None;
-            task_inner.sched.on_cpu = true;
+            task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.on_rq = false;
         }
     }
@@ -451,7 +452,7 @@ where
                     task_inner.task_status = TaskStatus::Running;
                     task_inner.wait_reason = None;
                     task_inner.current_wq_handle = None;
-                    task_inner.sched.on_cpu = true;
+                    task.on_cpu.store(true, Ordering::Relaxed);
                     task_inner.sched.on_rq = false;
                 }
             }

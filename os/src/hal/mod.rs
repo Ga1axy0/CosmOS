@@ -61,6 +61,48 @@ pub unsafe fn enable_local_irqs() {
     ArchHart::enable_irqs();
 }
 
+/// RAII guard implementing `local_irq_save()`/`local_irq_restore()` semantics.
+///
+/// On construction it records whether local interrupts were enabled and then
+/// disables them. On drop it restores the saved state. Use it to make a
+/// critical section atomic with respect to local interrupts without having to
+/// remember a manual restore on every return path (including the implicit
+/// return after a context `__switch` resumes the caller).
+pub struct LocalIrqSave {
+    was_enabled: bool,
+}
+
+impl LocalIrqSave {
+    /// Disable local interrupts on the current hart, remembering the previous
+    /// state so it can be restored when the guard is dropped.
+    #[inline]
+    pub fn new() -> Self {
+        let was_enabled = local_irqs_enabled();
+        if was_enabled {
+            // Safety: disabling local interrupts is always safe.
+            unsafe { disable_local_irqs() };
+        }
+        Self { was_enabled }
+    }
+}
+
+impl Default for LocalIrqSave {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LocalIrqSave {
+    #[inline]
+    fn drop(&mut self) {
+        if self.was_enabled {
+            // Safety: restoring the previously observed interrupt state.
+            unsafe { enable_local_irqs() };
+        }
+    }
+}
+
 /// Wait for the next interrupt/event on the current hart.
 #[inline]
 pub unsafe fn wait_for_interrupt() {

@@ -39,6 +39,10 @@ const CASES: &[Case] = &[
         name: "xlarge",
         size: 32 * 1024 * 1024,
     },
+    Case {
+        name: "xxlarge",
+        size: 128 * 1024 * 1024,
+    },
 ];
 
 #[derive(Clone, Copy)]

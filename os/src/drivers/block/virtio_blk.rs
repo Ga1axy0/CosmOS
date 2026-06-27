@@ -517,7 +517,14 @@ impl VirtIOBlock {
     /// Called from external interrupt path for this block device.
     pub fn handle_irq(&self) {
         let mut inner = self.inner.lock();
-        if inner.ack_interrupt().is_empty() {
+        let isr_set = !inner.ack_interrupt().is_empty();
+        // Even when the ISR reads back empty (a spurious EXTIOI re-fire after
+        // the device already de-asserted, or a re-assertion racing the EOI), a
+        // completion may still be sitting unread in the used ring. Fall back to
+        // the queue state so a real completion never fails to schedule the
+        // worker — otherwise `schedule_completion_work` is skipped and the
+        // block worker sleeps in BLOCK_WORKER_WAIT with no further wake.
+        if !isr_set && inner.peek_used().is_none() {
             return;
         }
         crate::drivers::virtio::virtio_dma_rmb();

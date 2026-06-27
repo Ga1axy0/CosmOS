@@ -34,6 +34,8 @@ use crate::mm::{
 use crate::net;
 #[cfg(feature = "perf_probe")]
 use crate::perf_probe;
+#[cfg(feature = "mm_perf_counters")]
+use crate::perf_sampler;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
 use crate::task::{cached_kstack_count, current_process, TaskStatus};
@@ -153,6 +155,8 @@ fn build_partitions() -> String {
 
 #[cfg(feature = "io_perf_counters")]
 fn reset_io_perf() {
+    crate::fs::reset_perf_counters();
+    ::fs::vfs::reset_perf_counters();
     ::fs::block_cache::reset_perf_counters();
     ::fs::ext4::reset_perf_counters();
     block_drivers::reset_perf_counters();
@@ -162,11 +166,18 @@ fn reset_io_perf() {
 #[cfg(feature = "io_perf_counters")]
 fn build_io_perf() -> String {
     let mut out = String::new();
+    out.push_str(&crate::fs::render_perf_counters());
+    out.push_str(&::fs::vfs::render_perf_counters());
     out.push_str(&block_drivers::render_perf_counters());
     out.push_str(&::fs::block_cache::render_perf_counters());
     out.push_str(&::fs::ext4::render_perf_counters());
     out.push_str(&page_cache::render_perf_counters());
     out
+}
+
+#[cfg(feature = "mm_perf_counters")]
+fn build_mm_perf() -> String {
+    perf_sampler::render()
 }
 
 fn parse_proc_u32(buf: &[u8]) -> Result<u32, FS_ERRNO> {
@@ -752,6 +763,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("perf_probe"), VfsFileType::Regular));
         #[cfg(feature = "perf_probe")]
         entries.push((String::from("perf_probe_enable"), VfsFileType::Regular));
+        #[cfg(feature = "mm_perf_counters")]
+        entries.push((String::from("mm_perf"), VfsFileType::Regular));
         entries.push((String::from("key-users"), VfsFileType::Regular));
         entries.push((String::from("sys"), VfsFileType::Directory));
         for pid in list_pids() {
@@ -778,6 +791,8 @@ impl VfsNode for ProcRootNode {
             "perf_probe_enable" => {
                 Some(Arc::new(ProcPerfProbeEnableNode::new()) as Arc<dyn VfsNode>)
             }
+            #[cfg(feature = "mm_perf_counters")]
+            "mm_perf" => Some(Arc::new(ProcMmPerfNode::new()) as Arc<dyn VfsNode>),
             "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
             "sys" => {
                 Some(Arc::new(ProcStaticDirNode::new(ProcStaticDirKind::Sys)) as Arc<dyn VfsNode>)
@@ -1998,6 +2013,79 @@ impl VfsNode for ProcPerfProbeEnableNode {
             "" => {}
             _ => {}
         }
+        buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/mm_perf` node - periodic memory-pressure trajectory sampled by
+/// [`crate::perf_sampler`].
+#[derive(Default, Debug)]
+#[cfg(feature = "mm_perf_counters")]
+pub struct ProcMmPerfNode;
+
+#[cfg(feature = "mm_perf_counters")]
+impl ProcMmPerfNode {
+    /// Create a new `/proc/mm_perf` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "mm_perf_counters")]
+impl VfsNode for ProcMmPerfNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_mm_perf().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        perf_sampler::reset();
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        perf_sampler::reset();
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_mm_perf(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        // Writing anything clears the buffered history (start a fresh trajectory).
+        perf_sampler::reset();
         buf.len()
     }
 

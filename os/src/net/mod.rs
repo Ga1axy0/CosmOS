@@ -574,6 +574,16 @@ pub fn poll_timer_tick() {
     poll();
 }
 
+/// Return `(tcp, udp)` live socket-state counts for diagnostics
+/// (e.g. `/proc/mm_perf`). Returns `(0, 0)` before the stack is initialized.
+pub fn socket_state_counts() -> (usize, usize) {
+    let guard = NET_STACK.lock();
+    match guard.as_ref() {
+        Some(stack) => (stack.tcp_states.len(), stack.udp_states.len()),
+        None => (0, 0),
+    }
+}
+
 pub(crate) struct NetStack {
     device: MultiDevice,
     pub(crate) iface: Interface,

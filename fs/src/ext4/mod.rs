@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use log::{debug, info};
 
 use crate::block_cache::{
-    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges,
+    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges, read_block_cache_range,
 };
 use crate::block_dev::{BlockDevice as OsBlockDevice, BlockWrite as OsBlockWrite};
 use crate::dentry_cache::insert_dentry;
@@ -38,6 +38,36 @@ static WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static WRITE_OFFSETS_MANY_ALIGNED_ITEMS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITE_OFFSETS_MANY_UNALIGNED_ITEMS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIR_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIR_LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIR_LOOKUP_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIR_LOOKUP_BLOCKS_SCANNED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIR_LOOKUP_DIRENTS_SCANNED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LS_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static LS_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_NONEMPTY_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_BACKEND_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_PRIME_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_PRIME_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static GETDENTS_PRIME_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_TIME_NOW_US: AtomicUsize = AtomicUsize::new(0);
 
 const EXT4_ROOT_INODE: u32 = 2;
 
@@ -65,26 +95,18 @@ impl Ext4BlockDeviceAdapter {
 impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
         let len = ext4_rs::BLOCK_SIZE;
-        let mut out = vec![0u8; len];
-
         let start_block = offset / BLOCK_SZ;
         let end_block = (offset + len).div_ceil(BLOCK_SZ);
-
-        for block_id in start_block..end_block {
-            let block_start = block_id * BLOCK_SZ;
-            let src_start = offset.saturating_sub(block_start);
-            let src_end = BLOCK_SZ.min(offset + len - block_start);
-            if src_start >= src_end {
-                continue;
-            }
-
-            let dst_start = block_start + src_start - offset;
-            let copy_len = src_end - src_start;
-            get_block_cache(block_id, Arc::clone(&self.inner))
-                .lock()
-                .read_bytes(src_start, &mut out[dst_start..dst_start + copy_len]);
+        let aligned_offset = start_block * BLOCK_SZ;
+        let aligned_len = (end_block - start_block) * BLOCK_SZ;
+        let mut aligned = vec![0u8; aligned_len];
+        read_block_cache_range(start_block, Arc::clone(&self.inner), &mut aligned);
+        let src_start = offset - aligned_offset;
+        if src_start == 0 && aligned_len == len {
+            return aligned;
         }
-
+        let mut out = vec![0u8; len];
+        out.copy_from_slice(&aligned[src_start..src_start + len]);
         out
     }
 
@@ -176,17 +198,62 @@ fn perf_load(counter: &AtomicUsize) -> usize {
 }
 
 #[cfg(feature = "io_perf_counters")]
+#[inline]
+fn perf_now_us() -> Option<usize> {
+    let ptr = PERF_TIME_NOW_US.load(Ordering::Relaxed);
+    if ptr == 0 {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<usize, fn() -> usize>(ptr) }())
+    }
+}
+
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+fn perf_elapsed_us(start_us: Option<usize>) -> usize {
+    match start_us {
+        Some(start_us) => perf_now_us()
+            .map(|end_us| end_us.saturating_sub(start_us))
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub fn set_perf_time_source(now_us: fn() -> usize) {
+    PERF_TIME_NOW_US.store(now_us as usize, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
 pub fn reset_perf_counters() {
     WRITE_OFFSETS_MANY_CALLS.store(0, Ordering::Relaxed);
     WRITE_OFFSETS_MANY_ITEMS.store(0, Ordering::Relaxed);
     WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS.store(0, Ordering::Relaxed);
     WRITE_OFFSETS_MANY_ALIGNED_ITEMS.store(0, Ordering::Relaxed);
     WRITE_OFFSETS_MANY_UNALIGNED_ITEMS.store(0, Ordering::Relaxed);
+    DIR_LOOKUP_CALLS.store(0, Ordering::Relaxed);
+    DIR_LOOKUP_HITS.store(0, Ordering::Relaxed);
+    DIR_LOOKUP_MISSES.store(0, Ordering::Relaxed);
+    DIR_LOOKUP_BLOCKS_SCANNED.store(0, Ordering::Relaxed);
+    DIR_LOOKUP_DIRENTS_SCANNED.store(0, Ordering::Relaxed);
+    LS_CALLS.store(0, Ordering::Relaxed);
+    LS_ENTRIES.store(0, Ordering::Relaxed);
+    GETDENTS_CALLS.store(0, Ordering::Relaxed);
+    GETDENTS_NONEMPTY_CALLS.store(0, Ordering::Relaxed);
+    GETDENTS_BYTES.store(0, Ordering::Relaxed);
+    GETDENTS_BACKEND_US.store(0, Ordering::Relaxed);
+    GETDENTS_PRIME_CALLS.store(0, Ordering::Relaxed);
+    GETDENTS_PRIME_ENTRIES.store(0, Ordering::Relaxed);
+    GETDENTS_PRIME_US.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
 pub fn render_perf_counters() -> String {
     let mut out = String::new();
+    let dir_lookup_calls = perf_load(&DIR_LOOKUP_CALLS);
+    let getdents_calls = perf_load(&GETDENTS_CALLS);
+    let getdents_prime_calls = perf_load(&GETDENTS_PRIME_CALLS);
+    let ls_calls = perf_load(&LS_CALLS);
     let _ = writeln!(&mut out, "ext4:");
     let _ = writeln!(
         &mut out,
@@ -212,6 +279,93 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  write_offsets_many_unaligned_items {}",
         perf_load(&WRITE_OFFSETS_MANY_UNALIGNED_ITEMS)
+    );
+    let _ = writeln!(&mut out, "  getdents_calls {}", getdents_calls);
+    let _ = writeln!(
+        &mut out,
+        "  getdents_nonempty_calls {}",
+        perf_load(&GETDENTS_NONEMPTY_CALLS)
+    );
+    let _ = writeln!(&mut out, "  getdents_bytes {}", perf_load(&GETDENTS_BYTES));
+    let _ = writeln!(
+        &mut out,
+        "  getdents_backend_us {}",
+        perf_load(&GETDENTS_BACKEND_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_getdents_backend_us_x100 {}",
+        if getdents_calls == 0 {
+            0
+        } else {
+            perf_load(&GETDENTS_BACKEND_US).saturating_mul(100) / getdents_calls
+        }
+    );
+    let _ = writeln!(
+        &mut out,
+        "  getdents_prime_calls {}",
+        getdents_prime_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "  getdents_prime_entries {}",
+        perf_load(&GETDENTS_PRIME_ENTRIES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  getdents_prime_us {}",
+        perf_load(&GETDENTS_PRIME_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_getdents_prime_us_x100 {}",
+        if getdents_prime_calls == 0 {
+            0
+        } else {
+            perf_load(&GETDENTS_PRIME_US).saturating_mul(100) / getdents_prime_calls
+        }
+    );
+    let _ = writeln!(&mut out, "  dir_lookup_calls {}", dir_lookup_calls);
+    let _ = writeln!(&mut out, "  dir_lookup_hits {}", perf_load(&DIR_LOOKUP_HITS));
+    let _ = writeln!(&mut out, "  dir_lookup_misses {}", perf_load(&DIR_LOOKUP_MISSES));
+    let _ = writeln!(
+        &mut out,
+        "  dir_lookup_blocks_scanned {}",
+        perf_load(&DIR_LOOKUP_BLOCKS_SCANNED)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  dir_lookup_dirents_scanned {}",
+        perf_load(&DIR_LOOKUP_DIRENTS_SCANNED)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_dir_lookup_blocks_x100 {}",
+        if dir_lookup_calls == 0 {
+            0
+        } else {
+            perf_load(&DIR_LOOKUP_BLOCKS_SCANNED).saturating_mul(100) / dir_lookup_calls
+        }
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_dir_lookup_dirents_x100 {}",
+        if dir_lookup_calls == 0 {
+            0
+        } else {
+            perf_load(&DIR_LOOKUP_DIRENTS_SCANNED).saturating_mul(100) / dir_lookup_calls
+        }
+    );
+    let _ = writeln!(&mut out, "  ls_calls {}", ls_calls);
+    let _ = writeln!(&mut out, "  ls_entries {}", perf_load(&LS_ENTRIES));
+    let _ = writeln!(
+        &mut out,
+        "  avg_ls_entries_x100 {}",
+        if ls_calls == 0 {
+            0
+        } else {
+            perf_load(&LS_ENTRIES).saturating_mul(100) / ls_calls
+        }
     );
     out
 }
@@ -299,10 +453,21 @@ impl Ext4Inode {
         }
     }
 
-    fn prime_dentry_cache_from_dirents(&self, ext4: &Ext4, buf: &[u8]) {
-        let fs_id = self.fs_id();
-        let parent_ino = self.ino();
+    fn cache_dir_entry(&self, name: &str, inode_num: u32, file_type: VfsFileType) {
+        if name == "." || name == ".." {
+            return;
+        }
+
+        let child = Inode::from_vfs_node(
+            Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode_num, file_type))
+                as Arc<dyn VfsNode>,
+        );
+        insert_dentry(self.fs_id(), self.ino(), name, &child);
+    }
+
+    fn prime_dentry_cache_from_dirents(&self, ext4: &Ext4, buf: &[u8]) -> usize {
         let mut cursor = 0usize;
+        let mut primed_entries = 0usize;
         while cursor + 19 <= buf.len() {
             let reclen = u16::from_le_bytes([buf[cursor + 16], buf[cursor + 17]]) as usize;
             if reclen == 0 || cursor + reclen > buf.len() {
@@ -332,7 +497,7 @@ impl Ext4Inode {
                 cursor += reclen;
                 continue;
             };
-            if ino == 0 || name == "." || name == ".." {
+            if ino == 0 {
                 cursor += reclen;
                 continue;
             }
@@ -341,13 +506,11 @@ impl Ext4Inode {
             if file_type == VfsFileType::Unknown {
                 file_type = Self::inode_file_type(ext4, ino as u32);
             }
-            let child = Inode::from_vfs_node(
-                Arc::new(Self::new_with_type(Arc::clone(&self.fs), ino as u32, file_type))
-                    as Arc<dyn VfsNode>,
-            );
-            insert_dentry(fs_id, parent_ino, name, &child);
+            self.cache_dir_entry(name, ino as u32, file_type);
+            primed_entries += 1;
             cursor += reclen;
         }
+        primed_entries
     }
 
     fn ext4_getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -356,9 +519,31 @@ impl Ext4Inode {
         }
 
         let ext4 = self.fs.ext4.lock();
+        #[cfg(feature = "io_perf_counters")]
+        GETDENTS_CALLS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "io_perf_counters")]
+        let backend_start_us = perf_now_us();
         let written = ext4.ext4_dir_getdents64(self.inode_num, offset, buf);
+        #[cfg(feature = "io_perf_counters")]
+        let backend_us = perf_elapsed_us(backend_start_us);
+        #[cfg(feature = "io_perf_counters")]
+        {
+            GETDENTS_BACKEND_US.fetch_add(backend_us, Ordering::Relaxed);
+            GETDENTS_BYTES.fetch_add(written, Ordering::Relaxed);
+            if written != 0 {
+                GETDENTS_NONEMPTY_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if written != 0 {
-            self.prime_dentry_cache_from_dirents(&ext4, &buf[..written]);
+            #[cfg(feature = "io_perf_counters")]
+            let prime_start_us = perf_now_us();
+            let primed_entries = self.prime_dentry_cache_from_dirents(&ext4, &buf[..written]);
+            #[cfg(feature = "io_perf_counters")]
+            {
+                GETDENTS_PRIME_CALLS.fetch_add(1, Ordering::Relaxed);
+                GETDENTS_PRIME_ENTRIES.fetch_add(primed_entries, Ordering::Relaxed);
+                GETDENTS_PRIME_US.fetch_add(perf_elapsed_us(prime_start_us), Ordering::Relaxed);
+            }
         }
         written
     }
@@ -368,8 +553,22 @@ impl Ext4Inode {
         if self.file_type != VfsFileType::Directory {
             return None;
         }
+        #[cfg(feature = "io_perf_counters")]
+        DIR_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
         let ext4 = self.fs.ext4.lock();
-        ext4.ext4_dir_lookup(self.inode_num, name).map(|(inode_num, _de_type)| {
+        let result = ext4.ext4_dir_lookup_with_stats(self.inode_num, name);
+        #[cfg(feature = "io_perf_counters")]
+        match result.as_ref() {
+            Some((_inode_num, _de_type, blocks_scanned, dirents_scanned)) => {
+                DIR_LOOKUP_HITS.fetch_add(1, Ordering::Relaxed);
+                DIR_LOOKUP_BLOCKS_SCANNED.fetch_add(*blocks_scanned, Ordering::Relaxed);
+                DIR_LOOKUP_DIRENTS_SCANNED.fetch_add(*dirents_scanned, Ordering::Relaxed);
+            }
+            None => {
+                DIR_LOOKUP_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result.map(|(inode_num, _de_type, _blocks_scanned, _dirents_scanned)| {
             // Trust the inode's mode bits over the directory entry type.
             // A stale/corrupt d_type can otherwise turn a non-directory inode
             // into a cached "directory" and later panic inside ext4 dir helpers.
@@ -515,24 +714,36 @@ impl VfsNode for Ext4Inode {
         if self.file_type != VfsFileType::Directory {
             return Vec::new();
         }
+        #[cfg(feature = "io_perf_counters")]
+        LS_CALLS.fetch_add(1, Ordering::Relaxed);
         let ext4 = self.fs.ext4.lock();
-        ext4
+        let entries = ext4
             .ext4_dir_get_entries(self.inode_num)
             .into_iter()
             .map(|de| {
+                let inode_num = de.inode;
+                let name = de.get_name();
                 let dirent_type = Self::dirent_file_type(de.get_de_type());
                 let file_type = if dirent_type == VfsFileType::Unknown {
-                    Self::inode_file_type(&ext4, de.inode)
+                    Self::inode_file_type(&ext4, inode_num)
                 } else {
                     dirent_type
                 };
-                (de.get_name(), file_type)
+                self.cache_dir_entry(name.as_str(), inode_num, file_type);
+                (name, file_type)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        #[cfg(feature = "io_perf_counters")]
+        LS_ENTRIES.fetch_add(entries.len(), Ordering::Relaxed);
+        entries
     }
 
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
         self.ext4_getdents64(offset, buf)
+    }
+
+    fn prefer_native_getdents64(&self) -> bool {
+        true
     }
 
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {

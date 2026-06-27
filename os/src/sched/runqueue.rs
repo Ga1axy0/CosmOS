@@ -14,6 +14,7 @@ use crate::task::{
 use crate::timer::get_time_ns;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 use core::array;
 use lazy_static::*;
@@ -33,7 +34,7 @@ struct EnqueuedTaskInfo {
 fn running_cfs_vruntime_snapshot(hart: usize) -> Option<u64> {
     let task = processor_for_hart(normalize_hart(hart)).lock().current()?;
     let mut task_inner = task.inner_exclusive_access();
-    if !task_inner.sched.on_cpu
+    if !task.on_cpu.load(Ordering::Relaxed)
         || !matches!(task_inner.task_status, TaskStatus::Running)
         || !matches!(task_inner.sched.policy, SchedPolicy::Other)
     {
@@ -69,6 +70,24 @@ impl RunQueue {
             min_vruntime_ns: 0,
             stop_task: None,
         }
+    }
+
+    /// Raw pointer identities of every runnable task in this runqueue
+    /// (all RT levels + the CFS tree). `stop_task` is intentionally excluded:
+    /// it is a dying-task reference held for kernel-stack safety, not a
+    /// runnable entry. Debug invariant checker only.
+    #[cfg(feature = "sched_invariant_checks")]
+    pub(super) fn runnable_ptrs(&self) -> Vec<usize> {
+        let mut v = Vec::new();
+        for q in self.rt_queues.iter() {
+            for t in q.iter() {
+                v.push(Arc::as_ptr(t) as usize);
+            }
+        }
+        for t in self.cfs_tasks.values() {
+            v.push(Arc::as_ptr(t) as usize);
+        }
+        v
     }
 
     fn enqueue_locked(
@@ -389,7 +408,7 @@ fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
         return;
     };
     let mut task_inner = task.inner_exclusive_access();
-    if !task_inner.sched.on_cpu || !matches!(task_inner.task_status, TaskStatus::Running) {
+    if !task.on_cpu.load(Ordering::Relaxed) || !matches!(task_inner.task_status, TaskStatus::Running) {
         return;
     }
     let current_policy = task_inner.sched.policy;
@@ -481,7 +500,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
     let (affinity_mask, policy) = {
         let task_inner = task.inner_exclusive_access();
         if task_inner.sched.on_rq
-            || task_inner.sched.on_cpu
+            || task.on_cpu.load(Ordering::Relaxed)
             || matches!(task_inner.task_status, TaskStatus::Zombie)
         {
             return;
@@ -494,7 +513,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
         if task_inner.sched.on_rq
-            || task_inner.sched.on_cpu
+            || task.on_cpu.load(Ordering::Relaxed)
             || matches!(task_inner.task_status, TaskStatus::Zombie)
         {
             return;
@@ -517,7 +536,7 @@ fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool 
             TaskStatus::Interruptible | TaskStatus::Uninterruptible => {}
             TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return true,
         }
-        if task_inner.sched.on_rq || task_inner.sched.on_cpu {
+        if task_inner.sched.on_rq || task.on_cpu.load(Ordering::Relaxed) {
             task_inner.task_status = TaskStatus::Runnable;
             task_inner.wait_reason = None;
             task_inner.current_wq_handle = None;
@@ -562,7 +581,7 @@ fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.sched.on_rq = false;
         if matches!(task_inner.task_status, TaskStatus::Runnable) {
-            task_inner.sched.on_cpu = true;
+            task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.last_cpu = hart;
             drop(task_inner);
             return Some(task);
@@ -596,7 +615,7 @@ fn steal_cfs_task(target_hart: usize) -> Option<Arc<TaskControlBlock>> {
             if !matches!(task_inner.task_status, TaskStatus::Runnable) {
                 continue;
             }
-            task_inner.sched.on_cpu = true;
+            task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.last_cpu = target_hart;
             task_inner.sched.vruntime_ns = task_inner.sched.vruntime_ns.max(target_min);
             drop(task_inner);
@@ -626,22 +645,71 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     }
                     return true;
                 }
-                if task_inner.sched.on_cpu {
+                if task.on_cpu.load(Ordering::Relaxed) {
                     let last_cpu = normalize_hart(task_inner.sched.last_cpu);
                     let is_still_current = processor_for_hart(last_cpu)
                         .lock()
                         .current()
                         .is_some_and(|current| Arc::ptr_eq(&current, &task));
                     if is_still_current {
+                        // Task is still the running task on `last_cpu`: just mark
+                        // it Runnable without enqueueing. The running hart keeps it
+                        // on-CPU (and if it is about to block, its
+                        // `block_current_and_run_next` observes Runnable and skips
+                        // the switch). Enqueueing a running task would corrupt it.
                         drop(task_inner);
                         return wake_running_or_queued_task(&task);
                     }
-                    task_inner.sched.on_cpu = false;
-                    Some((
-                        last_cpu,
-                        task_inner.sched.cpu_affinity_mask,
-                        task_inner.sched.policy,
-                    ))
+                    // Transition window: `take_current_task()` already cleared
+                    // `processor.current` on `last_cpu`, but the context switch is
+                    // still in flight, so `on_cpu` is still true. It is cleared
+                    // post-switch by `finish_pending_task_release`, *after* the
+                    // task's registers are safely saved. Enqueueing now would let
+                    // another hart `__switch` into a half-saved context — the
+                    // confirmed SMP wake/block race. Snapshot the target fields
+                    // (stable across the transition), drop the lock, and spin
+                    // until the owning hart finishes the switch, then enqueue. The
+                    // wait is bounded: `finish_pending_task_release` runs as the
+                    // very next step after that hart returns to its idle loop.
+                    let affinity_mask = task_inner.sched.cpu_affinity_mask;
+                    let policy = task_inner.sched.policy;
+                    drop(task_inner);
+                    // Defensive tripwire. The deferred release of `on_cpu` is
+                    // owned by `last_cpu`; if that is THIS hart, the only thing
+                    // that can clear `on_cpu` (`finish_pending_task_release`,
+                    // run when this hart next reaches its idle loop) cannot make
+                    // progress while we execute here — so the spin below would
+                    // never terminate. That is exactly the cyclictest
+                    // self-deadlock: a timer hardirq on the owning hart woke the
+                    // half-blocked task and spun on its still-set `on_cpu`. The
+                    // block/suspend transition is now kept IRQ-atomic, which
+                    // makes this state unreachable; panic loudly if it ever
+                    // recurs so it is debuggable instead of a silent 100%-CPU
+                    // hang.
+                    if last_cpu == normalize_hart(hartid()) {
+                        panic!(
+                            "[sched] wakeup_task: task {:#x} is mid-block (on_cpu set) with \
+                             last_cpu={} == this hart {} — the deferred `on_cpu` release cannot \
+                             complete while we run here; this should be unreachable now that the \
+                             block/suspend transition is IRQ-atomic",
+                            Arc::as_ptr(&task) as usize,
+                            last_cpu,
+                            hartid(),
+                        );
+                    }
+                    // Lock-free spin: pair with the `Release` store in
+                    // `finish_pending_task_release`. Seeing on_cpu==false means
+                    // the owning hart has finished saving this task's context, so
+                    // it is safe for us to enqueue it (and for another hart to
+                    // later switch into it).
+                    while task.on_cpu.load(Ordering::Acquire) {
+                        core::hint::spin_loop();
+                    }
+                    // `enqueue_wakeup_task` re-validates on_rq/on_cpu under the
+                    // runqueue+task locks, so a task that was re-picked (on_cpu
+                    // flipped back to true) or already woken by a rival (on_rq)
+                    // during the spin is handled safely.
+                    Some((last_cpu, affinity_mask, policy))
                 } else {
                     Some((
                         task_inner.sched.last_cpu,
@@ -658,6 +726,94 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
         return enqueue_wakeup_task(task, target_hart);
     }
     true
+}
+
+/// Debug-only scheduler invariant checker.
+///
+/// Snapshots, under all-at-once locking (every `PROCESSORS` then every
+/// `RUN_QUEUES`, in hart order), the identity of each hart's current task and
+/// every runnable task in every runqueue, then verifies three invariants whose
+/// violation is the signature of the SMP wake/block race in
+/// `block_current_and_run_next` / `wakeup_task`:
+///
+/// 0. A task is `current` on at most one hart (no double-run).
+/// 1. No `current` task is simultaneously present in any runqueue
+///    (running + on-rq).
+/// 2. No task is enqueued twice across runqueues (double-enqueue / leaked
+///    node after a raced block).
+///
+/// `SpinNoIrqLock` keeps SIE disabled on the calling hart for the whole
+/// snapshot, so no task can move between containers while we observe, and the
+/// caller cannot be preempted mid-scan. No task-inner locks are taken, so this
+/// cannot deadlock against paths that take processor/runqueue locks.
+#[cfg(feature = "sched_invariant_checks")]
+pub(crate) fn check_sched_invariants() {
+    use super::processor::PROCESSORS;
+
+    let proc_guards: Vec<_> = (0..MAX_HARTS)
+        .map(|h| PROCESSORS[h].lock())
+        .collect();
+    let currents: Vec<Option<usize>> = (0..MAX_HARTS)
+        .map(|h| proc_guards[h].current_ptr())
+        .collect();
+
+    let rq_guards: Vec<_> = (0..MAX_HARTS)
+        .map(|h| RUN_QUEUES[h].lock())
+        .collect();
+    // (owning_hart, task_ptr) for every runnable entry across all runqueues.
+    let mut all_runnable: Vec<(usize, usize)> = Vec::new();
+    for h in 0..MAX_HARTS {
+        for ptr in rq_guards[h].runnable_ptrs() {
+            all_runnable.push((h, ptr));
+        }
+    }
+    drop(proc_guards);
+    drop(rq_guards);
+
+    // Invariant 0: a task is current on at most one hart.
+    for a in 0..MAX_HARTS {
+        let Some(pa) = currents[a] else {
+            continue;
+        };
+        for b in (a + 1)..MAX_HARTS {
+            if currents[b] == Some(pa) {
+                panic!(
+                    "[sched-inv] task {:#x} is current on BOTH hart {} and hart {} (double-run)",
+                    pa, a, b
+                );
+            }
+        }
+    }
+
+    // Invariant 1: no current task is present in any runqueue.
+    for h in 0..MAX_HARTS {
+        let Some(p) = currents[h] else {
+            continue;
+        };
+        for (rh, ptr) in all_runnable.iter() {
+            if *ptr == p {
+                panic!(
+                    "[sched-inv] task {:#x} is current on hart {} AND enqueued on runqueue {} \
+                     (running + on-rq: a wakeup enqueued a task that was still current)",
+                    p, h, rh
+                );
+            }
+        }
+    }
+
+    // Invariant 2: no task is enqueued twice across runqueues.
+    let n = all_runnable.len();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if all_runnable[i].1 == all_runnable[j].1 {
+                panic!(
+                    "[sched-inv] task {:#x} enqueued TWICE (runqueue {} and runqueue {}) \
+                     (double-enqueue / leaked node after a raced block)",
+                    all_runnable[i].1, all_runnable[i].0, all_runnable[j].0
+                );
+            }
+        }
+    }
 }
 
 /// Remove a task from all local runqueues.

@@ -23,7 +23,9 @@ const KERNEL_HEAP_RECLAIM_TARGET_FREE: usize = 4 * 1024 * 1024;
 const KERNEL_HEAP_RECLAIM_MAX_PAGES_PER_CALL: usize = 4096;
 const HEAP_ORDER_COUNT: usize = 32;
 
-/// Bytes of virtual heap space currently backed by physical pages.
+/// Total capacity of the kernel heap in bytes, grown on demand in fixed
+/// `KERNEL_HEAP_GROW_SIZE` increments. Compare with [`KERNEL_HEAP_USED_BYTES`]
+/// to gauge internal allocator fragmentation.
 pub static KERNEL_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Approximate live heap usage (sum of `Layout::size()` on alloc minus dealloc).
 /// Tracks application-level demand; compare with [`KERNEL_HEAP_BYTES`] to gauge

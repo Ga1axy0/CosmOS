@@ -58,6 +58,8 @@ bitflags! {
         const LOADING = 1 << 3;
         /// 当前正在从 page cache 中摘除。
         const EVICTING = 1 << 4;
+        /// 当前已经挂在全局 inactive 队列中。
+        const INACTIVE_QUEUED = 1 << 5;
     }
 }
 
@@ -205,6 +207,21 @@ pub struct PageCacheManager {
     pub low_watermark: usize,
 }
 
+/// Snapshot of the global page-cache state relevant to long-run drift.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageCacheStats {
+    /// Number of cached file pages.
+    pub cached_pages: usize,
+    /// Number of queued inactive-page candidates, including stale duplicates.
+    pub inactive_entries: usize,
+    /// Number of live cached-file mappings.
+    pub mappings: usize,
+    /// Page-count threshold that starts reclaim.
+    pub high_watermark: usize,
+    /// Page-count threshold that stops reclaim.
+    pub low_watermark: usize,
+}
+
 impl PageCacheManager {
     /// 创建新的全局 page cache 管理器。
     fn new() -> Self {
@@ -223,6 +240,98 @@ lazy_static! {
     /// 全局 page cache 管理器。
     pub static ref PAGE_CACHE_MANAGER: SpinNoIrqLock<PageCacheManager> =
         SpinNoIrqLock::new(PageCacheManager::new());
+}
+
+/// Return the current page-cache footprint and metadata queue sizes.
+pub fn page_cache_stats() -> PageCacheStats {
+    let manager = PAGE_CACHE_MANAGER.lock();
+    PageCacheStats {
+        cached_pages: manager.cached_pages,
+        inactive_entries: manager.inactive.len(),
+        mappings: manager.mappings.len(),
+        high_watermark: manager.high_watermark,
+        low_watermark: manager.low_watermark,
+    }
+}
+
+fn inactive_compact_threshold(cached_pages: usize) -> usize {
+    cached_pages
+        .saturating_mul(2)
+        .saturating_add(256)
+        .max(1024)
+}
+
+fn compact_inactive_queue_if_needed() {
+    let should_compact = {
+        let manager = PAGE_CACHE_MANAGER.lock();
+        manager.inactive.len() > inactive_compact_threshold(manager.cached_pages)
+    };
+    if should_compact {
+        compact_inactive_queue();
+    }
+}
+
+fn compact_inactive_queue() {
+    let mut old_queue = {
+        let mut manager = PAGE_CACHE_MANAGER.lock();
+        core::mem::take(&mut manager.inactive)
+    };
+    if old_queue.is_empty() {
+        return;
+    }
+
+    let mut rebuilt = VecDeque::new();
+    let mut seen_pages = BTreeSet::new();
+    while let Some(weak) = old_queue.pop_front() {
+        let Some(page) = weak.upgrade() else {
+            continue;
+        };
+        let page_ptr = Arc::as_ptr(&page) as usize;
+        if !seen_pages.insert(page_ptr) {
+            continue;
+        }
+        let page_guard = page.lock();
+        if page_guard.state.contains(CachePageState::INACTIVE_QUEUED) {
+            rebuilt.push_back(Arc::downgrade(&page));
+        }
+    }
+
+    let mut manager = PAGE_CACHE_MANAGER.lock();
+    rebuilt.extend(core::mem::take(&mut manager.inactive));
+    manager.inactive = rebuilt;
+}
+
+fn enqueue_inactive_page(page: &Arc<SpinNoIrqLock<CachePage>>) {
+    {
+        let mut page_guard = page.lock();
+        if page_guard.state.contains(CachePageState::INACTIVE_QUEUED) {
+            return;
+        }
+        page_guard.state.insert(CachePageState::INACTIVE_QUEUED);
+    }
+
+    let should_compact = {
+        let mut manager = PAGE_CACHE_MANAGER.lock();
+        manager.inactive.push_back(Arc::downgrade(page));
+        manager.inactive.len() > inactive_compact_threshold(manager.cached_pages)
+    };
+    if should_compact {
+        compact_inactive_queue();
+    }
+}
+
+fn pop_inactive_page() -> Option<Arc<SpinNoIrqLock<CachePage>>> {
+    loop {
+        let candidate = {
+            let mut manager = PAGE_CACHE_MANAGER.lock();
+            manager.inactive.pop_front()
+        }?;
+        let Some(page) = candidate.upgrade() else {
+            continue;
+        };
+        page.lock().state.remove(CachePageState::INACTIVE_QUEUED);
+        return Some(page);
+    }
 }
 
 /// 判断一个 inode 当前是否适合进入 page cache。
@@ -488,6 +597,9 @@ pub fn discard_inode(inode: &Arc<Inode>) {
         manager.cached_pages = manager.cached_pages.saturating_sub(removed_pages);
         manager.mappings.remove(&InodeKey::from_inode(inode));
     }
+    if removed_pages > 0 {
+        compact_inactive_queue_if_needed();
+    }
 }
 
 /// 返回指定页对应的 cache page；供后续 `mmap` 缺页路径复用。
@@ -746,6 +858,9 @@ fn truncate_mapping(
         let mut manager = PAGE_CACHE_MANAGER.lock();
         manager.cached_pages = manager.cached_pages.saturating_sub(removed_pages);
     }
+    if removed_pages > 0 {
+        compact_inactive_queue_if_needed();
+    }
 
     if new_size < old_size && new_size > 0 {
         let tail_page = mapping.lock().pages.get(&new_tail_idx).cloned();
@@ -870,13 +985,13 @@ fn get_or_create_page(
 
     let mut manager = PAGE_CACHE_MANAGER.lock();
     manager.cached_pages += 1;
-    manager.inactive.push_back(Arc::downgrade(&page));
     trace!(
         "[page_cache] page miss: page_idx={} cached_pages={}",
         page_idx,
         manager.cached_pages
     );
     drop(manager);
+    enqueue_inactive_page(&page);
     Ok(page)
 }
 
@@ -1379,44 +1494,34 @@ fn run_reclaim_pass(scan_budget: usize) -> ReclaimPassStats {
 /// - `Skipped`：本轮遇到忙页/失效项等，无实质进展；
 /// - `Stop`：当前没有必要或无法继续扫描，外层应停止本轮 direct reclaim。
 fn reclaim_one() -> ReclaimStep {
-    let candidate = {
-        let mut manager = PAGE_CACHE_MANAGER.lock();
+    let page = {
+        let manager = PAGE_CACHE_MANAGER.lock();
         if manager.cached_pages <= manager.low_watermark {
             return ReclaimStep::Stop;
         }
-        manager.inactive.pop_front()
+        drop(manager);
+        pop_inactive_page()
     };
-    let Some(candidate) = candidate else {
+    let Some(page) = page else {
         return ReclaimStep::Stop;
-    };
-    let Some(page) = candidate.upgrade() else {
-        return ReclaimStep::Skipped;
     };
 
     {
         let mut page_guard = page.lock();
-        let page_idx = page_guard.index;
         if page_guard.pin_count > 0
             || page_guard.map_count > 0
             || page_guard.state.intersects(
                 CachePageState::LOADING | CachePageState::WRITEBACK | CachePageState::EVICTING,
             )
         {
-            let pin_count = page_guard.pin_count;
-            let map_count = page_guard.map_count;
-            let state_bits = page_guard.state.bits();
-            PAGE_CACHE_MANAGER
-                .lock()
-                .inactive
-                .push_back(Arc::downgrade(&page));
+            drop(page_guard);
+            enqueue_inactive_page(&page);
             return ReclaimStep::Skipped;
         }
         if page_guard.ref_bit {
             page_guard.ref_bit = false;
-            PAGE_CACHE_MANAGER
-                .lock()
-                .inactive
-                .push_back(Arc::downgrade(&page));
+            drop(page_guard);
+            enqueue_inactive_page(&page);
             return ReclaimStep::Deferred;
         }
         if page_guard.state.contains(CachePageState::DIRTY) {
@@ -1431,10 +1536,7 @@ fn reclaim_one() -> ReclaimStep {
             } else {
                 Ok(())
             };
-            PAGE_CACHE_MANAGER
-                .lock()
-                .inactive
-                .push_back(Arc::downgrade(&page));
+            enqueue_inactive_page(&page);
             return if flush_result.is_ok() {
                 ReclaimStep::Deferred
             } else {
@@ -1469,10 +1571,7 @@ fn reclaim_one() -> ReclaimStep {
         ReclaimStep::Reclaimed
     } else {
         page.lock().state.remove(CachePageState::EVICTING);
-        PAGE_CACHE_MANAGER
-            .lock()
-            .inactive
-            .push_back(Arc::downgrade(&page));
+        enqueue_inactive_page(&page);
         ReclaimStep::Skipped
     }
 }

@@ -159,7 +159,7 @@ fn log_detailed_oom() {
                 inner_tid,
                 task_inner.task_status,
                 task_inner.wait_reason,
-                task_inner.sched.on_cpu,
+                task.on_cpu.load(Ordering::Relaxed),
                 task_inner.sched.on_rq,
                 task_inner.sched.policy,
                 task_inner.pending_signals.bits(),

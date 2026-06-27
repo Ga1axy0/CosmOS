@@ -10,12 +10,13 @@ use core::ptr;
 
 use user_lib::{
     chdir, close, exec_ptr, exit, fork, fstatat, getdents64, link, mkdir, open, unlink, waitpid,
-    write,
+    read, write,
     OpenFlags, Stat,
 };
 
 const EEXIST: isize = -17;
 const ENOENT: isize = -2;
+const EXDEV: isize = -18;
 
 const BIN_DIR: &str = "/bin";
 const BIN_DIR_CSTR: &str = "/bin\0";
@@ -35,8 +36,24 @@ const HOME_DIR: &str = "/home";
 const ROOT_HOME_DIR: &str = "/root";
 const TMP_DIR: &str = "/tmp";
 const LIB_AR: &str = "/lib/ar";
+const MNT_MUSL_LIB_DIR: &str = "/mnt/musl/lib";
+const MNT_GLIBC_LIB_DIR: &str = "/mnt/glibc/lib";
+const MNT_MUSL_BUSYBOX_PATH: &str = "/mnt/musl/busybox";
+const MNT_GLIBC_BUSYBOX_PATH: &str = "/mnt/glibc/busybox";
+const MNT_MUSL_AR: &str = "/mnt/musl/lib/ar";
+const MNT_GLIBC_AR: &str = "/mnt/glibc/lib/ar";
+const MNT_MUSL_LTPROOT: &str = "/mnt/musl/ltp";
+const MNT_GLIBC_LTPROOT: &str = "/mnt/glibc/ltp";
+const MNT_MUSL_LTP_ENV_SH: &str = "/mnt/musl/ltp_env.sh";
+const MNT_GLIBC_LTP_ENV_SH: &str = "/mnt/glibc/ltp_env.sh";
+#[cfg(target_arch = "riscv64")]
 const MUSL_AR: &str = "/usr/lib/riscv64-linux-musl/ar";
+#[cfg(target_arch = "riscv64")]
 const GLIBC_AR: &str = "/lib/riscv64-linux-gnu/ar";
+#[cfg(target_arch = "loongarch64")]
+const MUSL_AR: &str = "/usr/lib/loongarch64-linux-musl/ar";
+#[cfg(target_arch = "loongarch64")]
+const GLIBC_AR: &str = "/lib/loongarch64-linux-gnu/ar";
 const MUSL_LEGACY_AR: &str = "/musl/lib/ar";
 const GLIBC_LEGACY_AR: &str = "/glibc/lib/ar";
 const USR_DIR: &str = "/usr";
@@ -232,6 +249,9 @@ fn ensure_hard_link(src: &str, dst: &str) -> bool {
     if link_ret == 0 || link_ret == EEXIST {
         return true;
     }
+    if link_ret == EXDEV {
+        return copy_file(src, dst);
+    }
     println!("[setupsh] link {} -> {} failed: {}", dst, src, link_ret);
     false
 }
@@ -243,6 +263,10 @@ fn optional_hard_link(src: &str, dst: &str) {
     }
     let link_ret = link(src, dst);
     if link_ret == 0 || link_ret == EEXIST || link_ret == ENOENT {
+        return;
+    }
+    if link_ret == EXDEV {
+        let _ = copy_file(src, dst);
         return;
     }
     println!(
@@ -265,6 +289,69 @@ fn remove_if_exists(path: &str) -> bool {
 
 fn first_existing_path<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
     candidates.iter().copied().find(|path| path_exists(path))
+}
+
+fn preferred_path<'a>(candidates: &'a [&'a str]) -> &'a str {
+    first_existing_path(candidates).unwrap_or(candidates[0])
+}
+
+fn copy_file(src: &str, dst: &str) -> bool {
+    let src_fd = open(src, OpenFlags::RDONLY);
+    if src_fd < 0 {
+        println!("[setupsh] open {} failed: {}", src, src_fd);
+        return false;
+    }
+
+    let dst_fd = open(
+        dst,
+        OpenFlags::WRONLY | OpenFlags::CREATE | OpenFlags::TRUNC,
+    );
+    if dst_fd < 0 {
+        println!("[setupsh] open {} for write failed: {}", dst, dst_fd);
+        close(src_fd as usize);
+        return false;
+    }
+
+    let mut ok = true;
+    let mut buf = [0u8; DENTS_BUF_SIZE];
+    loop {
+        let nread = read(src_fd as usize, &mut buf);
+        if nread < 0 {
+            println!("[setupsh] read {} failed: {}", src, nread);
+            ok = false;
+            break;
+        }
+        if nread == 0 {
+            break;
+        }
+
+        let mut written = 0usize;
+        let total = nread as usize;
+        while written < total {
+            let ret = write(dst_fd as usize, &buf[written..total]);
+            if ret <= 0 {
+                println!("[setupsh] write {} failed: {}", dst, ret);
+                ok = false;
+                break;
+            }
+            written += ret as usize;
+        }
+        if !ok {
+            break;
+        }
+    }
+
+    let src_close = close(src_fd as usize);
+    if src_close != 0 {
+        println!("[setupsh] close {} failed: {}", src, src_close);
+        ok = false;
+    }
+    let dst_close = close(dst_fd as usize);
+    if dst_close != 0 {
+        println!("[setupsh] close {} failed: {}", dst, dst_close);
+        ok = false;
+    }
+    ok
 }
 
 /// 拼接目录与文件名，返回完整路径。
@@ -531,9 +618,14 @@ fn ltp_env_script(ltproot: &str) -> String {
 }
 
 fn install_ltp_env_scripts() -> bool {
+    let musl_ltproot = preferred_path(&[MNT_MUSL_LTPROOT, MUSL_LTPROOT]);
+    let glibc_ltproot = preferred_path(&[MNT_GLIBC_LTPROOT, GLIBC_LTPROOT]);
     let scripts = [
-        (MUSL_LTP_ENV_SH, MUSL_LTPROOT),
-        (GLIBC_LTP_ENV_SH, GLIBC_LTPROOT),
+        (preferred_path(&[MNT_MUSL_LTP_ENV_SH, MUSL_LTP_ENV_SH]), musl_ltproot),
+        (
+            preferred_path(&[MNT_GLIBC_LTP_ENV_SH, GLIBC_LTP_ENV_SH]),
+            glibc_ltproot,
+        ),
     ];
 
     for (path, ltproot) in scripts {
@@ -546,10 +638,13 @@ fn install_ltp_env_scripts() -> bool {
 }
 
 fn install_busybox_entries() -> bool {
-    if !ensure_hard_link(MUSL_BUSYBOX_PATH, BIN_BUSYBOX) {
+    let musl_busybox = preferred_path(&[MNT_MUSL_BUSYBOX_PATH, MUSL_BUSYBOX_PATH]);
+    let glibc_busybox = preferred_path(&[MNT_GLIBC_BUSYBOX_PATH, GLIBC_BUSYBOX_PATH]);
+
+    if !ensure_hard_link(musl_busybox, BIN_BUSYBOX) {
         return false;
     }
-    if !ensure_hard_link(GLIBC_BUSYBOX_PATH, GLIBC_BUSYBOX_TARGET) {
+    if !ensure_hard_link(glibc_busybox, GLIBC_BUSYBOX_TARGET) {
         return false;
     }
     optional_hard_link(BIN_BUSYBOX, ROOT_BUSYBOX);
@@ -592,8 +687,8 @@ fn install_busybox_applets() -> bool {
 }
 
 fn install_ltp_helper_commands() -> bool {
-    let musl_ar = first_existing_path(&[LIB_AR, MUSL_AR, MUSL_LEGACY_AR]);
-    let glibc_ar = first_existing_path(&[LIB_AR, GLIBC_AR, GLIBC_LEGACY_AR]);
+    let musl_ar = first_existing_path(&[LIB_AR, MUSL_AR, MNT_MUSL_AR, MUSL_LEGACY_AR]);
+    let glibc_ar = first_existing_path(&[LIB_AR, GLIBC_AR, MNT_GLIBC_AR, GLIBC_LEGACY_AR]);
 
     for (src, dst) in [
         (
@@ -655,18 +750,20 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
     print_step(
         2,
         TOTAL_STEPS,
-        "install musl runtime into /usr/lib/riscv64-linux-musl",
+        "install musl runtime into Linux multiarch directories",
     );
-    if !install_runtime_libs(MUSL_LEGACY_LIB_DIR, MUSL_LIB_DIR) {
+    let musl_src_dir = preferred_path(&[MNT_MUSL_LIB_DIR, MUSL_LEGACY_LIB_DIR]);
+    if !install_runtime_libs(musl_src_dir, MUSL_LIB_DIR) {
         return 1;
     }
 
     print_step(
         3,
         TOTAL_STEPS,
-        "install glibc runtime into /lib/riscv64-linux-gnu",
+        "install glibc runtime into Linux multiarch directories",
     );
-    if !install_runtime_libs(GLIBC_LEGACY_LIB_DIR, GLIBC_LIB_DIR) {
+    let glibc_src_dir = preferred_path(&[MNT_GLIBC_LIB_DIR, GLIBC_LEGACY_LIB_DIR]);
+    if !install_runtime_libs(glibc_src_dir, GLIBC_LIB_DIR) {
         return 1;
     }
 

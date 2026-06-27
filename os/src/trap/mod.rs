@@ -432,10 +432,14 @@ pub fn trap_handler() -> ! {
             let _hardirq = irq::HardIrqGuard::enter();
             // trace!("hart {} timer tick", hartid());
             if handle_timer_interrupt() {
-                let now_raw = get_time();
-                check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                crate::net::poll_timer_tick();
-                on_timer_tick();
+                crate::probe!({
+                    let now_raw = get_time();
+                    check_itimers_of_all_processes(now_raw, get_realtime_ns());
+                    crate::net::poll();
+                    #[cfg(feature = "mm_perf_counters")]
+                    crate::perf_sampler::on_tick(now_raw);
+                    on_timer_tick();
+                }, "trap.user_timer_periodic");
             }
         }
         TrapCause::SoftwareInterrupt => {
@@ -499,14 +503,18 @@ pub fn trap_from_kernel() {
         TrapCause::TimerInterrupt => {
             // trace!("hart {} timer tick", hartid());
             if handle_timer_interrupt() {
-                let now_raw = get_time();
-                check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                crate::net::poll_timer_tick();
-                // Account CPU time spent while the current task executes in kernel
-                // context as part of its RR quantum as well. This matches Linux's
-                // "running on CPU" notion more closely than charging only
-                // user-mode ticks.
-                on_timer_tick();
+                crate::probe!({
+                    let now_raw = get_time();
+                    check_itimers_of_all_processes(now_raw, get_realtime_ns());
+                    crate::net::poll();
+                    #[cfg(feature = "mm_perf_counters")]
+                    crate::perf_sampler::on_tick(now_raw);
+                    // Account CPU time spent while the current task executes in kernel
+                    // context as part of its RR quantum as well. This matches Linux's
+                    // "running on CPU" notion more closely than charging only
+                    // user-mode ticks.
+                    on_timer_tick();
+                }, "trap.kernel_timer_periodic");
             }
         }
         TrapCause::SoftwareInterrupt => {

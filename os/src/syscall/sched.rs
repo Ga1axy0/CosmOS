@@ -1,6 +1,7 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::utils::read_bytes_from_user;
 use crate::syscall::{read_pod_from_user, write_bytes_to_user, write_pod_to_user, Pod};
+use core::sync::atomic::Ordering;
 use crate::syscall_body;
 use crate::{
     config::MAX_HARTS,
@@ -143,7 +144,7 @@ fn resched_task_if_running(task: &Arc<crate::task::TaskControlBlock>, is_current
         is_current || current_task().is_some_and(|current| Arc::ptr_eq(&current, task));
     let running_hart = {
         let task_inner = task.inner_exclusive_access();
-        if !task_inner.sched.on_cpu {
+        if !task.on_cpu.load(Ordering::Relaxed) {
             return;
         }
         if target_is_current {
@@ -278,7 +279,7 @@ fn apply_sched_attr_to_task(
         let task_inner = task.inner_exclusive_access();
         (
             task_inner.sched.on_rq,
-            task_inner.sched.on_cpu,
+            task.on_cpu.load(Ordering::Relaxed),
             task_inner.sched.last_cpu,
             task_inner.sched.policy,
             task_inner.sched.rt_priority,
@@ -375,7 +376,7 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
             let task_inner = task.inner_exclusive_access();
             (
                 task_inner.sched.on_rq,
-                task_inner.sched.on_cpu,
+                task.on_cpu.load(Ordering::Relaxed),
                 task_inner.sched.last_cpu,
                 task_inner.sched.policy,
                 task_inner.sched.rt_priority,
@@ -569,7 +570,7 @@ pub fn sys_setpriority(which: i32, who: usize, prio: i32) -> isize {
                 let task_inner = task.inner_exclusive_access();
                 (
                     task_inner.sched.on_rq,
-                    task_inner.sched.on_cpu,
+                    task.on_cpu.load(Ordering::Relaxed),
                     task_inner.sched.last_cpu,
                 )
             };
@@ -623,7 +624,7 @@ pub fn sys_sched_setaffinity(pid: isize, cpusetsize: usize, mask: *const u8) -> 
             let task_inner = task.inner_exclusive_access();
             (
                 task_inner.sched.on_rq,
-                task_inner.sched.on_cpu,
+                task.on_cpu.load(Ordering::Relaxed),
                 task_inner.sched.last_cpu,
                 affinity_mask
                     & (1usize << task_inner.sched.last_cpu.min(MAX_HARTS.saturating_sub(1)))
