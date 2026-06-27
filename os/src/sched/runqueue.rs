@@ -674,6 +674,29 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     let affinity_mask = task_inner.sched.cpu_affinity_mask;
                     let policy = task_inner.sched.policy;
                     drop(task_inner);
+                    // Defensive tripwire. The deferred release of `on_cpu` is
+                    // owned by `last_cpu`; if that is THIS hart, the only thing
+                    // that can clear `on_cpu` (`finish_pending_task_release`,
+                    // run when this hart next reaches its idle loop) cannot make
+                    // progress while we execute here — so the spin below would
+                    // never terminate. That is exactly the cyclictest
+                    // self-deadlock: a timer hardirq on the owning hart woke the
+                    // half-blocked task and spun on its still-set `on_cpu`. The
+                    // block/suspend transition is now kept IRQ-atomic, which
+                    // makes this state unreachable; panic loudly if it ever
+                    // recurs so it is debuggable instead of a silent 100%-CPU
+                    // hang.
+                    if last_cpu == normalize_hart(hartid()) {
+                        panic!(
+                            "[sched] wakeup_task: task {:#x} is mid-block (on_cpu set) with \
+                             last_cpu={} == this hart {} — the deferred `on_cpu` release cannot \
+                             complete while we run here; this should be unreachable now that the \
+                             block/suspend transition is IRQ-atomic",
+                            Arc::as_ptr(&task) as usize,
+                            last_cpu,
+                            hartid(),
+                        );
+                    }
                     // Lock-free spin: pair with the `Release` store in
                     // `finish_pending_task_release`. Seeing on_cpu==false means
                     // the owning hart has finished saving this task's context, so

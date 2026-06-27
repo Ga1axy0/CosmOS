@@ -18,6 +18,15 @@ fn suspend_current_and_run_next_inner(
     rt_enqueue_head: Option<bool>,
 ) {
     current_process().pause_cpu_accounting(get_time());
+    // IRQ-atomic transition window — see `block_current_and_run_next` for the
+    // rationale. `take_current_task()` clears `processor.current` while
+    // `on_cpu` is only dropped later by `finish_pending_task_release()` after
+    // `__switch`; keep local interrupts disabled across that window so no
+    // same-hart hardirq can wake the half-suspended task. (The confirmed
+    // deadlock is the `Interruptible` case in `block_current_and_run_next`;
+    // this path marks the task `Runnable`, but we close the identical window
+    // for consistency and to guard against future regressions.)
+    let _irq = crate::hal::LocalIrqSave::new();
     let task = take_current_task().unwrap();
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
@@ -69,6 +78,20 @@ pub fn suspend_current_and_run_next_with_slice_reset(reset_slice: bool) {
 
 /// Make current task blocked and switch to the next task.
 pub fn block_current_and_run_next(reason: WaitReason) {
+    // IRQ-atomic transition window.
+    //
+    // `take_current_task()` clears `processor.current` but leaves the task's
+    // `on_cpu` set; it is only cleared later by `finish_pending_task_release()`
+    // once this hart returns to its idle loop after `__switch`. If a timer
+    // interrupt fires on THIS hart during that window, its handler calls
+    // `wakeup_task()` on the half-blocked task, which spins on `on_cpu` — and
+    // since the hart that must clear `on_cpu` is now pinned inside that very
+    // hardirq, the spin never ends (self-deadlock, 100% CPU). Keep local
+    // interrupts disabled across the whole `take_current_task() .. schedule()`
+    // window so no same-hart hardirq can observe the half-state. The guard
+    // restores the saved state on drop, including when the caller is resumed
+    // after the context switch.
+    let _irq = crate::hal::LocalIrqSave::new();
     let task = take_current_task().unwrap();
     let mut boost_same_process_cfs = false;
     let task_cx_ptr = {
