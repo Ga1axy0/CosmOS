@@ -120,6 +120,10 @@ impl RequestState {
 }
 
 impl BlockDevice for VirtIOBlock {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     /// Read a block from the virtio_blk device
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         self.read_blocks(block_id, buf);

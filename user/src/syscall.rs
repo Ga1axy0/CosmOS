@@ -29,6 +29,7 @@ pub const SYSCALL_FSTAT: usize = 80;
 pub const SYSCALL_SYNC: usize = 81;
 pub const SYSCALL_FSYNC: usize = 82;
 pub const SYSCALL_FDATASYNC: usize = 83;
+pub const SYSCALL_IOCTL: usize = 29;
 pub const SYSCALL_EXIT: usize = 93;
 pub const SYSCALL_SLEEP: usize = 101;
 pub const SYSCALL_GETITIMER: usize = 102;
@@ -215,6 +216,10 @@ pub fn sys_openat(dirfd: usize, path: &str, flags: u32, mode: u32) -> isize {
 
 pub fn sys_close(fd: usize) -> isize {
     syscall(SYSCALL_CLOSE, [fd, 0, 0])
+}
+
+pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
+    syscall(SYSCALL_IOCTL, [fd, req, arg])
 }
 
 pub fn sys_read(fd: usize, buffer: &mut [u8]) -> isize {

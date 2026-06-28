@@ -39,3 +39,4 @@ second-fat32.img
 bootloader/loongarch64-direct/target/*
 sdcard-la.img
 sdcard-rv.img.xz
+cosmos_docs
