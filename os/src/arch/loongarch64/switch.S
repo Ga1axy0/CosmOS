@@ -14,6 +14,19 @@ __switch:
     st.d $s7, $a0, 80
     st.d $s8, $a0, 88
 
+    # Save callee-saved FP regs $f24-$f31 into TaskContext.fs[0..7]
+    # (offsets 14*8..21*8). The struct already reserves these slots; without
+    # saving them, kernel-side FP state would leak across context switches.
+    # FPEN is always on (see hart.rs), so fst.d does not trap here.
+    fst.d $f24, $a0, 14*8
+    fst.d $f25, $a0, 15*8
+    fst.d $f26, $a0, 16*8
+    fst.d $f27, $a0, 17*8
+    fst.d $f28, $a0, 18*8
+    fst.d $f29, $a0, 19*8
+    fst.d $f30, $a0, 20*8
+    fst.d $f31, $a0, 21*8
+
     ld.d $ra, $a1, 0
     ld.d $sp, $a1, 8
     ld.d $fp, $a1, 16
@@ -26,4 +39,13 @@ __switch:
     ld.d $s6, $a1, 72
     ld.d $s7, $a1, 80
     ld.d $s8, $a1, 88
+    # Restore callee-saved FP regs $f24-$f31 from TaskContext.fs[0..7].
+    fld.d $f24, $a1, 14*8
+    fld.d $f25, $a1, 15*8
+    fld.d $f26, $a1, 16*8
+    fld.d $f27, $a1, 17*8
+    fld.d $f28, $a1, 18*8
+    fld.d $f29, $a1, 19*8
+    fld.d $f30, $a1, 20*8
+    fld.d $f31, $a1, 21*8
     jr    $ra

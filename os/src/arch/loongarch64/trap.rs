@@ -132,6 +132,33 @@ impl Pod for LoongArchMContext {}
 const _: [(); 272] = [(); core::mem::size_of::<LoongArchMContext>()];
 const _: [(); 16] = [(); core::mem::align_of::<LoongArchMContext>()];
 
+/// Floating-point context appended after `uc_mcontext` in the signal frame.
+///
+/// Unlike riscv64 (whose musl `mcontext_t` embeds FP state), LoongArch musl
+/// `mcontext_t` is only 272 bytes (pc + gregs + flags) and carries no FP. The
+/// kernel therefore appends this block after the musl-visible ucontext prefix.
+/// It is kernel-internal: the kernel both writes it (`build_ucontext`) and
+/// reads it (`restore_ucontext`), and musl never reaches past `uc_mcontext`, so
+/// the on-stack frame stays musl-compatible. `fcsr` holds the full FP CSR,
+/// including the 8 condition-code (FCC) bits in [31:25].
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy)]
+pub struct LoongArchFpuContext {
+    pub fpregs: [u64; 32],
+    pub fcsr: u32,
+}
+
+impl Default for LoongArchFpuContext {
+    fn default() -> Self {
+        Self {
+            fpregs: [0; 32],
+            fcsr: 0,
+        }
+    }
+}
+
+impl Pod for LoongArchFpuContext {}
+
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct LoongArchUContext {
@@ -141,11 +168,17 @@ pub struct LoongArchUContext {
     pub uc_sigmask: SigSetT,
     pub uc_pad: isize,
     pub uc_mcontext: LoongArchMContext,
+    /// Appended FP context — kernel-internal, beyond musl's `ucontext_t`.
+    pub fpstate: LoongArchFpuContext,
 }
 
 impl Pod for LoongArchUContext {}
 
-const _: [(); 448] = [(); core::mem::size_of::<LoongArchUContext>()];
+// musl's `ucontext_t` is exactly the prefix through `uc_mcontext` (448 bytes).
+// The appended `fpstate` is kernel-internal; this guards that no musl-visible
+// field shifts if the layout above ever changes.
+const _: () =
+    assert!(core::mem::offset_of!(LoongArchUContext, uc_mcontext) + 272 == 448);
 const _: [(); 16] = [(); core::mem::align_of::<LoongArchUContext>()];
 
 /// 用户态 `rt_sigreturn` trampoline 机器码。
@@ -324,6 +357,11 @@ impl SignalAbi for LoongArchSignalAbi {
         }
         gregs[0] = 0;
 
+        // Capture the user FP state so it survives the signal handler and is
+        // re-applied on rt_sigreturn (see restore_ucontext below).
+        let mut fpstate = LoongArchFpuContext::default();
+        trap_cx.copy_fp_state_to(&mut fpstate.fpregs, &mut fpstate.fcsr);
+
         Self::UContext {
             uc_flags: 0,
             uc_link: 0,
@@ -340,6 +378,7 @@ impl SignalAbi for LoongArchSignalAbi {
                 flags: 0,
                 _pad: 0,
             },
+            fpstate,
         }
     }
 
@@ -352,6 +391,10 @@ impl SignalAbi for LoongArchSignalAbi {
         for idx in 1..32 {
             trap_cx.set_reg(idx, ucontext.uc_mcontext.gregs[idx]);
         }
+        trap_cx.restore_fp_state(
+            &ucontext.fpstate.fpregs,
+            ucontext.fpstate.fcsr,
+        );
     }
 
     fn saved_pc(ucontext: &Self::UContext) -> usize {

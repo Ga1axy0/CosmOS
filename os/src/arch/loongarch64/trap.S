@@ -10,6 +10,12 @@
     .macro    LOAD_X n
     ld.d      $r\n, $sp, \n*8
     .endm
+    .macro    STORE_FP n
+    fst.d     $f\n, $sp, (38+\n)*8
+    .endm
+    .macro    LOAD_FP n
+    fld.d     $f\n, $sp, (38+\n)*8
+    .endm
     .globl __tlb_refill
     .balign 4096
 __tlb_refill:
@@ -53,10 +59,18 @@ __alltraps:
     st.d    $t1, $sp, 33*8
     st.d    $t2, $sp, 3*8
 
-    # Keep the first user-trap path free of FP instructions.
-    # LoongArch can trap on FP use when EUEN/FPU state is not fully prepared,
-    # and nested traps here corrupt the user trap frame before Rust sees it.
-    st.d    $zero, $sp, 70*8
+    # Save the user floating-point context into the trap frame: the 32 FP
+    # registers $f0-$f31 into frame.f[] (38*8..69*8) and fcsr into frame.fcsr
+    # (70*8). FPEN is enabled once at boot (see hart.rs) and never cleared, so
+    # these FP instructions do not trap on the user-trap path. Without this,
+    # FP state leaks across processes/syscalls -> NaN/garbage in FP programs.
+    .set    n, 0
+    .rept   32
+    STORE_FP %n
+    .set    n, n + 1
+    .endr
+    movfcsr2gr $t0, $fcsr0
+    st.d    $t0, $sp, 70*8
 
     ld.d    $tp, $sp, 34*8
     ld.d    $t0, $sp, 35*8
@@ -76,6 +90,15 @@ __restore:
     ld.d    $t1, $sp, 33*8
     csrwr   $t0, 0x1
     csrwr   $t1, 0x6
+    # Restore the user floating-point context (mirror of __alltraps). $t0 is a
+    # scratch here; it is reloaded from frame.r[12] by the GPR loop below.
+    ld.d    $t0, $sp, 70*8
+    movgr2fcsr $fcsr0, $t0
+    .set    n, 0
+    .rept   32
+    LOAD_FP %n
+    .set    n, n + 1
+    .endr
     ld.d    $ra, $sp, 1*8
     ld.d    $tp, $sp, 2*8
     .set    n, 4
