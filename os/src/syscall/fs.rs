@@ -7,6 +7,7 @@ use crate::fs::{
     sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat, do_bind_mount, do_move_mount,
     record_newfstatat_perf,
 };
+use crate::fs::devfs::BlockDevNode;
 use crate::fs::Pipe;
 use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
 use crate::net::UnixSocketPairEnd;
@@ -2813,8 +2814,8 @@ const BLKGETSIZE64_COMPAT: usize = 0x8004_1272;
 const BLKGETSIZE64: usize = 0x8008_1272;
 const BLKGETSIZE64_COMPAT_SIGNED: usize = 0xffff_ffff_8004_1272;
 const BLKGETSIZE64_SIGNED: usize = 0xffff_ffff_8008_1272;
-const DEFAULT_BLOCK_DEV_SIZE_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_BLOCK_SECTOR_SIZE: i32 = 512;
+const LOOP_SET_FD: usize = 0x4c00;
+const LOOP_CLR_FD: usize = 0x4c01;
 
 /// ioctl 系统调用：校验 fd 后转发到具体文件对象。
 pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
@@ -2825,31 +2826,25 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
-        let is_block_device = desc.stat().mode.contains(StatMode::BLOCK)
-            || desc.path().as_deref().is_some_and(|path| {
-                path.strip_prefix("/dev/")
-                    .is_some_and(|name| name.starts_with("vd"))
-            });
-        if is_block_device {
-            match req {
-                BLKGETSIZE => {
-                    let sectors = DEFAULT_BLOCK_DEV_SIZE_BYTES / 512;
-                    write_pod_to_user(arg as *mut usize, &(sectors as usize))?;
-                    return Ok(0);
+        if let Some(inode) = desc.as_inode() {
+            let vfs_node = inode.vfs_node();
+            if let Some(block) = vfs_node.as_any().downcast_ref::<BlockDevNode>() {
+                match req {
+                    LOOP_SET_FD => {
+                        let backing = get_file_description(arg)?;
+                        return block.attach_loop_read_only(backing);
+                    }
+                    LOOP_CLR_FD => return block.detach_loop(),
+                    BLKGETSIZE
+                    | BLKGETSIZE64
+                    | BLKGETSIZE64_COMPAT
+                    | BLKGETSIZE64_SIGNED
+                    | BLKGETSIZE64_COMPAT_SIGNED
+                    | BLKSSZGET
+                    | BLKFLSBUF
+                    | BLKRRPART => return desc.ioctl(req, arg),
+                    _ => {}
                 }
-                BLKGETSIZE64
-                | BLKGETSIZE64_COMPAT
-                | BLKGETSIZE64_SIGNED
-                | BLKGETSIZE64_COMPAT_SIGNED => {
-                    write_pod_to_user(arg as *mut u64, &DEFAULT_BLOCK_DEV_SIZE_BYTES)?;
-                    return Ok(0);
-                }
-                BLKSSZGET => {
-                    write_pod_to_user(arg as *mut i32, &DEFAULT_BLOCK_SECTOR_SIZE)?;
-                    return Ok(0);
-                }
-                BLKFLSBUF | BLKRRPART => return Ok(0),
-                _ => {}
             }
         }
         // 具体 request 语义由底层文件对象决定；当前大多数对象会返回 ENOTTY。

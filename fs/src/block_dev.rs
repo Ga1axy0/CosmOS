@@ -13,6 +13,8 @@ pub struct BlockWrite<'a> {
 }
 
 pub trait BlockDevice: Send + Sync + Any {
+    /// Return this block device as `Any` for downcasting.
+    fn as_any(&self) -> &dyn Any;
     /// Read a block from the block device.
     fn read_block(&self, block_id: usize, buf: &mut [u8]);
     /// Write a block to the block device.

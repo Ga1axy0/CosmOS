@@ -12,6 +12,10 @@ const BLOCK_SZ: usize = 512;
 struct BlockFile(Mutex<File>);
 
 impl BlockDevice for BlockFile {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         let mut file = self.0.lock().unwrap();
         file.seek(SeekFrom::Start((block_id * BLOCK_SZ) as u64))

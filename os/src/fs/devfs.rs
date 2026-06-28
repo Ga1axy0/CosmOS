@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use fs::vfs::{VfsFileType, VfsNode};
 use fs::{BlockDevice, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT};
 
-use super::{empty_statfs, StatFs64};
+use super::{empty_statfs, FileDescription, StatFs64};
 use crate::drivers::block::BLOCK_DEVICES;
 use crate::fs::{Stat, StatMode};
 use crate::mm::translated_ref;
@@ -42,7 +42,6 @@ const BLKGETSIZE64_COMPAT_SIGNED: usize = 0xffff_ffff_8004_1272;
 const BLKGETSIZE64_SIGNED: usize = 0xffff_ffff_8008_1272;
 const DEFAULT_BLOCK_DEV_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_BLOCK_SECTOR_SIZE: i32 = 512;
-const LOOP_SET_FD: usize = 0x4c00;
 const LOOP_CLR_FD: usize = 0x4c01;
 const LOOP_SET_STATUS: usize = 0x4c02;
 const LOOP_GET_STATUS: usize = 0x4c03;
@@ -62,6 +61,10 @@ impl SparseBlockDevice {
 }
 
 impl BlockDevice for SparseBlockDevice {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         assert_eq!(buf.len(), fs::BLOCK_SZ);
         let blocks = self.blocks.lock();
@@ -85,6 +88,99 @@ impl BlockDevice for SparseBlockDevice {
     }
 }
 
+struct LoopBacking {
+    file: Arc<FileDescription>,
+    size_bytes: u64,
+}
+
+/// Minimal single-device loop block device backed by a regular file.
+///
+/// This implementation intentionally keeps a single read-only backing file and
+/// exposes it as `/dev/loop0` without supporting offsets, sizelimits, or
+/// Linux's richer multi-device loop-management ABI.
+pub struct LoopBlockDevice {
+    backing: SpinNoIrqLock<Option<LoopBacking>>,
+}
+
+impl LoopBlockDevice {
+    /// Create an unattached loop device.
+    pub fn new() -> Self {
+        Self {
+            backing: SpinNoIrqLock::new(None),
+        }
+    }
+
+    /// Attach a readable regular file as the loop device's backing storage.
+    pub fn attach_read_only(&self, file: Arc<FileDescription>) -> Result<(), ERRNO> {
+        if !file.readable() || !file.is_seekable() {
+            return Err(ERRNO::EINVAL);
+        }
+        let stat = file.stat();
+        if stat.mode.bits() & StatMode::TYPE_MASK.bits() != StatMode::FILE.bits() {
+            return Err(ERRNO::EINVAL);
+        }
+        let size_bytes = u64::try_from(stat.size).map_err(|_| ERRNO::EINVAL)?;
+        let aligned_size = size_bytes / fs::BLOCK_SZ as u64 * fs::BLOCK_SZ as u64;
+        if aligned_size == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        let mut backing = self.backing.lock();
+        if backing.is_some() {
+            return Err(ERRNO::EBUSY);
+        }
+        *backing = Some(LoopBacking {
+            file,
+            size_bytes: aligned_size,
+        });
+        Ok(())
+    }
+
+    /// Detach the current backing file from the loop device.
+    pub fn detach(&self) -> Result<(), ERRNO> {
+        let mut backing = self.backing.lock();
+        if backing.take().is_none() {
+            return Err(ERRNO::ENXIO);
+        }
+        Ok(())
+    }
+
+    /// Return the currently configured byte length of the loop device.
+    pub fn configured_size_bytes(&self) -> Result<u64, ERRNO> {
+        self.backing
+            .lock()
+            .as_ref()
+            .map(|backing| backing.size_bytes)
+            .ok_or(ERRNO::ENXIO)
+    }
+}
+
+impl BlockDevice for LoopBlockDevice {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        assert_eq!(buf.len(), fs::BLOCK_SZ);
+        buf.fill(0);
+        let Some(backing) = self.backing.lock().as_ref().map(|backing| {
+            (Arc::clone(&backing.file), backing.size_bytes)
+        }) else {
+            return;
+        };
+        let (file, size_bytes) = backing;
+        let offset = block_id.saturating_mul(fs::BLOCK_SZ);
+        if offset >= size_bytes as usize {
+            return;
+        }
+        let max_len = (size_bytes as usize - offset).min(fs::BLOCK_SZ);
+        let _ = file.read_bytes_at(offset, &mut buf[..max_len]);
+    }
+
+    fn write_block(&self, _block_id: usize, _buf: &[u8]) {
+        warn!("loop0 is read-only; ignoring block write");
+    }
+}
+
 /// Register a sparse scratch block device for LTP mount-device tests.
 pub fn ensure_ltp_scratch_device() {
     let mut devices = BLOCK_DEVICES.lock();
@@ -93,10 +189,16 @@ pub fn ensure_ltp_scratch_device() {
         .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
     devices
         .entry(String::from("loop0"))
-        .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
+        .or_insert_with(|| Arc::new(LoopBlockDevice::new()) as Arc<dyn BlockDevice>);
     devices
         .entry(String::from("loop-control"))
         .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
+}
+
+fn loop_device_from_block(
+    device: &Arc<dyn BlockDevice>,
+) -> Option<&LoopBlockDevice> {
+    device.as_ref().as_any().downcast_ref::<LoopBlockDevice>()
 }
 
 fn devfs_statfs() -> StatFs64 {
@@ -328,11 +430,33 @@ impl BlockDevNode {
         }
     }
 
+    fn size_bytes(&self) -> Result<u64, ERRNO> {
+        if let Some(loop_device) = loop_device_from_block(&self.device) {
+            loop_device.configured_size_bytes()
+        } else {
+            Ok(DEFAULT_BLOCK_DEV_SIZE_BYTES)
+        }
+    }
+
+    /// Attach a read-only regular file as this block node's loop backing.
+    pub fn attach_loop_read_only(&self, file: Arc<FileDescription>) -> Result<isize, ERRNO> {
+        let loop_device = loop_device_from_block(&self.device).ok_or(ERRNO::ENOTTY)?;
+        loop_device.attach_read_only(file)?;
+        Ok(0)
+    }
+
+    /// Detach any backing file currently attached to this loop block node.
+    pub fn detach_loop(&self) -> Result<isize, ERRNO> {
+        let loop_device = loop_device_from_block(&self.device).ok_or(ERRNO::ENOTTY)?;
+        loop_device.detach()?;
+        Ok(0)
+    }
+
     /// Handle Linux block-device ioctls.
     pub fn ioctl(&self, req: usize, arg: usize) -> Result<isize, ERRNO> {
         match req {
             BLKGETSIZE => {
-                let sectors = DEFAULT_BLOCK_DEV_SIZE_BYTES / 512;
+                let sectors = self.size_bytes()? / 512;
                 write_pod_to_user(arg as *mut usize, &(sectors as usize))?;
                 Ok(0)
             }
@@ -340,7 +464,8 @@ impl BlockDevNode {
             | BLKGETSIZE64_COMPAT
             | BLKGETSIZE64_SIGNED
             | BLKGETSIZE64_COMPAT_SIGNED => {
-                write_pod_to_user(arg as *mut u64, &DEFAULT_BLOCK_DEV_SIZE_BYTES)?;
+                let size_bytes = self.size_bytes()?;
+                write_pod_to_user(arg as *mut u64, &size_bytes)?;
                 Ok(0)
             }
             BLKSSZGET => {
@@ -349,7 +474,7 @@ impl BlockDevNode {
             }
             BLKFLSBUF | BLKRRPART => Ok(0),
             LOOP_CTL_GET_FREE => Ok(0),
-            LOOP_SET_FD | LOOP_SET_STATUS => Ok(0),
+            LOOP_SET_STATUS => Ok(0),
             LOOP_GET_STATUS | LOOP_CLR_FD => Err(ERRNO::ENXIO),
             _ => Err(ERRNO::ENOTTY),
         }
@@ -603,7 +728,7 @@ impl VfsNode for BlockDevNode {
     }
 
     fn size(&self) -> usize {
-        DEFAULT_BLOCK_DEV_SIZE_BYTES as usize
+        self.size_bytes().unwrap_or(0) as usize
     }
 
     fn ls(&self) -> Vec<(String, VfsFileType)> {

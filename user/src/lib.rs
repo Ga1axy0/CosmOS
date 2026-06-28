@@ -356,6 +356,10 @@ pub fn close(fd: usize) -> isize {
     sys_close(fd)
 }
 
+pub fn ioctl(fd: usize, req: usize, arg: usize) -> isize {
+    sys_ioctl(fd, req, arg)
+}
+
 pub fn fcntl(fd: usize, cmd: i32, arg: i32) -> isize {
     sys_fcntl(fd, cmd, arg)
 }

@@ -8,6 +8,10 @@ EXTRA_MIB="${EXTRA_MIB:-512}"
 MIN_SIZE_MIB="${MIN_SIZE_MIB:-1024}"
 LABEL="${LABEL:-COSMOSDISK}"
 MUSL_ARCH="${MUSL_ARCH:-riscv64}"
+LOOP_FAT32_ENABLE="${LOOP_FAT32_ENABLE:-1}"
+LOOP_FAT32_SIZE_MIB="${LOOP_FAT32_SIZE_MIB:-1}"
+LOOP_FAT32_GUEST_PATH="${LOOP_FAT32_GUEST_PATH:-root/loop-fat32.img}"
+LOOP_FAT32_MNT_DIR="${LOOP_FAT32_MNT_DIR:-root/loop-fat32-mnt}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 USER_APP_SRC_DIR="${USER_APP_SRC_DIR:-$PROJECT_ROOT/user/src/bin}"
@@ -26,6 +30,7 @@ require_tool truncate
 require_tool mktemp
 require_tool cp
 require_tool rm
+require_tool cargo
 
 if [ ! -d "$ROOTFS_DIR" ]; then
     echo "rootfs directory not found: $ROOTFS_DIR" >&2
@@ -79,6 +84,21 @@ fi
 
 if [ "$MUSL_ARCH" = "riscv64" ] && [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1" ]; then
     ln -sf libc.so "$STAGE_DIR/lib/ld-musl-riscv64-sf.so.1"
+fi
+
+if [ "$LOOP_FAT32_ENABLE" != "0" ]; then
+    LOOP_FAT32_HOST_PATH="$STAGE_DIR/$LOOP_FAT32_GUEST_PATH"
+    LOOP_FAT32_HOST_DIR="$(dirname "$LOOP_FAT32_HOST_PATH")"
+    LOOP_FAT32_SEED_DIR="$STAGE_DIR/.loop-fat32-seed"
+    mkdir -p "$LOOP_FAT32_HOST_DIR" "$STAGE_DIR/$LOOP_FAT32_MNT_DIR" "$LOOP_FAT32_SEED_DIR"
+    printf 'Minimal FAT32 seed for loop mount tests.\n' > "$LOOP_FAT32_SEED_DIR/README"
+    cargo run --manifest-path "$PROJECT_ROOT/fs-fuse/Cargo.toml" --release -- \
+        -s "$LOOP_FAT32_SEED_DIR" \
+        -t "$LOOP_FAT32_HOST_PATH" \
+        -f fat32 \
+        --size-mib "$LOOP_FAT32_SIZE_MIB"
+    rm -rf "$LOOP_FAT32_SEED_DIR"
+    echo "embedded FAT32 image at /$LOOP_FAT32_GUEST_PATH (${LOOP_FAT32_SIZE_MIB} MiB)"
 fi
 
 rootfs_mib="$(du -sm "$STAGE_DIR" | awk '{print $1}')"
