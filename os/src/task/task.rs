@@ -4,6 +4,7 @@ use super::id::{TaskUserRes, TaskUserResAlloc};
 use super::wait_queue::WaitQueueHandle;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, SigInfo, SignalBit, MAX_SIG};
 use crate::config::MAX_HARTS;
+use crate::fs::FileDescription;
 use crate::hal::traits::AddressSpaceToken;
 use crate::mm::MmError;
 use crate::mm::PhysPageNum;
@@ -12,6 +13,7 @@ use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
+use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicBool;
 
 const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
@@ -140,6 +142,8 @@ pub struct TaskControlBlock {
     pub process: Weak<ProcessControlBlock>,
     /// Kernel stack corresponding to PID
     pub kstack: KernelStack,
+    /// Current task's recent fd lookup cache.
+    recent_fd_cache: TaskFdCache,
     /// mutable
     inner: SpinNoIrqLock<TaskControlBlockInner>,
     /// Whether this task is currently running on a CPU. A lock-free atomic so a
@@ -160,6 +164,75 @@ impl TaskControlBlock {
         let process = self.process.upgrade().unwrap();
         let inner = process.inner_exclusive_access();
         inner.memory_set.token()
+    }
+
+    /// Return a recent fd lookup if the process fd table has not changed.
+    pub fn cached_file_description(
+        &self,
+        fd: usize,
+        generation: usize,
+    ) -> Option<Arc<FileDescription>> {
+        let cached = self.recent_fd_cache.load()?;
+        if cached.fd != fd || cached.generation != generation {
+            return None;
+        }
+        let desc = cached.desc.upgrade()?;
+        let process = self.process.upgrade()?;
+        if process.fd_table_generation() == generation {
+            Some(desc)
+        } else {
+            None
+        }
+    }
+
+    /// Remember the last successful fd lookup without extending its lifetime.
+    pub fn remember_file_description(
+        &self,
+        fd: usize,
+        generation: usize,
+        desc: &Arc<FileDescription>,
+    ) {
+        self.recent_fd_cache.store(Some(RecentFdCache {
+            fd,
+            generation,
+            desc: Arc::downgrade(desc),
+        }));
+    }
+}
+
+/// Task-local weak cache for the most recent fd lookup.
+#[derive(Clone)]
+pub struct RecentFdCache {
+    pub fd: usize,
+    pub generation: usize,
+    pub desc: Weak<FileDescription>,
+}
+
+/// Lock-free cache used only by the task that is currently running.
+pub struct TaskFdCache {
+    inner: UnsafeCell<Option<RecentFdCache>>,
+}
+
+// Safety: the cache is only read or written by the task while it is the
+// current running task. Cross-task fd changes invalidate entries through the
+// process fd-table generation, so other CPUs do not mutate this cell.
+unsafe impl Sync for TaskFdCache {}
+
+impl TaskFdCache {
+    pub fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(None),
+        }
+    }
+
+    pub fn load(&self) -> Option<RecentFdCache> {
+        unsafe { (&*self.inner.get()).clone() }
+    }
+
+    pub fn store(&self, cache: Option<RecentFdCache>) {
+        unsafe {
+            *self.inner.get() = cache;
+        }
     }
 }
 
@@ -264,6 +337,7 @@ impl TaskControlBlock {
         let task = Self {
             process: Arc::downgrade(&process),
             kstack,
+            recent_fd_cache: TaskFdCache::new(),
             on_cpu: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
@@ -311,6 +385,7 @@ impl TaskControlBlock {
         Ok(Self {
             process: Arc::downgrade(&process),
             kstack,
+            recent_fd_cache: TaskFdCache::new(),
             on_cpu: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: None,

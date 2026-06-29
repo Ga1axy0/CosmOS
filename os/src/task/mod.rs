@@ -355,6 +355,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 let mut parent_inner = parent.inner_exclusive_access();
                 if let Some(fd_table) = clone_shared_fd_table {
                     parent_inner.fd_table = fd_table;
+                    parent.bump_fd_table_generation();
                 }
                 if let Some(cwd) = clone_shared_cwd {
                     parent_inner.cwd = cwd;
@@ -452,6 +453,9 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
             let closed_fds = process_inner.take_all_fds();
             process_inner.fd_table.clear();
+            if !closed_fds.is_empty() {
+                process.bump_fd_table_generation();
+            }
             // warn_heap_state_lockfree("exit_after_fd_take", pid);
             // remove all tasks
             process_inner.tasks.clear();

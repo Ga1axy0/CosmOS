@@ -505,6 +505,9 @@ fn install_received_rights(
         inner.fd_table[fd] = Some(entry);
         out.push(fd as i32);
     }
+    if !out.is_empty() {
+        process.bump_fd_table_generation();
+    }
     Ok(out)
 }
 
@@ -797,6 +800,7 @@ fn replace_fd_socket(
     }
     entry.desc = new_desc;
     entry.flags = fd_flags;
+    process.bump_fd_table_generation();
     Ok(())
 }
 
@@ -1199,6 +1203,7 @@ fn accept_common(
         entry.flags |= FdFlags::CLOEXEC;
     }
     inner.fd_table[new_fd] = Some(entry);
+    process.bump_fd_table_generation();
     drop(inner);
 
     if !addr.is_null() {
@@ -1380,6 +1385,7 @@ pub fn sys_socket(domain: i32, socket_type: i32, protocol: i32) -> isize {
             entry.flags |= FdFlags::CLOEXEC;
         }
         inner.fd_table[fd] = Some(entry);
+        process.bump_fd_table_generation();
         Ok(fd as isize)
     })
 }
@@ -1445,6 +1451,7 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
             entry1.flags |= FdFlags::CLOEXEC;
         }
         inner.fd_table[fd1] = Some(entry1);
+        process.bump_fd_table_generation();
         drop(inner);
 
         write_pod_to_user(sv, &(fd0 as i32))?;

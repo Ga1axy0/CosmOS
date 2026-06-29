@@ -75,6 +75,42 @@ fn translated_byte_buffer_fast(
     translated_byte_buffer(token, ptr, len)
 }
 
+/// Return a single already-mapped user buffer slice without allocating a Vec.
+pub fn translated_single_byte_buffer_with_access(
+    ptr: *const u8,
+    len: usize,
+    access: PageFaultAccess,
+) -> Option<&'static mut [u8]> {
+    let token = current_user_token();
+    translated_single_byte_buffer_with_token(token, ptr, len, access)
+}
+
+/// Return a single already-mapped user buffer slice with a known address-space token.
+pub fn translated_single_byte_buffer_with_token(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: PageFaultAccess,
+) -> Option<&'static mut [u8]> {
+    if len == 0 {
+        return None;
+    }
+    let start = ptr as usize;
+    let end = checked_user_buffer_end(ptr, len)?;
+    if (start & !(PAGE_SIZE - 1)) != ((end - 1) & !(PAGE_SIZE - 1)) {
+        return None;
+    }
+
+    let page_table = PageTable::from_token(token);
+    let start_va = VirtAddr::from(start);
+    let pte = page_table.translate(start_va.floor())?;
+    if !pte_allows_user_access(pte, access) {
+        return None;
+    }
+    let offset = start_va.page_offset();
+    Some(&mut pte.ppn().get_bytes_array()[offset..offset + len])
+}
+
 /// 尝试为一段用户虚拟地址触发并完成缺页装入，使后续字节翻译可成功。
 ///
 /// 同时检查最终 PTE 是否具备用户态访问权限，避免内核 copyin/copyout 绕过
@@ -176,6 +212,21 @@ pub fn translated_byte_buffer_with_access(
     }
     let process = current_process();
     prefault_user_pages(&process, token, ptr, len, access)?;
+    translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)
+}
+
+/// 将用户地址翻译为内核切片，复用调用者已经解析出的进程和地址空间 token。
+pub fn translated_byte_buffer_with_process_token(
+    process: &Arc<ProcessControlBlock>,
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: PageFaultAccess,
+) -> Result<Vec<&'static mut [u8]>, ERRNO> {
+    if let Some(buffers) = translated_byte_buffer_fast(token, ptr, len, access) {
+        return Ok(buffers);
+    }
+    prefault_user_pages(process, token, ptr, len, access)?;
     translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)
 }
 

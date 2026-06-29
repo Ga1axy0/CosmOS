@@ -1036,6 +1036,7 @@ fn alloc_pidfd(pid: usize) -> Result<i32, ERRNO> {
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd()?;
     inner.fd_table[fd] = Some(FdEntry::new(desc));
+    process.bump_fd_table_generation();
     Ok(fd as i32)
 }
 

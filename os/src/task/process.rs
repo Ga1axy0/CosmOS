@@ -161,6 +161,8 @@ pub struct ProcessControlBlock {
     pub pid: PidHandle,
     /// Signal delivered to the parent when this process exits.
     pub clone_exit_signal: u32,
+    /// Monotonic version for fd-table mutations, used by task-local fd caches.
+    fd_table_generation: AtomicUsize,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
     /// wait queue for wait4/waitpid
@@ -947,6 +949,21 @@ impl ProcessControlBlock {
         self.inner.lock().netns_default_tag = tag;
     }
 
+    /// Return the current fd-table generation for validating task-local fd caches.
+    pub fn fd_table_generation(&self) -> usize {
+        self.fd_table_generation.load(Ordering::Acquire)
+    }
+
+    /// Invalidate task-local fd caches after any fd-table mutation.
+    pub fn bump_fd_table_generation(&self) {
+        self.fd_table_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Return this process's current user address-space token.
+    pub fn user_token(&self) -> AddressSpaceToken {
+        self.inner_exclusive_access().memory_set.token()
+    }
+
     /// Construct a task owned by this process without publishing it to the scheduler.
     pub fn create_task(
         self: &Arc<Self>,
@@ -1015,6 +1032,7 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             clone_exit_signal: 17,
+            fd_table_generation: AtomicUsize::new(0),
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
                 memory_set,
@@ -1138,6 +1156,9 @@ impl ProcessControlBlock {
             // 关键点：真正销毁 `FileDescription` 可能触发同步回写和块设备等待，
             // 这里必须先把表项挪出进程自旋锁，再在锁外执行 drop。
             let cloexec_entries = inner.take_cloexec_fds();
+            if !cloexec_entries.is_empty() {
+                self.bump_fd_table_generation();
+            }
             let old_shm_attachments = core::mem::take(&mut inner.shm_attachments);
             (
                 old_memory_set,
@@ -1303,6 +1324,7 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             clone_exit_signal: exit_signal,
+            fd_table_generation: AtomicUsize::new(0),
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
                 memory_set,
@@ -1567,6 +1589,7 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             clone_exit_signal: 17,
+            fd_table_generation: AtomicUsize::new(0),
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
                 memory_set,

@@ -19,7 +19,9 @@ use crate::syscall::times::Timespec;
 use crate::syscall::OldTimespec32;
 use crate::syscall::{
     read_bytes_from_user, read_cstring_from_user, read_pod_from_user,
-    translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod,
+    translated_byte_buffer_with_access, translated_single_byte_buffer_with_access,
+    translated_byte_buffer_with_process_token, translated_single_byte_buffer_with_token,
+    write_bytes_to_user, write_pod_to_user, Pod,
 };
 use crate::syscall_body;
 use crate::task::{
@@ -493,6 +495,7 @@ fn alloc_anonymous_fd_with_bits(
         entry.flags |= FdFlags::CLOEXEC;
     }
     inner.fd_table[fd] = Some(entry);
+    process.bump_fd_table_generation();
     Ok(fd as isize)
 }
 
@@ -941,6 +944,7 @@ fn alloc_bpf_map_fd(map: BpfMapFile) -> Result<isize, ERRNO> {
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd()?;
     inner.fd_table[fd] = Some(FdEntry::new(desc));
+    process.bump_fd_table_generation();
     Ok(fd as isize)
 }
 
@@ -956,6 +960,7 @@ fn alloc_bpf_prog_fd(prog: BpfProgFile) -> Result<isize, ERRNO> {
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd()?;
     inner.fd_table[fd] = Some(FdEntry::new(desc));
+    process.bump_fd_table_generation();
     Ok(fd as isize)
 }
 
@@ -1623,7 +1628,12 @@ struct OpenFileState {
 
 /// 校验 fd 并返回打开文件描述。
 fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
-    let process = current_process();
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let generation = process.fd_table_generation();
+    if let Some(desc) = task.cached_file_description(fd, generation) {
+        return Ok(desc);
+    }
     let inner = process.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
         return Err(ERRNO::EBADF);
@@ -1633,8 +1643,36 @@ fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
         .ok_or(ERRNO::EBADF)?
         .desc
         .clone();
+    let generation = process.fd_table_generation();
     drop(inner);
+    task.remember_file_description(fd, generation, &desc);
     Ok(desc)
+}
+
+fn get_file_description_with_process_token(
+    fd: usize,
+) -> Result<(Arc<FileDescription>, Arc<ProcessControlBlock>, usize), ERRNO> {
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let generation = process.fd_table_generation();
+    if let Some(desc) = task.cached_file_description(fd, generation) {
+        let token = process.user_token();
+        return Ok((desc, process, token));
+    }
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return Err(ERRNO::EBADF);
+    }
+    let desc = inner.fd_table[fd]
+        .as_ref()
+        .ok_or(ERRNO::EBADF)?
+        .desc
+        .clone();
+    let token = inner.memory_set.token();
+    let generation = process.fd_table_generation();
+    drop(inner);
+    task.remember_file_description(fd, generation, &desc);
+    Ok((desc, process, token))
 }
 
 /// 校验 fd 并返回可写打开文件描述。
@@ -1664,6 +1702,16 @@ fn get_readable_file(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
         return Err(ERRNO::EBADF);
     }
     Ok(desc)
+}
+
+fn get_readable_file_with_process_token(
+    fd: usize,
+) -> Result<(Arc<FileDescription>, Arc<ProcessControlBlock>, usize), ERRNO> {
+    let (desc, process, token) = get_file_description_with_process_token(fd)?;
+    if desc.is_path() || !desc.readable() {
+        return Err(ERRNO::EBADF);
+    }
+    Ok((desc, process, token))
 }
 
 fn parse_pos64(pos: i64) -> Result<usize, ERRNO> {
@@ -2259,6 +2307,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 } else {
                     entry.flags.remove(FdFlags::CLOEXEC);
                 }
+                process.bump_fd_table_generation();
                 Ok(0)
             }
             F_DUPFD => {
@@ -2272,6 +2321,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                     desc,
                     flags: FdFlags::empty(),
                 });
+                process.bump_fd_table_generation();
                 Ok(new_fd as isize)
             }
             F_GETFL => {
@@ -2297,6 +2347,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                     desc,
                     flags: FdFlags::CLOEXEC,
                 });
+                process.bump_fd_table_generation();
                 Ok(new_fd as isize)
             }
             _ => Err(ERRNO::EINVAL),
@@ -2352,11 +2403,13 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
                 );
             }
         }
-        let written = desc.write_result(UserBuffer::new(translated_byte_buffer_with_access(
-            buf,
-            len,
-            PageFaultAccess::Read,
-        )?))?;
+        let single = translated_single_byte_buffer_with_access(buf, len, PageFaultAccess::Read);
+        let written = if let Some(buffer) = single {
+            desc.write_slice_result(buffer)?
+        } else {
+            let buffers = translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?;
+            desc.write_result(UserBuffer::new(buffers))?
+        };
         if len > 0 && written == 0 && write_zero_is_broken_pipe(&desc) {
             signal_broken_pipe();
             return Err(ERRNO::EPIPE);
@@ -2373,19 +2426,29 @@ pub fn sys_pread64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
     );
     syscall_body!({
         let fd = fd as usize;
-        let desc = get_readable_file(fd)?;
+        let (desc, process, token) = get_readable_file_with_process_token(fd)?;
         let offset = parse_pos64(pos)?;
         if !desc.is_seekable() {
             return Err(ERRNO::ESPIPE);
         }
-        Ok(desc.read_at(
-            offset,
-            UserBuffer::new(translated_byte_buffer_with_access(
-                buf,
-                len,
-                PageFaultAccess::Write,
-            )?),
-        ) as isize)
+        let single =
+            translated_single_byte_buffer_with_token(token, buf, len, PageFaultAccess::Write);
+        if let Some(buffer) = single {
+            return Ok(desc.read_slice_at(offset, buffer)? as isize);
+        }
+        let mut buffers = translated_byte_buffer_with_process_token(
+            &process,
+            token,
+            buf,
+            len,
+            PageFaultAccess::Write,
+        )?;
+        let read = if buffers.len() == 1 {
+            desc.read_slice_at(offset, buffers.pop().unwrap())?
+        } else {
+            desc.read_at(offset, UserBuffer::new(buffers))
+        };
+        Ok(read as isize)
     })
 }
 
@@ -2424,13 +2487,14 @@ pub fn sys_pwrite64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
         if !desc.is_seekable() {
             return Err(ERRNO::ESPIPE);
         }
+        let single = translated_single_byte_buffer_with_access(buf, len, PageFaultAccess::Read);
+        if let Some(buffer) = single {
+            return Ok(desc.write_slice_at(offset, buffer)? as isize);
+        }
+        let buffers = translated_byte_buffer_with_access(buf, len, PageFaultAccess::Read)?;
         Ok(desc.write_at(
             offset,
-            UserBuffer::new(translated_byte_buffer_with_access(
-                buf,
-                len,
-                PageFaultAccess::Read,
-            )?),
+            UserBuffer::new(buffers),
         ) as isize)
     })
 }
@@ -2789,15 +2853,26 @@ pub fn sys_read(fd: u32, buf: *const u8, len: usize) -> isize {
     );
     syscall_body!({
         let fd = fd as usize;
-        let desc = get_readable_file(fd)?;
+        let (desc, process, token) = get_readable_file_with_process_token(fd)?;
         trace!("kernel: sys_read .. desc.read");
-        Ok(
-            desc.read_result(UserBuffer::new(translated_byte_buffer_with_access(
-                buf,
-                len,
-                PageFaultAccess::Write,
-            )?))? as isize,
-        )
+        let single =
+            translated_single_byte_buffer_with_token(token, buf, len, PageFaultAccess::Write);
+        if let Some(buffer) = single {
+            return Ok(desc.read_slice_result(buffer)? as isize);
+        }
+        let mut buffers = translated_byte_buffer_with_process_token(
+            &process,
+            token,
+            buf,
+            len,
+            PageFaultAccess::Write,
+        )?;
+        let read = if buffers.len() == 1 {
+            desc.read_slice_result(buffers.pop().unwrap())?
+        } else {
+            desc.read_result(UserBuffer::new(buffers))?
+        };
+        Ok(read as isize)
     })
 }
 
@@ -2919,6 +2994,7 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, mode: u32) -> isize {
         let mut entry = FdEntry::new(desc);
         entry.flags = fd_flags;
         inner.fd_table[fd] = Some(entry);
+        process.bump_fd_table_generation();
         Ok(fd as isize)
     })
 }
@@ -3179,6 +3255,7 @@ pub fn sys_close(fd: u32) -> isize {
             }
             // 先摘表项，等离开 `process.inner` 后再真正 drop，避免自旋锁内阻塞。
             let entry = inner.take_fd(fd).ok_or(ERRNO::EBADF)?;
+            process.bump_fd_table_generation();
             closed_entry = Some(entry);
             Ok(0)
         });
@@ -3233,11 +3310,15 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
                 for entry in inner.fd_table[first..=last].iter_mut().flatten() {
                     entry.flags |= FdFlags::CLOEXEC;
                 }
+                process.bump_fd_table_generation();
             } else {
                 for fd in first..=last {
                     if let Some(entry) = inner.take_fd(fd) {
                         closed_entries.push(entry);
                     }
+                }
+                if !closed_entries.is_empty() {
+                    process.bump_fd_table_generation();
                 }
             }
             Ok(0)
@@ -3249,6 +3330,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
     if let Some((parent, fd_table)) = shared_fd_table_update {
         if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
             parent.inner_exclusive_access().fd_table = fd_table;
+            parent.bump_fd_table_generation();
         }
     }
     drop(closed_entries);
@@ -3315,6 +3397,7 @@ pub fn sys_pipe2(pipefd: *mut i32, _flags: i32) -> isize {
             FileStatusFlags::empty(),
             0,
         ))));
+        process.bump_fd_table_generation();
         drop(inner);
         write_pod_to_user(pipefd, &(read_fd as i32))?;
         write_pod_to_user(unsafe { pipefd.add(1) }, &(write_fd as i32))?;
@@ -3345,6 +3428,7 @@ pub fn sys_dup(fd: u32) -> isize {
             desc,
             flags: FdFlags::empty(),
         });
+        process.bump_fd_table_generation();
         Ok(new_fd as isize)
     })
 }
@@ -3387,6 +3471,7 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
                 desc,
                 flags: FdFlags::empty(),
             });
+            process.bump_fd_table_generation();
             Ok(newfd as isize)
         });
         (result, replaced_entry)

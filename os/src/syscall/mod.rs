@@ -468,8 +468,10 @@ pub use times::Timespec;
 use times::*;
 pub(crate) use utils::{
     prefault_user_pages, read_bytes_from_user, read_cstring_from_user, read_pod_from_process_user,
-    read_pod_from_user, translated_byte_buffer_with_access, write_bytes_to_user,
-    write_pod_to_process_user, write_pod_to_user, Pod,
+    read_pod_from_user, translated_byte_buffer_with_access,
+    translated_byte_buffer_with_process_token, translated_single_byte_buffer_with_access,
+    translated_single_byte_buffer_with_token, write_bytes_to_user, write_pod_to_process_user,
+    write_pod_to_user, Pod,
 };
 
 use crate::klog::*;
