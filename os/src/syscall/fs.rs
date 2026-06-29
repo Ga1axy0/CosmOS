@@ -2326,26 +2326,31 @@ pub fn sys_write(fd: u32, buf: *const u8, len: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
-        let stat = desc.stat();
-        let path = desc.path();
-        let inode = desc.backing_inode();
-        debug!(
-            "sys_write: fd={} len={} file_size={} st_blksize={} path={:?} inode={}",
-            fd,
-            len,
-            stat.size,
-            stat.blksize,
-            path,
-            inode
-                .as_ref()
-                .map(|inode| alloc::format!("{}:{}", inode.fs_id(), inode.ino()))
-                .unwrap_or_else(|| String::from("-")),
-        );
-        if len >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
-            warn!(
-                "sys_write: suspicious request fd={} len={} file_size={} st_blksize={} path={:?}",
-                fd, len, stat.size, stat.blksize, path
+        if log::log_enabled!(log::Level::Debug)
+            || log::log_enabled!(log::Level::Warn)
+            || len >= SUSPICIOUS_RW_LEN
+        {
+            let stat = desc.stat();
+            let path = desc.path();
+            let inode = desc.backing_inode();
+            debug!(
+                "sys_write: fd={} len={} file_size={} st_blksize={} path={:?} inode={}",
+                fd,
+                len,
+                stat.size,
+                stat.blksize,
+                path,
+                inode
+                    .as_ref()
+                    .map(|inode| alloc::format!("{}:{}", inode.fs_id(), inode.ino()))
+                    .unwrap_or_else(|| String::from("-")),
             );
+            if len >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+                warn!(
+                    "sys_write: suspicious request fd={} len={} file_size={} st_blksize={} path={:?}",
+                    fd, len, stat.size, stat.blksize, path
+                );
+            }
         }
         let written = desc.write_result(UserBuffer::new(translated_byte_buffer_with_access(
             buf,
@@ -2394,22 +2399,27 @@ pub fn sys_pwrite64(fd: u32, buf: *const u8, len: usize, pos: i64) -> isize {
         let fd = fd as usize;
         let desc = get_writable_file(fd)?;
         let offset = parse_pos64(pos)?;
-        let stat = desc.stat();
-        let path = desc.path();
-        debug!(
-            "sys_pwrite64: fd={} offset={} len={} file_size={} st_blksize={} path={:?}",
-            fd, offset, len, stat.size, stat.blksize, path
-        );
-        if len >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
-            warn!(
-                "sys_pwrite64: suspicious request fd={} offset={} len={} file_size={} st_blksize={} path={:?}",
-                fd,
-                offset,
-                len,
-                stat.size,
-                stat.blksize,
-                path
+        if log::log_enabled!(log::Level::Debug)
+            || log::log_enabled!(log::Level::Warn)
+            || len >= SUSPICIOUS_RW_LEN
+        {
+            let stat = desc.stat();
+            let path = desc.path();
+            debug!(
+                "sys_pwrite64: fd={} offset={} len={} file_size={} st_blksize={} path={:?}",
+                fd, offset, len, stat.size, stat.blksize, path
             );
+            if len >= SUSPICIOUS_RW_LEN || stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+                warn!(
+                    "sys_pwrite64: suspicious request fd={} offset={} len={} file_size={} st_blksize={} path={:?}",
+                    fd,
+                    offset,
+                    len,
+                    stat.size,
+                    stat.blksize,
+                    path
+                );
+            }
         }
         if !desc.is_seekable() {
             return Err(ERRNO::ESPIPE);

@@ -365,6 +365,9 @@ pub fn mapping_for_inode(inode: &Arc<Inode>) -> Option<PageMappingHandle> {
     if !is_inode_page_cacheable(inode) {
         return None;
     }
+    if let Some(mapping) = try_get_mapping(inode) {
+        return Some(mapping);
+    }
     Some(PageMappingHandle::new(get_or_create_mapping(inode)))
 }
 
@@ -679,6 +682,11 @@ fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &
     if buf.is_empty() {
         return 0;
     }
+    if read_stays_within_page(offset, buf.len()) {
+        if let Some(readable) = read_mapping_single_page_hit(mapping, offset, buf) {
+            return readable;
+        }
+    }
 
     let file_size = mapping.lock().size;
     if offset >= file_size {
@@ -707,6 +715,49 @@ fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &
         done += readable;
     }
     done
+}
+
+#[inline]
+fn read_stays_within_page(offset: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    offset
+        .checked_add(len - 1)
+        .is_some_and(|last| file_page_index(offset) == file_page_index(last))
+}
+
+fn read_mapping_single_page_hit(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let page_idx = file_page_index(offset);
+    let page_off = file_page_offset(offset);
+    let (file_size, page) = {
+        let mapping_guard = mapping.lock();
+        if offset >= mapping_guard.size {
+            return Some(0);
+        }
+        (
+            mapping_guard.size,
+            mapping_guard.pages.get(&page_idx).cloned()?,
+        )
+    };
+    let read_limit = min(file_size, offset.saturating_add(buf.len())) - offset;
+
+    let mut page_guard = page.lock();
+    page_guard.ref_bit = true;
+    if !page_guard.state.contains(CachePageState::UPTODATE) {
+        return None;
+    }
+    let readable = min(page_guard.valid_bytes.saturating_sub(page_off), read_limit);
+    if readable == 0 {
+        return Some(0);
+    }
+    let bytes = page_guard.ppn().get_bytes_array();
+    buf[..readable].copy_from_slice(&bytes[page_off..page_off + readable]);
+    Some(readable)
 }
 
 /// 向单个 mapping 中写入指定范围的数据，并标脏涉及页。
