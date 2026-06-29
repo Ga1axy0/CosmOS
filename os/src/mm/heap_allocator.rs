@@ -259,7 +259,8 @@ impl KernelHeapAllocator {
 
     fn grow_virtual(&self, required_bytes: usize) -> bool {
         let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
-        let Some((virtual_offset, bytes)) = reserve_virtual_heap_bytes_locked(required_bytes) else {
+        let Some((virtual_offset, bytes)) = reserve_virtual_heap_bytes_locked(required_bytes)
+        else {
             return false;
         };
         // debug!(

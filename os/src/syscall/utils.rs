@@ -1,7 +1,8 @@
-use crate::config::PAGE_SIZE;
 use crate::mm::{
     translated_byte_buffer, MmError, PageFaultAccess, PageFaultHandled, PageTable, VirtAddr,
+    USER_SPACE_END,
 };
+use crate::config::PAGE_SIZE;
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::task::{current_process, current_user_token, ProcessControlBlock};
 
@@ -37,6 +38,41 @@ fn pte_allows_user_access(pte: crate::mm::PageTableEntry, access: PageFaultAcces
         PageFaultAccess::Write => pte.writable(),
         PageFaultAccess::Exec => pte.executable(),
     }
+}
+
+fn checked_user_buffer_end(ptr: *const u8, len: usize) -> Option<usize> {
+    let start = ptr as usize;
+    if len == 0 {
+        return Some(start);
+    }
+    if start >= USER_SPACE_END {
+        return None;
+    }
+    let end = start.checked_add(len)?;
+    (end <= USER_SPACE_END).then_some(end)
+}
+
+fn translated_byte_buffer_fast(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: PageFaultAccess,
+) -> Option<Vec<&'static mut [u8]>> {
+    let start = ptr as usize;
+    let end = checked_user_buffer_end(ptr, len)?;
+    let page_table = PageTable::from_token(token);
+    let mut page_start = start & !(PAGE_SIZE - 1);
+
+    while page_start < end {
+        let vpn = VirtAddr::from(page_start).floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte_allows_user_access(pte, access) {
+            return None;
+        }
+        page_start = page_start.checked_add(PAGE_SIZE)?;
+    }
+
+    translated_byte_buffer(token, ptr, len)
 }
 
 /// 尝试为一段用户虚拟地址触发并完成缺页装入，使后续字节翻译可成功。
@@ -135,6 +171,9 @@ pub fn translated_byte_buffer_with_access(
     access: PageFaultAccess,
 ) -> Result<Vec<&'static mut [u8]>, ERRNO> {
     let token = current_user_token();
+    if let Some(buffers) = translated_byte_buffer_fast(token, ptr, len, access) {
+        return Ok(buffers);
+    }
     let process = current_process();
     prefault_user_pages(&process, token, ptr, len, access)?;
     translated_byte_buffer(token, ptr, len).or_errno(ERRNO::EFAULT)

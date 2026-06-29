@@ -1,7 +1,6 @@
 use crate::syscall::errno::{OrErrno, ERRNO};
 use crate::syscall::utils::read_bytes_from_user;
 use crate::syscall::{read_pod_from_user, write_bytes_to_user, write_pod_to_user, Pod};
-use core::sync::atomic::Ordering;
 use crate::syscall_body;
 use crate::{
     config::MAX_HARTS,
@@ -17,6 +16,7 @@ use crate::{
         SchedPolicy, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
     },
 };
+use core::sync::atomic::Ordering;
 
 use alloc::{sync::Arc, vec::Vec};
 use core::mem::{size_of, MaybeUninit};

@@ -14,8 +14,8 @@ use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus
 use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
 use core::array;
+use core::sync::atomic::Ordering;
 use lazy_static::*;
 
 /// Processor management structure

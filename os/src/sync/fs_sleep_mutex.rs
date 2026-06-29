@@ -2,8 +2,8 @@
 
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
-    check_fatal_signals_of_current, current_task, exit_current_and_run_next, ExitReason,
-    wakeup_task, TaskControlBlock, WaitQueue, WaitReason,
+    check_fatal_signals_of_current, current_task, exit_current_and_run_next, wakeup_task,
+    ExitReason, TaskControlBlock, WaitQueue, WaitReason,
 };
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
