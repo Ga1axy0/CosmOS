@@ -1215,6 +1215,17 @@ impl File for OSInode {
             self.inode.read_at(offset, buf)
         })
     }
+    fn read_bytes_at_cached(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        cache: &mut page_cache::PageReadCache,
+    ) -> Result<Option<usize>, ERRNO> {
+        let Some(mapping) = cache.mapping_or_insert_with(|| self.page_mapping()) else {
+            return Ok(None);
+        };
+        Ok(Some(mapping.read_with_synced_cache(offset, buf, cache)))
+    }
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let mapping = self.page_mapping();
         let mut total_write_size = 0usize;
@@ -1232,7 +1243,8 @@ impl File for OSInode {
         total_write_size
     }
     fn write_bytes_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
-        Ok(if let Some(mapping) = self.page_mapping().as_ref() {
+        let mapping = self.page_mapping();
+        Ok(if let Some(mapping) = mapping.as_ref() {
             mapping.write(offset, buf)
         } else {
             self.inode.write_at(offset, buf)

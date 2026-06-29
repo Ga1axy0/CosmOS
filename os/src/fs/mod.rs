@@ -35,7 +35,7 @@ pub use page_cache::{
     discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats, reclaim_if_needed,
     release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
     sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PageCacheStats,
-    PAGE_CACHE_MANAGER,
+    PageReadCache, PAGE_CACHE_MANAGER,
 };
 
 /// Cumulative directory-iteration counters used by `/proc/mm_perf`.
@@ -498,6 +498,8 @@ struct FileDescriptionInner {
     status_flags: FileStatusFlags,
     /// 目录项快照，避免遍历期间删除目录项导致位置漂移漏读。
     dirent_snapshot: Option<Vec<(String, VfsFileType)>>,
+    /// 当前打开文件描述的顺序读页缓存。
+    read_cache: PageReadCache,
 }
 
 /// 套接字的不可变元信息。
@@ -542,6 +544,7 @@ impl FileDescription {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
+                read_cache: PageReadCache::default(),
             }),
         }
     }
@@ -564,6 +567,7 @@ impl FileDescription {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
+                read_cache: PageReadCache::default(),
             }),
         }
     }
@@ -599,6 +603,31 @@ impl FileDescription {
         self.file.read_at_result(0, buf)
     }
 
+    /// 顺序读取到单个已翻译的内核切片，并推进共享文件偏移。
+    pub fn read_slice_result(&self, buf: &'static mut [u8]) -> Result<usize, ERRNO> {
+        if self.file.is_seekable() {
+            let mut inner = self.inner.lock();
+            let offset = inner.offset;
+            let read_size =
+                match self
+                    .file
+                    .read_bytes_at_cached(offset, buf, &mut inner.read_cache)?
+                {
+                    Some(read_size) => Ok(read_size),
+                    None => match self.file.read_bytes_at(offset, buf) {
+                        Ok(read_size) => Ok(read_size),
+                        Err(ERRNO::EOPNOTSUPP) => self
+                            .file
+                            .read_at_result(offset, UserBuffer::new(alloc::vec![buf])),
+                        Err(err) => Err(err),
+                    },
+                }?;
+            inner.offset += read_size;
+            return Ok(read_size);
+        }
+        self.file.read_at_result(0, UserBuffer::new(alloc::vec![buf]))
+    }
+
     /// 顺序写入并推进共享文件偏移。
     pub fn write(&self, buf: UserBuffer) -> usize {
         self.write_result(buf).unwrap_or(0)
@@ -608,6 +637,7 @@ impl FileDescription {
     pub fn write_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
+            inner.read_cache.clear();
             if inner.status_flags.contains(FileStatusFlags::APPEND) {
                 // TODO: 当前仅保证同一 FileDescription 内的追加写顺序；跨描述竞争仍需 inode 级串行化。
                 inner.offset = self.file.stat().size.max(0) as usize;
@@ -624,9 +654,41 @@ impl FileDescription {
         self.file.write_at_result(0, buf)
     }
 
+    /// 顺序写入单个已翻译的内核切片，并推进共享文件偏移。
+    pub fn write_slice_result(&self, buf: &'static mut [u8]) -> Result<usize, ERRNO> {
+        if self.file.is_seekable() {
+            let mut inner = self.inner.lock();
+            inner.read_cache.clear();
+            if inner.status_flags.contains(FileStatusFlags::APPEND) {
+                inner.offset = self.file.stat().size.max(0) as usize;
+            }
+            let write_size = match self.file.write_bytes_at(inner.offset, buf) {
+                Ok(write_size) => Ok(write_size),
+                Err(ERRNO::EOPNOTSUPP) => self
+                    .file
+                    .write_at_result(inner.offset, UserBuffer::new(alloc::vec![buf])),
+                Err(err) => Err(err),
+            }?;
+            inner.offset += write_size;
+            return Ok(write_size);
+        }
+        self.file.write_at_result(0, UserBuffer::new(alloc::vec![buf]))
+    }
+
     /// 从固定偏移读取，不影响共享文件偏移。
     pub fn read_at(&self, offset: usize, buf: UserBuffer) -> usize {
         self.file.read_at(offset, buf)
+    }
+
+    /// 从固定偏移读取到单个已翻译的内核切片，不影响共享文件偏移。
+    pub fn read_slice_at(&self, offset: usize, buf: &'static mut [u8]) -> Result<usize, ERRNO> {
+        match self.file.read_bytes_at(offset, buf) {
+            Ok(read_size) => Ok(read_size),
+            Err(ERRNO::EOPNOTSUPP) => self
+                .file
+                .read_at_result(offset, UserBuffer::new(alloc::vec![buf])),
+            Err(err) => Err(err),
+        }
     }
 
     /// 从固定偏移读取到内核缓冲区，不影响共享文件偏移。
@@ -637,6 +699,17 @@ impl FileDescription {
     /// 向固定偏移写入，不影响共享文件偏移。
     pub fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         self.file.write_at(offset, buf)
+    }
+
+    /// 将单个已翻译的内核切片写入固定偏移，不影响共享文件偏移。
+    pub fn write_slice_at(&self, offset: usize, buf: &'static mut [u8]) -> Result<usize, ERRNO> {
+        match self.file.write_bytes_at(offset, buf) {
+            Ok(write_size) => Ok(write_size),
+            Err(ERRNO::EOPNOTSUPP) => self
+                .file
+                .write_at_result(offset, UserBuffer::new(alloc::vec![buf])),
+            Err(err) => Err(err),
+        }
     }
 
     /// 将内核缓冲区顺序写入并推进共享文件偏移。
@@ -665,11 +738,13 @@ impl FileDescription {
 
     /// 调整底层文件对象的逻辑长度。
     pub fn truncate(&self, new_size: usize) -> Result<(), ERRNO> {
+        self.inner.lock().read_cache.clear();
         self.file.truncate(new_size)
     }
 
     /// Reserve or deallocate file space on the underlying object.
     pub fn fallocate(&self, mode: i32, offset: usize, len: usize) -> Result<(), ERRNO> {
+        self.inner.lock().read_cache.clear();
         self.file.fallocate(mode, offset, len)
     }
 
@@ -925,6 +1000,15 @@ pub trait File: Send + Sync + Any {
     /// 从固定偏移读取到内核缓冲区。
     fn read_bytes_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, ERRNO> {
         Err(ERRNO::EOPNOTSUPP)
+    }
+    /// 从固定偏移读取到内核缓冲区，并可复用打开文件描述上的当前页缓存。
+    fn read_bytes_at_cached(
+        &self,
+        _offset: usize,
+        _buf: &mut [u8],
+        _cache: &mut PageReadCache,
+    ) -> Result<Option<usize>, ERRNO> {
+        Ok(None)
     }
     /// 向固定偏移写入数据。
     fn write_at(&self, _offset: usize, _buf: UserBuffer) -> usize {

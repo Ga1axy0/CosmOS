@@ -119,6 +119,12 @@ pub struct PageMapping {
     inode: Weak<Inode>,
     /// 当前文件缓存的所有页。
     pages: BTreeMap<u64, Arc<SpinNoIrqLock<CachePage>>>,
+    /// 最近一次读命中的缓存页，用于同页小读跳过树查找。
+    read_hot_page_idx: Option<u64>,
+    /// 最近一次读命中的缓存页弱引用；不阻止全局回收。
+    read_hot_page: Weak<SpinNoIrqLock<CachePage>>,
+    /// 会使已打开文件上的读页缓存失效的 mapping 版本。
+    generation: usize,
     /// page cache 视角下的文件长度。
     size: usize,
     /// 当前所有脏页的文件内页号集合。
@@ -131,8 +137,64 @@ impl PageMapping {
         Self {
             inode: Arc::downgrade(inode),
             pages: BTreeMap::new(),
+            read_hot_page_idx: None,
+            read_hot_page: Weak::new(),
+            generation: 0,
             size,
             dirty_pages: BTreeSet::new(),
+        }
+    }
+}
+
+/// Per-open-description cache for repeated small reads from the same page.
+#[derive(Default)]
+pub struct PageReadCache {
+    mapping: Weak<SpinNoIrqLock<PageMapping>>,
+    page_idx: Option<u64>,
+    generation: usize,
+    page: Option<Arc<SpinNoIrqLock<CachePage>>>,
+}
+
+impl PageReadCache {
+    /// Drop the cached page reference.
+    pub fn clear(&mut self) {
+        self.clear_page();
+    }
+
+    fn clear_mapping(&mut self) {
+        self.mapping = Weak::new();
+        self.clear_page();
+    }
+
+    fn clear_page(&mut self) {
+        self.page_idx = None;
+        self.generation = 0;
+        self.page = None;
+    }
+
+    /// Return the opened-file mapping cache, initializing it on miss.
+    pub fn mapping_or_insert_with<F>(&mut self, init: F) -> Option<PageMappingHandle>
+    where
+        F: FnOnce() -> Option<PageMappingHandle>,
+    {
+        if let Some(mapping) = self.mapping.upgrade() {
+            return Some(PageMappingHandle::new(mapping));
+        }
+        self.clear_mapping();
+        let mapping = init()?;
+        self.mapping = Arc::downgrade(&mapping.inner);
+        Some(mapping)
+    }
+
+    fn sync_mapping(&mut self, mapping: &Arc<SpinNoIrqLock<PageMapping>>) {
+        let same_mapping = self
+            .mapping
+            .upgrade()
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(cached, mapping));
+        if !same_mapping {
+            self.clear_page();
+            self.mapping = Arc::downgrade(mapping);
         }
     }
 }
@@ -158,6 +220,26 @@ impl PageMappingHandle {
     /// 读取指定范围的数据，必要时装入缺失缓存页。
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> usize {
         read_mapping(&self.inner, offset, buf)
+    }
+
+    /// 读取指定范围的数据，并复用打开文件描述上的当前页缓存。
+    pub fn read_with_cache(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        cache: &mut PageReadCache,
+    ) -> usize {
+        read_mapping_with_cache(&self.inner, offset, buf, cache)
+    }
+
+    /// 读取指定范围的数据；调用方已经从同一个 `PageReadCache` 取出 mapping。
+    pub fn read_with_synced_cache(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        cache: &mut PageReadCache,
+    ) -> usize {
+        read_mapping_with_synced_cache(&self.inner, offset, buf, cache)
     }
 
     /// 写入指定范围的数据，并把涉及页标记为脏页。
@@ -589,6 +671,9 @@ pub fn discard_inode(inode: &Arc<Inode>) {
         }
         let removed_pages = mapping_guard.pages.len();
         mapping_guard.pages.clear();
+        mapping_guard.read_hot_page_idx = None;
+        mapping_guard.read_hot_page = Weak::new();
+        mapping_guard.generation = mapping_guard.generation.wrapping_add(1);
         mapping_guard.dirty_pages.clear();
         removed_pages
     };
@@ -717,6 +802,37 @@ fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &
     done
 }
 
+/// 读取单个 mapping，并优先复用打开文件描述上的当前页缓存。
+fn read_mapping_with_cache(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    buf: &mut [u8],
+    cache: &mut PageReadCache,
+) -> usize {
+    cache.sync_mapping(mapping);
+    read_mapping_with_synced_cache(mapping, offset, buf, cache)
+}
+
+/// 读取单个 mapping；调用方已经保证 `cache` 属于当前 mapping。
+fn read_mapping_with_synced_cache(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    buf: &mut [u8],
+    cache: &mut PageReadCache,
+) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    if read_stays_within_page(offset, buf.len()) {
+        if let Some(readable) = read_mapping_opened_page_hit(mapping, offset, buf, cache) {
+            return readable;
+        }
+    } else {
+        cache.clear();
+    }
+    read_mapping(mapping, offset, buf)
+}
+
 #[inline]
 fn read_stays_within_page(offset: usize, len: usize) -> bool {
     if len == 0 {
@@ -727,27 +843,16 @@ fn read_stays_within_page(offset: usize, len: usize) -> bool {
         .is_some_and(|last| file_page_index(offset) == file_page_index(last))
 }
 
-fn read_mapping_single_page_hit(
-    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
-    offset: usize,
+fn copy_read_cache_page(
+    page: Arc<SpinNoIrqLock<CachePage>>,
+    page_off: usize,
+    read_limit: usize,
     buf: &mut [u8],
 ) -> Option<usize> {
-    let page_idx = file_page_index(offset);
-    let page_off = file_page_offset(offset);
-    let (file_size, page) = {
-        let mapping_guard = mapping.lock();
-        if offset >= mapping_guard.size {
-            return Some(0);
-        }
-        (
-            mapping_guard.size,
-            mapping_guard.pages.get(&page_idx).cloned()?,
-        )
-    };
-    let read_limit = min(file_size, offset.saturating_add(buf.len())) - offset;
-
     let mut page_guard = page.lock();
-    page_guard.ref_bit = true;
+    if !page_guard.ref_bit {
+        page_guard.ref_bit = true;
+    }
     if !page_guard.state.contains(CachePageState::UPTODATE) {
         return None;
     }
@@ -760,6 +865,74 @@ fn read_mapping_single_page_hit(
     Some(readable)
 }
 
+fn read_mapping_opened_page_hit(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    buf: &mut [u8],
+    cache: &mut PageReadCache,
+) -> Option<usize> {
+    let page_idx = file_page_index(offset);
+    let page_off = file_page_offset(offset);
+    let (file_size, page) = {
+        let mut mapping_guard = mapping.lock();
+        if offset >= mapping_guard.size {
+            return Some(0);
+        }
+        let page = if cache.page_idx == Some(page_idx)
+            && cache.generation == mapping_guard.generation
+        {
+            cache.page.as_ref().cloned()
+        } else {
+            None
+        };
+        let page = if let Some(page) = page {
+            page
+        } else {
+            let page = mapping_guard.pages.get(&page_idx).cloned()?;
+            cache.page_idx = Some(page_idx);
+            cache.generation = mapping_guard.generation;
+            cache.page = Some(page.clone());
+            mapping_guard.read_hot_page_idx = Some(page_idx);
+            mapping_guard.read_hot_page = Arc::downgrade(&page);
+            page
+        };
+        (mapping_guard.size, page)
+    };
+    let read_limit = min(file_size, offset.saturating_add(buf.len())) - offset;
+    copy_read_cache_page(page, page_off, read_limit, buf)
+}
+
+fn read_mapping_single_page_hit(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let page_idx = file_page_index(offset);
+    let page_off = file_page_offset(offset);
+    let (file_size, page) = {
+        let mut mapping_guard = mapping.lock();
+        if offset >= mapping_guard.size {
+            return Some(0);
+        }
+        let page = if mapping_guard.read_hot_page_idx == Some(page_idx) {
+            mapping_guard.read_hot_page.upgrade()
+        } else {
+            None
+        };
+        let page = if let Some(page) = page {
+            page
+        } else {
+            let page = mapping_guard.pages.get(&page_idx).cloned()?;
+            mapping_guard.read_hot_page_idx = Some(page_idx);
+            mapping_guard.read_hot_page = Arc::downgrade(&page);
+            page
+        };
+        (mapping_guard.size, page)
+    };
+    let read_limit = min(file_size, offset.saturating_add(buf.len())) - offset;
+    copy_read_cache_page(page, page_off, read_limit, buf)
+}
+
 /// 向单个 mapping 中写入指定范围的数据，并标脏涉及页。
 fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &[u8]) -> usize {
     if buf.is_empty() {
@@ -770,6 +943,11 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
     WRITE_MAPPING_CALLS.fetch_add(1, Ordering::Relaxed);
     #[cfg(feature = "io_perf_counters")]
     WRITE_MAPPING_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+
+    if let Some(written) = write_mapping_single_existing_page_hit(mapping, offset, buf) {
+        reclaim_if_needed();
+        return written;
+    }
 
     let old_size = mapping.lock().size;
     let new_size = offset.saturating_add(buf.len());
@@ -817,6 +995,53 @@ fn write_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: 
 
     reclaim_if_needed();
     done
+}
+
+fn write_mapping_single_existing_page_hit(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    offset: usize,
+    buf: &[u8],
+) -> Option<usize> {
+    if !read_stays_within_page(offset, buf.len()) {
+        return None;
+    }
+
+    let new_size = offset.saturating_add(buf.len());
+    let page_idx = file_page_index(offset);
+    let page_off = file_page_offset(offset);
+    let page_start = page_start(page_idx);
+    let (old_size, expected_valid, page_end_before, page) = {
+        let mut mapping_guard = mapping.lock();
+        let page = mapping_guard.pages.get(&page_idx).cloned()?;
+        let old_size = mapping_guard.size;
+        if mapping_guard.size < new_size {
+            mapping_guard.size = new_size;
+        }
+        let expected_valid = page_valid_bytes_for_size(mapping_guard.size, page_idx);
+        let page_end_before = min(old_size, page_start + PAGE_SIZE);
+        (old_size, expected_valid, page_end_before, page)
+    };
+
+    let need_load = page_start < old_size
+        && (page_off != 0 || buf.len() < PAGE_SIZE)
+        && !page.lock().state.contains(CachePageState::UPTODATE);
+    if need_load {
+        ensure_page_uptodate(mapping, &page, page_idx);
+    }
+
+    let mut page_guard = page.lock();
+    let bytes = page_guard.ppn().get_bytes_array();
+    bytes[page_off..page_off + buf.len()].copy_from_slice(buf);
+
+    if page_start >= old_size && !page_guard.state.contains(CachePageState::UPTODATE) {
+        page_guard.state.insert(CachePageState::UPTODATE);
+    }
+    page_guard.valid_bytes = max(page_guard.valid_bytes, expected_valid);
+    if page_guard.valid_bytes < page_end_before.saturating_sub(page_start) {
+        page_guard.valid_bytes = page_end_before - page_start;
+    }
+    mark_page_dirty(mapping, &mut page_guard);
+    Some(buf.len())
 }
 
 /// 调整当前 mapping 长度，并同步更新已有缓存页。
@@ -873,6 +1098,7 @@ fn truncate_mapping(
     let removed_pages = {
         let mut mapping_guard = mapping.lock();
         mapping_guard.size = new_size;
+        mapping_guard.generation = mapping_guard.generation.wrapping_add(1);
 
         if new_size < old_size {
             let first_removed_idx = if new_size == 0 {
@@ -880,6 +1106,13 @@ fn truncate_mapping(
             } else {
                 new_tail_idx.saturating_add(1)
             };
+            if mapping_guard
+                .read_hot_page_idx
+                .is_some_and(|idx| idx >= first_removed_idx)
+            {
+                mapping_guard.read_hot_page_idx = None;
+                mapping_guard.read_hot_page = Weak::new();
+            }
             let removed_indices: alloc::vec::Vec<_> = mapping_guard
                 .pages
                 .range(first_removed_idx..)
@@ -1604,6 +1837,11 @@ fn reclaim_one() -> ReclaimStep {
         let mut mapping_guard = mapping.lock();
         if let Some(existing) = mapping_guard.pages.get(&page_idx) {
             if Arc::ptr_eq(existing, &page) {
+                if mapping_guard.read_hot_page_idx == Some(page_idx) {
+                    mapping_guard.read_hot_page_idx = None;
+                    mapping_guard.read_hot_page = Weak::new();
+                }
+                mapping_guard.generation = mapping_guard.generation.wrapping_add(1);
                 mapping_guard.pages.remove(&page_idx)
             } else {
                 None
