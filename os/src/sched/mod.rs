@@ -31,12 +31,12 @@ pub(crate) use processor::{
 pub use processor::{
     current_process, current_task, current_trap_cx, current_trap_cx_user_va, current_user_token,
 };
+#[cfg(feature = "sched_invariant_checks")]
+pub(crate) use runqueue::check_sched_invariants;
 pub use runqueue::wakeup_task;
 pub(crate) use runqueue::{
     add_stopping_task, add_task, boost_process_cfs_tasks, cfs_should_preempt, clear_stopping_task,
     enqueue_task_on, has_runnable_task_at_or_above, insert_into_pid2process, list_pids,
     pick_next_task, pid2process, remove_from_pid2process, remove_task, resched_hart, PID2PCB,
 };
-#[cfg(feature = "sched_invariant_checks")]
-pub(crate) use runqueue::check_sched_invariants;
 pub use switch::__switch;

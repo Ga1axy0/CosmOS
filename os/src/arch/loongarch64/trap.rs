@@ -177,8 +177,7 @@ impl Pod for LoongArchUContext {}
 // musl's `ucontext_t` is exactly the prefix through `uc_mcontext` (448 bytes).
 // The appended `fpstate` is kernel-internal; this guards that no musl-visible
 // field shifts if the layout above ever changes.
-const _: () =
-    assert!(core::mem::offset_of!(LoongArchUContext, uc_mcontext) + 272 == 448);
+const _: () = assert!(core::mem::offset_of!(LoongArchUContext, uc_mcontext) + 272 == 448);
 const _: [(); 16] = [(); core::mem::align_of::<LoongArchUContext>()];
 
 /// 用户态 `rt_sigreturn` trampoline 机器码。
@@ -391,10 +390,7 @@ impl SignalAbi for LoongArchSignalAbi {
         for idx in 1..32 {
             trap_cx.set_reg(idx, ucontext.uc_mcontext.gregs[idx]);
         }
-        trap_cx.restore_fp_state(
-            &ucontext.fpstate.fpregs,
-            ucontext.fpstate.fcsr,
-        );
+        trap_cx.restore_fp_state(&ucontext.fpstate.fpregs, ucontext.fpstate.fcsr);
     }
 
     fn saved_pc(ucontext: &Self::UContext) -> usize {

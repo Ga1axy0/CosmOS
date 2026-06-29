@@ -2,8 +2,8 @@
 use super::{current_task, wakeup_task, TaskControlBlock, TaskStatus, WaitReason};
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
-use core::sync::atomic::Ordering;
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use hashbrown::HashMap;
 
 /// Type-erased handle used by signal delivery to properly wake a task

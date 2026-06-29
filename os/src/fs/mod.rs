@@ -13,27 +13,29 @@ pub mod sysfs;
 pub mod tmpfs;
 mod tty;
 
-use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-#[cfg(feature = "io_perf_counters")]
-use core::fmt::Write;
 use crate::mm::UserBuffer;
 use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
-use core::any::Any;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::timer::get_time_us;
-use fs::{dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode, InodeCacheStats};
-use lazy_static::*;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::any::Any;
+#[cfg(feature = "io_perf_counters")]
+use core::fmt::Write;
+use core::sync::atomic::{AtomicUsize, Ordering};
 pub use fs::vfs::{InodeTime, VfsFileType};
+use fs::{
+    dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode,
+    InodeCacheStats,
+};
+use lazy_static::*;
 pub use page_cache::{
-    discard_inode, mapping_for_inode, reclaim_if_needed,
-    page_cache_stats,
-    sync_all as sync_page_cache_all, sync_fs as sync_page_cache_fs,
-    sync_inode_range, truncate_inode, CachePage, PageCacheStats, mark_cached_page_dirty,
-    release_mapped_page, retain_mapped_page, PAGE_CACHE_MANAGER,
+    discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats, reclaim_if_needed,
+    release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
+    sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PageCacheStats,
+    PAGE_CACHE_MANAGER,
 };
 
 /// Cumulative directory-iteration counters used by `/proc/mm_perf`.
@@ -235,8 +237,16 @@ pub fn render_perf_counters() -> String {
     let _ = writeln!(&mut out, "fs_meta:");
     let _ = writeln!(&mut out, "  getdents_calls {}", getdents_calls);
     let _ = writeln!(&mut out, "  getdents_bytes {}", perf_load(&GETDENTS_BYTES));
-    let _ = writeln!(&mut out, "  getdents_total_us {}", perf_load(&GETDENTS_TOTAL_US));
-    let _ = writeln!(&mut out, "  dir_snapshot_calls {}", perf_load(&DIR_SNAPSHOT_CALLS));
+    let _ = writeln!(
+        &mut out,
+        "  getdents_total_us {}",
+        perf_load(&GETDENTS_TOTAL_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  dir_snapshot_calls {}",
+        perf_load(&DIR_SNAPSHOT_CALLS)
+    );
     let _ = writeln!(
         &mut out,
         "  dir_snapshot_entries {}",
@@ -248,7 +258,11 @@ pub fn render_perf_counters() -> String {
         perf_load(&DIR_SNAPSHOT_TOTAL_US)
     );
     let _ = writeln!(&mut out, "  lookup_inode_follow_calls {}", lookup_calls);
-    let _ = writeln!(&mut out, "  lookup_inode_follow_ok {}", perf_load(&LOOKUP_INODE_FOLLOW_OK));
+    let _ = writeln!(
+        &mut out,
+        "  lookup_inode_follow_ok {}",
+        perf_load(&LOOKUP_INODE_FOLLOW_OK)
+    );
     let _ = writeln!(
         &mut out,
         "  lookup_inode_follow_err {}",
@@ -279,7 +293,11 @@ pub fn render_perf_counters() -> String {
         }
     );
     let _ = writeln!(&mut out, "  inode_stat_calls {}", inode_stat_calls);
-    let _ = writeln!(&mut out, "  inode_stat_total_us {}", perf_load(&INODE_STAT_TOTAL_US));
+    let _ = writeln!(
+        &mut out,
+        "  inode_stat_total_us {}",
+        perf_load(&INODE_STAT_TOTAL_US)
+    );
     let _ = writeln!(
         &mut out,
         "  avg_inode_stat_us_x100 {}",
@@ -295,7 +313,11 @@ pub fn render_perf_counters() -> String {
         "  newfstatat_empty_path_calls {}",
         perf_load(&NEWFSTATAT_EMPTY_PATH_CALLS)
     );
-    let _ = writeln!(&mut out, "  newfstatat_total_us {}", perf_load(&NEWFSTATAT_TOTAL_US));
+    let _ = writeln!(
+        &mut out,
+        "  newfstatat_total_us {}",
+        perf_load(&NEWFSTATAT_TOTAL_US)
+    );
     let _ = writeln!(
         &mut out,
         "  newfstatat_resolve_us {}",
@@ -328,7 +350,11 @@ pub fn render_perf_counters() -> String {
     out
 }
 
-fn encode_dirent64_records(entries: &[(String, VfsFileType)], offset: usize, buf: &mut [u8]) -> usize {
+fn encode_dirent64_records(
+    entries: &[(String, VfsFileType)],
+    offset: usize,
+    buf: &mut [u8],
+) -> usize {
     let mut written = 0usize;
 
     for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
@@ -1086,12 +1112,13 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs, init_rootfs,
-    init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps, lookup_inode, lookup_inode_follow,
-    lookup_inode_follow_with_path, lookup_inode_from, mkdir_at, mkdir_at_with_inode, mount_cgroup2,
-    mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs, open_file, open_file_at,
-    open_file_at_with_status, remount_path, rename_at, symlinkat, unlinkat, OSInode, OpenFlags,
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs,
+    init_rootfs, init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps, lookup_inode,
+    lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, mkdir_at,
+    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
+    open_file, open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat,
+    unlinkat, OSInode, OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW,
+    AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::new_stdio_files;

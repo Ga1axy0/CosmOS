@@ -14,9 +14,9 @@ use crate::task::{
 use crate::timer::get_time_ns;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 use core::array;
+use core::sync::atomic::Ordering;
 use lazy_static::*;
 
 const RT_QUEUE_LEVELS: usize = SCHED_RT_PRIO_MAX as usize + 1;
@@ -408,7 +408,9 @@ fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
         return;
     };
     let mut task_inner = task.inner_exclusive_access();
-    if !task.on_cpu.load(Ordering::Relaxed) || !matches!(task_inner.task_status, TaskStatus::Running) {
+    if !task.on_cpu.load(Ordering::Relaxed)
+        || !matches!(task_inner.task_status, TaskStatus::Running)
+    {
         return;
     }
     let current_policy = task_inner.sched.policy;
@@ -750,16 +752,12 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
 pub(crate) fn check_sched_invariants() {
     use super::processor::PROCESSORS;
 
-    let proc_guards: Vec<_> = (0..MAX_HARTS)
-        .map(|h| PROCESSORS[h].lock())
-        .collect();
+    let proc_guards: Vec<_> = (0..MAX_HARTS).map(|h| PROCESSORS[h].lock()).collect();
     let currents: Vec<Option<usize>> = (0..MAX_HARTS)
         .map(|h| proc_guards[h].current_ptr())
         .collect();
 
-    let rq_guards: Vec<_> = (0..MAX_HARTS)
-        .map(|h| RUN_QUEUES[h].lock())
-        .collect();
+    let rq_guards: Vec<_> = (0..MAX_HARTS).map(|h| RUN_QUEUES[h].lock()).collect();
     // (owning_hart, task_ptr) for every runnable entry across all runqueues.
     let mut all_runnable: Vec<(usize, usize)> = Vec::new();
     for h in 0..MAX_HARTS {

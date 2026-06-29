@@ -162,9 +162,12 @@ impl BlockDevice for LoopBlockDevice {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         assert_eq!(buf.len(), fs::BLOCK_SZ);
         buf.fill(0);
-        let Some(backing) = self.backing.lock().as_ref().map(|backing| {
-            (Arc::clone(&backing.file), backing.size_bytes)
-        }) else {
+        let Some(backing) = self
+            .backing
+            .lock()
+            .as_ref()
+            .map(|backing| (Arc::clone(&backing.file), backing.size_bytes))
+        else {
             return;
         };
         let (file, size_bytes) = backing;
@@ -195,9 +198,7 @@ pub fn ensure_ltp_scratch_device() {
         .or_insert_with(|| Arc::new(SparseBlockDevice::new()) as Arc<dyn BlockDevice>);
 }
 
-fn loop_device_from_block(
-    device: &Arc<dyn BlockDevice>,
-) -> Option<&LoopBlockDevice> {
+fn loop_device_from_block(device: &Arc<dyn BlockDevice>) -> Option<&LoopBlockDevice> {
     device.as_ref().as_any().downcast_ref::<LoopBlockDevice>()
 }
 

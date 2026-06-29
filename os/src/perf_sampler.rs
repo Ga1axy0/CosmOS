@@ -26,7 +26,9 @@ use alloc::string::String;
 use lazy_static::lazy_static;
 
 use crate::config::CLOCK_FREQ;
-use crate::fs::{dentry_perf_counters, getdents_perf_counters, inode_perf_counters, page_cache_stats};
+use crate::fs::{
+    dentry_perf_counters, getdents_perf_counters, inode_perf_counters, page_cache_stats,
+};
 use crate::mm::{frame_allocator_stats, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES};
 use crate::net;
 use crate::sched::list_pids;

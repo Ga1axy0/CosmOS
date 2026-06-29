@@ -255,10 +255,7 @@ pub fn page_cache_stats() -> PageCacheStats {
 }
 
 fn inactive_compact_threshold(cached_pages: usize) -> usize {
-    cached_pages
-        .saturating_mul(2)
-        .saturating_add(256)
-        .max(1024)
+    cached_pages.saturating_mul(2).saturating_add(256).max(1024)
 }
 
 fn compact_inactive_queue_if_needed() {

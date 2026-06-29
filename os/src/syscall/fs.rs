@@ -1,15 +1,15 @@
-use crate::fs::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, AccessMode, File,
-    FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatMode, StatFs64, canonicalize, do_umount,
-    discard_inode, inode_stat, linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path,
-    lookup_inode_from, make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device,
-    mount_is_readonly, mount_sysfs, mount_tmpfs, open_file_at, open_file_at_with_status, remount_path, rename_at,
-    sync_page_cache_all, sync_page_cache_fs, truncate_inode, symlinkat, unlinkat, do_bind_mount, do_move_mount,
-    record_newfstatat_perf,
-};
 use crate::fs::devfs::BlockDevNode;
 use crate::fs::Pipe;
-use crate::mm::{PageFaultAccess, UserBuffer, translated_byte_buffer, translated_str};
+use crate::fs::{
+    canonicalize, discard_inode, do_bind_mount, do_move_mount, do_umount, inode_stat,
+    linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
+    make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
+    mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
+    rename_at, symlinkat, sync_page_cache_all, sync_page_cache_fs, truncate_inode, unlinkat,
+    AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatFs64,
+    StatMode, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+};
+use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
 use crate::poll::{self, PollWakeState};
 use crate::sched::block_current_and_run_next;
@@ -3529,7 +3529,14 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut Stat, flags: i32) 
         write_pod_to_user(st, &stat)?;
         let copyout_us = get_time_us().saturating_sub(copyout_start_us);
         let total_us = get_time_us().saturating_sub(total_start_us);
-        record_newfstatat_perf(false, resolve_us, lookup_us, inode_stat_us, copyout_us, total_us);
+        record_newfstatat_perf(
+            false,
+            resolve_us,
+            lookup_us,
+            inode_stat_us,
+            copyout_us,
+            total_us,
+        );
         debug!("sys_newfstatat: resolve_dirfd_base & canonicalize = {}us, lookup_inode = {}us, inode_stat = {}us, write_pod_to_user = {}us",
             resolve_us, lookup_us, inode_stat_us, copyout_us);
         Ok(0)
@@ -3569,11 +3576,8 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, mask: u32, stx: *mut
             }
         } else {
             let base = resolve_dirfd_lookup_base(dirfd, path.as_str())?;
-            let inode = lookup_inode_from_base(
-                &base,
-                path.as_str(),
-                flags & AT_SYMLINK_NOFOLLOW == 0,
-            )?;
+            let inode =
+                lookup_inode_from_base(&base, path.as_str(), flags & AT_SYMLINK_NOFOLLOW == 0)?;
             inode_stat(&inode)
         };
 
