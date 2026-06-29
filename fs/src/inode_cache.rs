@@ -67,6 +67,14 @@ lazy_static! {
 
 /// 按稳定键获取或创建内存 inode，保证同一文件对象复用同一个 `Arc<Inode>`。
 pub(crate) fn get_or_create_inode(node: Arc<dyn VfsNode>) -> Arc<Inode> {
+    #[cfg(feature = "no_inode_cache")]
+    {
+        // Bypass the inode cache: always create a new uncached inode.
+        return Inode::new_uncached(node);
+    }
+
+    #[cfg(not(feature = "no_inode_cache"))]
+    {
     let Some(key) = cache_key_of(node.as_ref()) else {
         return Inode::new_uncached(node);
     };
@@ -99,10 +107,18 @@ pub(crate) fn get_or_create_inode(node: Arc<dyn VfsNode>) -> Arc<Inode> {
     // TODO：后续可把当前按条目数的阈值回收，升级成结合内存压力的 shrinker。
     // TODO：当前 key 仅包含 `(fs_id, ino)`；若后端会在旧 inode 仍存活时复用 inode 号，需要补充 generation 或显式失效协议。
     inode
+    } // #[cfg(not(feature = "no_inode_cache"))]
 }
 
 /// Drop a cached inode by its stable key.
 pub(crate) fn remove_cached_inode(fs_id: u64, ino: u64) {
+    #[cfg(feature = "no_inode_cache")]
+    {
+        let _ = (fs_id, ino);
+        return;
+    }
+    #[cfg(not(feature = "no_inode_cache"))]
+    {
     if fs_id == 0 || ino == 0 {
         return;
     }
@@ -110,6 +126,7 @@ pub(crate) fn remove_cached_inode(fs_id: u64, ino: u64) {
         .lock()
         .table
         .remove(&InodeCacheKey { fs_id, ino });
+    }
 }
 
 /// Drop a cached inode corresponding to a backend node.
@@ -118,8 +135,16 @@ pub(crate) fn remove_cached_inode(fs_id: u64, ino: u64) {
 /// a newly allocated backend node must not resolve to an old in-memory inode
 /// with stale file type state.
 pub(crate) fn remove_cached_node(node: &dyn VfsNode) {
+    #[cfg(feature = "no_inode_cache")]
+    {
+        let _ = node;
+        return;
+    }
+    #[cfg(not(feature = "no_inode_cache"))]
+    {
     if let Some(key) = cache_key_of(node) {
         remove_cached_inode(key.fs_id, key.ino);
+    }
     }
 }
 

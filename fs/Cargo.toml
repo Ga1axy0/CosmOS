@@ -21,5 +21,11 @@ board_qemu = []
 board_k210 = []
 io_perf_counters = []
 kernel_sleep_mutex = []
+# Cache bypass features — enable to disable the corresponding cache for
+# benchmarking its performance contribution in isolation.
+no_block_cache = []
+no_inode_cache = []
+no_dentry_cache = []
+no_stat_cache = []
 
 default = ["io_perf_counters"]

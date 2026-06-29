@@ -606,6 +606,17 @@ impl Inode {
     pub fn stat_attrs(&self) -> VfsAttrs {
         #[cfg(feature = "io_perf_counters")]
         STAT_ATTRS_CALLS.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "no_stat_cache")]
+        {
+            // Bypass the stat-attributes cache: always go to the backend.
+            #[cfg(feature = "io_perf_counters")]
+            STAT_ATTRS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            return self.inner.stat_attrs();
+        }
+
+        #[cfg(not(feature = "no_stat_cache"))]
+        {
         let state = self.state.lock();
         if let Some(attrs) = state.stat_attrs.clone() {
             #[cfg(feature = "io_perf_counters")]
@@ -618,6 +629,7 @@ impl Inode {
         let attrs = self.inner.stat_attrs();
         self.state.lock().stat_attrs = Some(attrs.clone());
         attrs
+        }
     }
 
     /// Read filesystem-wide statistics.
@@ -777,7 +789,12 @@ impl Inode {
 
     /// Drop the cached stat snapshot for this inode.
     pub fn invalidate_stat_cache(&self) {
+        #[cfg(feature = "no_stat_cache")]
+        return;
+        #[cfg(not(feature = "no_stat_cache"))]
+        {
         self.state.lock().stat_attrs = None;
+        }
     }
 
     /// 获取当前 inode 挂载的 page cache 宿主对象。

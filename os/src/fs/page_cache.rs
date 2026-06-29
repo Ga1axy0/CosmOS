@@ -333,7 +333,15 @@ fn pop_inactive_page() -> Option<Arc<SpinNoIrqLock<CachePage>>> {
 
 /// 判断一个 inode 当前是否适合进入 page cache。
 pub fn is_inode_page_cacheable(inode: &Arc<Inode>) -> bool {
+    #[cfg(feature = "no_page_cache")]
+    {
+        let _ = inode;
+        return false;
+    }
+    #[cfg(not(feature = "no_page_cache"))]
+    {
     !inode.is_dir() && inode.fs_id() != 0 && inode.ino() != 0
+    }
 }
 
 /// 返回 page cache 视角下的文件长度。

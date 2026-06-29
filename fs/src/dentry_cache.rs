@@ -148,17 +148,41 @@ lazy_static! {
 
 /// Try to resolve `(fs_id, parent_ino, name)` from the dentry cache.
 pub fn lookup_dentry(fs_id: u64, parent_ino: u64, name: &str) -> Option<Arc<Inode>> {
+    #[cfg(feature = "no_dentry_cache")]
+    {
+        let _ = (fs_id, parent_ino, name);
+        return None;
+    }
+    #[cfg(not(feature = "no_dentry_cache"))]
+    {
     DENTRY_CACHE.lock().lookup(fs_id, parent_ino, name)
+    }
 }
 
 /// Store `(fs_id, parent_ino, name) → child` in the dentry cache.
 pub fn insert_dentry(fs_id: u64, parent_ino: u64, name: &str, child: &Arc<Inode>) {
+    #[cfg(feature = "no_dentry_cache")]
+    {
+        let _ = (fs_id, parent_ino, name, child);
+        return;
+    }
+    #[cfg(not(feature = "no_dentry_cache"))]
+    {
     DENTRY_CACHE.lock().insert(fs_id, parent_ino, name, child)
+    }
 }
 
 /// Explicitly invalidate a dentry (unlink / rmdir / rename).
 pub fn remove_dentry(fs_id: u64, parent_ino: u64, name: &str) {
+    #[cfg(feature = "no_dentry_cache")]
+    {
+        let _ = (fs_id, parent_ino, name);
+        return;
+    }
+    #[cfg(not(feature = "no_dentry_cache"))]
+    {
     DENTRY_CACHE.lock().remove(fs_id, parent_ino, name)
+    }
 }
 
 /// Return the current global dentry-cache footprint and queue depths.

@@ -42,4 +42,11 @@ oom_diagnostics = []
 perf_probe = []
 legacy-vdb-names = []
 sched_invariant_checks = []
+# Cache bypass features — enable to disable the corresponding cache for
+# benchmarking its performance contribution in isolation.
+no_page_cache = []
+no_block_cache = ["fs/no_block_cache"]
+no_inode_cache = ["fs/no_inode_cache"]
+no_dentry_cache = ["fs/no_dentry_cache"]
+no_stat_cache = ["fs/no_stat_cache"]
 default = ["ext4", "platform-qemu-virt", "net_perf_counters", "mm_perf_counters", "legacy-vdb-names"]

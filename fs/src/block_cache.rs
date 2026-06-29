@@ -257,26 +257,41 @@ impl BlockCacheManager {
     ) -> Arc<Mutex<BlockCache>> {
         #[cfg(feature = "io_perf_counters")]
         GET_CALLS.fetch_add(1, Ordering::Relaxed);
-        let key = (Self::device_id(&block_device), block_id);
-        #[cfg(feature = "io_perf_counters")]
-        LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
-        if let Some(block_cache) = self.map.get(&key) {
-            #[cfg(feature = "io_perf_counters")]
-            GET_HITS.fetch_add(1, Ordering::Relaxed);
-            return Arc::clone(block_cache);
-        }
-        #[cfg(feature = "io_perf_counters")]
-        GET_MISSES.fetch_add(1, Ordering::Relaxed);
 
-        self.evict_one_if_needed();
-        // load block into mem and push back
-        let block_cache = Arc::new(Mutex::new(BlockCache::new(
-            block_id,
-            Arc::clone(&block_device),
-        )));
-        self.queue.push_back(key);
-        self.map.insert(key, Arc::clone(&block_cache));
-        block_cache
+        #[cfg(feature = "no_block_cache")]
+        {
+            // Bypass the block cache: read directly from disk without caching.
+            #[cfg(feature = "io_perf_counters")]
+            GET_MISSES.fetch_add(1, Ordering::Relaxed);
+            return Arc::new(Mutex::new(BlockCache::new(
+                block_id,
+                Arc::clone(&block_device),
+            )));
+        }
+
+        #[cfg(not(feature = "no_block_cache"))]
+        {
+            let key = (Self::device_id(&block_device), block_id);
+            #[cfg(feature = "io_perf_counters")]
+            LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
+            if let Some(block_cache) = self.map.get(&key) {
+                #[cfg(feature = "io_perf_counters")]
+                GET_HITS.fetch_add(1, Ordering::Relaxed);
+                return Arc::clone(block_cache);
+            }
+            #[cfg(feature = "io_perf_counters")]
+            GET_MISSES.fetch_add(1, Ordering::Relaxed);
+
+            self.evict_one_if_needed();
+            // load block into mem and push back
+            let block_cache = Arc::new(Mutex::new(BlockCache::new(
+                block_id,
+                Arc::clone(&block_device),
+            )));
+            self.queue.push_back(key);
+            self.map.insert(key, Arc::clone(&block_cache));
+            block_cache
+        }
     }
 
     /// Read a contiguous range of 512-byte blocks, satisfying cache misses with
@@ -290,14 +305,28 @@ impl BlockCacheManager {
     ) {
         assert!(buf.len() % BLOCK_SZ == 0);
         let block_count = buf.len() / BLOCK_SZ;
-        #[cfg(feature = "io_perf_counters")]
+        #[cfg(all(feature = "io_perf_counters", not(feature = "no_block_cache")))]
         GET_CALLS.fetch_add(block_count, Ordering::Relaxed);
         if block_count == 0 {
             return;
         }
 
-        let device_id = Self::device_id(&block_device);
-        let mut idx = 0usize;
+        #[cfg(feature = "no_block_cache")]
+        {
+            // Bypass the block cache: read directly from disk.
+            #[cfg(feature = "io_perf_counters")]
+            {
+                GET_CALLS.fetch_add(block_count, Ordering::Relaxed);
+                GET_MISSES.fetch_add(block_count, Ordering::Relaxed);
+            }
+            block_device.read_blocks(start_block, buf);
+            return;
+        }
+
+        #[cfg(not(feature = "no_block_cache"))]
+        {
+            let device_id = Self::device_id(&block_device);
+            let mut idx = 0usize;
         while idx < block_count {
             #[cfg(feature = "io_perf_counters")]
             LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
@@ -335,6 +364,7 @@ impl BlockCacheManager {
                 &mut buf[byte_start..byte_end],
             );
         }
+        } // #[cfg(not(feature = "no_block_cache"))]
     }
 
     pub fn overwrite_block_cache_range(
@@ -350,6 +380,15 @@ impl BlockCacheManager {
         if block_count == 0 {
             return;
         }
+
+        #[cfg(feature = "no_block_cache")]
+        {
+            // Bypass: no cache to update — the caller writes directly to disk.
+            return;
+        }
+
+        #[cfg(not(feature = "no_block_cache"))]
+        {
         let device_id = Self::device_id(&block_device);
         let end_block = start_block
             .checked_add(block_count)
@@ -382,6 +421,7 @@ impl BlockCacheManager {
         }
         #[cfg(not(feature = "io_perf_counters"))]
         let _ = hits;
+        } // #[cfg(not(feature = "no_block_cache"))]
     }
 }
 
