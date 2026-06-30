@@ -1221,10 +1221,20 @@ impl File for OSInode {
         buf: &mut [u8],
         cache: &mut page_cache::PageReadCache,
     ) -> Result<Option<usize>, ERRNO> {
-        let Some(mapping) = cache.mapping_or_insert_with(|| self.page_mapping()) else {
-            return Ok(None);
-        };
-        Ok(Some(mapping.read_with_synced_cache(offset, buf, cache)))
+        #[cfg(feature = "no_syscall_io_fastpath")]
+        {
+            // per-FD hot-page cache disabled for A/B benchmarking; report a miss so
+            // read_slice_result falls back to read_bytes_at (still page-cache backed).
+            let _ = (offset, buf, cache);
+            Ok(None)
+        }
+        #[cfg(not(feature = "no_syscall_io_fastpath"))]
+        {
+            let Some(mapping) = cache.mapping_or_insert_with(|| self.page_mapping()) else {
+                return Ok(None);
+            };
+            Ok(Some(mapping.read_with_synced_cache(offset, buf, cache)))
+        }
     }
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let mapping = self.page_mapping();

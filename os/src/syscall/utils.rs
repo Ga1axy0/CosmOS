@@ -92,23 +92,32 @@ pub fn translated_single_byte_buffer_with_token(
     len: usize,
     access: PageFaultAccess,
 ) -> Option<&'static mut [u8]> {
-    if len == 0 {
-        return None;
+    #[cfg(feature = "no_syscall_io_fastpath")]
+    {
+        // single-page zero-alloc fast path disabled for A/B benchmarking.
+        let _ = (token, ptr, len, access);
+        None
     }
-    let start = ptr as usize;
-    let end = checked_user_buffer_end(ptr, len)?;
-    if (start & !(PAGE_SIZE - 1)) != ((end - 1) & !(PAGE_SIZE - 1)) {
-        return None;
-    }
+    #[cfg(not(feature = "no_syscall_io_fastpath"))]
+    {
+        if len == 0 {
+            return None;
+        }
+        let start = ptr as usize;
+        let end = checked_user_buffer_end(ptr, len)?;
+        if (start & !(PAGE_SIZE - 1)) != ((end - 1) & !(PAGE_SIZE - 1)) {
+            return None;
+        }
 
-    let page_table = PageTable::from_token(token);
-    let start_va = VirtAddr::from(start);
-    let pte = page_table.translate(start_va.floor())?;
-    if !pte_allows_user_access(pte, access) {
-        return None;
+        let page_table = PageTable::from_token(token);
+        let start_va = VirtAddr::from(start);
+        let pte = page_table.translate(start_va.floor())?;
+        if !pte_allows_user_access(pte, access) {
+            return None;
+        }
+        let offset = start_va.page_offset();
+        Some(&mut pte.ppn().get_bytes_array()[offset..offset + len])
     }
-    let offset = start_va.page_offset();
-    Some(&mut pte.ppn().get_bytes_array()[offset..offset + len])
 }
 
 /// 尝试为一段用户虚拟地址触发并完成缺页装入，使后续字节翻译可成功。

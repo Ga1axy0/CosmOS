@@ -143,6 +143,7 @@ pub struct TaskControlBlock {
     /// Kernel stack corresponding to PID
     pub kstack: KernelStack,
     /// Current task's recent fd lookup cache.
+    #[cfg_attr(feature = "no_syscall_io_fastpath", allow(dead_code))]
     recent_fd_cache: TaskFdCache,
     /// mutable
     inner: SpinNoIrqLock<TaskControlBlockInner>,
@@ -172,16 +173,25 @@ impl TaskControlBlock {
         fd: usize,
         generation: usize,
     ) -> Option<Arc<FileDescription>> {
-        let cached = self.recent_fd_cache.load()?;
-        if cached.fd != fd || cached.generation != generation {
-            return None;
-        }
-        let desc = cached.desc.upgrade()?;
-        let process = self.process.upgrade()?;
-        if process.fd_table_generation() == generation {
-            Some(desc)
-        } else {
+        #[cfg(feature = "no_syscall_io_fastpath")]
+        {
+            // fd-lookup cache disabled for A/B benchmarking; always miss.
+            let _ = (fd, generation);
             None
+        }
+        #[cfg(not(feature = "no_syscall_io_fastpath"))]
+        {
+            let cached = self.recent_fd_cache.load()?;
+            if cached.fd != fd || cached.generation != generation {
+                return None;
+            }
+            let desc = cached.desc.upgrade()?;
+            let process = self.process.upgrade()?;
+            if process.fd_table_generation() == generation {
+                Some(desc)
+            } else {
+                None
+            }
         }
     }
 
@@ -192,15 +202,24 @@ impl TaskControlBlock {
         generation: usize,
         desc: &Arc<FileDescription>,
     ) {
-        self.recent_fd_cache.store(Some(RecentFdCache {
-            fd,
-            generation,
-            desc: Arc::downgrade(desc),
-        }));
+        #[cfg(feature = "no_syscall_io_fastpath")]
+        {
+            // cache disabled; nothing to remember.
+            let _ = (fd, generation, desc);
+        }
+        #[cfg(not(feature = "no_syscall_io_fastpath"))]
+        {
+            self.recent_fd_cache.store(Some(RecentFdCache {
+                fd,
+                generation,
+                desc: Arc::downgrade(desc),
+            }));
+        }
     }
 }
 
 /// Task-local weak cache for the most recent fd lookup.
+#[cfg_attr(feature = "no_syscall_io_fastpath", allow(dead_code))]
 #[derive(Clone)]
 pub struct RecentFdCache {
     pub fd: usize,
@@ -209,6 +228,7 @@ pub struct RecentFdCache {
 }
 
 /// Lock-free cache used only by the task that is currently running.
+#[cfg_attr(feature = "no_syscall_io_fastpath", allow(dead_code))]
 pub struct TaskFdCache {
     inner: UnsafeCell<Option<RecentFdCache>>,
 }
@@ -218,6 +238,7 @@ pub struct TaskFdCache {
 // process fd-table generation, so other CPUs do not mutate this cell.
 unsafe impl Sync for TaskFdCache {}
 
+#[cfg_attr(feature = "no_syscall_io_fastpath", allow(dead_code))]
 impl TaskFdCache {
     pub fn new() -> Self {
         Self {

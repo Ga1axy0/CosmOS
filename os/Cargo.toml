@@ -42,4 +42,10 @@ oom_diagnostics = []
 perf_probe = []
 legacy-vdb-names = []
 sched_invariant_checks = []
+# A/B benchmark switch: disables the syscall-entry I/O fast paths
+# (per-task fd-lookup cache, single-page zero-alloc buffer, per-FD hot-page
+# cache). Opt-in — the kernel builds with --no-default-features, so the
+# optimized path remains the baseline unless this is explicitly enabled via
+# `make ... NO_SYSCALL_FASTPATH=1`.
+no_syscall_io_fastpath = []
 default = ["ext4", "platform-qemu-virt", "net_perf_counters", "mm_perf_counters", "legacy-vdb-names"]

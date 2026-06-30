@@ -33,7 +33,8 @@ KERNEL_BUILD_STAMP_RV := $(STAMP_DIR)/kernel-build-rv.stamp
 KERNEL_BUILD_STAMP_LA := $(STAMP_DIR)/kernel-build-la.stamp
 KERNEL_LOG_KEY := $(if $(strip $(LOG)),$(strip $(LOG)),OFF)
 KERNEL_PERF_PROBE_KEY := $(if $(filter 1,$(PERF_PROBE)),ON,OFF)
-KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY)
+KERNEL_NO_FASTPATH_KEY := $(if $(filter 1,$(NO_SYSCALL_FASTPATH)),ON,OFF)
+KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY) NO_SYSCALL_FASTPATH=$(KERNEL_NO_FASTPATH_KEY)
 KERNEL_CONFIG_STAMP_RV := $(STAMP_DIR)/kernel-config-rv.stamp
 KERNEL_CONFIG_STAMP_LA := $(STAMP_DIR)/kernel-config-la.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
