@@ -126,10 +126,10 @@ fn main() -> i32 {
 
             // Start the normal user shell, but over TCP.
             // NOTE: sys_exec expects a NUL-terminated string in user memory.
-            exec("sh\0", &[core::ptr::null::<u8>()]);
+            exec("bash\0", &["bash\0".as_ptr(), "-i\0".as_ptr()]);
 
             // If exec fails, we are still on the network stdio.
-            println!("remote_shell: exec('sh') failed");
+            println!("remote_shell: exec('bash -i') failed");
             let _ = exit(-1);
             return -1;
         } else {

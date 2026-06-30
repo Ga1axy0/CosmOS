@@ -187,7 +187,8 @@ run-inner:
 		$(QEMU_COMMON_ARGS) \
 		$(QEMU_BOOT_ARGS) \
 		$(QEMU_NET_ARGS) \
-		$(QEMU_BLK_ARGS)
+		$(QEMU_BLK_ARGS) \
+		-object filter-dump,id=ndump,netdev=net0,file=qemu-net.pcap
 #	Uncomment above lines to add a second virtio-blk device (for testing mount/umount) 
 
 run-inner-trace:

@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1180" viewBox="0 0 1600 1180" role="img" aria-labelledby="title desc">
+  <title id="title">xxOS kernel process lifecycle state machine</title>
+  <desc id="desc">State machine for process and task lifecycle paths in the current xxOS kernel.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f7fbf4"/>
+      <stop offset="48%" stop-color="#f3efe4"/>
+      <stop offset="100%" stop-color="#edf5f7"/>
+    </linearGradient>
+    <linearGradient id="active" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fef7d7"/>
+      <stop offset="100%" stop-color="#fee3b8"/>
+    </linearGradient>
+    <linearGradient id="zombie" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffe7df"/>
+      <stop offset="100%" stop-color="#ffc6b8"/>
+    </linearGradient>
+    <linearGradient id="born" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#e4f6de"/>
+      <stop offset="100%" stop-color="#c9ebc5"/>
+    </linearGradient>
+    <linearGradient id="dead" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#e8ecec"/>
+      <stop offset="100%" stop-color="#cfd8d7"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#315057"/>
+    </marker>
+    <marker id="arrowSoft" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#718486"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#274247" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .bg { fill: url(#bg); }
+      .title { font: 800 34px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #21383c; }
+      .subtitle { font: 500 17px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #52676b; }
+      .section { font: 800 22px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #263f43; }
+      .node-title { font: 800 20px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #20363a; }
+      .node-text { font: 500 15px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #334d51; }
+      .small { font: 500 13px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #4e666a; }
+      .code { font: 600 13px "JetBrains Mono", "Fira Code", monospace; fill: #315057; }
+      .edge { stroke: #315057; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .edge-soft { stroke: #718486; stroke-width: 2.2; fill: none; marker-end: url(#arrowSoft); stroke-dasharray: 8 7; }
+      .edge-label { font: 700 15px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #24454a; }
+      .edge-note { font: 500 13px "Noto Sans CJK SC", "Source Han Sans SC", sans-serif; fill: #415d62; }
+      .box { rx: 22; ry: 22; stroke: #315057; stroke-width: 2; filter: url(#shadow); }
+      .note-box { rx: 18; ry: 18; fill: #ffffff; stroke: #8da0a2; stroke-width: 1.5; filter: url(#shadow); }
+      .lane { fill: rgba(255,255,255,0.42); stroke: #d2dcda; stroke-width: 1.5; }
+      .pill { rx: 14; ry: 14; fill: #eff8f3; stroke: #9bb7ad; stroke-width: 1.3; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1600" height="1180"/>
+  <path d="M0,110 C230,35 350,150 540,86 C750,16 930,40 1110,102 C1300,166 1448,94 1600,44 L1600,0 L0,0 Z" fill="#dbeedd" opacity="0.45"/>
+  <path d="M0,1080 C270,1018 410,1128 650,1060 C840,1006 1028,1022 1238,1088 C1384,1134 1486,1100 1600,1050 L1600,1180 L0,1180 Z" fill="#d7e8eb" opacity="0.55"/>
+
+  <text x="70" y="70" class="title">xxOS 当前内核进程生命周期状态机</text>
+  <text x="72" y="103" class="subtitle">依据源码路径核对：init / clone-fork / exec / exit / wait，以及任务 TCB 调度状态。</text>
+
+  <rect x="60" y="145" width="1480" height="650" class="lane" rx="30"/>
+  <text x="90" y="187" class="section">PCB 进程层：是否存在、是否 zombie、是否仍在 PID2PCB/children 中</text>
+
+  <rect x="110" y="255" width="235" height="145" class="box" fill="url(#dead)"/>
+  <text x="138" y="296" class="node-title">尚无 PCB</text>
+  <text x="138" y="326" class="node-text">无 PID / 无 PCB</text>
+  <text x="138" y="350" class="node-text">不在 PID2PCB</text>
+  <text x="138" y="374" class="node-text">不在父进程 children</text>
+
+  <rect x="500" y="235" width="300" height="190" class="box" fill="url(#born)"/>
+  <text x="530" y="278" class="node-title">创建中</text>
+  <text x="530" y="309" class="node-text">分配 PID 与 PCB</text>
+  <text x="530" y="333" class="node-text">装载 ELF / 解释器</text>
+  <text x="530" y="357" class="node-text">创建主 TCB、用户栈</text>
+  <text x="530" y="381" class="node-text">构造 trap context</text>
+  <text x="530" y="405" class="code">not yet scheduled</text>
+
+  <rect x="960" y="220" width="375" height="220" class="box" fill="url(#active)"/>
+  <text x="994" y="263" class="node-title">活动进程</text>
+  <text x="994" y="294" class="code">PCB.inner.is_zombie = false</text>
+  <text x="994" y="318" class="node-text">PID2PCB 持有强引用</text>
+  <text x="994" y="342" class="node-text">父进程 children 持有子 PCB</text>
+  <text x="994" y="366" class="node-text">至少主任务可调度/可运行</text>
+  <text x="994" y="390" class="node-text">fd、cwd、cred、signals、mm 生效</text>
+  <text x="994" y="414" class="code">TaskStatus: Runnable / Running / Sleep</text>
+
+  <rect x="960" y="560" width="375" height="165" class="box" fill="url(#zombie)"/>
+  <text x="994" y="602" class="node-title">Zombie 进程</text>
+  <text x="994" y="633" class="code">PCB.inner.is_zombie = true</text>
+  <text x="994" y="657" class="node-text">保留 PID、exit_reason 与统计</text>
+  <text x="994" y="681" class="node-text">仍在 PID2PCB / parent.children</text>
+  <text x="994" y="705" class="node-text">等待父进程 wait4 回收</text>
+
+  <rect x="500" y="575" width="300" height="135" class="box" fill="url(#dead)"/>
+  <text x="530" y="618" class="node-title">已回收</text>
+  <text x="530" y="649" class="node-text">从 parent.children 移除</text>
+  <text x="530" y="673" class="node-text">从 PID2PCB 移除</text>
+  <text x="530" y="697" class="node-text">PCB 最终 drop / 资源释放</text>
+
+  <path class="edge" d="M345,320 C395,306 444,302 500,311"/>
+  <text x="370" y="270" class="edge-label">init</text>
+  <text x="370" y="295" class="edge-note">lazy INITPROC -> ProcessControlBlock::new</text>
+
+  <path class="edge" d="M800,325 C858,325 902,325 960,325"/>
+  <text x="822" y="285" class="edge-label">发布</text>
+  <text x="822" y="310" class="edge-note">attach_task -> insert_into_pid2process -> add_task</text>
+
+  <path class="edge" d="M1150,440 C1150,480 1150,520 1150,560"/>
+  <text x="1180" y="490" class="edge-label">exit / exit_group / fatal signal</text>
+  <text x="1180" y="515" class="edge-note">主线程退出或 force_process_exit 才终结 PCB</text>
+
+  <path class="edge" d="M960,640 C900,650 858,652 800,650"/>
+  <text x="805" y="602" class="edge-label">wait4 / waitpid</text>
+  <text x="805" y="627" class="edge-note">父进程 children 中找 zombie，编码 wstatus</text>
+
+  <path class="edge-soft" d="M965,250 C860,140 1030,118 1160,166 C1315,222 1325,424 1195,456 C1040,494 910,398 960,306"/>
+  <text x="1025" y="145" class="edge-label">execve 自环</text>
+  <text x="1025" y="170" class="edge-note">PID / 父子关系 / 非 CLOEXEC fd 保留</text>
+  <text x="1025" y="194" class="edge-note">替换地址空间，重建主线程栈与 trap context</text>
+
+  <path class="edge-soft" d="M1325,334 C1454,372 1455,184 1328,212 C1250,229 1257,198 1320,172"/>
+  <text x="1366" y="247" class="edge-label">clone / fork</text>
+  <text x="1366" y="272" class="edge-note">父进程继续运行，子 PCB 进入活动状态</text>
+  <text x="1366" y="296" class="edge-note">子返回值在 trap context 中置 0</text>
+
+  <path class="edge-soft" d="M1145,725 C1120,810 930,818 785,700"/>
+  <text x="938" y="765" class="edge-label">autoreap</text>
+  <text x="938" y="790" class="edge-note">SIGCHLD 被忽略或 SA_NOCLDWAIT 时直接回收</text>
+
+  <rect x="100" y="455" width="740" height="265" class="note-box"/>
+  <text x="130" y="493" class="section">关键迁移动作</text>
+  <text x="130" y="530" class="node-text">init：打开并解析 /sbin/init，支持 ELF / shebang / 动态解释器；设置 root 凭据、cwd=/root、stdio、环境变量。</text>
+  <text x="130" y="560" class="node-text">clone/fork：当前进程分支要求父进程单线程；地址空间 COW 复制或 CLONE_VM 共享；继承 fd/cwd/root/cred/sighand/env/limits。</text>
+  <text x="130" y="590" class="node-text">exec：当前实现断言单线程；替换 memory_set 和 vm_layout；重置非 SIG_IGN 信号处置，清 pending signals，关闭 CLOEXEC fd。</text>
+  <text x="130" y="620" class="node-text">exit：清 signal/futex wait、timer、runqueue、TID 映射、fd 表、地址空间、SysV shm、keyrings；孤儿子进程改挂 INITPROC。</text>
+  <text x="130" y="650" class="node-text">wait：父进程没有 zombie 时可睡在 wait_exit_queue；WNOHANG 返回 0；没有匹配 children 返回 ECHILD。</text>
+  <text x="130" y="690" class="code">主要函数：ProcessControlBlock::new / clone_process / exec, exit_current_and_run_next_inner, sys_wait4</text>
+
+  <rect x="60" y="835" width="1480" height="255" class="lane" rx="30"/>
+  <text x="90" y="877" class="section">TCB 任务层：调度状态与线程退出补充</text>
+
+  <rect x="110" y="925" width="195" height="90" class="pill"/>
+  <text x="145" y="960" class="node-title">Runnable</text>
+  <text x="137" y="987" class="small">在 runqueue 中等待调度</text>
+
+  <rect x="395" y="925" width="195" height="90" class="pill"/>
+  <text x="440" y="960" class="node-title">Running</text>
+  <text x="427" y="987" class="small">当前 hart 正在执行</text>
+
+  <rect x="680" y="925" width="240" height="90" class="pill"/>
+  <text x="720" y="960" class="node-title">Sleeping</text>
+  <text x="706" y="987" class="small">Interruptible / Uninterruptible</text>
+
+  <rect x="1015" y="925" width="195" height="90" class="pill" fill="#fff0ec"/>
+  <text x="1065" y="960" class="node-title">Zombie TCB</text>
+  <text x="1037" y="987" class="small">不再被调度，等待清理</text>
+
+  <rect x="1300" y="925" width="195" height="90" class="pill" fill="#eef1f1"/>
+  <text x="1354" y="960" class="node-title">Dropped</text>
+  <text x="1325" y="987" class="small">TCB/user res/kstack 可释放</text>
+
+  <path class="edge" d="M305,970 C335,970 365,970 395,970"/>
+  <text x="322" y="948" class="edge-note">pick_next_task</text>
+
+  <path class="edge" d="M395,1010 C350,1060 185,1060 145,1015"/>
+  <text x="206" y="1054" class="edge-note">yield / slice end / preempt</text>
+
+  <path class="edge" d="M590,970 C620,970 650,970 680,970"/>
+  <text x="610" y="948" class="edge-note">WaitQueue / timer / futex / poll</text>
+
+  <path class="edge" d="M680,1015 C580,1070 355,1068 255,1015"/>
+  <text x="438" y="1060" class="edge-note">wakeup_task</text>
+
+  <path class="edge" d="M920,970 C950,970 985,970 1015,970"/>
+  <text x="936" y="948" class="edge-note">thread exit / process exit sweep</text>
+
+  <path class="edge" d="M1210,970 C1240,970 1270,970 1300,970"/>
+  <text x="1226" y="948" class="edge-note">waittid / stop_task cleanup</text>
+
+  <rect x="95" y="1105" width="1410" height="44" class="note-box"/>
+  <text x="120" y="1133" class="small">源码锚点：os/src/task/process.rs、os/src/task/mod.rs、os/src/task/task.rs、os/src/syscall/process.rs、os/src/syscall/thread.rs、os/src/sched/runqueue.rs</text>
+</svg>
