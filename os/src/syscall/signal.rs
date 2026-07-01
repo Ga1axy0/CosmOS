@@ -321,6 +321,39 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
     })
 }
 
+/// `rt_sigpending(2)`：返回当前线程被阻塞的 pending signal 集合。
+///
+/// Linux 语义要求返回“线程级 pending ∪ 进程级 pending”再与当前 signal mask
+/// 取交集后的结果，并按用户态 `sigset_t` 布局写回。
+pub fn sys_rt_sigpending(set: *mut u64, sigsetsize: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_rt_sigpending set={:#x} sigsetsize={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        set as usize,
+        sigsetsize
+    );
+    syscall_body!({
+        if set.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        if sigsetsize < core::mem::size_of::<u32>() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let pending = {
+            let task = current_task().unwrap();
+            let process = current_process();
+            let process_inner = process.inner_exclusive_access();
+            let task_inner = task.inner_exclusive_access();
+            (task_inner.pending_signals | process_inner.pending_signals)
+                & task_inner.signal_mask.without_unblockable()
+        };
+
+        write_user_sigset(set, sigsetsize, pending)?;
+        Ok(0)
+    })
+}
+
 /// rt_sigreturn 系统调用
 ///
 /// 从用户栈上的 sigframe 恢复寄存器状态和信号掩码。
