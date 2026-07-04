@@ -193,6 +193,43 @@ pub struct TaskControlBlockInner {
     pub signal_mask_backup: Option<SignalBit>,
     /// Whether this task may still have non-futex timers that require eager removal on exit.
     pub may_have_non_futex_timer: bool,
+    /// Debug: the last scheduler-container transition that touched this task.
+    /// Updated best-effort at each enqueue/dequeue/wake/block/remove site via
+    /// [`TaskControlBlockInner::stamp_sched`]. Dumped by the lost-runnable
+    /// detector so an orphaned task's final operation is visible. Zero runtime
+    /// cost except at transitions; produces no log output on its own.
+    pub last_sched_op: LastSchedOp,
+}
+
+/// Record of the last scheduler transition that touched a task, used to
+/// diagnose lost-runnable orphans. `op` names the transition, `hart` is the
+/// hart that performed it, `status`/`on_rq` are the resulting task state, and
+/// `seq` is a per-task monotonic counter so the freshness of the stamp is
+/// visible. `Default` is the "just constructed" stamp.
+#[derive(Clone, Copy, Debug)]
+pub struct LastSchedOp {
+    /// Short name of the transition (e.g. `"enqueue_wake"`, `"dequeue_run"`).
+    pub op: &'static str,
+    /// Hart that performed the transition.
+    pub hart: usize,
+    /// Task status as observed *after* the transition.
+    pub status: TaskStatus,
+    /// `sched.on_rq` as observed after the transition.
+    pub on_rq: bool,
+    /// Per-task monotonic sequence number, so freshness of the stamp is visible.
+    pub seq: u32,
+}
+
+impl Default for LastSchedOp {
+    fn default() -> Self {
+        Self {
+            op: "init",
+            hart: 0,
+            status: TaskStatus::Runnable,
+            on_rq: false,
+            seq: 0,
+        }
+    }
 }
 
 impl TaskControlBlockInner {
@@ -280,6 +317,7 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
                 may_have_non_futex_timer: false,
+                last_sched_op: LastSchedOp::default(),
             }),
         };
         let build_ns = get_time_ns() - build_start_ns;
@@ -327,6 +365,7 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
                 may_have_non_futex_timer: false,
+                last_sched_op: LastSchedOp::default(),
             }),
         })
     }

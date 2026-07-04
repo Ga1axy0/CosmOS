@@ -336,8 +336,33 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
                 target_mask
             );
         }
+        // A target hart that is spinning in an IRQ-disabling lock (or otherwise
+        // unable to take the IPI) cannot ack, and this wait — held under the
+        // global launch lock — would then hang every subsequent shootdown
+        // system-wide. A healthy shootdown completes in microseconds; sample the
+        // spin count and, past a threshold only an abnormal stall would reach,
+        // log the still-missing hart mask so the wedge is debuggable instead of a
+        // silent lockup. Emitted unconditionally (not gated by `emit_logs`) and
+        // independent of the allocator: grow's local-flush path above never
+        // recurses into a shootdown, so logging here is safe.
+        let mut spins: u64 = 0;
+        let stall_threshold: u64 = 1 << 23; // ~8M spins ≈ a few ms on typical QEMU
         while TLB_SHOOTDOWN_STATE.ack_mask.load(Ordering::Acquire) != target_mask {
             spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins >= stall_threshold && spins.is_power_of_two() {
+                let missing =
+                    target_mask & !TLB_SHOOTDOWN_STATE.ack_mask.load(Ordering::Acquire);
+                warn!(
+                    "[tlb] seq={} shootdown stall: target={:#b} ack={:#b} missing={:#b} — \
+                     a hart in the missing mask likely has interrupts disabled (spinning in a \
+                     SpinNoIrqLock) and cannot service the shootdown IPI",
+                    seq,
+                    target_mask,
+                    TLB_SHOOTDOWN_STATE.ack_mask.load(Ordering::Acquire),
+                    missing
+                );
+            }
         }
         if emit_logs {
             debug!("[tlb] seq={} all remote ack received", seq);

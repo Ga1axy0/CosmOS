@@ -68,7 +68,9 @@ pub use process::{
     CloneResourceFlags, ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment,
 };
 pub(crate) use task::TaskControlBlockInner;
-pub use task::{all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason};
+pub use task::{
+    all_cpu_affinity_mask, LastSchedOp, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason,
+};
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 
 use crate::platform::QEMUExit;
@@ -766,33 +768,81 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
     for process in targets {
         let pid = process.getpid();
         let exec_path = process.exec_path();
-        let process_inner = process.inner_exclusive_access();
+        // Snapshot process + task state under the locks, then DROP the locks
+        // before formatting/printing. Holding process_inner/task_inner (SpinNoIrq,
+        // IRQs disabled) across the warn! calls — which do string formatting AND
+        // byte-by-byte UART output, both slow — blocked in-flight global TLB
+        // shootdown IPIs and wedged the machine when several harts dumped at
+        // once after Ctrl+C. The lock is now held only to copy fields.
+        let (pgid, is_zombie, pending, task_snaps) = {
+            let process_inner = process.inner_exclusive_access();
+            let p_pgid = process_inner.cred.pgid;
+            let p_zombie = process_inner.is_zombie;
+            let p_pending = process_inner.pending_signals.bits();
+            let snaps: Vec<(
+                usize,
+                TaskStatus,
+                Option<WaitReason>,
+                bool,
+                bool,
+                usize,
+                bool,
+                u64,
+                u64,
+                Option<ReschedReason>,
+            )> = process_inner
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(tid, task)| {
+                    let task = task.as_ref()?;
+                    let task_inner = task.inner_exclusive_access();
+                    Some((
+                        tid,
+                        task_inner.task_status,
+                        task_inner.wait_reason,
+                        task.on_cpu.load(Ordering::Relaxed),
+                        task_inner.sched.on_rq,
+                        task_inner.sched.last_cpu,
+                        task_inner.current_wq_handle.is_some(),
+                        task_inner.pending_signals.bits(),
+                        task_inner.signal_mask.bits(),
+                        task_inner.sched.resched_reason,
+                    ))
+                })
+                .collect();
+            (p_pgid, p_zombie, p_pending, snaps)
+        };
         warn!(
             "[task-dump] pid={} pgid={} zombie={} pending_signals={:#x} exec={}",
-            pid,
-            process_inner.cred.pgid,
-            process_inner.is_zombie,
-            process_inner.pending_signals.bits(),
-            exec_path
+            pid, pgid, is_zombie, pending, exec_path
         );
-        for (tid, task) in process_inner.tasks.iter().enumerate() {
-            let Some(task) = task.as_ref() else {
-                continue;
-            };
-            let task_inner = task.inner_exclusive_access();
+        for (
+            tid,
+            status,
+            wait,
+            on_cpu,
+            on_rq,
+            last_cpu,
+            has_wq,
+            task_pending,
+            mask,
+            resched,
+        ) in task_snaps
+        {
             warn!(
                 "[task-dump]   pid={} tid={} status={:?} wait={:?} on_cpu={} on_rq={} last_cpu={} has_wq={} task_pending={:#x} mask={:#x} resched={:?}",
                 pid,
                 tid,
-                task_inner.task_status,
-                task_inner.wait_reason,
-                task.on_cpu.load(Ordering::Relaxed),
-                task_inner.sched.on_rq,
-                task_inner.sched.last_cpu,
-                task_inner.current_wq_handle.is_some(),
-                task_inner.pending_signals.bits(),
-                task_inner.signal_mask.bits(),
-                task_inner.sched.resched_reason
+                status,
+                wait,
+                on_cpu,
+                on_rq,
+                last_cpu,
+                has_wq,
+                task_pending,
+                mask,
+                resched
             );
         }
     }

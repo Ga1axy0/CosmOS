@@ -8,13 +8,13 @@ use crate::platform::{
     VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
 };
 use crate::sync::SpinNoIrqLock;
-use crate::task::{SchedAttr, WaitQueue, WaitReason};
+use crate::task::{ReschedReason, SchedAttr, TaskControlBlock, TaskStatus, WaitQueue, WaitReason};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::convert::TryFrom;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::BlockDevice;
 use lazy_static::*;
 use virtio_drivers::transport::{
@@ -87,10 +87,43 @@ lazy_static! {
         pub static ref BLOCK_DEVICES_BY_IRQ: SpinNoIrqLock<BTreeMap<u32, Arc<VirtIOBlock>>> =
         SpinNoIrqLock::new(BTreeMap::new());
         static ref BLOCK_WORKER_WAIT: WaitQueue = WaitQueue::new();
+        static ref BLOCK_WORKER_TASK: SpinNoIrqLock<Option<Arc<TaskControlBlock>>> =
+        SpinNoIrqLock::new(None);
 }
 
 static BLOCK_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static BLOCK_COMPLETION_WORK_PENDING: AtomicBool = AtomicBool::new(false);
+static BLOCK_WORKER_SLEEPS: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_WAKES: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_COMPLETION_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_LOOPS: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_PUMP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_PUMP_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_LAST_LOOP_NS: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_LAST_PUMP_NS: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_WORKER_IN_PUMP: AtomicBool = AtomicBool::new(false);
+static BLOCK_WORKER_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_IRQ_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) struct BlockWorkerDebugSnapshot {
+    task_ptr: usize,
+    status: Option<TaskStatus>,
+    wait: Option<WaitReason>,
+    on_cpu: bool,
+    on_rq: bool,
+    last_cpu: usize,
+    has_wq: bool,
+    pending: u64,
+    mask: u64,
+    resched: Option<ReschedReason>,
+    loops: usize,
+    pump_calls: usize,
+    pump_completed: usize,
+    in_pump: bool,
+    last_loop_age_ms: Option<usize>,
+    last_pump_age_ms: Option<usize>,
+    last_sched_op: crate::task::LastSchedOp,
+}
 
 /// Scan the VirtIO MMIO bus slots and register every block device found.
 ///
@@ -150,6 +183,14 @@ fn block_devices_snapshot() -> alloc::vec::Vec<Arc<VirtIOBlock>> {
     BLOCK_DEVICES_BY_IRQ.lock().values().cloned().collect()
 }
 
+fn block_devices_with_irq_snapshot() -> alloc::vec::Vec<(u32, Arc<VirtIOBlock>)> {
+    BLOCK_DEVICES_BY_IRQ
+        .lock()
+        .iter()
+        .map(|(irq, dev)| (*irq, Arc::clone(dev)))
+        .collect()
+}
+
 fn block_worker_has_completions() -> bool {
     if BLOCK_COMPLETION_WORK_PENDING.load(Ordering::Acquire) {
         return true;
@@ -167,14 +208,113 @@ fn block_worker_pump_once() -> bool {
     completed_any
 }
 
+fn age_ms_since(now_ns: usize, then_ns: usize) -> Option<usize> {
+    if then_ns == 0 {
+        None
+    } else {
+        Some(now_ns.saturating_sub(then_ns) / 1_000_000)
+    }
+}
+
+fn block_worker_debug_snapshot(now_ns: usize) -> BlockWorkerDebugSnapshot {
+    let task = BLOCK_WORKER_TASK.lock().as_ref().cloned();
+    let (
+        task_ptr,
+        status,
+        wait,
+        on_cpu,
+        on_rq,
+        last_cpu,
+        has_wq,
+        pending,
+        mask,
+        resched,
+        last_sched_op,
+    ) = if let Some(task) = task {
+        let task_ptr = Arc::as_ptr(&task) as usize;
+        let task_inner = task.inner_exclusive_access();
+        // Read `on_cpu` UNDER the task-inner lock. Every writer of `on_cpu`
+        // (dequeue/steal/finish_pending/pick_run/block-abort/cancel/exit) holds
+        // this same lock, so reading it here yields a value consistent with
+        // status/on_rq/last_sched_op. Reading it before the lock (as before)
+        // produced torn snapshots during the worker's rapid enqueue/dequeue/run
+        // churn — e.g. on_cpu observed false (post-finish) while status observed
+        // Runnable (just dequeued) — which falsely tripped the orphan self-heal.
+        let on_cpu = task.on_cpu.load(Ordering::Relaxed);
+        (
+            task_ptr,
+            Some(task_inner.task_status),
+            task_inner.wait_reason,
+            on_cpu,
+            task_inner.sched.on_rq,
+            task_inner.sched.last_cpu,
+            task_inner.current_wq_handle.is_some(),
+            task_inner.pending_signals.bits(),
+            task_inner.signal_mask.bits(),
+            task_inner.sched.resched_reason,
+            task_inner.last_sched_op,
+        )
+    } else {
+        (
+            0,
+            None,
+            None,
+            false,
+            false,
+            0,
+            false,
+            0,
+            0,
+            None,
+            crate::task::LastSchedOp::default(),
+        )
+    };
+
+    BlockWorkerDebugSnapshot {
+        task_ptr,
+        status,
+        wait,
+        on_cpu,
+        on_rq,
+        last_cpu,
+        has_wq,
+        pending,
+        mask,
+        resched,
+        loops: BLOCK_WORKER_LOOPS.load(Ordering::Relaxed),
+        pump_calls: BLOCK_WORKER_PUMP_CALLS.load(Ordering::Relaxed),
+        pump_completed: BLOCK_WORKER_PUMP_COMPLETED.load(Ordering::Relaxed),
+        in_pump: BLOCK_WORKER_IN_PUMP.load(Ordering::Acquire),
+        last_loop_age_ms: age_ms_since(
+            now_ns,
+            BLOCK_WORKER_LAST_LOOP_NS.load(Ordering::Acquire),
+        ),
+        last_pump_age_ms: age_ms_since(
+            now_ns,
+            BLOCK_WORKER_LAST_PUMP_NS.load(Ordering::Acquire),
+        ),
+        last_sched_op,
+    }
+}
+
 fn block_io_worker_main() -> ! {
     warn!("[virtio_blk] worker started");
     loop {
+        BLOCK_WORKER_LOOPS.fetch_add(1, Ordering::Relaxed);
+        BLOCK_WORKER_LAST_LOOP_NS.store(crate::timer::get_time_ns() as usize, Ordering::Release);
         let had_completion_event = BLOCK_COMPLETION_WORK_PENDING.swap(false, Ordering::AcqRel);
+        BLOCK_WORKER_PUMP_CALLS.fetch_add(1, Ordering::Relaxed);
+        BLOCK_WORKER_LAST_PUMP_NS.store(crate::timer::get_time_ns() as usize, Ordering::Release);
+        BLOCK_WORKER_IN_PUMP.store(true, Ordering::Release);
         let completed_any = block_worker_pump_once();
+        BLOCK_WORKER_IN_PUMP.store(false, Ordering::Release);
+        if completed_any {
+            BLOCK_WORKER_PUMP_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        }
         if completed_any || had_completion_event {
             continue;
         }
+        BLOCK_WORKER_SLEEPS.fetch_add(1, Ordering::Relaxed);
         BLOCK_WORKER_WAIT
             .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, block_worker_has_completions);
     }
@@ -188,16 +328,103 @@ pub fn start_workers() {
     {
         return;
     }
-    crate::task::spawn_kernel_thread(block_io_worker_main, SchedAttr::other(0));
+    let task = crate::task::spawn_kernel_thread(block_io_worker_main, SchedAttr::other(0));
+    warn!(
+        "[virtio_blk][worker] spawned task={:#x}",
+        Arc::as_ptr(&task) as usize
+    );
+    *BLOCK_WORKER_TASK.lock() = Some(task);
 }
 
 pub(crate) fn wake_worker() {
+    BLOCK_WORKER_WAKES.fetch_add(1, Ordering::Relaxed);
     BLOCK_WORKER_WAIT.wake_all();
 }
 
 pub(crate) fn schedule_completion_work() {
+    BLOCK_COMPLETION_EVENTS.fetch_add(1, Ordering::Relaxed);
     BLOCK_COMPLETION_WORK_PENDING.store(true, Ordering::Release);
     BLOCK_WORKER_WAIT.wake_all();
+}
+
+/// Timer-driven WARN diagnostics for stuck block I/O.
+pub fn warn_if_stalled(now_ns: usize) {
+    let worker_waiters = BLOCK_WORKER_WAIT.debug_waiter_count();
+    let worker_work_pending = BLOCK_COMPLETION_WORK_PENDING.load(Ordering::Acquire);
+    let worker_sleeps = BLOCK_WORKER_SLEEPS.load(Ordering::Relaxed);
+    let worker_wakes = BLOCK_WORKER_WAKES.load(Ordering::Relaxed);
+    let completion_events = BLOCK_COMPLETION_EVENTS.load(Ordering::Relaxed);
+    let worker = block_worker_debug_snapshot(now_ns);
+
+    for (irq, dev) in block_devices_with_irq_snapshot() {
+        dev.warn_if_stalled(
+            irq,
+            now_ns,
+            worker_waiters,
+            worker_work_pending,
+            worker_sleeps,
+            worker_wakes,
+            completion_events,
+            &worker,
+        );
+    }
+
+    // Self-heal: if the worker is a lost-runnable orphan (Runnable, on no
+    // runqueue, on no CPU, and not in its wait queue), `wake_worker()` cannot
+    // rescue it — `wake_all` finds the WQ empty and never calls `wakeup_task`,
+    // so the repair path in `enqueue_wakeup_task` is never reached. Re-enqueue
+    // it directly. This is a safety net while the underlying wake/block race is
+    // closed elsewhere; it downgrades a permanent stall to a brief blip.
+    //
+    // Require the worker to have NOT looped for at least 200ms: a Runnable task
+    // is briefly off-rq/off-CPU during normal transitions too (e.g. inside
+    // `finish_pending_task_release`, between clearing on_cpu and `add_task`
+    // setting on_rq). Healing on that transient would be a spurious no-op and
+    // log noise. A genuine orphan's loop counter stops advancing, so gating on
+    // staleness fires only for real orphans.
+    let worker_stalled = worker
+        .last_loop_age_ms
+        .is_some_and(|age_ms| age_ms >= 200);
+    if worker.status == Some(TaskStatus::Runnable)
+        && !worker.on_rq
+        && !worker.on_cpu
+        && worker_waiters == 0
+        && worker.task_ptr != 0
+        && worker_stalled
+    {
+        let count = BLOCK_WORKER_SELF_HEAL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 16 || count.is_power_of_two() {
+            error!(
+                "[virtio_blk] orphan self-heal count={} task={:#x} loops={} \
+                 last_sched_op={:?} — re-enqueueing lost-runnable worker",
+                count, worker.task_ptr, worker.loops, worker.last_sched_op
+            );
+        }
+        if let Some(wtask) = BLOCK_WORKER_TASK.lock().as_ref().cloned() {
+            crate::task::wakeup_task(wtask);
+        }
+    }
+
+    // Self-heal (lost completion IRQ): a completion is sitting in some device's
+    // used ring (`block_worker_has_completions()` true) but the worker has not
+    // looped in >=200ms — meaning its completion IRQ never reached `handle_irq`,
+    // so `schedule_completion_work` was never called and neither the worker nor
+    // the blocked waiter will wake to pump the used ring. Re-arm the completion
+    // work from this timer tick; the worker then pumps, completes the request,
+    // and wakes the waiter. This recovers regardless of *why* the IRQ was lost
+    // (EXTIOI/PCH-PIC race, virtio MMIO ISR-vs-used-ring-DMA visibility, edge
+    // coalescing). Gated on the same staleness criterion as the orphan heal.
+    if worker_stalled && block_worker_has_completions() {
+        let count = BLOCK_IRQ_SELF_HEAL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 16 || count.is_power_of_two() {
+            error!(
+                "[virtio_blk] lost-irq self-heal count={} work_pending={} \
+                 worker_loops={} worker_status={:?} — re-arming completion work",
+                count, worker_work_pending, worker.loops, worker.status
+            );
+        }
+        schedule_completion_work();
+    }
 }
 
 lazy_static! {

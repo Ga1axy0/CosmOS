@@ -55,9 +55,6 @@ impl Processor {
         self.current = Some(task);
     }
 
-    /// Identity of the current task on this hart for the debug invariant
-    /// checker (raw pointer value, no refcount bump).
-    #[cfg(feature = "sched_invariant_checks")]
     pub(super) fn current_ptr(&self) -> Option<usize> {
         self.current.as_ref().map(|t| Arc::as_ptr(t) as usize)
     }

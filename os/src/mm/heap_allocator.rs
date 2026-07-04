@@ -258,10 +258,24 @@ impl KernelHeapAllocator {
     }
 
     fn grow_virtual(&self, required_bytes: usize) -> bool {
-        let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
-        let Some((virtual_offset, bytes)) = reserve_virtual_heap_bytes_locked(required_bytes)
-        else {
-            return false;
+        // Reserve our disjoint VA range under the lock, then DROP the lock before
+        // mapping. `map_heap_pages` may end with a global TLB shootdown that
+        // busy-waits for every online hart to ack an IPI. Holding this
+        // IRQ-disabling lock (`SpinNoIrqLock`) across that wait deadlocks against
+        // any other hart that concurrently enters grow/reclaim and spins on this
+        // same lock with IRQs disabled — it can never service the very IPI we are
+        // waiting for, so neither side makes progress (the observed SMP hang with
+        // the launcher in shootdown's ack-wait loop and the peer spinning here).
+        // Reservations hand out strictly disjoint, monotonically advancing
+        // ranges, so mapping `our` range needs no exclusion against a concurrent
+        // grow.
+        let (virtual_offset, bytes) = {
+            let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
+            let Some((virtual_offset, bytes)) = reserve_virtual_heap_bytes_locked(required_bytes)
+            else {
+                return false;
+            };
+            (virtual_offset, bytes)
         };
         // debug!(
         //     "Growing virtual kernel heap: {} KiB -> {} KiB",
@@ -270,6 +284,7 @@ impl KernelHeapAllocator {
         // );
         let start = KERNEL_HEAP_BASE + virtual_offset;
         if !map_heap_pages(start, bytes / PAGE_SIZE) {
+            let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
             rollback_virtual_heap_reservation_locked(virtual_offset, bytes);
             return false;
         }
@@ -286,26 +301,47 @@ impl KernelHeapAllocator {
             if reclaimed_pages >= KERNEL_HEAP_RECLAIM_MAX_PAGES_PER_CALL {
                 break;
             }
-            let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
-            let virtual_bytes = KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
-            let virtual_end = KERNEL_HEAP_BASE + virtual_bytes;
-            let released = {
-                let mut heap = self.heap.lock();
-                if heap.free_actual_bytes() <= KERNEL_HEAP_RECLAIM_START_FREE {
-                    None
-                } else {
-                    heap.release_one_tail_free_block(PAGE_SIZE, KERNEL_HEAP_BASE, virtual_end)
-                }
-            };
-            let Some((start, bytes)) = released else {
-                break;
+            // Pop one tail block and snapshot the current high-water under the
+            // lock, then DROP the lock before unmapping. `unmap_heap_pages` ends
+            // with a global TLB shootdown that busy-waits for every online hart
+            // to ack an IPI; holding this IRQ-disabling lock across that wait
+            // deadlocks a concurrent grow/reclaim spinning on it with IRQs off.
+            // The freed range is always the topmost [start, virtual_bytes), and a
+            // concurrent grow only reserves ranges strictly above `virtual_bytes`
+            // (it advances the high-water), so the unmapped range is disjoint from
+            // anything a grow can touch while the lock is released.
+            let (start, bytes, virtual_bytes) = {
+                let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
+                let virtual_bytes = KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire);
+                let virtual_end = KERNEL_HEAP_BASE + virtual_bytes;
+                let released = {
+                    let mut heap = self.heap.lock();
+                    if heap.free_actual_bytes() <= KERNEL_HEAP_RECLAIM_START_FREE {
+                        None
+                    } else {
+                        heap.release_one_tail_free_block(PAGE_SIZE, KERNEL_HEAP_BASE, virtual_end)
+                    }
+                };
+                let Some((start, bytes)) = released else {
+                    break;
+                };
+                (start, bytes, virtual_bytes)
             };
             let pages = bytes / PAGE_SIZE;
             unmap_heap_pages(start, pages);
-            KERNEL_HEAP_VIRTUAL_BYTES.store(virtual_bytes - bytes, Ordering::Release);
-            KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-            drop(_virtual_guard);
             reclaimed_pages += pages;
+            // Retract the high-water mark only if no concurrent grow advanced it
+            // while the lock was released. If one did, the freed range is no
+            // longer the top: leave it as an unmapped hole (the frames were
+            // already returned by `unmap_heap_pages`, so only VA is wasted, and
+            // only on this rare interleaved path).
+            {
+                let _virtual_guard = KERNEL_HEAP_VIRTUAL_LOCK.lock();
+                if KERNEL_HEAP_VIRTUAL_BYTES.load(Ordering::Acquire) == virtual_bytes {
+                    KERNEL_HEAP_VIRTUAL_BYTES.store(virtual_bytes - bytes, Ordering::Release);
+                }
+            }
+            KERNEL_HEAP_BYTES.fetch_sub(bytes, Ordering::AcqRel);
             let free_after = self.heap.lock().free_actual_bytes();
             if free_after <= KERNEL_HEAP_RECLAIM_TARGET_FREE {
                 break;
@@ -603,7 +639,25 @@ fn map_heap_pages(start_va: usize, pages: usize) -> bool {
         mapped_all
     };
     if mapped_pages > 0 {
-        crate::mm::shootdown_global_quiet();
+        // Fresh heap mappings install leaf PTEs over slots that were *invalid*
+        // (we rollback on any already-valid entry above), so no hart can hold a
+        // stale TLB entry for these VAs. Cross-CPU invalidation is therefore
+        // unnecessary — Linux likewise never IPIs for a brand-new anonymous
+        // mapping; remote harts only ever touch this memory after the allocator
+        // hands it out, by which time the PTE store is globally coherent.
+        //
+        // We still need a *local* sfence.vma so THIS hart's page-table walker
+        // observes the just-installed PTEs before `add_to_heap` writes the free
+        // list into the new pages.
+        //
+        // The previous global shootdown here was the dominant source of
+        // synchronous all-CPU IPI barriers under allocation pressure
+        // (iperf/fork), and — critically — a single non-acking hart would wedge
+        // `TLB_SHOOTDOWN_LAUNCH_LOCK` and hang every other grower (observed SMP
+        // lockup: a stuck shootdown launcher blocks all subsequent ones). The
+        // synchronous global flush belongs only on the unmap/reclaim path, where
+        // stale translations genuinely exist elsewhere.
+        unsafe { crate::hal::flush_tlb() };
     }
     mapped_all
 }

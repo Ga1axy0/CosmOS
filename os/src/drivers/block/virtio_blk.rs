@@ -21,6 +21,11 @@ pub struct VirtIOBlock {
     inner: SpinNoIrqLock<VirtIOBlk<VirtioHal, SomeTransport<'static>>>,
     pending: SpinNoIrqLock<BTreeMap<u16, Arc<RequestState>>>,
     batch_wait_queue: WaitQueue,
+    submitted: AtomicUsize,
+    completed: AtomicUsize,
+    last_submit_ns: AtomicUsize,
+    last_completion_ns: AtomicUsize,
+    last_stall_warn_ns: AtomicUsize,
 }
 
 // static mut READ_RECORDS: SpinNoIrqLock<([usize; 512], usize)> = SpinNoIrqLock::new(([0; 512], 0));
@@ -33,6 +38,7 @@ static WAIT_POLLS: AtomicUsize = AtomicUsize::new(0);
 static TASK_WAITS: AtomicUsize = AtomicUsize::new(0);
 static COMPLETE_RECHECK_MISSES: AtomicUsize = AtomicUsize::new(0);
 static COMPLETE_WRONG_TOKENS: AtomicUsize = AtomicUsize::new(0);
+static IRQ_EMPTY_ISR_WITH_USED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITE_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -46,6 +52,8 @@ const VIRTIO_BLK_QUEUE_SIZE: usize = 16;
 const VIRTIO_BLK_WRITE_DESCS: usize = 3;
 const MAX_WRITE_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_WRITE_DESCS;
 const ADAPTIVE_COMPLETION_SPINS: usize = 32;
+const STALL_WARN_AFTER_NS: usize = 500_000_000;
+const STALL_WARN_INTERVAL_NS: usize = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug)]
 enum RequestKind {
@@ -59,6 +67,13 @@ impl RequestKind {
             Self::Read { len, .. } | Self::Write { len, .. } => len,
         }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read { .. } => "read",
+            Self::Write { .. } => "write",
+        }
+    }
 }
 
 struct RequestData {
@@ -68,6 +83,7 @@ struct RequestData {
     req: BlkReq,
     resp: BlkResp,
     done: bool,
+    submitted_ns: usize,
 }
 
 struct RequestState {
@@ -105,6 +121,7 @@ impl RequestState {
                 req: BlkReq::default(),
                 resp: BlkResp::default(),
                 done: false,
+                submitted_ns: 0,
             }),
             wait_queue: WaitQueue::new(),
         }
@@ -300,6 +317,11 @@ impl VirtIOBlock {
                 inner: SpinNoIrqLock::new(blk),
                 pending: SpinNoIrqLock::new(BTreeMap::new()),
                 batch_wait_queue: WaitQueue::new(),
+                submitted: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+                last_submit_ns: AtomicUsize::new(0),
+                last_completion_ns: AtomicUsize::new(0),
+                last_stall_warn_ns: AtomicUsize::new(0),
             })
     }
 
@@ -318,9 +340,13 @@ impl VirtIOBlock {
         let req = &mut data.req as *mut BlkReq;
         let resp = &mut data.resp as *mut BlkResp;
         let token = unsafe { device.read_blocks_nb(block_id, &mut *req, buf, &mut *resp)? };
+        let submitted_ns = now_ns();
         data.token = token;
+        data.submitted_ns = submitted_ns;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        self.last_submit_ns.store(submitted_ns, Ordering::Release);
         super::wake_worker();
         Ok(request)
     }
@@ -340,9 +366,13 @@ impl VirtIOBlock {
         let req = &mut data.req as *mut BlkReq;
         let resp = &mut data.resp as *mut BlkResp;
         let token = unsafe { device.write_blocks_nb(block_id, &mut *req, buf, &mut *resp)? };
+        let submitted_ns = now_ns();
         data.token = token;
+        data.submitted_ns = submitted_ns;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        self.last_submit_ns.store(submitted_ns, Ordering::Release);
         super::wake_worker();
         Ok(request)
     }
@@ -358,8 +388,6 @@ impl VirtIOBlock {
                 if self.adaptive_pump_until(|| request.done()) {
                     return;
                 }
-                #[cfg(feature = "io_perf_counters")]
-                TASK_WAITS.fetch_add(1, Ordering::Relaxed);
                 if self.has_used_completions() {
                     super::wake_worker();
                     continue;
@@ -388,8 +416,6 @@ impl VirtIOBlock {
                 if self.adaptive_pump_until(|| in_flight.iter().any(|request| request.done())) {
                     return;
                 }
-                #[cfg(feature = "io_perf_counters")]
-                TASK_WAITS.fetch_add(1, Ordering::Relaxed);
                 if self.has_used_completions() {
                     super::wake_worker();
                     continue;
@@ -413,8 +439,6 @@ impl VirtIOBlock {
             if self.adaptive_pump_until(|| self.has_used_completions()) {
                 return;
             }
-            #[cfg(feature = "io_perf_counters")]
-            TASK_WAITS.fetch_add(1, Ordering::Relaxed);
             super::wake_worker();
             self.batch_wait_queue
                 .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
@@ -449,9 +473,18 @@ impl VirtIOBlock {
         !self.pending.lock().is_empty()
     }
 
+    /// Number of requests currently tracked as pending.
+    pub fn pending_request_count(&self) -> usize {
+        self.pending.lock().len()
+    }
+
     /// Returns whether the virtqueue currently exposes at least one used entry.
     pub fn has_used_completions(&self) -> bool {
-        self.inner.lock().peek_used().is_some()
+        let mut inner = self.inner.lock();
+        // Order the CPU read of the DMA-written used ring after the device's
+        // DMA writes (Acquire on used.idx alone does not suffice for device DMA).
+        crate::drivers::virtio::virtio_dma_rmb();
+        inner.peek_used().is_some()
     }
 
     /// Drain completed virtqueue entries and wake the corresponding waiters.
@@ -459,13 +492,24 @@ impl VirtIOBlock {
         let mut completed_any = false;
         loop {
             let mut device = self.inner.lock();
+            // See `handle_irq`: an I/O read fence is required before reading the
+            // DMA-written used ring, otherwise a just-completed entry can be
+            // invisible and this pump drains nothing.
+            crate::drivers::virtio::virtio_dma_rmb();
             let Some(token) = device.peek_used() else {
                 break;
             };
-            let Some(request) = self.pending.lock().remove(&token) else {
+            let request = self.pending.lock().remove(&token);
+            let Some(request) = request else {
+                let miss_count = COMPLETE_RECHECK_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
                 warn!(
-                    "[virtio_blk] used token {} has no pending request; stop completion pump",
-                    token
+                    "[virtio_blk][complete] used token {} has no pending request; \
+                     stop completion pump miss_count={} pending={} submitted={} completed={}",
+                    token,
+                    miss_count,
+                    self.pending_request_count(),
+                    self.submitted.load(Ordering::Relaxed),
+                    self.completed.load(Ordering::Relaxed),
                 );
                 break;
             };
@@ -503,6 +547,8 @@ impl VirtIOBlock {
                 );
             }
             data.done = true;
+            self.completed.fetch_add(1, Ordering::Relaxed);
+            self.last_completion_ns.store(now_ns(), Ordering::Release);
             drop(data);
             drop(device);
             completed_any = true;
@@ -522,19 +568,208 @@ impl VirtIOBlock {
     pub fn handle_irq(&self) {
         let mut inner = self.inner.lock();
         let isr_set = !inner.ack_interrupt().is_empty();
+        // The device writes the used-ring entry and increments used.idx via DMA,
+        // THEN raises the IRQ. The Acquire load virtio-drivers uses to read
+        // used.idx orders CPU-vs-CPU accesses only — it does NOT order against
+        // the device's DMA writes. Without an I/O read fence here first,
+        // `peek_used` can observe the used ring as still empty even though the
+        // device has completed and asserted the interrupt; combined with an
+        // already-acked ISR this made handle_irq return early, the entry became
+        // visible only later with no further IRQ, and the worker/waiter slept
+        // forever (the lost-IRQ stall). Fence BEFORE peeking so the DMA writes
+        // are visible, then fall back to the queue state so a real completion
+        // never fails to schedule the worker.
+        crate::drivers::virtio::virtio_dma_rmb();
         // Even when the ISR reads back empty (a spurious EXTIOI re-fire after
         // the device already de-asserted, or a re-assertion racing the EOI), a
-        // completion may still be sitting unread in the used ring. Fall back to
-        // the queue state so a real completion never fails to schedule the
-        // worker — otherwise `schedule_completion_work` is skipped and the
-        // block worker sleeps in BLOCK_WORKER_WAIT with no further wake.
-        if !isr_set && inner.peek_used().is_none() {
+        // completion may still be sitting unread in the used ring.
+        let has_used = inner.peek_used().is_some();
+        if !isr_set && !has_used {
             return;
         }
-        crate::drivers::virtio::virtio_dma_rmb();
+        if !isr_set && has_used {
+            let count = IRQ_EMPTY_ISR_WITH_USED.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_sample(count) {
+                warn!(
+                    "[virtio_blk][irq] empty ISR but used ring is non-empty count={} \
+                     pending={} submitted={} completed={}",
+                    count,
+                    self.pending_request_count(),
+                    self.submitted.load(Ordering::Relaxed),
+                    self.completed.load(Ordering::Relaxed),
+                );
+            }
+        }
         drop(inner);
         super::schedule_completion_work();
     }
+
+    /// Emit WARN-level diagnostics if requests are stuck in flight.
+    pub fn warn_if_stalled(
+        &self,
+        irq: u32,
+        now_ns: usize,
+        worker_waiters: usize,
+        worker_work_pending: bool,
+        worker_sleeps: usize,
+        worker_wakes: usize,
+        completion_events: usize,
+        worker: &super::BlockWorkerDebugSnapshot,
+    ) {
+        let (pending_len, first_request) = {
+            let pending = self.pending.lock();
+            (
+                pending.len(),
+                pending
+                    .iter()
+                    .next()
+                    .map(|(token, request)| (*token, Arc::clone(request))),
+            )
+        };
+        if pending_len == 0 {
+            return;
+        }
+
+        let last_submit = self.last_submit_ns.load(Ordering::Acquire);
+        let last_completion = self.last_completion_ns.load(Ordering::Acquire);
+        let last_activity = last_submit.max(last_completion);
+        if last_activity == 0 {
+            return;
+        }
+        let idle_ns = now_ns.saturating_sub(last_activity);
+        if idle_ns < STALL_WARN_AFTER_NS {
+            return;
+        }
+
+        let last_warn = self.last_stall_warn_ns.load(Ordering::Acquire);
+        if now_ns.saturating_sub(last_warn) < STALL_WARN_INTERVAL_NS {
+            return;
+        }
+        if self
+            .last_stall_warn_ns
+            .compare_exchange(last_warn, now_ns, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let has_used = self.has_used_completions();
+        let first = first_request
+            .map(|(token, request)| request_debug_summary(token, &request, now_ns))
+            .unwrap_or(RequestDebugSummary::empty());
+        warn!(
+            "[virtio_blk][stall] irq={} pending={} used={} worker_waiters={} \
+             worker_work_pending={} worker_sleeps={} worker_wakes={} completion_events={} \
+             worker_task={:#x} worker_status={:?} worker_wait={:?} worker_on_cpu={} \
+             worker_on_rq={} worker_last_cpu={} worker_has_wq={} worker_pending={:#x} \
+             worker_mask={:#x} worker_resched={:?} worker_loops={} worker_pump_calls={} \
+             worker_pump_completed={} worker_in_pump={} worker_last_loop_age_ms={:?} \
+             worker_last_pump_age_ms={:?} worker_last_sched_op={:?} \
+             submitted={} completed={} idle_ms={} last_submit_age_ms={} \
+             last_completion_age_ms={} batch_waiters={} first_token={} first_block={} \
+             first_op={} first_len={} first_done={} first_age_ms={} first_waiters={}",
+            irq,
+            pending_len,
+            has_used,
+            worker_waiters,
+            worker_work_pending,
+            worker_sleeps,
+            worker_wakes,
+            completion_events,
+            worker.task_ptr,
+            worker.status,
+            worker.wait,
+            worker.on_cpu,
+            worker.on_rq,
+            worker.last_cpu,
+            worker.has_wq,
+            worker.pending,
+            worker.mask,
+            worker.resched,
+            worker.loops,
+            worker.pump_calls,
+            worker.pump_completed,
+            worker.in_pump,
+            worker.last_loop_age_ms,
+            worker.last_pump_age_ms,
+            worker.last_sched_op,
+            self.submitted.load(Ordering::Relaxed),
+            self.completed.load(Ordering::Relaxed),
+            ns_to_ms(idle_ns),
+            ns_to_ms(now_ns.saturating_sub(last_submit)),
+            ns_to_ms(now_ns.saturating_sub(last_completion)),
+            self.batch_wait_queue.debug_waiter_count(),
+            first.token,
+            first.block_id,
+            first.op,
+            first.len,
+            first.done,
+            first.age_ms,
+            first.waiters,
+        );
+    }
+}
+
+struct RequestDebugSummary {
+    token: u16,
+    block_id: usize,
+    op: &'static str,
+    len: usize,
+    done: bool,
+    age_ms: usize,
+    waiters: usize,
+}
+
+impl RequestDebugSummary {
+    fn empty() -> Self {
+        Self {
+            token: u16::MAX,
+            block_id: usize::MAX,
+            op: "none",
+            len: 0,
+            done: false,
+            age_ms: 0,
+            waiters: 0,
+        }
+    }
+}
+
+fn request_debug_summary(
+    token: u16,
+    request: &Arc<RequestState>,
+    now_ns: usize,
+) -> RequestDebugSummary {
+    let (block_id, op, len, done, submitted_ns) = {
+        let data = request.inner.lock();
+        (
+            data.block_id,
+            data.kind.name(),
+            data.kind.len(),
+            data.done,
+            data.submitted_ns,
+        )
+    };
+    RequestDebugSummary {
+        token,
+        block_id,
+        op,
+        len,
+        done,
+        age_ms: ns_to_ms(now_ns.saturating_sub(submitted_ns)),
+        waiters: request.wait_queue.debug_waiter_count(),
+    }
+}
+
+fn now_ns() -> usize {
+    crate::timer::get_time_ns() as usize
+}
+
+fn ns_to_ms(ns: usize) -> usize {
+    ns / 1_000_000
+}
+
+fn should_log_sample(count: usize) -> bool {
+    count <= 16 || count.is_power_of_two()
 }
 
 fn load(counter: &AtomicUsize) -> usize {
@@ -550,6 +785,7 @@ pub fn reset_perf_counters() {
     TASK_WAITS.store(0, Ordering::Relaxed);
     COMPLETE_RECHECK_MISSES.store(0, Ordering::Relaxed);
     COMPLETE_WRONG_TOKENS.store(0, Ordering::Relaxed);
+    IRQ_EMPTY_ISR_WITH_USED.store(0, Ordering::Relaxed);
     #[cfg(feature = "io_perf_counters")]
     {
         WRITE_MANY_CALLS.store(0, Ordering::Relaxed);
@@ -577,6 +813,11 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  complete_wrong_tokens {}",
         load(&COMPLETE_WRONG_TOKENS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  irq_empty_isr_with_used {}",
+        load(&IRQ_EMPTY_ISR_WITH_USED)
     );
     #[cfg(feature = "io_perf_counters")]
     {

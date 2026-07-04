@@ -62,7 +62,7 @@ pub use memory_set::{
     unregister_file_mappings_for_process, DeferredUserReclaim, ElfLoadInfo, InodeKey,
     MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
-pub use oom::{log_oom, warn_heap_state, warn_heap_state_lockfree};
+pub use oom::{log_oom, warn_heap_state};
 pub use page_table::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
     PageTableEntry, UserBuffer, UserBufferIterator,

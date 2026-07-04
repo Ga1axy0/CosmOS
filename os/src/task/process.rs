@@ -1158,17 +1158,30 @@ impl ProcessControlBlock {
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
         let task = self.inner_exclusive_access().get_task(0);
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
-        task_inner
-            .res
-            .as_mut()
-            .unwrap()
-            .alloc_user_res()
-            .map_err(mm_error_to_errno)?;
-        task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        task_inner.pending_signals = SignalBit::empty();
-        task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
+        // Hold task_inner only briefly to update resource fields and capture the
+        // user stack top. The slow work — `init_user_stack_from_strings`, which
+        // copies args/envs/auxv into the new user address space (string ops +
+        // user page faults; seen via `grapheme_extend::lookup_slow`) — is done
+        // BELOW with the lock released. Holding this `SpinNoIrqLock` (IRQs
+        // disabled) across that slow work blocked in-flight global TLB shootdown
+        // IPIs from being serviced on this hart, wedging the whole machine under
+        // exec-heavy workloads (Ctrl+C ineffective). This task is the current,
+        // single thread of the process, so no other hart mutates it while the
+        // lock is released.
+        let ustack_top = {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
+            task_inner
+                .res
+                .as_mut()
+                .unwrap()
+                .alloc_user_res()
+                .map_err(mm_error_to_errno)?;
+            task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
+            task_inner.pending_signals = SignalBit::empty();
+            task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
+            task_inner.res.as_ref().unwrap().ustack_top()
+        };
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
         //         argv[0..argc-1], NULL
@@ -1178,7 +1191,7 @@ impl ProcessControlBlock {
         trace!("kernel: exec .. push arguments on user stack");
         let user_sp = init_user_stack_from_strings(
             new_token,
-            task_inner.res.as_mut().unwrap().ustack_top(),
+            ustack_top,
             args.as_slice(),
             envs.as_slice(),
             auxv_extra.as_slice(),
@@ -1206,7 +1219,8 @@ impl ProcessControlBlock {
             trap_cx.reg(10),
             trap_cx.reg(11)
         );
-        *task_inner.get_trap_cx() = trap_cx;
+        // Re-acquire task_inner only to install the trap context.
+        *task.inner_exclusive_access().get_trap_cx() = trap_cx;
         Ok(())
     }
     /// 按 Linux `clone` 的进程分支创建子进程。
