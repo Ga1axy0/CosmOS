@@ -117,7 +117,28 @@ pub(crate) fn virtio_dma_rmb() {
         core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags));
     }
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+    }
+
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+#[inline]
+pub(crate) fn virtio_dma_wmb() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags));
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+    }
+
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
