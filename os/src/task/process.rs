@@ -1107,6 +1107,7 @@ impl ProcessControlBlock {
     ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
+        let owner_pid = self.getpid();
 
         trace!("kernel: exec .. load process image");
         let cwd = self.inner_exclusive_access().cwd.clone();
@@ -1150,6 +1151,9 @@ impl ProcessControlBlock {
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
         DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
+        for entry in &cloexec_entries {
+            entry.desc.release_posix_locks_for_owner(owner_pid);
+        }
         drop(cloexec_entries);
         for attachment in old_shm_attachments {
             ipc::detach_segment(attachment.shmid);

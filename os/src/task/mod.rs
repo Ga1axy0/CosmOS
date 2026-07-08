@@ -472,6 +472,9 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         };
         reclaim.flush_then_release();
         // warn_heap_state("exit_after_user_reclaim", pid);
+        for entry in &closed_fds {
+            entry.desc.release_posix_locks_for_owner(pid);
+        }
         drop(closed_fds);
         // warn_heap_state("exit_after_fd_drop", pid);
         crate::keys::release_process_thread_keyring(keyrings_to_release);

@@ -14,10 +14,12 @@ pub mod tmpfs;
 mod tty;
 
 use crate::mm::UserBuffer;
+use crate::task::{WaitQueue, WaitReason};
 use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use crate::timer::get_time_us;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -425,6 +427,37 @@ bitflags! {
     }
 }
 
+/// POSIX 记录锁类型。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixLockType {
+    /// 共享读锁。
+    Read,
+    /// 排他写锁。
+    Write,
+    /// 解锁。
+    Unlock,
+}
+
+/// POSIX 记录锁区间，`len=None` 表示直到 EOF。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PosixLockRange {
+    /// 起始偏移。
+    pub start: u64,
+    /// 锁定长度；`None` 表示直到 EOF。
+    pub len: Option<u64>,
+}
+
+/// `F_GETLK` 返回的冲突锁信息。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PosixLockConflict {
+    /// 冲突锁类型。
+    pub lock_type: PosixLockType,
+    /// 冲突区间。
+    pub range: PosixLockRange,
+    /// 持锁进程 pid。
+    pub owner_pid: usize,
+}
+
 /// 文件访问模式，对应 `O_RDONLY/O_WRONLY/O_RDWR`。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessMode {
@@ -455,8 +488,204 @@ struct FlockRecord {
     kind: FlockKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PosixLockRecord {
+    owner_pid: usize,
+    lock_type: PosixLockType,
+    start: u64,
+    end: Option<u64>,
+}
+
+struct PosixLockState {
+    entries: SpinNoIrqLock<Vec<PosixLockRecord>>,
+    wait_queue: WaitQueue,
+}
+
 lazy_static! {
     static ref FLOCK_TABLE: SpinNoIrqLock<Vec<FlockRecord>> = SpinNoIrqLock::new(Vec::new());
+    static ref POSIX_LOCK_TABLE: SpinNoIrqLock<BTreeMap<(u64, u64), Arc<PosixLockState>>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+}
+
+impl PosixLockState {
+    fn new() -> Self {
+        Self {
+            entries: SpinNoIrqLock::new(Vec::new()),
+            wait_queue: WaitQueue::new(),
+        }
+    }
+}
+
+fn posix_lock_state(fs_id: u64, ino: u64, create: bool) -> Option<Arc<PosixLockState>> {
+    let mut table = POSIX_LOCK_TABLE.lock();
+    if let Some(state) = table.get(&(fs_id, ino)) {
+        return Some(Arc::clone(state));
+    }
+    if !create {
+        return None;
+    }
+    let state = Arc::new(PosixLockState::new());
+    table.insert((fs_id, ino), Arc::clone(&state));
+    Some(state)
+}
+
+fn posix_lock_overlaps(
+    left_start: u64,
+    left_end: Option<u64>,
+    right_start: u64,
+    right_end: Option<u64>,
+) -> bool {
+    let left_before_right = matches!(left_end, Some(end) if end <= right_start);
+    let right_before_left = matches!(right_end, Some(end) if end <= left_start);
+    !left_before_right && !right_before_left
+}
+
+fn posix_lock_conflicts(existing: PosixLockType, requested: PosixLockType) -> bool {
+    existing == PosixLockType::Write || requested == PosixLockType::Write
+}
+
+fn posix_lock_max_end(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, _) | (_, None) => None,
+        (Some(left), Some(right)) => Some(left.max(right)),
+    }
+}
+
+fn posix_lock_sort_and_merge(entries: &mut Vec<PosixLockRecord>) {
+    entries.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.owner_pid.cmp(&right.owner_pid))
+            .then_with(|| {
+                let left_kind = match left.lock_type {
+                    PosixLockType::Read => 0u8,
+                    PosixLockType::Write => 1u8,
+                    PosixLockType::Unlock => 2u8,
+                };
+                let right_kind = match right.lock_type {
+                    PosixLockType::Read => 0u8,
+                    PosixLockType::Write => 1u8,
+                    PosixLockType::Unlock => 2u8,
+                };
+                left_kind.cmp(&right_kind)
+            })
+    });
+
+    let mut merged: Vec<PosixLockRecord> = Vec::with_capacity(entries.len());
+    for record in entries.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            let contiguous = match last.end {
+                None => true,
+                Some(end) => record.start <= end,
+            };
+            if last.owner_pid == record.owner_pid
+                && last.lock_type == record.lock_type
+                && contiguous
+            {
+                last.end = posix_lock_max_end(last.end, record.end);
+                continue;
+            }
+        }
+        merged.push(record);
+    }
+    *entries = merged;
+}
+
+fn posix_lock_find_conflict(
+    entries: &[PosixLockRecord],
+    owner_pid: usize,
+    request_type: PosixLockType,
+    request_start: u64,
+    request_end: Option<u64>,
+) -> Option<PosixLockConflict> {
+    if request_type == PosixLockType::Unlock {
+        return None;
+    }
+    entries.iter().find_map(|record| {
+        if record.owner_pid == owner_pid
+            || !posix_lock_conflicts(record.lock_type, request_type)
+            || !posix_lock_overlaps(record.start, record.end, request_start, request_end)
+        {
+            return None;
+        }
+        Some(PosixLockConflict {
+            lock_type: record.lock_type,
+            range: PosixLockRange {
+                start: record.start,
+                len: record.end.map(|end| end - record.start),
+            },
+            owner_pid: record.owner_pid,
+        })
+    })
+}
+
+fn posix_lock_apply(
+    entries: &mut Vec<PosixLockRecord>,
+    owner_pid: usize,
+    request_type: PosixLockType,
+    request_start: u64,
+    request_end: Option<u64>,
+) -> bool {
+    let original = entries.clone();
+    let mut updated = Vec::with_capacity(entries.len() + 2);
+
+    for record in entries.drain(..) {
+        if record.owner_pid != owner_pid
+            || !posix_lock_overlaps(record.start, record.end, request_start, request_end)
+        {
+            updated.push(record);
+            continue;
+        }
+
+        if record.start < request_start {
+            updated.push(PosixLockRecord {
+                owner_pid: record.owner_pid,
+                lock_type: record.lock_type,
+                start: record.start,
+                end: Some(request_start),
+            });
+        }
+
+        match (record.end, request_end) {
+            (Some(record_end), Some(request_end)) if request_end < record_end => {
+                updated.push(PosixLockRecord {
+                    owner_pid: record.owner_pid,
+                    lock_type: record.lock_type,
+                    start: request_end,
+                    end: Some(record_end),
+                });
+            }
+            (None, Some(request_end)) => {
+                updated.push(PosixLockRecord {
+                    owner_pid: record.owner_pid,
+                    lock_type: record.lock_type,
+                    start: request_end,
+                    end: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if request_type != PosixLockType::Unlock {
+        updated.push(PosixLockRecord {
+            owner_pid,
+            lock_type: request_type,
+            start: request_start,
+            end: request_end,
+        });
+    }
+
+    posix_lock_sort_and_merge(&mut updated);
+    let changed = updated != original;
+    *entries = updated;
+    changed
+}
+
+fn posix_lock_release_owner(entries: &mut Vec<PosixLockRecord>, owner_pid: usize) -> bool {
+    let original_len = entries.len();
+    entries.retain(|record| record.owner_pid != owner_pid);
+    original_len != entries.len()
 }
 
 impl AccessMode {
@@ -740,6 +969,120 @@ impl FileDescription {
     /// 返回该打开文件描述最终关联的稳定 inode。
     pub fn backing_inode(&self) -> Option<Arc<Inode>> {
         self.file.backing_inode()
+    }
+
+    fn posix_lock_key(&self) -> Result<(u64, u64), ERRNO> {
+        let inode = self.backing_inode().ok_or(ERRNO::EINVAL)?;
+        Ok((inode.fs_id(), inode.ino()))
+    }
+
+    /// 查询与给定请求冲突的 POSIX 记录锁。
+    pub fn get_posix_lock(
+        &self,
+        owner_pid: usize,
+        request_type: PosixLockType,
+        range: PosixLockRange,
+    ) -> Result<Option<PosixLockConflict>, ERRNO> {
+        let (fs_id, ino) = self.posix_lock_key()?;
+        let Some(state) = posix_lock_state(fs_id, ino, false) else {
+            return Ok(None);
+        };
+        let request_end = match range.len {
+            Some(len) => Some(range.start.checked_add(len).ok_or(ERRNO::EINVAL)?),
+            None => None,
+        };
+        let entries = state.entries.lock();
+        Ok(posix_lock_find_conflict(
+            &entries,
+            owner_pid,
+            request_type,
+            range.start,
+            request_end,
+        ))
+    }
+
+    /// 设置、修改或释放 POSIX 记录锁。
+    pub fn set_posix_lock(
+        &self,
+        owner_pid: usize,
+        request_type: PosixLockType,
+        range: PosixLockRange,
+        wait: bool,
+    ) -> Result<(), ERRNO> {
+        let (fs_id, ino) = self.posix_lock_key()?;
+        let state = posix_lock_state(fs_id, ino, true).ok_or(ERRNO::EINVAL)?;
+        let request_end = match range.len {
+            Some(len) => Some(range.start.checked_add(len).ok_or(ERRNO::EINVAL)?),
+            None => None,
+        };
+
+        loop {
+            let changed = {
+                let mut entries = state.entries.lock();
+                if posix_lock_find_conflict(
+                    &entries,
+                    owner_pid,
+                    request_type,
+                    range.start,
+                    request_end,
+                )
+                .is_some()
+                {
+                    None
+                } else {
+                    Some(posix_lock_apply(
+                        &mut entries,
+                        owner_pid,
+                        request_type,
+                        range.start,
+                        request_end,
+                    ))
+                }
+            };
+
+            match changed {
+                Some(changed) => {
+                    if changed {
+                        state.wait_queue.wake_all();
+                    }
+                    return Ok(());
+                }
+                None if !wait => return Err(ERRNO::EAGAIN),
+                None => {
+                    if crate::signal::has_interrupting_signal() {
+                        return Err(ERRNO::EINTR);
+                    }
+                    state.wait_queue.wait_with_reason_or_skip(WaitReason::FileLock, || {
+                        let entries = state.entries.lock();
+                        posix_lock_find_conflict(
+                            &entries,
+                            owner_pid,
+                            request_type,
+                            range.start,
+                            request_end,
+                        )
+                        .is_none()
+                    });
+                }
+            }
+        }
+    }
+
+    /// 释放指定进程在该文件上的全部 POSIX 记录锁。
+    pub fn release_posix_locks_for_owner(&self, owner_pid: usize) {
+        let Ok((fs_id, ino)) = self.posix_lock_key() else {
+            return;
+        };
+        let Some(state) = posix_lock_state(fs_id, ino, false) else {
+            return;
+        };
+        let changed = {
+            let mut entries = state.entries.lock();
+            posix_lock_release_owner(&mut entries, owner_pid)
+        };
+        if changed {
+            state.wait_queue.wake_all();
+        }
     }
 
     /// Apply a BSD `flock(2)` lock to this open file description.

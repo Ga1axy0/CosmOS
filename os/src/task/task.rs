@@ -382,6 +382,8 @@ pub enum WaitReason {
     Semaphore,
     /// Waiting for a mutex to become available.
     Mutex,
+    /// Waiting for a POSIX file lock to become available.
+    FileLock,
     /// Waiting on a Linux futex word.
     Futex,
     /// Parent is waiting for child process exit.

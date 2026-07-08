@@ -6,8 +6,9 @@ use crate::fs::{
     make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
     mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
     rename_at, symlinkat, sync_page_cache_all, sync_page_cache_fs, truncate_inode, unlinkat,
-    AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatFs64,
-    StatMode, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags, PosixLockConflict,
+    PosixLockRange, PosixLockType, Stat, StatFs64, StatMode, AT_EMPTY_PATH, AT_FDCWD,
+    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
@@ -1973,7 +1974,14 @@ const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+const F_GETLK: i32 = 5;
+const F_SETLK: i32 = 6;
+const F_SETLKW: i32 = 7;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+const SEEK_SET: i16 = 0;
 
 const F_OK: i32 = 0;
 const X_OK: i32 = 1;
@@ -2157,6 +2165,78 @@ impl FcntlFdFlag {
     const ALL_BITS: i32 = Self::Cloexec as i32;
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Flock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+impl Pod for Flock {}
+
+fn flock_type_from_abi(lock_type: i16) -> Result<PosixLockType, ERRNO> {
+    match lock_type {
+        F_RDLCK => Ok(PosixLockType::Read),
+        F_WRLCK => Ok(PosixLockType::Write),
+        F_UNLCK => Ok(PosixLockType::Unlock),
+        _ => Err(ERRNO::EINVAL),
+    }
+}
+
+fn flock_type_to_abi(lock_type: PosixLockType) -> i16 {
+    match lock_type {
+        PosixLockType::Read => F_RDLCK,
+        PosixLockType::Write => F_WRLCK,
+        PosixLockType::Unlock => F_UNLCK,
+    }
+}
+
+fn flock_range_from_abi(lock: &Flock) -> Result<PosixLockRange, ERRNO> {
+    if lock.l_whence != SEEK_SET {
+        return Err(ERRNO::EINVAL);
+    }
+    if lock.l_start < 0 || lock.l_len < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let start = lock.l_start as u64;
+    let len = if lock.l_len == 0 {
+        None
+    } else {
+        let len = lock.l_len as u64;
+        start.checked_add(len).ok_or(ERRNO::EINVAL)?;
+        Some(len)
+    };
+    Ok(PosixLockRange { start, len })
+}
+
+fn write_flock_conflict(lock: &mut Flock, conflict: Option<PosixLockConflict>) -> Result<(), ERRNO> {
+    if let Some(conflict) = conflict {
+        lock.l_type = flock_type_to_abi(conflict.lock_type);
+        lock.l_whence = SEEK_SET;
+        lock.l_start = i64::try_from(conflict.range.start).map_err(|_| ERRNO::EINVAL)?;
+        lock.l_len = match conflict.range.len {
+            Some(len) => i64::try_from(len).map_err(|_| ERRNO::EINVAL)?,
+            None => 0,
+        };
+        lock.l_pid = i32::try_from(conflict.owner_pid).map_err(|_| ERRNO::EINVAL)?;
+    } else {
+        lock.l_type = F_UNLCK;
+        lock.l_pid = 0;
+    }
+    Ok(())
+}
+
+fn validate_fcntl_lock_access(desc: &FileDescription, lock_type: PosixLockType) -> Result<(), ERRNO> {
+    match lock_type {
+        PosixLockType::Read if !desc.readable() => Err(ERRNO::EBADF),
+        PosixLockType::Write if !desc.writable() => Err(ERRNO::EBADF),
+        _ => Ok(()),
+    }
+}
+
 /// 过滤并校验 `openat` 的路径打开语义位。
 fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     const O_APPEND: i32 = FileStatusFlags::APPEND.bits();
@@ -2298,6 +2378,34 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                     flags: FdFlags::CLOEXEC,
                 });
                 Ok(new_fd as isize)
+            }
+            F_GETLK | F_SETLK | F_SETLKW => {
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                drop(inner);
+
+                let mut flock = read_pod_from_user(arg as *const Flock)?;
+                let lock_type = flock_type_from_abi(flock.l_type)?;
+                let range = flock_range_from_abi(&flock)?;
+                validate_fcntl_lock_access(&desc, lock_type)?;
+                let owner_pid = process.getpid();
+
+                match cmd {
+                    F_GETLK => {
+                        let conflict = desc.get_posix_lock(owner_pid, lock_type, range)?;
+                        write_flock_conflict(&mut flock, conflict)?;
+                        write_pod_to_user(arg as *mut Flock, &flock)?;
+                        Ok(0)
+                    }
+                    F_SETLK => {
+                        desc.set_posix_lock(owner_pid, lock_type, range, false)?;
+                        Ok(0)
+                    }
+                    F_SETLKW => {
+                        desc.set_posix_lock(owner_pid, lock_type, range, true)?;
+                        Ok(0)
+                    }
+                    _ => unreachable!(),
+                }
             }
             _ => Err(ERRNO::EINVAL),
         }
@@ -3187,6 +3295,9 @@ pub fn sys_close(fd: u32) -> isize {
         }
         closed_entry
     };
+    if let Some(entry) = closed_entry.as_ref() {
+        entry.desc.release_posix_locks_for_owner(process.getpid());
+    }
     drop(closed_entry);
     0
 }
@@ -3250,6 +3361,9 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
         if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
             parent.inner_exclusive_access().fd_table = fd_table;
         }
+    }
+    for entry in &closed_entries {
+        entry.desc.release_posix_locks_for_owner(process.getpid());
     }
     drop(closed_entries);
     0
@@ -3391,6 +3505,9 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
         });
         (result, replaced_entry)
     };
+    if let Some(entry) = replaced_entry.as_ref() {
+        entry.desc.release_posix_locks_for_owner(process.getpid());
+    }
     drop(replaced_entry);
     result
 }
