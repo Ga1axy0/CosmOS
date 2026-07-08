@@ -181,19 +181,14 @@ impl UdpSocketFile {
         let bind_ep = listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port));
         let stack_ep = if bind_ep.addr.is_some() {
             bind_ep
-        } else if self.family == AF_INET_FAMILY {
-            IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))),
-                port: bind_ep.port,
-            }
         } else if self.family == super::AF_INET6 as i32 && self.ipv6_only() {
             IpListenEndpoint {
                 addr: Some(IpAddress::Ipv6(Ipv6Address::LOCALHOST)),
                 port: bind_ep.port,
             }
         } else {
-            // AF_INET6 wildcard with IPV6_V6ONLY=0 keeps addr=None so one UDP
-            // socket can accept both IPv6 and IPv4 loopback datagrams.
+            // Keep wildcard UDP binds as addr=None so the socket can reach
+            // external peers (e.g. DNS) while still matching loopback traffic.
             bind_ep
         };
         debug!(

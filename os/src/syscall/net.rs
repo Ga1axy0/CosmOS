@@ -44,6 +44,7 @@ const SHUT_RDWR: i32 = 2;
 const NETLINK_ROUTE: i32 = 0;
 const MSG_PEEK: u32 = 0x0002;
 const MSG_DONTWAIT: u32 = 0x0040;
+const MSG_NOSIGNAL: u32 = 0x4000;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const IPPROTO_SCTP: i32 = 132;
@@ -1738,7 +1739,7 @@ pub fn sys_sendto(
     addrlen: i32,
 ) -> isize {
     syscall_body!({
-        if flags != 0 {
+        if flags & !MSG_NOSIGNAL != 0 {
             return Err(ERRNO::EOPNOTSUPP);
         }
         if len == 0 {
@@ -2551,7 +2552,7 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
         if msg.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        if flags != 0 {
+        if flags & !MSG_NOSIGNAL != 0 {
             return Err(ERRNO::EOPNOTSUPP);
         }
 
@@ -2570,6 +2571,30 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
 
         let fd = fd as usize;
         let n = match socket_backend(fd)? {
+            SocketBackendKind::Udp => {
+                if msghdr.msg_controllen != 0 {
+                    return Err(ERRNO::EOPNOTSUPP);
+                }
+                if msghdr.msg_name == 0 {
+                    with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
+                } else {
+                    let ep = sockaddr_to_socket_endpoint(
+                        socket_spec(fd)?,
+                        msghdr.msg_name as *const SockAddrIn,
+                        msghdr.msg_namelen,
+                    )?;
+                    with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
+                }
+            }
+            SocketBackendKind::Tcp => {
+                if msghdr.msg_controllen != 0 {
+                    return Err(ERRNO::EOPNOTSUPP);
+                }
+                if msghdr.msg_name != 0 {
+                    return Err(ERRNO::EISCONN);
+                }
+                with_tcp_socket(fd, |tcp| tcp.send_from_user_buffer(&ubuf))?
+            }
             SocketBackendKind::UnixStream => {
                 let ancillary = if msghdr.msg_controllen == 0 {
                     UnixSocketAncillaryData::default()
@@ -2634,9 +2659,7 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
                 }
                 with_netlink_route_socket(fd, |netlink| netlink.send_user_buffer(&ubuf))?
             }
-            SocketBackendKind::Udp
-            | SocketBackendKind::Tcp
-            | SocketBackendKind::UnixDatagram
+            SocketBackendKind::UnixDatagram
             | SocketBackendKind::CompatIfreq
             | SocketBackendKind::Packet
             | SocketBackendKind::AlgSocket => return Err(ERRNO::EOPNOTSUPP),
@@ -2672,23 +2695,36 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
 
         let fd = fd as usize;
         let backend = socket_backend(fd)?;
-        let (n, ancillary, raw_control): (
+        let (n, name_ep, ancillary, raw_control): (
             usize,
+            Option<IpEndpoint>,
             UnixSocketAncillaryData,
             Vec<RawIpv6ControlMessage>,
         ) = match backend {
+            SocketBackendKind::Udp => {
+                let mut ubuf = ubuf;
+                let (n, ep) = with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?;
+                (n, Some(ep), UnixSocketAncillaryData::default(), Vec::new())
+            }
+            SocketBackendKind::Tcp => {
+                let mut ubuf = ubuf;
+                let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
+                let ep = with_tcp_socket(fd, |tcp| Ok(tcp.remote_endpoint()))?;
+                (n, ep, UnixSocketAncillaryData::default(), Vec::new())
+            }
             SocketBackendKind::UnixStream => with_unix_socket(fd, |unix| {
                 let (n, mut ancillary) = unix.recvmsg(ubuf)?;
                 if !unix.passcred_enabled() {
                     ancillary.credentials = None;
                 }
-                Ok((n, ancillary, Vec::new()))
+                Ok((n, None, ancillary, Vec::new()))
             })?,
             SocketBackendKind::NetlinkRoute => (
                 with_netlink_route_socket(fd, |netlink| {
                     let mut ubuf = ubuf;
                     netlink.recv_into_user_buffer(&mut ubuf, false)
                 })?,
+                None,
                 UnixSocketAncillaryData::default(),
                 Vec::new(),
             ),
@@ -2697,13 +2733,12 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
                 let packet = with_raw_ipv6_socket(fd, |raw| raw.recv_into_user_buffer(&mut ubuf))?;
                 (
                     packet.data.len(),
+                    None,
                     UnixSocketAncillaryData::default(),
                     packet.control,
                 )
             }
-            SocketBackendKind::Udp
-            | SocketBackendKind::Tcp
-            | SocketBackendKind::UnixDatagram
+            SocketBackendKind::UnixDatagram
             | SocketBackendKind::CompatIfreq
             | SocketBackendKind::Packet
             | SocketBackendKind::AlgSocket
@@ -2777,7 +2812,36 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         }
 
         msghdr.msg_controllen = control_out.len();
-        if backend == SocketBackendKind::NetlinkRoute && msghdr.msg_name != 0 {
+        if let Some(ep) = name_ep {
+            if msghdr.msg_name != 0 {
+                let spec = socket_spec(fd)?;
+                if spec.family == AF_INET6 as i32 {
+                    let sockaddr = endpoint_to_sockaddr_in6(ep);
+                    let sockaddr_bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            (&sockaddr as *const SockAddrIn6) as *const u8,
+                            size_of::<SockAddrIn6>(),
+                        )
+                    };
+                    let name_len = sockaddr_bytes.len().min(msghdr.msg_namelen);
+                    write_bytes_to_user(msghdr.msg_name as *mut u8, &sockaddr_bytes[..name_len])?;
+                    msghdr.msg_namelen = sockaddr_bytes.len();
+                } else {
+                    let sockaddr = endpoint_to_sockaddr(ep);
+                    let sockaddr_bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            (&sockaddr as *const SockAddrIn) as *const u8,
+                            size_of::<SockAddrIn>(),
+                        )
+                    };
+                    let name_len = sockaddr_bytes.len().min(msghdr.msg_namelen);
+                    write_bytes_to_user(msghdr.msg_name as *mut u8, &sockaddr_bytes[..name_len])?;
+                    msghdr.msg_namelen = sockaddr_bytes.len();
+                }
+            } else {
+                msghdr.msg_namelen = 0;
+            }
+        } else if backend == SocketBackendKind::NetlinkRoute && msghdr.msg_name != 0 {
             let sockaddr = SockAddrNl {
                 nl_family: AF_NETLINK as u16,
                 nl_pad: 0,

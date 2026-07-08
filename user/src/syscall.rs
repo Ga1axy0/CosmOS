@@ -69,6 +69,8 @@ pub const SYSCALL_GETSOCKNAME: usize = 204;
 pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
 pub const SYSCALL_RECVFROM: usize = 207;
+pub const SYSCALL_SETSOCKOPT: usize = 208;
+pub const SYSCALL_GETSOCKOPT: usize = 209;
 pub const SYSCALL_SHUTDOWN: usize = 210;
 pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
@@ -544,6 +546,39 @@ pub fn sys_recvfrom(
 
 pub fn sys_shutdown(fd: usize, how: usize) -> isize {
     syscall(SYSCALL_SHUTDOWN, [fd, how, 0])
+}
+
+pub fn sys_setsockopt(
+    fd: usize,
+    level: i32,
+    optname: i32,
+    optval: *const u8,
+    optlen: usize,
+) -> isize {
+    syscall6(
+        SYSCALL_SETSOCKOPT,
+        [fd, level as usize, optname as usize, optval as usize, optlen, 0],
+    )
+}
+
+pub fn sys_getsockopt(
+    fd: usize,
+    level: i32,
+    optname: i32,
+    optval: *mut u8,
+    optlen: *mut i32,
+) -> isize {
+    syscall6(
+        SYSCALL_GETSOCKOPT,
+        [
+            fd,
+            level as usize,
+            optname as usize,
+            optval as usize,
+            optlen as usize,
+            0,
+        ],
+    )
 }
 
 pub fn sys_sendmsg(fd: usize, msg: *const crate::net::MsgHdr, flags: usize) -> isize {

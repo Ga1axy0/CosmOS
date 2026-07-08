@@ -17,6 +17,10 @@ pub const SHUT_RDWR: usize = 2;
 
 /// socket level for control messages.
 pub const SOL_SOCKET: i32 = 1;
+/// receive timeout.
+pub const SO_RCVTIMEO: i32 = 20;
+/// send timeout.
+pub const SO_SNDTIMEO: i32 = 21;
 /// pass file descriptors as ancillary data.
 pub const SCM_RIGHTS: i32 = 1;
 /// pass credentials as ancillary data.
