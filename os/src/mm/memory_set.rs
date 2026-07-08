@@ -1659,6 +1659,7 @@ impl MemorySet {
         permission: MapPermission,
         shared: bool,
     ) -> Result<(), MmError> {
+        let start_vpn = start_va.floor();
         debug!(
             "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} shared={} eager={}",
             usize::from(start_va),
@@ -1674,11 +1675,13 @@ impl MemorySet {
         };
         if shared {
             self.insert_vma_eager(vma)?;
+            self.merge_vma_around(start_vpn);
+            unsafe {
+                crate::hal::flush_tlb();
+            }
         } else {
             self.register_vma_metadata(vma)?;
-        }
-        unsafe {
-            crate::hal::flush_tlb();
+            self.merge_vma_around(start_vpn);
         }
         Ok(())
     }
@@ -1706,9 +1709,6 @@ impl MemorySet {
             Vma::new_file(start_va, end_va, permission, file, pgoff, shared),
             None,
         )?;
-        unsafe {
-            crate::hal::flush_tlb();
-        }
         Ok(())
     }
 
@@ -1723,75 +1723,65 @@ impl MemorySet {
     ) -> Option<UserReleaseBatch> {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
-        // debug!(
-        //     "[munmap] begin teardown: start={:#x} end={:#x} start_vpn={:#x} end_vpn={:#x}",
-        //     usize::from(start_va),
-        //     usize::from(end_va),
-        //     start_vpn.0,
-        //     end_vpn.0
-        // );
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            let Some(area) = self.find_vma_containing(vpn) else {
+        // 先按 VMA 级别验证整段区间都被用户态映射覆盖，避免按页查找导致
+        // many-small munmap 在大量碎片 VMA 下退化得过于明显。
+        let mut overlap_starts = Vec::new();
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let Some((area_start, area)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.contains_vpn(cursor))
+            else {
                 return None;
             };
             if !area.is_user_accessible() {
                 return None;
             }
+            overlap_starts.push(*area_start);
+            cursor = area.end_vpn().min(end_vpn);
         }
 
         let mut batch = UserReleaseBatch::new();
-        let old_vmas = core::mem::take(&mut self.vmas);
-        let mut new_areas: Vec<Vma> = Vec::with_capacity(old_vmas.len() + 1);
-        for mut area in old_vmas.into_values() {
+        let mut merge_candidates = Vec::with_capacity(overlap_starts.len() * 2);
+        for area_start in overlap_starts {
+            let mut area = self.vmas.remove(&area_start)?;
             let area_start = area.start_vpn();
             let area_end = area.end_vpn();
-            let overlap_start = if area_start > start_vpn {
-                area_start
-            } else {
-                start_vpn
-            };
-            let overlap_end = if area_end < end_vpn {
-                area_end
-            } else {
-                end_vpn
-            };
+            let overlap_start = area_start.max(start_vpn);
+            let overlap_end = area_end.min(end_vpn);
 
-            if overlap_start >= overlap_end {
-                new_areas.push(area);
-                continue;
-            }
-
-            // debug!(
-            //     "[munmap] overlap VMA: area_start={:#x} area_end={:#x} overlap_start={:#x} overlap_end={:#x} file_backed={} direct_cache_pages={} private_pages={}",
-            //     area_start.0,
-            //     area_end.0,
-            //     overlap_start.0,
-            //     overlap_end.0,
-            //     area.file.is_some(),
-            //     area.direct_cache_pages.len(),
-            //     area.data_frames.len()
-            // );
+            let right_area = if overlap_end < area_end {
+                area.split_off(overlap_end)
+            } else {
+                None
+            };
+            let mut overlap_area = if area_start < overlap_start {
+                let overlap_area = area
+                    .split_off(overlap_start)
+                    .expect("validated overlap split should succeed");
+                let left_start = area.start_vpn();
+                self.insert_vma_unchecked(area);
+                merge_candidates.push(left_start);
+                overlap_area
+            } else {
+                area
+            };
 
             for vpn in VPNRange::new(overlap_start, overlap_end) {
-                area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                overlap_area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
             }
 
-            if area_start < overlap_start {
-                if let Some(left_tail) = area.split_off(overlap_start) {
-                    let overlap_area = left_tail;
-                    new_areas.push(area);
-                    area = overlap_area;
-                }
-            }
-
-            if overlap_end < area_end {
-                if let Some(right_area) = area.split_off(overlap_end) {
-                    new_areas.push(right_area);
-                }
+            if let Some(right_area) = right_area {
+                let right_start = right_area.start_vpn();
+                self.insert_vma_unchecked(right_area);
+                merge_candidates.push(right_start);
             }
         }
-        self.rebuild_vmas_from_vec(new_areas);
-        self.merge_adjacent_vmas();
+        for start in merge_candidates {
+            self.merge_vma_around(start);
+        }
         self.finish_deferred_page_table_edit();
         debug!(
             "[munmap] complete teardown: start_vpn={:#x} end_vpn={:#x}",
