@@ -48,6 +48,10 @@ ROOTFS_RV_BUILD_DIR := $(ROOTFS_REPO)/build/rv
 ROOTFS_LA_BUILD_DIR := $(ROOTFS_REPO)/build/la
 ROOTFS_RV_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-rv
 ROOTFS_LA_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-la
+ROOTFS_RV_INIT_STAMP := $(ROOTFS_RV_STAMP_DIR)/.rootfs-init.stamp
+ROOTFS_LA_INIT_STAMP := $(ROOTFS_LA_STAMP_DIR)/.rootfs-init.stamp
+ROOTFS_SCRIPT_FILES := $(shell find $(ROOTFS_REPO)/scripts -type f | sort)
+LA_ROOTFS_ARCH_FILES := bin/busybox usr/bin/bash lib/libc.so
 ROOTFS_RV_FILES := $(shell if [ -d $(ROOTFS_RV_DIR) ]; then find $(ROOTFS_RV_DIR) -type f | sort; fi)
 ROOTFS_LA_FILES := $(shell if [ -d $(ROOTFS_LA_DIR) ]; then find $(ROOTFS_LA_DIR) -type f | sort; fi)
 DISK_RV_IMG := disk.img
@@ -101,7 +105,7 @@ else
 $(error unsupported RUN_ARCH=$(RUN_ARCH), expected rv or la)
 endif
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready prepare-run-test-fs prepare-run-test-fs-la force
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
 
 all:
 	$(MAKE) submodules
@@ -186,12 +190,28 @@ sync-rootfs-variants:
 		exit 1; \
 	}
 	@for dir in "$(ROOTFS_RV_DIR)" "$(ROOTFS_LA_DIR)"; do \
-		echo "[SYNC] $(ROOTFS_BASE_DIR) -> $$dir"; \
-		mkdir -p "$$dir"; \
-		cp -a "$(ROOTFS_BASE_DIR)"/. "$$dir"/; \
+		if [ ! -d "$$dir" ]; then \
+			echo "[SYNC] initialize $(ROOTFS_BASE_DIR) -> $$dir"; \
+			cp -a "$(ROOTFS_BASE_DIR)" "$$dir"; \
+		else \
+			echo "[SYNC] keep existing $$dir"; \
+		fi; \
 	done
 
-rootfs-rv: sync-rootfs-variants
+rootfs-rv: $(ROOTFS_RV_INIT_STAMP)
+
+rootfs-la: $(ROOTFS_LA_INIT_STAMP)
+
+$(ROOTFS_RV_INIT_STAMP): $(ROOTFS_SCRIPT_FILES)
+	@test -d "$(ROOTFS_BASE_DIR)" || { \
+		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_BASE_DIR)/root" || { \
+		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
+		exit 1; \
+	}
+	@if [ ! -d "$(ROOTFS_RV_DIR)" ]; then cp -a "$(ROOTFS_BASE_DIR)" "$(ROOTFS_RV_DIR)"; fi
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
 		BUILD_ROOT="$(CURDIR)/$(ROOTFS_RV_BUILD_DIR)" \
@@ -203,8 +223,18 @@ rootfs-rv: sync-rootfs-variants
 		MUSL_LIB=$(RV_MUSL_LIB) \
 		MUSL_ARCH=$(RV_MUSL_ARCH) \
 		MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)"
+	@touch "$@"
 
-rootfs-la: sync-rootfs-variants
+$(ROOTFS_LA_INIT_STAMP): $(ROOTFS_SCRIPT_FILES)
+	@test -d "$(ROOTFS_BASE_DIR)" || { \
+		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_BASE_DIR)/root" || { \
+		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
+		exit 1; \
+	}
+	@if [ ! -d "$(ROOTFS_LA_DIR)" ]; then cp -a "$(ROOTFS_BASE_DIR)" "$(ROOTFS_LA_DIR)"; fi
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_LA_DIR)" \
 		BUILD_ROOT="$(CURDIR)/$(ROOTFS_LA_BUILD_DIR)" \
@@ -216,6 +246,7 @@ rootfs-la: sync-rootfs-variants
 		MUSL_LIB=$(LA_MUSL_LIB) \
 		MUSL_ARCH=$(LA_MUSL_ARCH) \
 		MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)"
+	@touch "$@"
 
 rv disk-rv: $(DISK_RV_IMG)
 
@@ -295,10 +326,38 @@ check-rootfs-la-ready:
 		exit 1; \
 	}
 
-$(DISK_RV_IMG): force check-user-apps-rv rootfs-rv check-rootfs-rv-ready $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
+# A previous interrupted/old build may leave valid-looking stamps while the
+# architecture-specific files have been overwritten by the base RISC-V rootfs.
+# Invalidate only the affected LA package stamps so the next rootfs build
+# repairs the files instead of silently skipping them.
+check-rootfs-la-arch: force
+	@if [ -d "$(ROOTFS_LA_DIR)" ]; then \
+		bad=0; \
+		for path in $(LA_ROOTFS_ARCH_FILES); do \
+			if [ ! -f "$(ROOTFS_LA_DIR)/$$path" ] || ! file -L "$(ROOTFS_LA_DIR)/$$path" | grep -q 'LoongArch'; then \
+				echo "[WARN] stale/non-LoongArch LA rootfs file: $(ROOTFS_LA_DIR)/$$path" >&2; \
+				bad=1; \
+			fi; \
+		done; \
+		if [ "$$bad" -ne 0 ]; then \
+			rm -f "$(ROOTFS_LA_INIT_STAMP)" \
+				"$(ROOTFS_LA_STAMP_DIR)/build-busybox.stamp" \
+				"$(ROOTFS_LA_STAMP_DIR)/build-bash.stamp" \
+				"$(ROOTFS_LA_STAMP_DIR)/install-libc.stamp"; \
+		fi; \
+	fi
+
+$(DISK_RV_IMG): $(USER_BUILD_STAMP_RV) $(ROOTFS_RV_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
 	MUSL_ARCH=$(RV_MUSL_ARCH) MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR_RV) $@
 
-$(DISK_LA_IMG): force check-user-apps-la rootfs-la check-rootfs-la-ready $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh
+
+$(DISK_LA_IMG): $(USER_BUILD_STAMP_LA) $(ROOTFS_LA_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh | check-rootfs-la-arch
+	@for path in $(LA_ROOTFS_ARCH_FILES); do \
+		file -L "$(ROOTFS_LA_DIR)/$$path" | grep -q 'LoongArch' || { \
+			echo "LA rootfs architecture check failed: $(ROOTFS_LA_DIR)/$$path" >&2; \
+			exit 1; \
+		}; \
+	done
 	MUSL_ARCH=$(LA_MUSL_ARCH) MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR_LA) $@
 
 force:

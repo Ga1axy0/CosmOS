@@ -14,12 +14,20 @@
     "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
     "rust-analyzer.checkOnSave.allTargets": false,
     "rust-analyzer.checkOnSave": true,
-    "files.watcherExclude": {
-        "**/target": true
-    },
+    "rust-analyzer.procMacro.enable": false,
     "metals.inlayHints.implicitArguments.enable": true,
     "metals.inlayHints.implicitConversions.enable": true,
     // "rust-analyzer.cargo.features": [
     //     "board_qemu"
     // ]
+    "files.watcherExclude": {
+        "**/node_modules/**": true,
+        "**/.git/**": true,
+        "**/dist/**": true,
+        "**/build/**": true,
+        "**/target/**": true,
+        "**/rootfs-la/**": true,
+        "**/rootfs-rv/**": true,
+        "**/vendor/**": true
+    }
 }
