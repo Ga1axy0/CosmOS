@@ -38,6 +38,7 @@ use crate::{
     drivers,
     poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT},
     sync::SpinNoIrqLock,
+    task::{WaitQueue, WaitReason},
     timer::get_time_us,
 };
 
@@ -102,6 +103,8 @@ const KERNEL_UDP_ECHO_PORT: u16 = 5555;
 lazy_static! {
     /// Global network stack instance.
     pub(crate) static ref NET_STACK: SpinNoIrqLock<Option<NetStack>> = SpinNoIrqLock::new(None);
+    /// Sleep queue for the single network bottom-half worker.
+    static ref NET_POLL_WAIT: WaitQueue = WaitQueue::new();
 }
 
 /// Whether one immediate poll is needed due to IRQ or recent TX activity.
@@ -109,6 +112,8 @@ pub(crate) static NEED_POLL: AtomicBool = AtomicBool::new(false);
 /// Next soft deadline (us since boot) for calling into smoltcp.
 /// `u64::MAX` means no timer-driven deadline currently exists.
 pub(crate) static NEXT_POLL_DEADLINE_US: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_US);
+
+static NET_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "net_perf_counters")]
 static PERF_POLL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -524,20 +529,66 @@ pub fn init() {
 
     let stack = NetStack::new(dev);
     *NET_STACK.lock() = Some(stack);
-    NEED_POLL.store(true, Ordering::Release);
+    request_poll();
     NEXT_POLL_DEADLINE_US.store(0, Ordering::Release);
     info!("[kernel] net: smoltcp stack initialized");
 }
 
+/// Start the scheduler-visible network bottom-half worker.
+///
+/// Network initialization happens before the init process and scheduler are
+/// fully online, so this is intentionally called by the bootstrap path after
+/// `task::add_initproc()`.
+pub fn start_worker() {
+    if NET_STACK.lock().is_none() {
+        return;
+    }
+    if NET_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let task = crate::task::spawn_kernel_thread(net_worker_main, crate::task::SchedAttr::other(0));
+    info!(
+        "[net] poll worker spawned task={:#x}",
+        Arc::as_ptr(&task) as usize
+    );
+}
+
+fn net_worker_has_work() -> bool {
+    if NEED_POLL.load(Ordering::Acquire) {
+        return true;
+    }
+    let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
+    deadline_us != NO_POLL_DEADLINE_US && (get_time_us() as u64) >= deadline_us
+}
+
+fn net_worker_main() -> ! {
+    loop {
+        if !net_worker_has_work() {
+            NET_POLL_WAIT.wait_with_reason_or_skip(WaitReason::NetPoll, net_worker_has_work);
+            continue;
+        }
+        drivers::net::service_tx_completions();
+        poll();
+    }
+}
+
+/// Mark network work pending and wake the bottom-half worker.
+pub(crate) fn request_poll() {
+    NEED_POLL.store(true, Ordering::Release);
+    NET_POLL_WAIT.wake_one();
+}
+
 /// Notify the net stack that one NIC IRQ has arrived.
 pub fn notify_irq() {
-    NEED_POLL.store(true, Ordering::Release);
+    request_poll();
     NEXT_POLL_DEADLINE_US.store(0, Ordering::Release);
 }
 
-/// Poll network stack once.
-///
-/// Call this from a safe context (e.g. timer interrupt path or scheduler tick).
+/// Poll network stack once from the worker or a synchronous socket fast path.
 pub fn poll() {
     // print!("p");
     #[cfg(feature = "net_perf_counters")]
@@ -559,19 +610,11 @@ pub fn poll() {
     stack.poll();
 }
 
-/// Poll from the periodic timer path only when smoltcp has pending work.
+/// Wake the worker from the periodic timer path when smoltcp has pending work.
 pub fn poll_timer_tick() {
-    if !NEED_POLL.load(Ordering::Acquire) {
-        let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
-        if deadline_us == NO_POLL_DEADLINE_US {
-            return;
-        }
-        if (get_time_us() as u64) < deadline_us {
-            return;
-        }
+    if net_worker_has_work() {
+        request_poll();
     }
-
-    poll();
 }
 
 /// Return `(tcp, udp)` live socket-state counts for diagnostics
@@ -754,7 +797,7 @@ impl NetStack {
         if !self.device.loopback.queue.is_empty() {
             #[cfg(feature = "net_perf_counters")]
             perf_inc(&PERF_POLL_BUDGET_EXHAUSTED);
-            NEED_POLL.store(true, Ordering::Release);
+            request_poll();
         }
     }
 
@@ -794,7 +837,7 @@ impl NetStack {
                                 rev.reverse();
                                 if socket.can_send() {
                                     let _ = socket.send_slice(&rev, meta.endpoint);
-                                    NEED_POLL.store(true, Ordering::Release);
+                                    request_poll();
                                 }
                             } else {
                                 break;
@@ -899,7 +942,7 @@ impl NetStack {
         // Keep liveness for immediate work units (e.g. handshake progress)
         // even when there's no external IRQ.
         if next != NO_POLL_DEADLINE_US && (get_time_us() as u64) >= next {
-            NEED_POLL.store(true, Ordering::Release);
+            request_poll();
         }
     }
 
@@ -1245,7 +1288,7 @@ impl<'a> TxToken for MultiTxToken<'a> {
             }
         }
 
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         ret
     }
 }
@@ -1345,7 +1388,7 @@ impl TxToken for VirtioTxToken {
                 warn!("net: try_send failed: {:?}", e);
             }
         }
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         ret
     }
 }

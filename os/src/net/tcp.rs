@@ -14,8 +14,9 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Ad
 use crate::fs::{File, Stat, StatMode};
 use crate::mm::UserBuffer;
 use crate::net::{
-    cleanup_socket_wait, register_socket_wait, socket_wait_mark_ready, socket_wait_should_skip,
-    socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState, NEED_POLL, NET_STACK,
+    cleanup_socket_wait, register_socket_wait, request_poll, socket_wait_mark_ready,
+    socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState,
+    NET_STACK,
 };
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
@@ -463,7 +464,7 @@ impl TcpSocketFile {
         st.read_wait.wake_all();
         st.write_wait.wake_all();
         notify_poll_source(st.source_id(), POLLIN | POLLOUT | POLLHUP);
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         Ok(())
     }
 
@@ -594,7 +595,7 @@ impl TcpSocketFile {
             st.write_wait.wake_all();
         }
         stack.poll();
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         Ok(())
     }
 
@@ -623,7 +624,7 @@ impl TcpSocketFile {
         }
 
         stack.poll();
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         Ok(())
     }
 
@@ -705,7 +706,7 @@ impl TcpSocketFile {
         self.listening.store(true, Ordering::Release);
         self.trim_listener_slots(&listener)?;
         self.refill_listener_slots(&listener)?;
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         Ok(())
     }
 
@@ -769,7 +770,7 @@ impl TcpSocketFile {
                     "Tcp accept: accepted handle={:?} peer={:?}",
                     st.handle, peer
                 );
-                NEED_POLL.store(true, Ordering::Release);
+                request_poll();
                 return Ok((accepted, peer));
             }
 
@@ -847,7 +848,7 @@ impl TcpSocketFile {
             stack.poll();
         }
 
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
 
         loop {
             if crate::signal::has_unmasked_pending_signal() {
@@ -915,7 +916,7 @@ impl TcpSocketFile {
 
         st.read_wait.wake_all();
         st.write_wait.wake_all();
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
         Ok(())
     }
 
@@ -963,7 +964,7 @@ impl TcpSocketFile {
                     }
                     crate::net::perf_tcp_user_recv(total);
                     stack.poll_socket_recv_work();
-                    NEED_POLL.store(true, Ordering::Release);
+                    request_poll();
                     return Ok(total);
                 }
                 if !socket.may_recv() {
@@ -1096,7 +1097,7 @@ impl TcpSocketFile {
                     if total > 0 {
                         crate::net::perf_tcp_user_send(total);
                         stack.poll_socket_work_for(st.handle);
-                        NEED_POLL.store(true, Ordering::Release);
+                        request_poll();
                         if let Some(handle) = timeout_handle.take() {
                             socket_wait_mark_ready(handle);
                             cleanup_socket_wait(handle);
@@ -1267,7 +1268,7 @@ impl File for TcpSocketFile {
                     }
                     crate::net::perf_tcp_user_recv(n);
                     stack.poll_socket_recv_work();
-                    NEED_POLL.store(true, Ordering::Release);
+                    request_poll();
                     return Ok(n);
                 }
                 if !socket.may_recv() {
@@ -1385,7 +1386,7 @@ impl File for TcpSocketFile {
                     }
                     crate::net::perf_tcp_user_send(n);
                     stack.poll_socket_work_for(st.handle);
-                    NEED_POLL.store(true, Ordering::Release);
+                    request_poll();
                     if let Some(handle) = timeout_handle.take() {
                         socket_wait_mark_ready(handle);
                         cleanup_socket_wait(handle);
@@ -1587,7 +1588,7 @@ impl Drop for TcpSocketFile {
                 }
                 listener.wake_accept_all();
                 notify_poll_source(source_id, POLLIN | POLLOUT | POLLHUP);
-                NEED_POLL.store(true, Ordering::Release);
+                request_poll();
                 return;
             }
         }
@@ -1610,7 +1611,7 @@ impl Drop for TcpSocketFile {
         st.read_wait.wake_all();
         st.write_wait.wake_all();
         notify_poll_source(source_id, POLLIN | POLLOUT | POLLHUP);
-        NEED_POLL.store(true, Ordering::Release);
+        request_poll();
     }
 }
 

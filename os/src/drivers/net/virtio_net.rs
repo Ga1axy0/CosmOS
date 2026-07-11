@@ -79,19 +79,27 @@ impl VirtIONetDevice {
         self.mac
     }
 
-    /// Acknowledge the device interrupt and wake a waiting TX token if any.
+    /// Acknowledge the device interrupt.
+    ///
+    /// Completion draining is deferred to the network bottom-half worker so
+    /// the hard IRQ path does not walk the used ring or wake task waiters.
     pub fn handle_irq(&self) {
         let mut inner = self.inner.lock();
-        if inner.ack_interrupt().is_empty() {
-            return;
-        }
-        drop(inner);
+        let _ = inner.ack_interrupt();
+    }
+
+    /// Drain completed TX buffers and wake blocked senders.
+    ///
+    /// The device may have written the used ring through DMA before raising
+    /// the interrupt. Order those writes before the worker inspects the ring.
+    pub fn service_tx_completions(&self) {
+        crate::drivers::virtio::virtio_dma_rmb();
         self.reclaim_tx_completions();
     }
 
     /// Returns whether TX queue can accept one packet.
     pub fn can_send(&self) -> bool {
-        self.reclaim_tx_completions();
+        self.service_tx_completions();
         self.inner.lock().can_send()
     }
 
@@ -186,7 +194,7 @@ impl VirtIONetDevice {
     pub fn try_send(&self, frame: &[u8]) -> Result<bool, Error> {
         const MAX_HEADER_PAD: usize = 32;
 
-        self.reclaim_tx_completions();
+        self.service_tx_completions();
 
         let mut tx_buf = vec![0u8; frame.len() + MAX_HEADER_PAD];
         {
@@ -295,7 +303,7 @@ impl VirtIONetDevice {
     }
 
     fn tx_token_ready(&self, token: u16) -> bool {
-        self.reclaim_tx_completions();
+        self.service_tx_completions();
         let idx = token as usize;
         if idx >= QUEUE_SIZE {
             return true;

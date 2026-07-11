@@ -398,6 +398,8 @@ pub enum WaitReason {
     Nanosleep,
     /// Waiting for block device I/O completion.
     BlockDeviceIo,
+    /// Waiting for network bottom-half work.
+    NetPoll,
     /// Waiting for poll/ppoll readiness notification.
     Poll,
     /// Waiting for network device TX completion.

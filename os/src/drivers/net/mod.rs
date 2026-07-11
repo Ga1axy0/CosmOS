@@ -107,6 +107,11 @@ pub fn handle_irq(irq: u32) -> bool {
     }
 }
 
+/// Drain TX completions from the network bottom-half context.
+pub fn service_tx_completions() {
+    let _ = with_device(|dev| dev.service_tx_completions());
+}
+
 /// Execute `f` with the discovered network device (if any).
 pub fn with_device<R>(f: impl FnOnce(&Arc<VirtIONetDevice>) -> R) -> Option<R> {
     let guard = NET_DEVICE.lock();
