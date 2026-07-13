@@ -18,7 +18,7 @@ use crate::mm::{
     MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
     UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
-use crate::sched::add_task;
+use crate::sched::{add_task, current_task};
 use crate::sched::insert_into_pid2process;
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
@@ -29,7 +29,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
@@ -165,6 +165,11 @@ pub struct ProcessControlBlock {
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
     /// wait queue for wait4/waitpid
     pub wait_exit_queue: Arc<WaitQueue>,
+    /// Whether a parent blocked by CLONE_VFORK may resume.
+    ///
+    /// This is separate from `is_zombie`: a vfork parent is released after
+    /// the child successfully execs, while the child may continue running.
+    vfork_released: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1064,6 +1069,7 @@ impl ProcessControlBlock {
                 shm_attachments: Vec::new(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
+            vfork_released: AtomicBool::new(false),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = process
@@ -1243,14 +1249,16 @@ impl ProcessControlBlock {
         let clone_start_ns = get_time_ns();
         // warn_heap_state("fork_begin", self.getpid());
         let mut parent = self.inner_exclusive_access();
-        // assert_eq!(parent.thread_count(), 1);
-        if parent.thread_count() != 1 {
-            warn!(
-                "clone_process with multiple threads is not fully supported: parent_pid={} thread_count={}",
+        // Linux fork/clone 允许从多线程进程创建一个只包含调用线程的子进程。
+        // 子进程随后通常会立即 exec（例如 glibc 的 posix_spawn），因此不能
+        // 因为父进程还有其他线程就拒绝这条路径。
+        let parent_thread_count = parent.thread_count();
+        if parent_thread_count != 1 {
+            debug!(
+                "clone_process from multithreaded parent: parent_pid={} thread_count={}",
                 self.getpid(),
-                parent.thread_count()
+                parent_thread_count
             );
-            return Err(ERRNO::EINVAL);
         }
         debug!(
             "[cow] clone_process begin: parent_pid={} parent_threads={}",
@@ -1374,10 +1382,11 @@ impl ProcessControlBlock {
                 shm_attachments: parent_shm_attachments.clone(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
+            vfork_released: AtomicBool::new(false),
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
-        let parent_task = parent.get_task(0);
+        let parent_task = current_task().ok_or(ERRNO::ESRCH)?;
         let parent_task_inner = parent_task.inner_exclusive_access();
         let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
         let parent_sched_attr = parent_task_inner.sched_attr();
@@ -1385,6 +1394,7 @@ impl ProcessControlBlock {
         let parent_cfs_initialized = parent_task_inner.sched.cfs_initialized;
         let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
         let parent_signal_mask = parent_task_inner.signal_mask;
+        let parent_trap_cx = *parent_task_inner.get_trap_cx();
         drop(parent_task_inner);
         if !shared_resources.contains(CloneResourceFlags::PARENT) {
             parent.children.push(Arc::clone(&child));
@@ -1457,6 +1467,7 @@ impl ProcessControlBlock {
         // patches the inherited return register, breaking fork semantics.
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
+        *trap_cx = parent_trap_cx;
         trap_cx.set_kernel_sp(task.kstack.get_top());
         trap_cx.set_syscall_ret(0);
         if child_stack != 0 {
@@ -1634,6 +1645,7 @@ impl ProcessControlBlock {
                 shm_attachments: Vec::new(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
+            vfork_released: AtomicBool::new(false),
         });
         parent.children.push(Arc::clone(&child));
         let parent_task = parent.get_task(0);
@@ -1687,6 +1699,23 @@ impl ProcessControlBlock {
     /// Return whether this process has exited and is waiting to be reaped.
     pub fn is_zombie(&self) -> bool {
         self.inner.lock().is_zombie
+    }
+
+    /// Release a parent blocked by `CLONE_VFORK`.
+    ///
+    /// The operation is idempotent because both the exec and exit paths may
+    /// perform the notification.  The queue is also used by normal waitpid
+    /// callers; their predicates will simply fail and make them sleep again.
+    pub fn release_vfork_parent(&self) {
+        if !self.vfork_released.swap(true, Ordering::AcqRel) {
+            debug!("[vfork] release parent for pid={}", self.getpid());
+            self.wait_exit_queue.wake_all();
+        }
+    }
+
+    /// Return whether a parent blocked by `CLONE_VFORK` may resume.
+    pub fn vfork_parent_released(&self) -> bool {
+        self.vfork_released.load(Ordering::Acquire)
     }
     /// Get absolute path of the last executed image.
     pub fn exec_path(&self) -> String {

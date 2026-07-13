@@ -223,7 +223,7 @@ pub fn sys_sigaction(
                 let word_ptr =
                     (action as usize + i * core::mem::size_of::<usize>()) as *const usize;
                 match translated_ref(token, word_ptr) {
-                    Some(word) => debug!(
+                    Some(word) => trace!(
                         "sys_sigaction signum={} raw action[{}] addr={:#x} value={:#x}",
                         signum, i, word_ptr as usize, *word
                     ),
@@ -265,7 +265,7 @@ pub fn sys_sigaction(
         if !old_action.is_null() {
             let user_old = ArchSignalAbi::encode_user_sigaction(old);
             write_pod_to_user(old_action, &user_old)?;
-            debug!(
+            trace!(
                 "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
                 signum, old.handler, old.sa_flags
             );

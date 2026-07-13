@@ -2934,6 +2934,8 @@ const BLKGETSIZE64_COMPAT_SIGNED: usize = 0xffff_ffff_8004_1272;
 const BLKGETSIZE64_SIGNED: usize = 0xffff_ffff_8008_1272;
 const LOOP_SET_FD: usize = 0x4c00;
 const LOOP_CLR_FD: usize = 0x4c01;
+/// `ioctl(FIONBIO)`：切换文件描述的非阻塞状态。
+const FIONBIO: usize = 0x5421;
 
 /// ioctl 系统调用：校验 fd 后转发到具体文件对象。
 pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
@@ -2944,6 +2946,22 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
+
+        // Linux 的 Rust 标准库会对捕获的子进程管道调用 FIONBIO，而不是
+        // 通过 fcntl(F_SETFL) 设置 O_NONBLOCK。这个请求属于打开文件描述
+        // 的通用状态，不应依赖具体的 Pipe/TTY 文件对象实现。
+        if req == FIONBIO {
+            let enabled: i32 = read_pod_from_user(arg as *const i32)?;
+            let mut status_flags = desc.status_flags();
+            if enabled != 0 {
+                status_flags.insert(FileStatusFlags::NONBLOCK);
+            } else {
+                status_flags.remove(FileStatusFlags::NONBLOCK);
+            }
+            desc.set_status_flags(status_flags);
+            return Ok(0);
+        }
+
         if let Some(inode) = desc.as_inode() {
             let vfs_node = inode.vfs_node();
             if let Some(block) = vfs_node.as_any().downcast_ref::<BlockDevNode>() {

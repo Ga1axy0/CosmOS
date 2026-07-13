@@ -287,6 +287,9 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // If this is the main thread or exit_group was requested, the process
     // should terminate at once.
     if tid == Some(0) || force_process_exit {
+        // A vfork parent must also be released when the child exits before
+        // reaching execve, for example when execve itself fails.
+        process.release_vfork_parent();
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(

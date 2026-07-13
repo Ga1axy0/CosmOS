@@ -1398,7 +1398,10 @@ pub fn sys_socketpair(domain: i32, socket_type: i32, protocol: i32, sv: *mut i32
         }
 
         let (base_type, status_flags, cloexec) = parse_socket_type_flags(socket_type)?;
-        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
+        // glibc 的 posix_spawn 使用 AF_UNIX/SOCK_SEQPACKET socketpair 传递
+        // 子进程启动错误。当前 UnixSocketPairEnd 的双向管道后端已经足够
+        // 支持该内部通道，因此按 SOCK_STREAM 兼容处理即可。
+        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM && base_type != SOCK_SEQPACKET {
             return Err(ERRNO::ESOCKTNOSUPPORT);
         }
 
@@ -1816,7 +1819,18 @@ pub fn sys_sendto(
                 };
                 with_unix_dgram_socket(fd, |socket| socket.send_to(data.as_slice(), unix_addr))?
             }
-            SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq => {
+            SocketBackendKind::UnixStream => {
+                // The posix_spawn error channel is connected, so send(2) must
+                // use the Unix socketpair endpoint when an exec failure is
+                // reported by the child.
+                if !addr.is_null() {
+                    return Err(ERRNO::EISCONN);
+                }
+                with_unix_socket(fd, |unix| {
+                    unix.sendmsg(ubuf, UnixSocketAncillaryData::default())
+                })?
+            }
+            SocketBackendKind::CompatIfreq => {
                 return Err(ERRNO::ENOTSOCK)
             }
             SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => {
@@ -1933,7 +1947,19 @@ pub fn sys_recvfrom(
                 }
                 return Ok(n as isize);
             }
-            SocketBackendKind::UnixStream | SocketBackendKind::CompatIfreq => {
+            SocketBackendKind::UnixStream => {
+                // Rust's Linux std uses recv(2) for the SOCK_SEQPACKET error
+                // channel created by posix_spawn. It is a connected Unix
+                // socketpair, so route the no-address form through recvmsg.
+                if !addr.is_null() {
+                    return Err(ERRNO::EOPNOTSUPP);
+                }
+                let n = with_unix_socket(fd, |unix| {
+                    unix.recvmsg(ubuf).map(|(n, _ancillary)| n)
+                })?;
+                return Ok(n as isize);
+            }
+            SocketBackendKind::CompatIfreq => {
                 return Err(ERRNO::ENOTSOCK)
             }
             SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => {

@@ -1280,6 +1280,10 @@ bitflags! {
         const CLONE_NEWNET = 0x4000_0000;
         /// Place the child into a cgroup v2 directory fd.
         const CLONE_INTO_CGROUP = 0x2_0000_0000;
+        /// Clear inherited signal handlers in a fork-like child.  The
+        /// current process clone already owns an independent signal table,
+        /// so recognizing this clone3-only flag is sufficient here.
+        const CLONE_CLEAR_SIGHAND = 0x1_0000_0000;
     }
 }
 
@@ -1312,8 +1316,8 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             stack_size,
         );
         debug!(
-            "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
-            clone_flags_arg, parent_tid, child_tid
+            "kernel: sys_clone enter flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x}",
+            clone_flags_arg, stack, stack_size, parent_tid, child_tid
         );
 
         let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
@@ -1450,6 +1454,20 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             if vfork_clone {
                 debug!("kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone");
             }
+            // clone3 describes the child stack as a base plus a size, while
+            // the legacy clone path passes the initial stack pointer directly.
+            // The process path must use the stack top just like the thread
+            // path above; otherwise a vfork child starts at the mapping's
+            // lower boundary and its first stack write faults below the VMA.
+            let child_user_sp = if stack_size != 0 {
+                if stack == 0 {
+                    warn!("kernel: sys_clone clone3 stack_size set without a stack base");
+                    return Err(ERRNO::EINVAL);
+                }
+                stack.checked_add(stack_size).ok_or(ERRNO::EINVAL)?
+            } else {
+                stack
+            };
             let mut shared_resources = CloneResourceFlags::empty();
             if flags.contains(CloneFlags::CLONE_VM) {
                 shared_resources.insert(CloneResourceFlags::VM);
@@ -1470,7 +1488,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 shared_resources.insert(CloneResourceFlags::NEWNET);
             }
             let new_process = current_process.clone_process(
-                stack,
+                child_user_sp,
                 child_tls,
                 parent_set_tid,
                 child_set_tid,
@@ -1493,10 +1511,14 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_pid
             );
             if vfork_clone {
-                current_process
+                // A vfork parent is released by the child's successful
+                // execve (or by _exit), not only after the child becomes a
+                // zombie.  Wait on the child queue so the predicate also
+                // closes the race where exec completes before sleeping.
+                new_process
                     .wait_exit_queue
                     .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
-                        new_process.is_zombie()
+                        new_process.vfork_parent_released()
                     });
             }
             Ok(child_pid as isize)
@@ -1681,6 +1703,9 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
             );
         }
         process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
+        // CLONE_VFORK releases its parent after the new image has been
+        // installed, before returning to the new user image.
+        process.release_vfork_parent();
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
         Ok(0)

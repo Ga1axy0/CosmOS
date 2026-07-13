@@ -2733,7 +2733,7 @@ impl Vma {
     ) {
         if let Some(page) = self.direct_cache_pages.remove(&vpn) {
             let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
-            debug!(
+            trace!(
                 "[munmap] defer file cache mapping release: vpn={:#x} shared={}",
                 vpn.0, shared_file_mapping
             );
