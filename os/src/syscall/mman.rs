@@ -123,6 +123,7 @@ pub fn sys_mmap(
     fd: usize,
     offset: usize,
 ) -> isize {
+    let _probe = crate::probe_scope!("syscall.mmap");
     trace!(
         "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()

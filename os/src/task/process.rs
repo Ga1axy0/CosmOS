@@ -1851,6 +1851,7 @@ impl ProcessControlBlock {
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
         let Some(reclaim) = ({
             let mut inner = self.inner.lock();
+            let _ = inner.memory_set.msync_range(start, end);
             let token = inner.memory_set.token();
             let mask = inner.memory_set.loaded_user_harts();
             inner
@@ -1927,7 +1928,8 @@ impl ProcessControlBlock {
         fault_addr: usize,
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
-        debug!(
+        let _probe = crate::probe_scope!("mmap.handle_file_page_fault");
+        trace!(
             "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
             self.getpid(),
             fault_addr,
@@ -1941,7 +1943,7 @@ impl ProcessControlBlock {
                     .handle_shared_write_fault(VirtAddr::from(fault_addr))
             };
             if notified {
-                debug!(
+                trace!(
                     "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
                     self.getpid(),
                     fault_addr
@@ -1956,7 +1958,7 @@ impl ProcessControlBlock {
                 .prepare_file_page_fault(VirtAddr::from(fault_addr), access)
         };
         let Some(plan) = plan else {
-            debug!(
+            trace!(
                 "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
                 self.getpid(),
                 fault_addr,
@@ -1973,7 +1975,7 @@ impl ProcessControlBlock {
         let page_start = plan.page_idx as usize * PAGE_SIZE;
         let file_size = mapping.size();
         if page_start >= file_size {
-            debug!(
+            trace!(
                 "[mmap] file-backed fault beyond EOF: pid={} vpn={:#x} page_idx={} page_start={:#x} file_size={:#x}",
                 self.getpid(),
                 plan.vpn.0,
@@ -1983,7 +1985,7 @@ impl ProcessControlBlock {
             );
             return Err(MmError::BeyondFileEnd);
         };
-        debug!(
+        trace!(
             "[mmap] page fault lazy load: pid={} vpn={:#x} page_idx={} shared={} path={:?}",
             self.getpid(),
             plan.vpn.0,
@@ -1992,6 +1994,9 @@ impl ProcessControlBlock {
             plan.file.path()
         );
         let page = mapping.try_get_page(plan.page_idx)?;
+        if access == PageFaultAccess::Exec {
+            mapping.readahead_exec(plan.page_idx);
+        }
         let mut inner = self.inner.lock();
         // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
         // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。
@@ -2000,7 +2005,7 @@ impl ProcessControlBlock {
         } else {
             inner.memory_set.map_private_file_page(&plan, page)
         }?;
-        debug!(
+        trace!(
             "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
             self.getpid(),
             plan.vpn.0,

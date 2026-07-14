@@ -1,4 +1,3 @@
-use super::BlockDevice;
 use crate::hal::hartid;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueue, WaitReason};
@@ -7,7 +6,7 @@ use core::fmt::Write;
 use core::hint::spin_loop;
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use fs::BlockWrite;
+use fs::{BlockDevice, BlockRead, BlockWrite};
 use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk},
     transport::SomeTransport,
@@ -36,9 +35,18 @@ static WRITE_OPS: AtomicUsize = AtomicUsize::new(0);
 static WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static WAIT_POLLS: AtomicUsize = AtomicUsize::new(0);
 static TASK_WAITS: AtomicUsize = AtomicUsize::new(0);
+static TASK_WAIT_NS: AtomicUsize = AtomicUsize::new(0);
 static COMPLETE_RECHECK_MISSES: AtomicUsize = AtomicUsize::new(0);
 static COMPLETE_WRONG_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static IRQ_EMPTY_ISR_WITH_USED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READ_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READ_MANY_REQS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READ_MANY_MAX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READ_MANY_QUEUE_FULL_WAITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITE_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -49,9 +57,11 @@ static WRITE_MANY_MAX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_MANY_QUEUE_FULL_WAITS: AtomicUsize = AtomicUsize::new(0);
 
 const VIRTIO_BLK_QUEUE_SIZE: usize = 16;
+const VIRTIO_BLK_READ_DESCS: usize = 3;
 const VIRTIO_BLK_WRITE_DESCS: usize = 3;
+const MAX_READ_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_READ_DESCS;
 const MAX_WRITE_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_WRITE_DESCS;
-const ADAPTIVE_COMPLETION_SPINS: usize = 32;
+const ADAPTIVE_COMPLETION_SPINS: usize = 8;
 const STALL_WARN_AFTER_NS: usize = 500_000_000;
 const STALL_WARN_INTERVAL_NS: usize = 1_000_000_000;
 
@@ -148,6 +158,7 @@ impl BlockDevice for VirtIOBlock {
 
     /// Read contiguous blocks from the virtio_blk device.
     fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
+        let _probe = crate::probe_scope!("virtio.read_blocks");
         assert!(buf.len() % ::fs::BLOCK_SZ == 0);
         #[cfg(feature = "io_perf_counters")]
         {
@@ -180,6 +191,103 @@ impl BlockDevice for VirtIOBlock {
             );
         }
     }
+
+    /// Read multiple independent contiguous ranges with several requests in
+    /// flight. The method remains synchronous to callers, but submission is
+    /// decoupled from completion so fragmented ext4 reads can use the queue.
+    fn read_blocks_many(&self, reads: &mut [BlockRead<'_>]) {
+        let _probe = crate::probe_scope!("virtio.read_blocks_many");
+        let total_reqs = reads.iter().filter(|read| !read.data.is_empty()).count();
+        if total_reqs == 0 {
+            return;
+        }
+        if total_reqs == 1 {
+            if let Some(read) = reads.iter_mut().find(|read| !read.data.is_empty()) {
+                self.read_blocks(read.start_block, read.data);
+            }
+            return;
+        }
+        let _multi_probe = crate::probe_scope!("virtio.read_multi_batch");
+        #[cfg(feature = "io_perf_counters")]
+        {
+            READ_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
+            READ_MANY_REQS.fetch_add(total_reqs, Ordering::Relaxed);
+        }
+
+        let mut next = 0usize;
+        let mut in_flight: Vec<Arc<RequestState>> = Vec::new();
+        while next < reads.len() || !in_flight.is_empty() {
+            while next < reads.len() && in_flight.len() < MAX_READ_IN_FLIGHT {
+                let read = &mut reads[next];
+                next += 1;
+                if read.data.is_empty() {
+                    continue;
+                }
+                assert!(read.data.len() % ::fs::BLOCK_SZ == 0);
+                #[cfg(feature = "io_perf_counters")]
+                {
+                    READ_OPS.fetch_add(1, Ordering::Relaxed);
+                    READ_BYTES.fetch_add(read.data.len(), Ordering::Relaxed);
+                }
+                match self.submit_read_request(read.start_block, read.data) {
+                    Ok(request) => {
+                        in_flight.push(request);
+                        update_max_read_in_flight(in_flight.len());
+                    }
+                    Err(VirtIoError::QueueFull) => {
+                        #[cfg(feature = "io_perf_counters")]
+                        {
+                            READ_MANY_QUEUE_FULL_WAITS.fetch_add(1, Ordering::Relaxed);
+                            READ_OPS.fetch_sub(1, Ordering::Relaxed);
+                            READ_BYTES.fetch_sub(read.data.len(), Ordering::Relaxed);
+                        }
+                        next -= 1;
+                        break;
+                    }
+                    Err(err) => {
+                        let capacity = self.inner.lock().capacity();
+                        panic!(
+                            "Error when submitting VirtIOBlk batched read: block_id={} buf_len={} capacity={} err={:?}",
+                            read.start_block,
+                            read.data.len(),
+                            capacity,
+                            err
+                        )
+                    }
+                }
+            }
+
+            if !in_flight.is_empty() {
+                self.pump_completions();
+                let mut idx = 0;
+                while idx < in_flight.len() {
+                    if !in_flight[idx].done() {
+                        idx += 1;
+                        continue;
+                    }
+                    let request = in_flight.swap_remove(idx);
+                    if request.status() != RespStatus::OK {
+                        let data = request.inner.lock();
+                        let capacity = self.inner.lock().capacity();
+                        panic!(
+                            "VirtIOBlk batched read response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
+                            data.block_id,
+                            data.token,
+                            data.kind.len(),
+                            capacity,
+                            data.resp.status()
+                        );
+                    }
+                }
+                if !in_flight.is_empty() {
+                    self.wait_for_batch_progress(&in_flight);
+                }
+            } else if next < reads.len() {
+                self.wait_for_device_progress();
+            }
+        }
+    }
+
     /// Write a block to the virtio_blk device
     fn write_block(&self, block_id: usize, buf: &[u8]) {
         self.write_blocks(block_id, buf);
@@ -187,6 +295,7 @@ impl BlockDevice for VirtIOBlock {
 
     /// Write contiguous blocks to the virtio_blk device.
     fn write_blocks(&self, block_id: usize, buf: &[u8]) {
+        let _probe = crate::probe_scope!("virtio.write_blocks");
         assert!(buf.len() % ::fs::BLOCK_SZ == 0);
         #[cfg(feature = "io_perf_counters")]
         {
@@ -222,6 +331,7 @@ impl BlockDevice for VirtIOBlock {
 
     /// Write multiple independent contiguous ranges with several requests in flight.
     fn write_blocks_many(&self, writes: &[BlockWrite<'_>]) {
+        let _probe = crate::probe_scope!("virtio.write_blocks_many");
         let total_reqs = writes.iter().filter(|write| !write.data.is_empty()).count();
         if total_reqs == 0 {
             return;
@@ -232,6 +342,7 @@ impl BlockDevice for VirtIOBlock {
             }
             return;
         }
+        let _multi_probe = crate::probe_scope!("virtio.write_multi_batch");
         #[cfg(feature = "io_perf_counters")]
         {
             WRITE_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -330,6 +441,7 @@ impl VirtIOBlock {
         block_id: usize,
         buf: &mut [u8],
     ) -> Result<Arc<RequestState>, VirtIoError> {
+        let _probe = crate::probe_scope!("virtio.submit_read_request");
         let request = RequestState::new_read(block_id, buf);
         let mut device = self.inner.lock();
         let mut data = request.inner.lock();
@@ -356,6 +468,7 @@ impl VirtIOBlock {
         block_id: usize,
         buf: &[u8],
     ) -> Result<Arc<RequestState>, VirtIoError> {
+        let _probe = crate::probe_scope!("virtio.submit_write_request");
         let request = RequestState::new_write(block_id, buf);
         let mut device = self.inner.lock();
         let mut data = request.inner.lock();
@@ -378,6 +491,7 @@ impl VirtIOBlock {
     }
 
     fn wait_request(&self, request: &Arc<RequestState>) {
+        let _probe = crate::probe_scope!("virtio.wait_request");
         loop {
             self.pump_completions();
             if request.done() {
@@ -393,9 +507,12 @@ impl VirtIOBlock {
                     continue;
                 }
                 super::wake_worker();
+                let wait_start = now_ns();
                 request
                     .wait_queue
                     .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || request.done());
+                TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+                TASK_WAIT_NS.fetch_add(now_ns().saturating_sub(wait_start), Ordering::Relaxed);
                 continue;
             }
 
@@ -406,6 +523,7 @@ impl VirtIOBlock {
     }
 
     fn wait_for_batch_progress(&self, in_flight: &[Arc<RequestState>]) {
+        let _probe = crate::probe_scope!("virtio.wait_for_batch_progress");
         loop {
             self.pump_completions();
             if in_flight.iter().any(|request| request.done()) {
@@ -421,10 +539,13 @@ impl VirtIOBlock {
                     continue;
                 }
                 super::wake_worker();
+                let wait_start = now_ns();
                 self.batch_wait_queue
                     .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
                         in_flight.iter().any(|request| request.done())
                     });
+                TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+                TASK_WAIT_NS.fetch_add(now_ns().saturating_sub(wait_start), Ordering::Relaxed);
                 continue;
             }
 
@@ -435,15 +556,19 @@ impl VirtIOBlock {
     }
 
     fn wait_for_device_progress(&self) {
+        let _probe = crate::probe_scope!("virtio.wait_for_device_progress");
         if current_task().is_some() && crate::hal::local_irqs_enabled() {
             if self.adaptive_pump_until(|| self.has_used_completions()) {
                 return;
             }
             super::wake_worker();
+            let wait_start = now_ns();
             self.batch_wait_queue
                 .wait_with_reason_or_skip(WaitReason::BlockDeviceIo, || {
                     self.has_used_completions() || !self.has_pending_requests()
                 });
+            TASK_WAITS.fetch_add(1, Ordering::Relaxed);
+            TASK_WAIT_NS.fetch_add(now_ns().saturating_sub(wait_start), Ordering::Relaxed);
             return;
         }
 
@@ -783,11 +908,16 @@ pub fn reset_perf_counters() {
     WRITE_BYTES.store(0, Ordering::Relaxed);
     WAIT_POLLS.store(0, Ordering::Relaxed);
     TASK_WAITS.store(0, Ordering::Relaxed);
+    TASK_WAIT_NS.store(0, Ordering::Relaxed);
     COMPLETE_RECHECK_MISSES.store(0, Ordering::Relaxed);
     COMPLETE_WRONG_TOKENS.store(0, Ordering::Relaxed);
     IRQ_EMPTY_ISR_WITH_USED.store(0, Ordering::Relaxed);
     #[cfg(feature = "io_perf_counters")]
     {
+        READ_MANY_CALLS.store(0, Ordering::Relaxed);
+        READ_MANY_REQS.store(0, Ordering::Relaxed);
+        READ_MANY_MAX_INFLIGHT.store(0, Ordering::Relaxed);
+        READ_MANY_QUEUE_FULL_WAITS.store(0, Ordering::Relaxed);
         WRITE_MANY_CALLS.store(0, Ordering::Relaxed);
         WRITE_MANY_REQS.store(0, Ordering::Relaxed);
         WRITE_MANY_MAX_INFLIGHT.store(0, Ordering::Relaxed);
@@ -804,6 +934,22 @@ pub fn render_perf_counters() -> String {
     let _ = writeln!(&mut out, "  write_bytes {}", load(&WRITE_BYTES));
     let _ = writeln!(&mut out, "  wait_polls {}", load(&WAIT_POLLS));
     let _ = writeln!(&mut out, "  task_waits {}", load(&TASK_WAITS));
+    let _ = writeln!(&mut out, "  task_wait_ns {}", load(&TASK_WAIT_NS));
+    #[cfg(feature = "io_perf_counters")]
+    {
+        let _ = writeln!(&mut out, "  read_many_calls {}", load(&READ_MANY_CALLS));
+        let _ = writeln!(&mut out, "  read_many_reqs {}", load(&READ_MANY_REQS));
+        let _ = writeln!(
+            &mut out,
+            "  read_many_max_inflight {}",
+            load(&READ_MANY_MAX_INFLIGHT)
+        );
+        let _ = writeln!(
+            &mut out,
+            "  read_many_queue_full_waits {}",
+            load(&READ_MANY_QUEUE_FULL_WAITS)
+        );
+    }
     let _ = writeln!(
         &mut out,
         "  complete_recheck_misses {}",
@@ -836,6 +982,14 @@ pub fn render_perf_counters() -> String {
     }
     out
 }
+
+#[cfg(feature = "io_perf_counters")]
+fn update_max_read_in_flight(value: usize) {
+    READ_MANY_MAX_INFLIGHT.fetch_max(value, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+fn update_max_read_in_flight(_value: usize) {}
 
 #[cfg(feature = "io_perf_counters")]
 fn update_max_write_in_flight(value: usize) {

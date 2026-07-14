@@ -233,8 +233,9 @@ pub fn trap_handler() -> ! {
             cx.in_syscall = true;
         }
         TrapCause::StorePageFault => {
+            let _probe = crate::probe_scope!("trap.user_page_fault.store");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
-            debug!(
+            trace!(
                 "[mmap] trap store page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
                 current_trap_cx().user_pc()
@@ -311,6 +312,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::LoadPageFault => {
+            let _probe = crate::probe_scope!("trap.user_page_fault.load");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // debug!(
             //     "[mmap] trap load page fault: bad_addr={:#x} sepc={:#x}",
@@ -357,8 +359,9 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::InstructionPageFault => {
+            let _probe = crate::probe_scope!("trap.user_page_fault.exec");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
-            debug!(
+            trace!(
                 "[mmap] trap instruction page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
                 current_trap_cx().user_pc()

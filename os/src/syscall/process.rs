@@ -11,8 +11,8 @@ use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{
-        canonicalize, open_file, open_file_at, AccessMode, File, FileDescription, FileStatusFlags,
-        OSInode, OpenFlags, Stat, StatMode,
+        canonicalize, discard_inode, open_file, open_file_at, AccessMode, File, FileDescription,
+        FileStatusFlags, sync_page_cache_all, OSInode, OpenFlags, Stat, StatMode,
     },
     hal::hartid,
     ipc::{self, IPC_RMID},
@@ -169,8 +169,30 @@ fn resolve_exec_image(
         return Err(ERRNO::EISDIR);
     }
 
+    // A freshly linked program may have been produced through a shared mmap
+    // (for example by lld).  The writer and this exec path can use different
+    // inode handles, so looking up only this inode's mapping is not enough to
+    // establish coherency.  Flush dirty page-cache mappings before probing
+    // the executable; otherwise execve can briefly see the old zero-filled
+    // file even though the linker has already completed successfully.
+    sync_page_cache_all()?;
+
     // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
-    let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    let (mut first_line, mut first_line_complete) =
+        inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    if !is_elf_image(&first_line) {
+        // The linker may have completed a file through a mapping that was
+        // subsequently flushed, while this inode still has an older clean
+        // first page in the cache.  ENOEXEC would make the shell interpret a
+        // perfectly valid ELF as a script.  Once the first probe is not an
+        // ELF, discard this inode's clean cache and retry from the backing
+        // filesystem; the sync above has already made dirty pages durable.
+        if let Some(backing_inode) = inode.backing_inode() {
+            discard_inode(&backing_inode);
+            (first_line, first_line_complete) =
+                inode.read_first_line_limited(EXEC_PROBE_SIZE);
+        }
+    }
     debug!(
         "First line of exec target: {:?}, complete={}",
         core::str::from_utf8(&first_line).unwrap_or("<invalid utf-8>"),
@@ -1618,6 +1640,7 @@ pub fn sys_unshare(flags: usize) -> isize {
 }
 /// sys_execve
 pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
+    let _probe = crate::probe_scope!("syscall.execve");
     trace!(
         "kernel:pid[{}] sys_execve",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -1730,6 +1753,7 @@ const WAIT_RECOGNIZED: isize = WNOHANG | WUNTRACED | WCONTINUED | WNOWAIT | W_IN
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
 pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize {
+    let _probe = crate::probe_scope!("syscall.wait4");
     trace!("kernel: sys_wait4");
     let process = current_process();
     syscall_body!({

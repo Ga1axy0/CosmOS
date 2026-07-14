@@ -1377,6 +1377,10 @@ impl MemorySet {
 
     /// 拆除全部用户 VMA，并把旧页对象放入延迟释放批次。
     pub(crate) fn recycle_data_pages_deferred(&mut self) -> UserReleaseBatch {
+        // Process exit and exec bypass the syscall-level munmap path.  Flush
+        // shared file mappings here as well so mmap writers do not lose their
+        // output merely because the process exits or replaces its image.
+        let _ = self.msync_range(VirtAddr::from(0), VirtAddr::from(USER_SPACE_END));
         let mut batch = UserReleaseBatch::new();
         for area in self.vmas.values_mut() {
             area.teardown_user_deferred(&mut self.page_table, &mut batch);
@@ -1978,6 +1982,24 @@ impl MemorySet {
             let page_count = overlap_end.0 - overlap_start.0;
             let file_offset = (file.pgoff + start_idx) * PAGE_SIZE;
             let byte_len = page_count * PAGE_SIZE;
+
+            // A writable MAP_SHARED page normally becomes dirty on its first
+            // write-protection fault.  A file writer can, however, receive a
+            // writable PTE through a prior read/population fault and then
+            // modify it without another trap.  At teardown there is no later
+            // fault to repair the missed notification.  All pages that are
+            // actually present in a writable shared mapping are therefore
+            // conservatively flushed here.  Pages that were never faulted in
+            // are absent and are not touched.
+            if file.shared && area.map_perm.contains(MapPermission::W) {
+                for page in area
+                    .direct_cache_pages
+                    .range(overlap_start..overlap_end)
+                    .map(|(_, page)| page)
+                {
+                    mark_cached_page_dirty(page);
+                }
+            }
             sync_inode_range(&inode, file_offset, byte_len)?;
         }
 
@@ -2015,7 +2037,7 @@ impl MemorySet {
         unsafe {
             crate::hal::flush_tlb();
         }
-        debug!(
+        trace!(
             "[cow] install MAP_PRIVATE readonly cache page: vpn={:#x} page_idx={} ppn={:#x} access={:?} path={:?}",
             plan.vpn.0,
             plan.page_idx,
@@ -2127,7 +2149,7 @@ impl MemorySet {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
             self.finish_deferred_page_table_edit();
-            debug!(
+            trace!(
                 "[cow] materialize MAP_PRIVATE page on write fault: vpn={:#x} cache_ppn={:#x} new_ppn={:#x} path={:?}",
                 vpn.0,
                 cache_page.lock().ppn().0,
@@ -2174,7 +2196,7 @@ impl MemorySet {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
             self.finish_deferred_page_table_edit();
-            debug!(
+            trace!(
                 "[cow] reuse exclusive private page: vpn={:#x} ppn={:#x} path={:?}",
                 vpn.0,
                 page.ppn().0,
@@ -2200,7 +2222,7 @@ impl MemorySet {
             return Ok((PageFaultHandled::NotHandled, None));
         }
         self.finish_deferred_page_table_edit();
-        debug!(
+        trace!(
             "[cow] copy private page on write fault: vpn={:#x} old_ppn={:#x} new_ppn={:#x} path={:?}",
             vpn.0,
             page.ppn().0,
@@ -2240,7 +2262,7 @@ impl MemorySet {
         unsafe {
             crate::hal::flush_tlb();
         }
-        debug!(
+        trace!(
             "[cow] materialize MAP_PRIVATE page on first write fault: vpn={:#x} page_idx={} dst_ppn={:#x} path={:?}",
             plan.vpn.0,
             plan.page_idx,

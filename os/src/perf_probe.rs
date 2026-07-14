@@ -178,6 +178,27 @@ mod enabled {
 #[cfg(feature = "perf_probe")]
 pub(crate) use enabled::{enabled, render, reset, scope_registered, set_enabled};
 
+/// Start a named timing scope without wrapping the measured code in another
+/// block.  The returned guard records the elapsed time when it is dropped.
+///
+/// Keeping this as a macro gives every call site its own cached probe slot,
+/// while the disabled configuration reduces to a zero-sized unit value.
+#[macro_export]
+macro_rules! probe_scope {
+    ($name:expr) => {{
+        #[cfg(feature = "perf_probe")]
+        {
+            static PROBE_SLOT: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            $crate::perf_probe::scope_registered(&PROBE_SLOT, $name)
+        }
+        #[cfg(not(feature = "perf_probe"))]
+        {
+            ()
+        }
+    }};
+}
+
 /// Measure the elapsed time of a block under a registered probe name.
 ///
 /// ```ignore

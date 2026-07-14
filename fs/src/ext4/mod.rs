@@ -9,9 +9,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use log::{debug, info};
 
 use crate::block_cache::{
-    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges, read_block_cache_range,
+    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges,
+    read_block_cache_range, read_block_cache_ranges,
 };
-use crate::block_dev::{BlockDevice as OsBlockDevice, BlockWrite as OsBlockWrite};
+use crate::block_dev::{
+    BlockDevice as OsBlockDevice, BlockRead as OsBlockRead, BlockWrite as OsBlockWrite,
+};
 use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
 use crate::sleep_mutex::SleepMutex as Mutex;
@@ -108,6 +111,81 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         let mut out = vec![0u8; len];
         out.copy_from_slice(&aligned[src_start..src_start + len]);
         out
+    }
+
+    fn read_offset_uncached(&self, offset: usize) -> Vec<u8> {
+        let len = ext4_rs::BLOCK_SIZE;
+        let start_block = offset / BLOCK_SZ;
+        let end_block = (offset + len).div_ceil(BLOCK_SZ);
+        let aligned_offset = start_block * BLOCK_SZ;
+        let aligned_len = (end_block - start_block) * BLOCK_SZ;
+        let mut aligned = vec![0u8; aligned_len];
+        self.inner.read_blocks(start_block, &mut aligned);
+
+        let src_start = offset - aligned_offset;
+        if src_start == 0 && aligned_len == len {
+            return aligned;
+        }
+        let mut out = vec![0u8; len];
+        out.copy_from_slice(&aligned[src_start..src_start + len]);
+        out
+    }
+
+    fn read_offsets(&self, offsets: &[usize], data: &mut [u8]) {
+        assert_eq!(data.len(), offsets.len() * ext4_rs::BLOCK_SIZE);
+        let mut pending: Vec<OsBlockRead<'_>> = Vec::new();
+        let mut run_start = 0;
+        let mut data_rest = data;
+        while run_start < offsets.len() {
+            let mut run_end = run_start + 1;
+            while run_end < offsets.len()
+                && offsets[run_end] == offsets[run_end - 1] + ext4_rs::BLOCK_SIZE
+            {
+                run_end += 1;
+            }
+            let run_len = (run_end - run_start) * ext4_rs::BLOCK_SIZE;
+            let (run_data, rest) = data_rest.split_at_mut(run_len);
+            let start_block = offsets[run_start] / BLOCK_SZ;
+            pending.push(OsBlockRead {
+                start_block,
+                data: run_data,
+            });
+            data_rest = rest;
+            run_start = run_end;
+        }
+        read_block_cache_ranges(Arc::clone(&self.inner), &mut pending);
+    }
+
+    fn read_offsets_uncached(&self, offsets: &[usize], data: &mut [u8]) {
+        assert_eq!(data.len(), offsets.len() * ext4_rs::BLOCK_SIZE);
+        if offsets.is_empty() {
+            return;
+        }
+
+        // Merge physically contiguous filesystem blocks into larger direct
+        // block-device requests.  The block cache is deliberately not
+        // touched by this path.
+        let mut pending: Vec<OsBlockRead<'_>> = Vec::new();
+        let mut run_start = 0;
+        let mut data_rest = data;
+        while run_start < offsets.len() {
+            let mut run_end = run_start + 1;
+            while run_end < offsets.len()
+                && offsets[run_end] == offsets[run_end - 1] + ext4_rs::BLOCK_SIZE
+            {
+                run_end += 1;
+            }
+            let run_len = (run_end - run_start) * ext4_rs::BLOCK_SIZE;
+            let (run_data, rest) = data_rest.split_at_mut(run_len);
+            assert_eq!(offsets[run_start] % BLOCK_SZ, 0);
+            pending.push(OsBlockRead {
+                start_block: offsets[run_start] / BLOCK_SZ,
+                data: run_data,
+            });
+            data_rest = rest;
+            run_start = run_end;
+        }
+        self.inner.read_blocks_many(&mut pending);
     }
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
@@ -869,6 +947,11 @@ impl VfsNode for Ext4Inode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let ext4 = self.fs.ext4.lock();
         ext4.read_at(self.inode_num, offset, buf).unwrap_or(0)
+    }
+
+    fn read_at_page_cache(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let ext4 = self.fs.ext4.lock();
+        ext4.read_at_uncached(self.inode_num, offset, buf).unwrap_or(0)
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {

@@ -1,6 +1,7 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::cmp::{max, min};
@@ -42,8 +43,21 @@ static WRITEBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
 static WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITEBACK_BATCH_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
+/// Number of file pages to read ahead after an executable page fault.
+///
+/// Rust's compiler binaries and shared libraries are large and mostly
+/// read-only.  Loading one 4 KiB page per instruction fault makes every cold
+/// page pay a separate filesystem/block-cache path.  The pages remain in the
+/// normal reclaimable cache; this only batches the backing-file read.
+const EXEC_READAHEAD_PAGES: usize = 8;
 
 bitflags! {
     /// 单个缓存页的状态位。
@@ -190,6 +204,40 @@ impl PageMappingHandle {
     /// 获取指定文件页号对应的缓存页，必要时装入；OOM 时返回 `MmError`。
     pub fn try_get_page(&self, page_idx: u64) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
         get_or_load_page(&self.inner, page_idx)
+    }
+
+    /// Best-effort read-ahead for executable file mappings.
+    pub fn readahead_exec(&self, page_idx: u64) {
+        // Rust/LLVM code has many non-local jumps.  Only prefetch after an
+        // already cached predecessor, which is a cheap indication that the
+        // current fault belongs to a forward sequential run; this avoids
+        // turning random instruction faults into speculative reads.
+        #[cfg(feature = "io_perf_counters")]
+        READAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+        let previous_page = if page_idx > 0 {
+            self.inner.lock().pages.get(&(page_idx - 1)).cloned()
+        } else {
+            None
+        };
+        let sequential = previous_page
+            .is_some_and(|page| page.lock().state.contains(CachePageState::UPTODATE));
+        if !sequential {
+            return;
+        }
+        let file_size = self.inner.lock().size;
+        let last_page = file_size
+            .saturating_add(PAGE_SIZE - 1)
+            .checked_div(PAGE_SIZE)
+            .unwrap_or(0)
+            .saturating_sub(1) as u64;
+        if page_idx >= last_page {
+            return;
+        }
+        let count = min(
+            EXEC_READAHEAD_PAGES,
+            (last_page - page_idx) as usize,
+        );
+        readahead_pages(&self.inner, page_idx, count);
     }
 }
 
@@ -498,6 +546,9 @@ pub fn reset_perf_counters() {
     WRITEBACK_BYTES.store(0, Ordering::Relaxed);
     WRITEBACK_BATCHES.store(0, Ordering::Relaxed);
     WRITEBACK_BATCH_PAGES.store(0, Ordering::Relaxed);
+    READAHEAD_CALLS.store(0, Ordering::Relaxed);
+    READAHEAD_PAGES.store(0, Ordering::Relaxed);
+    READAHEAD_BYTES.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
@@ -554,6 +605,9 @@ pub fn render_perf_counters() -> String {
         "  writeback_batch_pages {}",
         perf_load(&WRITEBACK_BATCH_PAGES)
     );
+    let _ = writeln!(&mut out, "  readahead_calls {}", perf_load(&READAHEAD_CALLS));
+    let _ = writeln!(&mut out, "  readahead_pages {}", perf_load(&READAHEAD_PAGES));
+    let _ = writeln!(&mut out, "  readahead_bytes {}", perf_load(&READAHEAD_BYTES));
     out
 }
 
@@ -679,6 +733,7 @@ fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> 
 
 /// 读取单个 mapping 中指定范围的数据。
 fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &mut [u8]) -> usize {
+    let _probe = crate::probe_scope!("page_cache.read_mapping");
     if buf.is_empty() {
         return 0;
     }
@@ -1049,6 +1104,7 @@ fn ensure_page_uptodate(
     page: &Arc<SpinNoIrqLock<CachePage>>,
     page_idx: u64,
 ) {
+    let _probe = crate::probe_scope!("page_cache.ensure_page_uptodate");
     loop {
         let (wait_queue, loader_ppn) = {
             let mut page_guard = page.lock();
@@ -1100,7 +1156,10 @@ fn ensure_page_uptodate(
                 valid_bytes
             );
             // TODO：后续接入通用 truncate 后，需要避免装页与截断并发时把旧数据重新提交回 cache。
-            let read = inode.read_at(page_start_off, &mut bytes[..valid_bytes]);
+            let read = crate::probe!(
+                { inode.read_at_page_cache(page_start_off, &mut bytes[..valid_bytes]) },
+                "page_cache.inode_read_at"
+            );
             #[cfg(feature = "io_perf_counters")]
             READ_PAGE_LOADS.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "io_perf_counters")]
@@ -1118,6 +1177,123 @@ fn ensure_page_uptodate(
         };
         wait_queue.wake_all();
         return;
+    }
+}
+
+/// Load a short contiguous window of not-yet-cached pages with one backing
+/// inode read per contiguous run.  This is deliberately best-effort: a page
+/// already being loaded by another task is skipped and a failed allocation or
+/// short read does not affect the faulting page that triggered the prefetch.
+fn readahead_pages(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    page_idx: u64,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    let Some(inode) = mapping.lock().inode.upgrade() else {
+        return;
+    };
+
+    let mut candidates = Vec::new();
+    for next_idx in page_idx.saturating_add(1)..=page_idx.saturating_add(count as u64) {
+        let Ok(page) = get_or_create_page(mapping, next_idx) else {
+            break;
+        };
+        let should_load = {
+            let mut page_guard = page.lock();
+            if page_guard
+                .state
+                .intersects(CachePageState::UPTODATE | CachePageState::LOADING)
+            {
+                false
+            } else {
+                page_guard.state.insert(CachePageState::LOADING);
+                page_guard.pin_count += 1;
+                true
+            }
+        };
+        if should_load {
+            candidates.push((next_idx, page));
+        }
+    }
+
+    let mut run_start = 0;
+    while run_start < candidates.len() {
+        let mut run_end = run_start + 1;
+        while run_end < candidates.len()
+            && candidates[run_end].0 == candidates[run_end - 1].0.saturating_add(1)
+        {
+            run_end += 1;
+        }
+        load_readahead_run(mapping, &inode, &candidates[run_start..run_end]);
+        run_start = run_end;
+    }
+}
+
+fn load_readahead_run(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    inode: &Arc<Inode>,
+    pages: &[(u64, Arc<SpinNoIrqLock<CachePage>>)],
+) {
+    let _probe = crate::probe_scope!("page_cache.load_readahead_run");
+    let Some(&(first_idx, _)) = pages.first() else {
+        return;
+    };
+    let last_idx = pages.last().unwrap().0;
+    let file_size = mapping.lock().size;
+    let start_offset = page_start(first_idx);
+    let end_offset = min(file_size, page_start(last_idx).saturating_add(PAGE_SIZE));
+    if end_offset <= start_offset {
+        finish_readahead_pages(pages, file_size, 0, &[]);
+        return;
+    }
+
+    let read_len = end_offset - start_offset;
+    let mut buffer = vec![0u8; read_len];
+    let read = crate::probe!(
+        { inode.read_at_page_cache(start_offset, &mut buffer) },
+        "page_cache.inode_read_at"
+    );
+    #[cfg(feature = "io_perf_counters")]
+    {
+        READAHEAD_PAGES.fetch_add(pages.len(), Ordering::Relaxed);
+        READAHEAD_BYTES.fetch_add(read, Ordering::Relaxed);
+    }
+    finish_readahead_pages(pages, file_size, read, &buffer);
+}
+
+fn finish_readahead_pages(
+    pages: &[(u64, Arc<SpinNoIrqLock<CachePage>>)],
+    file_size: usize,
+    read: usize,
+    buffer: &[u8],
+) {
+    let first_idx = pages.first().map(|entry| entry.0).unwrap_or(0);
+    for (page_idx, page) in pages {
+        let page_offset = (*page_idx - first_idx) as usize * PAGE_SIZE;
+        let expected = page_valid_bytes_for_size(file_size, *page_idx);
+        let copy_len = read
+            .saturating_sub(page_offset)
+            .min(expected)
+            .min(buffer.len().saturating_sub(page_offset));
+        let mut page_guard = page.lock();
+        if copy_len > 0 {
+            page_guard.ppn().get_bytes_array()[..copy_len]
+                .copy_from_slice(&buffer[page_offset..page_offset + copy_len]);
+        }
+        page_guard.valid_bytes = copy_len;
+        page_guard.state.remove(CachePageState::LOADING);
+        if copy_len == expected {
+            page_guard.state.insert(CachePageState::UPTODATE);
+        } else {
+            // Read-ahead is speculative.  Keep a short read retryable rather
+            // than exposing an incomplete page as valid executable data.
+            page_guard.state.remove(CachePageState::UPTODATE);
+        }
+        page_guard.pin_count = page_guard.pin_count.saturating_sub(1);
+        page_guard.wait_queue.wake_all();
     }
 }
 

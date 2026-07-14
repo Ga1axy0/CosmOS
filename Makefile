@@ -11,7 +11,7 @@ KERNEL_RV_ELF := os/target/$(TARGET)/release/os
 KERNEL_LA_ELF := os/target/loongarch64-unknown-none/release/os
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
-MEM ?= 1G
+MEM ?= 2G
 SMP ?= 1
 TEST_FS ?= sdcard-$(RUN_ARCH).img
 # 本地调试可设为 1，保留评测测试盘镜像。
@@ -49,11 +49,10 @@ ROOTFS_LA_BUILD_DIR := $(ROOTFS_REPO)/build/la
 ROOTFS_RV_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-rv
 ROOTFS_LA_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-la
 ROOTFS_RV_INIT_STAMP := $(ROOTFS_RV_STAMP_DIR)/.rootfs-init.stamp
+ROOTFS_RV_CARGO_STAMP := $(ROOTFS_RV_STAMP_DIR)/.cargo-offline.stamp
 ROOTFS_LA_INIT_STAMP := $(ROOTFS_LA_STAMP_DIR)/.rootfs-init.stamp
 ROOTFS_SCRIPT_FILES := $(shell find $(ROOTFS_REPO)/scripts -type f | sort)
 LA_ROOTFS_ARCH_FILES := bin/busybox usr/bin/bash lib/libc.so
-ROOTFS_RV_FILES := $(shell if [ -d $(ROOTFS_RV_DIR) ]; then find $(ROOTFS_RV_DIR) -type f | sort; fi)
-ROOTFS_LA_FILES := $(shell if [ -d $(ROOTFS_LA_DIR) ]; then find $(ROOTFS_LA_DIR) -type f | sort; fi)
 DISK_RV_IMG := disk.img
 DISK_LA_IMG := disk-la.img
 QEMU_LA_BLK_ARGS = -drive file=$(RUN_TEST_FS_LA),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0,id=x0
@@ -61,6 +60,10 @@ QEMU_LA_EXTRA_BLK_ARGS = -drive file=$(DISK_LA_IMG),if=none,format=raw,id=x1 -de
 RV_ROOTFS_TARGET ?= riscv64-linux-musl
 RV_TOOLCHAIN_BIN ?= /opt/riscv64-linux-musl-cross/bin
 RV_GLIBC_LIB ?= /usr/riscv64-linux-gnu/lib
+RV_GLIBC_SYSROOT ?= /usr/riscv64-linux-gnu
+RV_GLIBC_SYSROOT_DIR ?= /opt/riscv64-linux-gnu-sysroot
+RV_GLIBC_HOST_TARGET ?= riscv64gc-unknown-linux-gnu
+RV_GLIBC_HOST_LINKER ?= /usr/bin/riscv64gc-unknown-linux-gnu-ld
 RV_MUSL_LIB ?= /opt/riscv64-linux-musl-cross/riscv64-linux-musl/lib
 RV_MUSL_ARCH ?= riscv64
 RV_MUSL_LOADER_ALIASES ?= ld-musl-riscv64.so.1 ld-musl-riscv64-sf.so.1
@@ -72,7 +75,7 @@ LA_MUSL_ARCH ?= loongarch64
 LA_MUSL_LOADER_ALIASES ?= ld-musl-loongarch64.so.1
 LA_BOOTLOADER_ELF ?= $(LA_BOOTLOADER_DIR)/target/loongarch64-unknown-none/release/loongarch64-direct-boot
 LA_KERNEL_ENTRY_PA ?= 0x90000000
-MEM_LA ?= 1G
+MEM_LA ?= 2G
 QEMU_LA_NETDEV ?= user,id=net0
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
@@ -198,7 +201,7 @@ sync-rootfs-variants:
 		fi; \
 	done
 
-rootfs-rv: $(ROOTFS_RV_INIT_STAMP)
+rootfs-rv: $(ROOTFS_RV_CARGO_STAMP)
 
 rootfs-la: $(ROOTFS_LA_INIT_STAMP)
 
@@ -220,10 +223,23 @@ $(ROOTFS_RV_INIT_STAMP): $(ROOTFS_SCRIPT_FILES)
 		TOOLCHAIN_BIN=$(RV_TOOLCHAIN_BIN) \
 		BUSYBOX_ARCH=riscv \
 		GLIBC_LIB=$(RV_GLIBC_LIB) \
+		RV_GLIBC_SYSROOT=$(RV_GLIBC_SYSROOT) \
+		RV_GLIBC_SYSROOT_DIR=$(RV_GLIBC_SYSROOT_DIR) \
+		RV_GLIBC_HOST_TARGET=$(RV_GLIBC_HOST_TARGET) \
+		RV_GLIBC_HOST_LINKER=$(RV_GLIBC_HOST_LINKER) \
 		MUSL_LIB=$(RV_MUSL_LIB) \
 		MUSL_ARCH=$(RV_MUSL_ARCH) \
 		WITH_RUST=1 \
 		MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)"
+	@touch "$@"
+
+$(ROOTFS_RV_CARGO_STAMP): $(ROOTFS_RV_INIT_STAMP) \
+		$(ROOTFS_BASE_DIR)/root/tgoskits/Cargo.lock \
+		scripts/prepare-rootfs-rv-cargo-offline.sh
+	ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
+	GLIBC_HOST_TARGET="$(RV_GLIBC_HOST_TARGET)" \
+	GLIBC_HOST_LINKER="$(RV_GLIBC_HOST_LINKER)" \
+		bash scripts/prepare-rootfs-rv-cargo-offline.sh
 	@touch "$@"
 
 $(ROOTFS_LA_INIT_STAMP): $(ROOTFS_SCRIPT_FILES)
@@ -349,11 +365,11 @@ check-rootfs-la-arch: force
 		fi; \
 	fi
 
-$(DISK_RV_IMG): $(USER_BUILD_STAMP_RV) $(ROOTFS_RV_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
+$(DISK_RV_IMG): $(USER_BUILD_STAMP_RV) $(ROOTFS_RV_CARGO_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh
 	MUSL_ARCH=$(RV_MUSL_ARCH) MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR_RV) $@
 
 
-$(DISK_LA_IMG): $(USER_BUILD_STAMP_LA) $(ROOTFS_LA_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh | check-rootfs-la-arch
+$(DISK_LA_IMG): $(USER_BUILD_STAMP_LA) $(ROOTFS_LA_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh | check-rootfs-la-arch
 	@for path in $(LA_ROOTFS_ARCH_FILES); do \
 		file -L "$(ROOTFS_LA_DIR)/$$path" | grep -q 'LoongArch' || { \
 			echo "LA rootfs architecture check failed: $(ROOTFS_LA_DIR)/$$path" >&2; \

@@ -255,6 +255,13 @@ pub trait VfsNode: Send + Sync + Any + Debug {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
+    /// Read file payload for the page cache without using a lower-level data
+    /// cache when the backend can provide such a path.  Metadata reads remain
+    /// under the backend's normal cache policy.  Backends without a distinct
+    /// direct path retain the regular read behavior.
+    fn read_at_page_cache(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.read_at(offset, buf)
+    }
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
     /// 向固定偏移写入数据，并保留底层文件系统返回的真实错误。
     fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
@@ -565,6 +572,12 @@ impl Inode {
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         self.inner.read_at(offset, buf)
+    }
+
+    /// Read regular-file data for page-cache population without filling a
+    /// lower-level data cache when the filesystem supports it.
+    pub fn read_at_page_cache(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.inner.read_at_page_cache(offset, buf)
     }
 
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
