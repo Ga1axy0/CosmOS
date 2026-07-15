@@ -319,7 +319,7 @@ lazy_static! {
 }
 
 static LOST_RUNNABLE_SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
-static LOST_RUNNABLE_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOST_RUNNABLE_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LOST_RUNNABLE_REPAIR_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LOST_RUNNABLE_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -490,12 +490,7 @@ pub(crate) fn warn_lost_runnable_tasks(reason: &'static str) {
         .map(|h| {
             let rq = RUN_QUEUES[h].lock();
             runnable_ptrs.extend(rq.runnable_ptrs());
-            (
-                h,
-                rq.rt_nr_running,
-                rq.cfs_nr_running,
-                rq.highest_rt_prio,
-            )
+            (h, rq.rt_nr_running, rq.cfs_nr_running, rq.highest_rt_prio)
         })
         .collect();
 
@@ -538,12 +533,12 @@ pub(crate) fn warn_lost_runnable_tasks(reason: &'static str) {
             // Confirmed lost-runnable orphan: collect it for self-heal below.
             orphans.push(Arc::clone(task));
 
-            let count = LOST_RUNNABLE_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let count = LOST_RUNNABLE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if !should_log_sched_sample(count) {
                 continue;
             }
 
-            warn!(
+            error!(
                 "[sched-inv][lost-runnable] reason={} count={} task={:#x} pid={} \
                  tid={} pgid={} exec={} process_zombie={} wait={:?} last_cpu={} \
                  policy={:?} on_cpu={} on_rq={} has_wq={} task_pending={:#x} \

@@ -36,9 +36,21 @@ use lazy_static::*;
 pub use page_cache::{
     discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats, reclaim_if_needed,
     release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
-    sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PageCacheStats,
-    PAGE_CACHE_MANAGER,
+    sync_fs as sync_page_cache_fs, sync_inode as sync_page_cache_inode, sync_inode_range,
+    truncate_inode, CachePage, PageCacheStats, PAGE_CACHE_MANAGER,
 };
+
+/// Flush all modified entries in the lower-level block cache.
+pub fn sync_block_cache_all() -> Result<(), ERRNO> {
+    fs::block_cache_sync_all();
+    Ok(())
+}
+
+/// Flush both the file page cache and the filesystem block cache.
+pub fn sync_storage_all() -> Result<(), ERRNO> {
+    sync_page_cache_all()?;
+    sync_block_cache_all()
+}
 
 /// Cumulative directory-iteration counters used by `/proc/mm_perf`.
 #[derive(Clone, Copy, Debug, Default)]

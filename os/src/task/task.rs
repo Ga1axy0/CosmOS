@@ -384,10 +384,10 @@ pub enum WaitReason {
     Mutex,
     /// Waiting for a POSIX file lock to become available.
     FileLock,
-    /// Waiting on a Linux futex word.
-    Futex,
-    /// Parent is waiting for child process exit.
-    ProcessWaitExit,
+    /// Waiting on a Linux futex word: `(user_address, expected_value)`.
+    Futex(usize, i32),
+    /// Parent is waiting for a child selected by the wait4/waitpid `pid` argument.
+    ProcessWaitExit(isize),
     /// Waiting for UART RX data.
     UartRx,
     /// Waiting for pipe to become readable.

@@ -21,7 +21,7 @@ HOST_CARGO_HOME="${HOST_CARGO_HOME:-$HOME/.cargo}"
 HOST_RUST_TOOLCHAIN="${HOST_RUST_TOOLCHAIN:-nightly-2026-05-28}"
 PREFETCH_STARRY_TOOLS="${PREFETCH_STARRY_TOOLS:-1}"
 GLIBC_HOST_TARGET="${GLIBC_HOST_TARGET:-riscv64gc-unknown-linux-gnu}"
-GLIBC_HOST_LINKER="${GLIBC_HOST_LINKER:-/usr/bin/riscv64gc-unknown-linux-gnu-ld}"
+GLIBC_HOST_LINKER="${GLIBC_HOST_LINKER:-/usr/bin/riscv64gc-unknown-linux-gnu-gcc}"
 
 HOST_CARGO_ARGS=()
 if [[ -n "$HOST_RUST_TOOLCHAIN" ]]; then
@@ -80,7 +80,15 @@ fi
 for cache_dir in registry git; do
     if [[ -d "$HOST_CARGO_HOME/$cache_dir" ]]; then
         echo "[INFO] copying Cargo $cache_dir cache"
-        cp -a "$HOST_CARGO_HOME/$cache_dir" "$GUEST_CARGO_HOME/"
+        # Git pack files are commonly installed read-only.  A subsequent
+        # rootfs refresh must still be able to replace them when the host
+        # cache has advanced, so make the generated destination writable
+        # before merging the refreshed cache contents.
+        if [[ -d "$GUEST_CARGO_HOME/$cache_dir" ]]; then
+            chmod -R u+w "$GUEST_CARGO_HOME/$cache_dir"
+        fi
+        mkdir -p "$GUEST_CARGO_HOME/$cache_dir"
+        cp -a "$HOST_CARGO_HOME/$cache_dir/." "$GUEST_CARGO_HOME/$cache_dir/"
     fi
 done
 

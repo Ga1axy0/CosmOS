@@ -151,6 +151,15 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         Ok(())
     }
+    /// Ensure that the leaf page-table slot for `vpn` exists.
+    ///
+    /// This is used by virtual-address relocation paths to preflight all
+    /// intermediate page-table allocations before changing the old mapping.
+    pub fn ensure_leaf(&mut self, vpn: VirtPageNum) -> Result<(), MmError> {
+        self.find_pte_create(vpn)?
+            .ok_or(MmError::NoMapping)
+            .map(|_| ())
+    }
     /// Map a permanent kernel page without recording page-table frames in `frames`.
     pub fn map_kernel_untracked(
         &mut self,

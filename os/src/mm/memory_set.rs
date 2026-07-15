@@ -1716,6 +1716,202 @@ impl MemorySet {
         Ok(())
     }
 
+    /// Check whether a range is fully covered by user-accessible VMAs.
+    fn range_is_user_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let Some((_, area)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.contains_vpn(cursor))
+            else {
+                return false;
+            };
+            if !area.is_user_accessible() {
+                return false;
+            }
+            cursor = area.end_vpn().min(end_vpn);
+        }
+        true
+    }
+
+    /// Resize or relocate one complete user VMA.
+    ///
+    /// The syscall layer selects the destination address.  This method keeps
+    /// the VMA metadata, present PTEs, private pages and direct page-cache
+    /// references in sync.  Any pages removed from a fixed destination are
+    /// returned in `UserReleaseBatch` and must only be dropped after the
+    /// caller has completed the address-space shootdown.
+    pub(crate) fn mremap(
+        &mut self,
+        old_start_va: VirtAddr,
+        old_end_va: VirtAddr,
+        new_start_va: VirtAddr,
+        new_end_va: VirtAddr,
+    ) -> Result<(VirtAddr, UserReleaseBatch), MmError> {
+        let old_start_vpn = old_start_va.floor();
+        let old_end_vpn = old_end_va.ceil();
+        let new_start_vpn = new_start_va.floor();
+        let new_end_vpn = new_end_va.ceil();
+
+        if old_start_vpn >= old_end_vpn || new_start_vpn >= new_end_vpn {
+            return Err(MmError::InvalidRange);
+        }
+        if new_start_vpn != old_start_vpn
+            && old_start_vpn < new_end_vpn
+            && new_start_vpn < old_end_vpn
+        {
+            return Err(MmError::InvalidRange);
+        }
+
+        let Some(source) = self.vmas.get(&old_start_vpn) else {
+            return Err(MmError::NoMapping);
+        };
+        if source.start_vpn() != old_start_vpn
+            || source.end_vpn() != old_end_vpn
+            || !source.is_user_accessible()
+            || !source.supports_mremap()
+        {
+            // Keeping the first implementation to one complete mmap VMA
+            // avoids changing heap/stack bookkeeping or merging unrelated
+            // permission/file regions during a relocation.
+            return Err(MmError::InvalidRange);
+        }
+
+        let mut batch = UserReleaseBatch::new();
+
+        if new_start_vpn == old_start_vpn {
+            let mut area = self.vmas.remove(&old_start_vpn).ok_or(MmError::NoMapping)?;
+
+            if new_end_vpn < old_end_vpn {
+                area.shrink_to_deferred(&mut self.page_table, new_end_vpn, &mut batch);
+            } else if new_end_vpn > old_end_vpn {
+                if self.overlaps_vma_range(old_end_vpn, new_end_vpn) {
+                    self.insert_vma_unchecked(area);
+                    return Err(MmError::AddressUnavailable);
+                }
+                if area.should_eager_map() {
+                    for vpn in VPNRange::new(old_end_vpn, new_end_vpn) {
+                        if let Err(err) = self.page_table.ensure_leaf(vpn) {
+                            self.insert_vma_unchecked(area);
+                            return Err(err);
+                        }
+                    }
+                    if let Err(err) = area.append_to_checked(&mut self.page_table, new_end_vpn) {
+                        self.insert_vma_unchecked(area);
+                        return Err(err);
+                    }
+                } else {
+                    area.vpn_range = VPNRange::new(old_start_vpn, new_end_vpn);
+                }
+            }
+
+            self.insert_vma_unchecked(area);
+            self.merge_vma_around(old_start_vpn);
+            self.finish_deferred_page_table_edit();
+            return Ok((new_start_va, batch));
+        }
+
+        if new_end_vpn.0 > USER_SPACE_END / PAGE_SIZE {
+            return Err(MmError::InvalidRange);
+        }
+
+        // MREMAP_FIXED replaces the destination mapping.  The syscall layer
+        // has already rejected source/destination overlap; holes in the
+        // destination are deliberately not treated as a partial replacement
+        // in this first implementation.
+        let destination_occupied = self.overlaps_vma_range(new_start_vpn, new_end_vpn);
+        if destination_occupied && !self.range_is_user_mapped(new_start_vpn, new_end_vpn) {
+            return Err(MmError::AddressUnavailable);
+        }
+
+        // PageTable::map can allocate intermediate tables.  Prepare every
+        // destination leaf first, so a later PTE move cannot fail halfway
+        // through after the old mapping has been modified.
+        for vpn in VPNRange::new(new_start_vpn, new_end_vpn) {
+            self.page_table.ensure_leaf(vpn)?;
+        }
+
+        // Shared anonymous mappings are eagerly populated in this kernel.
+        // Allocate their growth pages before changing either the destination
+        // or source mapping; the frame allocator can still fail atomically.
+        let source_eager = source.should_eager_map();
+        let source_map_perm = source.map_perm;
+        let old_pages = old_end_vpn.0 - old_start_vpn.0;
+        let new_pages = new_end_vpn.0 - new_start_vpn.0;
+        let mut extra_pages = Vec::new();
+        if source_eager && new_pages > old_pages {
+            for offset in old_pages..new_pages {
+                let page = Arc::new(PrivatePage::new(
+                    frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
+                ));
+                extra_pages.push((VirtPageNum(new_start_vpn.0 + offset), page));
+            }
+        }
+
+        if destination_occupied {
+            let _ = self.msync_range(new_start_va, new_end_va);
+            let mut destination_batch = self
+                .munmap_deferred(new_start_va, new_end_va)
+                .ok_or(MmError::AddressUnavailable)?;
+            batch.append(&mut destination_batch);
+        }
+
+        let mut area = self.vmas.remove(&old_start_vpn).ok_or(MmError::NoMapping)?;
+
+        let mut present = Vec::new();
+        for offset in 0..old_pages {
+            let old_vpn = VirtPageNum(old_start_vpn.0 + offset);
+            if let Some(pte) = self.page_table.translate(old_vpn) {
+                present.push((offset, pte));
+            }
+        }
+
+        let pte_flags = Self::map_perm_to_pte_flags(source_map_perm);
+        for (vpn, page) in &extra_pages {
+            self.page_table
+                .map(*vpn, page.ppn(), pte_flags)
+                .expect("mremap destination page-table leaf was preflighted");
+        }
+
+        for (offset, pte) in &present {
+            let new_vpn = VirtPageNum(new_start_vpn.0 + *offset);
+            self.page_table
+                .map(new_vpn, pte.ppn(), pte.flags())
+                .expect("mremap destination page-table leaf was preflighted");
+        }
+        for offset in 0..old_pages {
+            let old_vpn = VirtPageNum(old_start_vpn.0 + offset);
+            let _ = self.page_table.clear(old_vpn);
+        }
+
+        let old_data_frames = core::mem::take(&mut area.data_frames);
+        for (vpn, page) in old_data_frames {
+            let offset = vpn.0 - old_start_vpn.0;
+            area.data_frames
+                .insert(VirtPageNum(new_start_vpn.0 + offset), page);
+        }
+        let old_direct_cache_pages = core::mem::take(&mut area.direct_cache_pages);
+        for (vpn, page) in old_direct_cache_pages {
+            let offset = vpn.0 - old_start_vpn.0;
+            area.direct_cache_pages
+                .insert(VirtPageNum(new_start_vpn.0 + offset), page);
+        }
+        for (vpn, page) in extra_pages {
+            area.data_frames.insert(vpn, page);
+        }
+        area.vpn_range = VPNRange::new(new_start_vpn, new_end_vpn);
+
+        self.insert_vma_unchecked(area);
+        self.merge_vma_around(new_start_vpn);
+        self.finish_deferred_page_table_edit();
+        Ok((new_start_va, batch))
+    }
+
     /// 按给定用户区间拆除映射，并返回需要在 shootdown 后释放的旧页对象。
     ///
     /// 调用方必须在锁内快照目标 hart，并在锁外完成 shootdown 后再释放返回的
@@ -2644,6 +2840,13 @@ impl Vma {
     pub fn is_trap_context(&self) -> bool {
         matches!(self.kind, VmaKind::TrapContext { .. })
     }
+    /// Whether this VMA is a relocatable mmap-style user mapping.
+    pub fn supports_mremap(&self) -> bool {
+        matches!(
+            &self.kind,
+            VmaKind::Anonymous | VmaKind::SharedAnonymous | VmaKind::File
+        )
+    }
     /// 返回区域覆盖的字节长度。
     pub fn byte_len(&self) -> usize {
         self.end_vpn().0.saturating_sub(self.start_vpn().0) * PAGE_SIZE
@@ -2908,11 +3111,40 @@ impl Vma {
     #[allow(unused)]
     /// 将当前区域向高地址扩展到新的上界，并补齐新增页映射。
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
-        for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
-            self.map_one(page_table, vpn)
-                .expect("failed to append eagerly mapped VMA");
+        self.append_to_checked(page_table, new_end)
+            .expect("failed to append eagerly mapped VMA");
+    }
+
+    /// Extend an eagerly mapped VMA, rolling back newly mapped pages on error.
+    pub fn append_to_checked(
+        &mut self,
+        page_table: &mut PageTable,
+        new_end: VirtPageNum,
+    ) -> Result<(), MmError> {
+        let old_end = self.vpn_range.get_end();
+        if new_end <= old_end {
+            return Ok(());
+        }
+
+        let mut mapped = Vec::new();
+        for vpn in VPNRange::new(old_end, new_end) {
+            if page_table.translate(vpn).is_some() {
+                for rollback_vpn in mapped {
+                    self.unmap_present_one(page_table, rollback_vpn);
+                }
+                return Err(MmError::Conflict);
+            }
+            if let Err(err) = self.map_one(page_table, vpn) {
+                self.unmap_present_one(page_table, vpn);
+                for rollback_vpn in mapped {
+                    self.unmap_present_one(page_table, rollback_vpn);
+                }
+                return Err(err);
+            }
+            mapped.push(vpn);
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        Ok(())
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before

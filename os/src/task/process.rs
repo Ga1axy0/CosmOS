@@ -18,8 +18,8 @@ use crate::mm::{
     MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
     UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
-use crate::sched::{add_task, current_task};
 use crate::sched::insert_into_pid2process;
+use crate::sched::{add_task, current_task};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
@@ -55,6 +55,7 @@ fn mm_error_to_errno(err: MmError) -> ERRNO {
         MmError::OutOfMemory => ERRNO::ENOMEM,
         MmError::InvalidRange => ERRNO::EINVAL,
         MmError::Conflict => ERRNO::EACCES,
+        MmError::AddressUnavailable => ERRNO::ENOMEM,
         MmError::NoMapping => ERRNO::EFAULT,
         MmError::PermissionDenied => ERRNO::EFAULT,
         MmError::BeyondFileEnd => ERRNO::ENXIO,
@@ -1865,6 +1866,47 @@ impl ProcessControlBlock {
         true
     }
 
+    /// Resize or relocate one mmap-style user mapping.
+    pub fn mremap(
+        &self,
+        old_start: VirtAddr,
+        old_end: VirtAddr,
+        new_start: VirtAddr,
+        new_end: VirtAddr,
+    ) -> Result<usize, ERRNO> {
+        let (result, token, mask, reclaim) = {
+            let mut inner = self.inner.lock();
+            let old_len = usize::from(old_end).saturating_sub(usize::from(old_start));
+            let new_len = usize::from(new_end).saturating_sub(usize::from(new_start));
+            if new_len > old_len {
+                inner.ensure_address_space_capacity(new_len - old_len)?;
+            }
+
+            let token = inner.memory_set.token();
+            let (result, batch) = inner
+                .memory_set
+                .mremap(old_start, old_end, new_start, new_end)
+                .map_err(mm_error_to_errno)?;
+            let mask = inner.memory_set.loaded_user_harts();
+            let reclaim = DeferredUserReclaim::new(token, mask, batch);
+            (usize::from(result), token, mask, reclaim)
+        };
+
+        // mremap changes PTEs even when it does not remove any pages, so an
+        // empty deferred batch must still receive a TLB shootdown.
+        if mask != 0 {
+            debug!(
+                "[tlb] mremap shootdown: pid={} token={:#x} mask={:#b}",
+                self.getpid(),
+                token,
+                mask
+            );
+            shootdown(mask, ShootdownKind::AddressSpace { token });
+        }
+        drop(reclaim);
+        Ok(result)
+    }
+
     /// Record a successful SysV shared-memory attachment.
     pub fn add_shm_attachment(&self, attachment: ShmAttachment) {
         self.inner.lock().shm_attachments.push(attachment);
@@ -1993,10 +2035,14 @@ impl ProcessControlBlock {
             plan.shared,
             plan.file.path()
         );
-        let page = mapping.try_get_page(plan.page_idx)?;
-        if access == PageFaultAccess::Exec {
-            mapping.readahead_exec(plan.page_idx);
-        }
+        let page = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
+            // Load the faulting page and a bounded sequential window in one
+            // page-cache read when the preceding page indicates forward
+            // access.  Random faults retain the single-page path.
+            mapping.try_get_page_with_readahead(plan.page_idx)?
+        } else {
+            mapping.try_get_page(plan.page_idx)?
+        };
         let mut inner = self.inner.lock();
         // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
         // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。

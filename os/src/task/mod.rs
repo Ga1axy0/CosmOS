@@ -73,7 +73,6 @@ pub use task::{
 };
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 
-use crate::platform::QEMUExit;
 use alloc::string::String;
 
 fn child_exit_autoreap(parent: &Arc<ProcessControlBlock>, exit_signal: u32) -> bool {
@@ -296,13 +295,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 "[kernel] Initproc process exit with exit_code {} ...",
                 task_exit_code
             );
-            if task_exit_code != 0 {
-                //crate::sbi::shutdown(255); //255 == -1 for err hint
-                crate::platform::QEMU_EXIT_HANDLE.exit_failure();
-            } else {
-                //crate::sbi::shutdown(0); //0 for success hint
-                crate::platform::QEMU_EXIT_HANDLE.exit_success();
-            }
+            crate::sbi::shutdown_with_code(task_exit_code);
         }
         let mut process_inner = process.inner_exclusive_access();
         if process_inner.is_zombie {
@@ -780,8 +773,14 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
         // byte-by-byte UART output, both slow — blocked in-flight global TLB
         // shootdown IPIs and wedged the machine when several harts dumped at
         // once after Ctrl+C. The lock is now held only to copy fields.
-        let (pgid, is_zombie, pending, task_snaps) = {
+        let (ppid, pgid, is_zombie, pending, task_snaps) = {
             let process_inner = process.inner_exclusive_access();
+            let p_ppid = process_inner
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid())
+                .unwrap_or(0);
             let p_pgid = process_inner.cred.pgid;
             let p_zombie = process_inner.is_zombie;
             let p_pending = process_inner.pending_signals.bits();
@@ -796,6 +795,7 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
                 u64,
                 u64,
                 Option<ReschedReason>,
+                LastSchedOp,
             )> = process_inner
                 .tasks
                 .iter()
@@ -814,14 +814,15 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
                         task_inner.pending_signals.bits(),
                         task_inner.signal_mask.bits(),
                         task_inner.sched.resched_reason,
+                        task_inner.last_sched_op,
                     ))
                 })
                 .collect();
-            (p_pgid, p_zombie, p_pending, snaps)
+            (p_ppid, p_pgid, p_zombie, p_pending, snaps)
         };
         warn!(
-            "[task-dump] pid={} pgid={} zombie={} pending_signals={:#x} exec={}",
-            pid, pgid, is_zombie, pending, exec_path
+            "[task-dump] pid={} ppid={} pgid={} zombie={} pending_signals={:#x} exec={}",
+            pid, ppid, pgid, is_zombie, pending, exec_path
         );
         for (
             tid,
@@ -834,10 +835,11 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
             task_pending,
             mask,
             resched,
+            last_sched_op,
         ) in task_snaps
         {
             warn!(
-                "[task-dump]   pid={} tid={} status={:?} wait={:?} on_cpu={} on_rq={} last_cpu={} has_wq={} task_pending={:#x} mask={:#x} resched={:?}",
+                "[task-dump]   pid={} tid={} status={:?} wait={:?} on_cpu={} on_rq={} last_cpu={} has_wq={} task_pending={:#x} mask={:#x} resched={:?} last_sched_op={:?}",
                 pid,
                 tid,
                 status,
@@ -848,8 +850,16 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
                 has_wq,
                 task_pending,
                 mask,
-                resched
+                resched,
+                last_sched_op,
             );
+            if let Some(WaitReason::Futex(uaddr, expected)) = wait {
+                let current = read_pod_from_process_user::<i32>(&process, uaddr as *const i32).ok();
+                warn!(
+                    "[task-dump]     futex pid={} tid={} uaddr={:#x} expected={} current={:?}",
+                    pid, tid, uaddr, expected, current
+                );
+            }
         }
     }
 }

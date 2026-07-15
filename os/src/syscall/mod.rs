@@ -300,6 +300,8 @@ pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
 /// brk syscall
 pub const SYSCALL_BRK: usize = 214;
+/// mremap syscall
+pub const SYSCALL_MREMAP: usize = 216;
 /// add_key syscall
 pub const SYSCALL_ADD_KEY: usize = 217;
 /// keyctl syscall
@@ -911,6 +913,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_ADJTIMEX => sys_adjtimex(args[0] as *mut Timex),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_BRK => sys_brk(args[0]),
+        SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),

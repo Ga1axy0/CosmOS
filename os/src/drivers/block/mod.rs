@@ -183,6 +183,23 @@ fn block_devices_snapshot() -> alloc::vec::Vec<Arc<VirtIOBlock>> {
     BLOCK_DEVICES_BY_IRQ.lock().values().cloned().collect()
 }
 
+/// Flush every discovered block device after filesystem and block-cache
+/// writeback has completed.
+pub fn flush_all() -> Result<(), ()> {
+    let mut failed = false;
+    for dev in block_devices_snapshot() {
+        if let Err(err) = dev.flush() {
+            error!("[virtio_blk] device flush failed: {:?}", err);
+            failed = true;
+        }
+    }
+    if failed {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 fn block_devices_with_irq_snapshot() -> alloc::vec::Vec<(u32, Arc<VirtIOBlock>)> {
     BLOCK_DEVICES_BY_IRQ
         .lock()
@@ -285,14 +302,8 @@ fn block_worker_debug_snapshot(now_ns: usize) -> BlockWorkerDebugSnapshot {
         pump_calls: BLOCK_WORKER_PUMP_CALLS.load(Ordering::Relaxed),
         pump_completed: BLOCK_WORKER_PUMP_COMPLETED.load(Ordering::Relaxed),
         in_pump: BLOCK_WORKER_IN_PUMP.load(Ordering::Acquire),
-        last_loop_age_ms: age_ms_since(
-            now_ns,
-            BLOCK_WORKER_LAST_LOOP_NS.load(Ordering::Acquire),
-        ),
-        last_pump_age_ms: age_ms_since(
-            now_ns,
-            BLOCK_WORKER_LAST_PUMP_NS.load(Ordering::Acquire),
-        ),
+        last_loop_age_ms: age_ms_since(now_ns, BLOCK_WORKER_LAST_LOOP_NS.load(Ordering::Acquire)),
+        last_pump_age_ms: age_ms_since(now_ns, BLOCK_WORKER_LAST_PUMP_NS.load(Ordering::Acquire)),
         last_sched_op,
     }
 }
@@ -382,9 +393,7 @@ pub fn warn_if_stalled(now_ns: usize) {
     // setting on_rq). Healing on that transient would be a spurious no-op and
     // log noise. A genuine orphan's loop counter stops advancing, so gating on
     // staleness fires only for real orphans.
-    let worker_stalled = worker
-        .last_loop_age_ms
-        .is_some_and(|age_ms| age_ms >= 200);
+    let worker_stalled = worker.last_loop_age_ms.is_some_and(|age_ms| age_ms >= 200);
     if worker.status == Some(TaskStatus::Runnable)
         && !worker.on_rq
         && !worker.on_cpu

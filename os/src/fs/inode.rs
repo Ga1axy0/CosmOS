@@ -1288,10 +1288,11 @@ impl File for OSInode {
     }
 
     fn sync(&self) -> Result<(), ERRNO> {
-        if let Some(mapping) = self.page_mapping() {
-            mapping.sync();
-        }
-        Ok(())
+        page_cache::sync_inode(&self.inode)?;
+        // Directory operations and ext4 inode metadata bypass the regular
+        // file page cache and use fs::block_cache directly.  fsync on a
+        // directory must therefore flush that lower cache as well.
+        crate::fs::sync_block_cache_all()
     }
 
     fn path(&self) -> Option<String> {

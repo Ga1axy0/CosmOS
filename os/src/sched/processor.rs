@@ -148,6 +148,13 @@ pub(crate) fn run_tasks() {
                 crate::fs::console_receive();
             }
 
+            // A task can become Runnable without being owned by either a
+            // runqueue or a hart if a wake/block transition loses the enqueue.
+            // Scan only from the idle path, where no local task can make
+            // progress anyway; the scanner is internally rate-limited and
+            // re-enqueues every orphan it finds.
+            super::warn_lost_runnable_tasks("idle_no_task");
+
             crate::trap::set_kernel_trap_entry();
 
             unsafe { enable_irqs_and_wait() };

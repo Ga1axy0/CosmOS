@@ -5,10 +5,10 @@ use crate::fs::{
     linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
     make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
     mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
-    rename_at, symlinkat, sync_page_cache_all, sync_page_cache_fs, truncate_inode, unlinkat,
-    AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags, PosixLockConflict,
-    PosixLockRange, PosixLockType, Stat, StatFs64, StatMode, AT_EMPTY_PATH, AT_FDCWD,
-    AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    rename_at, symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all,
+    truncate_inode, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime,
+    OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
@@ -2212,7 +2212,10 @@ fn flock_range_from_abi(lock: &Flock) -> Result<PosixLockRange, ERRNO> {
     Ok(PosixLockRange { start, len })
 }
 
-fn write_flock_conflict(lock: &mut Flock, conflict: Option<PosixLockConflict>) -> Result<(), ERRNO> {
+fn write_flock_conflict(
+    lock: &mut Flock,
+    conflict: Option<PosixLockConflict>,
+) -> Result<(), ERRNO> {
     if let Some(conflict) = conflict {
         lock.l_type = flock_type_to_abi(conflict.lock_type);
         lock.l_whence = SEEK_SET;
@@ -2229,7 +2232,10 @@ fn write_flock_conflict(lock: &mut Flock, conflict: Option<PosixLockConflict>) -
     Ok(())
 }
 
-fn validate_fcntl_lock_access(desc: &FileDescription, lock_type: PosixLockType) -> Result<(), ERRNO> {
+fn validate_fcntl_lock_access(
+    desc: &FileDescription,
+    lock_type: PosixLockType,
+) -> Result<(), ERRNO> {
     match lock_type {
         PosixLockType::Read if !desc.readable() => Err(ERRNO::EBADF),
         PosixLockType::Write if !desc.writable() => Err(ERRNO::EBADF),
@@ -3390,7 +3396,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
 /// sync syscall
 pub fn sys_sync() -> isize {
     syscall_body!({
-        sync_page_cache_all()?;
+        sync_storage_all()?;
         Ok(0)
     })
 }
@@ -3407,7 +3413,8 @@ pub fn sys_fsync(fd: u32) -> isize {
 /// fdatasync syscall
 pub fn sys_fdatasync(fd: u32) -> isize {
     syscall_body!({
-        sync_page_cache_all()?;
+        let file = get_any_file(fd as usize)?;
+        file.sync()?;
         Ok(0)
     })
 }
@@ -3418,39 +3425,57 @@ pub fn sys_syncfs(fd: u32) -> isize {
         let file = get_any_file(fd as usize)?;
         let inode = file.backing_inode().ok_or(ERRNO::EINVAL)?;
         sync_page_cache_fs(inode.fs_id())?;
+        sync_block_cache_all()?;
         Ok(0)
     })
 }
 
-/// pipe syscall
-pub fn sys_pipe2(pipefd: *mut i32, _flags: i32) -> isize {
+/// `pipe2(2)` syscall.
+pub fn sys_pipe2(pipefd: *mut i32, flags: i32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_pipe",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_pipe2 flags={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        flags
     );
     let process = current_process();
     syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
         let mut inner = process.inner_exclusive_access();
         inner.ensure_fd_capacity(2)?;
         let (pipe_read, pipe_write) = make_pipe();
         let read_fd = inner.alloc_fd()?;
-        inner.fd_table[read_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
+        let mut read_entry = FdEntry::new(Arc::new(FileDescription::new(
             pipe_read,
             AccessMode::ReadOnly,
-            FileStatusFlags::empty(),
+            status_flags,
             0,
-        ))));
+        )));
+        if cloexec {
+            read_entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[read_fd] = Some(read_entry);
         let write_fd = inner.alloc_fd()?;
-        inner.fd_table[write_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
+        let mut write_entry = FdEntry::new(Arc::new(FileDescription::new(
             pipe_write,
             AccessMode::WriteOnly,
-            FileStatusFlags::empty(),
+            status_flags,
             0,
-        ))));
+        )));
+        if cloexec {
+            write_entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[write_fd] = Some(write_entry);
         drop(inner);
         write_pod_to_user(pipefd, &(read_fd as i32))?;
         write_pod_to_user(unsafe { pipefd.add(1) }, &(write_fd as i32))?;
-        debug!("sys_pipe: read_fd = {}, write_fd = {}", read_fd, write_fd);
+        debug!(
+            "sys_pipe2: flags={:#x} read_fd={} write_fd={} cloexec={} nonblock={}",
+            flags,
+            read_fd,
+            write_fd,
+            cloexec,
+            status_flags.contains(FileStatusFlags::NONBLOCK),
+        );
         Ok(0)
     })
 }

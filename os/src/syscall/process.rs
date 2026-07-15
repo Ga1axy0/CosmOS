@@ -11,8 +11,8 @@ use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{
-        canonicalize, discard_inode, open_file, open_file_at, AccessMode, File, FileDescription,
-        FileStatusFlags, sync_page_cache_all, OSInode, OpenFlags, Stat, StatMode,
+        canonicalize, discard_inode, open_file, open_file_at, sync_page_cache_inode, AccessMode,
+        File, FileDescription, FileStatusFlags, OSInode, OpenFlags, Stat, StatMode,
     },
     hal::hartid,
     ipc::{self, IPC_RMID},
@@ -171,15 +171,14 @@ fn resolve_exec_image(
 
     // A freshly linked program may have been produced through a shared mmap
     // (for example by lld).  The writer and this exec path can use different
-    // inode handles, so looking up only this inode's mapping is not enough to
-    // establish coherency.  Flush dirty page-cache mappings before probing
-    // the executable; otherwise execve can briefly see the old zero-filled
-    // file even though the linker has already completed successfully.
-    sync_page_cache_all()?;
+    // inode handles, so sync the mapping indexed by the stable (fs_id, ino)
+    // key rather than synchronizing unrelated files before probing the
+    // executable.
+    let backing_inode = inode.backing_inode().ok_or(ERRNO::ENOENT)?;
+    sync_page_cache_inode(&backing_inode)?;
 
     // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
-    let (mut first_line, mut first_line_complete) =
-        inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    let (mut first_line, mut first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
     if !is_elf_image(&first_line) {
         // The linker may have completed a file through a mapping that was
         // subsequently flushed, while this inode still has an older clean
@@ -189,8 +188,7 @@ fn resolve_exec_image(
         // filesystem; the sync above has already made dirty pages durable.
         if let Some(backing_inode) = inode.backing_inode() {
             discard_inode(&backing_inode);
-            (first_line, first_line_complete) =
-                inode.read_first_line_limited(EXEC_PROBE_SIZE);
+            (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
         }
     }
     debug!(
@@ -1537,11 +1535,10 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 // execve (or by _exit), not only after the child becomes a
                 // zombie.  Wait on the child queue so the predicate also
                 // closes the race where exec completes before sleeping.
-                new_process
-                    .wait_exit_queue
-                    .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
-                        new_process.vfork_parent_released()
-                    });
+                new_process.wait_exit_queue.wait_with_reason_or_skip(
+                    WaitReason::ProcessWaitExit(child_pid as isize),
+                    || new_process.vfork_parent_released(),
+                );
             }
             Ok(child_pid as isize)
         }
@@ -1869,9 +1866,9 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 return Err(ERRNO::EINTR);
             }
 
-            process
-                .wait_exit_queue
-                .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
+            process.wait_exit_queue.wait_with_reason_or_skip(
+                WaitReason::ProcessWaitExit(pid),
+                || {
                     let inner = process.inner_exclusive_access();
                     let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
                     let has_target_zombie = inner.children.iter().any(|p| {
@@ -1891,7 +1888,8 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                         p_inner.cred.pgid == (-pid) as u32
                     });
                     !has_target_child || has_target_zombie
-                });
+                },
+            );
 
             // Re-scan child state after every wake. A child exit can also queue
             // a user-handled signal, but wait status must win over EINTR.

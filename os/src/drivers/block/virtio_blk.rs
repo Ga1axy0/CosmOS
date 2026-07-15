@@ -5,7 +5,7 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 use core::hint::spin_loop;
 use core::slice;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::{BlockDevice, BlockRead, BlockWrite};
 use virtio_drivers::{
     device::blk::{BlkReq, BlkResp, RespStatus, VirtIOBlk},
@@ -22,6 +22,7 @@ pub struct VirtIOBlock {
     batch_wait_queue: WaitQueue,
     submitted: AtomicUsize,
     completed: AtomicUsize,
+    needs_flush: AtomicBool,
     last_submit_ns: AtomicUsize,
     last_completion_ns: AtomicUsize,
     last_stall_warn_ns: AtomicUsize,
@@ -61,6 +62,9 @@ const VIRTIO_BLK_READ_DESCS: usize = 3;
 const VIRTIO_BLK_WRITE_DESCS: usize = 3;
 const MAX_READ_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_READ_DESCS;
 const MAX_WRITE_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_WRITE_DESCS;
+/// Split large contiguous reads so a single page-cache window can use the
+/// same in-flight queue as fragmented ext4 reads.
+const READ_BATCH_CHUNK_BLOCKS: usize = 128; // 64 KiB with 512-byte blocks.
 const ADAPTIVE_COMPLETION_SPINS: usize = 8;
 const STALL_WARN_AFTER_NS: usize = 500_000_000;
 const STALL_WARN_INTERVAL_NS: usize = 1_000_000_000;
@@ -203,89 +207,31 @@ impl BlockDevice for VirtIOBlock {
         }
         if total_reqs == 1 {
             if let Some(read) = reads.iter_mut().find(|read| !read.data.is_empty()) {
-                self.read_blocks(read.start_block, read.data);
+                if read.data.len() <= READ_BATCH_CHUNK_BLOCKS * ::fs::BLOCK_SZ {
+                    self.read_blocks(read.start_block, read.data);
+                    return;
+                }
             }
-            return;
-        }
-        let _multi_probe = crate::probe_scope!("virtio.read_multi_batch");
-        #[cfg(feature = "io_perf_counters")]
-        {
-            READ_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
-            READ_MANY_REQS.fetch_add(total_reqs, Ordering::Relaxed);
         }
 
-        let mut next = 0usize;
-        let mut in_flight: Vec<Arc<RequestState>> = Vec::new();
-        while next < reads.len() || !in_flight.is_empty() {
-            while next < reads.len() && in_flight.len() < MAX_READ_IN_FLIGHT {
-                let read = &mut reads[next];
-                next += 1;
-                if read.data.is_empty() {
-                    continue;
-                }
-                assert!(read.data.len() % ::fs::BLOCK_SZ == 0);
-                #[cfg(feature = "io_perf_counters")]
-                {
-                    READ_OPS.fetch_add(1, Ordering::Relaxed);
-                    READ_BYTES.fetch_add(read.data.len(), Ordering::Relaxed);
-                }
-                match self.submit_read_request(read.start_block, read.data) {
-                    Ok(request) => {
-                        in_flight.push(request);
-                        update_max_read_in_flight(in_flight.len());
-                    }
-                    Err(VirtIoError::QueueFull) => {
-                        #[cfg(feature = "io_perf_counters")]
-                        {
-                            READ_MANY_QUEUE_FULL_WAITS.fetch_add(1, Ordering::Relaxed);
-                            READ_OPS.fetch_sub(1, Ordering::Relaxed);
-                            READ_BYTES.fetch_sub(read.data.len(), Ordering::Relaxed);
-                        }
-                        next -= 1;
-                        break;
-                    }
-                    Err(err) => {
-                        let capacity = self.inner.lock().capacity();
-                        panic!(
-                            "Error when submitting VirtIOBlk batched read: block_id={} buf_len={} capacity={} err={:?}",
-                            read.start_block,
-                            read.data.len(),
-                            capacity,
-                            err
-                        )
-                    }
-                }
-            }
-
-            if !in_flight.is_empty() {
-                self.pump_completions();
-                let mut idx = 0;
-                while idx < in_flight.len() {
-                    if !in_flight[idx].done() {
-                        idx += 1;
-                        continue;
-                    }
-                    let request = in_flight.swap_remove(idx);
-                    if request.status() != RespStatus::OK {
-                        let data = request.inner.lock();
-                        let capacity = self.inner.lock().capacity();
-                        panic!(
-                            "VirtIOBlk batched read response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
-                            data.block_id,
-                            data.token,
-                            data.kind.len(),
-                            capacity,
-                            data.resp.status()
-                        );
-                    }
-                }
-                if !in_flight.is_empty() {
-                    self.wait_for_batch_progress(&in_flight);
-                }
-            } else if next < reads.len() {
-                self.wait_for_device_progress();
+        // The block-cache/ext4 layers often produce one large contiguous
+        // range. Split it into bounded requests so the same asynchronous
+        // submission path is used for both contiguous and fragmented files.
+        let mut chunks = Vec::new();
+        for read in reads.iter_mut().filter(|read| !read.data.is_empty()) {
+            let start_block = read.start_block;
+            for (chunk_idx, data) in read
+                .data
+                .chunks_mut(READ_BATCH_CHUNK_BLOCKS * ::fs::BLOCK_SZ)
+                .enumerate()
+            {
+                chunks.push(BlockRead {
+                    start_block: start_block + chunk_idx * READ_BATCH_CHUNK_BLOCKS,
+                    data,
+                });
             }
         }
+        self.submit_read_batch(&mut chunks);
     }
 
     /// Write a block to the virtio_blk device
@@ -430,10 +376,125 @@ impl VirtIOBlock {
                 batch_wait_queue: WaitQueue::new(),
                 submitted: AtomicUsize::new(0),
                 completed: AtomicUsize::new(0),
+                needs_flush: AtomicBool::new(false),
                 last_submit_ns: AtomicUsize::new(0),
                 last_completion_ns: AtomicUsize::new(0),
                 last_stall_warn_ns: AtomicUsize::new(0),
             })
+    }
+
+    /// Flush writes accepted by the virtio block device to its backing storage.
+    ///
+    /// The synchronous flush request in virtio-drivers assumes that no other
+    /// request is in the queue.  Drain our asynchronous requests first, and
+    /// avoid issuing a flush to read-only/unused devices.  The latter matters
+    /// when QEMU exposes a boot image alongside the writable root disk.
+    pub fn flush(&self) -> Result<(), VirtIoError> {
+        if !self.needs_flush.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        while self.has_pending_requests() {
+            self.pump_completions();
+            if self.has_pending_requests() {
+                self.wait_for_device_progress();
+            }
+        }
+
+        if !self.needs_flush.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = self.inner.lock().flush();
+        if result.is_err() {
+            self.needs_flush.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn submit_read_batch(&self, reads: &mut [BlockRead<'_>]) {
+        let total_reqs = reads.iter().filter(|read| !read.data.is_empty()).count();
+        if total_reqs == 0 {
+            return;
+        }
+        let _multi_probe = crate::probe_scope!("virtio.read_multi_batch");
+        #[cfg(feature = "io_perf_counters")]
+        {
+            READ_MANY_CALLS.fetch_add(1, Ordering::Relaxed);
+            READ_MANY_REQS.fetch_add(total_reqs, Ordering::Relaxed);
+        }
+
+        let mut next = 0usize;
+        let mut in_flight: Vec<Arc<RequestState>> = Vec::new();
+        while next < reads.len() || !in_flight.is_empty() {
+            while next < reads.len() && in_flight.len() < MAX_READ_IN_FLIGHT {
+                let read = &mut reads[next];
+                next += 1;
+                if read.data.is_empty() {
+                    continue;
+                }
+                assert!(read.data.len() % ::fs::BLOCK_SZ == 0);
+                #[cfg(feature = "io_perf_counters")]
+                {
+                    READ_OPS.fetch_add(1, Ordering::Relaxed);
+                    READ_BYTES.fetch_add(read.data.len(), Ordering::Relaxed);
+                }
+                match self.submit_read_request(read.start_block, read.data) {
+                    Ok(request) => {
+                        in_flight.push(request);
+                        update_max_read_in_flight(in_flight.len());
+                    }
+                    Err(VirtIoError::QueueFull) => {
+                        #[cfg(feature = "io_perf_counters")]
+                        {
+                            READ_MANY_QUEUE_FULL_WAITS.fetch_add(1, Ordering::Relaxed);
+                            READ_OPS.fetch_sub(1, Ordering::Relaxed);
+                            READ_BYTES.fetch_sub(read.data.len(), Ordering::Relaxed);
+                        }
+                        next -= 1;
+                        break;
+                    }
+                    Err(err) => {
+                        let capacity = self.inner.lock().capacity();
+                        panic!(
+                            "Error when submitting VirtIOBlk batched read: block_id={} buf_len={} capacity={} err={:?}",
+                            read.start_block,
+                            read.data.len(),
+                            capacity,
+                            err
+                        )
+                    }
+                }
+            }
+
+            if !in_flight.is_empty() {
+                self.pump_completions();
+                let mut idx = 0;
+                while idx < in_flight.len() {
+                    if !in_flight[idx].done() {
+                        idx += 1;
+                        continue;
+                    }
+                    let request = in_flight.swap_remove(idx);
+                    if request.status() != RespStatus::OK {
+                        let data = request.inner.lock();
+                        let capacity = self.inner.lock().capacity();
+                        panic!(
+                            "VirtIOBlk batched read response error: block_id={} token={} buf_len={} capacity={} resp_status={:?}",
+                            data.block_id,
+                            data.token,
+                            data.kind.len(),
+                            capacity,
+                            data.resp.status()
+                        );
+                    }
+                }
+                if !in_flight.is_empty() {
+                    self.wait_for_batch_progress(&in_flight);
+                }
+            } else if next < reads.len() {
+                self.wait_for_device_progress();
+            }
+        }
     }
 
     fn submit_read_request(
@@ -484,6 +545,7 @@ impl VirtIOBlock {
         data.submitted_ns = submitted_ns;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        self.needs_flush.store(true, Ordering::Release);
         self.submitted.fetch_add(1, Ordering::Relaxed);
         self.last_submit_ns.store(submitted_ns, Ordering::Release);
         super::wake_worker();
