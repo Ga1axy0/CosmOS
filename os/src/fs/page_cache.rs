@@ -1986,7 +1986,7 @@ fn default_watermarks() -> (usize, usize) {
         total_pages = total_pages.saturating_add(end.saturating_sub(start));
     });
     let total_pages = max(1, total_pages);
-    let high_watermark = max(128, total_pages / 4);
+    let high_watermark = max(128, total_pages / 2);
     let low_watermark = max(96, high_watermark * 3 / 4);
     (high_watermark, low_watermark)
 }

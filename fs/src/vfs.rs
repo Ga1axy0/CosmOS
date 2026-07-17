@@ -228,9 +228,19 @@ pub trait VfsNode: Send + Sync + Any + Debug {
     }
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
+    /// Create a regular file while preserving a backend-specific error.
+    /// Backends that still implement only the legacy `Option` API retain the
+    /// historical EIO fallback.
+    fn create_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        self.create(name).ok_or(FS_ERRNO::EIO)
+    }
     /// Create a sub-directory named `name` inside this directory.
     /// Returns the new directory inode, or `None` on failure.
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
+    /// Create a directory while preserving a backend-specific error.
+    fn mkdir_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        self.mkdir(name).ok_or(FS_ERRNO::EIO)
+    }
     /// Returns true if this node is a directory.
     fn file_type(&self) -> VfsFileType;
     fn is_dir(&self) -> bool {
@@ -492,7 +502,11 @@ impl Inode {
     }
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
-        let child = self.inner.create(name).map(|i| {
+        self.create_result(name).ok()
+    }
+
+    pub fn create_result(&self, name: &str) -> Result<Arc<Inode>, FS_ERRNO> {
+        let child = self.inner.create_result(name).map(|i| {
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o644u32 & perms_mask);
@@ -505,11 +519,15 @@ impl Inode {
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), name, &child);
         }
-        Some(child)
+        Ok(child)
     }
 
     pub fn mkdir(&self, name: &str) -> Option<Arc<Inode>> {
-        let child = self.inner.mkdir(name).map(|i|{
+        self.mkdir_result(name).ok()
+    }
+
+    pub fn mkdir_result(&self, name: &str) -> Result<Arc<Inode>, FS_ERRNO> {
+        let child = self.inner.mkdir_result(name).map(|i|{
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
@@ -522,7 +540,7 @@ impl Inode {
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), name, &child);
         }
-        Some(child)
+        Ok(child)
     }
 
     pub fn is_dir(&self) -> bool {

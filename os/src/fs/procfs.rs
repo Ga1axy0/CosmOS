@@ -28,7 +28,7 @@ use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
 use crate::mm::{
     deferred_frame_count, deferred_kstack_id_count, deferred_range_count, frame_allocator_stats,
-    MapPermission, VmaKind, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
+    kernel_heap_allocator_stats, MapPermission, VmaKind, KERNEL_HEAP_BYTES,
 };
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
@@ -52,13 +52,18 @@ fn parse_pid(name: &str) -> Option<usize> {
 fn build_meminfo() -> String {
     let stats = frame_allocator_stats();
     let cached_pages = PAGE_CACHE_MANAGER.lock().cached_pages;
-    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire);
-    let heap_used = KERNEL_HEAP_USED_BYTES.load(Ordering::Acquire);
+    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire) as u64;
+    let heap_stats = kernel_heap_allocator_stats();
+    let heap_used = heap_stats.requested_bytes as u64;
     let page_kb = (PAGE_SIZE as u64) / 1024;
     let mem_total = stats.total_pages as u64 * page_kb;
     let mem_free = stats.free_pages as u64 * page_kb;
     let cached = cached_pages as u64 * page_kb;
-    let mem_available = mem_free.saturating_add(cached);
+    // Cached pages are reclaimable, but they are also included in
+    // FrameAllocated. Cap the contribution by the currently allocated frame
+    // count and never report more available memory than MemTotal.
+    let reclaimable_cached = cached.min(stats.allocated_pages as u64 * page_kb);
+    let mem_available = mem_free.saturating_add(reclaimable_cached).min(mem_total);
 
     let mut out = String::new();
     let _ = writeln!(&mut out, "MemTotal:       {} kB", mem_total);
@@ -67,12 +72,88 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "Cached:         {} kB", cached);
     let _ = writeln!(&mut out, "FrameAllocated: {} pages", stats.allocated_pages);
     let _ = writeln!(&mut out, "FrameOom:       {}", stats.oom_count);
+    let _ = writeln!(&mut out, "FrameAllocCalls: {}", stats.alloc_calls);
+    let _ = writeln!(&mut out, "FrameDeallocCalls: {}", stats.dealloc_calls);
+    let _ = writeln!(
+        &mut out,
+        "FrameContiguousAllocCalls: {}",
+        stats.contiguous_alloc_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameRangeDeallocCalls: {}",
+        stats.range_dealloc_calls
+    );
+    let _ = writeln!(&mut out, "FrameFreeScanSteps: {}", stats.free_scan_steps);
+    let _ = writeln!(&mut out, "FrameSplitOps: {}", stats.split_ops);
+    let _ = writeln!(&mut out, "FrameMergeOps: {}", stats.merge_ops);
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddySearchCalls: {}",
+        stats.buddy_search_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddySearchHits: {}",
+        stats.buddy_search_hits
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddySearchMisses: {}",
+        stats.buddy_search_misses
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddyBitmapEnabled: {}",
+        stats.bitmap_enabled as usize
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameAllocatorLockWaitTicks: {}",
+        stats.lock_wait_ticks
+    );
     let _ = writeln!(&mut out, "KernelHeapCommitted: {} bytes", heap_committed);
     let _ = writeln!(&mut out, "KernelHeapUsed:      {} bytes", heap_used);
     let _ = writeln!(
         &mut out,
         "KernelHeapFree:      {} bytes",
         heap_committed.saturating_sub(heap_used)
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapAllocated: {} bytes",
+        heap_stats.allocated_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapActualFree: {} bytes",
+        heap_stats.actual_free_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapLargestFree: {} bytes",
+        heap_stats.largest_free_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapFreeScanSteps: {}",
+        heap_stats.free_scan_steps
+    );
+    let _ = writeln!(&mut out, "KernelHeapFreeCalls: {}", heap_stats.free_calls);
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapBuddyFreeCalls: {}",
+        heap_stats.buddy_free_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapSlabReserved: {} bytes",
+        heap_stats.slab_reserved_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapSlabFree: {} bytes",
+        heap_stats.slab_free_bytes
     );
     let _ = writeln!(&mut out, "KStackCached:   {}", cached_kstack_count());
     let _ = writeln!(&mut out, "DeferredRanges: {}", deferred_range_count());

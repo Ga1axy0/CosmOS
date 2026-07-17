@@ -4034,7 +4034,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
             if parent.find(path.as_str()).is_some() {
                 return Err(ERRNO::EEXIST);
             }
-            parent.mkdir(path.as_str()).ok_or(ERRNO::EIO)?
+            parent.mkdir_result(path.as_str()).map_err(ERRNO::from)?
         } else {
             let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
             mkdir_at_with_inode(cwd.as_str(), path.as_str())?

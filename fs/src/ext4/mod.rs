@@ -830,25 +830,33 @@ impl VfsNode for Ext4Inode {
     }
 
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        self.create_result(name).ok()
+    }
+
+    fn create_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
         if self.file_type != VfsFileType::Directory {
-            return None;
+            return Err(FS_ERRNO::ENOTDIR);
         }
         let ext4 = self.fs.ext4.lock();
         let inode = ext4
             .create(self.inode_num, name, InodeFileType::S_IFREG.bits())
-            .ok()?;
-        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Regular)) as Arc<dyn VfsNode>)
+            .map_err(FS_ERRNO::from)?;
+        Ok(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Regular)) as Arc<dyn VfsNode>)
     }
 
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        self.mkdir_result(name).ok()
+    }
+
+    fn mkdir_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
         if self.file_type != VfsFileType::Directory {
-            return None;
+            return Err(FS_ERRNO::ENOTDIR);
         }
         let ext4 = self.fs.ext4.lock();
         let inode = ext4
             .create(self.inode_num, name, InodeFileType::S_IFDIR.bits())
-            .ok()?;
-        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Directory)) as Arc<dyn VfsNode>)
+            .map_err(FS_ERRNO::from)?;
+        Ok(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Directory)) as Arc<dyn VfsNode>)
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {

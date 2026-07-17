@@ -900,12 +900,12 @@ pub fn open_file_at_with_status(
             Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
         } else {
             parent
-                .create(&name)
+                .create_result(&name)
                 .map(|inode| {
                     let _ = inode.set_times_now(inode_now());
                     (Arc::new(OSInode::new(inode, abs.clone())), true)
                 })
-                .ok_or(ERRNO::EIO)
+                .map_err(ERRNO::from)
         }
     } else {
         let mut inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
@@ -948,12 +948,9 @@ pub fn mkdir_at_with_inode(cwd: &str, path: &str) -> Result<Arc<Inode>, ERRNO> {
             return Err(ERRNO::ENOTDIR);
         }
         // 创建失败
-        if let Some(inode) = parent.mkdir(&name) {
-            let _ = inode.set_times_now(inode_now());
-            Ok(inode)
-        } else {
-            Err(ERRNO::EIO)
-        }
+        let inode = parent.mkdir_result(&name).map_err(ERRNO::from)?;
+        let _ = inode.set_times_now(inode_now());
+        Ok(inode)
     } else if lookup_inode_follow(cwd, path, true).is_ok() {
         Err(ERRNO::EEXIST)
     } else {
