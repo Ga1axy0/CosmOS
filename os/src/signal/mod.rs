@@ -7,7 +7,7 @@ use crate::{
         ArchSignalAbi, ArchTrapContextAbi, ArchTrapMachine,
     },
     syscall::write_pod_to_user,
-    task::{current_task, current_trap_cx},
+    task::{current_process, current_task, current_trap_cx},
 };
 
 mod action;
@@ -203,7 +203,9 @@ pub fn handle_signals() -> Option<i32> {
 
     let trap_cx = current_trap_cx();
     // Save the current user stack pointer
-    let mut user_sp = trap_cx.user_sp();
+    let original_pc = trap_cx.user_pc();
+    let original_sp = trap_cx.user_sp();
+    let mut user_sp = original_sp;
 
     // Construct sigframe on user stack
     // Layout: sp points to ucontext, siginfo is above it if SA_SIGINFO
@@ -357,6 +359,43 @@ pub fn handle_signals() -> Option<i32> {
 
     // Jump to signal handler
     trap_cx.set_user_pc(action.handler);
+
+    // SIGINT/SIGSEGV/SIGBUS delivery is intentionally visible at WARN level:
+    // these are the signals most useful when correlating Ctrl+C, fault
+    // handling, and rt_sigreturn/context-restoration failures.  Ordinary
+    // signal delivery remains at the existing DEBUG level.
+    if matches!(signum, 2 | 7 | 11) {
+        let process = current_process();
+        let task = current_task();
+        let (tid, thread_id) = task
+            .as_ref()
+            .and_then(|task| {
+                let inner = task.inner_exclusive_access();
+                inner
+                    .res
+                    .as_ref()
+                    .map(|res| (Some(res.tid), Some(res.thread_id)))
+            })
+            .unwrap_or((None, None));
+        warn!(
+            "[signal] deliver signum={} hart={} pid={} tid={:?} thread_id={:?} \
+             old_pc={:#x} old_sp={:#x} handler={:#x} restorer={:#x} \
+             new_sp={:#x} ucontext={:#x} siginfo={:#x} flags={:#x}",
+            signum,
+            crate::hal::hartid(),
+            process.getpid(),
+            tid,
+            thread_id,
+            original_pc,
+            original_sp,
+            action.handler,
+            trap_cx.ra(),
+            user_sp,
+            ucontext_ptr,
+            siginfo_ptr,
+            action.sa_flags,
+        );
+    }
 
     debug!(
         "handle_signals: setup complete, jumping to handler={:#x}, ra={:#x}, sp={:#x}",

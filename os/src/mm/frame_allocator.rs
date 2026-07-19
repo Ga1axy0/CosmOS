@@ -652,8 +652,7 @@ pub fn frame_alloc_with_reclaim() -> Option<FrameTracker> {
     if let Some(frame) = frame_alloc() {
         return Some(frame);
     }
-    crate::fs::reclaim_if_needed();
-    frame_alloc()
+    crate::fs::reclaim_for_frame_allocation()
 }
 
 /// Deallocate a physical page frame with a given ppn

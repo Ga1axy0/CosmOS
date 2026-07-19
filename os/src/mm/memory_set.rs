@@ -496,7 +496,12 @@ impl DeferredUserReclaim {
 
     /// 在目标 hart 完成 TLB shootdown 后释放旧页对象。
     pub fn flush_then_release(self) {
-        if self.mask != 0 && !self.batch.is_empty() {
+        // Permission-only edits (for example an exclusive COW page becoming
+        // writable) can leave the release batch empty while still requiring
+        // remote harts to discard a restrictive translation.  The mask is the
+        // authoritative indication that this address space may still be loaded
+        // elsewhere; page ownership is only relevant to the deferred release.
+        if self.mask != 0 {
             debug!(
                 "[tlb] deferred user reclaim shootdown: token={:#x} mask={:#b}",
                 self.token, self.mask
@@ -523,6 +528,16 @@ impl MemorySet {
             flags.insert(PTEFlags::U);
         }
         crate::hal::normalize_leaf_pte_flags(flags)
+    }
+
+    /// Return whether a resident leaf PTE permits one user-mode access.
+    fn pte_allows_user_access(pte: PageTableEntry, access: PageFaultAccess) -> bool {
+        pte.is_user()
+            && match access {
+                PageFaultAccess::Read => pte.readable(),
+                PageFaultAccess::Write => pte.writable(),
+                PageFaultAccess::Exec => pte.executable(),
+            }
     }
 
     /// 完成一次会返回延迟回收 batch 的本地页表修改。
@@ -1995,23 +2010,65 @@ impl MemorySet {
         &self,
         fault_va: VirtAddr,
         access: PageFaultAccess,
-    ) -> Option<FilePageFaultPlan> {
+    ) -> FilePageFaultPrepare {
         let vpn = fault_va.floor();
-        if self.page_table.translate(vpn).is_some() {
-            return None;
+        if let Some(pte) = self.page_table.translate(vpn) {
+            let vma_allows = self
+                .find_vma_containing(vpn)
+                .is_some_and(|area| area.is_user_accessible() && area.allows_fault_access(access));
+            if vma_allows && Self::pte_allows_user_access(pte, access) {
+                // The PTE may have been installed by another hart after the
+                // trap dispatcher performed its first resident-PTE check but
+                // before it reached this file-fault path.  Treat that state as
+                // a resolved stale translation instead of returning a miss
+                // that the trap layer would turn into SIGSEGV.
+                warn!(
+                    "[tlb] retry file fault with present user PTE: hart={} vpn={:#x} \
+                     access={:?} pte_bits={:#x} ppn={:#x} flags={:?}",
+                    crate::hal::hartid(),
+                    vpn.0,
+                    access,
+                    pte.bits,
+                    pte.ppn().0,
+                    pte.flags(),
+                );
+                unsafe {
+                    crate::hal::flush_tlb();
+                }
+                return FilePageFaultPrepare::Resolved;
+            }
+            warn!(
+                "[mmap] file fault sees incompatible PTE: hart={} vpn={:#x} access={:?} \
+                 pte_bits={:#x} ppn={:#x} flags={:?} vma_allows={}",
+                crate::hal::hartid(),
+                vpn.0,
+                access,
+                pte.bits,
+                pte.ppn().0,
+                pte.flags(),
+                vma_allows,
+            );
+            return FilePageFaultPrepare::NotHandled;
         }
-        let area = self.find_vma_containing(vpn)?;
+        let Some(area) = self.find_vma_containing(vpn) else {
+            return FilePageFaultPrepare::NotHandled;
+        };
         if !area.is_user_accessible() || !area.allows_fault_access(access) {
-            return None;
+            return FilePageFaultPrepare::NotHandled;
         }
-        let file = area.file.as_ref()?;
+        let Some(file) = area.file.as_ref() else {
+            return FilePageFaultPrepare::NotHandled;
+        };
+        let Some(page_idx) = area.file_page_index(vpn) else {
+            return FilePageFaultPrepare::NotHandled;
+        };
         let plan = FilePageFaultPlan {
             vpn,
             vma_start: area.start_vpn(),
             vma_end: area.end_vpn(),
             map_perm: area.map_perm,
             file: Arc::clone(&file.file),
-            page_idx: area.file_page_index(vpn)?,
+            page_idx,
             pgoff: file.pgoff,
             shared: file.shared,
             access,
@@ -2025,7 +2082,7 @@ impl MemorySet {
             plan.shared,
             plan.file.path()
         );
-        Some(plan)
+        FilePageFaultPrepare::Pending(plan)
     }
 
     /// 检查某个缺页计划在慢路径返回后是否仍然与当前地址空间匹配。
@@ -2085,7 +2142,31 @@ impl MemorySet {
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
         let vpn = fault_va.floor();
-        if self.page_table.translate(vpn).is_some() {
+        if let Some(pte) = self.page_table.translate(vpn) {
+            let vma_allows = self
+                .find_vma_containing(vpn)
+                .is_some_and(|area| area.is_user_accessible() && area.allows_fault_access(access));
+            if vma_allows && Self::pte_allows_user_access(pte, access) {
+                // Another hart may have installed or relaxed this PTE after
+                // the current hart cached an invalid/restrictive translation.
+                // The in-memory PTE is already sufficient, so invalidate the
+                // local translation and retry the faulting instruction instead
+                // of incorrectly delivering SIGSEGV.
+                warn!(
+                    "[tlb] retry stale present user PTE: hart={} vpn={:#x} access={:?} \
+                     pte_bits={:#x} ppn={:#x} flags={:?}",
+                    crate::hal::hartid(),
+                    vpn.0,
+                    access,
+                    pte.bits,
+                    pte.ppn().0,
+                    pte.flags(),
+                );
+                unsafe {
+                    crate::hal::flush_tlb();
+                }
+                return Ok(PageFaultHandled::Handled);
+            }
             return Ok(PageFaultHandled::NotHandled);
         }
         let Some(area) = self.find_vma_containing(vpn) else {
@@ -2607,6 +2688,16 @@ pub enum PageFaultAccess {
     Write,
     /// 指令取值缺页。
     Exec,
+}
+
+/// Result of checking a file-backed page fault while the process MM lock is held.
+pub enum FilePageFaultPrepare {
+    /// A compatible resident PTE already resolves the fault after a local flush.
+    Resolved,
+    /// The page is absent and must be loaded through the file/page-cache slow path.
+    Pending(FilePageFaultPlan),
+    /// The address is not a compatible file-backed user mapping.
+    NotHandled,
 }
 
 /// file-backed 缺页在锁外执行慢路径时携带的最小计划。

@@ -50,6 +50,17 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
+    /// Try to acquire the lock without waiting.
+    ///
+    /// This is useful for subsystem-specific wait loops that must perform
+    /// progress work while another hart owns the lock.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard { lock: self })
+    }
+
     /// Get mutable access without locking.
     ///
     /// # Safety

@@ -62,8 +62,9 @@ pub use heap_allocator::{
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
-    unregister_file_mappings_for_process, DeferredUserReclaim, ElfLoadInfo, InodeKey,
-    MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
+    unregister_file_mappings_for_process, DeferredUserReclaim, ElfLoadInfo, FilePageFaultPrepare,
+    InodeKey, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind,
+    KERNEL_SPACE,
 };
 pub use oom::{log_oom, warn_heap_state};
 pub use page_table::{
@@ -73,8 +74,8 @@ pub use page_table::{
 pub use tlb_shootdown::{
     clear_deferred, defer_release, deferred_frame_count, deferred_kstack_id_count,
     deferred_range_count, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush,
-    online_mask, shootdown, shootdown_global, shootdown_global_quiet, take_deferred, DeferredBatch,
-    ShootdownKind,
+    online_mask, poll_pending_shootdown, shootdown, shootdown_global, shootdown_global_quiet,
+    take_deferred, DeferredBatch, ShootdownKind,
 };
 
 /// initiate heap allocator, frame allocator and kernel space

@@ -1127,17 +1127,18 @@ pub fn rename_at(
     Ok(())
 }
 
-/// Remove a link at `path` relative to `cwd`.
-pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
-    debug!("unlinkat: cwd={}, path={}, flags={:#x}", cwd, path, flags);
+/// Remove a named child from an already-resolved parent directory.
+///
+/// Both path-based and direct-dirfd unlinkat paths must use this helper so
+/// hard-link and page-cache lifetime rules cannot diverge.
+pub fn unlink_child(parent: &Arc<Inode>, name: &str, flags: u32) -> Result<(), ERRNO> {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(ERRNO::EINVAL);
     }
-    let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
     if name.is_empty() {
         return Err(ERRNO::ENOENT);
     }
-    let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
+    let inode = parent.find(name).ok_or(ERRNO::ENOENT)?;
     if inode.is_dir() {
         if flags & AT_REMOVEDIR == 0 {
             return Err(ERRNO::EISDIR);
@@ -1147,22 +1148,31 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
             // Contains at least one entry other than `.` and `..`
             return Err(ERRNO::ENOTEMPTY);
         }
-        parent.rmdir(name.as_str())?
+        parent.rmdir(name)?
     } else {
         if flags & AT_REMOVEDIR != 0 {
             return Err(ERRNO::ENOTDIR);
         }
-        // 删除普通文件前丢弃旧页，避免已经解除目录项后仍有脏页迟到回写。
-        discard_inode(&inode);
-        if let Err(err) = parent.unlink(name.as_str()) {
-            error!(
-                "[unlinkat] unlink regular file failed: cwd={} path={} name={} errno={}",
-                cwd, path, name, err as i32
-            );
-            return Err(err.into());
+        // A hard-linked file remains reachable after removing this name. Its
+        // page cache may contain the only current copy of dirty data and the
+        // grown logical size, so discarding it would make the surviving name
+        // observe a stale (often zero-length) backing inode.
+        let discard_after_unlink = inode.nlink() <= 1;
+        parent.unlink(name)?;
+        if discard_after_unlink {
+            // Detach only after a successful final unlink, so an error cannot
+            // destroy data belonging to a still-visible file.
+            discard_inode(&inode);
         }
     }
     Ok(())
+}
+
+/// Remove a link at `path` relative to `cwd`.
+pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
+    debug!("unlinkat: cwd={}, path={}, flags={:#x}", cwd, path, flags);
+    let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
+    unlink_child(&parent, name.as_str(), flags)
 }
 
 impl File for OSInode {
@@ -1330,7 +1340,10 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         attrs.size
     };
     let stat = Stat {
-        dev: 0,
+        // `st_dev` identifies the mounted filesystem containing this inode.
+        // Keeping it aligned with the VFS cache key also lets userspace
+        // distinguish mount boundaries while reconstructing a physical cwd.
+        dev: inode.fs_id(),
         ino: attrs.ino,
         mode,
         nlink: attrs.nlink,

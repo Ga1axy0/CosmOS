@@ -168,6 +168,15 @@ pub enum VfsFileType {
     Unknown,
 }
 
+/// A directory entry together with the inode number exposed through
+/// `linux_dirent64::d_ino`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsDirEntry {
+    pub name: String,
+    pub file_type: VfsFileType,
+    pub ino: u64,
+}
+
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
@@ -176,28 +185,51 @@ pub trait VfsNode: Send + Sync + Any + Debug {
     fn as_any(&self) -> &dyn Any;
     /// List directory entries as `(name, file_type)` pairs.
     fn ls(&self) -> Vec<(String, VfsFileType)>;
+    /// List directory entries with the inode number reported by `stat(2)` for
+    /// the same child.
+    ///
+    /// Backends with a native directory iterator may override this to avoid
+    /// the per-name lookup. The default keeps the legacy `ls()` interface but
+    /// resolves each visible child so `getdents64().d_ino` is not confused
+    /// with the directory-entry position.
+    fn dir_entries(&self) -> Vec<VfsDirEntry> {
+        self.ls()
+            .into_iter()
+            .map(|(name, file_type)| {
+                let ino = self
+                    .find(name.as_str())
+                    .map(|child| child.ino())
+                    .unwrap_or(0);
+                VfsDirEntry {
+                    name,
+                    file_type,
+                    ino,
+                }
+            })
+            .collect()
+    }
     /// Fill `buf` with `linux_dirent64` records starting from the backend-defined
     /// directory position `offset`.
     ///
     /// The default implementation preserves the historical behavior used by the
     /// in-tree backends: `offset` is treated as an entry index and the method
-    /// is implemented on top of `ls()`.
+    /// is implemented on top of `dir_entries()`.
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let entries = self.ls();
+        let entries = self.dir_entries();
         let mut written = 0usize;
 
-        for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
-            let name_bytes = name.as_bytes();
+        for (i, entry) in entries.iter().enumerate().skip(offset) {
+            let name_bytes = entry.name.as_bytes();
             let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
             if written + reclen > buf.len() {
                 break;
             }
 
-            buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+            buf[written..written + 8].copy_from_slice(&entry.ino.to_le_bytes());
             let next_off = (i + 1) as i64;
             buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
             buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            buf[written + 18] = match file_type {
+            buf[written + 18] = match entry.file_type {
                 VfsFileType::Directory => 4,
                 VfsFileType::Symlink => 10,
                 VfsFileType::Char => 2,
@@ -425,6 +457,9 @@ pub struct Inode {
 struct InodeState {
     /// 由 OS 层按需挂载的 page cache 宿主对象。
     page_cache: Option<Arc<dyn Any + Send + Sync>>,
+    /// Page-cache data is newer than the backing inode and must keep this
+    /// stable inode alive until writeback or explicit discard completes.
+    page_cache_retained: bool,
     /// 最近一次读取到的 stat 元数据快照。
     stat_attrs: Option<VfsAttrs>,
 }
@@ -436,6 +471,7 @@ impl Inode {
             inner,
             state: Mutex::new(InodeState {
                 page_cache: None,
+                page_cache_retained: false,
                 stat_attrs: None,
             }),
         }
@@ -458,6 +494,12 @@ impl Inode {
 
     pub fn ls(&self) -> Vec<(String, VfsFileType)> {
         self.inner.ls()
+    }
+
+    /// Return a directory snapshot whose inode numbers agree with stat-like
+    /// metadata for the corresponding children.
+    pub fn dir_entries(&self) -> Vec<VfsDirEntry> {
+        self.inner.dir_entries()
     }
 
     pub fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
@@ -781,12 +823,18 @@ impl Inode {
     }
 
     pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
-        let old_child = self.find(old_name).map(|child| (child.fs_id(), child.ino()));
+        // Keep the stable in-memory inode alive across the backend rename. Its
+        // page-cache state can contain dirty bytes and a newer logical size
+        // than the backing inode until writeback completes.
+        let old_child = self.find(old_name);
+        let old_child_key = old_child
+            .as_ref()
+            .map(|child| (child.fs_id(), child.ino()));
         let replaced_child = new_parent
             .find(new_name)
             .filter(|child| {
                 let child_key = (child.fs_id(), child.ino());
-                Some(child_key) != old_child && (child.is_dir() || child.nlink() <= 1)
+                Some(child_key) != old_child_key && (child.is_dir() || child.nlink() <= 1)
             })
             .map(|child| (child.fs_id(), child.ino()));
         self.inner.rename_child(old_name, &new_parent.inner, new_name)?;
@@ -797,6 +845,9 @@ impl Inode {
         let new_fs = new_parent.fs_id();
         if new_fs != 0 {
             remove_dentry(new_fs, new_parent.ino(), new_name);
+            if let Some(old_child) = old_child.as_ref() {
+                insert_dentry(new_fs, new_parent.ino(), new_name, old_child);
+            }
         }
         if let Some((child_fs, child_ino)) = replaced_child {
             remove_cached_inode(child_fs, child_ino);
@@ -822,7 +873,25 @@ impl Inode {
 
     /// 为当前 inode 安装 page cache 宿主对象。
     pub fn set_page_cache_state<T: Any + Send + Sync>(&self, state: Arc<T>) {
-        self.state.lock().page_cache = Some(state);
+        let mut state_guard = self.state.lock();
+        state_guard.page_cache = Some(state);
+        state_guard.page_cache_retained = false;
+    }
+
+    /// Record whether upper-layer page-cache state contains data newer than
+    /// the backing inode.
+    ///
+    /// The generic VFS cache cannot inspect the type-erased mapping. This
+    /// explicit bit lets it preserve dirty mappings while still reclaiming
+    /// clean read-cache state.
+    pub fn set_page_cache_retained(&self, retained: bool) {
+        let mut state_guard = self.state.lock();
+        state_guard.page_cache_retained = retained && state_guard.page_cache.is_some();
+    }
+
+    /// Return whether dropping this stable inode could lose page-cache data.
+    pub fn page_cache_retained(&self) -> bool {
+        self.state.lock().page_cache_retained
     }
 
     /// 原子地获取或安装当前 inode 挂载的 page cache 宿主对象。
@@ -842,13 +911,15 @@ impl Inode {
         let state = init();
         let erased: Arc<dyn Any + Send + Sync> = state.clone();
         state_guard.page_cache = Some(erased);
+        state_guard.page_cache_retained = false;
         (state, true)
     }
 
     /// 移除当前 inode 挂载的 page cache 宿主对象。
     pub fn take_page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-        self.state
-            .lock()
+        let mut state_guard = self.state.lock();
+        state_guard.page_cache_retained = false;
+        state_guard
             .page_cache
             .take()
             .and_then(|state| state.downcast::<T>().ok())
@@ -860,5 +931,115 @@ impl Inode {
     /// (e.g. an ext4 root) so it can be stored as a mount-point overlay.
     pub fn vfs_node(&self) -> Arc<dyn VfsNode> {
         Arc::clone(&self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::convert::TryInto;
+
+    #[derive(Debug)]
+    struct TestFile {
+        ino: u64,
+    }
+
+    impl VfsNode for TestFile {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn ls(&self) -> Vec<(String, VfsFileType)> {
+            Vec::new()
+        }
+
+        fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn file_type(&self) -> VfsFileType {
+            VfsFileType::Regular
+        }
+
+        fn clear(&self) {}
+
+        fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+            0
+        }
+
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+            0
+        }
+
+        fn ino(&self) -> u64 {
+            self.ino
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestDir {
+        child_ino: u64,
+    }
+
+    impl VfsNode for TestDir {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn ls(&self) -> Vec<(String, VfsFileType)> {
+            alloc::vec![(String::from("child"), VfsFileType::Regular)]
+        }
+
+        fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+            (name == "child").then(|| {
+                Arc::new(TestFile {
+                    ino: self.child_ino,
+                }) as Arc<dyn VfsNode>
+            })
+        }
+
+        fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn file_type(&self) -> VfsFileType {
+            VfsFileType::Directory
+        }
+
+        fn clear(&self) {}
+
+        fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+            0
+        }
+
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn default_getdents64_reports_the_child_inode() {
+        let expected = 0x1234_5678_9abc_def0;
+        let dir = TestDir {
+            child_ino: expected,
+        };
+        let mut buf = [0u8; 64];
+
+        let written = dir.getdents64(0, &mut buf);
+
+        assert!(written >= 19 + "child".len() + 1);
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), expected);
     }
 }

@@ -506,15 +506,29 @@ pub(crate) fn warn_lost_runnable_tasks(reason: &'static str) {
     let mut orphans: Vec<Arc<TaskControlBlock>> = Vec::new();
 
     for (pid, process) in processes {
-        let process_inner = process.inner_exclusive_access();
-        let pgid = process_inner.cred.pgid;
-        let process_zombie = process_inner.is_zombie;
-        let exec_path = process_inner.exec_path.clone();
-        for (tid, task) in process_inner.tasks.iter().enumerate() {
-            let Some(task) = task.as_ref() else {
-                continue;
-            };
-            let task_ptr = Arc::as_ptr(task) as usize;
+        // Do not nest process-inner -> task-inner here.  exec rebuilds the
+        // current task's user resources by briefly taking task-inner and then
+        // process-inner; retaining the process lock while waiting for that task
+        // produces an AB-BA deadlock.  Snapshot the stable Arc references and
+        // process metadata, then inspect every task after dropping the process
+        // lock.
+        let (pgid, process_zombie, exec_path, tasks) = {
+            let process_inner = process.inner_exclusive_access();
+            let tasks: Vec<(usize, Arc<TaskControlBlock>)> = process_inner
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(tid, task)| task.as_ref().map(|task| (tid, Arc::clone(task))))
+                .collect();
+            (
+                process_inner.cred.pgid,
+                process_inner.is_zombie,
+                process_inner.exec_path.clone(),
+                tasks,
+            )
+        };
+        for (tid, task) in tasks {
+            let task_ptr = Arc::as_ptr(&task) as usize;
             let task_inner = task.inner_exclusive_access();
             // Read `on_cpu` under the task-inner lock so it is consistent with
             // status/on_rq (every on_cpu writer holds this lock). A torn read
@@ -531,7 +545,9 @@ pub(crate) fn warn_lost_runnable_tasks(reason: &'static str) {
             }
 
             // Confirmed lost-runnable orphan: collect it for self-heal below.
-            orphans.push(Arc::clone(task));
+            orphans.push(Arc::clone(&task));
+
+            let thread_id = task_inner.res.as_ref().map(|res| res.thread_id);
 
             let count = LOST_RUNNABLE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if !should_log_sched_sample(count) {
@@ -539,16 +555,18 @@ pub(crate) fn warn_lost_runnable_tasks(reason: &'static str) {
             }
 
             error!(
-                "[sched-inv][lost-runnable] reason={} count={} task={:#x} pid={} \
-                 tid={} pgid={} exec={} process_zombie={} wait={:?} last_cpu={} \
+                "[sched-inv][lost-runnable] reason={} count={} scan_hart={} task={:#x} pid={} \
+                 tid={} thread_id={:?} pgid={} exec={} process_zombie={} wait={:?} last_cpu={} \
                  policy={:?} on_cpu={} on_rq={} has_wq={} task_pending={:#x} \
                  mask={:#x} resched={:?} currents={:?} rq_snapshot={:?} \
                  last_sched_op={:?}",
                 reason,
                 count,
+                hartid(),
                 task_ptr,
                 pid,
                 tid,
+                thread_id,
                 pgid,
                 exec_path,
                 process_zombie,

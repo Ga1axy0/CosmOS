@@ -202,8 +202,12 @@ pub const SYSCALL_SETREUID: usize = 145;
 pub const SYSCALL_SETUID: usize = 146;
 /// setresuid syscall
 pub const SYSCALL_SETRESUID: usize = 147;
+/// getresuid syscall
+pub const SYSCALL_GETRESUID: usize = 148;
 /// setresgid syscall
 pub const SYSCALL_SETRESGID: usize = 149;
+/// getresgid syscall
+pub const SYSCALL_GETRESGID: usize = 150;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -878,7 +882,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETREUID => sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETRESUID => sys_getresuid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_SETRESGID => sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETRESGID => sys_getresgid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_GETUID => sys_getuid(),
@@ -1024,19 +1038,19 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     };
     if (-4095..0).contains(&result) {
         let errno = -result;
-        warn!(
-            "syscall error: id={} errno={}({}) result={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-            syscall_id,
-            errno,
-            errno_name(errno),
-            result,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-        );
+        // warn!(
+        //     "syscall error: id={} errno={}({}) result={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+        //     syscall_id,
+        //     errno,
+        //     errno_name(errno),
+        //     result,
+        //     args[0],
+        //     args[1],
+        //     args[2],
+        //     args[3],
+        //     args[4],
+        //     args[5],
+        // );
     }
     result
 }

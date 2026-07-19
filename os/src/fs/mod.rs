@@ -27,15 +27,16 @@ use core::any::Any;
 #[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
-pub use fs::vfs::{InodeTime, VfsFileType};
+pub use fs::vfs::{InodeTime, VfsDirEntry, VfsFileType};
 use fs::{
     dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode,
     InodeCacheStats,
 };
 use lazy_static::*;
 pub use page_cache::{
-    discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats, reclaim_if_needed,
-    release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
+    discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats,
+    reclaim_for_frame_allocation, reclaim_if_needed, release_mapped_page, retain_mapped_page,
+    sync_all as sync_page_cache_all,
     sync_fs as sync_page_cache_fs, sync_inode as sync_page_cache_inode, sync_inode_range,
     truncate_inode, CachePage, PageCacheStats, PAGE_CACHE_MANAGER,
 };
@@ -364,25 +365,21 @@ pub fn render_perf_counters() -> String {
     out
 }
 
-fn encode_dirent64_records(
-    entries: &[(String, VfsFileType)],
-    offset: usize,
-    buf: &mut [u8],
-) -> usize {
+fn encode_dirent64_records(entries: &[VfsDirEntry], offset: usize, buf: &mut [u8]) -> usize {
     let mut written = 0usize;
 
-    for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
-        let name_bytes = name.as_bytes();
+    for (i, entry) in entries.iter().enumerate().skip(offset) {
+        let name_bytes = entry.name.as_bytes();
         let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
         if written + reclen > buf.len() {
             break;
         }
 
-        buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+        buf[written..written + 8].copy_from_slice(&entry.ino.to_le_bytes());
         let next_off = (i + 1) as i64;
         buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
         buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        buf[written + 18] = match file_type {
+        buf[written + 18] = match entry.file_type {
             VfsFileType::Directory => 4,
             VfsFileType::Symlink => 10,
             VfsFileType::Char => 2,
@@ -738,7 +735,7 @@ struct FileDescriptionInner {
     /// 当前文件状态位。
     status_flags: FileStatusFlags,
     /// 目录项快照，避免遍历期间删除目录项导致位置漂移漏读。
-    dirent_snapshot: Option<Vec<(String, VfsFileType)>>,
+    dirent_snapshot: Option<Vec<VfsDirEntry>>,
 }
 
 /// 套接字的不可变元信息。
@@ -1157,7 +1154,7 @@ impl FileDescription {
                 } else {
                     if inner.offset == 0 || inner.dirent_snapshot.is_none() {
                         let snapshot_start_us = get_time_us();
-                        let snapshot = inode.ls();
+                        let snapshot = inode.dir_entries();
                         record_dir_snapshot_perf(
                             snapshot.len(),
                             get_time_us().saturating_sub(snapshot_start_us),
@@ -1472,8 +1469,8 @@ pub use inode::{
     lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, mkdir_at,
     mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
     open_file, open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat,
-    unlinkat, OSInode, OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW,
-    AT_SYMLINK_NOFOLLOW,
+    unlink_child, unlinkat, OSInode, OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
+    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::new_stdio_files;

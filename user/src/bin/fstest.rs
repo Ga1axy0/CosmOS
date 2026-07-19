@@ -77,6 +77,17 @@ pub fn main() -> i32 {
 	println!("[fstest] begin");
 
 	// ---- getcwd basic + boundary (too-small buffer) ----
+	let mut cwd_buf = [0u8; 256];
+	let cwd_ret = getcwd(&mut cwd_buf);
+	let cwd_len = cwd_buf
+		.iter()
+		.position(|&b| b == 0)
+		.expect("getcwd should NUL-terminate its result");
+	assert_eq!(
+		cwd_ret,
+		(cwd_len + 1) as isize,
+		"raw getcwd should return byte length including NUL"
+	);
 	let cwd0 = cwd_string();
 	println!("[fstest] cwd(start)={}", cwd0);
 	assert!(!cwd0.is_empty() && cwd0.as_bytes()[0] == b'/');

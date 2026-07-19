@@ -6,7 +6,7 @@ use super::WaitQueue;
 use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
 use super::{pid_alloc, PidHandle};
 use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
-use crate::config::PAGE_SIZE;
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{
     canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription,
     OpenFlags,
@@ -14,8 +14,8 @@ use crate::fs::{
 use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
 use crate::mm::{
-    register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
-    MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
+    register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, FilePageFaultPrepare,
+    InodeKey, MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
     UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sched::insert_into_pid2process;
@@ -1169,30 +1169,65 @@ impl ProcessControlBlock {
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
         let task = self.inner_exclusive_access().get_task(0);
-        // Hold task_inner only briefly to update resource fields and capture the
-        // user stack top. The slow work — `init_user_stack_from_strings`, which
-        // copies args/envs/auxv into the new user address space (string ops +
-        // user page faults; seen via `grapheme_extend::lookup_slow`) — is done
-        // BELOW with the lock released. Holding this `SpinNoIrqLock` (IRQs
-        // disabled) across that slow work blocked in-flight global TLB shootdown
-        // IPIs from being serviced on this hart, wedging the whole machine under
-        // exec-heavy workloads (Ctrl+C ineffective). This task is the current,
-        // single thread of the process, so no other hart mutates it while the
-        // lock is released.
-        let ustack_top = {
+        // Capture the mapping layout without retaining task-inner.  In
+        // particular, TaskUserRes::{alloc_user_res,trap_cx_ppn} both acquire
+        // process-inner, so calling them under task-inner inverts the scheduler's
+        // normal process-inner -> task-inner order and can deadlock against a
+        // process/task scan.
+        let (tid, ustack_bottom, ustack_top, trap_cx_bottom) = {
             let mut task_inner = task.inner_exclusive_access();
-            task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
-            task_inner
-                .res
-                .as_mut()
-                .unwrap()
-                .alloc_user_res()
+            let res = task_inner.res.as_mut().unwrap();
+            res.ustack_base = ustack_base;
+            let ustack_top = res.ustack_top();
+            (
+                res.tid,
+                ustack_top - USER_STACK_SIZE,
+                ustack_top,
+                res.trap_cx_user_va(),
+            )
+        };
+
+        // Recreate both VMAs while holding only process-inner.  This mirrors
+        // TaskUserRes::alloc_user_res, but deliberately keeps task-inner out of
+        // the critical section.
+        let trap_cx_ppn = {
+            let mut process_inner = self.inner_exclusive_access();
+            let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), tid);
+            if tid == 0 {
+                process_inner
+                    .memory_set
+                    .insert_vma_eager(ustack_vma)
+                    .map_err(mm_error_to_errno)?;
+            } else {
+                process_inner
+                    .memory_set
+                    .insert_vma(ustack_vma, None)
+                    .map_err(mm_error_to_errno)?;
+            }
+            process_inner
+                .memory_set
+                .insert_vma(
+                    Vma::new_trap_context(
+                        trap_cx_bottom.into(),
+                        (trap_cx_bottom + PAGE_SIZE).into(),
+                        tid,
+                    ),
+                    None,
+                )
                 .map_err(mm_error_to_errno)?;
-            task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
+            process_inner
+                .memory_set
+                .translate(VirtAddr::from(trap_cx_bottom).into())
+                .unwrap()
+                .ppn()
+        };
+
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.trap_cx_ppn = trap_cx_ppn;
             task_inner.pending_signals = SignalBit::empty();
             task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
-            task_inner.res.as_ref().unwrap().ustack_top()
-        };
+        }
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
         //         argv[0..argc-1], NULL
@@ -1959,10 +1994,23 @@ impl ProcessControlBlock {
         fault_addr: usize,
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
-        self.inner
-            .lock()
-            .memory_set
-            .handle_lazy_user_fault(VirtAddr::from(fault_addr), access)
+        let (handled, token, mask) = {
+            let mut inner = self.inner.lock();
+            let handled = inner
+                .memory_set
+                .handle_lazy_user_fault(VirtAddr::from(fault_addr), access)?;
+            let token = inner.memory_set.token();
+            let mask = if handled == PageFaultHandled::Handled {
+                inner.memory_set.loaded_user_harts()
+            } else {
+                0
+            };
+            (handled, token, mask)
+        };
+        if mask != 0 {
+            shootdown(mask, ShootdownKind::AddressSpace { token });
+        }
+        Ok(handled)
     }
     /// 处理当前进程的 file-backed 缺页。
     pub fn handle_file_page_fault(
@@ -1978,13 +2026,23 @@ impl ProcessControlBlock {
             access
         );
         if access == PageFaultAccess::Write {
-            let notified = {
+            let (notified, token, mask) = {
                 let mut inner = self.inner.lock();
-                inner
+                let notified = inner
                     .memory_set
-                    .handle_shared_write_fault(VirtAddr::from(fault_addr))
+                    .handle_shared_write_fault(VirtAddr::from(fault_addr));
+                let token = inner.memory_set.token();
+                let mask = if notified {
+                    inner.memory_set.loaded_user_harts()
+                } else {
+                    0
+                };
+                (notified, token, mask)
             };
             if notified {
+                if mask != 0 {
+                    shootdown(mask, ShootdownKind::AddressSpace { token });
+                }
                 trace!(
                     "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
                     self.getpid(),
@@ -1993,20 +2051,42 @@ impl ProcessControlBlock {
                 return Ok(PageFaultHandled::Handled);
             }
         }
-        let plan = {
+        let (prepared, token, mask) = {
             let inner = self.inner.lock();
-            inner
+            let prepared = inner
                 .memory_set
-                .prepare_file_page_fault(VirtAddr::from(fault_addr), access)
+                .prepare_file_page_fault(VirtAddr::from(fault_addr), access);
+            let token = inner.memory_set.token();
+            let mask = if matches!(&prepared, FilePageFaultPrepare::Resolved) {
+                inner.memory_set.loaded_user_harts()
+            } else {
+                0
+            };
+            (prepared, token, mask)
         };
-        let Some(plan) = plan else {
-            trace!(
-                "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
-                self.getpid(),
-                fault_addr,
-                access
-            );
-            return Ok(PageFaultHandled::NotHandled);
+        let plan = match prepared {
+            FilePageFaultPrepare::Resolved => {
+                if mask != 0 {
+                    shootdown(mask, ShootdownKind::AddressSpace { token });
+                }
+                trace!(
+                    "[mmap] page fault resolved by present PTE: pid={} addr={:#x} access={:?}",
+                    self.getpid(),
+                    fault_addr,
+                    access
+                );
+                return Ok(PageFaultHandled::Handled);
+            }
+            FilePageFaultPrepare::Pending(plan) => plan,
+            FilePageFaultPrepare::NotHandled => {
+                trace!(
+                    "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
+                    self.getpid(),
+                    fault_addr,
+                    access
+                );
+                return Ok(PageFaultHandled::NotHandled);
+            }
         };
         let Some(inode) = plan.file.backing_inode() else {
             return Ok(PageFaultHandled::NotHandled);
@@ -2043,14 +2123,30 @@ impl ProcessControlBlock {
         } else {
             mapping.try_get_page(plan.page_idx)?
         };
-        let mut inner = self.inner.lock();
-        // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
-        // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。
-        let committed = if plan.shared {
-            inner.memory_set.map_shared_file_page(&plan, page)
-        } else {
-            inner.memory_set.map_private_file_page(&plan, page)
-        }?;
+        let (committed, token, mask) = {
+            let mut inner = self.inner.lock();
+            // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
+            // 后续补齐更严格的 `mm_seq` 代际校验。
+            let committed = if plan.shared {
+                inner.memory_set.map_shared_file_page(&plan, page)
+            } else {
+                inner.memory_set.map_private_file_page(&plan, page)
+            }?;
+            let token = inner.memory_set.token();
+            let mask = if committed == PageFaultHandled::Handled {
+                inner.memory_set.loaded_user_harts()
+            } else {
+                0
+            };
+            (committed, token, mask)
+        };
+        // File-backed PTEs are shared by all threads in this process.  The
+        // mapping helper has already flushed the faulting hart locally; flush
+        // every other hart that was running this address space before allowing
+        // it to continue with a cached invalid or restrictive translation.
+        if mask != 0 {
+            shootdown(mask, ShootdownKind::AddressSpace { token });
+        }
         trace!(
             "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
             self.getpid(),

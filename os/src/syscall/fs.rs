@@ -1,14 +1,14 @@
 use crate::fs::devfs::BlockDevNode;
 use crate::fs::Pipe;
 use crate::fs::{
-    canonicalize, discard_inode, do_bind_mount, do_move_mount, do_umount, inode_stat,
-    linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
-    make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
-    mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
-    rename_at, symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all,
-    truncate_inode, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime,
-    OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode,
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    canonicalize, do_bind_mount, do_move_mount, do_umount, inode_stat, linkat_with_flags,
+    lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, make_pipe,
+    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
+    open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path, rename_at,
+    symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all, truncate_inode,
+    unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags,
+    PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode, AT_EMPTY_PATH,
+    AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
@@ -3963,20 +3963,7 @@ pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
             return Err(ERRNO::ENOENT);
         }
         if let Some(parent) = resolve_simple_dirfd_inode(dirfd, name.as_str())? {
-            if flags & AT_REMOVEDIR == 0 {
-                let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
-                if inode.is_dir() {
-                    return Err(ERRNO::EISDIR);
-                }
-                discard_inode(&inode);
-                parent.unlink(name.as_str())?;
-            } else {
-                let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
-                if !inode.is_dir() {
-                    return Err(ERRNO::ENOTDIR);
-                }
-                parent.rmdir(name.as_str())?;
-            }
+            unlink_child(&parent, name.as_str(), flags)?;
         } else {
             let cwd = resolve_dirfd_base(dirfd, name.as_str())?;
             unlinkat(cwd.as_str(), &name, flags)?;
@@ -3987,23 +3974,25 @@ pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
 
 /// getcwd – copy the current working directory into a user-space buffer.
 ///
-/// Returns the buffer address as `isize` on success, −errno on failure.
+/// The raw Linux syscall returns the number of bytes copied, including the
+/// trailing NUL, on success. The libc `getcwd(3)` wrapper converts that length
+/// back into the caller's buffer pointer.
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_getcwd",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        if size == 0 || buf.is_null() {
-            return Err(ERRNO::EINVAL);
-        }
         let cwd = current_process().inner_exclusive_access().cwd.clone();
         let cwd_bytes = cwd.as_bytes();
-        if size < cwd_bytes.len() + 1 {
+        let total = cwd_bytes.len() + 1;
+        // Linux checks the required size before touching the user pointer, so
+        // a NULL buffer that is also too small reports ERANGE rather than
+        // EFAULT.
+        if size < total {
             return Err(ERRNO::ERANGE);
         }
         // Write cwd + null terminator into the user buffer in one pass.
-        let total = cwd_bytes.len() + 1;
         let src: Vec<u8> = cwd_bytes
             .iter()
             .copied()
@@ -4011,7 +4000,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
             .collect();
         debug_assert_eq!(src.len(), total);
         write_bytes_to_user(buf, &src)?;
-        Ok(buf as isize)
+        Ok(total as isize)
     })
 }
 

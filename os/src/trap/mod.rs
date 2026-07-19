@@ -26,16 +26,89 @@ use crate::signal::{handle_signals, SignalBit, SignalNum};
 use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::task::{
     check_fatal_signals_of_current, check_itimers_of_all_processes, current_add_signal,
-    current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, exit_current_and_run_next, exit_group_current_and_run_next, ExitReason,
+    current_process, current_process_is_zombie, current_task, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    exit_group_current_and_run_next, ExitReason,
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+
+/// Snapshot the address-space state at a user fault.
+///
+/// The trap entry has already switched `satp` to the kernel address space by
+/// the time this function runs.  Therefore both the post-trap kernel token and
+/// the process' user token are recorded explicitly; confusing the two makes
+/// TLB/address-space races very difficult to diagnose.
+fn log_user_fault_mapping(fault_addr: usize) {
+    let process = current_process();
+    let task = current_task();
+    let (tid, thread_id) = task
+        .as_ref()
+        .and_then(|task| {
+            let inner = task.inner_exclusive_access();
+            inner
+                .res
+                .as_ref()
+                .map(|res| (Some(res.tid), Some(res.thread_id)))
+        })
+        .unwrap_or((None, None));
+    let kernel_satp = unsafe { crate::hal::current_address_space_token() };
+    let vpn = crate::mm::VirtAddr::from(fault_addr).floor();
+    let page_offset = fault_addr & (PAGE_SIZE - 1);
+
+    let (user_token, loaded_user_harts, pte_info, vma_info) = {
+        let inner = process.inner_exclusive_access();
+        let memory_set = &inner.memory_set;
+        let pte_info = memory_set
+            .page_table
+            .translate(vpn)
+            .map(|pte| (pte.bits, pte.ppn().0, pte.flags()));
+        let vma_info = memory_set.find_vma_containing(vpn).map(|vma| {
+            let file_info = vma
+                .file
+                .as_ref()
+                .map(|file| (file.pgoff, file.shared, file.file.path()));
+            (
+                vma.start_vpn().0,
+                vma.end_vpn().0,
+                vma.map_perm,
+                vma.kind.clone(),
+                file_info,
+                vma.file_page_index(vpn),
+            )
+        });
+        (
+            memory_set.token(),
+            memory_set.loaded_user_harts(),
+            pte_info,
+            vma_info,
+        )
+    };
+
+    error!(
+        "[kernel] user fault mapping: hart={} pid={} tid={:?} thread_id={:?} \
+         addr={:#x} vpn={:#x} page_offset={:#x} kernel_satp={:#x} user_token={:#x} \
+         loaded_user_harts={:#b} pte={:?} vma={:?}",
+        hartid(),
+        process.getpid(),
+        tid,
+        thread_id,
+        fault_addr,
+        vpn.0,
+        page_offset,
+        kernel_satp,
+        user_token,
+        loaded_user_harts,
+        pte_info,
+        vma_info,
+    );
+}
 
 /// 输出用户态致命异常现场，区分 fault 地址、用户 PC 与关键寄存器。
 fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
     let cx = current_trap_cx();
     let summary = cx.fault_dump_summary();
     let detail = cx.fault_dump_detail();
+    log_user_fault_mapping(fault_addr);
     error!(
         "[kernel] user fault: reason={}, access={}, pid={}, fault_addr={:#x}, user_pc={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, signal={}",
         reason,
@@ -211,6 +284,9 @@ fn handle_reschedule_ipi() {
 #[no_mangle]
 pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
+    // The trampoline has already switched to the kernel page table.  Ack an
+    // older shootdown snapshot before taking locks or relying on SIE delivery.
+    crate::mm::poll_pending_shootdown();
     current_process().enter_kernel(get_time());
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
@@ -466,7 +542,30 @@ pub fn trap_handler() -> ! {
     }
     // check signals
     if let Some((signum, msg)) = check_fatal_signals_of_current() {
-        trace!("[kernel] trap_handler: .. check signals {}", msg);
+        let task = current_task();
+        let (tid, thread_id) = task
+            .as_ref()
+            .and_then(|task| {
+                let inner = task.inner_exclusive_access();
+                inner
+                    .res
+                    .as_ref()
+                    .map(|res| (Some(res.tid), Some(res.thread_id)))
+            })
+            .unwrap_or((None, None));
+        let cx = current_trap_cx();
+        warn!(
+            "[signal] fatal signum={} hart={} pid={} tid={:?} thread_id={:?} \
+             reason={} user_pc={:#x} user_sp={:#x}",
+            signum,
+            hartid(),
+            current_process().getpid(),
+            tid,
+            thread_id,
+            msg,
+            cx.user_pc(),
+            cx.user_sp(),
+        );
         exit_current_and_run_next(ExitReason::Signal(signum as u32));
     }
     if current_process_is_zombie() {

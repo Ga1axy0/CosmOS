@@ -305,6 +305,36 @@ pub fn sys_getegid() -> isize {
     process.getegid() as isize
 }
 
+/// getresuid syscall
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        let (real, effective, saved) = {
+            let inner = process.inner_exclusive_access();
+            (inner.cred.uid, inner.cred.euid, inner.cred.suid)
+        };
+        write_pod_to_user(ruid, &real)?;
+        write_pod_to_user(euid, &effective)?;
+        write_pod_to_user(suid, &saved)?;
+        Ok(0)
+    })
+}
+
+/// getresgid syscall
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        let (real, effective, saved) = {
+            let inner = process.inner_exclusive_access();
+            (inner.cred.gid, inner.cred.egid, inner.cred.sgid)
+        };
+        write_pod_to_user(rgid, &real)?;
+        write_pod_to_user(egid, &effective)?;
+        write_pod_to_user(sgid, &saved)?;
+        Ok(0)
+    })
+}
+
 /// getgroups syscall
 pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
     let process = current_process();

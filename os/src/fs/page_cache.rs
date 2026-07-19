@@ -21,7 +21,7 @@ use crate::mm::{
 };
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
-use crate::task::{WaitQueue, WaitReason};
+use crate::task::{current_task, WaitQueue, WaitReason};
 
 #[cfg(feature = "io_perf_counters")]
 static READ_PAGE_LOADS: AtomicUsize = AtomicUsize::new(0);
@@ -101,6 +101,9 @@ pub struct CachePage {
     map_count: usize,
     /// 简化 CLOCK 回收用访问位。
     ref_bit: bool,
+    /// A buffered writer modified this page after the current writeback copy
+    /// was captured, so completion must leave it dirty for another pass.
+    redirtied_during_writeback: bool,
     /// 并发装页/回写时的等待队列。
     wait_queue: Arc<WaitQueue>,
 }
@@ -117,6 +120,7 @@ impl CachePage {
             pin_count: 0,
             map_count: 0,
             ref_bit: true,
+            redirtied_during_writeback: false,
             wait_queue: Arc::new(WaitQueue::new()),
         }
     }
@@ -334,6 +338,82 @@ lazy_static! {
     /// 全局 page cache 管理器。
     pub static ref PAGE_CACHE_MANAGER: SpinNoIrqLock<PageCacheManager> =
         SpinNoIrqLock::new(PageCacheManager::new());
+    /// Tasks waiting for the active direct reclaimer to release ownership.
+    static ref PAGE_CACHE_RECLAIM_WAIT_QUEUE: WaitQueue = WaitQueue::new();
+}
+
+/// The task currently running direct page-cache reclaim, or zero when idle.
+///
+/// A task identity, rather than a hart id, is used because reclaim may sleep
+/// during writeback and another task can run on the same hart in the meantime.
+static PAGE_CACHE_RECLAIM_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+struct PageCacheReclaimGuard {
+    owner: usize,
+}
+
+impl Drop for PageCacheReclaimGuard {
+    fn drop(&mut self) {
+        let released = PAGE_CACHE_RECLAIM_OWNER.compare_exchange(
+            self.owner,
+            0,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        debug_assert!(released.is_ok());
+        if released.is_ok() {
+            PAGE_CACHE_RECLAIM_WAIT_QUEUE.wake_all();
+        }
+    }
+}
+
+enum PageCacheReclaimAcquire {
+    Acquired(PageCacheReclaimGuard),
+    Reentrant,
+    Busy,
+}
+
+fn current_reclaim_owner_token() -> usize {
+    current_task()
+        .map(|task| Arc::as_ptr(&task) as usize)
+        // Reclaim should normally run in task context. Keep early-boot callers
+        // safe and distinguish their ownership by hart when no task exists.
+        .unwrap_or_else(|| hartid().saturating_add(1))
+}
+
+fn try_acquire_page_cache_reclaim() -> PageCacheReclaimAcquire {
+    let owner = current_reclaim_owner_token();
+    match PAGE_CACHE_RECLAIM_OWNER.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed) {
+        Ok(_) => PageCacheReclaimAcquire::Acquired(PageCacheReclaimGuard { owner }),
+        Err(active_owner) if active_owner == owner => PageCacheReclaimAcquire::Reentrant,
+        Err(_) => PageCacheReclaimAcquire::Busy,
+    }
+}
+
+/// Wait for exclusive reclaim ownership after a physical-frame allocation
+/// failure. Ordinary watermark checks never wait; they leave the work to the
+/// already-active reclaimer instead.
+fn acquire_page_cache_reclaim_for_allocation() -> Option<PageCacheReclaimGuard> {
+    loop {
+        match try_acquire_page_cache_reclaim() {
+            PageCacheReclaimAcquire::Acquired(guard) => return Some(guard),
+            // Recursing into frame reclaim from the active reclaimer cannot
+            // make progress by waiting for itself.
+            PageCacheReclaimAcquire::Reentrant => return None,
+            PageCacheReclaimAcquire::Busy => {
+                if current_task().is_some() {
+                    PAGE_CACHE_RECLAIM_WAIT_QUEUE
+                        .wait_with_reason_or_skip(WaitReason::PageCacheReclaim, || {
+                            PAGE_CACHE_RECLAIM_OWNER.load(Ordering::Acquire) == 0
+                        });
+                } else {
+                    while PAGE_CACHE_RECLAIM_OWNER.load(Ordering::Acquire) != 0 {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Return the current page-cache footprint and metadata queue sizes.
@@ -459,8 +539,8 @@ pub fn mapping_for_inode(inode: &Arc<Inode>) -> Option<PageMappingHandle> {
     if !is_inode_page_cacheable(inode) {
         return None;
     }
-    if let Some(mapping) = try_get_mapping(inode) {
-        return Some(mapping);
+    if let Some(mapping) = inode.page_cache_state::<SpinNoIrqLock<PageMapping>>() {
+        return Some(PageMappingHandle::new(mapping));
     }
     Some(PageMappingHandle::new(get_or_create_mapping(inode)))
 }
@@ -769,29 +849,96 @@ pub fn mark_cached_page_dirty(page: &Arc<SpinNoIrqLock<CachePage>>) {
 fn try_get_mapping(inode: &Arc<Inode>) -> Option<PageMappingHandle> {
     inode
         .page_cache_state::<SpinNoIrqLock<PageMapping>>()
+        .or_else(|| try_get_registered_mapping(inode))
         .map(PageMappingHandle::new)
+}
+
+/// Look up the canonical mapping by stable inode identity.
+///
+/// The VFS normally canonicalizes `Arc<Inode>`, but mmap/exec and cache
+/// invalidation paths can legitimately produce another wrapper for the same
+/// backing inode. The global registry is therefore the source of truth for
+/// page-cache identity, not the address of an individual wrapper.
+fn try_get_registered_mapping(inode: &Arc<Inode>) -> Option<Arc<SpinNoIrqLock<PageMapping>>> {
+    let key = InodeKey::from_inode(inode);
+    let mut manager = PAGE_CACHE_MANAGER.lock();
+    let mapping = manager
+        .mappings
+        .get(&key)
+        .cloned()
+        .and_then(|weak| weak.upgrade());
+    if mapping.is_none() {
+        manager.mappings.remove(&key);
+    }
+    mapping
 }
 
 /// 获取或创建 inode 对应的 page mapping。
 fn get_or_create_mapping(inode: &Arc<Inode>) -> Arc<SpinNoIrqLock<PageMapping>> {
     let current_size = inode.size();
-    let (mapping, inserted) = inode.get_or_insert_page_cache_state(|| {
-        Arc::new(SpinNoIrqLock::new(PageMapping::new(inode, current_size)))
-    });
+    let key = InodeKey::from_inode(inode);
+    let local_mapping = inode.page_cache_state::<SpinNoIrqLock<PageMapping>>();
+
+    // Arbitrate creation under the global registry lock before attaching the
+    // result to an individual Inode wrapper. Otherwise two wrappers for the
+    // same `(fs_id, ino)` can each create a mapping and the later insertion
+    // silently hides dirty data and the page-cache-only file length of the
+    // first mapping.
+    let (mapping, registered) = {
+        let mut manager = PAGE_CACHE_MANAGER.lock();
+        let existing = manager
+            .mappings
+            .get(&key)
+            .cloned()
+            .and_then(|weak| weak.upgrade());
+        if let Some(existing) = existing {
+            (existing, false)
+        } else {
+            manager.mappings.remove(&key);
+            let mapping = local_mapping.unwrap_or_else(|| {
+                Arc::new(SpinNoIrqLock::new(PageMapping::new(inode, current_size)))
+            });
+            manager.mappings.insert(key, Arc::downgrade(&mapping));
+            (mapping, true)
+        }
+    };
+
+    let (attached_mapping, attached) =
+        inode.get_or_insert_page_cache_state(|| Arc::clone(&mapping));
+    if !Arc::ptr_eq(&attached_mapping, &mapping) {
+        // All creators use the registry arbitration above, so this can only
+        // indicate a broken invariant. Keep release builds on the canonical
+        // mapping as well instead of allowing future local fast paths to
+        // observe a private mapping.
+        debug_assert!(false, "inode has a non-canonical page-cache mapping");
+        inode.set_page_cache_state(Arc::clone(&mapping));
+    }
+
+    let mut adopted_owner = false;
     {
         let mut mapping_guard = mapping.lock();
+        if mapping_guard.inode.upgrade().is_none() {
+            mapping_guard.inode = Arc::downgrade(inode);
+            adopted_owner = true;
+        }
         if mapping_guard.size < current_size {
             mapping_guard.size = current_size;
         }
+        if adopted_owner && !mapping_guard.dirty_pages.is_empty() {
+            inode.set_page_cache_retained(true);
+        }
     }
-    if inserted {
-        let key = InodeKey::from_inode(inode);
-        PAGE_CACHE_MANAGER
-            .lock()
-            .mappings
-            .insert(key, Arc::downgrade(&mapping));
+    if registered {
         debug!(
             "[page_cache] mapping miss: inode_ptr={:#x} fs_id={} ino={} size={}",
+            Arc::as_ptr(inode) as usize,
+            inode.fs_id(),
+            inode.ino(),
+            current_size
+        );
+    } else if attached {
+        debug!(
+            "[page_cache] mapping adopted: inode_ptr={:#x} fs_id={} ino={} size={}",
             Arc::as_ptr(inode) as usize,
             inode.fs_id(),
             inode.ino(),
@@ -1051,6 +1198,11 @@ fn truncate_mapping(
             }
             if new_size == 0 {
                 mapping_guard.dirty_pages.clear();
+            }
+            if mapping_guard.dirty_pages.is_empty() {
+                if let Some(inode) = mapping_guard.inode.upgrade() {
+                    inode.set_page_cache_retained(false);
+                }
             }
             removed_cnt
         } else {
@@ -1450,12 +1602,19 @@ fn finish_page_run(
 fn mark_page_dirty(mapping: &Arc<SpinNoIrqLock<PageMapping>>, page_guard: &mut CachePage) {
     page_guard.ref_bit = true;
     if page_guard.state.contains(CachePageState::DIRTY) {
+        if page_guard.state.contains(CachePageState::WRITEBACK) {
+            page_guard.redirtied_during_writeback = true;
+        }
         return;
     }
     page_guard
         .state
         .insert(CachePageState::DIRTY | CachePageState::UPTODATE);
-    mapping.lock().dirty_pages.insert(page_guard.index);
+    let mut mapping_guard = mapping.lock();
+    mapping_guard.dirty_pages.insert(page_guard.index);
+    if let Some(inode) = mapping_guard.inode.upgrade() {
+        inode.set_page_cache_retained(true);
+    }
 }
 
 /// 同步单个 mapping 的全部脏页。
@@ -1593,6 +1752,7 @@ fn collect_writeback_batch(
             }
 
             page_guard.state.insert(CachePageState::WRITEBACK);
+            page_guard.redirtied_during_writeback = false;
             page_guard.pin_count += 1;
             let valid_bytes = page_guard.valid_bytes;
             let bytes = page_guard.ppn().get_bytes_array();
@@ -1686,13 +1846,26 @@ fn finish_page_writeback(
     let wait_queue = {
         let mut page_guard = page.lock();
         if page_guard.state.contains(CachePageState::DIRTY) {
-            if !write_ok || page_guard.map_count > 0 {
+            if !write_ok
+                || page_guard.map_count > 0
+                || page_guard.redirtied_during_writeback
+            {
                 // 共享映射仍然存在时先保守地维持脏状态，避免写回后后续写入无法再次通知内核。
                 // TODO：后续补齐反向映射后，可在写回前清 PTE 脏位并重新写保护，从而精确清脏。
-                mapping.lock().dirty_pages.insert(page_idx);
+                let mut mapping_guard = mapping.lock();
+                mapping_guard.dirty_pages.insert(page_idx);
+                if let Some(inode) = mapping_guard.inode.upgrade() {
+                    inode.set_page_cache_retained(true);
+                }
             } else {
                 page_guard.state.remove(CachePageState::DIRTY);
-                mapping.lock().dirty_pages.remove(&page_idx);
+                let mut mapping_guard = mapping.lock();
+                mapping_guard.dirty_pages.remove(&page_idx);
+                if mapping_guard.dirty_pages.is_empty() {
+                    if let Some(inode) = mapping_guard.inode.upgrade() {
+                        inode.set_page_cache_retained(false);
+                    }
+                }
             }
         }
         page_guard.state.remove(CachePageState::WRITEBACK);
@@ -1716,6 +1889,7 @@ fn flush_page(
                 return Ok(());
             } else {
                 page_guard.state.insert(CachePageState::WRITEBACK);
+                page_guard.redirtied_during_writeback = false;
                 page_guard.pin_count += 1;
                 let inode = {
                     let mapping_guard = mapping.lock();
@@ -1787,16 +1961,37 @@ fn flush_page(
 
 /// 若当前缓存压力过大，则回收到低水位。
 pub fn reclaim_if_needed() {
+    let _reclaim_guard = match try_acquire_page_cache_reclaim() {
+        PageCacheReclaimAcquire::Acquired(guard) => guard,
+        // Another task is already reclaiming toward the shared low watermark,
+        // so parallel callers must not duplicate its full inactive-list scan.
+        PageCacheReclaimAcquire::Reentrant | PageCacheReclaimAcquire::Busy => return,
+    };
     refresh_page_cache_watermarks();
-    let mut pass = 0usize;
+
+    // True high/low hysteresis: crossing high starts a reclaim episode; once
+    // started, reclaim_to_low_watermark keeps going until low (or no progress).
+    let above_high_watermark = {
+        let manager = PAGE_CACHE_MANAGER.lock();
+        manager.cached_pages > manager.high_watermark
+    };
+    if !above_high_watermark {
+        return;
+    }
+
+    let _ = reclaim_to_low_watermark(false);
+}
+
+/// Run one serialized reclaim episode. When `allocate_after_progress` is set,
+/// stop as soon as reclaim has made a physical frame available.
+fn reclaim_to_low_watermark(allocate_after_progress: bool) -> Option<FrameTracker> {
     let mut deferred_only_passes = 0usize;
     loop {
-        let (cached_before, low_watermark, high_watermark, inactive_before) = {
+        let (cached_before, low_watermark, inactive_before) = {
             let manager = PAGE_CACHE_MANAGER.lock();
             (
                 manager.cached_pages,
                 manager.low_watermark,
-                manager.high_watermark,
                 manager.inactive.len(),
             )
         };
@@ -1807,11 +2002,15 @@ pub fn reclaim_if_needed() {
             break;
         }
 
-        pass += 1;
         let stats = run_reclaim_pass(inactive_before);
 
         if stats.reclaimed > 0 {
             deferred_only_passes = 0;
+            if allocate_after_progress {
+                if let Some(frame) = frame_alloc() {
+                    return Some(frame);
+                }
+            }
             continue;
         }
 
@@ -1823,7 +2022,14 @@ pub fn reclaim_if_needed() {
         if deferred_only_passes >= MAX_DEFERRED_ONLY_PASSES {
             break;
         }
+
+        if allocate_after_progress {
+            if let Some(frame) = frame_alloc() {
+                return Some(frame);
+            }
+        }
     }
+    None
 }
 
 const MAX_DEFERRED_ONLY_PASSES: usize = 4;
@@ -2002,48 +2208,22 @@ fn alloc_cache_frame() -> Option<FrameTracker> {
         return Some(frame);
     }
     let _ = sync_all();
-    // 分配失败时再主动推进回收，避免 cache 尚未超过高水位时错过可回收页。
-    let mut pass = 0usize;
-    let mut deferred_only_passes = 0usize;
-    loop {
-        let (cached_before, low_watermark, high_watermark, inactive_before) = {
-            let manager = PAGE_CACHE_MANAGER.lock();
-            (
-                manager.cached_pages,
-                manager.low_watermark,
-                manager.high_watermark,
-                manager.inactive.len(),
-            )
-        };
-        if inactive_before == 0 {
-            break;
-        }
+    reclaim_for_frame_allocation()
+}
 
-        pass += 1;
-        let stats = run_reclaim_pass(inactive_before);
+/// Serialize emergency reclaim after a physical-frame allocation failure.
+/// Unlike the ordinary watermark path this may scan even below `high`, but it
+/// still respects `low` and returns as soon as one frame can be allocated.
+pub fn reclaim_for_frame_allocation() -> Option<FrameTracker> {
+    let _reclaim_guard = acquire_page_cache_reclaim_for_allocation()?;
 
-        if stats.reclaimed > 0 {
-            deferred_only_passes = 0;
-            if let Some(frame) = frame_alloc() {
-                return Some(frame);
-            }
-            continue;
-        }
-
-        if stats.deferred == 0 {
-            break;
-        }
-
-        deferred_only_passes += 1;
-        if deferred_only_passes >= MAX_DEFERRED_ONLY_PASSES {
-            break;
-        }
-
-        if let Some(frame) = frame_alloc() {
-            return Some(frame);
-        }
+    // A concurrent owner may have freed a frame before handing us the gate.
+    if let Some(frame) = frame_alloc() {
+        return Some(frame);
     }
-    None
+
+    refresh_page_cache_watermarks();
+    reclaim_to_low_watermark(true)
 }
 
 /// 计算文件偏移所属页号。

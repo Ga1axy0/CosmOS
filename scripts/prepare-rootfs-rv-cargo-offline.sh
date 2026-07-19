@@ -111,6 +111,12 @@ CONFIG_EOF
 # the target-specific Starry linker configuration remains owned by tgoskits.
 cat >> "$guest_config" <<CONFIG_EOF
 
+[env]
+# cc-rs treats HOST == TARGET as a native build and otherwise falls back to
+# /usr/bin/cc, which is the guest's musl compiler.  Select the matching glibc
+# wrapper for C dependencies of GNU-host build scripts such as libz-sys.
+CC_${GLIBC_HOST_TARGET//-/_} = "${GLIBC_HOST_LINKER}"
+
 [target.${GLIBC_HOST_TARGET}]
 linker = "${GLIBC_HOST_LINKER}"
 CONFIG_EOF
