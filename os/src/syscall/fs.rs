@@ -10,7 +10,7 @@ use crate::fs::{
     PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode, AT_EMPTY_PATH,
     AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
-use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
+use crate::mm::{translated_byte_buffer, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
 use crate::poll::{self, PollWakeState};
 use crate::sched::block_current_and_run_next;
@@ -3003,11 +3003,10 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, mode: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let process = current_process();
-    let token = current_user_token();
     syscall_body!({
         // TODO: 目前只有O_CLOEXEC位会落入FD层处理。
         const O_CLOEXEC: i32 = 0x80000;
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3061,10 +3060,9 @@ pub fn sys_truncate(path: *const u8, len: isize) -> isize {
         "kernel:pid[{}] sys_truncate",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         let new_size = parse_truncate_len(len)?;
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3874,13 +3872,12 @@ pub fn sys_linkat(
         "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if flags & !AT_SYMLINK_FOLLOW != 0 {
             return Err(ERRNO::EINVAL);
         }
-        let old_path = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
-        let new_path = translated_str(token, new_name).or_errno(ERRNO::EFAULT)?;
+        let old_path = read_cstring_from_user(old_name, PATH_MAX)?;
+        let new_path = read_cstring_from_user(new_name, PATH_MAX)?;
         if old_path.is_empty() || new_path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3906,10 +3903,9 @@ pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -
         "kernel:pid[{}] sys_symlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let target = translated_str(token, target).or_errno(ERRNO::EFAULT)?;
-        let linkpath = translated_str(token, linkpath).or_errno(ERRNO::EFAULT)?;
+        let target = read_cstring_from_user(target, PATH_MAX)?;
+        let linkpath = read_cstring_from_user(linkpath, PATH_MAX)?;
         if target.is_empty() || linkpath.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3925,12 +3921,11 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         "kernel:pid[{}] sys_readlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if bufsiz == 0 {
             return Err(ERRNO::EINVAL);
         }
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3953,12 +3948,11 @@ pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
         "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if flags & !AT_REMOVEDIR != 0 {
             return Err(ERRNO::EINVAL);
         }
-        let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
+        let name = read_cstring_from_user(name, PATH_MAX)?;
         if name.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -4013,9 +4007,8 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         "kernel:pid[{}] sys_mkdirat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -4164,7 +4157,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         let path = if path.is_null() && (effective_flags & AT_EMPTY_PATH as i32 != 0) {
             String::new()
         } else {
-            translated_str(token, path).or_errno(ERRNO::EFAULT)?
+            read_cstring_from_user(path, PATH_MAX)?
         };
         debug!(
             "sys_utimensat: dirfd = {}, path = {}, flags = {}, effective_flags = {}",
@@ -4426,9 +4419,8 @@ pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
         "kernel:pid[{}] sys_umount",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
+        let name = read_cstring_from_user(name, PATH_MAX)?;
         let cwd = current_process().inner_exclusive_access().cwd.clone();
         let abs = canonicalize(&cwd, &name);
         do_umount(&abs)?;
@@ -4542,10 +4534,9 @@ pub fn sys_renameat2(
     if flags != 0 {
         return -(ERRNO::EINVAL as isize);
     }
-    let token = current_user_token();
     syscall_body!({
-        let old_name = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
-        let new_name = translated_str(token, new_name).or_errno(ERRNO::EFAULT)?;
+        let old_name = read_cstring_from_user(old_name, PATH_MAX)?;
+        let new_name = read_cstring_from_user(new_name, PATH_MAX)?;
         if old_name.is_empty() || new_name.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -4562,9 +4553,8 @@ pub fn sys_statfs64(path: *const u8, buf: *mut u8) -> isize {
         "kernel:pid[{}] sys_statfs64",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path_str = translated_str(token, path).ok_or(ERRNO::EFAULT)?;
+        let path_str = read_cstring_from_user(path, PATH_MAX)?;
         let cwd = resolve_dirfd_base(AT_FDCWD, path_str.as_str())?;
         debug!("sys_statfs64: cwd = '{}', path = '{}'", cwd, path_str);
         let inode = lookup_inode_follow(cwd.as_str(), rooted_lookup_path(path_str.as_str()), true)?;

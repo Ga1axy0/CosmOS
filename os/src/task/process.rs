@@ -9,7 +9,7 @@ use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{
     canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription,
-    OpenFlags,
+    OSInode, OpenFlags,
 };
 use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
@@ -524,7 +524,7 @@ fn init_user_stack_from_strings(
 }
 
 struct ResolvedInitImage {
-    elf_data: Vec<u8>,
+    elf_file: Arc<OSInode>,
     argv: Vec<String>,
 }
 
@@ -589,7 +589,7 @@ fn resolve_init_image(
     let (first_line, first_line_complete) = inode.read_first_line_limited(INIT_PROBE_SIZE);
     if is_elf_image(&first_line) {
         return Ok(ResolvedInitImage {
-            elf_data: inode.read_all(),
+            elf_file: inode,
             argv,
         });
     }
@@ -622,11 +622,11 @@ fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
 }
 
 fn load_process_image(
-    elf_data: &[u8],
+    elf_file: Arc<OSInode>,
     cwd: &str,
 ) -> Result<(MemorySet, UserSpaceLayout, usize, Vec<(Auxv, usize)>), ERRNO> {
     let (mut memory_set, user_layout, app_load_info) =
-        MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
+        MemorySet::from_elf_file(Arc::clone(&elf_file)).map_err(mm_error_to_errno)?;
 
     let (final_entry, auxv_extra) = if let Some(interp_path) = &app_load_info.interp_path {
         debug!(
@@ -646,59 +646,12 @@ fn load_process_image(
             return Err(ERRNO::EISDIR);
         }
 
-        let interp_data = interp_inode.read_all();
-        let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ERRNO::ENOEXEC)?;
-        let interp_entry = interp_elf.header.pt2.entry_point() as usize;
-        let ph_count = interp_elf.header.pt2.ph_count();
         let interp_base = crate::config::INTERP_BASE;
         debug!("Loading interpreter at base address: {:#x}", interp_base);
-        debug!("Interpreter original entry: {:#x}", interp_entry);
-
-        for i in 0..ph_count {
-            let ph = interp_elf.program_header(i).map_err(|_| ERRNO::ELIBBAD)?;
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (interp_base + ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr =
-                    (interp_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
-                let mut map_perm = MapPermission::U;
-                let ph_flags = ph.flags();
-                if ph_flags.is_read() {
-                    map_perm |= MapPermission::R;
-                }
-                if ph_flags.is_write() {
-                    map_perm |= MapPermission::W;
-                }
-                if ph_flags.is_execute() {
-                    map_perm |= MapPermission::X;
-                }
-
-                debug!(
-                    "mapping interpreter segment: [{:#x}, {:#x}) with flags {:?}",
-                    usize::from(start_va),
-                    usize::from(end_va),
-                    map_perm
-                );
-
-                let vma = Vma::new_elf(start_va, end_va, map_perm);
-                let page_off = start_va.page_offset();
-                let raw =
-                    &interp_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
-                let padded: Vec<u8>;
-                let seg_data: &[u8] = if page_off != 0 {
-                    let mut buf = alloc::vec![0u8; page_off + raw.len()];
-                    buf[page_off..].copy_from_slice(raw);
-                    padded = buf;
-                    &padded
-                } else {
-                    raw
-                };
-                memory_set
-                    .insert_vma(vma, Some(seg_data))
-                    .map_err(mm_error_to_errno)?;
-            }
-        }
-
-        let relocated_entry = interp_base + interp_entry;
+        let (interp_load_info, _) = memory_set
+            .load_elf_file_at(&interp_inode, Some(interp_base))
+            .map_err(mm_error_to_errno)?;
+        let relocated_entry = interp_load_info.entry_point;
         debug!("Interpreter relocated entry: {:#x}", relocated_entry);
         debug!(
             "App PHDR vaddr: {:#x}, phnum: {}",
@@ -1007,7 +960,7 @@ impl ProcessControlBlock {
         let resolved = resolve_init_image("/", exec_path.as_str(), init_argv, 0)
             .expect("failed to resolve init image");
         let (memory_set, user_layout, entry_point, auxv_extra) =
-            load_process_image(resolved.elf_data.as_slice(), "/")
+            load_process_image(resolved.elf_file, "/")
                 .expect("failed to build init process address space");
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
@@ -1101,13 +1054,14 @@ impl ProcessControlBlock {
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // publish main thread to scheduler only after the process/task state is fully initialized
         add_task(task);
+        super::account_process_create();
         process
     }
 
     /// Only support processes with a single thread.
     pub fn exec(
         self: &Arc<Self>,
-        elf_data: &[u8],
+        elf_file: Arc<OSInode>,
         args: Vec<String>,
         envs: Vec<String>,
         exec_path: String,
@@ -1119,7 +1073,7 @@ impl ProcessControlBlock {
         trace!("kernel: exec .. load process image");
         let cwd = self.inner_exclusive_access().cwd.clone();
         let (memory_set, user_layout, final_entry, auxv_extra) =
-            load_process_image(elf_data, cwd.as_str())?;
+            load_process_image(elf_file, cwd.as_str())?;
 
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
@@ -1267,6 +1221,7 @@ impl ProcessControlBlock {
         );
         // Re-acquire task_inner only to install the trap context.
         *task.inner_exclusive_access().get_trap_cx() = trap_cx;
+        super::account_process_exec();
         Ok(())
     }
     /// 按 Linux `clone` 的进程分支创建子进程。
@@ -1583,6 +1538,7 @@ impl ProcessControlBlock {
         let publish_start_ns = get_time_ns();
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        super::account_process_create();
         let publish_ns = get_time_ns() - publish_start_ns;
         let total_ns = get_time_ns() - clone_start_ns;
         if total_ns >= CLONE_PROCESS_TIMING_WARN_THRESHOLD_NS {
@@ -1726,6 +1682,7 @@ impl ProcessControlBlock {
         child.attach_task(Arc::clone(&task));
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        super::account_process_create();
         Ok(child)
     }
     /// get pid

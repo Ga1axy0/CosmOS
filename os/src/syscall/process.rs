@@ -5,7 +5,9 @@ use crate::mm::{
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{read_bytes_from_user, read_pod_from_user, write_pod_to_user, Pod};
+use crate::syscall::{
+    read_bytes_from_user, read_cstring_from_user, read_pod_from_user, write_pod_to_user, Pod,
+};
 use crate::syscall_body;
 use crate::timer::get_time_ns;
 use crate::{
@@ -16,9 +18,8 @@ use crate::{
     },
     hal::hartid,
     ipc::{self, IPC_RMID},
-    mm::{translated_ref, translated_str},
     task::{
-        current_process, current_task, current_trap_cx, current_user_token,
+        current_process, current_task, current_trap_cx,
         exit_current_and_run_next, exit_group_current_and_run_next, reclaim_cached_kstacks,
         thread_id2task, CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock,
         ShmAttachment, SigInfo, SignalBit, TaskUserResAlloc, WaitReason,
@@ -35,6 +36,10 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const CAP_SETPCAP: usize = 8;
 const CAP_LAST_CAP: usize = 63;
 const NGROUPS_MAX: usize = 32;
+/// Maximum length of one pathname passed to `execve`.
+const EXEC_PATH_MAX: usize = 4096;
+/// Linux-compatible per-string bound for argv/envp strings.
+const EXEC_ARG_STRING_MAX: usize = 128 * 1024;
 const PR_CAPBSET_READ: i32 = 23;
 const PR_CAPBSET_DROP: i32 = 24;
 
@@ -76,8 +81,8 @@ fn unprivileged_gid_change_allowed(
 }
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
-    /// 最终需要交给 ELF 装载器处理的字节内容。
-    elf_data: Vec<u8>,
+    /// 最终需要交给 ELF 装载器处理的文件对象；装载器按段读取。
+    elf_file: Arc<OSInode>,
     /// 按 shebang 规则重写后的参数列表。
     argv: Vec<String>,
     /// 最终执行映像的绝对路径。
@@ -197,9 +202,8 @@ fn resolve_exec_image(
         first_line_complete
     );
     if is_elf_image(&first_line) {
-        let file_data = inode.read_all();
         return Ok(ResolvedExecImage {
-            elf_data: file_data,
+            elf_file: inode,
             argv,
             exec_path: abs_path,
         });
@@ -1672,27 +1676,35 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         "kernel:pid[{}] sys_execve",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        // These helpers prefault lazy anonymous/file-backed pages before
+        // copying from userspace.  Cargo commonly stores Command argv/envp
+        // in cold heap pages, so raw page-table translation is insufficient.
+        let path = read_cstring_from_user(path, EXEC_PATH_MAX)?;
         let mut args_vec: Vec<String> = Vec::new();
         loop {
-            let arg_str_ptr = *translated_ref(token, args).or_errno(ERRNO::EFAULT)?;
+            let arg_str_ptr = read_pod_from_user(args)?;
             if arg_str_ptr == 0 {
                 break;
             }
-            args_vec.push(translated_str(token, arg_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
+            args_vec.push(read_cstring_from_user(
+                arg_str_ptr as *const u8,
+                EXEC_ARG_STRING_MAX,
+            )?);
             unsafe {
                 args = args.add(1);
             }
         }
         let mut envs_vec: Vec<String> = Vec::new();
         loop {
-            let env_str_ptr = *translated_ref(token, envp).or_errno(ERRNO::EFAULT)?;
+            let env_str_ptr = read_pod_from_user(envp)?;
             if env_str_ptr == 0 {
                 break;
             }
-            envs_vec.push(translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
+            envs_vec.push(read_cstring_from_user(
+                env_str_ptr as *const u8,
+                EXEC_ARG_STRING_MAX,
+            )?);
             unsafe {
                 envp = envp.add(1);
             }
@@ -1740,7 +1752,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         };
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage {
-            elf_data,
+            elf_file,
             argv,
             exec_path,
         } = resolved;
@@ -1752,7 +1764,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
                 argv
             );
         }
-        process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
+        process.exec(elf_file, argv, envs_vec, exec_path)?;
         // CLONE_VFORK releases its parent after the new image has been
         // installed, before returning to the new user image.
         process.release_vfork_parent();
@@ -2058,9 +2070,8 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, _path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(_path, EXEC_PATH_MAX)?;
         let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
         let parent = current_process();
         let all_data = app_inode.read_all();

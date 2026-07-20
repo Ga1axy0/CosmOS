@@ -1,5 +1,6 @@
 //! Address Space [`MemorySet`] management of Process
 
+use super::elf_loader::{ElfLoadInfo, ElfLoader};
 use super::{
     frame_alloc_with_reclaim, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind,
 };
@@ -8,12 +9,11 @@ use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
 use crate::config::{
-    MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_PIE_BASE, USER_STACK_BASE, USER_STACK_SIZE,
-    USER_VDSO_BASE,
+    MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE, USER_VDSO_BASE,
 };
 use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
-    FileDescription,
+    FileDescription, OSInode,
 };
 use crate::hal::traits::{AddressSpaceToken, TrapMachine};
 use crate::hal::ArchTrapMachine;
@@ -44,22 +44,6 @@ extern "C" {
     fn strampoline();
 }
 
-/// ELF 加载结果，包含动态链接所需的额外信息
-pub struct ElfLoadInfo {
-    /// 程序入口点
-    pub entry_point: usize,
-    /// 程序头表在内存中的地址（用于 AT_PHDR）
-    pub phdr_vaddr: usize,
-    /// 程序头表项大小（用于 AT_PHENT）
-    pub phent_size: usize,
-    /// 程序头表项数量（用于 AT_PHNUM）
-    pub phnum: usize,
-    /// 动态链接器路径（如果存在 INTERP 段）
-    pub interp_path: Option<String>,
-}
-
-/// `R_RISCV_RELATIVE` relocation used by static PIE executables.
-const R_RISCV_RELATIVE: u32 = 3;
 const FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
 
 lazy_static! {
@@ -228,176 +212,6 @@ fn format_hex_bytes(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", byte);
     }
     out
-}
-
-fn add_load_bias(addr: usize, load_bias: usize) -> Result<usize, MmError> {
-    addr.checked_add(load_bias).ok_or(MmError::InvalidElf)
-}
-
-fn relocated_value(load_bias: usize, addend: i64) -> Result<usize, MmError> {
-    if addend >= 0 {
-        load_bias
-            .checked_add(addend as usize)
-            .ok_or(MmError::InvalidElf)
-    } else {
-        load_bias
-            .checked_sub(addend.unsigned_abs() as usize)
-            .ok_or(MmError::InvalidElf)
-    }
-}
-
-fn write_user_usize(memory_set: &mut MemorySet, va: usize, value: usize) -> Result<(), MmError> {
-    for (idx, byte) in value.to_le_bytes().iter().copied().enumerate() {
-        let pa = memory_set
-            .page_table
-            .translate_va(VirtAddr(va + idx))
-            .ok_or(MmError::NoMapping)?;
-        *pa.get_mut::<u8>() = byte;
-    }
-    Ok(())
-}
-
-fn file_offset_for_vaddr(elf: &xmas_elf::ElfFile<'_>, vaddr: usize) -> Option<usize> {
-    let ph_count = elf.header.pt2.ph_count();
-    for i in 0..ph_count {
-        let ph = elf.program_header(i).ok()?;
-        if ph.get_type().ok()? != xmas_elf::program::Type::Load {
-            continue;
-        }
-        let seg_start = ph.virtual_addr() as usize;
-        let seg_size = ph.file_size() as usize;
-        let seg_end = seg_start.checked_add(seg_size)?;
-        if vaddr < seg_start || vaddr >= seg_end {
-            continue;
-        }
-        let within_seg = vaddr.checked_sub(seg_start)?;
-        return (ph.offset() as usize).checked_add(within_seg);
-    }
-    None
-}
-
-fn read_dynsym_value(
-    elf: &xmas_elf::ElfFile<'_>,
-    symtab_vaddr: usize,
-    sym_ent: usize,
-    sym_index: u32,
-) -> Result<(usize, u16), MmError> {
-    if sym_ent != 24 {
-        return Err(MmError::InvalidElf);
-    }
-    let symtab_offset = file_offset_for_vaddr(elf, symtab_vaddr).ok_or(MmError::InvalidElf)?;
-    let sym_offset = symtab_offset
-        .checked_add(
-            sym_ent
-                .checked_mul(sym_index as usize)
-                .ok_or(MmError::InvalidElf)?,
-        )
-        .ok_or(MmError::InvalidElf)?;
-    let sym_end = sym_offset.checked_add(sym_ent).ok_or(MmError::InvalidElf)?;
-    let sym = elf
-        .input
-        .get(sym_offset..sym_end)
-        .ok_or(MmError::InvalidElf)?;
-    let shndx = u16::from_le_bytes(sym[6..8].try_into().map_err(|_| MmError::InvalidElf)?);
-    let value = usize::from_le_bytes(sym[8..16].try_into().map_err(|_| MmError::InvalidElf)?);
-    Ok((value, shndx))
-}
-
-fn apply_static_pie_relocations(
-    memory_set: &mut MemorySet,
-    elf: &xmas_elf::ElfFile<'_>,
-    load_bias: usize,
-) -> Result<(), MmError> {
-    let mut rela_vaddr: Option<usize> = None;
-    let mut rela_size = 0usize;
-    let mut rela_ent = 0usize;
-    let mut symtab_vaddr: Option<usize> = None;
-    let mut sym_ent = 0usize;
-    let ph_count = elf.header.pt2.ph_count();
-
-    for i in 0..ph_count {
-        let ph = elf.program_header(i).map_err(|_| MmError::InvalidElf)?;
-        if ph.get_type().map_err(|_| MmError::InvalidElf)? != xmas_elf::program::Type::Dynamic {
-            continue;
-        }
-        let entries = ph.get_data(elf).map_err(|_| MmError::InvalidElf)?;
-        let xmas_elf::program::SegmentData::Dynamic64(entries) = entries else {
-            return Err(MmError::InvalidElf);
-        };
-        for entry in entries {
-            match entry.get_tag().map_err(|_| MmError::InvalidElf)? {
-                xmas_elf::dynamic::Tag::Rela => {
-                    rela_vaddr = Some(entry.get_ptr().map_err(|_| MmError::InvalidElf)? as usize);
-                }
-                xmas_elf::dynamic::Tag::RelaSize => {
-                    rela_size = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
-                }
-                xmas_elf::dynamic::Tag::RelaEnt => {
-                    rela_ent = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
-                }
-                xmas_elf::dynamic::Tag::SymTab => {
-                    symtab_vaddr = Some(entry.get_ptr().map_err(|_| MmError::InvalidElf)? as usize);
-                }
-                xmas_elf::dynamic::Tag::SymEnt => {
-                    sym_ent = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
-                }
-                xmas_elf::dynamic::Tag::Rel | xmas_elf::dynamic::Tag::JmpRel => {
-                    return Err(MmError::InvalidElf);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if rela_size == 0 {
-        return Ok(());
-    }
-    if rela_ent != 24 {
-        return Err(MmError::InvalidElf);
-    }
-
-    let rela_vaddr = rela_vaddr.ok_or(MmError::InvalidElf)?;
-    let rela_offset = file_offset_for_vaddr(elf, rela_vaddr).ok_or(MmError::InvalidElf)?;
-    let rela_end = rela_offset
-        .checked_add(rela_size)
-        .ok_or(MmError::InvalidElf)?;
-    let rela_bytes = elf
-        .input
-        .get(rela_offset..rela_end)
-        .ok_or(MmError::InvalidElf)?;
-    if rela_bytes.len() % rela_ent != 0 {
-        return Err(MmError::InvalidElf);
-    }
-
-    for chunk in rela_bytes.chunks_exact(rela_ent) {
-        let offset = usize::from_le_bytes(chunk[0..8].try_into().map_err(|_| MmError::InvalidElf)?);
-        let info = u64::from_le_bytes(chunk[8..16].try_into().map_err(|_| MmError::InvalidElf)?);
-        let addend = i64::from_le_bytes(chunk[16..24].try_into().map_err(|_| MmError::InvalidElf)?);
-        let rel_type = info as u32;
-        let sym_index = (info >> 32) as u32;
-        let target = add_load_bias(offset, load_bias)?;
-        let value = match rel_type {
-            R_RISCV_RELATIVE => {
-                if sym_index != 0 {
-                    return Err(MmError::InvalidElf);
-                }
-                relocated_value(load_bias, addend)?
-            }
-            2 => {
-                let symtab_vaddr = symtab_vaddr.ok_or(MmError::InvalidElf)?;
-                let (sym_value, shndx) = read_dynsym_value(elf, symtab_vaddr, sym_ent, sym_index)?;
-                if shndx == 0 {
-                    return Err(MmError::InvalidElf);
-                }
-                let sym_addr = add_load_bias(sym_value, load_bias)?;
-                relocated_value(sym_addr, addend)?
-            }
-            _ => return Err(MmError::InvalidElf),
-        };
-        write_user_usize(memory_set, target, value)?;
-    }
-
-    Ok(())
 }
 
 /// address space
@@ -1030,133 +844,49 @@ impl MemorySet {
         } // end #[cfg(not(loongarch64))]
         memory_set
     }
-    /// Include ELF segments and trampoline, and compute initial process VM layout.
-    /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo)
-    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
+    /// Load an ELF file and construct the initial user address space.
+    pub fn from_elf_file(
+        file: Arc<OSInode>,
+    ) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
         let mut memory_set = Self::new_bare()?;
-        // map trampoline
         memory_set.map_trampoline()?;
         memory_set.map_user_vdso()?;
-        // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| MmError::InvalidElf)?;
-        let elf_header = elf.header;
-        let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
-        let elf_type = elf_header.pt2.type_().as_type();
-        let load_bias = if elf_type == xmas_elf::header::Type::SharedObject {
-            USER_PIE_BASE
-        } else {
-            0
-        };
-        let ph_count = elf_header.pt2.ph_count();
-        let mut max_end_vpn = VirtPageNum(0);
-
-        // 收集动态链接信息
-        let mut interp_path: Option<String> = None;
-        let phdr_vaddr = elf_header.pt2.ph_offset() as usize; // 程序头表文件偏移
-        let mut phdr_load_vaddr: Option<usize> = None; // 程序头表加载后的虚拟地址
-
-        for i in 0..ph_count {
-            let ph = elf.program_header(i).map_err(|_| MmError::InvalidElf)?;
-            let ph_type = ph.get_type().map_err(|_| MmError::InvalidElf)?;
-
-            // 检查 INTERP 段
-            if ph_type == xmas_elf::program::Type::Interp {
-                debug!("Found INTERP segment in ELF program header");
-                let offset = ph.offset() as usize;
-                let size = ph.file_size() as usize;
-                if size > 0 && offset + size <= elf_data.len() {
-                    let interp_bytes = &elf_data[offset..offset + size];
-                    // INTERP 段内容是以 null 结尾的字符串
-                    let end = interp_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(interp_bytes.len());
-                    if let Ok(path) = core::str::from_utf8(&interp_bytes[..end]) {
-                        interp_path = Some(String::from(path));
-                        debug!("Found INTERP segment: {}", path);
-                    }
-                }
-            }
-
-            if ph_type == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr =
-                    add_load_bias(ph.virtual_addr() as usize, load_bias)?.into();
-                let end_va: VirtAddr =
-                    add_load_bias((ph.virtual_addr() + ph.mem_size()) as usize, load_bias)?.into();
-
-                // 检查程序头表是否在这个 LOAD 段内
-                if phdr_load_vaddr.is_none() {
-                    let seg_file_start = ph.offset() as usize;
-                    let seg_file_end = seg_file_start + ph.file_size() as usize;
-                    if phdr_vaddr >= seg_file_start && phdr_vaddr < seg_file_end {
-                        // 程序头表在此段内，计算其虚拟地址
-                        let offset_in_seg = phdr_vaddr - seg_file_start;
-                        phdr_load_vaddr = Some(add_load_bias(
-                            ph.virtual_addr() as usize + offset_in_seg,
-                            load_bias,
-                        )?);
-                    }
-                }
-
-                let mut map_perm = MapPermission::U;
-                let ph_flags = ph.flags();
-                if ph_flags.is_read() {
-                    map_perm |= MapPermission::R;
-                }
-                if ph_flags.is_write() {
-                    map_perm |= MapPermission::W;
-                }
-                if ph_flags.is_execute() {
-                    map_perm |= MapPermission::X;
-                }
-                debug!(
-                    "mapping ELF segment: [{:#x}, {:#x}) with flags {:?}",
-                    &(usize::from(start_va)),
-                    &(usize::from(end_va)),
-                    map_perm
-                );
-                let vma = Vma::new_elf(start_va, end_va, map_perm);
-                max_end_vpn = vma.end_vpn();
-                // start_va may not be page-aligned (p_vaddr % p_align == p_offset % p_align).
-                // copy_data writes from the start of the first mapped page, so we must pad
-                // the data with zeros equal to start_va's within-page offset so that each
-                // ELF byte lands at the correct virtual address.
-                let page_off = start_va.page_offset();
-                let raw = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
-                let padded: Vec<u8>;
-                let seg_data: &[u8] = if page_off != 0 {
-                    let mut buf = alloc::vec![0u8; page_off + raw.len()];
-                    buf[page_off..].copy_from_slice(raw);
-                    padded = buf;
-                    &padded
-                } else {
-                    raw
-                };
-                memory_set.insert_vma(vma, Some(seg_data))?;
-            }
-        }
-        if elf_type == xmas_elf::header::Type::SharedObject && interp_path.is_none() {
-            apply_static_pie_relocations(&mut memory_set, &elf, load_bias)?;
-        }
-        let max_end_va: VirtAddr = max_end_vpn.into();
-        let start_brk: usize = max_end_va.into();
+        let loaded = ElfLoader::new(&mut memory_set).load_file(&file)?;
         let layout = UserSpaceLayout {
-            start_brk,
+            start_brk: loaded.image_end,
             mmap_base: USER_MMAP_BASE,
             ustack_base: USER_STACK_BASE,
             start_stack: USER_STACK_BASE + USER_STACK_SIZE,
         };
+        Ok((memory_set, layout, loaded.info))
+    }
 
-        let load_info = ElfLoadInfo {
-            entry_point: add_load_bias(elf.header.pt2.entry_point() as usize, load_bias)?,
-            phdr_vaddr: phdr_load_vaddr.unwrap_or(0),
-            phent_size: elf.header.pt2.ph_entry_size() as usize,
-            phnum: ph_count as usize,
-            interp_path,
+    /// Load one ELF file into an existing address space. The optional forced
+    /// load bias is used for the dynamic linker; None selects the normal
+    /// ET_EXEC/PIE policy used by the main executable.
+    pub fn load_elf_file_at(
+        &mut self,
+        file: &Arc<OSInode>,
+        forced_load_bias: Option<usize>,
+    ) -> Result<(ElfLoadInfo, usize), MmError> {
+        let loaded = ElfLoader::new(self).load_file_at(file, forced_load_bias)?;
+        Ok((loaded.info, loaded.image_end))
+    }
+
+    /// Include ELF segments and trampoline, and compute initial process VM layout.
+    /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo).
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
+        let mut memory_set = Self::new_bare()?;
+        memory_set.map_trampoline()?;
+        memory_set.map_user_vdso()?;
+        let loaded = ElfLoader::new(&mut memory_set).load_bytes(elf_data)?;
+        let layout = UserSpaceLayout {
+            start_brk: loaded.image_end,
+            mmap_base: USER_MMAP_BASE,
+            ustack_base: USER_STACK_BASE,
+            start_stack: USER_STACK_BASE + USER_STACK_SIZE,
         };
-
-        Ok((memory_set, layout, load_info))
+        Ok((memory_set, layout, loaded.info))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &mut Self) -> Result<(Self, bool), MmError> {

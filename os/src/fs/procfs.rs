@@ -28,7 +28,8 @@ use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
 use crate::mm::{
     deferred_frame_count, deferred_kstack_id_count, deferred_range_count, frame_allocator_stats,
-    kernel_heap_allocator_stats, MapPermission, VmaKind, KERNEL_HEAP_BYTES,
+    kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats, MapPermission, VmaKind,
+    KERNEL_HEAP_BYTES,
 };
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
@@ -38,7 +39,7 @@ use crate::perf_probe;
 use crate::perf_sampler;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
-use crate::task::{cached_kstack_count, current_process, TaskStatus};
+use crate::task::{cached_kstack_count, current_process, process_lifecycle_stats, TaskStatus};
 use crate::timer::{get_time, time_to_ticks};
 use core::sync::atomic::Ordering;
 
@@ -51,6 +52,9 @@ fn parse_pid(name: &str) -> Option<usize> {
 
 fn build_meminfo() -> String {
     let stats = frame_allocator_stats();
+    let page_table = page_table_stats();
+    let tlb = tlb_shootdown_stats();
+    let process = process_lifecycle_stats();
     let cached_pages = PAGE_CACHE_MANAGER.lock().cached_pages;
     let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire) as u64;
     let heap_stats = kernel_heap_allocator_stats();
@@ -112,6 +116,42 @@ fn build_meminfo() -> String {
         "FrameAllocatorLockWaitTicks: {}",
         stats.lock_wait_ticks
     );
+    let _ = writeln!(&mut out, "FrameZeroedPages: {}", stats.zeroed_pages);
+    let _ = writeln!(&mut out, "FrameZeroedBytes: {}", stats.zeroed_bytes);
+    let _ = writeln!(&mut out, "FrameZeroTimeTicks: {}", stats.zero_time_ticks);
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCacheEnabled: {}",
+        stats.per_cpu_cache_enabled as usize
+    );
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCacheHits: {}",
+        stats.per_cpu_cache_hits
+    );
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCacheMisses: {}",
+        stats.per_cpu_cache_misses
+    );
+    let _ = writeln!(&mut out, "PageTableAllocCalls: {}", page_table.alloc_calls);
+    let _ = writeln!(&mut out, "PageTableFreeCalls: {}", page_table.free_calls);
+    let _ = writeln!(
+        &mut out,
+        "PageTableUntrackedAllocCalls: {}",
+        page_table.untracked_alloc_calls
+    );
+    let _ = writeln!(&mut out, "TlbShootdownCalls: {}", tlb.calls);
+    let _ = writeln!(&mut out, "TlbShootdownIpiTargets: {}", tlb.ipi_targets);
+    let _ = writeln!(&mut out, "TlbShootdownAckWaits: {}", tlb.ack_waits);
+    let _ = writeln!(
+        &mut out,
+        "TlbShootdownAckWaitTicks: {}",
+        tlb.ack_wait_ticks
+    );
+    let _ = writeln!(&mut out, "ProcessCreateCalls: {}", process.create_calls);
+    let _ = writeln!(&mut out, "ProcessExecCalls: {}", process.exec_calls);
+    let _ = writeln!(&mut out, "ProcessExitCalls: {}", process.exit_calls);
     let _ = writeln!(&mut out, "KernelHeapCommitted: {} bytes", heap_committed);
     let _ = writeln!(&mut out, "KernelHeapUsed:      {} bytes", heap_used);
     let _ = writeln!(

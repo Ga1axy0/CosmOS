@@ -11,7 +11,7 @@ KERNEL_RV_ELF := os/target/$(TARGET)/release/os
 KERNEL_LA_ELF := os/target/loongarch64-unknown-none/release/os
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
-MEM ?= 2G
+MEM ?= 4G
 SMP ?= 1
 TEST_FS ?= sdcard-$(RUN_ARCH).img
 # 本地调试可设为 1，保留评测测试盘镜像。

@@ -25,6 +25,17 @@ static FRAME_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FRAME_CONTIGUOUS_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FRAME_RANGE_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FRAME_ALLOCATOR_LOCK_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
+/// Number of physical pages explicitly cleared before being handed to a caller.
+static FRAME_ZEROED_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Number of bytes explicitly cleared before being handed to a caller.
+static FRAME_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Cumulative platform timer ticks spent clearing physical pages.
+static FRAME_ZERO_TIME_TICKS: AtomicUsize = AtomicUsize::new(0);
+/// Per-CPU frame-cache counters.  The cache is not enabled yet; keeping the
+/// counters here makes the no-cache baseline explicit before a local cache is
+/// added.
+static FRAME_PER_CPU_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static FRAME_PER_CPU_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
@@ -35,11 +46,7 @@ pub struct FrameTracker {
 impl FrameTracker {
     /// Create a new FrameTracker
     pub fn new(ppn: PhysPageNum) -> Self {
-        // page cleaning
-        let bytes_array = ppn.get_bytes_array();
-        for i in bytes_array {
-            *i = 0;
-        }
+        clear_frame(ppn);
         Self { ppn }
     }
 }
@@ -560,6 +567,20 @@ pub struct FrameAllocatorStats {
     /// This includes the local interrupt save/restore overhead around lock
     /// acquisition, but excludes the allocator operation after acquisition.
     pub lock_wait_ticks: usize,
+    /// Number of pages cleared before allocation.
+    pub zeroed_pages: usize,
+    /// Number of bytes cleared before allocation.
+    pub zeroed_bytes: usize,
+    /// Cumulative timer ticks spent clearing pages.
+    pub zero_time_ticks: usize,
+    /// Number of allocations served from a per-CPU frame cache.
+    pub per_cpu_cache_hits: usize,
+    /// Number of allocations that fell through a per-CPU frame cache.
+    /// The cache is currently disabled, so this is the single-frame
+    /// allocation baseline and every such request is counted as a miss.
+    pub per_cpu_cache_misses: usize,
+    /// Whether a per-CPU frame cache is currently enabled.
+    pub per_cpu_cache_enabled: bool,
 }
 
 lazy_static! {
@@ -583,6 +604,11 @@ pub fn init_frame_allocator() {
     FRAME_CONTIGUOUS_ALLOC_CALLS.store(0, Ordering::Release);
     FRAME_RANGE_DEALLOC_CALLS.store(0, Ordering::Release);
     FRAME_ALLOCATOR_LOCK_WAIT_TICKS.store(0, Ordering::Release);
+    FRAME_ZEROED_PAGES.store(0, Ordering::Release);
+    FRAME_ZEROED_BYTES.store(0, Ordering::Release);
+    FRAME_ZERO_TIME_TICKS.store(0, Ordering::Release);
+    FRAME_PER_CPU_CACHE_HITS.store(0, Ordering::Release);
+    FRAME_PER_CPU_CACHE_MISSES.store(0, Ordering::Release);
 }
 
 /// Return runtime statistics of the frame allocator.
@@ -607,6 +633,12 @@ pub fn frame_allocator_stats() -> FrameAllocatorStats {
         buddy_search_misses: allocator.buddy_search_misses,
         bitmap_enabled: allocator.free_bitmap.enabled,
         lock_wait_ticks: FRAME_ALLOCATOR_LOCK_WAIT_TICKS.load(Ordering::Acquire),
+        zeroed_pages: FRAME_ZEROED_PAGES.load(Ordering::Acquire),
+        zeroed_bytes: FRAME_ZEROED_BYTES.load(Ordering::Acquire),
+        zero_time_ticks: FRAME_ZERO_TIME_TICKS.load(Ordering::Acquire),
+        per_cpu_cache_hits: FRAME_PER_CPU_CACHE_HITS.load(Ordering::Acquire),
+        per_cpu_cache_misses: FRAME_PER_CPU_CACHE_MISSES.load(Ordering::Acquire),
+        per_cpu_cache_enabled: false,
     }
 }
 
@@ -624,6 +656,10 @@ fn record_frame_allocator_lock_wait(start: usize) {
 /// Allocate a physical page frame in FrameTracker style
 pub fn frame_alloc() -> Option<FrameTracker> {
     FRAME_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    // There is deliberately no per-CPU frame cache yet.  Count this as a
+    // miss so the first run provides a directly comparable baseline for the
+    // cache implementation that may be added later.
+    FRAME_PER_CPU_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     let lock_start = frame_allocator_lock_start();
     let mut allocator = FRAME_ALLOCATOR.lock();
     record_frame_allocator_lock_wait(lock_start);
@@ -632,12 +668,25 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     ppn.map(FrameTracker::new).or_else(|| {
         FRAME_ALLOC_OOM_COUNT.fetch_add(1, Ordering::AcqRel);
         let frame_allocator_stats = frame_allocator_stats();
+        // Keep the page-cache guard's lifetime bounded to this block.  Using
+        // PAGE_CACHE_MANAGER.lock() once per format argument keeps the first
+        // SpinNoIrqLockGuard alive until the end of the error! statement;
+        // the second call then spins forever on the same lock (especially
+        // because interrupts are disabled while acquiring it).
+        let (cached_pages, low_watermark, high_watermark) = {
+            let manager = PAGE_CACHE_MANAGER.lock();
+            (
+                manager.cached_pages,
+                manager.low_watermark,
+                manager.high_watermark,
+            )
+        };
         error!(
             "frame_alloc: out of memory (free={} cached={} low={} high={} total={})",
             frame_allocator_stats.free_pages,
-            PAGE_CACHE_MANAGER.lock().cached_pages,
-            PAGE_CACHE_MANAGER.lock().low_watermark,
-            PAGE_CACHE_MANAGER.lock().high_watermark,
+            cached_pages,
+            low_watermark,
+            high_watermark,
             frame_allocator_stats.total_pages,
         );
         None
@@ -700,9 +749,13 @@ pub fn frame_dealloc_range(start: PhysPageNum, pages: usize) {
 }
 
 fn clear_frame(ppn: PhysPageNum) {
+    let start = Plat::read_time();
     for byte in ppn.get_bytes_array() {
         *byte = 0;
     }
+    FRAME_ZEROED_PAGES.fetch_add(1, Ordering::Relaxed);
+    FRAME_ZEROED_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed);
+    FRAME_ZERO_TIME_TICKS.fetch_add(Plat::read_time().wrapping_sub(start), Ordering::Relaxed);
 }
 
 fn floor_log2(value: usize) -> usize {

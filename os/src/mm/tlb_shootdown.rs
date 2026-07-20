@@ -2,8 +2,8 @@
 
 use super::{kernel_token, FrameTracker};
 use crate::config::MAX_HARTS;
-use crate::hal::hartid;
-use crate::hal::traits::AddressSpaceToken;
+use crate::hal::traits::{AddressSpaceToken, Timer as _};
+use crate::hal::{hartid, Plat};
 use crate::sbi::send_ipi_mask;
 use crate::sync::{SpinLock, SpinLockGuard, SpinNoIrqLock};
 use alloc::vec::Vec;
@@ -203,6 +203,42 @@ static LAST_HANDLED_SEQ: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0)
 const KIND_GLOBAL: usize = 0;
 const KIND_ADDRESS_SPACE: usize = 1;
 
+static TLB_SHOOTDOWN_CALLS: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_IPI_TARGETS: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_ACK_WAITS: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_ACK_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+/// Runtime counters for synchronous TLB shootdown traffic.
+pub struct TlbShootdownStats {
+    /// Number of shootdown requests launched.
+    pub calls: usize,
+    /// Cumulative number of remote hart targets sent an IPI.
+    pub ipi_targets: usize,
+    /// Number of requests that had to wait for at least one remote ack.
+    pub ack_waits: usize,
+    /// Cumulative platform timer ticks spent waiting for remote acks.
+    pub ack_wait_ticks: usize,
+}
+
+/// Reset TLB shootdown counters after early memory-management setup.
+pub fn reset_tlb_shootdown_stats() {
+    TLB_SHOOTDOWN_CALLS.store(0, Ordering::Release);
+    TLB_SHOOTDOWN_IPI_TARGETS.store(0, Ordering::Release);
+    TLB_SHOOTDOWN_ACK_WAITS.store(0, Ordering::Release);
+    TLB_SHOOTDOWN_ACK_WAIT_TICKS.store(0, Ordering::Release);
+}
+
+/// Return cumulative TLB shootdown counters.
+pub fn tlb_shootdown_stats() -> TlbShootdownStats {
+    TlbShootdownStats {
+        calls: TLB_SHOOTDOWN_CALLS.load(Ordering::Acquire),
+        ipi_targets: TLB_SHOOTDOWN_IPI_TARGETS.load(Ordering::Acquire),
+        ack_waits: TLB_SHOOTDOWN_ACK_WAITS.load(Ordering::Acquire),
+        ack_wait_ticks: TLB_SHOOTDOWN_ACK_WAIT_TICKS.load(Ordering::Acquire),
+    }
+}
+
 /// 记录一个被释放的内核虚拟地址区间及其页框，等待后续全局 TLB flush 处理。
 pub fn defer_release(
     start: usize,
@@ -383,6 +419,8 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     let online_mask = online_mask();
     let target_mask = hart_mask & online_mask & !self_bit;
     let seq = TLB_SHOOTDOWN_STATE.seq.load(Ordering::Acquire) + 1;
+    TLB_SHOOTDOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+    TLB_SHOOTDOWN_IPI_TARGETS.fetch_add(target_mask.count_ones() as usize, Ordering::Relaxed);
 
     let (kind_bits, arg_token) = encode_shootdown_kind(kind);
     TLB_SHOOTDOWN_STATE
@@ -412,6 +450,8 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     // 先刷新发起方本地 TLB，再通知其他 hart。
     perform_local_tlb_shootdown(kind);
     if target_mask != 0 {
+        TLB_SHOOTDOWN_ACK_WAITS.fetch_add(1, Ordering::Relaxed);
+        let ack_wait_start = Plat::read_time();
         send_ipi_mask(target_mask);
         if emit_logs {
             trace!(
@@ -447,6 +487,10 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
                 );
             }
         }
+        TLB_SHOOTDOWN_ACK_WAIT_TICKS.fetch_add(
+            Plat::read_time().wrapping_sub(ack_wait_start),
+            Ordering::Relaxed,
+        );
         if emit_logs {
             debug!("[tlb] seq={} all remote ack received", seq);
         }

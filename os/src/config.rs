@@ -11,7 +11,7 @@ pub const MAX_KERNEL_HEAP_SIZE: usize = 0x4000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 8;
 /// Fallback physical memory end used only when firmware memory discovery fails.
-pub const MEMORY_END: usize = 0x100000000;
+pub const MEMORY_END: usize = 0x180000000;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12

@@ -7,6 +7,7 @@
 //! Every task or process has a memory_set to control its virtual memory.
 
 mod address;
+mod elf_loader;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
@@ -51,6 +52,7 @@ pub use address::{
     phys_to_virt, virt_to_phys, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
     USER_SPACE_END,
 };
+pub use elf_loader::ElfLoadInfo;
 pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_alloc_with_reclaim, frame_allocator_stats,
     frame_dealloc, frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
@@ -62,25 +64,28 @@ pub use heap_allocator::{
 pub use memory_set::remap_test;
 pub use memory_set::{
     invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
-    unregister_file_mappings_for_process, DeferredUserReclaim, ElfLoadInfo, FilePageFaultPrepare,
-    InodeKey, MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind,
-    KERNEL_SPACE,
+    unregister_file_mappings_for_process, DeferredUserReclaim, FilePageFaultPrepare, InodeKey,
+    MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
 pub use oom::{log_oom, warn_heap_state};
 pub use page_table::{
-    translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
-    PageTableEntry, UserBuffer, UserBufferIterator,
+    page_table_stats, reset_page_table_stats, translated_byte_buffer, translated_ref,
+    translated_refmut, translated_str, PageTable, PageTableEntry, PageTableStats, UserBuffer,
+    UserBufferIterator,
 };
 pub use tlb_shootdown::{
     clear_deferred, defer_release, deferred_frame_count, deferred_kstack_id_count,
     deferred_range_count, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush,
-    online_mask, poll_pending_shootdown, shootdown, shootdown_global, shootdown_global_quiet,
-    take_deferred, DeferredBatch, ShootdownKind,
+    online_mask, poll_pending_shootdown, reset_tlb_shootdown_stats, shootdown, shootdown_global,
+    shootdown_global_quiet, take_deferred, tlb_shootdown_stats, DeferredBatch, ShootdownKind,
+    TlbShootdownStats,
 };
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     frame_allocator::init_frame_allocator();
+    reset_page_table_stats();
+    reset_tlb_shootdown_stats();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
     heap_allocator::init_kernel_heap_mapping();

@@ -55,6 +55,42 @@ static DEBUG_DUMP_PGRP: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_REMAINING: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_DEADLINE_NS: AtomicUsize = AtomicUsize::new(0);
 const DEBUG_DUMP_INTERVAL_NS: usize = 1_000_000_000;
+
+static PROCESS_CREATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_EXEC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+/// Cumulative process lifecycle counters exported through `/proc/meminfo`.
+pub struct ProcessLifecycleStats {
+    /// Number of successfully published processes.
+    pub create_calls: usize,
+    /// Number of successful `execve` transitions.
+    pub exec_calls: usize,
+    /// Number of processes transitioned to zombie state.
+    pub exit_calls: usize,
+}
+
+pub(crate) fn account_process_create() {
+    PROCESS_CREATE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn account_process_exec() {
+    PROCESS_EXEC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn account_process_exit() {
+    PROCESS_EXIT_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Return cumulative process lifecycle counters.
+pub fn process_lifecycle_stats() -> ProcessLifecycleStats {
+    ProcessLifecycleStats {
+        create_calls: PROCESS_CREATE_CALLS.load(Ordering::Acquire),
+        exec_calls: PROCESS_EXEC_CALLS.load(Ordering::Acquire),
+        exit_calls: PROCESS_EXIT_CALLS.load(Ordering::Acquire),
+    }
+}
 pub use crate::sched::{
     clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, DEFAULT_TIME_SLICE_TICKS,
     MAX_NICE, MIN_NICE, NICE_0_LOAD, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
@@ -312,6 +348,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             return;
         }
         // mark this process as a zombie process
+        account_process_exit();
         process_inner.is_zombie = true;
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;

@@ -8,6 +8,48 @@ use crate::hal::traits::{AddressSpaceToken, PTEFlags, PagingArch};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static PAGE_TABLE_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_UNTRACKED_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+/// Runtime counters for page-table frame ownership and permanent mappings.
+pub struct PageTableStats {
+    /// Tracked page-table frames allocated through an owned `PageTable`.
+    pub alloc_calls: usize,
+    /// Tracked page-table frames released when an owned `PageTable` is dropped.
+    pub free_calls: usize,
+    /// Page-table frames allocated without ownership tracking (kernel tables).
+    pub untracked_alloc_calls: usize,
+}
+
+/// Reset page-table counters after the boot allocator has been initialized.
+pub fn reset_page_table_stats() {
+    PAGE_TABLE_ALLOC_CALLS.store(0, Ordering::Release);
+    PAGE_TABLE_FREE_CALLS.store(0, Ordering::Release);
+    PAGE_TABLE_UNTRACKED_ALLOC_CALLS.store(0, Ordering::Release);
+}
+
+/// Return page-table frame allocation counters.
+pub fn page_table_stats() -> PageTableStats {
+    PageTableStats {
+        alloc_calls: PAGE_TABLE_ALLOC_CALLS.load(Ordering::Acquire),
+        free_calls: PAGE_TABLE_FREE_CALLS.load(Ordering::Acquire),
+        untracked_alloc_calls: PAGE_TABLE_UNTRACKED_ALLOC_CALLS.load(Ordering::Acquire),
+    }
+}
+
+#[inline]
+fn account_tracked_page_table_alloc() {
+    PAGE_TABLE_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn account_untracked_page_table_alloc() {
+    PAGE_TABLE_UNTRACKED_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -68,6 +110,7 @@ impl PageTable {
     /// Create a new page table
     pub fn new() -> Result<Self, MmError> {
         let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+        account_tracked_page_table_alloc();
         Ok(PageTable {
             root_ppn: frame.ppn,
             frames: vec![frame],
@@ -94,6 +137,7 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+                account_tracked_page_table_alloc();
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 self.frames.push(frame);
             }
@@ -115,6 +159,7 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+                account_untracked_page_table_alloc();
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 core::mem::forget(frame);
             }
@@ -191,6 +236,7 @@ impl PageTable {
         let pte = &mut self.root_ppn.get_pte_array()[idx];
         if !pte.is_valid() {
             let frame = frame_alloc().unwrap();
+            account_untracked_page_table_alloc();
             pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
         }
@@ -249,6 +295,12 @@ impl PageTable {
     /// get the token from the page table
     pub fn token(&self) -> AddressSpaceToken {
         crate::hal::make_address_space_token(self.root_ppn.0)
+    }
+}
+
+impl Drop for PageTable {
+    fn drop(&mut self) {
+        PAGE_TABLE_FREE_CALLS.fetch_add(self.frames.len(), Ordering::Relaxed);
     }
 }
 
