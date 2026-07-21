@@ -27,9 +27,9 @@ use crate::fs::page_cache;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
 use crate::mm::{
-    deferred_frame_count, deferred_kstack_id_count, deferred_range_count, frame_allocator_stats,
-    kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats, MapPermission, VmaKind,
-    KERNEL_HEAP_BYTES,
+    anonymous_page_stats, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
+    frame_allocator_stats, kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats,
+    MapPermission, VmaKind, KERNEL_HEAP_BYTES,
 };
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
@@ -52,6 +52,7 @@ fn parse_pid(name: &str) -> Option<usize> {
 
 fn build_meminfo() -> String {
     let stats = frame_allocator_stats();
+    let anon = anonymous_page_stats();
     let page_table = page_table_stats();
     let tlb = tlb_shootdown_stats();
     let process = process_lifecycle_stats();
@@ -119,6 +120,26 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "FrameZeroedPages: {}", stats.zeroed_pages);
     let _ = writeln!(&mut out, "FrameZeroedBytes: {}", stats.zeroed_bytes);
     let _ = writeln!(&mut out, "FrameZeroTimeTicks: {}", stats.zero_time_ticks);
+    let _ = writeln!(
+        &mut out,
+        "AnonZeroPageMapHits: {}",
+        anon.zero_page_map_hits
+    );
+    let _ = writeln!(
+        &mut out,
+        "AnonZeroPageWriteMaterializations: {}",
+        anon.zero_page_write_materializations
+    );
+    let _ = writeln!(
+        &mut out,
+        "AnonPrivateFirstFaultsRead: {}",
+        anon.private_first_faults_read
+    );
+    let _ = writeln!(
+        &mut out,
+        "AnonPrivateFirstFaultsWrite: {}",
+        anon.private_first_faults_write
+    );
     let _ = writeln!(
         &mut out,
         "FramePerCpuCacheEnabled: {}",

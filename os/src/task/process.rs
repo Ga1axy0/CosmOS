@@ -170,6 +170,8 @@ pub struct ProcessControlBlock {
     ///
     /// This is separate from `is_zombie`: a vfork parent is released after
     /// the child successfully execs, while the child may continue running.
+    /// It starts as `true` for ordinary processes so their exec/exit paths do
+    /// not spuriously wake normal waitpid callers.
     vfork_released: AtomicBool,
 }
 
@@ -1023,7 +1025,7 @@ impl ProcessControlBlock {
                 shm_attachments: Vec::new(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
-            vfork_released: AtomicBool::new(false),
+            vfork_released: AtomicBool::new(true),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = process
@@ -1235,6 +1237,7 @@ impl ProcessControlBlock {
         child_set_tid: Option<usize>,
         shared_resources: CloneResourceFlags,
         exit_signal: u32,
+        vfork_clone: bool,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
         let clone_start_ns = get_time_ns();
@@ -1261,9 +1264,16 @@ impl ProcessControlBlock {
         let (memory_set, parent_token, parent_mask) = if shared_resources
             .contains(CloneResourceFlags::VM)
         {
-            let memory_set = MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
-                .map_err(mm_error_to_errno)?;
-            (memory_set, parent.memory_set.token(), 0)
+            let (memory_set, parent_tlb_needs_flush) =
+                MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
+                    .map_err(mm_error_to_errno)?;
+            let parent_token = parent.memory_set.token();
+            let parent_mask = if parent_tlb_needs_flush {
+                parent.memory_set.loaded_user_harts()
+            } else {
+                0
+            };
+            (memory_set, parent_token, parent_mask)
         } else {
             let (memory_set, parent_tlb_needs_flush) =
                 MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
@@ -1373,7 +1383,7 @@ impl ProcessControlBlock {
                 shm_attachments: parent_shm_attachments.clone(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
-            vfork_released: AtomicBool::new(false),
+            vfork_released: AtomicBool::new(!vfork_clone),
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
@@ -1637,7 +1647,7 @@ impl ProcessControlBlock {
                 shm_attachments: Vec::new(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
-            vfork_released: AtomicBool::new(false),
+            vfork_released: AtomicBool::new(true),
         });
         parent.children.push(Arc::clone(&child));
         let parent_task = parent.get_task(0);

@@ -63,9 +63,11 @@ pub use heap_allocator::{
 };
 pub use memory_set::remap_test;
 pub use memory_set::{
-    invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
-    unregister_file_mappings_for_process, DeferredUserReclaim, FilePageFaultPrepare, InodeKey,
-    MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
+    anonymous_page_stats, invalidate_inode_mappings_after_truncate, kernel_token,
+    record_anonymous_zero_page_map_hit, record_anonymous_zero_page_write_materialization,
+    register_file_mapping, reset_anonymous_page_stats, unregister_file_mappings_for_process,
+    AnonymousPageStats, DeferredUserReclaim, FilePageFaultPrepare, InodeKey, MapPermission,
+    MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
 pub use oom::{log_oom, warn_heap_state};
 pub use page_table::{
@@ -86,6 +88,7 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     reset_page_table_stats();
     reset_tlb_shootdown_stats();
+    reset_anonymous_page_stats();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
     heap_allocator::init_kernel_heap_mapping();

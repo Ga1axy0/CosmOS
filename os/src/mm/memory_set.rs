@@ -46,6 +46,77 @@ extern "C" {
 
 const FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
 
+/// Counters for the anonymous-page zero-page/COW experiment.
+///
+/// The zero-page counters are intentionally kept here before the shared-zero
+/// page implementation lands, so `/proc/meminfo` has a stable baseline
+/// interface.  They remain zero until the corresponding mapping and
+/// materialization paths call the record helpers below.
+static ANON_ZERO_PAGE_MAP_HITS: AtomicUsize = AtomicUsize::new(0);
+static ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+static ANON_PRIVATE_FIRST_FAULTS_READ: AtomicUsize = AtomicUsize::new(0);
+static ANON_PRIVATE_FIRST_FAULTS_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+/// Runtime counters for private anonymous-page first faults and zero-page use.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnonymousPageStats {
+    /// Read or instruction-faults satisfied by the shared zero page.
+    pub zero_page_map_hits: usize,
+    /// Writes that materialized a private page from the shared zero page.
+    pub zero_page_write_materializations: usize,
+    /// Private anonymous first faults caused by a read or instruction fetch.
+    pub private_first_faults_read: usize,
+    /// Private anonymous first faults caused by a write.
+    pub private_first_faults_write: usize,
+}
+
+/// Return cumulative anonymous-page instrumentation counters.
+pub fn anonymous_page_stats() -> AnonymousPageStats {
+    AnonymousPageStats {
+        zero_page_map_hits: ANON_ZERO_PAGE_MAP_HITS.load(Ordering::Acquire),
+        zero_page_write_materializations: ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS
+            .load(Ordering::Acquire),
+        private_first_faults_read: ANON_PRIVATE_FIRST_FAULTS_READ.load(Ordering::Acquire),
+        private_first_faults_write: ANON_PRIVATE_FIRST_FAULTS_WRITE.load(Ordering::Acquire),
+    }
+}
+
+/// Reset anonymous-page instrumentation after the memory subsystem is ready.
+pub fn reset_anonymous_page_stats() {
+    ANON_ZERO_PAGE_MAP_HITS.store(0, Ordering::Release);
+    ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS.store(0, Ordering::Release);
+    ANON_PRIVATE_FIRST_FAULTS_READ.store(0, Ordering::Release);
+    ANON_PRIVATE_FIRST_FAULTS_WRITE.store(0, Ordering::Release);
+}
+
+/// Record one shared-zero-page mapping hit.
+///
+/// This is exposed for the eventual zero-page fault path; keeping the counter
+/// update in one place prevents the `/proc` ABI from changing when that path is
+/// enabled.
+#[allow(dead_code)]
+pub fn record_anonymous_zero_page_map_hit() {
+    ANON_ZERO_PAGE_MAP_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one write fault that materialized a private page from the zero page.
+#[allow(dead_code)]
+pub fn record_anonymous_zero_page_write_materialization() {
+    ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_private_anonymous_first_fault(access: PageFaultAccess) {
+    match access {
+        PageFaultAccess::Write => {
+            ANON_PRIVATE_FIRST_FAULTS_WRITE.fetch_add(1, Ordering::Relaxed);
+        }
+        PageFaultAccess::Read | PageFaultAccess::Exec => {
+            ANON_PRIVATE_FIRST_FAULTS_READ.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
     pub static ref KERNEL_SPACE: Arc<SpinNoIrqLock<MemorySet>> =
@@ -1045,45 +1116,99 @@ impl MemorySet {
         Ok((memory_set, parent_tlb_needs_flush))
     }
 
-    /// Create a new address space for `clone(CLONE_VM)` process-style clones.
+    /// Create a vfork-compatible address space for a process-style
+    /// `clone(CLONE_VM)`.
     ///
-    /// User private pages that are safe to share are installed into the child
-    /// page table with their current permissions. Kernel-managed per-task pages
-    /// such as trap contexts still get copied, so each task keeps independent
-    /// saved register state.
-    pub fn from_existed_user_shared_vm(user_space: &mut Self) -> Result<Self, MmError> {
+    /// The child needs a distinct page table because kernel-managed per-task
+    /// pages such as trap contexts cannot be shared.  Resident user pages are
+    /// nevertheless mapped to the same physical pages.  Before doing so,
+    /// writable pages that still carry fork COW protection are detached for
+    /// the parent and then shared writable with the CLONE_VM child.  Otherwise
+    /// a child write (notably glibc's posix_spawn `args.err`) would COW into a
+    /// child-private page and remain invisible to the resumed parent.
+    ///
+    /// Returns whether parent PTEs were relaxed/replaced and therefore require
+    /// a parent-address-space TLB shootdown.
+    pub fn from_existed_user_shared_vm(user_space: &mut Self) -> Result<(Self, bool), MmError> {
         let mut memory_set = Self::new_bare()?;
         memory_set.map_trampoline()?;
+        let mut parent_tlb_needs_flush = false;
         let parent_vma_starts: Vec<_> = user_space.vmas.keys().copied().collect();
         for area_start in parent_vma_starts {
-            let Some(area) = user_space.vmas.get(&area_start) else {
-                continue;
+            let (
+                share_private_pages,
+                cow_private_pages,
+                new_area,
+                private_pages,
+                direct_cache_pages,
+                inherit_direct_cache_pages,
+                map_perm,
+            ) = {
+                let Some(area) = user_space.vmas.get(&area_start) else {
+                    continue;
+                };
+                let cow_private_pages = area.supports_private_page_sharing();
+                (
+                    cow_private_pages || area.shared_anon || area.is_shared_anonymous(),
+                    cow_private_pages,
+                    area.clone_metadata(),
+                    area.data_frames
+                        .iter()
+                        .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                        .collect::<Vec<_>>(),
+                    area.direct_cache_pages
+                        .iter()
+                        .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                        .collect::<Vec<_>>(),
+                    area.file.is_some(),
+                    area.map_perm,
+                )
             };
-            let share_private_pages = area.supports_private_page_sharing()
-                || area.shared_anon
-                || area.is_shared_anonymous();
-            let new_area = area.clone_metadata();
             if share_private_pages {
                 memory_set.register_vma_metadata(new_area)?;
             } else {
                 memory_set.insert_vma(new_area, None)?;
             }
 
-            let private_pages: Vec<_> = area
-                .data_frames
-                .iter()
-                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
-                .collect();
-            let direct_cache_pages: Vec<_> = area
-                .direct_cache_pages
-                .iter()
-                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
-                .collect();
-            let inherit_direct_cache_pages = area.file.is_some();
-
-            for (vpn, page) in private_pages {
+            for (vpn, mut page) in private_pages {
                 if share_private_pages {
-                    let flags = user_space.translate(vpn).unwrap().flags();
+                    let mut flags = user_space.translate(vpn).ok_or(MmError::NoMapping)?.flags();
+
+                    // A normal fork can leave a writable VMA backed by a
+                    // read-only COW page.  Sharing that PTE unchanged would
+                    // make the CLONE_VM child take a private COW fault, which
+                    // violates vfork/posix_spawn's shared-memory contract.
+                    if cow_private_pages
+                        && map_perm.contains(MapPermission::W)
+                        && page.is_cow()
+                        && !flags.contains(PTEFlags::W)
+                    {
+                        let shared_page = Arc::new(PrivatePage::new(
+                            frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
+                        ));
+                        shared_page
+                            .ppn()
+                            .get_bytes_array()
+                            .copy_from_slice(page.ppn().get_bytes_array());
+                        let mut writable_flags = flags;
+                        writable_flags.insert(PTEFlags::W);
+                        writable_flags.remove(PTEFlags::D);
+                        if !user_space
+                            .page_table
+                            .replace(vpn, shared_page.ppn(), writable_flags)
+                        {
+                            return Err(MmError::NoMapping);
+                        }
+                        user_space
+                            .vmas
+                            .get_mut(&area_start)
+                            .ok_or(MmError::NoMapping)?
+                            .data_frames
+                            .insert(vpn, Arc::clone(&shared_page));
+                        page = shared_page;
+                        flags = writable_flags;
+                        parent_tlb_needs_flush = true;
+                    }
                     memory_set.map_existing_private_page(vpn, page, flags)?;
                     continue;
                 }
@@ -1107,7 +1232,7 @@ impl MemorySet {
                 }
             }
         }
-        Ok(memory_set)
+        Ok((memory_set, parent_tlb_needs_flush))
     }
     /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
@@ -1906,6 +2031,7 @@ impl MemorySet {
             return Ok(PageFaultHandled::NotHandled);
         }
         self.map_private_page_in_vma(vpn)?;
+        record_private_anonymous_first_fault(access);
         unsafe {
             crate::hal::flush_tlb();
         }

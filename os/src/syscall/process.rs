@@ -169,7 +169,11 @@ fn resolve_exec_image(
     }
 
     let abs_path = canonicalize(cwd, path);
-    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
+    // Preserve the filesystem errno.  In particular, exec callers must be
+    // able to distinguish a genuinely missing image from transient I/O or
+    // memory pressure; flattening every lookup failure to ENOENT makes libc
+    // report those failures as the posix_spawn sentinel exit status 127.
+    let inode = open_file_at(cwd, path, OpenFlags::RDONLY)?;
     if inode.is_dir() {
         return Err(ERRNO::EISDIR);
     }
@@ -1548,6 +1552,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_set_tid,
                 shared_resources,
                 exit_signal as u32,
+                vfork_clone,
             )?;
             let child_pid = new_process.getpid() as i32;
             if let Some(cgroup_fd) = cgroup {
@@ -1567,12 +1572,36 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             if vfork_clone {
                 // A vfork parent is released by the child's successful
                 // execve (or by _exit), not only after the child becomes a
-                // zombie.  Wait on the child queue so the predicate also
-                // closes the race where exec completes before sleeping.
-                new_process.wait_exit_queue.wait_with_reason_or_skip(
-                    WaitReason::ProcessWaitExit(child_pid as isize),
-                    || new_process.vfork_parent_released(),
-                );
+                // zombie.  Keep checking the predicate after every wake: a
+                // signal or another consumer of the shared child wait queue
+                // must not let the parent resume while the child still uses
+                // its CLONE_VM address space.
+                while !new_process.vfork_parent_released() {
+                    new_process.wait_exit_queue.wait_with_reason_or_skip(
+                        WaitReason::ProcessWaitExit(child_pid as isize),
+                        || new_process.vfork_parent_released(),
+                    );
+                    // Linux's vfork completion wait is killable: a fatal
+                    // signal (including a sibling-exec teardown SIGKILL) must
+                    // be allowed to remove this thread instead of deadlocking
+                    // the exec initiator.  Non-fatal/spurious wakes continue
+                    // to wait for the child-owned shared VM to be released.
+                    if crate::task::check_fatal_signals_of_current().is_some() {
+                        warn!(
+                            "[vfork] parent wait interrupted by fatal signal: parent_pid={} child_pid={}",
+                            current_process.getpid(),
+                            child_pid
+                        );
+                        break;
+                    }
+                    if !new_process.vfork_parent_released() {
+                        warn!(
+                            "[vfork] parent woke before child release: parent_pid={} child_pid={}",
+                            current_process.getpid(),
+                            child_pid
+                        );
+                    }
+                }
             }
             Ok(child_pid as isize)
         }
@@ -1738,15 +1767,13 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         let resolved = match resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0) {
             Ok(resolved) => resolved,
             Err(errno) => {
-                if path.contains("acct02") {
-                    debug!(
-                        "[execve] resolve failed pid={} cwd='{}' path='{}': {:?}",
-                        process.getpid(),
-                        cwd,
-                        path,
-                        errno
-                    );
-                }
+                warn!(
+                    "[execve][resolve-failed] pid={} cwd='{}' path='{}' errno={:?}",
+                    process.getpid(),
+                    cwd,
+                    path,
+                    errno
+                );
                 return Err(errno);
             }
         };

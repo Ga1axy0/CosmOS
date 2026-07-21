@@ -756,20 +756,78 @@ fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool 
     true
 }
 
-fn wake_running_or_queued_task(task: &Arc<TaskControlBlock>) -> bool {
-    let target_hart = {
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.task_status = TaskStatus::Runnable;
-        task_inner.wait_reason = None;
-        task_inner.current_wq_handle = None;
-        if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
-            task_inner.reset_time_slice();
+fn mark_task_woken(task_inner: &mut TaskControlBlockInner) {
+    task_inner.task_status = TaskStatus::Runnable;
+    task_inner.wait_reason = None;
+    task_inner.current_wq_handle = None;
+    if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
+        task_inner.reset_time_slice();
+    }
+}
+
+enum OnCpuWakeAction {
+    Done,
+    Enqueue {
+        preferred_hart: usize,
+        affinity_mask: usize,
+        policy: SchedPolicy,
+    },
+    WaitForSwitch {
+        last_cpu: usize,
+        affinity_mask: usize,
+        policy: SchedPolicy,
+    },
+}
+
+/// Revalidate and wake a task that was observed with `on_cpu=true`.
+///
+/// The processor lock is deliberately acquired before the task lock, matching
+/// `run_tasks`.  Holding both across the `processor.current` check and the
+/// Runnable transition prevents the owning hart from committing a block in
+/// between those two operations.
+fn resolve_on_cpu_wake(task: &Arc<TaskControlBlock>, last_cpu: usize) -> OnCpuWakeAction {
+    let processor = processor_for_hart(last_cpu).lock();
+    let mut task_inner = task.inner_exclusive_access();
+
+    if !matches!(
+        task_inner.task_status,
+        TaskStatus::Interruptible | TaskStatus::Uninterruptible
+    ) {
+        return OnCpuWakeAction::Done;
+    }
+    if task_inner.sched.on_rq {
+        mark_task_woken(&mut task_inner);
+        return OnCpuWakeAction::Done;
+    }
+
+    let is_still_current = processor
+        .current()
+        .is_some_and(|current| Arc::ptr_eq(&current, task));
+    if is_still_current {
+        mark_task_woken(&mut task_inner);
+        let target_hart = normalize_hart(task_inner.sched.last_cpu);
+        drop(task_inner);
+        drop(processor);
+        resched_hart(target_hart);
+        return OnCpuWakeAction::Done;
+    }
+
+    let preferred_hart = task_inner.sched.last_cpu;
+    let affinity_mask = task_inner.sched.cpu_affinity_mask;
+    let policy = task_inner.sched.policy;
+    if task.on_cpu.load(Ordering::Acquire) {
+        OnCpuWakeAction::WaitForSwitch {
+            last_cpu,
+            affinity_mask,
+            policy,
         }
-        let h = normalize_hart(task_inner.sched.last_cpu);
-        h
-    };
-    resched_hart(target_hart);
-    true
+    } else {
+        OnCpuWakeAction::Enqueue {
+            preferred_hart,
+            affinity_mask,
+            policy,
+        }
+    }
 }
 
 /// Pop one runnable task from the selected hart's runqueue.
@@ -848,71 +906,43 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     }
                     return true;
                 }
-                if task.on_cpu.load(Ordering::Relaxed) {
+                if task.on_cpu.load(Ordering::Acquire) {
                     let last_cpu = normalize_hart(task_inner.sched.last_cpu);
-                    let is_still_current = processor_for_hart(last_cpu)
-                        .lock()
-                        .current()
-                        .is_some_and(|current| Arc::ptr_eq(&current, &task));
-                    if is_still_current {
-                        // Task is still the running task on `last_cpu`: just mark
-                        // it Runnable without enqueueing. The running hart keeps it
-                        // on-CPU (and if it is about to block, its
-                        // `block_current_and_run_next` observes Runnable and skips
-                        // the switch). Enqueueing a running task would corrupt it.
-                        drop(task_inner);
-                        return wake_running_or_queued_task(&task);
-                    }
-                    // Transition window: `take_current_task()` already cleared
-                    // `processor.current` on `last_cpu`, but the context switch is
-                    // still in flight, so `on_cpu` is still true. It is cleared
-                    // post-switch by `finish_pending_task_release`, *after* the
-                    // task's registers are safely saved. Enqueueing now would let
-                    // another hart `__switch` into a half-saved context — the
-                    // confirmed SMP wake/block race. Snapshot the target fields
-                    // (stable across the transition), drop the lock, and spin
-                    // until the owning hart finishes the switch, then enqueue. The
-                    // wait is bounded: `finish_pending_task_release` runs as the
-                    // very next step after that hart returns to its idle loop.
-                    let affinity_mask = task_inner.sched.cpu_affinity_mask;
-                    let policy = task_inner.sched.policy;
                     drop(task_inner);
-                    // Defensive tripwire. The deferred release of `on_cpu` is
-                    // owned by `last_cpu`; if that is THIS hart, the only thing
-                    // that can clear `on_cpu` (`finish_pending_task_release`,
-                    // run when this hart next reaches its idle loop) cannot make
-                    // progress while we execute here — so the spin below would
-                    // never terminate. That is exactly the cyclictest
-                    // self-deadlock: a timer hardirq on the owning hart woke the
-                    // half-blocked task and spun on its still-set `on_cpu`. The
-                    // block/suspend transition is now kept IRQ-atomic, which
-                    // makes this state unreachable; panic loudly if it ever
-                    // recurs so it is debuggable instead of a silent 100%-CPU
-                    // hang.
-                    if last_cpu == normalize_hart(hartid()) {
-                        panic!(
-                            "[sched] wakeup_task: task {:#x} is mid-block (on_cpu set) with \
-                             last_cpu={} == this hart {} — the deferred `on_cpu` release cannot \
-                             complete while we run here; this should be unreachable now that the \
-                             block/suspend transition is IRQ-atomic",
-                            Arc::as_ptr(&task) as usize,
+                    match resolve_on_cpu_wake(&task, last_cpu) {
+                        OnCpuWakeAction::Done => return true,
+                        OnCpuWakeAction::Enqueue {
+                            preferred_hart,
+                            affinity_mask,
+                            policy,
+                        } => Some((preferred_hart, affinity_mask, policy)),
+                        OnCpuWakeAction::WaitForSwitch {
                             last_cpu,
-                            hartid(),
-                        );
+                            affinity_mask,
+                            policy,
+                        } => {
+                            // `take_current_task()` has already removed the
+                            // task from its processor, but the owning hart has
+                            // not finished saving its context.  Wait without
+                            // holding scheduler locks, then let the enqueue path
+                            // revalidate ownership under runqueue+task locks.
+                            if last_cpu == normalize_hart(hartid()) {
+                                panic!(
+                                    "[sched] wakeup_task: task {:#x} is mid-block (on_cpu set) with \
+                                     last_cpu={} == this hart {} — the deferred `on_cpu` release cannot \
+                                     complete while we run here; this should be unreachable now that the \
+                                     block/suspend transition is IRQ-atomic",
+                                    Arc::as_ptr(&task) as usize,
+                                    last_cpu,
+                                    hartid(),
+                                );
+                            }
+                            while task.on_cpu.load(Ordering::Acquire) {
+                                core::hint::spin_loop();
+                            }
+                            Some((last_cpu, affinity_mask, policy))
+                        }
                     }
-                    // Lock-free spin: pair with the `Release` store in
-                    // `finish_pending_task_release`. Seeing on_cpu==false means
-                    // the owning hart has finished saving this task's context, so
-                    // it is safe for us to enqueue it (and for another hart to
-                    // later switch into it).
-                    while task.on_cpu.load(Ordering::Acquire) {
-                        core::hint::spin_loop();
-                    }
-                    // `enqueue_wakeup_task` re-validates on_rq/on_cpu under the
-                    // runqueue+task locks, so a task that was re-picked (on_cpu
-                    // flipped back to true) or already woken by a rival (on_rq)
-                    // during the spin is handled safely.
-                    Some((last_cpu, affinity_mask, policy))
                 } else {
                     Some((
                         task_inner.sched.last_cpu,
