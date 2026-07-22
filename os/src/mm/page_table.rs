@@ -8,12 +8,17 @@ use crate::hal::traits::{AddressSpaceToken, PTEFlags, PagingArch};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(feature = "cosmos-meminfo")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(feature = "cosmos-meminfo")]
 static PAGE_TABLE_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static PAGE_TABLE_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static PAGE_TABLE_UNTRACKED_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "cosmos-meminfo")]
 #[derive(Clone, Copy, Debug, Default)]
 /// Runtime counters for page-table frame ownership and permanent mappings.
 pub struct PageTableStats {
@@ -26,6 +31,7 @@ pub struct PageTableStats {
 }
 
 /// Reset page-table counters after the boot allocator has been initialized.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn reset_page_table_stats() {
     PAGE_TABLE_ALLOC_CALLS.store(0, Ordering::Release);
     PAGE_TABLE_FREE_CALLS.store(0, Ordering::Release);
@@ -33,6 +39,7 @@ pub fn reset_page_table_stats() {
 }
 
 /// Return page-table frame allocation counters.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn page_table_stats() -> PageTableStats {
     PageTableStats {
         alloc_calls: PAGE_TABLE_ALLOC_CALLS.load(Ordering::Acquire),
@@ -42,11 +49,13 @@ pub fn page_table_stats() -> PageTableStats {
 }
 
 #[inline]
+#[cfg(feature = "cosmos-meminfo")]
 fn account_tracked_page_table_alloc() {
     PAGE_TABLE_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
+#[cfg(feature = "cosmos-meminfo")]
 fn account_untracked_page_table_alloc() {
     PAGE_TABLE_UNTRACKED_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
 }
@@ -110,6 +119,7 @@ impl PageTable {
     /// Create a new page table
     pub fn new() -> Result<Self, MmError> {
         let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+        #[cfg(feature = "cosmos-meminfo")]
         account_tracked_page_table_alloc();
         Ok(PageTable {
             root_ppn: frame.ppn,
@@ -137,6 +147,7 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+                #[cfg(feature = "cosmos-meminfo")]
                 account_tracked_page_table_alloc();
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 self.frames.push(frame);
@@ -159,6 +170,7 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+                #[cfg(feature = "cosmos-meminfo")]
                 account_untracked_page_table_alloc();
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 core::mem::forget(frame);
@@ -236,6 +248,7 @@ impl PageTable {
         let pte = &mut self.root_ppn.get_pte_array()[idx];
         if !pte.is_valid() {
             let frame = frame_alloc().unwrap();
+            #[cfg(feature = "cosmos-meminfo")]
             account_untracked_page_table_alloc();
             pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
@@ -300,7 +313,10 @@ impl PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
-        PAGE_TABLE_FREE_CALLS.fetch_add(self.frames.len(), Ordering::Relaxed);
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            PAGE_TABLE_FREE_CALLS.fetch_add(self.frames.len(), Ordering::Relaxed);
+        }
     }
 }
 

@@ -1085,6 +1085,7 @@ impl ProcessControlBlock {
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // publish main thread to scheduler only after the process/task state is fully initialized
         add_task(task);
+        #[cfg(feature = "cosmos-meminfo")]
         super::account_process_create();
         process
     }
@@ -1286,6 +1287,7 @@ impl ProcessControlBlock {
         );
         // Re-acquire task_inner only to install the trap context.
         *task.inner_exclusive_access().get_trap_cx() = trap_cx;
+        #[cfg(feature = "cosmos-meminfo")]
         super::account_process_exec();
         Ok(())
     }
@@ -1612,6 +1614,7 @@ impl ProcessControlBlock {
         let publish_start_ns = get_time_ns();
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        #[cfg(feature = "cosmos-meminfo")]
         super::account_process_create();
         let publish_ns = get_time_ns() - publish_start_ns;
         let total_ns = get_time_ns() - clone_start_ns;
@@ -1757,6 +1760,7 @@ impl ProcessControlBlock {
         child.attach_task(Arc::clone(&task));
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        #[cfg(feature = "cosmos-meminfo")]
         super::account_process_create();
         Ok(child)
     }

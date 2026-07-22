@@ -3,7 +3,7 @@
 #[allow(unused)]
 
 /// user app's stack size (increased to avoid user-space stack overflow for glibc/busybox)
-pub const USER_STACK_SIZE: usize = 1024 * 2048; // 2 MiB
+pub const USER_STACK_SIZE: usize = 1024 * 8192; // 8 MiB
 /// kernel stack size
 pub const KERNEL_STACK_SIZE: usize = 4096 * 32;
 /// kernel heap size

@@ -43,6 +43,66 @@ const EXEC_ARG_STRING_MAX: usize = 128 * 1024;
 const PR_CAPBSET_READ: i32 = 23;
 const PR_CAPBSET_DROP: i32 = 24;
 
+/// Child state captured without holding the caller's PCB lock.
+///
+/// Process PCB locks must never be nested. In particular, callers must not
+/// hold the parent PCB's `inner` lock while taking a child's `inner` lock:
+/// the exit/reparent path takes the reverse order when it publishes children
+/// to INITPROC.
+#[derive(Clone, Copy, Debug)]
+struct WaitChildSnapshot {
+    pid: usize,
+    ppid: usize,
+    pgid: u32,
+    is_zombie: bool,
+}
+
+/// Snapshot the current child list, then inspect each child after releasing
+/// the parent PCB lock. The returned `Arc`s keep the processes alive while
+/// their state is being examined and while a candidate is revalidated.
+fn snapshot_wait_children(
+    process: &Arc<ProcessControlBlock>,
+) -> Vec<(Arc<ProcessControlBlock>, WaitChildSnapshot)> {
+    let children = {
+        let inner = process.inner_exclusive_access();
+        inner.children.iter().cloned().collect::<Vec<_>>()
+    };
+
+    children
+        .into_iter()
+        .map(|child| {
+            let child_inner = child.inner_exclusive_access();
+            let ppid = child_inner
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid())
+                .unwrap_or(0);
+            let snapshot = WaitChildSnapshot {
+                pid: child.getpid(),
+                ppid,
+                pgid: child_inner.cred.pgid,
+                is_zombie: child_inner.is_zombie,
+            };
+            drop(child_inner);
+            (child, snapshot)
+        })
+        .collect()
+}
+
+fn wait_child_matches(pid: isize, current_pgid: u32, child: WaitChildSnapshot) -> bool {
+    if pid == -1 {
+        return true;
+    }
+    if pid == 0 {
+        return child.pgid == current_pgid;
+    }
+    if pid > 0 {
+        return child.pid == pid as usize;
+    }
+    child.pgid == (-pid) as u32
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct UserCapHeader {
@@ -1895,23 +1955,10 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
     trace!("kernel: sys_wait4");
     let process = current_process();
     let caller_pid = process.getpid();
-    let children_snapshot = {
-        let inner = process.inner_exclusive_access();
-        inner
-            .children
-            .iter()
-            .map(|child| {
-                let child_inner = child.inner_exclusive_access();
-                let child_ppid = child_inner
-                    .parent
-                    .as_ref()
-                    .and_then(|parent| parent.upgrade())
-                    .map(|parent| parent.getpid())
-                    .unwrap_or(0);
-                (child.getpid(), child_ppid, child_inner.is_zombie)
-            })
-            .collect::<Vec<_>>()
-    };
+    let children_snapshot = snapshot_wait_children(&process)
+        .into_iter()
+        .map(|(_, child)| (child.pid, child.ppid, child.is_zombie))
+        .collect::<Vec<_>>();
     warn!(
         "[wait4-diag] enter caller_pid={} target_pid={} options={:#x} children={:?}",
         caller_pid, pid, options, children_snapshot
@@ -1928,77 +1975,117 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
         let current_pgid = process.getpgid();
 
         loop {
-            let mut inner = process.inner_exclusive_access();
-            let matches_wait_pid = |child: &Arc<ProcessControlBlock>| -> bool {
-                if pid == -1 {
-                    return true;
-                }
-                if pid == 0 {
-                    return child.getpgid() == current_pgid;
-                }
-                if pid > 0 {
-                    return child.getpid() == pid as usize;
-                }
-                child.getpgid() == (-pid) as u32
-            };
+            // Snapshot the child list under the parent lock, then inspect each
+            // child after releasing it. No two PCB `inner` locks are nested.
+            let child_snapshots = snapshot_wait_children(&process);
 
             // 1) 没有任何匹配的子进程
-            let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
+            let has_target_child = child_snapshots
+                .iter()
+                .any(|(_, child)| wait_child_matches(pid, current_pgid, *child));
 
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
 
             // 2) 查找已经退出的目标子进程
-            let zombie_idx = inner.children.iter().position(|p| {
-                let p_inner = p.inner_exclusive_access();
-                if !p_inner.is_zombie {
-                    return false;
-                }
-                if pid == -1 {
-                    return true;
-                }
-                if pid == 0 {
-                    return p_inner.cred.pgid == current_pgid;
-                }
-                if pid > 0 {
-                    return p.getpid() == pid as usize;
-                }
-                p_inner.cred.pgid == (-pid) as u32
-            });
+            let zombie_child = child_snapshots
+                .iter()
+                .find(|(_, child)| child.is_zombie && wait_child_matches(pid, current_pgid, *child))
+                .map(|(child, _)| Arc::clone(child));
 
-            if let Some(idx) = zombie_idx {
-                let child = inner.children.remove(idx);
+            if let Some(zombie_child) = zombie_child {
+                // Claim the child from the parent list without taking the
+                // child's lock. A concurrent reaper may have won the race;
+                // in that case simply rescan the child list.
+                let child = {
+                    let mut inner = process.inner_exclusive_access();
+                    let Some(idx) = inner
+                        .children
+                        .iter()
+                        .position(|candidate| Arc::ptr_eq(candidate, &zombie_child))
+                    else {
+                        continue;
+                    };
+                    inner.children.remove(idx)
+                };
                 let found_pid = child.getpid();
-                // warn_heap_state("reap_begin", found_pid);
-                let child_inner = child.inner_exclusive_access();
-                // 编码为wstatus
-                let exit_status = match child_inner.exit_reason {
-                    ExitReason::Exit(code) => (code & 0xff) << 8,
-                    ExitReason::Signal(signum) => {
-                        // 低 7 位为终止信号；若该信号默认动作会转储核心，
-                        // 置上 0x80（WCOREDUMP）以满足 `WCOREDUMP(status)`。
-                        let mut status = (signum & 0x7f) as i32;
-                        let dumps_core = crate::signal::SignalNum::from_number(signum)
-                            .map(|sig| sig.dumps_core())
-                            .unwrap_or(false);
-                        if dumps_core {
-                            status |= 0x80;
-                        }
-                        status
+                // Read the child's exit data only after releasing the parent
+                // lock. Revalidate the snapshot in case of a concurrent race.
+                let child_data = {
+                    let child_inner = child.inner_exclusive_access();
+                    let child_snapshot = WaitChildSnapshot {
+                        pid: found_pid,
+                        ppid: 0,
+                        pgid: child_inner.cred.pgid,
+                        is_zombie: child_inner.is_zombie,
+                    };
+                    if !child_inner.is_zombie
+                        || !wait_child_matches(pid, current_pgid, child_snapshot)
+                    {
+                        None
+                    } else {
+                        // 编码为wstatus
+                        let exit_status = match child_inner.exit_reason {
+                            ExitReason::Exit(code) => (code & 0xff) << 8,
+                            ExitReason::Signal(signum) => {
+                                // 低 7 位为终止信号；若该信号默认动作会转储核心，
+                                // 置上 0x80（WCOREDUMP）以满足 `WCOREDUMP(status)`。
+                                let mut status = (signum & 0x7f) as i32;
+                                let dumps_core = crate::signal::SignalNum::from_number(signum)
+                                    .map(|sig| sig.dumps_core())
+                                    .unwrap_or(false);
+                                if dumps_core {
+                                    status |= 0x80;
+                                }
+                                status
+                            }
+                        };
+                        Some((
+                            exit_status,
+                            child_inner.user_time,
+                            child_inner.child_user_time,
+                            child_inner.kernel_time,
+                            child_inner.child_kernel_time,
+                        ))
                     }
                 };
-                inner.child_user_time = inner
-                    .child_user_time
-                    .saturating_add(child_inner.user_time)
-                    .saturating_add(child_inner.child_user_time);
-                inner.child_kernel_time = inner
-                    .child_kernel_time
-                    .saturating_add(child_inner.kernel_time)
-                    .saturating_add(child_inner.child_kernel_time);
-                let no_remaining_children = inner.children.is_empty();
-                drop(child_inner);
-                drop(inner);
+
+                let Some((
+                    exit_status,
+                    child_user_time,
+                    child_child_user_time,
+                    child_kernel_time,
+                    child_child_kernel_time,
+                )) = child_data
+                else {
+                    // The child was claimed based on a stale snapshot. Restore
+                    // it without taking its lock and rescan on the next loop.
+                    let mut inner = process.inner_exclusive_access();
+                    if !inner
+                        .children
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, &child))
+                    {
+                        inner.children.push(child);
+                    }
+                    continue;
+                };
+
+                // Update parent accounting after releasing the child lock.
+                let no_remaining_children = {
+                    let mut inner = process.inner_exclusive_access();
+                    inner.child_user_time = inner
+                        .child_user_time
+                        .saturating_add(child_user_time)
+                        .saturating_add(child_child_user_time);
+                    inner.child_kernel_time = inner
+                        .child_kernel_time
+                        .saturating_add(child_kernel_time)
+                        .saturating_add(child_child_kernel_time);
+                    inner.children.is_empty()
+                };
+
                 unregister_file_mappings_for_process(&child);
                 remove_from_pid2process(found_pid);
                 drop(child);
@@ -2024,8 +2111,7 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 return Ok(0);
             }
 
-            // 4) 阻塞等待；这里必须先释放 inner，再检查信号/睡眠。
-            drop(inner);
+            // 4) 阻塞等待；谓词同样使用无嵌套锁的快照。
             if crate::signal::has_interrupting_signal() {
                 return Err(ERRNO::EINTR);
             }
@@ -2033,23 +2119,12 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             process.wait_exit_queue.wait_with_reason_or_skip(
                 WaitReason::ProcessWaitExit(pid),
                 || {
-                    let inner = process.inner_exclusive_access();
-                    let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
-                    let has_target_zombie = inner.children.iter().any(|p| {
-                        let p_inner = p.inner_exclusive_access();
-                        if !p_inner.is_zombie {
-                            return false;
-                        }
-                        if pid == -1 {
-                            return true;
-                        }
-                        if pid == 0 {
-                            return p_inner.cred.pgid == current_pgid;
-                        }
-                        if pid > 0 {
-                            return p.getpid() == pid as usize;
-                        }
-                        p_inner.cred.pgid == (-pid) as u32
+                    let child_snapshots = snapshot_wait_children(&process);
+                    let has_target_child = child_snapshots
+                        .iter()
+                        .any(|(_, child)| wait_child_matches(pid, current_pgid, *child));
+                    let has_target_zombie = child_snapshots.iter().any(|(_, child)| {
+                        child.is_zombie && wait_child_matches(pid, current_pgid, *child)
                     });
                     !has_target_child || has_target_zombie
                 },

@@ -197,6 +197,7 @@ pub(crate) fn terminate_other_threads_for_exec(
     }
     drop(recycle_res);
 }
+#[cfg(feature = "cosmos-meminfo")]
 pub(crate) use id::cached_kstack_count;
 pub(crate) use id::reclaim_cached_kstacks;
 pub(crate) use id::recycle_deferred_kstack_ids;
@@ -214,12 +215,16 @@ static DEBUG_DUMP_REMAINING: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_DEADLINE_NS: AtomicUsize = AtomicUsize::new(0);
 const DEBUG_DUMP_INTERVAL_NS: usize = 1_000_000_000;
 
+#[cfg(feature = "cosmos-meminfo")]
 static PROCESS_CREATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static PROCESS_EXEC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static PROCESS_EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "cosmos-meminfo")]
 #[derive(Clone, Copy, Debug, Default)]
-/// Cumulative process lifecycle counters exported through `/proc/meminfo`.
+/// Cumulative process lifecycle counters exported through `/proc/cosmos_meminfo`.
 pub struct ProcessLifecycleStats {
     /// Number of successfully published processes.
     pub create_calls: usize,
@@ -229,19 +234,23 @@ pub struct ProcessLifecycleStats {
     pub exit_calls: usize,
 }
 
+#[cfg(feature = "cosmos-meminfo")]
 pub(crate) fn account_process_create() {
     PROCESS_CREATE_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(feature = "cosmos-meminfo")]
 pub(crate) fn account_process_exec() {
     PROCESS_EXEC_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(feature = "cosmos-meminfo")]
 pub(crate) fn account_process_exit() {
     PROCESS_EXIT_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Return cumulative process lifecycle counters.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn process_lifecycle_stats() -> ProcessLifecycleStats {
     ProcessLifecycleStats {
         create_calls: PROCESS_CREATE_CALLS.load(Ordering::Acquire),
@@ -302,24 +311,51 @@ fn reap_zombie_child_from_parent(
         else {
             return false;
         };
-        let removed_child = parent_inner.children.remove(idx);
-        {
-            let child_inner = removed_child.inner_exclusive_access();
-            if !child_inner.is_zombie {
-                parent_inner.children.push(Arc::clone(&removed_child));
-                return false;
-            }
-            parent_inner.child_user_time = parent_inner
-                .child_user_time
-                .saturating_add(child_inner.user_time)
-                .saturating_add(child_inner.child_user_time);
-            parent_inner.child_kernel_time = parent_inner
-                .child_kernel_time
-                .saturating_add(child_inner.kernel_time)
-                .saturating_add(child_inner.child_kernel_time);
-        }
-        removed_child
+        parent_inner.children.remove(idx)
     };
+
+    // The child must be inspected after releasing the parent PCB lock. The
+    // exit path can hold a child PCB lock while notifying/reparenting it.
+    let child_data = {
+        let child_inner = removed_child.inner_exclusive_access();
+        if child_inner.is_zombie {
+            Some((
+                child_inner.user_time,
+                child_inner.child_user_time,
+                child_inner.kernel_time,
+                child_inner.child_kernel_time,
+            ))
+        } else {
+            None
+        }
+    };
+
+    let Some((user_time, child_user_time, kernel_time, child_kernel_time)) = child_data else {
+        // A concurrent state transition made the snapshot stale. Restore the
+        // relationship without holding the child's lock.
+        let mut parent_inner = parent.inner_exclusive_access();
+        if !parent_inner
+            .children
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &removed_child))
+        {
+            parent_inner.children.push(Arc::clone(&removed_child));
+        }
+        return false;
+    };
+
+    // Update parent accounting only after the child lock has been released.
+    {
+        let mut parent_inner = parent.inner_exclusive_access();
+        parent_inner.child_user_time = parent_inner
+            .child_user_time
+            .saturating_add(user_time)
+            .saturating_add(child_user_time);
+        parent_inner.child_kernel_time = parent_inner
+            .child_kernel_time
+            .saturating_add(kernel_time)
+            .saturating_add(child_kernel_time);
+    }
 
     let found_pid = removed_child.getpid();
     unregister_file_mappings_for_process(&removed_child);
@@ -506,6 +542,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             return;
         }
         // mark this process as a zombie process
+        #[cfg(feature = "cosmos-meminfo")]
         account_process_exit();
         process_inner.is_zombie = true;
         // record process exit reason for wait4/waitpid
@@ -522,13 +559,18 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             .contains(CloneResourceFlags::SIGHAND)
             .then(|| process_inner.signal_actions.clone());
         let children_to_reparent = core::mem::take(&mut process_inner.children);
-        for child in children_to_reparent.iter() {
-            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-        }
+        // Do not hold the exiting process's PCB lock while taking any child
+        // PCB lock or INITPROC's PCB lock. Those paths can run concurrently
+        // with wait4/child-exit notification and otherwise create a cycle.
+        drop(process_inner);
+
         let reparented_zombies = children_to_reparent
             .iter()
-            .filter(|child| child.inner_exclusive_access().is_zombie)
-            .map(Arc::clone)
+            .filter_map(|child| {
+                let mut child_inner = child.inner_exclusive_access();
+                child_inner.parent = Some(Arc::downgrade(&INITPROC));
+                child_inner.is_zombie.then(|| Arc::clone(child))
+            })
             .collect::<Vec<_>>();
         {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
@@ -536,7 +578,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 initproc_inner.children.push(child);
             }
         }
-        drop(process_inner);
         for child in reparented_zombies {
             let autoreap = notify_parent_child_exit(&INITPROC, child.clone_exit_signal);
             if autoreap {

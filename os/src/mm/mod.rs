@@ -57,37 +57,47 @@ pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_alloc_with_reclaim, frame_allocator_stats,
     frame_dealloc, frame_dealloc_range, ContiguousFrames, FrameAllocatorStats, FrameTracker,
 };
+#[cfg(feature = "cosmos-meminfo")]
+pub use heap_allocator::{kernel_heap_allocator_stats, KernelHeapAllocatorStats};
 pub use heap_allocator::{
-    kernel_heap_allocator_stats, map_one_heap_page, reclaim_kernel_heap_if_needed,
-    KernelHeapAllocatorStats, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
+    map_one_heap_page, reclaim_kernel_heap_if_needed, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
 };
 pub use memory_set::remap_test;
+#[cfg(feature = "cosmos-meminfo")]
 pub use memory_set::{
-    anonymous_page_stats, invalidate_inode_mappings_after_truncate, kernel_token,
-    record_anonymous_zero_page_map_hit, record_anonymous_zero_page_write_materialization,
-    register_file_mapping, reset_anonymous_page_stats, unregister_file_mappings_for_process,
-    AnonymousPageStats, DeferredUserReclaim, FilePageFaultPrepare, InodeKey, MapPermission,
-    MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
+    anonymous_page_stats, record_anonymous_zero_page_map_hit,
+    record_anonymous_zero_page_write_materialization, reset_anonymous_page_stats,
+    AnonymousPageStats,
+};
+pub use memory_set::{
+    invalidate_inode_mappings_after_truncate, kernel_token, register_file_mapping,
+    unregister_file_mappings_for_process, DeferredUserReclaim, FilePageFaultPrepare, InodeKey,
+    MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
 pub use oom::{log_oom, warn_heap_state};
+#[cfg(feature = "cosmos-meminfo")]
+pub use page_table::{page_table_stats, reset_page_table_stats, PageTableStats};
 pub use page_table::{
-    page_table_stats, reset_page_table_stats, translated_byte_buffer, translated_ref,
-    translated_refmut, translated_str, PageTable, PageTableEntry, PageTableStats, UserBuffer,
-    UserBufferIterator,
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
+    PageTableEntry, UserBuffer, UserBufferIterator,
 };
 pub use tlb_shootdown::{
     clear_deferred, defer_release, deferred_frame_count, deferred_kstack_id_count,
     deferred_range_count, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush,
-    online_mask, poll_pending_shootdown, reset_tlb_shootdown_stats, shootdown, shootdown_global,
-    shootdown_global_quiet, take_deferred, tlb_shootdown_stats, DeferredBatch, ShootdownKind,
-    TlbShootdownStats,
+    online_mask, poll_pending_shootdown, shootdown, shootdown_global, shootdown_global_quiet,
+    take_deferred, DeferredBatch, ShootdownKind,
 };
+#[cfg(feature = "cosmos-meminfo")]
+pub use tlb_shootdown::{reset_tlb_shootdown_stats, tlb_shootdown_stats, TlbShootdownStats};
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     frame_allocator::init_frame_allocator();
+    #[cfg(feature = "cosmos-meminfo")]
     reset_page_table_stats();
+    #[cfg(feature = "cosmos-meminfo")]
     reset_tlb_shootdown_stats();
+    #[cfg(feature = "cosmos-meminfo")]
     reset_anonymous_page_stats();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();

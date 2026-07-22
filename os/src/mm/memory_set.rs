@@ -49,15 +49,20 @@ const FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
 /// Counters for the anonymous-page zero-page/COW experiment.
 ///
 /// The zero-page counters are intentionally kept here before the shared-zero
-/// page implementation lands, so `/proc/meminfo` has a stable baseline
+/// page implementation lands, so `/proc/cosmos_meminfo` has a stable baseline
 /// interface.  They remain zero until the corresponding mapping and
 /// materialization paths call the record helpers below.
+#[cfg(feature = "cosmos-meminfo")]
 static ANON_ZERO_PAGE_MAP_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static ANON_PRIVATE_FIRST_FAULTS_READ: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static ANON_PRIVATE_FIRST_FAULTS_WRITE: AtomicUsize = AtomicUsize::new(0);
 
 /// Runtime counters for private anonymous-page first faults and zero-page use.
+#[cfg(feature = "cosmos-meminfo")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AnonymousPageStats {
     /// Read or instruction-faults satisfied by the shared zero page.
@@ -71,6 +76,7 @@ pub struct AnonymousPageStats {
 }
 
 /// Return cumulative anonymous-page instrumentation counters.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn anonymous_page_stats() -> AnonymousPageStats {
     AnonymousPageStats {
         zero_page_map_hits: ANON_ZERO_PAGE_MAP_HITS.load(Ordering::Acquire),
@@ -82,6 +88,7 @@ pub fn anonymous_page_stats() -> AnonymousPageStats {
 }
 
 /// Reset anonymous-page instrumentation after the memory subsystem is ready.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn reset_anonymous_page_stats() {
     ANON_ZERO_PAGE_MAP_HITS.store(0, Ordering::Release);
     ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS.store(0, Ordering::Release);
@@ -94,18 +101,21 @@ pub fn reset_anonymous_page_stats() {
 /// This is exposed for the eventual zero-page fault path; keeping the counter
 /// update in one place prevents the `/proc` ABI from changing when that path is
 /// enabled.
+#[cfg(feature = "cosmos-meminfo")]
 #[allow(dead_code)]
 pub fn record_anonymous_zero_page_map_hit() {
     ANON_ZERO_PAGE_MAP_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record one write fault that materialized a private page from the zero page.
+#[cfg(feature = "cosmos-meminfo")]
 #[allow(dead_code)]
 pub fn record_anonymous_zero_page_write_materialization() {
     ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
+#[cfg(feature = "cosmos-meminfo")]
 fn record_private_anonymous_first_fault(access: PageFaultAccess) {
     match access {
         PageFaultAccess::Write => {
@@ -2031,7 +2041,10 @@ impl MemorySet {
             return Ok(PageFaultHandled::NotHandled);
         }
         self.map_private_page_in_vma(vpn)?;
-        record_private_anonymous_first_fault(access);
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            record_private_anonymous_first_fault(access);
+        }
         unsafe {
             crate::hal::flush_tlb();
         }

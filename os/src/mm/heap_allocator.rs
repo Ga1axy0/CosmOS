@@ -277,12 +277,15 @@ struct ReclaimingHeap {
     /// Cumulative number of free-list nodes inspected while coalescing a
     /// deallocation. This exposes the linear-search cost of the current buddy
     /// implementation.
+    #[cfg(feature = "cosmos-meminfo")]
     free_scan_steps: usize,
     /// Cumulative number of buddy-level deallocations.
+    #[cfg(feature = "cosmos-meminfo")]
     buddy_free_calls: usize,
 }
 
 /// Snapshot of the kernel heap allocator's fragmentation and free-list state.
+#[cfg(feature = "cosmos-meminfo")]
 #[derive(Clone, Copy, Debug)]
 pub struct KernelHeapAllocatorStats {
     /// Bytes requested by live allocations.
@@ -315,7 +318,9 @@ impl ReclaimingHeap {
             user: 0,
             allocated: 0,
             total: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             free_scan_steps: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             buddy_free_calls: 0,
         }
     }
@@ -354,7 +359,10 @@ impl ReclaimingHeap {
         if self.free_index_overflow {
             let mut current = self.free_list[order].head;
             while !current.is_null() {
-                self.free_scan_steps += 1;
+                #[cfg(feature = "cosmos-meminfo")]
+                {
+                    self.free_scan_steps += 1;
+                }
                 if current == block {
                     unsafe { self.free_list[order].remove(current) };
                     return true;
@@ -435,7 +443,10 @@ impl ReclaimingHeap {
     }
 
     fn dealloc_rounded(&mut self, ptr: NonNull<u8>, size: usize) {
-        self.buddy_free_calls += 1;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.buddy_free_calls += 1;
+        }
         let class = size.trailing_zeros() as usize;
 
         unsafe {
@@ -462,6 +473,7 @@ impl ReclaimingHeap {
         self.total.saturating_sub(self.allocated)
     }
 
+    #[cfg(feature = "cosmos-meminfo")]
     fn largest_free_block(&self) -> usize {
         for class in (0..HEAP_ORDER_COUNT).rev() {
             if !self.free_list[class].is_empty() {
@@ -471,6 +483,7 @@ impl ReclaimingHeap {
         0
     }
 
+    #[cfg(feature = "cosmos-meminfo")]
     fn stats(&self) -> KernelHeapAllocatorStats {
         KernelHeapAllocatorStats {
             requested_bytes: self.user,
@@ -524,8 +537,11 @@ struct SmallSlabClass {
     slot_size: usize,
     available_head: *mut SlabChunkHeader,
     available_chunks: usize,
+    #[cfg(feature = "cosmos-meminfo")]
     reserved_bytes: usize,
+    #[cfg(feature = "cosmos-meminfo")]
     free_bytes: usize,
+    #[cfg(feature = "cosmos-meminfo")]
     requested_bytes: usize,
 }
 
@@ -537,8 +553,11 @@ impl SmallSlabClass {
             slot_size,
             available_head: core::ptr::null_mut(),
             available_chunks: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             reserved_bytes: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             free_bytes: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             requested_bytes: 0,
         }
     }
@@ -595,12 +614,18 @@ impl SmallSlabClass {
             *slot = (*header).free_head as usize;
             (*header).free_head = slot;
         }
-        self.reserved_bytes += SLAB_CHUNK_SIZE;
-        self.free_bytes += total_slots * self.slot_size;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.reserved_bytes += SLAB_CHUNK_SIZE;
+        }
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.free_bytes += total_slots * self.slot_size;
+        }
         self.add_available(header);
     }
 
-    unsafe fn alloc_slot(&mut self, requested_size: usize) -> Option<NonNull<u8>> {
+    unsafe fn alloc_slot(&mut self, _requested_size: usize) -> Option<NonNull<u8>> {
         let chunk = self.available_head;
         if chunk.is_null() {
             return None;
@@ -609,11 +634,17 @@ impl SmallSlabClass {
         debug_assert!(!slot.is_null());
         (*chunk).free_head = *slot as *mut usize;
         (*chunk).free_slots -= 1;
-        self.free_bytes -= self.slot_size;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.free_bytes -= self.slot_size;
+        }
         if (*chunk).free_slots == 0 {
             self.remove_available(chunk);
         }
-        self.requested_bytes += requested_size;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.requested_bytes += _requested_size;
+        }
         Some(NonNull::new_unchecked(slot as *mut u8))
     }
 
@@ -622,7 +653,7 @@ impl SmallSlabClass {
     unsafe fn dealloc_slot(
         &mut self,
         ptr: NonNull<u8>,
-        requested_size: usize,
+        _requested_size: usize,
     ) -> Option<NonNull<u8>> {
         let chunk = (ptr.as_ptr() as usize & !(SLAB_CHUNK_SIZE - 1)) as *mut SlabChunkHeader;
         assert_eq!((*chunk).magic, SLAB_MAGIC);
@@ -632,17 +663,30 @@ impl SmallSlabClass {
         *slot = (*chunk).free_head as usize;
         (*chunk).free_head = slot;
         (*chunk).free_slots += 1;
-        self.free_bytes += self.slot_size;
-        self.requested_bytes -= requested_size;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.free_bytes += self.slot_size;
+        }
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.requested_bytes -= _requested_size;
+        }
         if was_full {
             self.add_available(chunk);
         }
 
         if (*chunk).free_slots == (*chunk).total_slots && self.available_chunks > 1 {
+            #[cfg(feature = "cosmos-meminfo")]
             let bytes = (*chunk).total_slots * self.slot_size;
             self.remove_available(chunk);
-            self.reserved_bytes -= SLAB_CHUNK_SIZE;
-            self.free_bytes -= bytes;
+            #[cfg(feature = "cosmos-meminfo")]
+            {
+                self.reserved_bytes -= SLAB_CHUNK_SIZE;
+            }
+            #[cfg(feature = "cosmos-meminfo")]
+            {
+                self.free_bytes -= bytes;
+            }
             Some(NonNull::new_unchecked(chunk as *mut u8))
         } else {
             None
@@ -686,6 +730,7 @@ impl SmallSlabHeap {
         self.classes[class].dealloc_slot(ptr, requested_size)
     }
 
+    #[cfg(feature = "cosmos-meminfo")]
     fn stats(&self) -> (usize, usize, usize, usize) {
         let mut reserved = 0;
         let mut free = 0;
@@ -730,6 +775,7 @@ pub fn init_kernel_heap_mapping() {
 struct KernelHeapAllocator {
     heap: SpinNoIrqLock<ReclaimingHeap>,
     slabs: SpinNoIrqLock<SmallSlabHeap>,
+    #[cfg(feature = "cosmos-meminfo")]
     dealloc_calls: AtomicUsize,
 }
 
@@ -738,6 +784,7 @@ impl KernelHeapAllocator {
         Self {
             heap: SpinNoIrqLock::new(ReclaimingHeap::empty()),
             slabs: SpinNoIrqLock::new(SmallSlabHeap::new()),
+            #[cfg(feature = "cosmos-meminfo")]
             dealloc_calls: AtomicUsize::new(0),
         }
     }
@@ -927,7 +974,10 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.dealloc_calls.fetch_add(1, Ordering::AcqRel);
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.dealloc_calls.fetch_add(1, Ordering::AcqRel);
+        }
         if let Some(class) = slab_class_for_layout(layout) {
             self.dealloc_slab(class, core::ptr::NonNull::new_unchecked(ptr), layout.size());
             KERNEL_HEAP_USED_BYTES.fetch_sub(layout.size(), Ordering::AcqRel);
@@ -974,6 +1024,7 @@ pub fn reclaim_kernel_heap_if_needed() -> usize {
 }
 
 /// Return a consistent snapshot of the kernel heap allocator state.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn kernel_heap_allocator_stats() -> KernelHeapAllocatorStats {
     // Allocation takes the slab lock before the buddy lock when a slab grows;
     // keep the same order here to avoid a lock-order inversion.

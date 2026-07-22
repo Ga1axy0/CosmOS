@@ -2,8 +2,12 @@
 
 use super::{kernel_token, FrameTracker};
 use crate::config::MAX_HARTS;
-use crate::hal::traits::{AddressSpaceToken, Timer as _};
-use crate::hal::{hartid, Plat};
+use crate::hal::hartid;
+use crate::hal::traits::AddressSpaceToken;
+#[cfg(feature = "cosmos-meminfo")]
+use crate::hal::traits::Timer as _;
+#[cfg(feature = "cosmos-meminfo")]
+use crate::hal::Plat;
 use crate::sbi::send_ipi_mask;
 use crate::sync::{SpinLock, SpinLockGuard, SpinNoIrqLock};
 use alloc::vec::Vec;
@@ -203,11 +207,16 @@ static LAST_HANDLED_SEQ: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0)
 const KIND_GLOBAL: usize = 0;
 const KIND_ADDRESS_SPACE: usize = 1;
 
+#[cfg(feature = "cosmos-meminfo")]
 static TLB_SHOOTDOWN_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static TLB_SHOOTDOWN_IPI_TARGETS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static TLB_SHOOTDOWN_ACK_WAITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static TLB_SHOOTDOWN_ACK_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "cosmos-meminfo")]
 #[derive(Clone, Copy, Debug, Default)]
 /// Runtime counters for synchronous TLB shootdown traffic.
 pub struct TlbShootdownStats {
@@ -222,6 +231,7 @@ pub struct TlbShootdownStats {
 }
 
 /// Reset TLB shootdown counters after early memory-management setup.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn reset_tlb_shootdown_stats() {
     TLB_SHOOTDOWN_CALLS.store(0, Ordering::Release);
     TLB_SHOOTDOWN_IPI_TARGETS.store(0, Ordering::Release);
@@ -230,6 +240,7 @@ pub fn reset_tlb_shootdown_stats() {
 }
 
 /// Return cumulative TLB shootdown counters.
+#[cfg(feature = "cosmos-meminfo")]
 pub fn tlb_shootdown_stats() -> TlbShootdownStats {
     TlbShootdownStats {
         calls: TLB_SHOOTDOWN_CALLS.load(Ordering::Acquire),
@@ -419,8 +430,14 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     let online_mask = online_mask();
     let target_mask = hart_mask & online_mask & !self_bit;
     let seq = TLB_SHOOTDOWN_STATE.seq.load(Ordering::Acquire) + 1;
-    TLB_SHOOTDOWN_CALLS.fetch_add(1, Ordering::Relaxed);
-    TLB_SHOOTDOWN_IPI_TARGETS.fetch_add(target_mask.count_ones() as usize, Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        TLB_SHOOTDOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        TLB_SHOOTDOWN_IPI_TARGETS.fetch_add(target_mask.count_ones() as usize, Ordering::Relaxed);
+    }
 
     let (kind_bits, arg_token) = encode_shootdown_kind(kind);
     TLB_SHOOTDOWN_STATE
@@ -450,7 +467,11 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
     // 先刷新发起方本地 TLB，再通知其他 hart。
     perform_local_tlb_shootdown(kind);
     if target_mask != 0 {
-        TLB_SHOOTDOWN_ACK_WAITS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            TLB_SHOOTDOWN_ACK_WAITS.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(feature = "cosmos-meminfo")]
         let ack_wait_start = Plat::read_time();
         send_ipi_mask(target_mask);
         if emit_logs {
@@ -487,10 +508,13 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
                 );
             }
         }
-        TLB_SHOOTDOWN_ACK_WAIT_TICKS.fetch_add(
-            Plat::read_time().wrapping_sub(ack_wait_start),
-            Ordering::Relaxed,
-        );
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            TLB_SHOOTDOWN_ACK_WAIT_TICKS.fetch_add(
+                Plat::read_time().wrapping_sub(ack_wait_start),
+                Ordering::Relaxed,
+            );
+        }
         if emit_logs {
             debug!("[tlb] seq={} all remote ack received", seq);
         }

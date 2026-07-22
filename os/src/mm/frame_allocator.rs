@@ -4,7 +4,9 @@ use super::{virt_to_phys, PhysPageNum};
 use crate::bootinfo::{self, PhysMemoryRegion};
 use crate::config::PAGE_SIZE;
 use crate::fs::PAGE_CACHE_MANAGER;
+#[cfg(feature = "cosmos-meminfo")]
 use crate::hal::traits::Timer as _;
+#[cfg(feature = "cosmos-meminfo")]
 use crate::hal::Plat;
 use crate::sync::SpinNoIrqLock;
 use core::cmp::{max, min};
@@ -20,21 +22,31 @@ const MAX_MANAGED_REGIONS: usize = 16;
 const MAX_BITMAP_PAGES: usize = crate::config::MEMORY_END / PAGE_SIZE;
 const MAX_BITMAP_WORDS: usize = (2 * MAX_BITMAP_PAGES + MAX_ORDER + 63) / 64;
 static FRAME_ALLOC_OOM_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_CONTIGUOUS_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_RANGE_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_ALLOCATOR_LOCK_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
 /// Number of physical pages explicitly cleared before being handed to a caller.
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_ZEROED_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// Number of bytes explicitly cleared before being handed to a caller.
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Cumulative platform timer ticks spent clearing physical pages.
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_ZERO_TIME_TICKS: AtomicUsize = AtomicUsize::new(0);
 /// Per-CPU frame-cache counters.  The cache is not enabled yet; keeping the
 /// counters here makes the no-cache baseline explicit before a local cache is
 /// added.
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_PER_CPU_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
 static FRAME_PER_CPU_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 
 /// tracker for physical page frame allocation and deallocation
@@ -191,16 +203,22 @@ pub struct BuddyFrameAllocator {
     free_pages: usize,
     allocated_pages: usize,
     /// Cumulative free-list nodes inspected while finding a buddy to merge.
+    #[cfg(feature = "cosmos-meminfo")]
     free_scan_steps: usize,
     /// Cumulative number of buddy blocks split to satisfy an allocation.
+    #[cfg(feature = "cosmos-meminfo")]
     split_ops: usize,
     /// Cumulative number of buddy blocks merged during deallocation.
+    #[cfg(feature = "cosmos-meminfo")]
     merge_ops: usize,
     /// Number of buddy membership checks performed while deallocating.
+    #[cfg(feature = "cosmos-meminfo")]
     buddy_search_calls: usize,
     /// Number of buddy membership checks that found a free buddy.
+    #[cfg(feature = "cosmos-meminfo")]
     buddy_search_hits: usize,
     /// Number of buddy membership checks that found no free buddy.
+    #[cfg(feature = "cosmos-meminfo")]
     buddy_search_misses: usize,
 }
 
@@ -238,12 +256,15 @@ impl BuddyFrameAllocator {
         self.free_bitmap = FreeBlockBitmap::empty();
         self.free_pages = 0;
         self.allocated_pages = 0;
-        self.free_scan_steps = 0;
-        self.split_ops = 0;
-        self.merge_ops = 0;
-        self.buddy_search_calls = 0;
-        self.buddy_search_hits = 0;
-        self.buddy_search_misses = 0;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.free_scan_steps = 0;
+            self.split_ops = 0;
+            self.merge_ops = 0;
+            self.buddy_search_calls = 0;
+            self.buddy_search_hits = 0;
+            self.buddy_search_misses = 0;
+        }
     }
 
     fn add_usable_region(
@@ -339,13 +360,22 @@ impl BuddyFrameAllocator {
     }
 
     fn remove_block(&mut self, order: usize, target: usize) -> bool {
-        self.buddy_search_calls += 1;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.buddy_search_calls += 1;
+        }
         if self.free_bitmap.enabled {
             if !self.free_bitmap.is_set(order, target) {
-                self.buddy_search_misses += 1;
+                #[cfg(feature = "cosmos-meminfo")]
+                {
+                    self.buddy_search_misses += 1;
+                }
                 return false;
             }
-            self.buddy_search_hits += 1;
+            #[cfg(feature = "cosmos-meminfo")]
+            {
+                self.buddy_search_hits += 1;
+            }
             let previous = Self::previous(target);
             let next = Self::next(target);
             if let Some(previous) = previous {
@@ -366,7 +396,10 @@ impl BuddyFrameAllocator {
         let mut current = self.free_list[order];
         let mut previous = None;
         while let Some(ppn) = current {
-            self.free_scan_steps += 1;
+            #[cfg(feature = "cosmos-meminfo")]
+            {
+                self.free_scan_steps += 1;
+            }
             let next = Self::next(ppn);
             if ppn == target {
                 if let Some(previous) = previous {
@@ -379,13 +412,19 @@ impl BuddyFrameAllocator {
                 }
                 Self::set_next(ppn, None);
                 Self::set_previous(ppn, None);
-                self.buddy_search_hits += 1;
+                #[cfg(feature = "cosmos-meminfo")]
+                {
+                    self.buddy_search_hits += 1;
+                }
                 return true;
             }
             previous = current;
             current = next;
         }
-        self.buddy_search_misses += 1;
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            self.buddy_search_misses += 1;
+        }
         false
     }
 
@@ -444,7 +483,10 @@ impl BuddyFrameAllocator {
         let ppn = self.pop_block(source_order)?;
         while source_order > order {
             source_order -= 1;
-            self.split_ops += 1;
+            #[cfg(feature = "cosmos-meminfo")]
+            {
+                self.split_ops += 1;
+            }
             self.push_block(source_order, ppn + (1usize << source_order));
         }
         self.free_pages -= 1usize << order;
@@ -483,7 +525,10 @@ impl BuddyFrameAllocator {
             if !self.remove_block(current_order, buddy) {
                 break;
             }
-            self.merge_ops += 1;
+            #[cfg(feature = "cosmos-meminfo")]
+            {
+                self.merge_ops += 1;
+            }
             ppn = ppn.min(buddy);
             current_order += 1;
         }
@@ -505,11 +550,17 @@ impl FrameAllocator for BuddyFrameAllocator {
             free_bitmap: FreeBlockBitmap::empty(),
             free_pages: 0,
             allocated_pages: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             free_scan_steps: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             split_ops: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             merge_ops: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             buddy_search_calls: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             buddy_search_hits: 0,
+            #[cfg(feature = "cosmos-meminfo")]
             buddy_search_misses: 0,
         }
     }
@@ -542,44 +593,62 @@ pub struct FrameAllocatorStats {
     /// Number of failed single-frame allocation attempts.
     pub oom_count: usize,
     /// Number of single-frame allocation attempts.
+    #[cfg(feature = "cosmos-meminfo")]
     pub alloc_calls: usize,
     /// Number of single-frame deallocations.
+    #[cfg(feature = "cosmos-meminfo")]
     pub dealloc_calls: usize,
     /// Number of contiguous allocation attempts.
+    #[cfg(feature = "cosmos-meminfo")]
     pub contiguous_alloc_calls: usize,
     /// Number of contiguous range deallocations.
+    #[cfg(feature = "cosmos-meminfo")]
     pub range_dealloc_calls: usize,
     /// Cumulative free-list nodes inspected while finding a buddy to merge.
+    #[cfg(feature = "cosmos-meminfo")]
     pub free_scan_steps: usize,
     /// Cumulative number of buddy blocks split to satisfy an allocation.
+    #[cfg(feature = "cosmos-meminfo")]
     pub split_ops: usize,
     /// Cumulative number of buddy blocks merged during deallocation.
+    #[cfg(feature = "cosmos-meminfo")]
     pub merge_ops: usize,
     /// Number of buddy membership checks performed while deallocating.
+    #[cfg(feature = "cosmos-meminfo")]
     pub buddy_search_calls: usize,
     /// Number of buddy membership checks that found a free buddy.
+    #[cfg(feature = "cosmos-meminfo")]
     pub buddy_search_hits: usize,
     /// Number of buddy membership checks that found no free buddy.
+    #[cfg(feature = "cosmos-meminfo")]
     pub buddy_search_misses: usize,
     /// Whether the O(1) per-order free-block bitmap is active.
+    #[cfg(feature = "cosmos-meminfo")]
     pub bitmap_enabled: bool,
     /// Cumulative timer ticks spent acquiring the frame allocator lock.
     /// This includes the local interrupt save/restore overhead around lock
     /// acquisition, but excludes the allocator operation after acquisition.
+    #[cfg(feature = "cosmos-meminfo")]
     pub lock_wait_ticks: usize,
     /// Number of pages cleared before allocation.
+    #[cfg(feature = "cosmos-meminfo")]
     pub zeroed_pages: usize,
     /// Number of bytes cleared before allocation.
+    #[cfg(feature = "cosmos-meminfo")]
     pub zeroed_bytes: usize,
     /// Cumulative timer ticks spent clearing pages.
+    #[cfg(feature = "cosmos-meminfo")]
     pub zero_time_ticks: usize,
     /// Number of allocations served from a per-CPU frame cache.
+    #[cfg(feature = "cosmos-meminfo")]
     pub per_cpu_cache_hits: usize,
     /// Number of allocations that fell through a per-CPU frame cache.
     /// The cache is currently disabled, so this is the single-frame
     /// allocation baseline and every such request is counted as a miss.
+    #[cfg(feature = "cosmos-meminfo")]
     pub per_cpu_cache_misses: usize,
     /// Whether a per-CPU frame cache is currently enabled.
+    #[cfg(feature = "cosmos-meminfo")]
     pub per_cpu_cache_enabled: bool,
 }
 
@@ -599,16 +668,19 @@ pub fn init_frame_allocator() {
         .lock()
         .init_from_bootinfo(kernel_start, kernel_end);
     FRAME_ALLOC_OOM_COUNT.store(0, Ordering::Release);
-    FRAME_ALLOC_CALLS.store(0, Ordering::Release);
-    FRAME_DEALLOC_CALLS.store(0, Ordering::Release);
-    FRAME_CONTIGUOUS_ALLOC_CALLS.store(0, Ordering::Release);
-    FRAME_RANGE_DEALLOC_CALLS.store(0, Ordering::Release);
-    FRAME_ALLOCATOR_LOCK_WAIT_TICKS.store(0, Ordering::Release);
-    FRAME_ZEROED_PAGES.store(0, Ordering::Release);
-    FRAME_ZEROED_BYTES.store(0, Ordering::Release);
-    FRAME_ZERO_TIME_TICKS.store(0, Ordering::Release);
-    FRAME_PER_CPU_CACHE_HITS.store(0, Ordering::Release);
-    FRAME_PER_CPU_CACHE_MISSES.store(0, Ordering::Release);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_ALLOC_CALLS.store(0, Ordering::Release);
+        FRAME_DEALLOC_CALLS.store(0, Ordering::Release);
+        FRAME_CONTIGUOUS_ALLOC_CALLS.store(0, Ordering::Release);
+        FRAME_RANGE_DEALLOC_CALLS.store(0, Ordering::Release);
+        FRAME_ALLOCATOR_LOCK_WAIT_TICKS.store(0, Ordering::Release);
+        FRAME_ZEROED_PAGES.store(0, Ordering::Release);
+        FRAME_ZEROED_BYTES.store(0, Ordering::Release);
+        FRAME_ZERO_TIME_TICKS.store(0, Ordering::Release);
+        FRAME_PER_CPU_CACHE_HITS.store(0, Ordering::Release);
+        FRAME_PER_CPU_CACHE_MISSES.store(0, Ordering::Release);
+    }
 }
 
 /// Return runtime statistics of the frame allocator.
@@ -621,33 +693,53 @@ pub fn frame_allocator_stats() -> FrameAllocatorStats {
         allocated_pages,
         total_pages: free_pages + allocated_pages,
         oom_count: FRAME_ALLOC_OOM_COUNT.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         alloc_calls: FRAME_ALLOC_CALLS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         dealloc_calls: FRAME_DEALLOC_CALLS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         contiguous_alloc_calls: FRAME_CONTIGUOUS_ALLOC_CALLS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         range_dealloc_calls: FRAME_RANGE_DEALLOC_CALLS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         free_scan_steps: allocator.free_scan_steps,
+        #[cfg(feature = "cosmos-meminfo")]
         split_ops: allocator.split_ops,
+        #[cfg(feature = "cosmos-meminfo")]
         merge_ops: allocator.merge_ops,
+        #[cfg(feature = "cosmos-meminfo")]
         buddy_search_calls: allocator.buddy_search_calls,
+        #[cfg(feature = "cosmos-meminfo")]
         buddy_search_hits: allocator.buddy_search_hits,
+        #[cfg(feature = "cosmos-meminfo")]
         buddy_search_misses: allocator.buddy_search_misses,
+        #[cfg(feature = "cosmos-meminfo")]
         bitmap_enabled: allocator.free_bitmap.enabled,
+        #[cfg(feature = "cosmos-meminfo")]
         lock_wait_ticks: FRAME_ALLOCATOR_LOCK_WAIT_TICKS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         zeroed_pages: FRAME_ZEROED_PAGES.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         zeroed_bytes: FRAME_ZEROED_BYTES.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         zero_time_ticks: FRAME_ZERO_TIME_TICKS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         per_cpu_cache_hits: FRAME_PER_CPU_CACHE_HITS.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         per_cpu_cache_misses: FRAME_PER_CPU_CACHE_MISSES.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
         per_cpu_cache_enabled: false,
     }
 }
 
 #[inline]
+#[cfg(feature = "cosmos-meminfo")]
 fn frame_allocator_lock_start() -> usize {
     Plat::read_time()
 }
 
 #[inline]
+#[cfg(feature = "cosmos-meminfo")]
 fn record_frame_allocator_lock_wait(start: usize) {
     FRAME_ALLOCATOR_LOCK_WAIT_TICKS
         .fetch_add(Plat::read_time().wrapping_sub(start), Ordering::Relaxed);
@@ -655,14 +747,24 @@ fn record_frame_allocator_lock_wait(start: usize) {
 
 /// Allocate a physical page frame in FrameTracker style
 pub fn frame_alloc() -> Option<FrameTracker> {
-    FRAME_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     // There is deliberately no per-CPU frame cache yet.  Count this as a
     // miss so the first run provides a directly comparable baseline for the
     // cache implementation that may be added later.
-    FRAME_PER_CPU_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_PER_CPU_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "cosmos-meminfo")]
     let lock_start = frame_allocator_lock_start();
     let mut allocator = FRAME_ALLOCATOR.lock();
-    record_frame_allocator_lock_wait(lock_start);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        record_frame_allocator_lock_wait(lock_start);
+    }
     let ppn = { allocator.alloc() };
     drop(allocator);
     ppn.map(FrameTracker::new).or_else(|| {
@@ -706,26 +808,40 @@ pub fn frame_alloc_with_reclaim() -> Option<FrameTracker> {
 
 /// Deallocate a physical page frame with a given ppn
 pub fn frame_dealloc(ppn: PhysPageNum) {
-    FRAME_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "cosmos-meminfo")]
     let lock_start = frame_allocator_lock_start();
     let mut allocator = FRAME_ALLOCATOR.lock();
-    record_frame_allocator_lock_wait(lock_start);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        record_frame_allocator_lock_wait(lock_start);
+    }
     allocator.dealloc(ppn);
 }
 
 /// Allocate a physically contiguous frame range.
 /// Simplified implmentation: maybe fail when align_pages > pages (require over-alignment)
 pub fn frame_alloc_contiguous(pages: usize, align_pages: usize) -> Option<ContiguousFrames> {
-    FRAME_CONTIGUOUS_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_CONTIGUOUS_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     if pages == 0 || align_pages == 0 || !pages.is_power_of_two() || !align_pages.is_power_of_two()
     {
         return None;
     }
     let order = pages.trailing_zeros() as usize;
     let start = {
+        #[cfg(feature = "cosmos-meminfo")]
         let lock_start = frame_allocator_lock_start();
         let mut allocator = FRAME_ALLOCATOR.lock();
-        record_frame_allocator_lock_wait(lock_start);
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            record_frame_allocator_lock_wait(lock_start);
+        }
         let start = allocator.alloc_order(order)?;
         if start.0 & (align_pages - 1) != 0 {
             allocator.dealloc_order(start, order);
@@ -741,21 +857,38 @@ pub fn frame_dealloc_range(start: PhysPageNum, pages: usize) {
     if pages == 0 || !pages.is_power_of_two() {
         panic!("invalid frame range: start={:#x}, pages={}", start.0, pages);
     }
-    FRAME_RANGE_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_RANGE_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "cosmos-meminfo")]
     let lock_start = frame_allocator_lock_start();
     let mut allocator = FRAME_ALLOCATOR.lock();
-    record_frame_allocator_lock_wait(lock_start);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        record_frame_allocator_lock_wait(lock_start);
+    }
     allocator.dealloc_order(start, pages.trailing_zeros() as usize);
 }
 
 fn clear_frame(ppn: PhysPageNum) {
+    #[cfg(feature = "cosmos-meminfo")]
     let start = Plat::read_time();
     for byte in ppn.get_bytes_array() {
         *byte = 0;
     }
-    FRAME_ZEROED_PAGES.fetch_add(1, Ordering::Relaxed);
-    FRAME_ZEROED_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed);
-    FRAME_ZERO_TIME_TICKS.fetch_add(Plat::read_time().wrapping_sub(start), Ordering::Relaxed);
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_ZEROED_PAGES.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_ZEROED_BYTES.fetch_add(PAGE_SIZE, Ordering::Relaxed);
+    }
+    #[cfg(feature = "cosmos-meminfo")]
+    {
+        FRAME_ZERO_TIME_TICKS.fetch_add(Plat::read_time().wrapping_sub(start), Ordering::Relaxed);
+    }
 }
 
 fn floor_log2(value: usize) -> usize {

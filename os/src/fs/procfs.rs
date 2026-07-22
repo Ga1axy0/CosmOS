@@ -1,7 +1,8 @@
 //! Minimal procfs implementation for `/proc`.
 //!
 //! Provides:
-//! - `/proc/meminfo` — basic memory statistics.
+//! - `/proc/meminfo` — standard memory statistics.
+//! - `/proc/cosmos_meminfo` — xxOS memory and performance counters.
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.
@@ -26,11 +27,12 @@ use crate::fs::inode::snapshot_mount_table;
 use crate::fs::page_cache;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
+#[cfg(feature = "cosmos-meminfo")]
 use crate::mm::{
     anonymous_page_stats, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
-    frame_allocator_stats, kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats,
-    MapPermission, VmaKind, KERNEL_HEAP_BYTES,
+    kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats, KERNEL_HEAP_BYTES,
 };
+use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
 #[cfg(feature = "perf_probe")]
@@ -41,8 +43,11 @@ use crate::perf_sampler;
 use crate::poll;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
-use crate::task::{cached_kstack_count, current_process, process_lifecycle_stats, TaskStatus};
+#[cfg(feature = "cosmos-meminfo")]
+use crate::task::{cached_kstack_count, process_lifecycle_stats};
+use crate::task::{current_process, TaskStatus};
 use crate::timer::{get_time, time_to_ticks};
+#[cfg(feature = "cosmos-meminfo")]
 use core::sync::atomic::Ordering;
 
 fn parse_pid(name: &str) -> Option<usize> {
@@ -54,14 +59,7 @@ fn parse_pid(name: &str) -> Option<usize> {
 
 fn build_meminfo() -> String {
     let stats = frame_allocator_stats();
-    let anon = anonymous_page_stats();
-    let page_table = page_table_stats();
-    let tlb = tlb_shootdown_stats();
-    let process = process_lifecycle_stats();
     let cached_pages = PAGE_CACHE_MANAGER.lock().cached_pages;
-    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire) as u64;
-    let heap_stats = kernel_heap_allocator_stats();
-    let heap_used = heap_stats.requested_bytes as u64;
     let page_kb = (PAGE_SIZE as u64) / 1024;
     let mem_total = stats.total_pages as u64 * page_kb;
     let mem_free = stats.free_pages as u64 * page_kb;
@@ -77,6 +75,21 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "MemFree:        {} kB", mem_free);
     let _ = writeln!(&mut out, "MemAvailable:   {} kB", mem_available);
     let _ = writeln!(&mut out, "Cached:         {} kB", cached);
+    out
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+fn build_cosmos_meminfo() -> String {
+    let stats = frame_allocator_stats();
+    let anon = anonymous_page_stats();
+    let page_table = page_table_stats();
+    let tlb = tlb_shootdown_stats();
+    let process = process_lifecycle_stats();
+    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire) as u64;
+    let heap_stats = kernel_heap_allocator_stats();
+    let heap_used = heap_stats.requested_bytes as u64;
+
+    let mut out = String::new();
     let _ = writeln!(&mut out, "FrameAllocated: {} pages", stats.allocated_pages);
     let _ = writeln!(&mut out, "FrameOom:       {}", stats.oom_count);
     let _ = writeln!(&mut out, "FrameAllocCalls: {}", stats.alloc_calls);
@@ -891,6 +904,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("cpuinfo"), VfsFileType::Regular));
         entries.push((String::from("filesystems"), VfsFileType::Regular));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
+        #[cfg(feature = "cosmos-meminfo")]
+        entries.push((String::from("cosmos_meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
         entries.push((String::from("partitions"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
@@ -917,6 +932,8 @@ impl VfsNode for ProcRootNode {
             "cpuinfo" => Some(Arc::new(ProcCpuinfoNode::new()) as Arc<dyn VfsNode>),
             "filesystems" => Some(Arc::new(ProcFilesystemsNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "cosmos-meminfo")]
+            "cosmos_meminfo" => Some(Arc::new(ProcCosmosMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             "partitions" => Some(Arc::new(ProcPartitionsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
@@ -1736,6 +1753,69 @@ impl VfsNode for ProcMeminfoNode {
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         read_string_at(build_meminfo(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/cosmos_meminfo` node.
+#[cfg(feature = "cosmos-meminfo")]
+#[derive(Default, Debug)]
+pub struct ProcCosmosMeminfoNode;
+
+#[cfg(feature = "cosmos-meminfo")]
+impl ProcCosmosMeminfoNode {
+    /// Create a new xxOS memory statistics node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+impl VfsNode for ProcCosmosMeminfoNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_cosmos_meminfo().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_cosmos_meminfo(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
