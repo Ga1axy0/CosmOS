@@ -115,8 +115,42 @@ __emergency_end:
     # 2^2=4 bytes aligned for stvec
     .align 2
 __trap_from_kernel:
+    .if KERNEL_TRAP_DIAGNOSTICS
     addi sp, sp, -256
-    # 保存基本寄存器 (ra, t0-t6, a0-a7)
+    # Save a complete GPR snapshot using architectural x-register indices as
+    # slots. x0 is recorded as zero and x2 contains the interrupted (pre-frame)
+    # stack pointer. Keeping this layout in sync with RiscvKernelTrapFrame lets
+    # fatal kernel traps print the actual fault-time registers rather than the
+    # Rust handler's already-clobbered values.
+    .set n, 1
+    .rept 31
+        SAVE_GP %n
+        .set n, n+1
+    .endr
+    sd zero, 0*8(sp)
+    addi t0, sp, 256
+    sd t0, 2*8(sp)
+
+    # Pass the saved frame as the first Rust/C ABI argument. The interrupted a0
+    # has already been preserved in x[10] above.
+    mv a0, sp
+    la t0, trap_from_kernel_riscv
+    jalr t0
+
+    # Restore every GPR except x0 and sp. sp is restored by releasing the frame.
+    ld x1, 1*8(sp)
+    .set n, 3
+    .rept 29
+        LOAD_GP %n
+        .set n, n+1
+    .endr
+
+    addi sp, sp, 256
+    sret
+    .else
+    # The normal fast path preserves only caller-saved registers that the Rust
+    # handler may clobber. Callee-saved registers remain protected by the ABI.
+    addi sp, sp, -256
     sd ra, 0(sp)
     sd t0, 8(sp)
     sd t1, 16(sp)
@@ -133,11 +167,10 @@ __trap_from_kernel:
     sd a5, 104(sp)
     sd a6, 112(sp)
     sd a7, 120(sp)
-    
+
     la t0, trap_from_kernel
     jalr t0
 
-    # 恢复寄存器
     ld ra, 0(sp)
     ld t0, 8(sp)
     ld t1, 16(sp)
@@ -157,3 +190,4 @@ __trap_from_kernel:
 
     addi sp, sp, 256
     sret
+    .endif

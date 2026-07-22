@@ -20,6 +20,10 @@ const KERNEL_HEAP_BOOTSTRAP_PAGES: usize = 64;
 const KERNEL_HEAP_RECLAIM_START_FREE: usize = 8 * 1024 * 1024;
 const KERNEL_HEAP_RECLAIM_TARGET_FREE: usize = 4 * 1024 * 1024;
 const KERNEL_HEAP_RECLAIM_MAX_PAGES_PER_CALL: usize = 4096;
+/// Keep reclaim bookkeeping off the heap: this path runs from the global
+/// allocator itself.  A small stack batch also avoids growing kernel stack use
+/// with the size of a coalesced tail block.
+const KERNEL_HEAP_UNMAP_BATCH_PAGES: usize = 256;
 const HEAP_ORDER_COUNT: usize = 32;
 const MIN_BUDDY_BLOCK_SIZE: usize = 2 * size_of::<usize>();
 const MIN_BUDDY_ORDER: usize = MIN_BUDDY_BLOCK_SIZE.trailing_zeros() as usize;
@@ -1240,26 +1244,44 @@ fn unmap_heap_pages(start_va: usize, pages: usize) {
     if subtree_root_ppn.0 == 0 {
         panic!("unmap_heap_pages: subtree root ppn is 0");
     }
-    let mut unmapped_pages = 0usize;
-    {
-        let _guard = HEAP_PT_LOCK.lock();
-        for page in 0..pages {
-            let va = start_va + page * PAGE_SIZE;
-            let vpn = VirtAddr::from(va).floor();
-            let Some(pte) = existing_heap_leaf_pte(subtree_root_ppn, vpn) else {
-                continue;
-            };
-            let entry = unsafe { &mut *pte };
-            if !entry.is_valid() {
-                continue;
+    let mut batch_start = 0usize;
+    while batch_start < pages {
+        let batch_end = min(
+            batch_start.saturating_add(KERNEL_HEAP_UNMAP_BATCH_PAGES),
+            pages,
+        );
+        let mut reclaimed_ppns = [0usize; KERNEL_HEAP_UNMAP_BATCH_PAGES];
+        let mut reclaimed_count = 0usize;
+        {
+            let _guard = HEAP_PT_LOCK.lock();
+            for page in batch_start..batch_end {
+                let va = start_va + page * PAGE_SIZE;
+                let vpn = VirtAddr::from(va).floor();
+                let Some(pte) = existing_heap_leaf_pte(subtree_root_ppn, vpn) else {
+                    continue;
+                };
+                let entry = unsafe { &mut *pte };
+                if !entry.is_valid() {
+                    continue;
+                }
+                reclaimed_ppns[reclaimed_count] = entry.ppn().0;
+                reclaimed_count += 1;
+                // Make the translation unreachable before asking every hart to
+                // discard a possibly cached copy.  The frame must remain owned
+                // until that shootdown has completed.
+                *entry = PageTableEntry::empty();
             }
-            frame_dealloc(entry.ppn());
-            *entry = PageTableEntry::empty();
-            unmapped_pages += 1;
         }
-    }
-    if unmapped_pages != 0 {
-        crate::mm::shootdown_global_quiet();
+
+        if reclaimed_count != 0 {
+            // Do not hold HEAP_PT_LOCK across this synchronous IPI barrier: a
+            // target hart may currently be spinning on that IRQ-disabling lock.
+            crate::mm::shootdown_global_quiet();
+            for ppn in reclaimed_ppns[..reclaimed_count].iter().copied() {
+                frame_dealloc(PhysPageNum(ppn));
+            }
+        }
+        batch_start = batch_end;
     }
 }
 

@@ -72,7 +72,6 @@ bitflags! {
 }
 
 /// fd 表中的单个表项，区分 fd 自身标志与底层文件对象。
-#[derive(Clone)]
 pub struct FdEntry {
     /// 当前 fd 引用的打开文件描述。
     pub desc: Arc<FileDescription>,
@@ -83,10 +82,26 @@ pub struct FdEntry {
 impl FdEntry {
     /// 基于文件对象创建默认 fd 表项。
     pub fn new(desc: Arc<FileDescription>) -> Self {
-        Self {
-            desc,
-            // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
-            flags: FdFlags::empty(),
+        Self::with_flags(desc, FdFlags::empty())
+    }
+
+    /// 基于文件对象和 fd-local flags 创建表项。
+    pub fn with_flags(desc: Arc<FileDescription>, flags: FdFlags) -> Self {
+        desc.retain_fd_ref();
+        Self { desc, flags }
+    }
+}
+
+impl Clone for FdEntry {
+    fn clone(&self) -> Self {
+        Self::with_flags(Arc::clone(&self.desc), self.flags)
+    }
+}
+
+impl Drop for FdEntry {
+    fn drop(&mut self) {
+        if self.desc.release_fd_ref() {
+            crate::fs::epoll::notify_file_description_closed(self.desc.identity());
         }
     }
 }

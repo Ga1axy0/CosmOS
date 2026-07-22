@@ -1,14 +1,16 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 use core::fmt::Debug;
 #[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
 #[cfg(feature = "io_perf_counters")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use log::warn;
-use core::any::Any;
 use spin::Mutex;
 
-use crate::dentry_cache::{insert_dentry, lookup_dentry, remove_dentry};
+use crate::dentry_cache::{
+    insert_dentry, insert_negative_dentry, lookup_dentry, remove_dentry, DentryLookup,
+};
 use crate::errno::FS_ERRNO;
 use crate::inode_cache::{get_or_create_inode, remove_cached_inode, remove_cached_node};
 
@@ -20,6 +22,10 @@ static DENTRY_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 static DENTRY_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static DENTRY_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DENTRY_NEGATIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BACKEND_NEGATIVE_INSERTS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static BACKEND_FIND_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -42,6 +48,8 @@ pub fn reset_perf_counters() {
     DENTRY_LOOKUPS.store(0, Ordering::Relaxed);
     DENTRY_HITS.store(0, Ordering::Relaxed);
     DENTRY_MISSES.store(0, Ordering::Relaxed);
+    DENTRY_NEGATIVE_HITS.store(0, Ordering::Relaxed);
+    BACKEND_NEGATIVE_INSERTS.store(0, Ordering::Relaxed);
     BACKEND_FIND_HITS.store(0, Ordering::Relaxed);
     BACKEND_FIND_MISSES.store(0, Ordering::Relaxed);
     STAT_ATTRS_CALLS.store(0, Ordering::Relaxed);
@@ -58,16 +66,37 @@ pub fn render_perf_counters() -> String {
     let _ = writeln!(&mut out, "  find_calls {}", perf_load(&FIND_CALLS));
     let _ = writeln!(&mut out, "  dentry_lookups {}", dentry_lookups);
     let _ = writeln!(&mut out, "  dentry_hits {}", perf_load(&DENTRY_HITS));
+    let _ = writeln!(
+        &mut out,
+        "  dentry_negative_hits {}",
+        perf_load(&DENTRY_NEGATIVE_HITS)
+    );
     let _ = writeln!(&mut out, "  dentry_misses {}", perf_load(&DENTRY_MISSES));
-    let _ = writeln!(&mut out, "  backend_find_hits {}", perf_load(&BACKEND_FIND_HITS));
-    let _ = writeln!(&mut out, "  backend_find_misses {}", perf_load(&BACKEND_FIND_MISSES));
+    let _ = writeln!(
+        &mut out,
+        "  backend_negative_inserts {}",
+        perf_load(&BACKEND_NEGATIVE_INSERTS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  backend_find_hits {}",
+        perf_load(&BACKEND_FIND_HITS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  backend_find_misses {}",
+        perf_load(&BACKEND_FIND_MISSES)
+    );
     let _ = writeln!(
         &mut out,
         "  dentry_hit_rate_x100 {}",
         if dentry_lookups == 0 {
             0
         } else {
-            perf_load(&DENTRY_HITS).saturating_mul(100) / dentry_lookups
+            perf_load(&DENTRY_HITS)
+                .saturating_add(perf_load(&DENTRY_NEGATIVE_HITS))
+                .saturating_mul(100)
+                / dentry_lookups
         }
     );
     let _ = writeln!(&mut out, "  stat_attrs_calls {}", stat_attrs_calls);
@@ -519,13 +548,22 @@ impl Inode {
         if fs_id != 0 {
             #[cfg(feature = "io_perf_counters")]
             DENTRY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
-            if let Some(child) = lookup_dentry(fs_id, self.ino(), name) {
-                #[cfg(feature = "io_perf_counters")]
-                DENTRY_HITS.fetch_add(1, Ordering::Relaxed);
-                return Some(child);
+            match lookup_dentry(fs_id, self.ino(), name) {
+                DentryLookup::Positive(child) => {
+                    #[cfg(feature = "io_perf_counters")]
+                    DENTRY_HITS.fetch_add(1, Ordering::Relaxed);
+                    return Some(child);
+                }
+                DentryLookup::Negative => {
+                    #[cfg(feature = "io_perf_counters")]
+                    DENTRY_NEGATIVE_HITS.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                DentryLookup::Miss => {
+                    #[cfg(feature = "io_perf_counters")]
+                    DENTRY_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            #[cfg(feature = "io_perf_counters")]
-            DENTRY_MISSES.fetch_add(1, Ordering::Relaxed);
         }
         let child = self.inner.find(name).map(Self::wrap);
         #[cfg(feature = "io_perf_counters")]
@@ -534,13 +572,22 @@ impl Inode {
                 BACKEND_FIND_HITS.fetch_add(1, Ordering::Relaxed);
             } else {
                 BACKEND_FIND_MISSES.fetch_add(1, Ordering::Relaxed);
+                if fs_id != 0 {
+                    BACKEND_NEGATIVE_INSERTS.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        let child = child?;
-        if fs_id != 0 {
-            insert_dentry(fs_id, self.ino(), name, &child);
+        if let Some(child) = child {
+            if fs_id != 0 {
+                insert_dentry(fs_id, self.ino(), name, &child);
+            }
+            Some(child)
+        } else {
+            if fs_id != 0 {
+                insert_negative_dentry(fs_id, self.ino(), name);
+            }
+            None
         }
-        Some(child)
     }
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
@@ -569,7 +616,7 @@ impl Inode {
     }
 
     pub fn mkdir_result(&self, name: &str) -> Result<Arc<Inode>, FS_ERRNO> {
-        let child = self.inner.mkdir_result(name).map(|i|{
+        let child = self.inner.mkdir_result(name).map(|i| {
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
@@ -759,12 +806,12 @@ impl Inode {
         let fs_id = self.fs_id();
         if let Err(err) = self.inner.unlink(name) {
             if matches!(err, FS_ERRNO::ENOENT) && fs_id != 0 {
-                remove_dentry(fs_id, self.ino(), name);
+                insert_negative_dentry(fs_id, self.ino(), name);
             }
             return Err(err);
         }
         if fs_id != 0 {
-            remove_dentry(fs_id, self.ino(), name);
+            insert_negative_dentry(fs_id, self.ino(), name);
         }
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
@@ -778,12 +825,12 @@ impl Inode {
         let fs_id = self.fs_id();
         if let Err(err) = self.inner.rmdir(name) {
             if matches!(err, FS_ERRNO::ENOENT) && fs_id != 0 {
-                remove_dentry(fs_id, self.ino(), name);
+                insert_negative_dentry(fs_id, self.ino(), name);
             }
             return Err(err);
         }
         if fs_id != 0 {
-            remove_dentry(fs_id, self.ino(), name);
+            insert_negative_dentry(fs_id, self.ino(), name);
         }
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
@@ -822,14 +869,17 @@ impl Inode {
         Ok(())
     }
 
-    pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
+    pub fn rename_child(
+        &self,
+        old_name: &str,
+        new_parent: &Inode,
+        new_name: &str,
+    ) -> Result<(), FS_ERRNO> {
         // Keep the stable in-memory inode alive across the backend rename. Its
         // page-cache state can contain dirty bytes and a newer logical size
         // than the backing inode until writeback completes.
         let old_child = self.find(old_name);
-        let old_child_key = old_child
-            .as_ref()
-            .map(|child| (child.fs_id(), child.ino()));
+        let old_child_key = old_child.as_ref().map(|child| (child.fs_id(), child.ino()));
         let replaced_child = new_parent
             .find(new_name)
             .filter(|child| {
@@ -837,10 +887,11 @@ impl Inode {
                 Some(child_key) != old_child_key && (child.is_dir() || child.nlink() <= 1)
             })
             .map(|child| (child.fs_id(), child.ino()));
-        self.inner.rename_child(old_name, &new_parent.inner, new_name)?;
+        self.inner
+            .rename_child(old_name, &new_parent.inner, new_name)?;
         let old_fs = self.fs_id();
         if old_fs != 0 {
-            remove_dentry(old_fs, self.ino(), old_name);
+            insert_negative_dentry(old_fs, self.ino(), old_name);
         }
         let new_fs = new_parent.fs_id();
         if new_fs != 0 {

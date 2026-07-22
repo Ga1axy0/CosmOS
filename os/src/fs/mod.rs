@@ -2,6 +2,7 @@
 
 pub mod cgroupfs;
 pub mod devfs;
+pub(crate) mod epoll;
 mod inode;
 mod page_cache;
 mod pipe;
@@ -761,6 +762,9 @@ pub struct FileDescription {
     socket_spec: Option<SocketSpec>,
     /// 共享的偏移与状态位。
     inner: SleepMutex<FileDescriptionInner>,
+    /// Number of descriptor-table entries referring to this open file
+    /// description.  Epoll interests deliberately do not contribute here.
+    fd_refs: AtomicUsize,
 }
 
 impl FileDescription {
@@ -781,6 +785,7 @@ impl FileDescription {
                 status_flags,
                 dirent_snapshot: None,
             }),
+            fd_refs: AtomicUsize::new(0),
         }
     }
 
@@ -803,7 +808,31 @@ impl FileDescription {
                 status_flags,
                 dirent_snapshot: None,
             }),
+            fd_refs: AtomicUsize::new(0),
         }
+    }
+
+    /// Stable identity of this open file description while it is Arc-owned.
+    pub(crate) fn identity(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// Account for one descriptor-table reference.
+    pub(crate) fn retain_fd_ref(&self) {
+        self.fd_refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Report whether a userspace descriptor-table entry still refers to this
+    /// open file description.
+    pub(crate) fn has_fd_refs(&self) -> bool {
+        self.fd_refs.load(Ordering::Acquire) != 0
+    }
+
+    /// Release one descriptor-table reference and report whether it was last.
+    pub(crate) fn release_fd_ref(&self) -> bool {
+        let previous = self.fd_refs.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "FileDescription fd_refs underflow");
+        previous == 1
     }
 
     /// 返回底层文件对象是否允许当前描述执行读操作。

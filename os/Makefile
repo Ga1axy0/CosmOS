@@ -6,6 +6,9 @@ EXTRA_FEATURES ?= --features legacy-vdb-names --features io_perf_counters
 ifeq ($(PERF_PROBE),1)
 EXTRA_FEATURES += --features perf_probe
 endif
+ifeq ($(KERNEL_TRAP_DIAGNOSTICS),1)
+EXTRA_FEATURES += --features kernel_trap_diagnostics
+endif
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 

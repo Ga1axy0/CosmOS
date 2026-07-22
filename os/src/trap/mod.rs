@@ -598,6 +598,27 @@ pub fn trap_return() -> ! {
 /// handle trap from kernel
 #[no_mangle]
 pub fn trap_from_kernel() {
+    trap_from_kernel_impl(None);
+}
+
+/// RISC-V kernel-trap entry carrying the fault-time register frame saved by
+/// `__trap_from_kernel`. LoongArch keeps using the frame-less compatibility
+/// entry above until it grows an equivalent architecture-specific dump.
+#[cfg(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics"))]
+#[no_mangle]
+pub extern "C" fn trap_from_kernel_riscv(
+    frame: *const crate::arch::riscv::trap::RiscvKernelTrapFrame,
+) {
+    trap_from_kernel_impl(Some(frame));
+}
+
+fn trap_from_kernel_impl(
+    #[cfg(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics"))] riscv_frame: Option<
+        *const crate::arch::riscv::trap::RiscvKernelTrapFrame,
+    >,
+    #[cfg(not(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics")))]
+    _riscv_frame: Option<()>,
+) {
     let _hardirq = irq::HardIrqGuard::enter();
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
@@ -629,6 +650,12 @@ pub fn trap_from_kernel() {
             handle_reschedule_ipi();
         }
         _ => {
+            #[cfg(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics"))]
+            if let Some(frame) = riscv_frame {
+                // SAFETY: the RISC-V assembly entry owns this frame until this
+                // handler returns. Fatal traps panic before the frame can escape.
+                unsafe { crate::arch::riscv::trap::log_kernel_trap_frame(frame) };
+            }
             panic!(
                 "Kernel trap: {:?}, fault_addr = {:#x}",
                 trap_info.cause, trap_info.fault_addr

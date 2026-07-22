@@ -16,6 +16,10 @@ pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_EVENTFD2: usize = 19;
 /// epoll_create1 syscall
 pub const SYSCALL_EPOLL_CREATE1: usize = 20;
+/// epoll_ctl syscall
+pub const SYSCALL_EPOLL_CTL: usize = 21;
+/// epoll_pwait syscall
+pub const SYSCALL_EPOLL_PWAIT: usize = 22;
 /// dup syscall
 pub const SYSCALL_DUP: usize = 23;
 /// dup2 syscall
@@ -384,6 +388,8 @@ pub const SYSCALL_PIDFD_OPEN: usize = 434;
 pub const SYSCALL_CLOSE_RANGE: usize = 436;
 /// faccessat2 syscall
 pub const SYSCALL_FACCESSAT2: usize = 439;
+/// epoll_pwait2 syscall
+pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
 /// memfd_secret syscall
 pub const SYSCALL_MEMFD_SECRET: usize = 447;
 /*
@@ -559,6 +565,28 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let result = match syscall_id {
         SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as i32),
         SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as i32),
+        SYSCALL_EPOLL_CTL => sys_epoll_ctl(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *const u8,
+        ),
+        SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as i32,
+            args[4] as *const u8,
+            args[5],
+        ),
+        SYSCALL_EPOLL_PWAIT2 => sys_epoll_pwait2(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as *const Timespec,
+            args[4] as *const u8,
+            args[5],
+        ),
         SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),

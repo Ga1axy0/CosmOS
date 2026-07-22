@@ -37,6 +37,8 @@ use crate::net;
 use crate::perf_probe;
 #[cfg(feature = "mm_perf_counters")]
 use crate::perf_sampler;
+#[cfg(feature = "io_perf_counters")]
+use crate::poll;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
 use crate::task::{cached_kstack_count, current_process, process_lifecycle_stats, TaskStatus};
@@ -120,11 +122,7 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "FrameZeroedPages: {}", stats.zeroed_pages);
     let _ = writeln!(&mut out, "FrameZeroedBytes: {}", stats.zeroed_bytes);
     let _ = writeln!(&mut out, "FrameZeroTimeTicks: {}", stats.zero_time_ticks);
-    let _ = writeln!(
-        &mut out,
-        "AnonZeroPageMapHits: {}",
-        anon.zero_page_map_hits
-    );
+    let _ = writeln!(&mut out, "AnonZeroPageMapHits: {}", anon.zero_page_map_hits);
     let _ = writeln!(
         &mut out,
         "AnonZeroPageWriteMaterializations: {}",
@@ -165,11 +163,7 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "TlbShootdownCalls: {}", tlb.calls);
     let _ = writeln!(&mut out, "TlbShootdownIpiTargets: {}", tlb.ipi_targets);
     let _ = writeln!(&mut out, "TlbShootdownAckWaits: {}", tlb.ack_waits);
-    let _ = writeln!(
-        &mut out,
-        "TlbShootdownAckWaitTicks: {}",
-        tlb.ack_wait_ticks
-    );
+    let _ = writeln!(&mut out, "TlbShootdownAckWaitTicks: {}", tlb.ack_wait_ticks);
     let _ = writeln!(&mut out, "ProcessCreateCalls: {}", process.create_calls);
     let _ = writeln!(&mut out, "ProcessExecCalls: {}", process.exec_calls);
     let _ = writeln!(&mut out, "ProcessExitCalls: {}", process.exit_calls);
@@ -297,6 +291,7 @@ fn build_partitions() -> String {
 
 #[cfg(feature = "io_perf_counters")]
 fn reset_io_perf() {
+    poll::reset_perf_counters();
     crate::fs::reset_perf_counters();
     ::fs::vfs::reset_perf_counters();
     ::fs::block_cache::reset_perf_counters();
@@ -308,6 +303,7 @@ fn reset_io_perf() {
 #[cfg(feature = "io_perf_counters")]
 fn build_io_perf() -> String {
     let mut out = String::new();
+    out.push_str(&poll::render_perf_counters());
     out.push_str(&crate::fs::render_perf_counters());
     out.push_str(&::fs::vfs::render_perf_counters());
     out.push_str(&block_drivers::render_perf_counters());

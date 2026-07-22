@@ -17,7 +17,19 @@ use riscv::register::{
     stval, stvec,
 };
 
-global_asm!(include_str!("trap.S"));
+#[cfg(feature = "kernel_trap_diagnostics")]
+use riscv::register::{satp, sepc};
+
+#[cfg(feature = "kernel_trap_diagnostics")]
+global_asm!(concat!(
+    ".equ KERNEL_TRAP_DIAGNOSTICS, 1\n",
+    include_str!("trap.S")
+));
+#[cfg(not(feature = "kernel_trap_diagnostics"))]
+global_asm!(concat!(
+    ".equ KERNEL_TRAP_DIAGNOSTICS, 0\n",
+    include_str!("trap.S")
+));
 
 /// RISC-V implementation of [`InterruptControl`](crate::hal::traits::InterruptControl).
 pub struct RiscvInterruptControl;
@@ -56,6 +68,91 @@ pub struct RiscvTrapContextFrame {
     pub f: [u64; 32],
     /// Floating-point CSR.
     pub fcsr: usize,
+}
+
+/// Complete GPR snapshot captured by `__trap_from_kernel` before entering Rust.
+///
+/// Slots use architectural register numbers (`x[1]` is `ra`, `x[2]` is the
+/// interrupted stack pointer, and so on), which keeps the assembly and the
+/// diagnostic formatter mechanically checkable against one another.
+#[cfg(feature = "kernel_trap_diagnostics")]
+#[repr(C)]
+pub struct RiscvKernelTrapFrame {
+    pub x: [usize; 32],
+}
+
+#[cfg(feature = "kernel_trap_diagnostics")]
+const _: () = assert!(core::mem::size_of::<RiscvKernelTrapFrame>() == 256);
+
+/// Emit a fault-time register dump for an unexpected kernel trap.
+///
+/// # Safety
+///
+/// `frame_ptr` must point to the 256-byte frame currently owned by
+/// `__trap_from_kernel` on this hart's kernel stack.
+#[cfg(feature = "kernel_trap_diagnostics")]
+pub unsafe fn log_kernel_trap_frame(frame_ptr: *const RiscvKernelTrapFrame) {
+    if frame_ptr.is_null() {
+        log::error!("[kernel-trap][gpr] missing RISC-V kernel trap frame");
+        return;
+    }
+    let frame = &*frame_ptr;
+    let x = &frame.x;
+    log::error!(
+        "[kernel-trap][csr] hart={} sepc={:#018x} scause={:#018x} stval={:#018x} sstatus={:#018x} satp={:#018x}",
+        crate::hal::hartid(),
+        sepc::read(),
+        scause::read().bits(),
+        stval::read(),
+        sstatus::read().bits(),
+        satp::read().bits(),
+    );
+    log::error!(
+        "[kernel-trap][gpr] ra={:#018x} sp={:#018x} gp={:#018x} tp={:#018x}",
+        x[1],
+        x[2],
+        x[3],
+        x[4],
+    );
+    log::error!(
+        "[kernel-trap][arg] a0={:#018x} a1={:#018x} a2={:#018x} a3={:#018x} a4={:#018x} a5={:#018x} a6={:#018x} a7={:#018x}",
+        x[10],
+        x[11],
+        x[12],
+        x[13],
+        x[14],
+        x[15],
+        x[16],
+        x[17],
+    );
+    log::error!(
+        "[kernel-trap][tmp] t0={:#018x} t1={:#018x} t2={:#018x} t3={:#018x} t4={:#018x} t5={:#018x} t6={:#018x}",
+        x[5],
+        x[6],
+        x[7],
+        x[28],
+        x[29],
+        x[30],
+        x[31],
+    );
+    log::error!(
+        "[kernel-trap][saved] s0={:#018x} s1={:#018x} s2={:#018x} s3={:#018x} s4={:#018x} s5={:#018x}",
+        x[8],
+        x[9],
+        x[18],
+        x[19],
+        x[20],
+        x[21],
+    );
+    log::error!(
+        "[kernel-trap][saved] s6={:#018x} s7={:#018x} s8={:#018x} s9={:#018x} s10={:#018x} s11={:#018x}",
+        x[22],
+        x[23],
+        x[24],
+        x[25],
+        x[26],
+        x[27],
+    );
 }
 
 /// RISC-V musl raw `rt_sigaction` syscall layout used by this kernel.

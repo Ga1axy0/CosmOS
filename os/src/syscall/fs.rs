@@ -1,4 +1,5 @@
 use crate::fs::devfs::BlockDevNode;
+use crate::fs::epoll::{EpollEvent, EpollFile, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
 use crate::fs::Pipe;
 use crate::fs::{
     canonicalize, do_bind_mount, do_move_mount, do_umount, inode_stat, linkat_with_flags,
@@ -6,9 +7,9 @@ use crate::fs::{
     mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
     open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path, rename_at,
     symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all, truncate_inode,
-    unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags,
-    PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode, AT_EMPTY_PATH,
-    AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime,
+    OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use crate::mm::{translated_byte_buffer, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
@@ -1185,6 +1186,8 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
         }
     }
 
+    drop(inner);
+    poll::record_scan(pollfds.len(), ready_cnt);
     ready_cnt
 }
 
@@ -1337,6 +1340,7 @@ where
         let handle = match poll::register_poll_wait(pid, &task, &interests) {
             Ok(handle) => handle,
             Err(ERRNO::ENOSPC) => {
+                poll::record_fallback();
                 // 回退路径：全局 poll 键/行耗尽时，短周期睡眠后重新扫描 fd 集，
                 // 避免直接失败，同时不引入忙等。
                 let sleep_until_ns = if let Some(deadline_ns) = deadline_ns {
@@ -2354,10 +2358,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 }
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
                 let new_fd = inner.alloc_fd_from(min_fd as usize)?;
-                inner.fd_table[new_fd] = Some(FdEntry {
-                    desc,
-                    flags: FdFlags::empty(),
-                });
+                inner.fd_table[new_fd] = Some(FdEntry::with_flags(desc, FdFlags::empty()));
                 Ok(new_fd as isize)
             }
             F_GETFL => {
@@ -2379,10 +2380,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 }
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
                 let new_fd = inner.alloc_fd_from(min_fd as usize)?;
-                inner.fd_table[new_fd] = Some(FdEntry {
-                    desc,
-                    flags: FdFlags::CLOEXEC,
-                });
+                inner.fd_table[new_fd] = Some(FdEntry::with_flags(desc, FdFlags::CLOEXEC));
                 Ok(new_fd as isize)
             }
             F_GETLK | F_SETLK | F_SETLKW => {
@@ -3114,8 +3112,204 @@ pub fn sys_eventfd2(_initval: u32, flags: i32) -> isize {
 
 pub fn sys_epoll_create1(flags: i32) -> isize {
     syscall_body!({
-        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC)?;
-        alloc_anonymous_fd(status_flags, cloexec)
+        let (_, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC)?;
+        let desc = Arc::new(FileDescription::new(
+            Arc::new(EpollFile::new()),
+            AccessMode::ReadWrite,
+            FileStatusFlags::empty(),
+            0,
+        ));
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let fd = inner.alloc_fd()?;
+        let mut entry = FdEntry::new(desc);
+        if cloexec {
+            entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[fd] = Some(entry);
+        Ok(fd as isize)
+    })
+}
+
+// Linux only packs this structure on x86_64.  Generic 64-bit ABIs, including
+// RISC-V, align the u64 payload to 8 bytes and use a 16-byte array stride.
+#[cfg(target_arch = "x86_64")]
+const EPOLL_EVENT_DATA_OFFSET: usize = 4;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_EVENT_DATA_OFFSET: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const EPOLL_EVENT_SIZE: usize = 12;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_EVENT_SIZE: usize = 16;
+const EPOLL_MAX_EVENTS: usize = i32::MAX as usize / EPOLL_EVENT_SIZE;
+
+fn read_epoll_event(event: *const u8) -> Result<EpollEvent, ERRNO> {
+    if event.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let bytes = read_bytes_from_user(event, EPOLL_EVENT_SIZE)?;
+    let events = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+    let data = u64::from_ne_bytes(
+        bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + size_of::<u64>()]
+            .try_into()
+            .unwrap(),
+    );
+    Ok(EpollEvent { events, data })
+}
+
+fn write_epoll_event(event: *mut u8, value: EpollEvent) -> Result<(), ERRNO> {
+    let mut bytes = [0u8; EPOLL_EVENT_SIZE];
+    bytes[0..4].copy_from_slice(&value.events.to_ne_bytes());
+    bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&value.data.to_ne_bytes());
+    write_bytes_to_user(event, &bytes)
+}
+
+/// Change one registration in an epoll interest set.
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> isize {
+    syscall_body!({
+        if epfd < 0 || fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        let epoll_desc = get_file_description(epfd as usize)?;
+        let epoll = epoll_desc
+            .as_any()
+            .downcast_ref::<EpollFile>()
+            .ok_or(ERRNO::EINVAL)?;
+        let target = get_file_description(fd as usize)?;
+        if Arc::ptr_eq(&epoll_desc, &target) {
+            return Err(ERRNO::EINVAL);
+        }
+        match op {
+            EPOLL_CTL_ADD => epoll.ctl_add(fd, target, read_epoll_event(event)?)?,
+            EPOLL_CTL_MOD => epoll.ctl_mod(fd, &target, read_epoll_event(event)?)?,
+            EPOLL_CTL_DEL => epoll.ctl_del(fd, &target)?,
+            _ => return Err(ERRNO::EINVAL),
+        }
+        Ok(0)
+    })
+}
+
+fn epoll_timeout_ms_to_deadline(timeout_ms: i32) -> Result<Option<u64>, ERRNO> {
+    if timeout_ms < 0 {
+        return Ok(None);
+    }
+    let timeout_ns = (timeout_ms as u64)
+        .checked_mul(1_000_000)
+        .ok_or(ERRNO::EINVAL)?;
+    get_time_ns()
+        .checked_add(timeout_ns)
+        .map(Some)
+        .ok_or(ERRNO::EINVAL)
+}
+
+fn epoll_timespec_to_deadline(timeout: *const Timespec) -> Result<Option<u64>, ERRNO> {
+    if timeout.is_null() {
+        return Ok(None);
+    }
+    let timeout = read_pod_from_user(timeout)?;
+    if timeout.tv_nsec >= 1_000_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let timeout_ns = (timeout.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(timeout.tv_nsec as u64))
+        .ok_or(ERRNO::EINVAL)?;
+    get_time_ns()
+        .checked_add(timeout_ns)
+        .map(Some)
+        .ok_or(ERRNO::EINVAL)
+}
+
+fn epoll_pwait_common(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    deadline_ns: Option<u64>,
+    sigmask: *const u8,
+    sigsetsize: usize,
+    syscall_name: &str,
+) -> Result<isize, ERRNO> {
+    if epfd < 0 {
+        return Err(ERRNO::EBADF);
+    }
+    if maxevents <= 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    if maxevents as usize > EPOLL_MAX_EVENTS {
+        return Err(ERRNO::EINVAL);
+    }
+    if events.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let output_len = (maxevents as usize)
+        .checked_mul(EPOLL_EVENT_SIZE)
+        .ok_or(ERRNO::EINVAL)?;
+    // Fault writable pages in before sleeping and before consuming ready items.
+    drop(translated_byte_buffer_with_access(
+        events as *const u8,
+        output_len,
+        PageFaultAccess::Write,
+    )?);
+
+    let epoll_desc = get_file_description(epfd as usize)?;
+    let epoll = epoll_desc
+        .as_any()
+        .downcast_ref::<EpollFile>()
+        .ok_or(ERRNO::EINVAL)?;
+    let old_mask = apply_temp_signal_mask(sigmask, sigsetsize, syscall_name)?;
+    let result = epoll.wait(epfd as usize, maxevents as usize, deadline_ns);
+    restore_temp_signal_mask(old_mask);
+    let ready = result?;
+    for (index, event) in ready.iter().copied().enumerate() {
+        write_epoll_event(events.wrapping_add(index * EPOLL_EVENT_SIZE), event)?;
+    }
+    Ok(ready.len() as isize)
+}
+
+/// Generic-ABI epoll wait syscall used by libc's `epoll_wait` wrapper.
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    timeout_ms: i32,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> isize {
+    syscall_body!({
+        let deadline_ns = epoll_timeout_ms_to_deadline(timeout_ms)?;
+        epoll_pwait_common(
+            epfd,
+            events,
+            maxevents,
+            deadline_ns,
+            sigmask,
+            sigsetsize,
+            "sys_epoll_pwait",
+        )
+    })
+}
+
+/// Nanosecond-resolution epoll wait syscall.
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    timeout: *const Timespec,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> isize {
+    syscall_body!({
+        let deadline_ns = epoll_timespec_to_deadline(timeout)?;
+        epoll_pwait_common(
+            epfd,
+            events,
+            maxevents,
+            deadline_ns,
+            sigmask,
+            sigsetsize,
+            "sys_epoll_pwait2",
+        )
     })
 }
 
@@ -3496,10 +3690,7 @@ pub fn sys_dup(fd: u32) -> isize {
         }
         let new_fd = inner.alloc_fd()?;
         let desc = Arc::clone(&inner.fd_table[fd].as_ref().unwrap().desc);
-        inner.fd_table[new_fd] = Some(FdEntry {
-            desc,
-            flags: FdFlags::empty(),
-        });
+        inner.fd_table[new_fd] = Some(FdEntry::with_flags(desc, FdFlags::empty()));
         Ok(new_fd as isize)
     })
 }
@@ -3538,10 +3729,7 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
             // 先把旧 `newfd` 表项拿出来，等离开进程自旋锁后再 drop。
             replaced_entry = inner.take_fd(newfd);
             let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
-            inner.fd_table[newfd] = Some(FdEntry {
-                desc,
-                flags: FdFlags::empty(),
-            });
+            inner.fd_table[newfd] = Some(FdEntry::with_flags(desc, FdFlags::empty()));
             Ok(newfd as isize)
         });
         (result, replaced_entry)
