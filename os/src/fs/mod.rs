@@ -3,6 +3,7 @@
 pub mod cgroupfs;
 pub mod devfs;
 pub(crate) mod epoll;
+mod eventfd;
 mod inode;
 mod page_cache;
 mod pipe;
@@ -852,6 +853,16 @@ impl FileDescription {
 
     /// 顺序读取并推进共享文件偏移，同时保留底层 errno。
     pub fn read_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
+        // eventfd's blocking mode is an open-file-description flag, so it
+        // cannot be captured permanently by the underlying File object.
+        // Route reads through the counter implementation with the current
+        // status snapshot instead of its creation-time default.
+        if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
+            return eventfd.read_with_nonblock(
+                buf,
+                self.status_flags().contains(FileStatusFlags::NONBLOCK),
+            );
+        }
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
             let read_size = self.file.read_at_result(inner.offset, buf)?;
@@ -873,6 +884,12 @@ impl FileDescription {
 
     /// 顺序写入并推进共享文件偏移，同时保留底层 errno。
     pub fn write_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
+        if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
+            return eventfd.write_with_nonblock(
+                buf,
+                self.status_flags().contains(FileStatusFlags::NONBLOCK),
+            );
+        }
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
             if inner.status_flags.contains(FileStatusFlags::APPEND) {
@@ -1502,6 +1519,7 @@ pub use inode::{
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
+pub(crate) use eventfd::EventFdFile;
 pub use stdio::new_stdio_files;
 pub use tty::{
     console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize,

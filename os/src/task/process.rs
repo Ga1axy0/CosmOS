@@ -50,6 +50,17 @@ const INIT_ENV: &[&str] = &[
     "PWD=/root",
 ];
 
+/// Prevent thread creation from racing with a process-wide `execve` transition.
+struct ExecInProgressGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for ExecInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 fn mm_error_to_errno(err: MmError) -> ERRNO {
     match err {
         MmError::OutOfMemory => ERRNO::ENOMEM,
@@ -188,6 +199,8 @@ pub struct ProcessControlBlock {
     /// It starts as `true` for ordinary processes so their exec/exit paths do
     /// not spuriously wake normal waitpid callers.
     vfork_released: AtomicBool,
+    /// Whether this process is currently replacing its image with `execve`.
+    exec_in_progress: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1041,6 +1054,7 @@ impl ProcessControlBlock {
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(true),
+            exec_in_progress: AtomicBool::new(false),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = process
@@ -1075,7 +1089,13 @@ impl ProcessControlBlock {
         process
     }
 
-    /// Only support processes with a single thread.
+    /// Replace this process's image with `execve` semantics.
+    ///
+    /// The current implementation supports the common case where the process
+    /// leader calls `execve`: sibling threads are terminated first and the
+    /// leader is retained as the sole thread.  A non-leader caller is rejected
+    /// for now because the rest of the task lifecycle still assumes tid 0 is
+    /// the process leader.
     pub fn exec(
         self: &Arc<Self>,
         elf_file: Arc<OSInode>,
@@ -1084,7 +1104,32 @@ impl ProcessControlBlock {
         exec_path: String,
     ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
-        assert_eq!(self.inner_exclusive_access().thread_count(), 1);
+        let task = current_task().ok_or(ERRNO::ESRCH)?;
+        let caller_tid = task
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .ok_or(ERRNO::ESRCH)?
+            .tid;
+        if caller_tid != 0 {
+            warn!(
+                "kernel: exec from non-leader thread is not supported: pid={} tid={}",
+                self.getpid(),
+                caller_tid
+            );
+            return Err(ERRNO::EINVAL);
+        }
+        if self
+            .exec_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            warn!("kernel: concurrent exec rejected: pid={}", self.getpid());
+            return Err(ERRNO::EAGAIN);
+        }
+        let _exec_guard = ExecInProgressGuard {
+            flag: &self.exec_in_progress,
+        };
         let owner_pid = self.getpid();
 
         trace!("kernel: exec .. load process image");
@@ -1095,6 +1140,10 @@ impl ProcessControlBlock {
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
+        // Remove sibling tasks while the old address space is still active:
+        // their TaskUserRes destructors must detach mappings from the old
+        // MemorySet, not from the newly installed image.
+        super::terminate_other_threads_for_exec(self, &task);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
         let (mut old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments) = {
@@ -1139,7 +1188,6 @@ impl ProcessControlBlock {
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
-        let task = self.inner_exclusive_access().get_task(0);
         // Capture the mapping layout without retaining task-inner.  In
         // particular, TaskUserRes::{alloc_user_res,trap_cx_ppn} both acquire
         // process-inner, so calling them under task-inner inverts the scheduler's
@@ -1399,6 +1447,7 @@ impl ProcessControlBlock {
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(!vfork_clone),
+            exec_in_progress: AtomicBool::new(false),
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
@@ -1663,6 +1712,7 @@ impl ProcessControlBlock {
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(true),
+            exec_in_progress: AtomicBool::new(false),
         });
         parent.children.push(Arc::clone(&child));
         let parent_task = parent.get_task(0);
@@ -1717,6 +1767,11 @@ impl ProcessControlBlock {
     /// Return whether this process has exited and is waiting to be reaped.
     pub fn is_zombie(&self) -> bool {
         self.inner.lock().is_zombie
+    }
+
+    /// Return whether a process-wide `execve` transition is in progress.
+    pub(crate) fn exec_in_progress(&self) -> bool {
+        self.exec_in_progress.load(Ordering::Acquire)
     }
 
     /// Release a parent blocked by `CLONE_VFORK`.

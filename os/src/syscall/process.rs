@@ -1366,15 +1366,33 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             child_tid,
         } = req;
         let clone_flags_arg = flags | exit_signal;
+        let caller_task = current_task().ok_or(ERRNO::ESRCH)?;
+        let caller_pid = caller_task
+            .process
+            .upgrade()
+            .ok_or(ERRNO::ESRCH)?
+            .getpid();
+        let caller_tid = caller_task
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .ok_or(ERRNO::ESRCH)?
+            .thread_id();
+        let caller_thread_count = current_process()
+            .inner_exclusive_access()
+            .thread_count();
         trace!(
             "kernel:pid[{}] sys_clone flags={:#x} stack={:#x} stack_size={:#x}",
-            current_task().unwrap().process.upgrade().unwrap().getpid(),
+            caller_pid,
             clone_flags_arg,
             stack,
             stack_size,
         );
         debug!(
-            "kernel: sys_clone enter flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x}",
+            "[clone-diag] enter pid={} caller_tid={} thread_count={} flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x}",
+            caller_pid,
+            caller_tid,
+            caller_thread_count,
             clone_flags_arg, stack, stack_size, parent_tid, child_tid
         );
 
@@ -1434,6 +1452,13 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             child_tls = Some(tls);
         }
         let current_process = current_process();
+        if current_process.exec_in_progress() {
+            warn!(
+                "kernel: sys_clone rejected during exec: pid={}",
+                current_process.getpid()
+            );
+            return Err(ERRNO::EAGAIN);
+        }
         if thread_clone {
             let parent_task = current_task().unwrap();
             let (ustack_base, sched_attr, affinity_mask, signal_mask) = {
@@ -1507,6 +1532,16 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             }
             current_process.attach_task(Arc::clone(&new_task));
             add_task(new_task);
+            let process_thread_count = current_process.inner_exclusive_access().thread_count();
+            debug!(
+                "[clone-diag] thread child parent_pid={} parent_caller_tid={} new_tid={} inner_tid={} process_thread_count={} flags={:#x}",
+                current_process.getpid(),
+                caller_tid,
+                new_tid,
+                new_inner_tid,
+                process_thread_count,
+                clone_flags_arg
+            );
             Ok(new_tid as isize)
         } else {
             if vfork_clone {
@@ -1568,6 +1603,27 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 parent_tid,
                 child_tid,
                 child_pid
+            );
+            let (child_thread_count, child_ppid) = {
+                let child_inner = new_process.inner_exclusive_access();
+                let child_ppid = child_inner
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.upgrade())
+                    .map(|parent| parent.getpid())
+                    .unwrap_or(0);
+                (child_inner.thread_count(), child_ppid)
+            };
+            warn!(
+                "[clone-diag] process child parent_pid={} parent_caller_tid={} child_pid={} child_ppid={} child_thread_count={} flags={:#x} clone_parent={} vfork={}",
+                caller_pid,
+                caller_tid,
+                child_pid,
+                child_ppid,
+                child_thread_count,
+                clone_flags_arg,
+                flags.contains(CloneFlags::CLONE_PARENT),
+                vfork_clone
             );
             if vfork_clone {
                 // A vfork parent is released by the child's successful
@@ -1783,6 +1839,22 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
             argv,
             exec_path,
         } = resolved;
+        let caller_tid = current_task()
+            .ok_or(ERRNO::ESRCH)?
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .ok_or(ERRNO::ESRCH)?
+            .thread_id();
+        let thread_count = process.inner_exclusive_access().thread_count();
+        debug!(
+            "[exec-diag] pid={} caller_tid={} thread_count={} exec_path='{}' argv_len={}",
+            process.getpid(),
+            caller_tid,
+            thread_count,
+            exec_path,
+            argv.len()
+        );
         if exec_path.contains("acct02") || argv.iter().any(|arg| arg.contains("acct02")) {
             debug!(
                 "[execve] resolved pid={} exec_path='{}' argv={:?}",
@@ -1822,7 +1894,30 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
     let _probe = crate::probe_scope!("syscall.wait4");
     trace!("kernel: sys_wait4");
     let process = current_process();
-    syscall_body!({
+    let caller_pid = process.getpid();
+    let children_snapshot = {
+        let inner = process.inner_exclusive_access();
+        inner
+            .children
+            .iter()
+            .map(|child| {
+                let child_inner = child.inner_exclusive_access();
+                let child_ppid = child_inner
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.upgrade())
+                    .map(|parent| parent.getpid())
+                    .unwrap_or(0);
+                (child.getpid(), child_ppid, child_inner.is_zombie)
+            })
+            .collect::<Vec<_>>()
+    };
+    warn!(
+        "[wait4-diag] enter caller_pid={} target_pid={} options={:#x} children={:?}",
+        caller_pid, pid, options, children_snapshot
+    );
+
+    let result = syscall_body!({
         // 只在低 32 位上校验选项，避免符号扩展把 `__WCLONE`(0x80000000) 误判为非法位。
         // `WUNTRACED`/`WCONTINUED` 当前没有额外的停止/继续状态可上报（本内核不实现
         // 作业控制停止），按 Linux 语义安全地忽略即可——这正是 shell 前台等待
@@ -1964,7 +2059,12 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
             // a user-handled signal, but wait status must win over EINTR.
             continue;
         }
-    })
+    });
+    warn!(
+        "[wait4-diag] exit caller_pid={} target_pid={} result={}",
+        caller_pid, pid, result
+    );
+    result
 }
 
 /// kill syscall.

@@ -1,5 +1,6 @@
 use crate::fs::devfs::BlockDevNode;
 use crate::fs::epoll::{EpollEvent, EpollFile, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
+use crate::fs::EventFdFile;
 use crate::fs::Pipe;
 use crate::fs::{
     canonicalize, do_bind_mount, do_move_mount, do_umount, inode_stat, linkat_with_flags,
@@ -485,6 +486,34 @@ fn alloc_anonymous_fd_with_bits(
         AccessMode::ReadWrite,
         status_flags,
         status_fixed_bits,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    let mut entry = FdEntry::new(desc);
+    if cloexec {
+        entry.flags |= FdFlags::CLOEXEC;
+    }
+    inner.fd_table[fd] = Some(entry);
+    Ok(fd as isize)
+}
+
+fn alloc_eventfd(
+    initval: u32,
+    status_flags: FileStatusFlags,
+    cloexec: bool,
+    semaphore: bool,
+) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(EventFdFile::new(
+            initval,
+            semaphore,
+            status_flags.contains(FileStatusFlags::NONBLOCK),
+        )),
+        AccessMode::ReadWrite,
+        status_flags,
+        0,
     ));
 
     let process = current_process();
@@ -3103,10 +3132,17 @@ pub fn sys_ftruncate(fd: u32, len: isize) -> isize {
     })
 }
 
-pub fn sys_eventfd2(_initval: u32, flags: i32) -> isize {
+pub fn sys_eventfd2(initval: u32, flags: i32) -> isize {
     syscall_body!({
-        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
-        alloc_anonymous_fd(status_flags, cloexec)
+        const EFD_SEMAPHORE: i32 = 0x1;
+        let allowed = O_NONBLOCK | O_CLOEXEC | EFD_SEMAPHORE;
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, allowed)?;
+        alloc_eventfd(
+            initval,
+            status_flags,
+            cloexec,
+            (flags & EFD_SEMAPHORE) != 0,
+        )
     })
 }
 
@@ -3276,7 +3312,16 @@ pub fn sys_epoll_pwait(
     sigmask: *const u8,
     sigsetsize: usize,
 ) -> isize {
-    syscall_body!({
+    warn!(
+        "[epoll-diag] enter syscall=epoll_pwait epfd={} events={:#x} maxevents={} timeout_ms={} sigmask={:#x} sigsetsize={}",
+        epfd,
+        events as usize,
+        maxevents,
+        timeout_ms,
+        sigmask as usize,
+        sigsetsize
+    );
+    let result = syscall_body!({
         let deadline_ns = epoll_timeout_ms_to_deadline(timeout_ms)?;
         epoll_pwait_common(
             epfd,
@@ -3287,7 +3332,12 @@ pub fn sys_epoll_pwait(
             sigsetsize,
             "sys_epoll_pwait",
         )
-    })
+    });
+    warn!(
+        "[epoll-diag] exit syscall=epoll_pwait epfd={} maxevents={} timeout_ms={} result={}",
+        epfd, maxevents, timeout_ms, result
+    );
+    result
 }
 
 /// Nanosecond-resolution epoll wait syscall.
@@ -3299,7 +3349,16 @@ pub fn sys_epoll_pwait2(
     sigmask: *const u8,
     sigsetsize: usize,
 ) -> isize {
-    syscall_body!({
+    warn!(
+        "[epoll-diag] enter syscall=epoll_pwait2 epfd={} events={:#x} maxevents={} timeout_ptr={:#x} sigmask={:#x} sigsetsize={}",
+        epfd,
+        events as usize,
+        maxevents,
+        timeout as usize,
+        sigmask as usize,
+        sigsetsize
+    );
+    let result = syscall_body!({
         let deadline_ns = epoll_timespec_to_deadline(timeout)?;
         epoll_pwait_common(
             epfd,
@@ -3310,7 +3369,12 @@ pub fn sys_epoll_pwait2(
             sigsetsize,
             "sys_epoll_pwait2",
         )
-    })
+    });
+    warn!(
+        "[epoll-diag] exit syscall=epoll_pwait2 epfd={} maxevents={} timeout_ptr={:#x} result={}",
+        epfd, maxevents, timeout as usize, result
+    );
+    result
 }
 
 pub fn sys_inotify_init1(flags: i32) -> isize {

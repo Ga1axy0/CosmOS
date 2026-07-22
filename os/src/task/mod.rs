@@ -23,7 +23,7 @@ use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::sched::{
     add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
-    take_current_task, TaskContext,
+    resched_hart, take_current_task, TaskContext,
 };
 pub use crate::sched::{
     block_current_and_run_next, current_process, current_task, current_trap_cx,
@@ -39,6 +39,164 @@ use crate::timer::get_time_ns;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Terminate every sibling task before the current process installs a new
+/// image with `execve`.
+///
+/// `execve` keeps the calling thread and the process identity, but all other
+/// threads must disappear before the old address space is recycled.  This is
+/// deliberately separate from `exit_group_current_and_run_next`: the current
+/// task must continue running and the PCB must remain usable after the image
+/// replacement.
+pub(crate) fn terminate_other_threads_for_exec(
+    process: &Arc<ProcessControlBlock>,
+    leader: &Arc<TaskControlBlock>,
+) {
+    let siblings = {
+        let process_inner = process.inner_exclusive_access();
+        process_inner
+            .tasks
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|task| !Arc::ptr_eq(task, leader))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if siblings.is_empty() {
+        return;
+    }
+
+    debug!(
+        "[exec] terminate sibling threads: pid={} count={}",
+        process.getpid(),
+        siblings.len()
+    );
+
+    let mut active_siblings = Vec::<(Arc<TaskControlBlock>, usize)>::new();
+    let mut running_siblings = Vec::<(Arc<TaskControlBlock>, usize)>::new();
+    let mut recycle_res = Vec::<TaskUserRes>::new();
+
+    for sibling in siblings {
+        let state = {
+            let mut task_inner = sibling.inner_exclusive_access();
+            if task_inner.exit_code.is_some() {
+                None
+            } else {
+                let tid = task_inner.res.as_ref().map(|res| res.tid);
+                let thread_id = task_inner.res.as_ref().map(|res| res.thread_id());
+                let clear_child_tid = task_inner.clear_child_tid;
+                let wait_handle = task_inner.current_wq_handle.take();
+                let was_on_cpu = sibling.on_cpu.load(Ordering::Acquire);
+                let last_cpu = task_inner.sched.last_cpu;
+                task_inner.exit_code = Some(0);
+                task_inner.task_status = TaskStatus::Zombie;
+                task_inner.wait_reason = None;
+                task_inner.sched.resched_reason =
+                    Some(crate::sched::ReschedReason::HigherRtPriority);
+                task_inner.clear_child_tid = 0;
+                Some((
+                    tid,
+                    thread_id,
+                    clear_child_tid,
+                    wait_handle,
+                    was_on_cpu,
+                    last_cpu,
+                ))
+            }
+        };
+        let Some((tid, thread_id, clear_child_tid, wait_handle, was_on_cpu, last_cpu)) = state
+        else {
+            continue;
+        };
+
+        if let Some(wait_handle) = wait_handle {
+            wait_handle.remove_waiter(&sibling);
+        }
+        cleanup_signal_wait_for_task(&sibling);
+        cleanup_futex_wait_for_task(&sibling);
+        if should_remove_non_futex_timers_on_exit(&sibling) {
+            remove_timer(Arc::clone(&sibling));
+        }
+        if let Some(thread_id) = thread_id {
+            remove_from_tid2task(thread_id);
+        }
+        if let Some(tid) = tid {
+            let mut process_inner = process.inner_exclusive_access();
+            process_inner.mutex_detector.clear_thread(tid);
+            process_inner.semaphore_detector.clear_thread(tid);
+        }
+
+        if clear_child_tid != 0 {
+            if let Err(err) = write_pod_to_process_user(
+                process,
+                clear_child_tid as *mut i32,
+                &0i32,
+            ) {
+                warn!(
+                    "[exec] failed to clear sibling child_tid: pid={} tid={:?} addr={:#x} err={:?}",
+                    process.getpid(),
+                    tid,
+                    clear_child_tid,
+                    err
+                );
+            }
+            if let Err(err) = futex_wake_addr_in_process(process, clear_child_tid, 1, false) {
+                warn!(
+                    "[exec] failed to wake sibling child_tid futex: pid={} tid={:?} addr={:#x} err={:?}",
+                    process.getpid(),
+                    tid,
+                    clear_child_tid,
+                    err
+                );
+            }
+        }
+
+        remove_task(Arc::clone(&sibling));
+        if let Some(tid) = tid {
+            active_siblings.push((Arc::clone(&sibling), tid));
+        }
+        if was_on_cpu {
+            resched_hart(last_cpu);
+            running_siblings.push((sibling, last_cpu));
+        } else if let Some(res) = sibling.inner_exclusive_access().res.take() {
+            recycle_res.push(res);
+        }
+    }
+
+    // A sibling may currently be executing on another hart.  Its next
+    // scheduling transition observes TaskStatus::Zombie and will not return
+    // it to a runqueue.  Wait until its kernel stack and old user context are
+    // no longer active before replacing the address space.
+    while running_siblings
+        .iter()
+        .any(|(task, _)| task.on_cpu.load(Ordering::Acquire))
+    {
+        core::hint::spin_loop();
+    }
+    for (sibling, _) in running_siblings {
+        if let Some(res) = sibling.inner_exclusive_access().res.take() {
+            recycle_res.push(res);
+        }
+    }
+
+    // Remove the dead tasks from the process task table.  Their resources are
+    // dropped only after releasing process_inner because TaskUserRes::drop
+    // needs to acquire that same lock while removing the old VMAs.
+    {
+        let mut process_inner = process.inner_exclusive_access();
+        for (sibling, tid) in active_siblings {
+            let slot_matches = process_inner
+                .tasks
+                .get(tid)
+                .and_then(|slot| slot.as_ref())
+                .is_some_and(|registered| Arc::ptr_eq(registered, &sibling));
+            if slot_matches {
+                process_inner.tasks[tid] = None;
+            }
+        }
+    }
+    drop(recycle_res);
+}
 pub(crate) use id::cached_kstack_count;
 pub(crate) use id::reclaim_cached_kstacks;
 pub(crate) use id::recycle_deferred_kstack_ids;

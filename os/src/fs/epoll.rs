@@ -35,8 +35,13 @@ pub(crate) const EPOLL_CTL_ADD: i32 = 1;
 pub(crate) const EPOLL_CTL_DEL: i32 = 2;
 pub(crate) const EPOLL_CTL_MOD: i32 = 3;
 
-const SUPPORTED_EVENTS: u32 = EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-const UNSUPPORTED_MODIFIERS: u32 = EPOLLEXCLUSIVE | EPOLLWAKEUP | EPOLLONESHOT | EPOLLET;
+// Mio registers readable interests as EPOLLIN | EPOLLRDHUP | EPOLLET.
+// EPOLLET is implemented below with per-item readiness state: an edge item is
+// queued only on a 0 -> non-zero readiness transition and is not requeued just
+// because the underlying object remains ready after delivery.
+const SUPPORTED_EVENTS: u32 =
+    EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
+const UNSUPPORTED_MODIFIERS: u32 = EPOLLEXCLUSIVE | EPOLLWAKEUP | EPOLLONESHOT;
 const ITEM_ALIVE: usize = 1 << 0;
 const ITEM_QUEUED: usize = 1 << 1;
 const EPOLL_FALLBACK_POLL_NS: u64 = 10_000_000;
@@ -83,6 +88,9 @@ struct EpollItem {
     events: AtomicU32,
     data: AtomicU64,
     state: AtomicUsize,
+    /// Last readiness observed for an edge-triggered item.  This is the
+    /// edge detector's armed state, not the transient ready-queue bit.
+    edge_ready: AtomicU32,
 }
 
 impl EpollItem {
@@ -120,6 +128,19 @@ impl EpollItem {
                 Err(next) => state = next,
             }
         }
+    }
+
+    fn edge_triggered(&self) -> bool {
+        self.events.load(Ordering::Acquire) & EPOLLET != 0
+    }
+
+    fn reset_edge_ready(&self) {
+        self.edge_ready.store(0, Ordering::Release);
+    }
+
+    fn observe_edge_ready(&self, ready: u32) -> bool {
+        let previous = self.edge_ready.swap(ready, Ordering::AcqRel);
+        previous == 0 && ready != 0
     }
 
     fn current_ready_events(&self) -> u32 {
@@ -202,15 +223,23 @@ impl EpollInner {
             }
             let events = item.current_ready_events();
             if events == 0 {
+                if item.edge_triggered() {
+                    // A stale queued entry may be the first observation of a
+                    // readiness transition back to zero.  Re-arm it here so
+                    // the next transition can produce an edge.
+                    item.observe_edge_ready(0);
+                }
                 continue;
             }
             output.push(EpollEvent {
                 events,
                 data: item.data.load(Ordering::Acquire),
             });
-            // Stage one implements level-triggered delivery.  Delay requeueing
-            // until this batch is complete so one fd appears at most once.
-            level_ready.push(item);
+            if !item.edge_triggered() {
+                // Delay level-triggered requeueing until this batch is
+                // complete so one fd appears at most once.
+                level_ready.push(item);
+            }
         }
 
         for item in level_ready {
@@ -270,6 +299,7 @@ impl EpollFile {
         if events & UNSUPPORTED_MODIFIERS != 0
             || events & !(SUPPORTED_EVENTS | UNSUPPORTED_MODIFIERS) != 0
         {
+            warn!("epoll: unsupported event mask {:#x}", events);
             return Err(ERRNO::EINVAL);
         }
         Ok(())
@@ -305,6 +335,7 @@ impl EpollFile {
             events: AtomicU32::new(event.events),
             data: AtomicU64::new(event.data),
             state: AtomicUsize::new(ITEM_ALIVE),
+            edge_ready: AtomicU32::new(0),
         });
 
         {
@@ -326,7 +357,15 @@ impl EpollFile {
             return Err(ERRNO::EBADF);
         }
         // Subscribe before checking readiness to close the ADD-vs-notify race.
-        if item.current_ready_events() != 0 {
+        let ready = item.current_ready_events();
+        if item.edge_triggered() {
+            // ADD observes the current state as the initial edge.  A
+            // descriptor that is already readable must still be returned
+            // once, but it must not be returned repeatedly until it becomes
+            // non-readable and readable again.
+            item.observe_edge_ready(ready);
+        }
+        if ready != 0 {
             self.inner.enqueue(item);
         }
         Ok(())
@@ -352,7 +391,15 @@ impl EpollFile {
             .ok_or(ERRNO::ENOENT)?;
         item.data.store(event.data, Ordering::Release);
         item.events.store(event.events, Ordering::Release);
-        if item.current_ready_events() != 0 {
+        // MOD starts a fresh interest.  Remove an old queued notification and
+        // re-arm edge detection before evaluating the new mask.
+        self.inner.remove_ready_item(&item);
+        item.reset_edge_ready();
+        let ready = item.current_ready_events();
+        if item.edge_triggered() {
+            item.observe_edge_ready(ready);
+        }
+        if ready != 0 {
             self.inner.enqueue(item);
         }
         Ok(())
@@ -375,8 +422,9 @@ impl EpollFile {
         Ok(())
     }
 
-    /// Wait for level-triggered events.  The existing transient poll key is
-    /// used only to sleep this task on the epoll instance's own source id.
+    /// Wait for queued level- or edge-triggered events.  The existing
+    /// transient poll key is used only to sleep this task on the epoll
+    /// instance's own source id.
     pub(crate) fn wait(
         &self,
         epfd: usize,
@@ -558,7 +606,20 @@ pub(crate) fn notify_source(source_id: usize, ready_mask: u16) {
         let Some(item) = weak.upgrade() else {
             continue;
         };
-        if !item.is_alive() || !item.interested_in(ready_mask) {
+        if !item.is_alive() {
+            continue;
+        }
+        if item.edge_triggered() {
+            // Edge detection must observe both sides of a transition.  Some
+            // file implementations notify a source because its writable
+            // state changed while the epoll interest is readable (and vice
+            // versa), so filtering solely by ready_mask would fail to clear
+            // the armed state after a read/drain operation.
+            let ready = item.current_ready_events();
+            if !item.observe_edge_ready(ready) {
+                continue;
+            }
+        } else if !item.interested_in(ready_mask) || item.current_ready_events() == 0 {
             continue;
         }
         if let Some(owner) = item.owner.upgrade() {

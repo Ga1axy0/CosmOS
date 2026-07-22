@@ -394,6 +394,10 @@ pub enum WaitReason {
     PipeReadable,
     /// Waiting for pipe to become writable.
     PipeWritable,
+    /// Waiting for an eventfd counter to become readable.
+    EventFdReadable,
+    /// Waiting for an eventfd counter to have writable capacity.
+    EventFdWritable,
     /// Waiting for nanosleep timer expiration.
     Nanosleep,
     /// Waiting for block device I/O completion.
