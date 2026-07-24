@@ -23,6 +23,7 @@ pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_PREAD64: usize = 67;
 pub const SYSCALL_PWRITE64: usize = 68;
+pub const SYSCALL_PPOLL_TIME32: usize = 73;
 pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
@@ -114,6 +115,21 @@ pub struct Clone3Args {
     pub set_tid: u64,
     pub set_tid_size: u64,
     pub cgroup: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OldTimespec32 {
+    pub tv_sec: i32,
+    pub tv_nsec: i32,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -691,6 +707,21 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: i32) -> isize {
 
 pub fn sys_pipe(pipe: &mut [i32]) -> isize {
     syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0])
+}
+
+pub fn sys_ppoll_time32(fds: &mut [PollFd], timeout: Option<&OldTimespec32>) -> isize {
+    let timeout_ptr = timeout.map_or(core::ptr::null(), |value| value as *const _);
+    syscall6(
+        SYSCALL_PPOLL_TIME32,
+        [
+            fds.as_mut_ptr() as usize,
+            fds.len(),
+            timeout_ptr as usize,
+            0,
+            0,
+            0,
+        ],
+    )
 }
 
 pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {

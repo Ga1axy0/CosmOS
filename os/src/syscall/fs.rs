@@ -1393,6 +1393,39 @@ where
             }
             Err(e) => return Err(e),
         };
+
+        // Close the readiness-notification race between the first fd scan and
+        // registering this poll key:
+        //
+        // 1. the first scan observes no readiness;
+        // 2. a producer makes an fd ready and notifies before registration;
+        // 3. no registered key records that notification;
+        // 4. the producer blocks (for example, after filling a pipe);
+        // 5. the poller would otherwise sleep forever waiting for a new edge.
+        //
+        // Once the key is registered, scan the level-triggered fd state again.
+        // Notifications after this scan are safe: they mark the key Ready, and
+        // wait_poll_key() rechecks that state after enqueueing the task.
+        let ready = scan_pollfds(pollfds);
+        if let Err(e) = write_back(pollfds) {
+            poll::cleanup_poll_wait(handle);
+            return Err(e);
+        }
+        if ready > 0 {
+            poll::cleanup_poll_wait(handle);
+            return Ok(ready as isize);
+        }
+        if has_unmasked_pending_signal() {
+            poll::cleanup_poll_wait(handle);
+            return Err(ERRNO::EINTR);
+        }
+        if let Some(deadline_ns) = deadline_ns {
+            if get_time_ns() >= deadline_ns {
+                poll::cleanup_poll_wait(handle);
+                return Ok(0);
+            }
+        }
+
         if let Some(deadline_ns) = deadline_ns {
             add_timer_with_poll_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
         }
