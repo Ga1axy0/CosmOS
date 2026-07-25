@@ -11,6 +11,10 @@ KERNEL_RV_ELF := os/target/$(TARGET)/release/os
 KERNEL_LA_ELF := os/target/loongarch64-unknown-none/release/os
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
+LINUX_RV_DIR ?= .make/linux-rv
+LINUX_RV_IMAGE ?= $(LINUX_RV_DIR)/arch/riscv/boot/Image
+LINUX_RV_SOURCE ?= ../linux
+LINUX_RV_CROSS_COMPILE ?= /opt/riscv64-linux-musl-cross/bin/riscv64-linux-musl-
 MEM ?= 4G
 SMP ?= 1
 TEST_FS ?= sdcard-$(RUN_ARCH).img
@@ -112,7 +116,7 @@ else
 $(error unsupported RUN_ARCH=$(RUN_ARCH), expected rv or la)
 endif
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la linux snapshot-fast-run snapshot-linux clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
 
 all:
 	$(MAKE) submodules
@@ -409,6 +413,19 @@ run-la: check-kernel-la $(LA_BOOTLOADER_ELF) $(DISK_LA_IMG) prepare-run-test-fs-
 
 fast-run: check-kernel
 	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
+
+$(LINUX_RV_IMAGE): $(LINUX_RV_SOURCE)/Makefile
+	$(MAKE) -C $(LINUX_RV_SOURCE) O=$(abspath $(LINUX_RV_DIR)) ARCH=riscv CROSS_COMPILE=$(LINUX_RV_CROSS_COMPILE) defconfig
+	$(MAKE) -C $(LINUX_RV_SOURCE) O=$(abspath $(LINUX_RV_DIR)) ARCH=riscv CROSS_COMPILE=$(LINUX_RV_CROSS_COMPILE) -j$${JOBS:-$$(nproc)} Image
+
+linux: $(LINUX_RV_IMAGE) $(DISK_RV_IMG)
+	$(QEMU) -machine virt -kernel $(LINUX_RV_IMAGE) -m $(MEM) -nographic -smp $(SMP) -bios default -drive file=$(DISK_RV_IMG),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -append 'console=ttyS0 root=/dev/vda rw rootwait init=/bin/sh' -no-reboot -rtc base=utc
+
+snapshot-linux: $(LINUX_RV_IMAGE) $(DISK_RV_IMG)
+	$(QEMU) -snapshot -machine virt -kernel $(LINUX_RV_IMAGE) -m $(MEM) -nographic -smp $(SMP) -bios default -drive file=$(DISK_RV_IMG),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -append 'console=ttyS0 root=/dev/vda rw rootwait init=/bin/sh' -no-reboot -rtc base=utc
+
+snapshot-fast-run: check-kernel
+	$(QEMU) -snapshot -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
 
 fast-run-trace: check-kernel
 	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS) -d int,in_asm -D qemu.log

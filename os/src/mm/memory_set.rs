@@ -1359,6 +1359,10 @@ impl MemorySet {
                 continue;
             }
 
+            // A direct_cache_pages entry aliases the page-cache frame.
+            // page_cache::truncate_mapping() owns zeroing the retained tail,
+            // so the VM layer only removes mappings that now lie wholly
+            // beyond EOF.
             let direct_vpns: Vec<_> = area.direct_cache_pages.keys().copied().collect();
             for vpn in direct_vpns {
                 let Some(page_idx) = area.file_page_index(vpn) else {
@@ -1366,15 +1370,12 @@ impl MemorySet {
                 };
                 let page_start = page_idx as usize * PAGE_SIZE;
                 if page_start >= new_size {
-                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    area.unmap_present_one_deferred_after_truncate(
+                        &mut self.page_table,
+                        vpn,
+                        &mut batch,
+                    );
                     pte_changed = true;
-                    continue;
-                }
-                if new_size < page_start + PAGE_SIZE {
-                    if let Some(page) = area.direct_cache_pages.get(&vpn) {
-                        let page = page.lock();
-                        page.ppn().get_bytes_array()[new_size - page_start..].fill(0);
-                    }
                 }
             }
 
@@ -1385,7 +1386,11 @@ impl MemorySet {
                 };
                 let page_start = page_idx as usize * PAGE_SIZE;
                 if page_start >= new_size {
-                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    area.unmap_present_one_deferred_after_truncate(
+                        &mut self.page_table,
+                        vpn,
+                        &mut batch,
+                    );
                     pte_changed = true;
                     continue;
                 }
@@ -2916,6 +2921,30 @@ impl Vma {
         vpn: VirtPageNum,
         batch: &mut UserReleaseBatch,
     ) {
+        self.unmap_present_one_deferred_inner(page_table, vpn, batch, true);
+    }
+
+    /// Remove a file mapping after truncate has committed.
+    ///
+    /// Bytes beyond the new EOF are intentionally discarded, so a dirty PTE
+    /// must not re-dirty a cache page that `page_cache::truncate_mapping()` may
+    /// already have removed from the mapping.
+    pub(crate) fn unmap_present_one_deferred_after_truncate(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        batch: &mut UserReleaseBatch,
+    ) {
+        self.unmap_present_one_deferred_inner(page_table, vpn, batch, false);
+    }
+
+    fn unmap_present_one_deferred_inner(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        batch: &mut UserReleaseBatch,
+        mark_shared_dirty: bool,
+    ) {
         if let Some(page) = self.direct_cache_pages.remove(&vpn) {
             let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
             trace!(
@@ -2923,7 +2952,10 @@ impl Vma {
                 vpn.0, shared_file_mapping
             );
             if let Some(old_pte) = page_table.clear(vpn) {
-                if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
+                if mark_shared_dirty
+                    && shared_file_mapping
+                    && old_pte.flags().contains(PTEFlags::D)
+                {
                     mark_cached_page_dirty(&page);
                 }
             }

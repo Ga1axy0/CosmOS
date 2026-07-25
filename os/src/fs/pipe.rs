@@ -73,8 +73,11 @@ impl Pipe {
                 break;
             }
         }
-        ring_buffer.write_wait_queue.wake_one();
-        notify_poll_source(self.source_id(), POLLOUT);
+        let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+        let source_id = self.source_id();
+        drop(ring_buffer);
+        write_wait_queue.wake_one();
+        notify_poll_source(source_id, POLLOUT);
         Ok(already_read)
     }
 
@@ -103,8 +106,11 @@ impl Pipe {
                 break;
             }
         }
-        ring_buffer.read_wait_queue.wake_one();
-        notify_poll_source(self.source_id(), POLLIN);
+        let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+        let source_id = self.source_id();
+        drop(ring_buffer);
+        read_wait_queue.wake_one();
+        notify_poll_source(source_id, POLLIN);
         Ok(already_write)
     }
 }
@@ -182,10 +188,15 @@ impl PipeRingBuffer {
         }
     }
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_end.as_ref().unwrap().upgrade().is_none()
+        // This is called while the ring-buffer lock is held.  `upgrade()`
+        // creates a temporary Arc whose drop may run `Pipe::drop` and take
+        // the same buffer/wait-queue locks again.  Inspect the strong count
+        // directly so this check cannot execute an arbitrary destructor under
+        // the ring-buffer lock.
+        self.write_end.as_ref().unwrap().strong_count() == 0
     }
     pub fn all_read_ends_closed(&self) -> bool {
-        self.read_end.as_ref().unwrap().upgrade().is_none()
+        self.read_end.as_ref().unwrap().strong_count() == 0
     }
 }
 
@@ -259,18 +270,27 @@ impl File for Pipe {
                     }
                     already_read += 1;
                     if already_read == want_to_read {
-                        ring_buffer.write_wait_queue.wake_one();
-                        notify_poll_source(self.source_id(), POLLOUT);
+                        let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+                        let source_id = self.source_id();
+                        drop(ring_buffer);
+                        write_wait_queue.wake_one();
+                        notify_poll_source(source_id, POLLOUT);
                         return Ok(want_to_read);
                     }
                 } else {
-                    ring_buffer.write_wait_queue.wake_one();
-                    notify_poll_source(self.source_id(), POLLOUT);
+                    let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+                    let source_id = self.source_id();
+                    drop(ring_buffer);
+                    write_wait_queue.wake_one();
+                    notify_poll_source(source_id, POLLOUT);
                     return Ok(already_read);
                 }
             }
-            ring_buffer.write_wait_queue.wake_one();
-            notify_poll_source(self.source_id(), POLLOUT);
+            let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+            let source_id = self.source_id();
+            drop(ring_buffer);
+            write_wait_queue.wake_one();
+            notify_poll_source(source_id, POLLOUT);
         }
     }
     fn read_bytes_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
@@ -307,15 +327,21 @@ impl File for Pipe {
             }
             for _ in 0..loop_read {
                 if already_read == want_to_read {
-                    ring_buffer.write_wait_queue.wake_one();
-                    notify_poll_source(self.source_id(), POLLOUT);
+                    let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+                    let source_id = self.source_id();
+                    drop(ring_buffer);
+                    write_wait_queue.wake_one();
+                    notify_poll_source(source_id, POLLOUT);
                     return Ok(already_read);
                 }
                 buf[already_read] = ring_buffer.read_byte();
                 already_read += 1;
             }
-            ring_buffer.write_wait_queue.wake_one();
-            notify_poll_source(self.source_id(), POLLOUT);
+            let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
+            let source_id = self.source_id();
+            drop(ring_buffer);
+            write_wait_queue.wake_one();
+            notify_poll_source(source_id, POLLOUT);
         }
     }
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
@@ -358,18 +384,27 @@ impl File for Pipe {
                     ring_buffer.write_byte(unsafe { *byte_ref });
                     already_write += 1;
                     if already_write == want_to_write {
-                        ring_buffer.read_wait_queue.wake_one();
-                        notify_poll_source(self.source_id(), POLLIN);
+                        let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+                        let source_id = self.source_id();
+                        drop(ring_buffer);
+                        read_wait_queue.wake_one();
+                        notify_poll_source(source_id, POLLIN);
                         return Ok(want_to_write);
                     }
                 } else {
-                    ring_buffer.read_wait_queue.wake_one();
-                    notify_poll_source(self.source_id(), POLLIN);
+                    let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+                    let source_id = self.source_id();
+                    drop(ring_buffer);
+                    read_wait_queue.wake_one();
+                    notify_poll_source(source_id, POLLIN);
                     return Ok(already_write);
                 }
             }
-            ring_buffer.read_wait_queue.wake_one();
-            notify_poll_source(self.source_id(), POLLIN);
+            let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+            let source_id = self.source_id();
+            drop(ring_buffer);
+            read_wait_queue.wake_one();
+            notify_poll_source(source_id, POLLIN);
         }
     }
     fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
@@ -400,15 +435,21 @@ impl File for Pipe {
             }
             for _ in 0..loop_write {
                 if already_write == want_to_write {
-                    ring_buffer.read_wait_queue.wake_one();
-                    notify_poll_source(self.source_id(), POLLIN);
+                    let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+                    let source_id = self.source_id();
+                    drop(ring_buffer);
+                    read_wait_queue.wake_one();
+                    notify_poll_source(source_id, POLLIN);
                     return Ok(already_write);
                 }
                 ring_buffer.write_byte(buf[already_write]);
                 already_write += 1;
             }
-            ring_buffer.read_wait_queue.wake_one();
-            notify_poll_source(self.source_id(), POLLIN);
+            let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+            let source_id = self.source_id();
+            drop(ring_buffer);
+            read_wait_queue.wake_one();
+            notify_poll_source(source_id, POLLIN);
         }
     }
     fn poll(&self, events: u16) -> u16 {
@@ -474,9 +515,11 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         let source_id = self.source_id();
         let ring_buffer = self.buffer.lock();
-        ring_buffer.read_wait_queue.wake_all();
-        ring_buffer.write_wait_queue.wake_all();
+        let read_wait_queue = Arc::clone(&ring_buffer.read_wait_queue);
+        let write_wait_queue = Arc::clone(&ring_buffer.write_wait_queue);
         drop(ring_buffer);
+        read_wait_queue.wake_all();
+        write_wait_queue.wake_all();
         notify_poll_source(source_id, POLLIN | POLLOUT | POLLHUP);
     }
 }

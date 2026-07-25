@@ -30,6 +30,7 @@ os/vendor/
 notes
 base.img
 disk.img
+disk.img.xz
 disk-la.img 
 kernel-rv
 kernel-la

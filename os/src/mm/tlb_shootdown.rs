@@ -1,6 +1,6 @@
 //! TLB shootdown state and deferred recycle helpers.
 
-use super::{kernel_token, FrameTracker};
+use super::FrameTracker;
 use crate::config::MAX_HARTS;
 use crate::hal::hartid;
 use crate::hal::traits::AddressSpaceToken;
@@ -332,7 +332,7 @@ pub fn online_mask() -> usize {
 /// 尝试在当前 hart 上完成一份尚未响应的 shootdown 请求。
 ///
 /// 该路径不打印日志、不分配内存，也不依赖本地中断开启。因此它既可由 IPI
-/// handler 调用，也可在关中断状态等待 shootdown 发起锁时主动轮询。
+/// handler 调用，也可在关中断状态等待任意自旋锁时主动轮询。
 fn service_pending_shootdown_quiet() -> Option<(usize, ShootdownKind)> {
     if !TLB_SHOOTDOWN_STATE.active.load(Ordering::Acquire) {
         return None;
@@ -594,32 +594,14 @@ fn decode_shootdown_kind(kind_bits: usize, arg_token: usize) -> ShootdownKind {
 fn perform_local_tlb_shootdown(kind: ShootdownKind) {
     match kind {
         ShootdownKind::Global => local_sfence_vma_all(),
-        ShootdownKind::AddressSpace {
-            token: target_token,
-        } => {
-            // 目标 hart 可能是在用户态收到 IPI 后刚切入内核，因此当前 satp
-            // 可能已经是 kernel_token；此时仍然要完成本地 flush 并回 ack。
-            // TODO：引入 ASID 后，应避免把 kernel_token 情况退化成全量 flush。
-            let current_token = unsafe { crate::hal::current_address_space_token() };
-            if current_token == target_token || current_token == kernel_token() {
-                local_sfence_vma_all();
-            } else {
-                // With Sv39 the current implementation does not assign ASIDs.
-                // A target hart changing address spaces between the mask
-                // snapshot and IPI handling is expected to have flushed while
-                // switching, but this is exactly the timing window that must
-                // be visible when investigating stale executable TLB entries.
-                warn!(
-                    "[tlb] address-space shootdown skipped: hart={} current_satp={:#x} \
-                     target_satp={:#x} online={:#b} target_mask={:#b} ack_mask={:#b}",
-                    hartid(),
-                    current_token,
-                    target_token,
-                    TLB_SHOOTDOWN_STATE.online_hart_mask.load(Ordering::Acquire),
-                    TLB_SHOOTDOWN_STATE.target_mask.load(Ordering::Acquire),
-                    TLB_SHOOTDOWN_STATE.ack_mask.load(Ordering::Acquire),
-                );
-            }
+        ShootdownKind::AddressSpace { .. } => {
+            // The ack path may run from SpinNoIrqLock::lock while another
+            // hart is synchronously waiting for this ack.  It must therefore
+            // never acquire KERNEL_SPACE or any other lock.  Without ASIDs,
+            // a local full flush is the conservative and correct operation
+            // even if this hart switched address spaces after the target mask
+            // was sampled.
+            local_sfence_vma_all();
         }
     }
 }

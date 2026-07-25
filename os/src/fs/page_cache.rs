@@ -583,10 +583,17 @@ pub fn truncate_inode(inode: &Arc<Inode>, new_size: usize) -> Result<(), FS_ERRN
         new_size
     );
     if let Some(mapping) = mapping_for_inode(inode) {
-        if new_size < mapping.size() {
+        let old_size = mapping.size();
+        let result = mapping.truncate(new_size);
+        if result.is_ok() && new_size < old_size {
+            // The page cache owns the contents of CachePage frames and has
+            // already zeroed the retained tail page in truncate_mapping.
+            // Only invalidate user mappings after the backing inode and cache
+            // metadata have both committed successfully.  This keeps a
+            // failed backing truncate from modifying user-visible pages.
             invalidate_inode_mappings_after_truncate(inode, new_size);
         }
-        return mapping.truncate(new_size);
+        return result;
     }
     if let Err(err) = inode.truncate(new_size) {
         error!(
@@ -1399,7 +1406,8 @@ fn ensure_page_uptodate(
             0
         } else {
             let bytes = ppn.get_bytes_array();
-            bytes.fill(0);
+            // New cache frames are zeroed by FrameTracker::new(); no extra
+            // clear is needed before loading file data.
             trace!(
                 "[page_cache] load page: fs_id={} ino={} page_idx={} valid_bytes={}",
                 inode.fs_id(),
