@@ -66,9 +66,6 @@ impl OSInode {
         read_ahead: Option<FileReadAheadPlan>,
     ) -> usize {
         let mapping = self.page_mapping();
-        if let (Some(mapping), Some(plan)) = (mapping.as_ref(), read_ahead) {
-            mapping.prefetch_for_sequential_read(plan.start, plan.len, offset);
-        }
 
         let mut file_off = offset;
         let mut total_read_size = 0usize;
@@ -86,6 +83,14 @@ impl OSInode {
             if read_size < slice.len() {
                 break;
             }
+        }
+        if let (Some(mapping), Some(plan)) = (mapping.as_ref(), read_ahead) {
+            mapping.prefetch_for_sequential_read(
+                plan.start,
+                plan.len,
+                offset,
+                total_read_size,
+            );
         }
         total_read_size
     }

@@ -2159,9 +2159,8 @@ impl ProcessControlBlock {
             plan.file.path()
         );
         let page = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
-            // Load the faulting page and the VMA-selected bounded window in
-            // one page-cache operation.  Sequential streams use 128 KiB;
-            // non-linear instruction faults use a conservative 64 KiB.
+            // Keep the conservative 64 KiB demand prefix synchronous, then
+            // let the page-cache worker fill any confirmed sequential tail.
             mapping.try_get_page_with_fault_window(plan.page_idx, plan.read_ahead_pages)?
         } else {
             mapping.try_get_page(plan.page_idx)?

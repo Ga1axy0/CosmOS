@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::cmp::{max, min};
 use core::fmt::Write;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use fs::errno::FS_ERRNO;
 use fs::Inode;
@@ -21,7 +21,7 @@ use crate::mm::{
 };
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
-use crate::task::{current_task, WaitQueue, WaitReason};
+use crate::task::{current_task, SchedAttr, TaskControlBlock, WaitQueue, WaitReason};
 
 #[cfg(feature = "io_perf_counters")]
 static READ_PAGE_LOADS: AtomicUsize = AtomicUsize::new(0);
@@ -61,13 +61,35 @@ static BUFFERED_READ_RUNS: AtomicUsize = AtomicUsize::new(0);
 static BUFFERED_READ_PAGES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static BUFFERED_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_QUEUED_JOBS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_QUEUED_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_MERGED_JOBS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_DROPPED_JOBS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_DROPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_WORKER_JOBS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READAHEAD_WORKER_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
+/// Bound speculative work independently of the normal page-cache watermarks.
+///
+/// Queueing is best effort: demand I/O must never wait for space here.
+const MAX_READAHEAD_QUEUED_PAGES: usize = 2048; // 8 MiB with 4 KiB pages.
 /// Maximum number of file pages loaded together for a buffered read.
 ///
 /// Keep this bounded so a large userspace read cannot cause an unbounded
 /// kernel allocation while still amortizing page-cache and block I/O costs.
 const READ_BATCH_PAGES: usize = 64;
+/// Keep one 64 KiB request on the foreground path.  A conservative 64 KiB
+/// random-exec window therefore remains synchronous, while a confirmed
+/// 128 KiB sequential window leaves its second half to `kreadahead`.
+const FAULT_READAHEAD_DEMAND_PAGES: usize = 16;
 /// Total number of file pages loaded by one sequential file-backed fault.
 ///
 /// Rust's compiler binaries and shared libraries are large and mostly
@@ -180,6 +202,19 @@ impl PageMapping {
     }
 }
 
+/// One best-effort speculative range owned by the background readahead task.
+struct ReadaheadWork {
+    mapping: Weak<SpinNoIrqLock<PageMapping>>,
+    first_page: u64,
+    page_count: usize,
+}
+
+#[derive(Default)]
+struct ReadaheadQueue {
+    jobs: VecDeque<ReadaheadWork>,
+    queued_pages: usize,
+}
+
 /// inode 对应 page mapping 的稳定句柄。
 #[derive(Clone)]
 pub struct PageMappingHandle {
@@ -203,16 +238,16 @@ impl PageMappingHandle {
         read_mapping(&self.inner, offset, buf)
     }
 
-    /// Synchronously fill one bounded range selected by a per-open-file
-    /// sequential-read detector.  The requested page, when covered by this
-    /// range, is accounted as demand I/O; the rest is speculative readahead.
+    /// Queue the part of a per-open-file readahead window which lies beyond
+    /// the bytes already returned to the caller.
     pub(crate) fn prefetch_for_sequential_read(
         &self,
         offset: usize,
         len: usize,
         demand_offset: usize,
+        demand_len: usize,
     ) {
-        if len == 0 {
+        if len == 0 || demand_len == 0 {
             return;
         }
         let file_size = self.inner.lock().size;
@@ -220,24 +255,15 @@ impl PageMappingHandle {
             return;
         }
         let end = min(file_size, offset.saturating_add(len));
-        let first_page = file_page_index(offset);
+        let demand_end = min(file_size, demand_offset.saturating_add(demand_len));
+        let demand_end_page = demand_end.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+        let first_page = max(file_page_index(offset), demand_end_page as u64);
         let end_page = end.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
         let count = end_page.saturating_sub(first_page as usize);
         if count == 0 {
             return;
         }
-
-        #[cfg(feature = "io_perf_counters")]
-        READAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
-        let demand_page = if demand_offset >= offset && demand_offset < end {
-            file_page_index(demand_offset)
-        } else {
-            // `load_page_range_inner` uses `Some(page)` to distinguish
-            // speculative pages from demand reads.  No real page can have
-            // this index on the supported address spaces.
-            u64::MAX
-        };
-        load_page_range_inner(&self.inner, first_page, count, Some(demand_page));
+        enqueue_readahead(&self.inner, first_page, count);
     }
 
     /// 写入指定范围的数据，并把涉及页标记为脏页。
@@ -316,10 +342,8 @@ impl PageMappingHandle {
         get_or_load_page(&self.inner, page_idx)
     }
 
-    /// Load a faulting page with a window selected by the owning VMA's
-    /// sequential-fault state.  Unlike the mapping-global heuristic above,
-    /// this also handles the first instruction fault in an ELF segment whose
-    /// file offset is not page zero.
+    /// Complete the demand prefix of a VMA-selected fault window, then queue
+    /// any sequential tail for the background readahead worker.
     pub fn try_get_page_with_fault_window(
         &self,
         page_idx: u64,
@@ -336,12 +360,24 @@ impl PageMappingHandle {
                 page.state.contains(CachePageState::UPTODATE)
                     && !page.state.contains(CachePageState::EVICTING)
             });
-        if count > 1 && !demand_is_ready {
+        if demand_is_ready {
+            return get_or_load_page(&self.inner, page_idx);
+        }
+        let foreground_pages = count.min(FAULT_READAHEAD_DEMAND_PAGES).max(1);
+        if foreground_pages > 1 {
             #[cfg(feature = "io_perf_counters")]
             READAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
-            load_fault_window(&self.inner, page_idx, count);
+            load_fault_window(&self.inner, page_idx, foreground_pages);
         }
-        get_or_load_page(&self.inner, page_idx)
+        let page = get_or_load_page(&self.inner, page_idx)?;
+        if count > foreground_pages {
+            enqueue_readahead(
+                &self.inner,
+                page_idx.saturating_add(foreground_pages as u64),
+                count - foreground_pages,
+            );
+        }
+        Ok(page)
     }
 
     /// Determine whether this fault extends a forward sequential run and, if
@@ -443,6 +479,141 @@ lazy_static! {
         SpinNoIrqLock::new(PageCacheManager::new());
     /// Tasks waiting for the active direct reclaimer to release ownership.
     static ref PAGE_CACHE_RECLAIM_WAIT_QUEUE: WaitQueue = WaitQueue::new();
+    /// Bounded speculative work queue consumed by `kreadahead`.
+    static ref PAGE_CACHE_READAHEAD_QUEUE: SpinNoIrqLock<ReadaheadQueue> =
+        SpinNoIrqLock::new(ReadaheadQueue::default());
+    static ref PAGE_CACHE_READAHEAD_WAIT_QUEUE: WaitQueue = WaitQueue::new();
+    static ref PAGE_CACHE_READAHEAD_WORKER_TASK:
+        SpinNoIrqLock<Option<Arc<TaskControlBlock>>> = SpinNoIrqLock::new(None);
+}
+
+static PAGE_CACHE_READAHEAD_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn enqueue_readahead(
+    mapping: &Arc<SpinNoIrqLock<PageMapping>>,
+    first_page: u64,
+    page_count: usize,
+) {
+    if page_count == 0 {
+        return;
+    }
+    let file_pages = {
+        let mapping_guard = mapping.lock();
+        mapping_guard.size.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE
+    };
+    if first_page as usize >= file_pages {
+        return;
+    }
+    let mut page_count = page_count.min(file_pages - first_page as usize);
+    if page_count == 0 {
+        return;
+    }
+
+    let mapping_weak = Arc::downgrade(mapping);
+    let end_page = first_page.saturating_add(page_count as u64);
+    let mut queue = PAGE_CACHE_READAHEAD_QUEUE.lock();
+
+    for existing in queue.jobs.iter() {
+        if Weak::ptr_eq(&existing.mapping, &mapping_weak)
+            && first_page >= existing.first_page
+            && end_page
+                <= existing
+                    .first_page
+                    .saturating_add(existing.page_count as u64)
+        {
+            #[cfg(feature = "io_perf_counters")]
+            READAHEAD_MERGED_JOBS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    let available = MAX_READAHEAD_QUEUED_PAGES.saturating_sub(queue.queued_pages);
+    if available == 0 {
+        #[cfg(feature = "io_perf_counters")]
+        {
+            READAHEAD_DROPPED_JOBS.fetch_add(1, Ordering::Relaxed);
+            READAHEAD_DROPPED_PAGES.fetch_add(page_count, Ordering::Relaxed);
+        }
+        return;
+    }
+    if page_count > available {
+        #[cfg(feature = "io_perf_counters")]
+        READAHEAD_DROPPED_PAGES.fetch_add(page_count - available, Ordering::Relaxed);
+        page_count = available;
+    }
+
+    queue.jobs.push_back(ReadaheadWork {
+        mapping: mapping_weak,
+        first_page,
+        page_count,
+    });
+    queue.queued_pages += page_count;
+    #[cfg(feature = "io_perf_counters")]
+    {
+        READAHEAD_QUEUED_JOBS.fetch_add(1, Ordering::Relaxed);
+        READAHEAD_QUEUED_PAGES.fetch_add(page_count, Ordering::Relaxed);
+    }
+    drop(queue);
+    PAGE_CACHE_READAHEAD_WAIT_QUEUE.wake_one();
+}
+
+fn pop_readahead_work() -> Option<ReadaheadWork> {
+    let mut queue = PAGE_CACHE_READAHEAD_QUEUE.lock();
+    let work = queue.jobs.pop_front()?;
+    queue.queued_pages = queue.queued_pages.saturating_sub(work.page_count);
+    Some(work)
+}
+
+fn readahead_worker_has_work() -> bool {
+    !PAGE_CACHE_READAHEAD_QUEUE.lock().jobs.is_empty()
+}
+
+fn page_cache_readahead_worker_main() -> ! {
+    // Kernel threads enter directly instead of through trap_return, so they
+    // do not inherit a userspace sstatus/SIE restore.  Readahead performs
+    // sleepable block I/O and must not fall back to the driver's polling path.
+    unsafe {
+        crate::hal::enable_local_irqs();
+    }
+    loop {
+        while let Some(work) = pop_readahead_work() {
+            let Some(mapping) = work.mapping.upgrade() else {
+                continue;
+            };
+            #[cfg(feature = "io_perf_counters")]
+            {
+                READAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+                READAHEAD_WORKER_JOBS.fetch_add(1, Ordering::Relaxed);
+                READAHEAD_WORKER_PAGES.fetch_add(work.page_count, Ordering::Relaxed);
+            }
+            // No real file page can have this index on the supported address
+            // spaces.  Passing it as the demand marker accounts every page
+            // actually loaded by this job as speculative readahead.
+            load_page_range_inner(
+                &mapping,
+                work.first_page,
+                work.page_count,
+                Some(u64::MAX),
+            );
+        }
+        PAGE_CACHE_READAHEAD_WAIT_QUEUE.wait_with_reason_or_skip(
+            WaitReason::PageCacheReadahead,
+            readahead_worker_has_work,
+        );
+    }
+}
+
+/// Start the low-priority page-cache readahead worker.
+pub fn start_workers() {
+    if PAGE_CACHE_READAHEAD_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let task =
+        crate::task::spawn_kernel_thread(page_cache_readahead_worker_main, SchedAttr::other(10));
+    *PAGE_CACHE_READAHEAD_WORKER_TASK.lock() = Some(task);
 }
 
 /// The task currently running direct page-cache reclaim, or zero when idle.
@@ -810,6 +981,13 @@ pub fn reset_perf_counters() {
     BUFFERED_READ_RUNS.store(0, Ordering::Relaxed);
     BUFFERED_READ_PAGES.store(0, Ordering::Relaxed);
     BUFFERED_READ_BYTES.store(0, Ordering::Relaxed);
+    READAHEAD_QUEUED_JOBS.store(0, Ordering::Relaxed);
+    READAHEAD_QUEUED_PAGES.store(0, Ordering::Relaxed);
+    READAHEAD_MERGED_JOBS.store(0, Ordering::Relaxed);
+    READAHEAD_DROPPED_JOBS.store(0, Ordering::Relaxed);
+    READAHEAD_DROPPED_PAGES.store(0, Ordering::Relaxed);
+    READAHEAD_WORKER_JOBS.store(0, Ordering::Relaxed);
+    READAHEAD_WORKER_PAGES.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
@@ -880,6 +1058,41 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  readahead_bytes {}",
         perf_load(&READAHEAD_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_queued_jobs {}",
+        perf_load(&READAHEAD_QUEUED_JOBS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_queued_pages {}",
+        perf_load(&READAHEAD_QUEUED_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_merged_jobs {}",
+        perf_load(&READAHEAD_MERGED_JOBS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_dropped_jobs {}",
+        perf_load(&READAHEAD_DROPPED_JOBS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_dropped_pages {}",
+        perf_load(&READAHEAD_DROPPED_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_worker_jobs {}",
+        perf_load(&READAHEAD_WORKER_JOBS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  readahead_worker_pages {}",
+        perf_load(&READAHEAD_WORKER_PAGES)
     );
     let _ = writeln!(
         &mut out,

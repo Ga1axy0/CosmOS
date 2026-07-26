@@ -404,6 +404,8 @@ pub enum WaitReason {
     BlockDeviceIo,
     /// Waiting for the active page-cache direct reclaimer to release ownership.
     PageCacheReclaim,
+    /// Background page-cache readahead worker waiting for queued work.
+    PageCacheReadahead,
     /// Waiting for poll/ppoll readiness notification.
     Poll,
     /// Waiting for network device TX completion.

@@ -39,6 +39,7 @@ use lazy_static::*;
 pub use page_cache::{
     discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats,
     reclaim_for_frame_allocation, reclaim_if_needed, release_mapped_page, retain_mapped_page,
+    start_workers as start_page_cache_workers,
     sync_all as sync_page_cache_all,
     sync_fs as sync_page_cache_fs, sync_inode as sync_page_cache_inode, sync_inode_range,
     truncate_inode, CachePage, PageCacheStats, PAGE_CACHE_MANAGER,
