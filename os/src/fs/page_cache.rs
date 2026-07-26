@@ -16,8 +16,8 @@ use crate::bootinfo;
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
 use crate::mm::{
-    frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, FrameTracker,
-    InodeKey, MmError, PhysPageNum,
+    frame_alloc, frame_allocator_stats, invalidate_inode_mappings_after_truncate, phys_to_virt,
+    FrameTracker, InodeKey, MmError, PhysPageNum,
 };
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
@@ -49,6 +49,18 @@ static READAHEAD_CALLS: AtomicUsize = AtomicUsize::new(0);
 static READAHEAD_PAGES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static READAHEAD_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIRECT_READ_RUNS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIRECT_READ_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DIRECT_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BUFFERED_READ_RUNS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BUFFERED_READ_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BUFFERED_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
 /// Maximum number of file pages loaded together for a buffered read.
@@ -221,6 +233,32 @@ impl PageMappingHandle {
     /// 获取指定文件页号对应的缓存页，必要时装入；OOM 时返回 `MmError`。
     pub fn try_get_page(&self, page_idx: u64) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
         get_or_load_page(&self.inner, page_idx)
+    }
+
+    /// Return the already-resident, complete pages in a bounded range.
+    ///
+    /// This lookup never starts I/O.  It is used by the file-fault path to
+    /// install PTEs for neighbouring pages which readahead has already made
+    /// ready, avoiding one user/kernel round trip per cached page.
+    pub fn cached_uptodate_pages(
+        &self,
+        first_page: u64,
+        count: usize,
+    ) -> Vec<(u64, Arc<SpinNoIrqLock<CachePage>>)> {
+        let mapping = self.inner.lock();
+        let end_page = first_page.saturating_add(count as u64);
+        mapping
+            .pages
+            .range(first_page..end_page)
+            .filter_map(|(&page_idx, page)| {
+                let ready = {
+                    let page_guard = page.lock();
+                    page_guard.state.contains(CachePageState::UPTODATE)
+                        && !page_guard.state.contains(CachePageState::EVICTING)
+                };
+                ready.then(|| (page_idx, Arc::clone(page)))
+            })
+            .collect()
     }
 
     /// 获取文件映射缺页所需的页面，并在顺序访问时一起预读取一个有限窗口。
@@ -701,6 +739,12 @@ pub fn reset_perf_counters() {
     READAHEAD_CALLS.store(0, Ordering::Relaxed);
     READAHEAD_PAGES.store(0, Ordering::Relaxed);
     READAHEAD_BYTES.store(0, Ordering::Relaxed);
+    DIRECT_READ_RUNS.store(0, Ordering::Relaxed);
+    DIRECT_READ_PAGES.store(0, Ordering::Relaxed);
+    DIRECT_READ_BYTES.store(0, Ordering::Relaxed);
+    BUFFERED_READ_RUNS.store(0, Ordering::Relaxed);
+    BUFFERED_READ_PAGES.store(0, Ordering::Relaxed);
+    BUFFERED_READ_BYTES.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
@@ -771,6 +815,36 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  readahead_bytes {}",
         perf_load(&READAHEAD_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  direct_read_runs {}",
+        perf_load(&DIRECT_READ_RUNS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  direct_read_pages {}",
+        perf_load(&DIRECT_READ_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  direct_read_bytes {}",
+        perf_load(&DIRECT_READ_BYTES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  buffered_read_runs {}",
+        perf_load(&BUFFERED_READ_RUNS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  buffered_read_pages {}",
+        perf_load(&BUFFERED_READ_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  buffered_read_bytes {}",
+        perf_load(&BUFFERED_READ_BYTES)
     );
     out
 }
@@ -1469,7 +1543,7 @@ fn load_page_range_inner(
         return;
     };
 
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(count);
     let end_page = first_page.saturating_add(count as u64);
     for next_idx in first_page..end_page {
         let Ok(page) = get_or_create_page(mapping, next_idx) else {
@@ -1531,16 +1605,56 @@ fn load_page_run(
     let start_offset = page_start(first_idx);
     let end_offset = min(file_size, page_start(last_idx).saturating_add(PAGE_SIZE));
     if end_offset <= start_offset {
-        finish_page_run(pages, file_size, 0, &[]);
+        finish_page_run(pages, file_size, 0, None);
         return;
     }
 
     let read_len = end_offset - start_offset;
-    let mut buffer = vec![0u8; read_len];
-    let read = crate::probe!(
-        { inode.read_at_page_cache(start_offset, &mut buffer) },
-        "page_cache.inode_read_at"
-    );
+    let direct_ppn = pages
+        .len()
+        .checked_mul(PAGE_SIZE)
+        .filter(|&run_bytes| read_len <= run_bytes)
+        .and_then(|_| physically_contiguous_page_run(pages));
+    let (read, buffered): (usize, Option<Vec<u8>>) = if let Some(first_ppn) = direct_ppn {
+        let first_pa = first_ppn
+            .0
+            .checked_mul(PAGE_SIZE)
+            .expect("page-cache physical address overflow");
+        // SAFETY:
+        // - every page in `pages` is pinned and marked LOADING, so its
+        //   frame cannot be reclaimed or concurrently exposed as valid;
+        // - physically_contiguous_page_run verified that these frames
+        //   cover one increasing physical interval;
+        // - both supported platforms map physical RAM linearly in the
+        //   kernel direct-map region;
+        // - the checked run span above contains all `read_len` bytes.
+        let direct_buffer =
+            unsafe { core::slice::from_raw_parts_mut(phys_to_virt(first_pa) as *mut u8, read_len) };
+        let read = crate::probe!(
+            { inode.read_at_page_cache(start_offset, direct_buffer) },
+            "page_cache.inode_read_at"
+        );
+        #[cfg(feature = "io_perf_counters")]
+        {
+            DIRECT_READ_RUNS.fetch_add(1, Ordering::Relaxed);
+            DIRECT_READ_PAGES.fetch_add(pages.len(), Ordering::Relaxed);
+            DIRECT_READ_BYTES.fetch_add(read.min(read_len), Ordering::Relaxed);
+        }
+        (read, None)
+    } else {
+        let mut buffer = vec![0u8; read_len];
+        let read = crate::probe!(
+            { inode.read_at_page_cache(start_offset, &mut buffer) },
+            "page_cache.inode_read_at"
+        );
+        #[cfg(feature = "io_perf_counters")]
+        {
+            BUFFERED_READ_RUNS.fetch_add(1, Ordering::Relaxed);
+            BUFFERED_READ_PAGES.fetch_add(pages.len(), Ordering::Relaxed);
+            BUFFERED_READ_BYTES.fetch_add(read.min(read_len), Ordering::Relaxed);
+        }
+        (read, Some(buffer))
+    };
     #[cfg(feature = "io_perf_counters")]
     {
         let loaded_bytes = read.min(read_len);
@@ -1570,31 +1684,53 @@ fn load_page_run(
         READAHEAD_PAGES.fetch_add(readahead_pages, Ordering::Relaxed);
         READAHEAD_BYTES.fetch_add(readahead_bytes, Ordering::Relaxed);
     }
-    finish_page_run(pages, file_size, read, &buffer);
+    finish_page_run(pages, file_size, read, buffered.as_deref());
+}
+
+/// Return the first frame when a logical page run also occupies one
+/// increasing physical interval.
+///
+/// Page-cache pages are normally allocated one by one, so contiguity is only
+/// an opportunistic property.  The caller must retain the buffered fallback.
+fn physically_contiguous_page_run(
+    pages: &[(u64, Arc<SpinNoIrqLock<CachePage>>)],
+) -> Option<PhysPageNum> {
+    let (first_idx, first_page) = pages.first()?;
+    let first_ppn = first_page.lock().ppn();
+    for (offset, (page_idx, page)) in pages.iter().enumerate().skip(1) {
+        if *page_idx != first_idx.checked_add(offset as u64)? {
+            return None;
+        }
+        let expected_ppn = first_ppn.0.checked_add(offset)?;
+        if page.lock().ppn().0 != expected_ppn {
+            return None;
+        }
+    }
+    Some(first_ppn)
 }
 
 fn finish_page_run(
     pages: &[(u64, Arc<SpinNoIrqLock<CachePage>>)],
     file_size: usize,
     read: usize,
-    buffer: &[u8],
+    buffered: Option<&[u8]>,
 ) {
     let first_idx = pages.first().map(|entry| entry.0).unwrap_or(0);
     for (page_idx, page) in pages {
         let page_offset = (*page_idx - first_idx) as usize * PAGE_SIZE;
         let expected = page_valid_bytes_for_size(file_size, *page_idx);
-        let copy_len = read
-            .saturating_sub(page_offset)
-            .min(expected)
-            .min(buffer.len().saturating_sub(page_offset));
+        let mut valid_bytes = read.saturating_sub(page_offset).min(expected);
         let mut page_guard = page.lock();
-        if copy_len > 0 {
-            page_guard.ppn().get_bytes_array()[..copy_len]
-                .copy_from_slice(&buffer[page_offset..page_offset + copy_len]);
+        if let Some(buffer) = buffered {
+            valid_bytes = valid_bytes.min(buffer.len().saturating_sub(page_offset));
+            if valid_bytes > 0 {
+                page_guard.ppn().get_bytes_array()[..valid_bytes]
+                    .copy_from_slice(&buffer[page_offset..page_offset + valid_bytes]);
+            }
         }
-        page_guard.valid_bytes = copy_len;
+        page_guard.valid_bytes = valid_bytes;
         page_guard.state.remove(CachePageState::LOADING);
-        if copy_len == expected {
+        if valid_bytes == expected {
             page_guard.state.insert(CachePageState::UPTODATE);
         } else {
             // Read-ahead is speculative.  Keep a short read retryable rather

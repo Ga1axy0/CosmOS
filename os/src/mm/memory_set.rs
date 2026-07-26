@@ -2104,6 +2104,79 @@ impl MemorySet {
         Ok(PageFaultHandled::Handled)
     }
 
+    /// Install a bounded set of already-uptodate page-cache pages around a
+    /// read/execute fault.  The caller has performed the cache lookup without
+    /// holding the process lock; revalidate the original VMA before changing
+    /// any PTE, then populate all neighbours under one lock and one TLB flush.
+    pub fn map_file_cache_pages_around(
+        &mut self,
+        plan: &FilePageFaultPlan,
+        pages: Vec<(VirtPageNum, Arc<SpinNoIrqLock<CachePage>>)>,
+    ) -> Result<PageFaultHandled, MmError> {
+        if !matches!(plan.access, PageFaultAccess::Read | PageFaultAccess::Exec)
+            || (!plan.shared && plan.map_perm.contains(MapPermission::W))
+        {
+            return Ok(PageFaultHandled::NotHandled);
+        }
+        if !self.can_commit_file_page_fault(plan) {
+            return Ok(PageFaultHandled::NotHandled);
+        }
+
+        // Allocate every required intermediate page-table page before taking
+        // cache-page mapping references.  Once this succeeds, the commit loop
+        // cannot leave a half-installed batch due to page-table OOM.
+        for (vpn, _) in &pages {
+            if *vpn >= plan.vma_start
+                && *vpn < plan.vma_end
+                && self.page_table.translate(*vpn).is_none()
+            {
+                self.page_table.ensure_leaf(*vpn)?;
+            }
+        }
+
+        let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
+        if plan.shared {
+            if plan.map_perm.contains(MapPermission::W) {
+                pte_flags.remove(PTEFlags::W);
+            }
+        } else {
+            pte_flags.remove(PTEFlags::W);
+            pte_flags.remove(PTEFlags::D);
+        }
+
+        let mut mapped_fault_page = self.page_table.translate(plan.vpn).is_some();
+        let mut mapped_any = false;
+        for (vpn, page) in pages {
+            if vpn < plan.vma_start
+                || vpn >= plan.vma_end
+                || self.page_table.translate(vpn).is_some()
+            {
+                continue;
+            }
+            let ppn = page.lock().ppn();
+            retain_mapped_page(&page);
+            let area = self
+                .find_vma_containing_mut(vpn)
+                .expect("validated fault-around VMA disappeared");
+            if let Some(old_page) = area.direct_cache_pages.insert(vpn, Arc::clone(&page)) {
+                release_mapped_page(&old_page);
+            }
+            self.page_table.map(vpn, ppn, pte_flags)?;
+            mapped_any = true;
+            mapped_fault_page |= vpn == plan.vpn;
+        }
+        if mapped_any {
+            unsafe {
+                crate::hal::flush_tlb();
+            }
+        }
+        Ok(if mapped_fault_page {
+            PageFaultHandled::Handled
+        } else {
+            PageFaultHandled::NotHandled
+        })
+    }
+
     /// 对当前地址空间内指定范围的 MAP_SHARED 文件映射执行同步。
     pub fn msync_range(&self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), ERRNO> {
         let start_vpn = start_va.floor();

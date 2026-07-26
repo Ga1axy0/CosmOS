@@ -33,6 +33,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
+/// Match Linux's default 64 KiB file fault-around span on 4 KiB pages.
+const FILE_FAULT_AROUND_PAGES: usize = 16;
 
 const INIT_CWD: &str = "/root";
 const INIT_INTERPRETER_MAX_DEPTH: usize = 4;
@@ -2164,11 +2166,45 @@ impl ProcessControlBlock {
         } else {
             mapping.try_get_page(plan.page_idx)?
         };
+        let fault_around_pages =
+            (matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
+                && (plan.shared || !plan.map_perm.contains(MapPermission::W)))
+            .then(|| {
+                let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
+                let first_vpn = aligned_start.max(plan.vma_start.0);
+                let end_vpn = aligned_start
+                    .saturating_add(FILE_FAULT_AROUND_PAGES)
+                    .min(plan.vma_end.0);
+                let first_page_idx = plan
+                    .pgoff
+                    .saturating_add(first_vpn.saturating_sub(plan.vma_start.0))
+                    as u64;
+                let mut pages: Vec<_> = mapping
+                    .cached_uptodate_pages(first_page_idx, end_vpn.saturating_sub(first_vpn))
+                    .into_iter()
+                    .filter_map(|(page_idx, cached_page)| {
+                        let delta = page_idx.checked_sub(first_page_idx)? as usize;
+                        Some((
+                            crate::mm::VirtPageNum(first_vpn.saturating_add(delta)),
+                            cached_page,
+                        ))
+                    })
+                    .collect();
+                // Preserve the existing demand-fault guarantee even if a
+                // concurrent reclaim removed the page from the mapping
+                // between loading it above and scanning the resident range.
+                if !pages.iter().any(|(vpn, _)| *vpn == plan.vpn) {
+                    pages.push((plan.vpn, Arc::clone(&page)));
+                }
+                pages
+            });
         let (committed, token, mask) = {
             let mut inner = self.inner.lock();
             // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
             // 后续补齐更严格的 `mm_seq` 代际校验。
-            let committed = if plan.shared {
+            let committed = if let Some(pages) = fault_around_pages {
+                inner.memory_set.map_file_cache_pages_around(&plan, pages)
+            } else if plan.shared {
                 inner.memory_set.map_shared_file_page(&plan, page)
             } else {
                 inner.memory_set.map_private_file_page(&plan, page)
