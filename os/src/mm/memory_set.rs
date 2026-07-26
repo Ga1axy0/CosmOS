@@ -1932,6 +1932,12 @@ impl MemorySet {
         let Some(page_idx) = area.file_page_index(vpn) else {
             return FilePageFaultPrepare::NotHandled;
         };
+        let available_pages = area.end_vpn().0.saturating_sub(vpn.0);
+        let read_ahead_pages = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
+            file.fault_read_window(page_idx, access, available_pages)
+        } else {
+            1
+        };
         let plan = FilePageFaultPlan {
             vpn,
             vma_start: area.start_vpn(),
@@ -1942,6 +1948,7 @@ impl MemorySet {
             pgoff: file.pgoff,
             shared: file.shared,
             access,
+            read_ahead_pages,
         };
         debug!(
             "[mmap] prepared lazy fault plan: va={:#x} vpn={:#x} page_idx={} access={:?} shared={} path={:?}",
@@ -2616,7 +2623,6 @@ pub enum VmaKind {
 }
 
 /// 文件映射区域附带的底层对象信息。
-#[derive(Clone)]
 pub struct FileVma {
     /// 建立映射时引用的打开文件描述。
     pub file: Arc<FileDescription>,
@@ -2624,6 +2630,59 @@ pub struct FileVma {
     pub pgoff: usize,
     /// 是否为 `MAP_SHARED` 映射。
     pub shared: bool,
+    /// 当前 VMA 自己的 fault readahead 流状态。VMA 分裂和 fork 时复制
+    /// 状态快照，与同一文件上的其他独立 mmap 流互不干扰。
+    fault_read_ahead: Arc<SpinNoIrqLock<FileVmaReadAheadState>>,
+}
+
+impl Clone for FileVma {
+    fn clone(&self) -> Self {
+        let fault_read_ahead = *self.fault_read_ahead.lock();
+        Self {
+            file: Arc::clone(&self.file),
+            pgoff: self.pgoff,
+            shared: self.shared,
+            fault_read_ahead: Arc::new(SpinNoIrqLock::new(fault_read_ahead)),
+        }
+    }
+}
+
+const FILE_FAULT_READAHEAD_PAGES: usize = 32;
+const FILE_RANDOM_EXEC_READAHEAD_PAGES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FileVmaReadAheadState {
+    previous_fault_page: Option<u64>,
+    window_end: u64,
+}
+
+impl FileVma {
+    fn fault_read_window(
+        &self,
+        page_idx: u64,
+        access: PageFaultAccess,
+        available_pages: usize,
+    ) -> usize {
+        let mut state = self.fault_read_ahead.lock();
+        let begins_mapping = page_idx == self.pgoff as u64;
+        let adjacent = state
+            .previous_fault_page
+            .is_some_and(|previous| page_idx == previous.saturating_add(1));
+        let extends_window = page_idx == state.window_end;
+        let sequential = begins_mapping || adjacent || extends_window;
+        state.previous_fault_page = Some(page_idx);
+        let desired_pages = if sequential {
+            FILE_FAULT_READAHEAD_PAGES
+        } else if access == PageFaultAccess::Exec {
+            FILE_RANDOM_EXEC_READAHEAD_PAGES
+        } else {
+            return 1;
+        };
+
+        let count = desired_pages.min(available_pages).max(1);
+        state.window_end = page_idx.saturating_add(count as u64);
+        count
+    }
 }
 
 /// 页错误对应的访问类型。
@@ -2668,6 +2727,8 @@ pub struct FilePageFaultPlan {
     pub shared: bool,
     /// 触发本次缺页的访问类型。
     pub access: PageFaultAccess,
+    /// 本次 fault 应同步装入的向前页窗口。
+    pub read_ahead_pages: usize,
 }
 
 /// 一张可在多个地址空间之间共享的私有页。
@@ -2838,6 +2899,7 @@ impl Vma {
             file,
             pgoff,
             shared,
+            fault_read_ahead: Arc::new(SpinNoIrqLock::new(FileVmaReadAheadState::default())),
         });
         vma
     }

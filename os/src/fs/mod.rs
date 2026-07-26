@@ -15,6 +15,7 @@ pub mod sysfs;
 pub mod tmpfs;
 mod tty;
 
+use crate::config::PAGE_SIZE;
 use crate::mm::UserBuffer;
 use crate::task::{WaitQueue, WaitReason};
 use crate::sync::{SleepMutex, SpinNoIrqLock};
@@ -730,6 +731,87 @@ impl AccessMode {
     }
 }
 
+const FILE_READAHEAD_INITIAL_PAGES: usize = 32;
+const FILE_READAHEAD_MAX_PAGES: usize = 64;
+
+/// One bounded page-cache fill requested by a sequential buffered reader.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileReadAheadPlan {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+/// Per-open-file sequential-read state.
+///
+/// Keeping this state on the open file description, rather than on the inode
+/// mapping, prevents independent readers from perturbing one another.
+#[derive(Clone, Copy, Debug, Default)]
+struct FileReadAheadState {
+    previous_end: Option<usize>,
+    window_pages: usize,
+    window_end: usize,
+    trigger: usize,
+    eof: bool,
+}
+
+impl FileReadAheadState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn prepare(&mut self, offset: usize, request_len: usize) -> Option<FileReadAheadPlan> {
+        if request_len == 0 {
+            return None;
+        }
+
+        let starts_at_file_beginning = self.previous_end.is_none() && offset == 0;
+        let continues_previous_read = self.previous_end == Some(offset);
+        if !starts_at_file_beginning && !continues_previous_read {
+            self.reset();
+            return None;
+        }
+        if self.eof {
+            return None;
+        }
+
+        let request_end = offset.saturating_add(request_len);
+        if self.window_pages != 0 && request_end < self.trigger {
+            return None;
+        }
+
+        let window_pages = if self.window_pages == 0 {
+            FILE_READAHEAD_INITIAL_PAGES
+        } else {
+            self.window_pages
+                .saturating_mul(2)
+                .min(FILE_READAHEAD_MAX_PAGES)
+        };
+        let current_page_start = offset / PAGE_SIZE * PAGE_SIZE;
+        let start = if self.window_pages == 0 {
+            current_page_start
+        } else {
+            self.window_end.max(current_page_start)
+        };
+        let len = window_pages.saturating_mul(PAGE_SIZE);
+        let end = start.saturating_add(len);
+
+        self.window_pages = window_pages;
+        self.window_end = end;
+        // Refill once half of the newly submitted window remains.  The
+        // current implementation completes this fill synchronously, but the
+        // marker also provides the right state transition for a later
+        // asynchronous readahead worker.
+        self.trigger = end.saturating_sub(len / 2);
+
+        Some(FileReadAheadPlan { start, len })
+    }
+
+    fn complete(&mut self, offset: usize, requested: usize, read: usize) {
+        self.previous_end = Some(offset.saturating_add(read));
+        self.eof = requested != 0 && read < requested;
+    }
+}
+
 /// 打开文件描述内部状态，对应 Linux 的 open file description 可变部分。
 struct FileDescriptionInner {
     /// 当前文件偏移。
@@ -738,6 +820,8 @@ struct FileDescriptionInner {
     status_flags: FileStatusFlags,
     /// 目录项快照，避免遍历期间删除目录项导致位置漂移漏读。
     dirent_snapshot: Option<Vec<VfsDirEntry>>,
+    /// 普通文件顺序读取的自适应预读状态。
+    read_ahead: FileReadAheadState,
 }
 
 /// 套接字的不可变元信息。
@@ -785,6 +869,7 @@ impl FileDescription {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
+                read_ahead: FileReadAheadState::default(),
             }),
             fd_refs: AtomicUsize::new(0),
         }
@@ -808,6 +893,7 @@ impl FileDescription {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
+                read_ahead: FileReadAheadState::default(),
             }),
             fd_refs: AtomicUsize::new(0),
         }
@@ -865,7 +951,23 @@ impl FileDescription {
         }
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
-            let read_size = self.file.read_at_result(inner.offset, buf)?;
+            let offset = inner.offset;
+            let requested = buf.len();
+            let read_result =
+                if let Some(inode) = self.file.as_any().downcast_ref::<inode::OSInode>() {
+                    let plan = inner.read_ahead.prepare(offset, requested);
+                    Ok(inode.read_at_with_readahead(offset, buf, plan))
+                } else {
+                    self.file.read_at_result(offset, buf)
+                };
+            let read_size = match read_result {
+                Ok(read_size) => read_size,
+                Err(err) => {
+                    inner.read_ahead.reset();
+                    return Err(err);
+                }
+            };
+            inner.read_ahead.complete(offset, requested, read_size);
             inner.offset += read_size;
             return Ok(read_size);
         }
@@ -1292,6 +1394,7 @@ impl FileDescription {
         }
         inner.offset = new_offset as usize;
         inner.dirent_snapshot = None;
+        inner.read_ahead.reset();
         Ok(new_offset as u64)
     }
 }

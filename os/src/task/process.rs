@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
 /// Match Linux's default 64 KiB file fault-around span on 4 KiB pages.
-const FILE_FAULT_AROUND_PAGES: usize = 16;
+const FILE_FAULT_AROUND_PAGES: usize = 32;
 
 const INIT_CWD: &str = "/root";
 const INIT_INTERPRETER_MAX_DEPTH: usize = 4;
@@ -2159,10 +2159,10 @@ impl ProcessControlBlock {
             plan.file.path()
         );
         let page = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
-            // Load the faulting page and a bounded sequential window in one
-            // page-cache read when the preceding page indicates forward
-            // access.  Random faults retain the single-page path.
-            mapping.try_get_page_with_readahead(plan.page_idx)?
+            // Load the faulting page and the VMA-selected bounded window in
+            // one page-cache operation.  Sequential streams use 128 KiB;
+            // non-linear instruction faults use a conservative 64 KiB.
+            mapping.try_get_page_with_fault_window(plan.page_idx, plan.read_ahead_pages)?
         } else {
             mapping.try_get_page(plan.page_idx)?
         };

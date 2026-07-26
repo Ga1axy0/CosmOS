@@ -2,7 +2,9 @@ use super::cgroupfs::{new_cgroup2_root, CgroupDirNode};
 use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use super::tmpfs::new_tmpfs_root;
-use super::{discard_inode, page_cache, File, Stat, StatFs64, StatMode};
+use super::{
+    discard_inode, page_cache, File, FileReadAheadPlan, Stat, StatFs64, StatMode,
+};
 use crate::drivers::block::{block_device_name, BLOCK_DEVICES};
 use crate::fs::devfs::{
     ensure_ltp_scratch_device, BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode,
@@ -55,6 +57,46 @@ impl OSInode {
     /// 返回当前普通文件对应的 page mapping；目录或不可缓存对象返回 `None`。
     fn page_mapping(&self) -> Option<page_cache::PageMappingHandle> {
         page_cache::mapping_for_inode(&self.inode)
+    }
+
+    fn read_user_buffer_at(
+        &self,
+        offset: usize,
+        mut buf: UserBuffer,
+        read_ahead: Option<FileReadAheadPlan>,
+    ) -> usize {
+        let mapping = self.page_mapping();
+        if let (Some(mapping), Some(plan)) = (mapping.as_ref(), read_ahead) {
+            mapping.prefetch_for_sequential_read(plan.start, plan.len, offset);
+        }
+
+        let mut file_off = offset;
+        let mut total_read_size = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            let read_size = if let Some(mapping) = mapping.as_ref() {
+                mapping.read(file_off, *slice)
+            } else {
+                self.inode.read_at(file_off, *slice)
+            };
+            if read_size == 0 {
+                break;
+            }
+            file_off += read_size;
+            total_read_size += read_size;
+            if read_size < slice.len() {
+                break;
+            }
+        }
+        total_read_size
+    }
+
+    pub(crate) fn read_at_with_readahead(
+        &self,
+        offset: usize,
+        buf: UserBuffer,
+        read_ahead: Option<FileReadAheadPlan>,
+    ) -> usize {
+        self.read_user_buffer_at(offset, buf, read_ahead)
     }
 
     /// read all data from the inode in memory
@@ -1259,26 +1301,8 @@ impl File for OSInode {
     fn is_dir(&self) -> bool {
         self.inode.is_dir()
     }
-    fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
-        let mapping = self.page_mapping();
-        let mut file_off = offset;
-        let mut total_read_size = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            let read_size = if let Some(mapping) = mapping.as_ref() {
-                mapping.read(file_off, *slice)
-            } else {
-                self.inode.read_at(file_off, *slice)
-            };
-            if read_size == 0 {
-                break;
-            }
-            file_off += read_size;
-            total_read_size += read_size;
-            if read_size < slice.len() {
-                break;
-            }
-        }
-        total_read_size
+    fn read_at(&self, offset: usize, buf: UserBuffer) -> usize {
+        self.read_user_buffer_at(offset, buf, None)
     }
     fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
         let mapping = self.page_mapping();

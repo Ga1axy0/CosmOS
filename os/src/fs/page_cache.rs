@@ -203,6 +203,43 @@ impl PageMappingHandle {
         read_mapping(&self.inner, offset, buf)
     }
 
+    /// Synchronously fill one bounded range selected by a per-open-file
+    /// sequential-read detector.  The requested page, when covered by this
+    /// range, is accounted as demand I/O; the rest is speculative readahead.
+    pub(crate) fn prefetch_for_sequential_read(
+        &self,
+        offset: usize,
+        len: usize,
+        demand_offset: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let file_size = self.inner.lock().size;
+        if offset >= file_size {
+            return;
+        }
+        let end = min(file_size, offset.saturating_add(len));
+        let first_page = file_page_index(offset);
+        let end_page = end.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+        let count = end_page.saturating_sub(first_page as usize);
+        if count == 0 {
+            return;
+        }
+
+        #[cfg(feature = "io_perf_counters")]
+        READAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+        let demand_page = if demand_offset >= offset && demand_offset < end {
+            file_page_index(demand_offset)
+        } else {
+            // `load_page_range_inner` uses `Some(page)` to distinguish
+            // speculative pages from demand reads.  No real page can have
+            // this index on the supported address spaces.
+            u64::MAX
+        };
+        load_page_range_inner(&self.inner, first_page, count, Some(demand_page));
+    }
+
     /// 写入指定范围的数据，并把涉及页标记为脏页。
     pub fn write(&self, offset: usize, buf: &[u8]) -> usize {
         write_mapping(&self.inner, offset, buf)
@@ -276,6 +313,34 @@ impl PageMappingHandle {
         // The window load is best-effort.  If allocation failed, another
         // task won the race, or the backing read was short, the normal demand
         // path below still guarantees that the faulting page is complete.
+        get_or_load_page(&self.inner, page_idx)
+    }
+
+    /// Load a faulting page with a window selected by the owning VMA's
+    /// sequential-fault state.  Unlike the mapping-global heuristic above,
+    /// this also handles the first instruction fault in an ELF segment whose
+    /// file offset is not page zero.
+    pub fn try_get_page_with_fault_window(
+        &self,
+        page_idx: u64,
+        count: usize,
+    ) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
+        let demand_is_ready = self
+            .inner
+            .lock()
+            .pages
+            .get(&page_idx)
+            .cloned()
+            .is_some_and(|page| {
+                let page = page.lock();
+                page.state.contains(CachePageState::UPTODATE)
+                    && !page.state.contains(CachePageState::EVICTING)
+            });
+        if count > 1 && !demand_is_ready {
+            #[cfg(feature = "io_perf_counters")]
+            READAHEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+            load_fault_window(&self.inner, page_idx, count);
+        }
         get_or_load_page(&self.inner, page_idx)
     }
 

@@ -58,10 +58,13 @@ static WRITE_MANY_MAX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_MANY_QUEUE_FULL_WAITS: AtomicUsize = AtomicUsize::new(0);
 
 const VIRTIO_BLK_QUEUE_SIZE: usize = 16;
-const VIRTIO_BLK_READ_DESCS: usize = 3;
-const VIRTIO_BLK_WRITE_DESCS: usize = 3;
-const MAX_READ_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_READ_DESCS;
-const MAX_WRITE_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE / VIRTIO_BLK_WRITE_DESCS;
+// With indirect descriptors a request consumes one descriptor in the main
+// ring, so all queue entries can be in flight.  Devices which did not
+// negotiate indirect descriptors report QueueFull after roughly five
+// three-descriptor requests; the submission loops already treat that as
+// backpressure and wait before retrying.
+const MAX_READ_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE;
+const MAX_WRITE_IN_FLIGHT: usize = VIRTIO_BLK_QUEUE_SIZE;
 /// Split large contiguous reads so a single page-cache window can use the
 /// same in-flight queue as fragmented ext4 reads.
 const READ_BATCH_CHUNK_BLOCKS: usize = 128; // 64 KiB with 512-byte blocks.
