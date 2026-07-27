@@ -974,8 +974,19 @@ impl ProcessControlBlock {
         let res = task_inner.res.as_ref().unwrap();
         let tid = res.tid;
         let thread_id = res.thread_id();
+        let thread_pending = task_inner.pending_signals;
+        let signal_mask = task_inner.signal_mask;
+        let restore_mask = task_inner.signal_mask_backup.is_some();
         drop(task_inner);
         let mut inner = self.inner_exclusive_access();
+        if crate::signal::signal_work_needed(
+            thread_pending,
+            inner.pending_signals,
+            signal_mask,
+            restore_mask,
+        ) {
+            task.mark_signal_work_pending();
+        }
         while inner.tasks.len() <= tid {
             inner.tasks.push(None);
         }
@@ -1249,7 +1260,9 @@ impl ProcessControlBlock {
             task_inner.trap_cx_ppn = trap_cx_ppn;
             task_inner.pending_signals = SignalBit::empty();
             task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
+            task_inner.signal_mask_backup = None;
         }
+        crate::signal::refresh_current_signal_work_pending();
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
         //         argv[0..argc-1], NULL

@@ -39,7 +39,12 @@ __alltraps:
     sd t0, 32*8(sp)
     sd t1, 33*8(sp)
 
-    # save fpu registers
+    # Save floating-point state only when userspace actually dirtied it.  For
+    # FS=Off/Initial/Clean the trap-frame backing store is already authoritative.
+    srli t2, t0, 13
+    andi t2, t2, 3
+    li t1, 3
+    bne t2, t1, 1f
     .set n, 0
     .rept 32
         SAVE_FP %n
@@ -47,6 +52,29 @@ __alltraps:
     .endr
     frcsr t0
     sd t0, 70*8(sp)
+    # The backing store now matches hardware, so return with FS=Clean unless
+    # userspace dirties the registers again.
+    ld t0, 32*8(sp)
+    li t1, ~(3 << 13)
+    and t0, t0, t1
+    li t1, (2 << 13)
+    or t0, t0, t1
+    sd t0, 32*8(sp)
+1:
+
+    # The trap frame above keeps the userspace FS state (Off/Initial/Clean),
+    # but this kernel is built for the hard-float ABI and may execute FP
+    # instructions in ordinary Rust code.  Enable FP only in the live kernel
+    # CSR; the saved userspace sstatus remains unchanged.
+    csrr t0, sstatus
+    li t1, ~(3 << 13)
+    and t0, t0, t1
+    li t1, (1 << 13)
+    or t0, t0, t1
+    csrw sstatus, t0
+    # Do not let a userspace rounding mode or accrued exception flags affect
+    # hard-float kernel code.  User fcsr is restored from the trap frame later.
+    csrwi fcsr, 0
 
     # read user stack from sscratch and save it in TrapContext
     csrr t2, sscratch
@@ -79,7 +107,12 @@ __restore:
     csrw sstatus, t0
     csrw sepc, t1
 
-    # restore fpu registers
+    # Restore FP state only after the task has crossed the lazy first-use path.
+    # Loading FP registers dirties the live FS bits, so write the saved status
+    # once more afterwards to retain the frame's Initial/Clean state.
+    srli t2, t0, 13
+    andi t2, t2, 3
+    beqz t2, 1f
     ld t0, 70*8(a0)
     fscsr t0
     .set n, 0
@@ -87,6 +120,9 @@ __restore:
         LOAD_FP %n
         .set n, n + 1
     .endr
+    ld t0, 32*8(sp)
+    csrw sstatus, t0
+1:
 
     # restore general purpose registers except x0/sp
     ld x1, 1*8(sp)

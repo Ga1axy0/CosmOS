@@ -1222,6 +1222,9 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
 
 fn has_unmasked_pending_signal() -> bool {
     let task = current_task().unwrap();
+    if !task.signal_work_pending() {
+        return false;
+    }
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
@@ -1229,13 +1232,11 @@ fn has_unmasked_pending_signal() -> bool {
     let pending = (thread_pending | process_inner.pending_signals)
         & !task_inner.signal_mask.without_unblockable();
 
-    for signum in 1..=crate::task::MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if !pending.contains(flag) {
-            continue;
-        }
+    let mut remaining = pending;
+    while !remaining.is_empty() {
+        let signum = remaining.bits().trailing_zeros() as usize + 1;
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
 
         let from_thread = thread_pending.contains(flag);
         let action = process_inner.signal_actions.table[signum];
@@ -1258,6 +1259,12 @@ fn has_unmasked_pending_signal() -> bool {
         return true;
     }
 
+    task.set_signal_work_pending(crate::signal::signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
     false
 }
 
@@ -1313,12 +1320,15 @@ fn apply_temp_signal_mask(
     let mut inner = task.inner_exclusive_access();
     let old = inner.signal_mask;
     inner.signal_mask = new_mask;
+    task.mark_signal_work_pending();
     Ok(Some(old))
 }
 
 fn restore_temp_signal_mask(old_mask: Option<SignalBit>) {
     if let Some(old) = old_mask {
-        current_task().unwrap().inner_exclusive_access().signal_mask = old;
+        let task = current_task().unwrap();
+        task.inner_exclusive_access().signal_mask = old;
+        task.mark_signal_work_pending();
     }
 }
 

@@ -23,6 +23,8 @@ use crate::sched::{
     on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason,
 };
 use crate::signal::{handle_signals, SignalBit, SignalNum};
+#[cfg(target_arch = "riscv64")]
+use crate::syscall::translated_byte_buffer_with_access;
 use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::task::{
     check_fatal_signals_of_current, check_itimers_of_all_processes, current_add_signal,
@@ -31,6 +33,69 @@ use crate::task::{
     exit_group_current_and_run_next, ExitReason,
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+
+#[cfg(target_arch = "riscv64")]
+fn faulting_user_instruction(stval: usize, pc: usize) -> Option<u32> {
+    if stval != 0 {
+        let instruction = stval as u32;
+        return Some(if instruction & 0b11 == 0b11 {
+            instruction
+        } else {
+            instruction & 0xffff
+        });
+    }
+
+    // `stval` is allowed to be zero for illegal-instruction traps.  Read with
+    // execute permission rather than assuming an executable page is also
+    // readable, and collect through the sliced translation so an instruction
+    // spanning two pages remains supported.
+    let read_instruction_bytes = |len: usize| -> Option<u32> {
+        let buffers =
+            translated_byte_buffer_with_access(pc as *const u8, len, PageFaultAccess::Exec).ok()?;
+        let mut bytes = [0u8; 4];
+        let mut copied = 0usize;
+        for buffer in buffers {
+            let copy_len = buffer.len().min(len.saturating_sub(copied));
+            bytes[copied..copied + copy_len].copy_from_slice(&buffer[..copy_len]);
+            copied += copy_len;
+            if copied == len {
+                break;
+            }
+        }
+        (copied == len).then(|| u32::from_le_bytes(bytes))
+    };
+
+    let low = read_instruction_bytes(2)? as u16;
+    if low & 0b11 != 0b11 {
+        Some(low as u32)
+    } else {
+        read_instruction_bytes(4)
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn try_handle_lazy_user_fp(stval: usize) -> bool {
+    let pc = current_trap_cx().user_pc();
+    let Some(instruction) = faulting_user_instruction(stval, pc) else {
+        return false;
+    };
+    let handled =
+        crate::arch::riscv::trap::try_enable_user_fp(&mut current_trap_cx().arch, instruction);
+    if handled {
+        trace!(
+            "[trap] lazy FP enable: hart={} pc={:#x} instruction={:#010x}",
+            hartid(),
+            pc,
+            instruction
+        );
+    }
+    handled
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn try_handle_lazy_user_fp(_stval: usize) -> bool {
+    false
+}
 
 /// Snapshot the address-space state at a user fault.
 ///
@@ -499,13 +564,15 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalBit::SIGSEGV);
         }
         TrapCause::IllegalInstruction => {
-            log_user_fault(
-                "illegal instruction",
-                "exec",
-                trap_info.fault_addr,
-                "SIGILL",
-            );
-            current_add_signal(SignalBit::SIGILL);
+            if !try_handle_lazy_user_fp(trap_info.fault_addr) {
+                log_user_fault(
+                    "illegal instruction",
+                    "exec",
+                    trap_info.fault_addr,
+                    "SIGILL",
+                );
+                current_add_signal(SignalBit::SIGILL);
+            }
         }
         TrapCause::TimerInterrupt => {
             let _hardirq = irq::HardIrqGuard::enter();

@@ -12,7 +12,7 @@ use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
@@ -148,6 +148,13 @@ pub struct TaskControlBlock {
     /// registers are saved; a remote waker spins on it with `Acquire`. All other
     /// accesses are under the inner lock and use `Relaxed`.
     pub on_cpu: AtomicBool,
+    /// Lock-free hint for the user-return signal slow path.
+    ///
+    /// `true` means that this task may have an unmasked thread/process signal,
+    /// or deferred signal-mask restoration work.  It is deliberately a hint:
+    /// stale true values are cleared by the locked slow path, while producers
+    /// publish true after making pending state visible.
+    signal_work_pending: AtomicBool,
 }
 
 impl TaskControlBlock {
@@ -160,6 +167,24 @@ impl TaskControlBlock {
         let process = self.process.upgrade().unwrap();
         let inner = process.inner_exclusive_access();
         inner.memory_set.token()
+    }
+
+    /// Return whether user-return signal handling needs the locked slow path.
+    #[inline]
+    pub fn signal_work_pending(&self) -> bool {
+        self.signal_work_pending.load(Ordering::Acquire)
+    }
+
+    /// Publish that signal delivery or mask-restoration work may be pending.
+    #[inline]
+    pub(crate) fn mark_signal_work_pending(&self) {
+        self.signal_work_pending.store(true, Ordering::Release);
+    }
+
+    /// Refresh the signal-work hint from state protected by signal locks.
+    #[inline]
+    pub(crate) fn set_signal_work_pending(&self, pending: bool) {
+        self.signal_work_pending.store(pending, Ordering::Release);
     }
 }
 
@@ -302,6 +327,7 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             on_cpu: AtomicBool::new(false),
+            signal_work_pending: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -350,6 +376,7 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             on_cpu: AtomicBool::new(false),
+            signal_work_pending: AtomicBool::new(false),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: None,
                 trap_cx_ppn: PhysPageNum(0),

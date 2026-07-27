@@ -817,18 +817,19 @@ fn wake_signal_waiters(tasks: Vec<Arc<TaskControlBlock>>) {
 /// 因为只检查致命信号，所以可不复位pending_signals
 pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     let task = current_task().unwrap();
+    if !task.signal_work_pending() {
+        return None;
+    }
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
     let pending = (task_inner.pending_signals | process_inner.pending_signals)
         & !task_inner.signal_mask.without_unblockable();
-    for signum in 1..=MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if !pending.contains(flag) {
-            continue;
-        }
+    let mut remaining = pending;
+    while !remaining.is_empty() {
+        let signum = remaining.bits().trailing_zeros() as usize + 1;
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
         let action = process_inner.signal_actions.table[signum];
         if action.handler == SIG_DFL {
             if let Some(error) = flag.check_error() {
@@ -836,6 +837,12 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
             }
         }
     }
+    task.set_signal_work_pending(crate::signal::signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
     None
 }
 
@@ -847,15 +854,8 @@ pub fn current_process_is_zombie() -> bool {
 }
 
 fn first_signum_in_set(signal: SignalBit) -> Option<usize> {
-    for signum in 1..=MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if signal.contains(flag) {
-            return Some(signum);
-        }
-    }
-    None
+    let bits = signal.bits();
+    (bits != 0).then(|| bits.trailing_zeros() as usize + 1)
 }
 
 /// Add signal to target process.
@@ -887,6 +887,13 @@ pub fn add_signal_to_process_with_siginfo(
         process_inner.pending_signals |= signal;
         if let Some(signum) = first_signum_in_set(signal) {
             process_inner.pending_siginfo[signum] = siginfo;
+        }
+        // Publish the slow-path hint before releasing process-inner, so a
+        // concurrently returning task cannot miss both the signal and its
+        // notification.  Masked tasks may take one conservative slow path and
+        // clear the hint again.
+        for task in &tasks {
+            task.mark_signal_work_pending();
         }
         (process.getpid(), newly_pending, tasks)
     };
@@ -936,6 +943,9 @@ pub fn add_signal_to_task_with_siginfo(
         if let Some(signum) = first_signum_in_set(signal) {
             task_inner.pending_siginfo[signum] = siginfo;
         }
+        // Set the hint while holding task-inner.  The locked consumer can then
+        // safely clear it only after observing the newly published bit.
+        task.mark_signal_work_pending();
         (
             task_inner.res.as_ref().unwrap().thread_id(),
             task_inner.res.as_ref().unwrap().tid,

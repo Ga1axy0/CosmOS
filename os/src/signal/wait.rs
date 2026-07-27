@@ -281,6 +281,9 @@ pub(crate) fn has_pending_signal_in_set(signal_set: SignalBit) -> bool {
 
 pub(crate) fn has_unmasked_pending_signal() -> bool {
     let task = crate::task::current_task().unwrap();
+    if !task.signal_work_pending() {
+        return false;
+    }
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
@@ -296,21 +299,40 @@ pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<(i32, 
     let mut task_inner = task.inner_exclusive_access();
     let thread_pending = task_inner.pending_signals & signal_set;
     let process_pending = process_inner.pending_signals & signal_set;
-    for signum in 1..=crate::signal::MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
+    let mut remaining = thread_pending | process_pending;
+    while !remaining.is_empty() {
+        let signum = remaining.bits().trailing_zeros() as usize + 1;
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
         if thread_pending.contains(flag) {
             let siginfo = task_inner.pending_siginfo[signum];
             task_inner.pending_signals &= !flag;
+            task.set_signal_work_pending(crate::signal::signal_work_needed(
+                task_inner.pending_signals,
+                process_inner.pending_signals,
+                task_inner.signal_mask,
+                task_inner.signal_mask_backup.is_some(),
+            ));
             return Some((signum as i32, siginfo));
         }
         if process_pending.contains(flag) {
             let siginfo = process_inner.pending_siginfo[signum];
             process_inner.pending_signals &= !flag;
+            task.set_signal_work_pending(crate::signal::signal_work_needed(
+                task_inner.pending_signals,
+                process_inner.pending_signals,
+                task_inner.signal_mask,
+                task_inner.signal_mask_backup.is_some(),
+            ));
             return Some((signum as i32, siginfo));
         }
     }
+    task.set_signal_work_pending(crate::signal::signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
     None
 }
 

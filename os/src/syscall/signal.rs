@@ -310,6 +310,10 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
                     2 => inner.signal_mask = new_mask,       // SIG_SETMASK
                     _ => return Err(ERRNO::EINVAL),
                 }
+                // A previously masked pending signal may have become
+                // deliverable.  Let the user-return slow path recompute the
+                // exact state under both signal locks.
+                task.mark_signal_work_pending();
             }
             old_mask
         };
@@ -399,6 +403,7 @@ pub fn sys_sigreturn() -> isize {
             let mask = SignalBit::from_user_bits(ArchSignalAbi::signal_mask(&ucontext));
             inner.signal_mask = mask;
             inner.signal_mask_backup = None;
+            task.mark_signal_work_pending();
             debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
         }
 
@@ -452,6 +457,9 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
             let old = inner.signal_mask;
             inner.signal_mask = new_mask;
             inner.signal_mask_backup = Some(old);
+            // Even before a signal arrives, the return path must restore the
+            // pre-sigsuspend mask if this sleep is canceled or wakes spuriously.
+            task.mark_signal_work_pending();
             debug!(
                 "sys_sigsuspend: changed mask from {:#x} to {:#x}",
                 old.bits(),

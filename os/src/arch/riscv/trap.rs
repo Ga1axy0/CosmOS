@@ -13,7 +13,7 @@ use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
     sie,
-    sstatus::{self, Sstatus, SPP},
+    sstatus::{self, Sstatus, FS, SPP},
     stval, stvec,
 };
 
@@ -68,6 +68,52 @@ pub struct RiscvTrapContextFrame {
     pub f: [u64; 32],
     /// Floating-point CSR.
     pub fcsr: usize,
+}
+
+/// Return whether an illegal instruction accesses scalar floating-point state
+/// and can therefore fault solely because `sstatus.FS` is Off.
+fn is_fp_state_instruction(instruction: u32) -> bool {
+    if instruction & 0b11 != 0b11 {
+        // RV64 compressed floating-point instructions are C.FLD/C.FSD and
+        // their stack-pointer variants.  The encodings that share funct3 with
+        // C.LD/C.SD on RV64 must not be treated as floating-point operations.
+        let quadrant = instruction & 0b11;
+        let funct3 = (instruction >> 13) & 0b111;
+        return matches!(quadrant, 0b00 | 0b10) && matches!(funct3, 0b001 | 0b101);
+    }
+
+    let opcode = instruction & 0x7f;
+    match opcode {
+        // LOAD-FP / STORE-FP.  Widths 001..100 cover the standard half,
+        // single, double and quad encodings; unsupported extensions will trap
+        // again with FS enabled and follow the normal SIGILL path.
+        0x07 | 0x27 => matches!((instruction >> 12) & 0b111, 0b001..=0b100),
+        // FMADD, FMSUB, FNMSUB, FNMADD and OP-FP.
+        0x43 | 0x47 | 0x4b | 0x4f | 0x53 => true,
+        // CSR operations on fflags, frm or fcsr also require FS to be enabled.
+        0x73 => {
+            let funct3 = (instruction >> 12) & 0b111;
+            let csr = (instruction >> 20) & 0xfff;
+            matches!(funct3, 0b001..=0b011 | 0b101..=0b111) && matches!(csr, 0x001..=0x003)
+        }
+        _ => false,
+    }
+}
+
+/// Lazily initialize a user's floating-point context after its first
+/// floating-point-state instruction traps with `sstatus.FS=Off`.
+///
+/// The trap frame remains the canonical backing store in this first version.
+/// Trap entry saves it only when hardware reports Dirty, while trap return
+/// restores it only for tasks that have crossed this first-use point.
+pub fn try_enable_user_fp(frame: &mut RiscvTrapContextFrame, instruction: u32) -> bool {
+    if frame.sstatus.fs() != FS::Off || !is_fp_state_instruction(instruction) {
+        return false;
+    }
+    frame.f.fill(0);
+    frame.fcsr = 0;
+    frame.sstatus.set_fs(FS::Initial);
+    true
 }
 
 /// Complete GPR snapshot captured by `__trap_from_kernel` before entering Rust.
@@ -398,6 +444,10 @@ impl TrapContextAbi for RiscvTrapContextAbi {
     ) -> Self::Frame {
         let mut status = sstatus::read();
         status.set_spp(SPP::User);
+        // Keep FP disabled until the task executes its first F/D instruction.
+        // This lets the trampoline skip all FP loads/stores for integer-only
+        // workloads while still preserving the existing per-task backing area.
+        status.set_fs(FS::Off);
         let mut frame = RiscvTrapContextFrame {
             x: [0; 32],
             sstatus: status,
@@ -515,6 +565,9 @@ impl TrapContextAbi for RiscvTrapContextAbi {
     fn restore_fp_state(frame: &mut Self::Frame, fpregs: &[u64; 32], fcsr: u32) {
         frame.f.copy_from_slice(fpregs);
         frame.fcsr = fcsr as usize;
+        // A signal frame explicitly supplying FP state makes that state valid,
+        // even if the interrupted task had not previously used the FPU.
+        frame.sstatus.set_fs(FS::Clean);
     }
 
     fn fault_dump_summary(frame: &Self::Frame) -> [NamedReg; 7] {

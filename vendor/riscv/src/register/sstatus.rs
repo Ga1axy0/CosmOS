@@ -115,6 +115,12 @@ impl Sstatus {
     pub fn set_spp(&mut self, val: SPP) {
         self.bits.set_bit(8, val == SPP::Supervisor);
     }
+
+    /// Update the floating-point extension state saved in this status value.
+    #[inline]
+    pub fn set_fs(&mut self, fs: FS) {
+        self.bits.set_bits(13..15, fs as usize);
+    }
 }
 
 read_csr_as!(Sstatus, 0x100, __read_sstatus);
