@@ -4,7 +4,8 @@ use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{
     defer_release, deferred_frame_count, deferred_kstack_id_count, flush_deferred, online_mask,
-    DeferredUserReclaim, MapPermission, MmError, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
+    shootdown, DeferredUserReclaim, MapPermission, MmError, PhysPageNum, ShootdownKind, VirtAddr,
+    Vma, KERNEL_SPACE,
 };
 use crate::sync::SpinNoIrqLock;
 use crate::timer::get_time_ns;
@@ -66,13 +67,13 @@ lazy_static! {
     };
     /// Global allocator for kernel stack
     static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
-    /// Cache of fully mapped kernel stacks that can be reused without a global TLB flush.
+    /// Cache of fully mapped kernel stacks that can be reused without a kernel-ASID TLB flush.
     static ref KSTACK_CACHE: SpinNoIrqLock<Vec<usize>> = SpinNoIrqLock::new(Vec::new());
 }
 
-/// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
+/// deferred kernel stack id 超过该水位时触发一次 kernel-ASID flush 回收。
 const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 64;
-/// deferred 物理页超过该水位时触发一次全局 flush 回收。
+/// deferred 物理页超过该水位时触发一次 kernel-ASID flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
 /// Keep a small bounded pool of mapped kernel stacks for reuse without letting
 /// fork/exit storms permanently withhold large amounts of memory.
@@ -260,7 +261,7 @@ impl Drop for KernelStack {
             kernel_stack_bottom,
             deferred_frames.len()
         );
-        // 这里先把拆下来的页框挂到 deferred 容器里；真正的 global TLB flush
+        // 这里先把拆下来的页框挂到 deferred 容器里；真正的 kernel-ASID TLB flush
         // 与批量并回 frame allocator 的同步点在下一步接入。
         defer_release(
             kernel_stack_bottom,
@@ -392,37 +393,59 @@ impl TaskUserRes {
     /// Allocate user resource for a task
     pub fn alloc_user_res(&self) -> Result<(), MmError> {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        // alloc user stack
-        let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
-        let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
-        if self.tid == 0 {
-            // Main thread needs eager mapping: kernel writes args/auxv before start.
-            process_inner.memory_set.insert_vma_eager(ustack_vma)?;
-        } else {
-            process_inner.memory_set.insert_vma(ustack_vma, None)?;
+        let (token, mask) = {
+            let mut process_inner = process.inner_exclusive_access();
+            // alloc user stack
+            let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
+            let ustack_top = ustack_bottom + USER_STACK_SIZE;
+            let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
+            if self.tid == 0 {
+                // Main thread needs eager mapping: kernel writes args/auxv before start.
+                process_inner.memory_set.insert_vma_eager(ustack_vma)?;
+            } else {
+                process_inner.memory_set.insert_vma(ustack_vma, None)?;
+            }
+            // alloc trap_cx
+            let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+            let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+            process_inner.memory_set.insert_vma(
+                Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+                None,
+            )?;
+            (
+                process_inner.memory_set.token(),
+                process_inner
+                    .memory_set
+                    .record_tlb_change_with_local_fence(),
+            )
+        };
+        if mask != 0 {
+            shootdown(mask, ShootdownKind::AddressSpace { token });
         }
-        // alloc trap_cx
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
-        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_vma(
-            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
-            None,
-        )?;
         Ok(())
     }
 
     /// Allocate only the trap context mapping for a Linux `CLONE_VM` thread.
     pub fn alloc_trap_cx(&self) -> Result<(), MmError> {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
-        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_vma(
-            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
-            None,
-        )?;
+        let (token, mask) = {
+            let mut process_inner = process.inner_exclusive_access();
+            let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+            let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+            process_inner.memory_set.insert_vma(
+                Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+                None,
+            )?;
+            (
+                process_inner.memory_set.token(),
+                process_inner
+                    .memory_set
+                    .record_tlb_change_with_local_fence(),
+            )
+        };
+        if mask != 0 {
+            shootdown(mask, ShootdownKind::AddressSpace { token });
+        }
         Ok(())
     }
     /// Deallocate user resource for a task
@@ -432,7 +455,6 @@ impl TaskUserRes {
         let reclaim = {
             let mut process_inner = process.inner_exclusive_access();
             let token = process_inner.memory_set.token();
-            let mask = process_inner.memory_set.loaded_user_harts();
             // 用户栈可能在 fork 后与子进程共享 COW 页，不能使用 kernel stack
             // 专用的独占 frame deferred helper。
             let ustack_bottom_va: VirtAddr =
@@ -445,6 +467,7 @@ impl TaskUserRes {
                 .memory_set
                 .remove_vma_with_start_vpn_user_deferred(trap_cx_bottom_va.into());
             release_batch.append(&mut trap_cx_batch);
+            let mask = process_inner.memory_set.record_local_tlb_change();
             DeferredUserReclaim::new(token, mask, release_batch)
         };
         if !reclaim.is_empty() {

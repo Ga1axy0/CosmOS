@@ -7,6 +7,7 @@
 //! Every task or process has a memory_set to control its virtual memory.
 
 mod address;
+mod asid;
 mod elf_loader;
 mod frame_allocator;
 mod heap_allocator;
@@ -52,6 +53,7 @@ pub use address::{
     phys_to_virt, virt_to_phys, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
     USER_SPACE_END,
 };
+pub use asid::KERNEL_ASID;
 pub use elf_loader::ElfLoadInfo;
 pub use frame_allocator::{
     frame_alloc, frame_alloc_contiguous, frame_alloc_with_reclaim, frame_allocator_stats,
@@ -84,8 +86,9 @@ pub use page_table::{
 pub use tlb_shootdown::{
     clear_deferred, defer_release, deferred_frame_count, deferred_kstack_id_count,
     deferred_range_count, flush_deferred, handle_ipi, has_deferred, mark_online, needs_flush,
-    online_mask, poll_pending_shootdown, shootdown, shootdown_global, shootdown_global_quiet,
-    take_deferred, DeferredBatch, ShootdownKind,
+    online_mask, poll_pending_shootdown, shootdown, shootdown_asid, shootdown_asid_quiet,
+    shootdown_global, shootdown_global_quiet, shootdown_page, shootdown_page_quiet,
+    shootdown_range, shootdown_range_quiet, take_deferred, DeferredBatch, ShootdownKind,
 };
 #[cfg(feature = "cosmos-meminfo")]
 pub use tlb_shootdown::{reset_tlb_shootdown_stats, tlb_shootdown_stats, TlbShootdownStats};
@@ -101,6 +104,7 @@ pub fn init() {
     reset_anonymous_page_stats();
     heap_allocator::init_heap();
     KERNEL_SPACE.lock().activate();
+    asid::init();
     heap_allocator::init_kernel_heap_mapping();
     heap_allocator::init_heap_virtual_window();
 }

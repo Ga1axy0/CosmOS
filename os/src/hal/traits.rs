@@ -213,6 +213,23 @@ pub trait PagingArch {
     const INDEX_BITS: usize;
     /// Build an architecture token from a root page-table physical page number.
     fn make_token(root_ppn: usize) -> AddressSpaceToken;
+    /// Return a copy of `token` tagged with the requested address-space ID.
+    ///
+    /// Architectures without tagged TLB support may ignore `asid`.
+    fn with_address_space_id(token: AddressSpaceToken, _asid: usize) -> AddressSpaceToken {
+        token
+    }
+    /// Extract the address-space ID encoded in one architecture token.
+    fn address_space_id(_token: AddressSpaceToken) -> usize {
+        0
+    }
+    /// Probe the usable hardware address-space-ID mask on the current hart.
+    ///
+    /// This is called once during bootstrap after the kernel page table is
+    /// active. Architectures without ASIDs return zero.
+    unsafe fn probe_address_space_id_mask() -> usize {
+        0
+    }
     /// Extract the root page-table physical page number from an architecture token.
     fn root_ppn(token: AddressSpaceToken) -> usize;
     /// Activate the given address-space token and flush the local TLB.
@@ -221,6 +238,27 @@ pub trait PagingArch {
     unsafe fn current_token() -> AddressSpaceToken;
     /// Flush entire TLB.
     unsafe fn flush_tlb();
+    /// Flush all non-global translations tagged with one address-space ID.
+    ///
+    /// The default is a conservative full flush for architectures that have
+    /// not implemented an ASID-targeted invalidation primitive.
+    unsafe fn flush_tlb_asid(_asid: usize) {
+        Self::flush_tlb();
+    }
+    /// Flush one non-global virtual-address translation tagged with an ASID.
+    ///
+    /// The default conservatively flushes the whole ASID for architectures
+    /// without a VA-and-ASID-targeted invalidation primitive.
+    unsafe fn flush_tlb_page_asid(_vaddr: usize, asid: usize) {
+        Self::flush_tlb_asid(asid);
+    }
+    /// Flush a half-open virtual-address range tagged with an ASID.
+    ///
+    /// The default performs one ASID-wide flush. Architectures with an
+    /// efficient page-targeted primitive may override this for small ranges.
+    unsafe fn flush_tlb_range_asid(_start: usize, _end: usize, asid: usize) {
+        Self::flush_tlb_asid(asid);
+    }
     /// Encode one leaf/intermediate PTE for this architecture.
     fn make_pte(ppn: usize, flags: PTEFlags) -> usize;
     /// Encode a non-leaf directory entry pointing to the next page-table level.

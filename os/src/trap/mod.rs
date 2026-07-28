@@ -120,7 +120,7 @@ fn log_user_fault_mapping(fault_addr: usize) {
     let vpn = crate::mm::VirtAddr::from(fault_addr).floor();
     let page_offset = fault_addr & (PAGE_SIZE - 1);
 
-    let (user_token, loaded_user_harts, pte_info, vma_info) = {
+    let (user_token, active_user_harts, pte_info, vma_info) = {
         let inner = process.inner_exclusive_access();
         let memory_set = &inner.memory_set;
         let pte_info = memory_set
@@ -143,7 +143,7 @@ fn log_user_fault_mapping(fault_addr: usize) {
         });
         (
             memory_set.token(),
-            memory_set.loaded_user_harts(),
+            memory_set.active_user_harts(),
             pte_info,
             vma_info,
         )
@@ -152,7 +152,7 @@ fn log_user_fault_mapping(fault_addr: usize) {
     error!(
         "[kernel] user fault mapping: hart={} pid={} tid={:?} thread_id={:?} \
          addr={:#x} vpn={:#x} page_offset={:#x} kernel_satp={:#x} user_token={:#x} \
-         loaded_user_harts={:#b} pte={:?} vma={:?}",
+         active_user_harts={:#b} pte={:?} vma={:?}",
         hartid(),
         process.getpid(),
         tid,
@@ -162,7 +162,7 @@ fn log_user_fault_mapping(fault_addr: usize) {
         page_offset,
         kernel_satp,
         user_token,
-        loaded_user_harts,
+        active_user_harts,
         pte_info,
         vma_info,
     );

@@ -679,8 +679,8 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             let mut process_inner = process.inner_exclusive_access();
             // deallocate other data in user space i.e. program code/data section
             let token = process_inner.memory_set.token();
-            let mask = process_inner.memory_set.loaded_user_harts();
             let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
+            let mask = process_inner.memory_set.record_local_tlb_change();
             // warn_heap_state_lockfree("exit_after_vmas_clear", pid);
             let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。

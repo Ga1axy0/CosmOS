@@ -849,13 +849,9 @@ impl KernelHeapAllocator {
 
     fn grow_virtual(&self, required_bytes: usize) -> bool {
         // Reserve our disjoint VA range under the lock, then DROP the lock before
-        // mapping. `map_heap_pages` may end with a global TLB shootdown that
-        // busy-waits for every online hart to ack an IPI. Holding this
-        // IRQ-disabling lock (`SpinNoIrqLock`) across that wait deadlocks against
-        // any other hart that concurrently enters grow/reclaim and spins on this
-        // same lock with IRQs disabled — it can never service the very IPI we are
-        // waiting for, so neither side makes progress (the observed SMP hang with
-        // the launcher in shootdown's ack-wait loop and the peer spinning here).
+        // mapping. `map_heap_pages` allocates frames and takes the independent
+        // page-table lock, so keeping this IRQ-disabling virtual-range lock held
+        // across the mapping work would create unnecessary lock nesting.
         // Reservations hand out strictly disjoint, monotonically advancing
         // ranges, so mapping `our` range needs no exclusion against a concurrent
         // grow.
@@ -893,7 +889,7 @@ impl KernelHeapAllocator {
             }
             // Pop one tail block and snapshot the current high-water under the
             // lock, then DROP the lock before unmapping. `unmap_heap_pages` ends
-            // with a global TLB shootdown that busy-waits for every online hart
+            // with a kernel-ASID TLB shootdown that busy-waits for every online hart
             // to ack an IPI; holding this IRQ-disabling lock across that wait
             // deadlocks a concurrent grow/reclaim spinning on it with IRQs off.
             // The freed range is always the topmost [start, virtual_bytes), and a
@@ -1327,7 +1323,8 @@ fn unmap_heap_pages(start_va: usize, pages: usize) {
         if reclaimed_count != 0 {
             // Do not hold HEAP_PT_LOCK across this synchronous IPI barrier: a
             // target hart may currently be spinning on that IRQ-disabling lock.
-            crate::mm::shootdown_global_quiet();
+            // Dynamic heap PTEs are non-global, so kernel ASID 0 is sufficient.
+            crate::mm::shootdown_asid_quiet(usize::MAX, crate::mm::KERNEL_ASID);
             for ppn in reclaimed_ppns[..reclaimed_count].iter().copied() {
                 frame_dealloc(PhysPageNum(ppn));
             }

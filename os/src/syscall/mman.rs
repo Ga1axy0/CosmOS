@@ -214,7 +214,7 @@ pub fn sys_mmap(
         }
         let map_addr = if addr == 0 {
             // Linux-style mmap(NULL, ...): choose a free user VA automatically.
-            let (chosen, chosen_end, hint) = {
+            let (chosen, chosen_end, hint, token, tlb_mask) = {
                 let mut inner = process.inner_exclusive_access();
                 inner.ensure_address_space_capacity(len_aligned)?;
                 let hint = inner.vm_layout.mmap_hint;
@@ -243,8 +243,28 @@ pub fn sys_mmap(
                 };
                 mapped.map_err(|_| ERRNO::ENOMEM)?;
                 inner.vm_layout.mmap_hint = chosen_end;
-                (chosen, chosen_end, hint)
+                // MAP_SHARED anonymous mappings are eagerly populated.  The
+                // fixed-address path goes through ProcessControlBlock::mmap,
+                // but this atomic choose-and-map path must publish the same
+                // TLB generation before releasing process-inner.
+                let (token, tlb_mask) = if file_desc.is_none() && is_shared {
+                    (
+                        inner.memory_set.token(),
+                        inner.memory_set.record_local_tlb_change(),
+                    )
+                } else {
+                    (0, 0)
+                };
+                (chosen, chosen_end, hint, token, tlb_mask)
             };
+            if tlb_mask != 0 {
+                crate::mm::shootdown_range(
+                    tlb_mask,
+                    crate::hal::address_space_id_from_token(token),
+                    chosen,
+                    chosen_end,
+                );
+            }
             debug!(
                 "[mmap-debug] auto-selected pid={} start={:#x} end={:#x} hint_in={:#x} hint_out={:#x} file_backed={} shared={} lazy={}",
                 pid,

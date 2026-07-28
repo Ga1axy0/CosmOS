@@ -121,6 +121,24 @@ pub fn make_address_space_token(root_ppn: usize) -> AddressSpaceToken {
     ArchPaging::make_token(root_ppn)
 }
 
+/// Tag an architecture token with an address-space ID.
+#[inline]
+pub fn with_address_space_id(token: AddressSpaceToken, asid: usize) -> AddressSpaceToken {
+    ArchPaging::with_address_space_id(token, asid)
+}
+
+/// Extract the address-space ID from an architecture token.
+#[inline]
+pub fn address_space_id_from_token(token: AddressSpaceToken) -> usize {
+    ArchPaging::address_space_id(token)
+}
+
+/// Probe the usable hardware address-space-ID mask on the current hart.
+#[inline]
+pub unsafe fn probe_address_space_id_mask() -> usize {
+    ArchPaging::probe_address_space_id_mask()
+}
+
 /// Extract the root page-table PPN from an architecture-specific address-space token.
 #[inline]
 pub fn root_ppn_from_token(token: AddressSpaceToken) -> usize {
@@ -143,6 +161,24 @@ pub unsafe fn current_address_space_token() -> AddressSpaceToken {
 #[inline]
 pub unsafe fn flush_tlb() {
     ArchPaging::flush_tlb();
+}
+
+/// Flush all local non-global translations tagged with one address-space ID.
+#[inline]
+pub unsafe fn flush_tlb_asid(asid: usize) {
+    ArchPaging::flush_tlb_asid(asid);
+}
+
+/// Flush one local non-global virtual-address translation tagged with an ASID.
+#[inline]
+pub unsafe fn flush_tlb_page_asid(vaddr: usize, asid: usize) {
+    ArchPaging::flush_tlb_page_asid(vaddr, asid);
+}
+
+/// Flush one local non-global virtual-address range tagged with an ASID.
+#[inline]
+pub unsafe fn flush_tlb_range_asid(start: usize, end: usize, asid: usize) {
+    ArchPaging::flush_tlb_range_asid(start, end, asid);
 }
 
 /// Encode a non-leaf directory PTE (must not set GNR/GNX on LoongArch).

@@ -87,17 +87,31 @@ __alltraps:
     ld t1, 37*8(sp)
     # move to kernel_sp
     ld sp, 36*8(sp)
-    # switch to kernel space
+    # Switch to kernel ASID 0.  A nonzero userspace ASID keeps both address
+    # spaces' translations independently tagged, so changing satp needs no
+    # fence.  ASID 0 is the compatibility fallback and still requires the old
+    # full flush because it shares the kernel's tag.
+    csrr t2, satp
+    # Drop MODE by shifting ASID[15:0] to the top before extracting it.
+    slli t2, t2, 4
+    srli t2, t2, 48
     csrw satp, t0
+    bnez t2, .Lkernel_satp_ready
     sfence.vma
+.Lkernel_satp_ready:
     # jump to trap_handler
     jr t1
 
 __restore:
     # a0: *TrapContext in user space(Constant); a1: user space token
-    # switch to user space
+    # Switch to the user page table without evicting either ASID.  Tokens with
+    # ASID 0 use the conservative fallback path.
     csrw satp, a1
+    slli t2, a1, 4
+    srli t2, t2, 48
+    bnez t2, .Luser_satp_ready
     sfence.vma
+.Luser_satp_ready:
     csrw sscratch, a0
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it

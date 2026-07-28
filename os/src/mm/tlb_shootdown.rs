@@ -29,11 +29,34 @@ pub struct DeferredVaRange {
 pub enum ShootdownKind {
     /// 刷新当前 hart 上整个地址空间的 TLB。
     Global,
+    /// 刷新当前 hart 上属于一个 ASID 的全部非全局 TLB 翻译。
+    ///
+    /// 该请求不会失效带全局位的翻译；调用方必须保证被修改的映射没有设置 G 位。
+    Asid {
+        /// 目标硬件地址空间标识符。
+        asid: usize,
+    },
+    /// 刷新一个 ASID 下的单页非全局翻译。
+    Page {
+        /// 目标硬件地址空间标识符。
+        asid: usize,
+        /// 目标页内的任意虚拟地址。
+        vaddr: usize,
+    },
+    /// 刷新一个 ASID 下指定半开区间覆盖的非全局翻译。
+    Range {
+        /// 目标硬件地址空间标识符。
+        asid: usize,
+        /// 区间起始虚拟地址（含）。
+        start: usize,
+        /// 区间结束虚拟地址（不含）。
+        end: usize,
+    },
     /// 刷新某个地址空间的 TLB。
     ///
-    /// 调用方应使用目标地址空间的 loaded hart 掩码决定通知范围。远端收到 IPI
-    /// 时可能已经从用户态切入内核，但仍需要完成本地 flush 并 ack。
-    /// TODO：引入 ASID 后，应把这里改成按 ASID 或地址范围精确刷新。
+    /// 调用方应使用目标地址空间的 active-user hart 掩码决定通知范围。
+    /// inactive hart 不参与同步等待；它会在下次返回该地址空间前根据 TLB
+    /// generation 执行 ASID-wide fence。
     AddressSpace {
         /// 目标地址空间的架构 token。
         token: AddressSpaceToken,
@@ -56,8 +79,12 @@ struct TlbShootdownState {
     online_hart_mask: AtomicUsize,
     /// 当前请求类型编码。
     kind_bits: AtomicUsize,
-    /// 当前请求附带的地址空间 token 参数。
+    /// 当前请求附带的地址空间 token 或 ASID 参数。
     arg_token: AtomicUsize,
+    /// 当前请求附带的起始地址或单页地址参数。
+    arg_start: AtomicUsize,
+    /// 当前请求附带的结束地址参数。
+    arg_end: AtomicUsize,
 }
 
 impl TlbShootdownState {
@@ -71,20 +98,22 @@ impl TlbShootdownState {
             online_hart_mask: AtomicUsize::new(0),
             kind_bits: AtomicUsize::new(0),
             arg_token: AtomicUsize::new(0),
+            arg_start: AtomicUsize::new(0),
+            arg_end: AtomicUsize::new(0),
         }
     }
 }
 
 /// 内核态延迟回收状态。
 ///
-/// 这里记录“哪些内核虚拟地址区间已拆映射但尚未完成全局 shootdown”，以及
+/// 这里记录“哪些内核虚拟地址区间已拆映射但尚未完成 kernel-ASID shootdown”，以及
 /// 对应暂缓归还给 frame allocator 的页框。
 pub struct DeferredKernelRecycleState {
-    /// 记录尚未经过全局 flush 的内核虚拟地址区间。
+    /// 记录尚未经过 kernel-ASID flush 的内核虚拟地址区间。
     deferred_va_ranges: Vec<DeferredVaRange>,
     /// 当前 deferred 区间数量。
     deferred_va_range_count: usize,
-    /// 记录尚未经过全局 flush 的页框。
+    /// 记录尚未经过 kernel-ASID flush 的页框。
     deferred_frames: Vec<FrameTracker>,
     /// 记录 flush 完成后才能归还的 kernel stack id。
     deferred_kstack_ids: Vec<usize>,
@@ -206,6 +235,9 @@ static LAST_HANDLED_SEQ: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0)
 
 const KIND_GLOBAL: usize = 0;
 const KIND_ADDRESS_SPACE: usize = 1;
+const KIND_ASID: usize = 2;
+const KIND_PAGE: usize = 3;
+const KIND_RANGE: usize = 4;
 
 #[cfg(feature = "cosmos-meminfo")]
 static TLB_SHOOTDOWN_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -250,7 +282,7 @@ pub fn tlb_shootdown_stats() -> TlbShootdownStats {
     }
 }
 
-/// 记录一个被释放的内核虚拟地址区间及其页框，等待后续全局 TLB flush 处理。
+/// 记录一个被释放的内核虚拟地址区间及其页框，等待后续 kernel-ASID TLB flush 处理。
 pub fn defer_release(
     start: usize,
     end: usize,
@@ -269,7 +301,7 @@ pub fn defer_release(
     );
 }
 
-/// 判断给定内核虚拟地址区间在当前是否仍要求先做全局 TLB flush。
+/// 判断给定内核虚拟地址区间在当前是否仍要求先做 kernel-ASID TLB flush。
 pub fn needs_flush(start: usize, end: usize) -> bool {
     DEFERRED_KERNEL_RECYCLE_STATE
         .lock()
@@ -294,7 +326,7 @@ pub fn deferred_kstack_id_count() -> usize {
         .len()
 }
 
-/// 判断当前是否存在待后续全局 flush 处理的内核态延迟回收状态。
+/// 判断当前是否存在待后续 kernel-ASID flush 处理的内核态延迟回收状态。
 pub fn has_deferred() -> bool {
     let state = DEFERRED_KERNEL_RECYCLE_STATE.lock();
     state.deferred_va_range_count != 0
@@ -377,6 +409,8 @@ fn service_pending_shootdown_quiet() -> Option<(usize, ShootdownKind)> {
     let kind = decode_shootdown_kind(
         TLB_SHOOTDOWN_STATE.kind_bits.load(Ordering::Acquire),
         TLB_SHOOTDOWN_STATE.arg_token.load(Ordering::Acquire),
+        TLB_SHOOTDOWN_STATE.arg_start.load(Ordering::Acquire),
+        TLB_SHOOTDOWN_STATE.arg_end.load(Ordering::Acquire),
     );
     perform_local_tlb_shootdown(kind);
     TLB_SHOOTDOWN_STATE
@@ -388,7 +422,7 @@ fn service_pending_shootdown_quiet() -> Option<(usize, ShootdownKind)> {
 /// 在普通内核路径中主动轮询一次 shootdown 请求。
 ///
 /// 用户 trap 入口调用此函数，使一个已经切换到 kernel page table、但尚未重新
-/// 开启中断的 hart 也能及时确认发起方早先拍摄到的 loaded-hart 快照。
+/// 开启中断的 hart 也能及时确认发起方早先拍摄到的 active-user hart 快照。
 pub fn poll_pending_shootdown() -> bool {
     service_pending_shootdown_quiet().is_some()
 }
@@ -439,13 +473,19 @@ fn shootdown_inner(hart_mask: usize, kind: ShootdownKind, emit_logs: bool) {
         TLB_SHOOTDOWN_IPI_TARGETS.fetch_add(target_mask.count_ones() as usize, Ordering::Relaxed);
     }
 
-    let (kind_bits, arg_token) = encode_shootdown_kind(kind);
+    let (kind_bits, arg_token, arg_start, arg_end) = encode_shootdown_kind(kind);
     TLB_SHOOTDOWN_STATE
         .kind_bits
         .store(kind_bits, Ordering::Release);
     TLB_SHOOTDOWN_STATE
         .arg_token
         .store(arg_token, Ordering::Release);
+    TLB_SHOOTDOWN_STATE
+        .arg_start
+        .store(arg_start, Ordering::Release);
+    TLB_SHOOTDOWN_STATE
+        .arg_end
+        .store(arg_end, Ordering::Release);
     TLB_SHOOTDOWN_STATE
         .target_mask
         .store(target_mask, Ordering::Release);
@@ -538,7 +578,43 @@ pub fn shootdown_global_quiet() {
     shootdown_quiet(usize::MAX, ShootdownKind::Global);
 }
 
-/// 完成一次“刷新后提交 deferred 回收”的同步点。
+/// 对指定 hart 掩码发起一次 ASID 定向 TLB shootdown。
+pub fn shootdown_asid(hart_mask: usize, asid: usize) {
+    shootdown(hart_mask, ShootdownKind::Asid { asid });
+}
+
+/// 对指定 hart 掩码发起一次 ASID 定向 TLB shootdown，但不打印日志。
+pub fn shootdown_asid_quiet(hart_mask: usize, asid: usize) {
+    shootdown_quiet(hart_mask, ShootdownKind::Asid { asid });
+}
+
+/// 对指定 hart 掩码发起一次单页 VA+ASID TLB shootdown。
+pub fn shootdown_page(hart_mask: usize, asid: usize, vaddr: usize) {
+    shootdown(hart_mask, ShootdownKind::Page { asid, vaddr });
+}
+
+/// 对指定 hart 掩码发起一次单页 VA+ASID TLB shootdown，但不打印日志。
+pub fn shootdown_page_quiet(hart_mask: usize, asid: usize, vaddr: usize) {
+    shootdown_quiet(hart_mask, ShootdownKind::Page { asid, vaddr });
+}
+
+/// 对指定 hart 掩码发起一次范围 VA+ASID TLB shootdown。
+pub fn shootdown_range(hart_mask: usize, asid: usize, start: usize, end: usize) {
+    if start < end {
+        shootdown(hart_mask, ShootdownKind::Range { asid, start, end });
+    }
+}
+
+/// 对指定 hart 掩码发起一次范围 VA+ASID TLB shootdown，但不打印日志。
+pub fn shootdown_range_quiet(hart_mask: usize, asid: usize, start: usize, end: usize) {
+    if start < end {
+        shootdown_quiet(hart_mask, ShootdownKind::Range { asid, start, end });
+    }
+}
+
+/// 完成一次“刷新 kernel ASID 后提交 deferred 回收”的同步点。
+///
+/// 当前 deferred 状态只承载不带 G 位的动态内核栈映射。
 pub fn flush_deferred(hart_mask: usize) {
     let deferred_ranges = deferred_range_count();
     let deferred_frames = deferred_frame_count();
@@ -550,7 +626,7 @@ pub fn flush_deferred(hart_mask: usize) {
         "[tlb] flush deferred recycle on mask={:#b}, ranges={}, frames={}",
         hart_mask, deferred_ranges, deferred_frames
     );
-    shootdown(hart_mask, ShootdownKind::Global);
+    shootdown_asid(hart_mask, super::asid::KERNEL_ASID);
     debug!(
         "[tlb] reclaim deferred batch: ranges={}, frames={}",
         batch.ranges.len(),
@@ -575,17 +651,35 @@ pub fn handle_ipi() {
 }
 
 /// 将枚举语义编码到全局请求槽。
-fn encode_shootdown_kind(kind: ShootdownKind) -> (usize, usize) {
+fn encode_shootdown_kind(kind: ShootdownKind) -> (usize, usize, usize, usize) {
     match kind {
-        ShootdownKind::Global => (KIND_GLOBAL, 0),
-        ShootdownKind::AddressSpace { token } => (KIND_ADDRESS_SPACE, token),
+        ShootdownKind::Global => (KIND_GLOBAL, 0, 0, 0),
+        ShootdownKind::AddressSpace { token } => (KIND_ADDRESS_SPACE, token, 0, 0),
+        ShootdownKind::Asid { asid } => (KIND_ASID, asid, 0, 0),
+        ShootdownKind::Page { asid, vaddr } => (KIND_PAGE, asid, vaddr, 0),
+        ShootdownKind::Range { asid, start, end } => (KIND_RANGE, asid, start, end),
     }
 }
 
 /// 从全局请求槽解码出当前请求语义。
-fn decode_shootdown_kind(kind_bits: usize, arg_token: usize) -> ShootdownKind {
+fn decode_shootdown_kind(
+    kind_bits: usize,
+    arg_token: usize,
+    arg_start: usize,
+    arg_end: usize,
+) -> ShootdownKind {
     match kind_bits {
         KIND_ADDRESS_SPACE => ShootdownKind::AddressSpace { token: arg_token },
+        KIND_ASID => ShootdownKind::Asid { asid: arg_token },
+        KIND_PAGE => ShootdownKind::Page {
+            asid: arg_token,
+            vaddr: arg_start,
+        },
+        KIND_RANGE => ShootdownKind::Range {
+            asid: arg_token,
+            start: arg_start,
+            end: arg_end,
+        },
         _ => ShootdownKind::Global,
     }
 }
@@ -594,14 +688,17 @@ fn decode_shootdown_kind(kind_bits: usize, arg_token: usize) -> ShootdownKind {
 fn perform_local_tlb_shootdown(kind: ShootdownKind) {
     match kind {
         ShootdownKind::Global => local_sfence_vma_all(),
-        ShootdownKind::AddressSpace { .. } => {
+        ShootdownKind::Asid { asid } => unsafe { crate::hal::flush_tlb_asid(asid) },
+        ShootdownKind::Page { asid, vaddr } => local_sfence_vma_page_asid(vaddr, asid),
+        ShootdownKind::Range { asid, start, end } => local_sfence_vma_range_asid(start, end, asid),
+        ShootdownKind::AddressSpace { token } => {
             // The ack path may run from SpinNoIrqLock::lock while another
             // hart is synchronously waiting for this ack.  It must therefore
-            // never acquire KERNEL_SPACE or any other lock.  Without ASIDs,
-            // a local full flush is the conservative and correct operation
-            // even if this hart switched address spaces after the target mask
-            // was sampled.
-            local_sfence_vma_all();
+            // never acquire KERNEL_SPACE or any other lock.  The ASID is
+            // encoded directly in the shootdown token, so invalidation remains
+            // precise even after this hart has switched to another satp.
+            let asid = crate::hal::address_space_id_from_token(token);
+            unsafe { crate::hal::flush_tlb_asid(asid) };
         }
     }
 }
@@ -610,6 +707,9 @@ fn perform_local_tlb_shootdown(kind: ShootdownKind) {
 fn shootdown_kind_name(kind: ShootdownKind) -> &'static str {
     match kind {
         ShootdownKind::Global => "global",
+        ShootdownKind::Asid { .. } => "asid",
+        ShootdownKind::Page { .. } => "page",
+        ShootdownKind::Range { .. } => "range",
         ShootdownKind::AddressSpace { .. } => "address-space",
     }
 }
@@ -617,4 +717,14 @@ fn shootdown_kind_name(kind: ShootdownKind) -> &'static str {
 /// 在当前 hart 上执行一次全量 `sfence.vma`。
 fn local_sfence_vma_all() {
     unsafe { crate::hal::flush_tlb() }
+}
+
+/// 在当前 hart 上刷新一个 VA+ASID 翻译。
+fn local_sfence_vma_page_asid(vaddr: usize, asid: usize) {
+    unsafe { crate::hal::flush_tlb_page_asid(vaddr, asid) }
+}
+
+/// 在当前 hart 上刷新一个 VA 范围；大范围自动退化为 ASID-wide fence。
+pub(super) fn local_sfence_vma_range_asid(start: usize, end: usize, asid: usize) {
+    unsafe { crate::hal::flush_tlb_range_asid(start, end, asid) }
 }

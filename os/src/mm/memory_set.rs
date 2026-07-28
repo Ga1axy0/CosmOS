@@ -9,7 +9,8 @@ use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
 use crate::config::{
-    MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE, USER_VDSO_BASE,
+    MAX_HARTS, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
+    USER_VDSO_BASE,
 };
 use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
@@ -301,8 +302,18 @@ pub struct MemorySet {
     pub page_table: PageTable,
     /// virtual memory areas, keyed by start VPN.
     pub vmas: BTreeMap<VirtPageNum, Vma>,
-    /// 当前仍在用户态装载该地址空间的 hart 掩码。
-    loaded_user_harts: AtomicUsize,
+    /// Hardware address-space ID encoded into this memory set's token.
+    asid: usize,
+    /// Harts currently executing userspace with this address space loaded.
+    ///
+    /// The bit is cleared after trap entry has switched to the kernel ASID.
+    /// Inactive harts may still retain stale entries, but `tlb_generation`
+    /// forces an ASID-wide fence before they return to this address space.
+    active_user_harts: AtomicUsize,
+    /// Incremented after every page-table edit visible to an existing task.
+    tlb_generation: AtomicUsize,
+    /// Last generation synchronized locally by each hart.
+    seen_tlb_generation: [AtomicUsize; MAX_HARTS],
 }
 
 /// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
@@ -374,14 +385,59 @@ pub struct DeferredUserReclaim {
     token: usize,
     /// 需要接收 shootdown 的 hart 掩码。
     mask: usize,
+    /// 精确刷新语义。
+    flush: DeferredUserFlush,
     /// shootdown 完成后才能释放的旧页对象。
     batch: UserReleaseBatch,
+}
+
+#[derive(Copy, Clone)]
+enum DeferredUserFlush {
+    AddressSpace,
+    Page { vaddr: usize },
+    Range { start: usize, end: usize },
 }
 
 impl DeferredUserReclaim {
     /// 基于锁内快照创建一次用户页表延迟回收动作。
     pub(crate) fn new(token: usize, mask: usize, batch: UserReleaseBatch) -> Self {
-        Self { token, mask, batch }
+        Self {
+            token,
+            mask,
+            flush: DeferredUserFlush::AddressSpace,
+            batch,
+        }
+    }
+
+    /// 创建一次单页 VA+ASID 延迟回收动作。
+    pub(crate) fn new_page(
+        token: usize,
+        mask: usize,
+        vaddr: usize,
+        batch: UserReleaseBatch,
+    ) -> Self {
+        Self {
+            token,
+            mask,
+            flush: DeferredUserFlush::Page { vaddr },
+            batch,
+        }
+    }
+
+    /// 创建一次范围 VA+ASID 延迟回收动作。
+    pub(crate) fn new_range(
+        token: usize,
+        mask: usize,
+        start: usize,
+        end: usize,
+        batch: UserReleaseBatch,
+    ) -> Self {
+        Self {
+            token,
+            mask,
+            flush: DeferredUserFlush::Range { start, end },
+            batch,
+        }
     }
 
     /// 判断本次回收是否实际持有旧页对象。
@@ -401,13 +457,56 @@ impl DeferredUserReclaim {
                 "[tlb] deferred user reclaim shootdown: token={:#x} mask={:#b}",
                 self.token, self.mask
             );
-            shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
+            match self.flush {
+                DeferredUserFlush::AddressSpace => {
+                    shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
+                }
+                DeferredUserFlush::Page { vaddr } => shootdown(
+                    self.mask,
+                    ShootdownKind::Page {
+                        asid: crate::hal::address_space_id_from_token(self.token),
+                        vaddr,
+                    },
+                ),
+                DeferredUserFlush::Range { start, end } => shootdown(
+                    self.mask,
+                    ShootdownKind::Range {
+                        asid: crate::hal::address_space_id_from_token(self.token),
+                        start,
+                        end,
+                    },
+                ),
+            }
         }
         // self 在函数返回时析构，batch 的 Drop 会真正释放旧页引用。
     }
 }
 
 impl MemorySet {
+    /// Flush every local non-global translation tagged with this memory set's ASID.
+    #[inline]
+    fn flush_local_tlb_asid(&self) {
+        unsafe { crate::hal::flush_tlb_asid(self.asid) };
+    }
+
+    /// Flush one local non-global page translation tagged with this ASID.
+    #[inline]
+    fn flush_local_tlb_page_asid(&self, vaddr: usize) {
+        unsafe { crate::hal::flush_tlb_page_asid(vaddr, self.asid) };
+    }
+
+    /// Flush one local virtual page number tagged with this ASID.
+    #[inline]
+    fn flush_local_tlb_vpn_asid(&self, vpn: VirtPageNum) {
+        self.flush_local_tlb_page_asid(VirtAddr::from(vpn).0);
+    }
+
+    /// Flush a bounded local VA range, falling back to ASID-wide for large ranges.
+    #[inline]
+    fn flush_local_tlb_range_asid(&self, start: usize, end: usize) {
+        super::tlb_shootdown::local_sfence_vma_range_asid(start, end, self.asid);
+    }
+
     fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {
         let mut flags = PTEFlags::empty();
         if map_perm.contains(MapPermission::R) {
@@ -439,59 +538,109 @@ impl MemorySet {
     fn finish_deferred_page_table_edit(&self) {
         // 本地 hart 可能刚刚使用过被拆除的翻译，必须先清掉本地 TLB；
         // 远端 hart 的同步由调用方构造 `DeferredUserReclaim` 后在锁外完成。
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_asid();
     }
 
-    /// Create a new empty `MemorySet`.
-    pub fn new_bare() -> Result<Self, MmError> {
+    fn new_bare_with_asid(asid: usize) -> Result<Self, MmError> {
         Ok(Self {
             page_table: PageTable::new()?,
             vmas: BTreeMap::new(),
-            loaded_user_harts: AtomicUsize::new(0),
+            asid,
+            active_user_harts: AtomicUsize::new(0),
+            // Generation zero means "never synchronized" for a new hart.
+            tlb_generation: AtomicUsize::new(1),
+            seen_tlb_generation: [const { AtomicUsize::new(0) }; MAX_HARTS],
         })
+    }
+    /// Create a new empty user `MemorySet` with a boot-unique ASID when
+    /// supported by the current architecture.
+    pub fn new_bare() -> Result<Self, MmError> {
+        // Allocate the page-table root first so an OOM failure does not burn a
+        // non-recycled ASID from this boot's finite namespace.
+        let mut memory_set = Self::new_bare_with_asid(super::asid::KERNEL_ASID)?;
+        memory_set.asid = super::asid::allocate_user_asid();
+        Ok(memory_set)
     }
     /// Get he page table token
     pub fn token(&self) -> AddressSpaceToken {
-        self.page_table.token()
+        crate::hal::with_address_space_id(self.page_table.token(), self.asid)
     }
-    /// 标记某个 hart 即将返回用户态并装载该地址空间。
-    pub fn mark_user_loaded(&self, hart_id: usize) {
+    /// Mark one hart active immediately before returning to userspace.
+    ///
+    /// A hart that missed page-table shootdowns while inactive synchronizes the
+    /// whole ASID once here. Ordinary traps whose generation did not change do
+    /// not execute a fence.
+    pub fn mark_user_active(&self, hart_id: usize) {
+        let generation = self.tlb_generation.load(Ordering::Acquire);
+        if hart_id >= MAX_HARTS {
+            self.flush_local_tlb_asid();
+            return;
+        }
+        if self.seen_tlb_generation[hart_id].load(Ordering::Acquire) != generation {
+            self.flush_local_tlb_asid();
+            self.seen_tlb_generation[hart_id].store(generation, Ordering::Release);
+        }
         let bit = 1usize << hart_id;
-        let mask = self.loaded_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
+        let mask = self.active_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
         trace!(
-            "[tlb] user mm loaded on hart {} token={:#x} mask={:#b}",
+            "[tlb] user ASID active on hart {} token={:#x} asid={} generation={} mask={:#b}",
             hart_id,
             self.token(),
+            self.asid,
+            generation,
             mask
         );
     }
-    /// 标记某个 hart 已经离开用户态，不再需要作为该地址空间的远端 shootdown 目标。
-    pub fn mark_user_unloaded(&self, hart_id: usize) {
+    /// Mark one hart inactive after trap entry switched to the kernel ASID.
+    pub fn mark_user_inactive(&self, hart_id: usize) {
+        if hart_id >= MAX_HARTS {
+            return;
+        }
+        // Do not advance `seen_tlb_generation` here.  A page-table editor
+        // publishes the new generation under process-inner, then launches the
+        // remote shootdown after dropping that lock.  This hart can acquire
+        // process-inner in between those two steps; retaining the old seen
+        // value forces `mark_user_active()` to fence before any such stale
+        // translation can be used again.
         let bit = 1usize << hart_id;
-        let mask = self.loaded_user_harts.fetch_and(!bit, Ordering::AcqRel) & !bit;
-        trace!(
-            "[tlb] user mm unloaded from hart {} token={:#x} mask={:#b}",
-            hart_id,
-            self.token(),
-            mask
-        );
+        self.active_user_harts.fetch_and(!bit, Ordering::AcqRel);
     }
-    /// 返回当前仍在用户态装载该地址空间的 hart 掩码。
-    pub fn loaded_user_harts(&self) -> usize {
-        self.loaded_user_harts.load(Ordering::Acquire)
+    /// Return harts currently executing userspace with this address space.
+    pub fn active_user_harts(&self) -> usize {
+        self.active_user_harts.load(Ordering::Acquire)
     }
-    /// 对当前仍在用户态装载该地址空间的 hart 发起同步 TLB shootdown。
+    /// Publish one locally synchronized page-table generation and snapshot the
+    /// harts that must be synchronously shot down.
     ///
-    /// 调用方不能持有对应进程锁等待 ack。用户态 IPI 进入内核后会先更新进程
-    /// 运行态信息，持锁等待可能导致远端 hart 无法进入 softirq 分支。
-    ///
-    /// 这里依赖当前 trap 语义：hart 从用户态进入内核时已经切到 kernel satp
-    /// 并执行本地 `sfence.vma`，因此不在该掩码中的 hart 不应再持有这个用户
-    /// 地址空间的旧翻译。若后续去掉 trap 入口 flush 或引入 ASID，需要重新审查。
-    pub fn shootdown_loaded_user_harts(&self) {
-        let mask = self.loaded_user_harts();
+    /// Page-table edit helpers already flush the current hart before calling
+    /// this method, so its seen generation can advance without another fence.
+    /// Inactive harts are omitted from the synchronous mask and will observe the
+    /// new generation in `mark_user_active()` before their next user return.
+    fn advance_tlb_generation(&self) -> usize {
+        let generation = self
+            .tlb_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let hart_id = crate::hal::hartid();
+        if hart_id < MAX_HARTS {
+            self.seen_tlb_generation[hart_id].store(generation, Ordering::Release);
+        }
+        self.active_user_harts()
+    }
+    /// Record a page-table edit after the caller has already synchronized the
+    /// current hart's TLB.
+    pub fn record_local_tlb_change(&self) -> usize {
+        self.advance_tlb_generation()
+    }
+    /// Synchronize the current hart for this ASID, then publish a new page-table
+    /// generation and return the active remote target mask.
+    pub fn record_tlb_change_with_local_fence(&self) -> usize {
+        self.flush_local_tlb_asid();
+        self.advance_tlb_generation()
+    }
+    /// 对当前正在用户态执行该地址空间的 hart 发起同步 TLB shootdown。
+    pub fn shootdown_active_user_harts(&self) {
+        let mask = self.active_user_harts();
         self.shootdown_user_harts(mask);
     }
     /// 对指定 hart 掩码发起该地址空间的同步 TLB shootdown。
@@ -499,14 +648,14 @@ impl MemorySet {
     /// 这个接口用于调用方已经在锁内快照出目标 mask，随后释放锁再执行同步等待
     /// 的场景。
     ///
-    /// snapshot 只覆盖“页表修改完成时仍在用户态运行该 mm”的 hart。修改完成后
-    /// 才从内核态返回用户态的 hart，必须已经经过 trap 入口的本地 flush 同步点。
+    /// snapshot 只覆盖当前 active harts；inactive harts 会在下一次返回该 mm
+    /// 前根据 TLB generation 执行一次本地 ASID-wide fence。
     pub fn shootdown_user_harts(&self, mask: usize) {
         if mask == 0 {
             return;
         }
         debug!(
-            "[tlb] shootdown user mm token={:#x} loaded_mask={:#b}",
+            "[tlb] shootdown user mm token={:#x} active_mask={:#b}",
             self.token(),
             mask
         );
@@ -827,8 +976,8 @@ impl MemorySet {
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
-        let mut memory_set =
-            Self::new_bare().expect("failed to allocate boot-time kernel root page table");
+        let mut memory_set = Self::new_bare_with_asid(super::asid::KERNEL_ASID)
+            .expect("failed to allocate boot-time kernel root page table");
         // map trampoline
         memory_set
             .map_trampoline()
@@ -1103,9 +1252,7 @@ impl MemorySet {
             }
         }
         if parent_tlb_needs_flush {
-            unsafe {
-                crate::hal::flush_tlb();
-            }
+            user_space.flush_local_tlb_asid();
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
         let total_ns = get_time_ns() - clone_start_ns;
@@ -1247,7 +1394,7 @@ impl MemorySet {
     /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
         unsafe {
-            crate::hal::activate_address_space(self.page_table.token());
+            crate::hal::activate_address_space(self.token());
         }
     }
     /// Translate a virtual page number to a page table entry
@@ -1276,9 +1423,7 @@ impl MemorySet {
             let _ = area.teardown_deferred(&mut self.page_table);
         }
         self.vmas.clear();
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_asid();
     }
 
     /// 将用户区域收缩到新的上界，并延迟释放被拆下的旧页对象。
@@ -1423,9 +1568,7 @@ impl MemorySet {
     pub fn shrink_metadata_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self.vmas.get_mut(&start.floor()) {
             area.shrink_present_to(&mut self.page_table, new_end.ceil());
-            unsafe {
-                crate::hal::flush_tlb();
-            }
+            self.flush_local_tlb_asid();
             true
         } else {
             false
@@ -1565,9 +1708,7 @@ impl MemorySet {
         if shared {
             self.insert_vma_eager(vma)?;
             self.merge_vma_around(start_vpn);
-            unsafe {
-                crate::hal::flush_tlb();
-            }
+            self.flush_local_tlb_range_asid(start_va.0, end_va.0);
         } else {
             self.register_vma_metadata(vma)?;
             self.merge_vma_around(start_vpn);
@@ -1867,7 +2008,7 @@ impl MemorySet {
         for start in merge_candidates {
             self.merge_vma_around(start);
         }
-        self.finish_deferred_page_table_edit();
+        self.flush_local_tlb_range_asid(start_va.0, end_va.0);
         debug!(
             "[munmap] complete teardown: start_vpn={:#x} end_vpn={:#x}",
             start_vpn.0, end_vpn.0
@@ -1902,9 +2043,7 @@ impl MemorySet {
                     pte.ppn().0,
                     pte.flags(),
                 );
-                unsafe {
-                    crate::hal::flush_tlb();
-                }
+                self.flush_local_tlb_page_asid(fault_va.0);
                 return FilePageFaultPrepare::Resolved;
             }
             warn!(
@@ -2039,9 +2178,7 @@ impl MemorySet {
                     pte.ppn().0,
                     pte.flags(),
                 );
-                unsafe {
-                    crate::hal::flush_tlb();
-                }
+                self.flush_local_tlb_page_asid(fault_va.0);
                 return Ok(PageFaultHandled::Handled);
             }
             return Ok(PageFaultHandled::NotHandled);
@@ -2057,9 +2194,7 @@ impl MemorySet {
         {
             record_private_anonymous_first_fault(access);
         }
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_page_asid(fault_va.0);
         Ok(PageFaultHandled::Handled)
     }
 
@@ -2070,6 +2205,11 @@ impl MemorySet {
         page: Arc<SpinNoIrqLock<CachePage>>,
     ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
+            // Another hart installed the demand page after our lock-free
+            // prepare phase.  The current hart may still cache the invalid
+            // translation that caused this fault, so retry only after a local
+            // ASID fence.
+            self.flush_local_tlb_vpn_asid(plan.vpn);
             return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
@@ -2097,9 +2237,7 @@ impl MemorySet {
             release_mapped_page(&old_page);
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_vpn_asid(plan.vpn);
         debug!(
             "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} writable={} path={:?}",
             plan.vpn.0,
@@ -2153,6 +2291,8 @@ impl MemorySet {
 
         let mut mapped_fault_page = self.page_table.translate(plan.vpn).is_some();
         let mut mapped_any = false;
+        let mut mapped_start = usize::MAX;
+        let mut mapped_end = 0usize;
         for (vpn, page) in pages {
             if vpn < plan.vma_start
                 || vpn >= plan.vma_end
@@ -2171,11 +2311,16 @@ impl MemorySet {
             self.page_table.map(vpn, ppn, pte_flags)?;
             mapped_any = true;
             mapped_fault_page |= vpn == plan.vpn;
+            let page_start = VirtAddr::from(vpn).0;
+            mapped_start = mapped_start.min(page_start);
+            mapped_end = mapped_end.max(page_start + PAGE_SIZE);
         }
         if mapped_any {
-            unsafe {
-                crate::hal::flush_tlb();
-            }
+            self.flush_local_tlb_range_asid(mapped_start, mapped_end);
+        } else if mapped_fault_page {
+            // The demand page can have been installed concurrently after the
+            // prepare phase even when this fault-around batch added no page.
+            self.flush_local_tlb_vpn_asid(plan.vpn);
         }
         Ok(if mapped_fault_page {
             PageFaultHandled::Handled
@@ -2265,9 +2410,7 @@ impl MemorySet {
             release_mapped_page(&old_page);
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_vpn_asid(plan.vpn);
         trace!(
             "[cow] install MAP_PRIVATE readonly cache page: vpn={:#x} page_idx={} ppn={:#x} access={:?} path={:?}",
             plan.vpn.0,
@@ -2313,9 +2456,7 @@ impl MemorySet {
         }
         // 首次写 fault 时立即把 page cache 页记脏，避免等待 teardown 才传播脏状态。
         mark_cached_page_dirty(&page);
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_vpn_asid(vpn);
         debug!(
             "[mmap] shared write-notify fault: vpn={:#x} ppn={:#x} path={:?}",
             vpn.0,
@@ -2338,7 +2479,7 @@ impl MemorySet {
         if pte.writable() {
             // 可能是其他 hart 已经把该页从 COW 只读状态放宽为可写，
             // 当前 hart 仍命中了陈旧的只读 TLB。刷新本地后让用户态重试。
-            self.finish_deferred_page_table_edit();
+            self.flush_local_tlb_vpn_asid(vpn);
             return Ok((PageFaultHandled::Handled, Some(batch)));
         }
         let file_private_cache_page = {
@@ -2379,7 +2520,7 @@ impl MemorySet {
             if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
-            self.finish_deferred_page_table_edit();
+            self.flush_local_tlb_vpn_asid(vpn);
             trace!(
                 "[cow] materialize MAP_PRIVATE page on write fault: vpn={:#x} cache_ppn={:#x} new_ppn={:#x} path={:?}",
                 vpn.0,
@@ -2426,7 +2567,7 @@ impl MemorySet {
             if !self.page_table.update_flags(vpn, writable_flags) {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
-            self.finish_deferred_page_table_edit();
+            self.flush_local_tlb_vpn_asid(vpn);
             trace!(
                 "[cow] reuse exclusive private page: vpn={:#x} ppn={:#x} path={:?}",
                 vpn.0,
@@ -2452,7 +2593,7 @@ impl MemorySet {
         if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
             return Ok((PageFaultHandled::NotHandled, None));
         }
-        self.finish_deferred_page_table_edit();
+        self.flush_local_tlb_vpn_asid(vpn);
         trace!(
             "[cow] copy private page on write fault: vpn={:#x} old_ppn={:#x} new_ppn={:#x} path={:?}",
             vpn.0,
@@ -2470,6 +2611,9 @@ impl MemorySet {
         page: Arc<SpinNoIrqLock<CachePage>>,
     ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
+            // A concurrent fault resolved this page after prepare.  Discard
+            // the current hart's stale invalid translation before retrying.
+            self.flush_local_tlb_vpn_asid(plan.vpn);
             return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
@@ -2490,9 +2634,7 @@ impl MemorySet {
         let page_guard = page.lock();
         let src = page_guard.ppn().get_bytes_array();
         dst.copy_from_slice(src);
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_vpn_asid(plan.vpn);
         trace!(
             "[cow] materialize MAP_PRIVATE page on first write fault: vpn={:#x} page_idx={} dst_ppn={:#x} path={:?}",
             plan.vpn.0,
@@ -2586,9 +2728,7 @@ impl MemorySet {
         for key in changed_keys {
             self.merge_vma_around(key);
         }
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_range_asid(start_va.0, end_va.0);
         true
     }
 }

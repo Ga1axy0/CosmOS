@@ -14,9 +14,9 @@ use crate::fs::{
 use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
 use crate::mm::{
-    register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, FilePageFaultPrepare,
-    InodeKey, MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
-    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
+    register_file_mapping, shootdown, shootdown_page, shootdown_range, translated_refmut,
+    DeferredUserReclaim, FilePageFaultPrepare, InodeKey, MapPermission, MemorySet, MmError,
+    PageFaultAccess, PageFaultHandled, ShootdownKind, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sched::insert_into_pid2process;
 use crate::sched::{add_task, current_task};
@@ -1160,11 +1160,10 @@ impl ProcessControlBlock {
         super::terminate_other_threads_for_exec(self, &task);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        let (mut old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments) = {
+        let (mut old_memory_set, old_token, cloexec_entries, old_shm_attachments) = {
             let mut inner = self.inner_exclusive_access();
             let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             let old_token = old_memory_set.token();
-            let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
             inner.exec_path = exec_path;
             inner.environment = envs.clone();
@@ -1184,13 +1183,13 @@ impl ProcessControlBlock {
             (
                 old_memory_set,
                 old_token,
-                old_mask,
                 cloexec_entries,
                 old_shm_attachments,
             )
         };
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
+        let old_mask = old_memory_set.record_local_tlb_change();
         DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
         for entry in &cloexec_entries {
             entry.desc.release_posix_locks_for_owner(owner_pid);
@@ -1349,7 +1348,7 @@ impl ProcessControlBlock {
                     .map_err(mm_error_to_errno)?;
             let parent_token = parent.memory_set.token();
             let parent_mask = if parent_tlb_needs_flush {
-                parent.memory_set.loaded_user_harts()
+                parent.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -1359,7 +1358,7 @@ impl ProcessControlBlock {
                 MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
             let parent_token = parent.memory_set.token();
             let parent_mask = if parent_tlb_needs_flush {
-                parent.memory_set.loaded_user_harts()
+                parent.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -1877,12 +1876,31 @@ impl ProcessControlBlock {
         shared: bool,
     ) -> Result<(), ERRNO> {
         let len = usize::from(end).saturating_sub(usize::from(start));
-        let mut inner = self.inner.lock();
-        inner.ensure_address_space_capacity(len)?;
-        inner
-            .memory_set
-            .mmap_anonymous(start, end, perm, shared)
-            .map_err(mm_error_to_errno)
+        let (token, mask) = {
+            let mut inner = self.inner.lock();
+            inner.ensure_address_space_capacity(len)?;
+            inner
+                .memory_set
+                .mmap_anonymous(start, end, perm, shared)
+                .map_err(mm_error_to_errno)?;
+            if shared {
+                (
+                    inner.memory_set.token(),
+                    inner.memory_set.record_local_tlb_change(),
+                )
+            } else {
+                (0, 0)
+            }
+        };
+        if mask != 0 {
+            shootdown_range(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                start.0,
+                end.0,
+            );
+        }
+        Ok(())
     }
     /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
     pub fn mmap_file(
@@ -1914,10 +1932,14 @@ impl ProcessControlBlock {
         let reclaim = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
-            let mask = inner.memory_set.loaded_user_harts();
             let batch = inner
                 .memory_set
                 .invalidate_file_mappings_after_truncate_deferred(inode, new_size);
+            let mask = if batch.is_empty() {
+                0
+            } else {
+                inner.memory_set.record_local_tlb_change()
+            };
             DeferredUserReclaim::new(token, mask, batch)
         };
         reclaim.flush_then_release();
@@ -1945,11 +1967,10 @@ impl ProcessControlBlock {
             let mut inner = self.inner.lock();
             let _ = inner.memory_set.msync_range(start, end);
             let token = inner.memory_set.token();
-            let mask = inner.memory_set.loaded_user_harts();
-            inner
-                .memory_set
-                .munmap_deferred(start, end)
-                .map(|batch| DeferredUserReclaim::new(token, mask, batch))
+            inner.memory_set.munmap_deferred(start, end).map(|batch| {
+                let mask = inner.memory_set.record_local_tlb_change();
+                DeferredUserReclaim::new_range(token, mask, start.0, end.0, batch)
+            })
         }) else {
             return false;
         };
@@ -1978,7 +1999,7 @@ impl ProcessControlBlock {
                 .memory_set
                 .mremap(old_start, old_end, new_start, new_end)
                 .map_err(mm_error_to_errno)?;
-            let mask = inner.memory_set.loaded_user_harts();
+            let mask = inner.memory_set.record_local_tlb_change();
             let reclaim = DeferredUserReclaim::new(token, mask, batch);
             (usize::from(result), token, mask, reclaim)
         };
@@ -2030,13 +2051,15 @@ impl ProcessControlBlock {
         let (handled, reclaim) = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
-            let mask = inner.memory_set.loaded_user_harts();
             let (handled, batch) = inner
                 .memory_set
                 .handle_private_cow_fault(VirtAddr::from(fault_addr))?;
             (
                 handled,
-                batch.map(|batch| DeferredUserReclaim::new(token, mask, batch)),
+                batch.map(|batch| {
+                    let mask = inner.memory_set.record_local_tlb_change();
+                    DeferredUserReclaim::new_page(token, mask, fault_addr, batch)
+                }),
             )
         };
         if let Some(reclaim) = reclaim {
@@ -2057,14 +2080,18 @@ impl ProcessControlBlock {
                 .handle_lazy_user_fault(VirtAddr::from(fault_addr), access)?;
             let token = inner.memory_set.token();
             let mask = if handled == PageFaultHandled::Handled {
-                inner.memory_set.loaded_user_harts()
+                inner.memory_set.record_local_tlb_change()
             } else {
                 0
             };
             (handled, token, mask)
         };
         if mask != 0 {
-            shootdown(mask, ShootdownKind::AddressSpace { token });
+            shootdown_page(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                fault_addr,
+            );
         }
         Ok(handled)
     }
@@ -2089,7 +2116,7 @@ impl ProcessControlBlock {
                     .handle_shared_write_fault(VirtAddr::from(fault_addr));
                 let token = inner.memory_set.token();
                 let mask = if notified {
-                    inner.memory_set.loaded_user_harts()
+                    inner.memory_set.record_local_tlb_change()
                 } else {
                     0
                 };
@@ -2097,7 +2124,11 @@ impl ProcessControlBlock {
             };
             if notified {
                 if mask != 0 {
-                    shootdown(mask, ShootdownKind::AddressSpace { token });
+                    shootdown_page(
+                        mask,
+                        crate::hal::address_space_id_from_token(token),
+                        fault_addr,
+                    );
                 }
                 trace!(
                     "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
@@ -2114,7 +2145,7 @@ impl ProcessControlBlock {
                 .prepare_file_page_fault(VirtAddr::from(fault_addr), access);
             let token = inner.memory_set.token();
             let mask = if matches!(&prepared, FilePageFaultPrepare::Resolved) {
-                inner.memory_set.loaded_user_harts()
+                inner.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -2123,7 +2154,11 @@ impl ProcessControlBlock {
         let plan = match prepared {
             FilePageFaultPrepare::Resolved => {
                 if mask != 0 {
-                    shootdown(mask, ShootdownKind::AddressSpace { token });
+                    shootdown_page(
+                        mask,
+                        crate::hal::address_space_id_from_token(token),
+                        fault_addr,
+                    );
                 }
                 trace!(
                     "[mmap] page fault resolved by present PTE: pid={} addr={:#x} access={:?}",
@@ -2210,6 +2245,14 @@ impl ProcessControlBlock {
                 }
                 pages
             });
+        let fault_flush_range = fault_around_pages.as_ref().and_then(|pages| {
+            let first_vpn = pages.iter().map(|(vpn, _)| *vpn).min()?;
+            let last_vpn = pages.iter().map(|(vpn, _)| *vpn).max()?;
+            Some((
+                VirtAddr::from(first_vpn).0,
+                VirtAddr::from(last_vpn).0 + PAGE_SIZE,
+            ))
+        });
         let (committed, token, mask) = {
             let mut inner = self.inner.lock();
             // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
@@ -2223,7 +2266,7 @@ impl ProcessControlBlock {
             }?;
             let token = inner.memory_set.token();
             let mask = if committed == PageFaultHandled::Handled {
-                inner.memory_set.loaded_user_harts()
+                inner.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -2234,7 +2277,12 @@ impl ProcessControlBlock {
         // every other hart that was running this address space before allowing
         // it to continue with a cached invalid or restrictive translation.
         if mask != 0 {
-            shootdown(mask, ShootdownKind::AddressSpace { token });
+            let asid = crate::hal::address_space_id_from_token(token);
+            if let Some((start, end)) = fault_flush_range {
+                shootdown_range(mask, asid, start, end);
+            } else {
+                shootdown_page(mask, asid, fault_addr);
+            }
         }
         trace!(
             "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
@@ -2255,10 +2303,10 @@ impl ProcessControlBlock {
             // 锁内只快照目标 hart，锁外再等待 ack。远端用户态 IPI 进入
             // trap_handler 前会调用 enter_kernel()，持进程锁等待会造成死锁。
             //
-            // 这个快照依赖 trap 入口本地 sfence.vma：快照后才返回用户态的 hart
-            // 已经经过本地 flush，不需要包含在本次远端 shootdown 里。
+            // 这个快照只覆盖当前 active harts。inactive hart 会在下一次返回
+            // 该 mm 前根据 TLB generation 自行执行 ASID fence。
             let mask = if ok {
-                inner.memory_set.loaded_user_harts()
+                inner.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -2271,7 +2319,12 @@ impl ProcessControlBlock {
                 token,
                 mask
             );
-            shootdown(mask, ShootdownKind::AddressSpace { token });
+            shootdown_range(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                start.0,
+                end.0,
+            );
         }
         ok
     }
@@ -2352,10 +2405,10 @@ impl ProcessControlBlock {
 
             inner.vm_layout.brk = new_brk;
             let reclaim = batch.map(|batch| {
-                // 锁内快照仍在用户态运行该 mm 的 hart，锁外等待 shootdown ack。
+                // 锁内快照所有可能缓存该 ASID 的 hart，锁外等待 shootdown ack。
                 DeferredUserReclaim::new(
                     inner.memory_set.token(),
-                    inner.memory_set.loaded_user_harts(),
+                    inner.memory_set.record_local_tlb_change(),
                     batch,
                 )
             });
@@ -2377,8 +2430,10 @@ impl ProcessControlBlock {
     /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
     pub fn enter_kernel(&self, now: usize) {
         let mut inner = self.inner.lock();
-        // trap 入口已经切到内核页表并做过本地 sfence.vma，此 hart 不再持有该用户 mm。
-        inner.memory_set.mark_user_unloaded(crate::hal::hartid());
+        // The trampoline already switched to the kernel ASID. Stale user TLB
+        // entries may remain locally, but generation tracking guarantees an
+        // ASID fence before this hart next returns to an edited address space.
+        inner.memory_set.mark_user_inactive(crate::hal::hartid());
         match inner.accounting_state {
             CpuAccountingState::User => {
                 inner.user_time = inner
@@ -2405,7 +2460,7 @@ impl ProcessControlBlock {
         inner.accounting_state = CpuAccountingState::User;
         inner.accounting_timestamp = now;
         // 即将跳回用户态，后续其他 hart 修改该 mm 时需要把当前 hart 作为 shootdown 目标。
-        inner.memory_set.mark_user_loaded(crate::hal::hartid());
+        inner.memory_set.mark_user_active(crate::hal::hartid());
     }
 
     /// Flush the current running slice into the corresponding accumulator.
