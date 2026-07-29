@@ -332,12 +332,23 @@ pub fn sys_getpid() -> isize {
 
 /// getppid syscall
 pub fn sys_getppid() -> isize {
+    #[cfg(feature = "process_identity_cache")]
+    {
+        let process = current_process();
+        trace!("kernel: sys_getppid pid:{}", process.getpid());
+        return process.getppid_cached() as isize;
+    }
+
+    #[cfg(not(feature = "process_identity_cache"))]
     trace!(
         "kernel: sys_getppid pid:{}",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
+    #[cfg(not(feature = "process_identity_cache"))]
     let process = current_process();
+    #[cfg(not(feature = "process_identity_cache"))]
     let parent = process.inner_exclusive_access().parent.clone();
+    #[cfg(not(feature = "process_identity_cache"))]
     if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
         parent.getpid() as isize
     } else {
@@ -1577,6 +1588,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 *trap_cx = inherited_cx;
                 trap_cx.set_kernel_sp(new_task.kstack.get_top());
                 trap_cx.set_syscall_ret(0);
+                #[cfg(all(
+                    target_arch = "riscv64",
+                    any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+                ))]
+                trap_cx.set_reg(0, 0);
                 if child_user_sp != 0 {
                     trap_cx.set_user_sp(child_user_sp);
                 }

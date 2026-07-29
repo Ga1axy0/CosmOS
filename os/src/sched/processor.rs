@@ -15,6 +15,10 @@ use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use core::array;
+#[cfg(feature = "current_task_cache")]
+use core::ptr;
+#[cfg(feature = "current_task_cache")]
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 use lazy_static::*;
 
@@ -74,6 +78,23 @@ lazy_static! {
         array::from_fn(|_| SpinNoIrqLock::new(Processor::new()));
 }
 
+#[cfg(feature = "current_task_cache")]
+static CURRENT_TASK_PTRS: [AtomicPtr<TaskControlBlock>; MAX_HARTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; MAX_HARTS];
+
+#[cfg(feature = "current_task_cache")]
+#[inline]
+fn publish_current_task(task: Option<&Arc<TaskControlBlock>>) {
+    let ptr = task.map_or(ptr::null_mut(), |task| Arc::as_ptr(task).cast_mut());
+    CURRENT_TASK_PTRS[hartid()].store(ptr, Ordering::Release);
+}
+
+#[cfg(feature = "current_task_cache")]
+#[inline]
+fn current_task_ptr() -> *mut TaskControlBlock {
+    CURRENT_TASK_PTRS[hartid()].load(Ordering::Acquire)
+}
+
 /// 返回当前 hart 对应的 `Processor` 存储入口。
 ///
 /// 这里会根据 `hartid()` 选择 `PROCESSORS[hartid]`，从而让“当前任务”
@@ -118,7 +139,7 @@ pub(crate) fn run_tasks() {
             task_inner.sched.last_cpu = hartid();
             task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.on_rq = false;
-            task_inner.sched.resched_reason = None;
+            task.set_resched_reason_locked(&mut task_inner, None);
             if matches!(task_inner.sched.policy, SchedPolicy::Other) {
                 let now_ns = crate::timer::get_time_ns();
                 task_inner.sched.exec_start_ns = now_ns;
@@ -127,6 +148,8 @@ pub(crate) fn run_tasks() {
             drop(task_inner);
 
             processor.current = Some(task);
+            #[cfg(feature = "current_task_cache")]
+            publish_current_task(processor.current.as_ref());
             drop(processor);
             process.resume_in_kernel(get_time());
 
@@ -186,17 +209,61 @@ fn finish_pending_task_release() {
 
 /// Get current task through take, leaving a None in its place
 pub(crate) fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    current_processor().lock().take_current()
+    let mut processor = current_processor().lock();
+    let task = processor.take_current();
+    #[cfg(feature = "current_task_cache")]
+    publish_current_task(None);
+    task
+}
+
+/// Restore ownership of the running task after a block attempt was cancelled.
+pub(crate) fn restore_current_task(task: Arc<TaskControlBlock>) {
+    let mut processor = current_processor().lock();
+    processor.set_current(task);
+    #[cfg(feature = "current_task_cache")]
+    publish_current_task(processor.current.as_ref());
 }
 
 /// Get a copy of the current task
+#[cfg(not(feature = "current_task_cache"))]
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     current_processor().lock().current()
 }
 
+/// Get a copy of the current task without taking Processor's spinlock.
+///
+/// The Processor-held `Arc` remains the ownership source. Only the owning hart
+/// publishes or clears this pointer, with local interrupts disabled by the
+/// Processor lock. CosmOS does not preempt executing kernel code, so this hart
+/// cannot drop that owner between the load and strong-count increment.
+#[cfg(feature = "current_task_cache")]
+pub fn current_task() -> Option<Arc<TaskControlBlock>> {
+    let ptr = current_task_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
+}
+
 /// get current process
+#[cfg(not(feature = "process_identity_cache"))]
 pub fn current_process() -> Arc<ProcessControlBlock> {
     current_task().unwrap().process.upgrade().unwrap()
+}
+
+/// Get the current process without first constructing a temporary task Arc.
+///
+/// The Processor-owned task Arc cannot disappear while this hart executes
+/// non-preemptible kernel code.  The process itself is still returned as an
+/// owned Arc through the task's Weak pointer.
+#[cfg(feature = "process_identity_cache")]
+pub fn current_process() -> Arc<ProcessControlBlock> {
+    let ptr = current_task_ptr();
+    assert!(!ptr.is_null(), "current process requested without a task");
+    unsafe { (*ptr).process.upgrade().unwrap() }
 }
 
 /// Get the current user address-space token.
@@ -207,6 +274,11 @@ pub fn current_user_token() -> AddressSpaceToken {
 
 /// Get the mutable reference to trap context of current task
 pub fn current_trap_cx() -> &'static mut TrapContext {
+    #[cfg(feature = "trap_context_cache")]
+    {
+        return current_task().unwrap().cached_trap_cx();
+    }
+    #[cfg(not(feature = "trap_context_cache"))]
     current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -215,6 +287,11 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 
 /// get the user virtual address of trap context
 pub fn current_trap_cx_user_va() -> usize {
+    #[cfg(feature = "trap_context_cache")]
+    {
+        return current_task().unwrap().cached_trap_cx_user_va();
+    }
+    #[cfg(not(feature = "trap_context_cache"))]
     current_task()
         .unwrap()
         .inner_exclusive_access()

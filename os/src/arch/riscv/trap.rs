@@ -20,16 +20,26 @@ use riscv::register::{
 #[cfg(feature = "kernel_trap_diagnostics")]
 use riscv::register::{satp, sepc};
 
-#[cfg(feature = "kernel_trap_diagnostics")]
-global_asm!(concat!(
-    ".equ KERNEL_TRAP_DIAGNOSTICS, 1\n",
-    include_str!("trap.S")
-));
-#[cfg(not(feature = "kernel_trap_diagnostics"))]
-global_asm!(concat!(
-    ".equ KERNEL_TRAP_DIAGNOSTICS, 0\n",
-    include_str!("trap.S")
-));
+#[cfg(all(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe"))]
+compile_error!("getpid assembly probe modes are mutually exclusive");
+
+const GETPID_ASM_PROBE_MODE: usize = if cfg!(feature = "getpid_asm_satp_probe") {
+    2
+} else if cfg!(feature = "getpid_asm_probe") {
+    1
+} else {
+    0
+};
+
+global_asm!(
+    concat!(
+        ".equ KERNEL_TRAP_DIAGNOSTICS, {kernel_trap_diagnostics}\n",
+        ".equ GETPID_ASM_PROBE, {getpid_asm_probe}\n",
+        include_str!("trap.S")
+    ),
+    kernel_trap_diagnostics = const cfg!(feature = "kernel_trap_diagnostics") as usize,
+    getpid_asm_probe = const GETPID_ASM_PROBE_MODE,
+);
 
 /// RISC-V implementation of [`InterruptControl`](crate::hal::traits::InterruptControl).
 pub struct RiscvInterruptControl;
@@ -337,7 +347,7 @@ impl TrapMachine for RiscvTrapMachine {
         }
         let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
         asm!(
-            "fence.i",
+            // "fence.i",
             "jr {restore_va}",
             restore_va = in(reg) restore_va,
             in("a0") trap_cx_user_va,
@@ -468,6 +478,11 @@ impl TrapContextAbi for RiscvTrapContextAbi {
     }
 
     fn set_reg(frame: &mut Self::Frame, index: usize, value: usize) {
+        #[cfg(any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe"))]
+        if index == 0 {
+            frame.x[0] = value;
+            return;
+        }
         if index != 0 {
             frame.x[index] = value;
         }

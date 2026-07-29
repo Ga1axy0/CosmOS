@@ -79,6 +79,53 @@ __alltraps:
     # read user stack from sscratch and save it in TrapContext
     csrr t2, sscratch
     sd t2, 2*8(sp)
+
+    # Diagnostic-only assembly getppid path.  lmbench's "null" callback invokes
+    # syscall 173, not getpid.  The first call follows the normal Rust path,
+    # which caches the real parent PID in the otherwise-unused saved x0 slot.
+    # Later calls can therefore preserve getppid semantics while bounding trap
+    # entry/restore and satp-switch overhead without Rust or lock traffic.
+    #
+    # mode 1: restore directly in the still-active user address space.
+    # mode 2: perform the normal user->kernel->user satp writes, but no Rust.
+    .if GETPID_ASM_PROBE
+    # a7 retains the syscall number across user timer interrupts.  Check the
+    # cause first so an interrupt during the benchmark cannot masquerade as a
+    # second getppid call.
+    csrr t0, scause
+    li t1, 8
+    bne t0, t1, .Lnormal_trap_path
+    ld t0, 17*8(sp)
+    li t1, 173
+    bne t0, t1, .Lnormal_trap_path
+    ld t0, 0*8(sp)
+    beqz t0, .Lnormal_trap_path
+    addi t0, t0, -1
+    sd t0, 10*8(sp)
+    ld t0, 33*8(sp)
+    addi t0, t0, 4
+    sd t0, 33*8(sp)
+    mv a0, sp
+    csrr a1, satp
+
+    .if GETPID_ASM_PROBE == 2
+    # Preserve the user ASID test across both satp writes.
+    slli t2, a1, 4
+    srli t2, t2, 48
+    ld t0, 35*8(sp)
+    csrw satp, t0
+    bnez t2, .Lprobe_kernel_satp_ready
+    sfence.vma
+.Lprobe_kernel_satp_ready:
+    csrw satp, a1
+    bnez t2, .Luser_satp_ready
+    sfence.vma
+    .endif
+
+    j .Luser_satp_ready
+.Lnormal_trap_path:
+    .endif
+
     # restore kernel hart id into tp before entering Rust
     ld tp, 34*8(sp)
     # load kernel_satp into t0

@@ -1,9 +1,9 @@
 //! Scheduling control-flow entry points.
 
 use super::{
-    boost_process_cfs_tasks, cfs_should_preempt, current_process, current_processor, current_task,
-    defer_task_release_after_switch, has_runnable_task_at_or_above, schedule, take_current_task,
-    TaskContext,
+    boost_process_cfs_tasks, cfs_should_preempt, current_process, current_task,
+    defer_task_release_after_switch, has_runnable_task_at_or_above, restore_current_task, schedule,
+    take_current_task, TaskContext,
 };
 use crate::hal::hartid;
 use crate::sched::CFS_YIELD_PENALTY_NS;
@@ -34,12 +34,10 @@ fn suspend_current_and_run_next_inner(
         if matches!(task_inner.task_status, TaskStatus::Zombie) {
             task_inner.sched.on_rq = false;
             task_inner.wait_reason = None;
-            task_inner.sched.resched_reason = None;
         } else {
             task_inner.sched.on_rq = false;
             task_inner.task_status = TaskStatus::Runnable;
             task_inner.wait_reason = None;
-            task_inner.sched.resched_reason = None;
             if reset_slice {
                 task_inner.reset_time_slice();
             }
@@ -55,6 +53,7 @@ fn suspend_current_and_run_next_inner(
                     .saturating_add(CFS_YIELD_PENALTY_NS);
             }
         }
+        task.set_resched_reason_locked(&mut task_inner, None);
         &mut task_inner.task_cx as *mut TaskContext
     };
     defer_task_release_after_switch(task);
@@ -97,7 +96,7 @@ pub fn block_current_and_run_next(reason: WaitReason) {
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.account_cfs_runtime(get_time_ns());
-        if matches!(task_inner.task_status, TaskStatus::Runnable) {
+        let task_cx_ptr = if matches!(task_inner.task_status, TaskStatus::Runnable) {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
             task.on_cpu.store(true, Ordering::Relaxed);
@@ -111,20 +110,20 @@ pub fn block_current_and_run_next(reason: WaitReason) {
                 crate::hal::hartid(),
             );
             task_inner.sched.on_rq = false;
-            task_inner.sched.resched_reason = None;
             None
         } else {
             task_inner.sched.on_rq = false;
             task_inner.task_status = TaskStatus::Interruptible;
             task_inner.wait_reason = Some(reason);
-            task_inner.sched.resched_reason = None;
             boost_same_process_cfs =
                 task_inner.sched.policy.is_rt() && matches!(reason, WaitReason::Nanosleep);
             Some(&mut task_inner.task_cx as *mut TaskContext)
-        }
+        };
+        task.set_resched_reason_locked(&mut task_inner, None);
+        task_cx_ptr
     };
     if task_cx_ptr.is_none() {
-        current_processor().lock().set_current(task);
+        restore_current_task(task);
         return;
     }
     let process = task.process.upgrade().unwrap();
@@ -152,12 +151,20 @@ pub fn mark_current_task_need_resched() {
 /// Mark the current task for deferred rescheduling with a concrete reason.
 pub fn request_current_task_resched(reason: ReschedReason) {
     if let Some(task) = current_task() {
-        task.inner_exclusive_access().sched.resched_reason = Some(reason);
+        let mut inner = task.inner_exclusive_access();
+        task.set_resched_reason_locked(&mut inner, Some(reason));
     }
 }
 
 /// Returns whether the current task has a pending reschedule request.
 pub fn current_task_need_resched() -> bool {
+    #[cfg(feature = "return_work_cache")]
+    {
+        return current_task()
+            .map(|task| task.resched_work_pending())
+            .unwrap_or(false);
+    }
+    #[cfg(not(feature = "return_work_cache"))]
     current_task()
         .map(|task| task.inner_exclusive_access().sched.resched_reason.is_some())
         .unwrap_or(false)
@@ -165,7 +172,36 @@ pub fn current_task_need_resched() -> bool {
 
 /// Handle deferred rescheduling at a safe scheduling point.
 pub fn schedule_if_needed() {
-    let reason = current_task().and_then(|task| task.inner_exclusive_access().sched.resched_reason);
+    let task = current_task();
+    #[cfg(feature = "return_work_cache")]
+    if !task
+        .as_ref()
+        .map(|task| task.resched_work_pending())
+        .unwrap_or(false)
+    {
+        #[cfg(feature = "sched_invariant_checks")]
+        if let Some(task) = task.as_ref() {
+            let task_inner = task.inner_exclusive_access();
+            assert!(
+                task.resched_work_pending() || task_inner.sched.resched_reason.is_none(),
+                "[sched-inv] false reschedule hint with pending reason"
+            );
+        }
+        return;
+    }
+    let reason = task.as_ref().and_then(|task| {
+        #[cfg_attr(not(feature = "return_work_cache"), allow(unused_mut))]
+        let mut task_inner = task.inner_exclusive_access();
+        let reason = task_inner.sched.resched_reason;
+        #[cfg(feature = "return_work_cache")]
+        if reason.is_none() {
+            // Clear a stale positive hint before dropping task-inner. Every
+            // producer uses this same lock, so a later producer's true store
+            // cannot be overwritten by this cleanup.
+            task.set_resched_reason_locked(&mut task_inner, None);
+        }
+        reason
+    });
     let Some(reason) = reason else {
         return;
     };
@@ -198,7 +234,10 @@ pub fn on_timer_tick() {
         SchedPolicy::Fifo => {
             let prio = task_inner.sched.rt_priority;
             if has_runnable_task_at_or_above(hartid(), prio.saturating_add(1)) {
-                task_inner.sched.resched_reason = Some(ReschedReason::HigherRtPriority);
+                task.set_resched_reason_locked(
+                    &mut task_inner,
+                    Some(ReschedReason::HigherRtPriority),
+                );
             }
         }
         SchedPolicy::Rr => {
@@ -210,7 +249,10 @@ pub fn on_timer_tick() {
             }
             let prio = task_inner.sched.rt_priority;
             if has_runnable_task_at_or_above(hartid(), prio) {
-                task_inner.sched.resched_reason = Some(ReschedReason::RrTimesliceExpired);
+                task.set_resched_reason_locked(
+                    &mut task_inner,
+                    Some(ReschedReason::RrTimesliceExpired),
+                );
             } else {
                 task_inner.reset_time_slice();
             }
@@ -225,7 +267,7 @@ pub fn on_timer_tick() {
                 task_inner.sched.weight,
                 slice_exec,
             ) {
-                task_inner.sched.resched_reason = Some(ReschedReason::CfsPreempt);
+                task.set_resched_reason_locked(&mut task_inner, Some(ReschedReason::CfsPreempt));
             }
         }
         SchedPolicy::Idle => {}

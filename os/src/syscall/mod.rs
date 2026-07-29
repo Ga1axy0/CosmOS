@@ -463,6 +463,8 @@ mod utils;
 /// Standard error numbers and conversion traits
 pub mod errno;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::syscall::random::*;
 use fs::*;
 pub(crate) use fs::{

@@ -2,7 +2,7 @@
 ARCH ?= riscv64
 # EXTRA_FEATURES ?=
 # EXTRA_FEATURES ?= --features io_perf_counters --features net_perf_counters
-EXTRA_FEATURES ?= --features legacy-vdb-names
+EXTRA_FEATURES ?= --features legacy-vdb-names --features trap_context_cache --features process_identity_cache --features return_work_cache --features current_task_cache
 ifeq ($(PERF_PROBE),1)
 EXTRA_FEATURES += --features perf_probe
 endif

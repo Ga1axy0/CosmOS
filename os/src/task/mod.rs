@@ -91,8 +91,10 @@ pub(crate) fn terminate_other_threads_for_exec(
                 task_inner.exit_code = Some(0);
                 task_inner.task_status = TaskStatus::Zombie;
                 task_inner.wait_reason = None;
-                task_inner.sched.resched_reason =
-                    Some(crate::sched::ReschedReason::HigherRtPriority);
+                sibling.set_resched_reason_locked(
+                    &mut task_inner,
+                    Some(crate::sched::ReschedReason::HigherRtPriority),
+                );
                 task_inner.clear_child_tid = 0;
                 Some((
                     tid,
@@ -448,7 +450,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     task_inner.task_status = TaskStatus::Zombie;
     task.on_cpu.store(false, Ordering::Relaxed);
     task_inner.sched.on_rq = false;
-    task_inner.sched.resched_reason = None;
+    task.set_resched_reason_locked(&mut task_inner, None);
     task_inner.clear_child_tid = 0;
     // The current kernel stack must stay alive until after the context switch.
     // Legacy threads remain attached for sys_waittid; clear_child_tid threads
@@ -545,6 +547,8 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         #[cfg(feature = "cosmos-meminfo")]
         account_process_exit();
         process_inner.is_zombie = true;
+        #[cfg(feature = "return_work_cache")]
+        process.mark_zombie_work_pending();
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
         let clone_shared_resources = process_inner.clone_shared_resources;
@@ -569,6 +573,8 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             .filter_map(|child| {
                 let mut child_inner = child.inner_exclusive_access();
                 child_inner.parent = Some(Arc::downgrade(&INITPROC));
+                #[cfg(feature = "process_identity_cache")]
+                child.set_ppid_cached(INITPROC.getpid());
                 child_inner.is_zombie.then(|| Arc::clone(child))
             })
             .collect::<Vec<_>>();
@@ -615,7 +621,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 task_inner.task_status = TaskStatus::Zombie;
                 task_inner.wait_reason = None;
                 task_inner.sched.on_rq = false;
-                task_inner.sched.resched_reason = Some(ReschedReason::HigherRtPriority);
+                task.set_resched_reason_locked(
+                    &mut task_inner,
+                    Some(ReschedReason::HigherRtPriority),
+                );
                 (
                     task_inner.res.as_ref().map(|res| res.thread_id()),
                     task.on_cpu.load(Ordering::Relaxed),
@@ -849,7 +858,13 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
 /// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
 pub fn current_process_is_zombie() -> bool {
     let process = current_process();
+    #[cfg(feature = "return_work_cache")]
+    {
+        return process.zombie_work_pending();
+    }
+    #[cfg(not(feature = "return_work_cache"))]
     let process_inner = process.inner_exclusive_access();
+    #[cfg(not(feature = "return_work_cache"))]
     process_inner.is_zombie
 }
 

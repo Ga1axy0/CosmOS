@@ -188,6 +188,12 @@ enum Auxv {
 pub struct ProcessControlBlock {
     /// immutable
     pub pid: PidHandle,
+    /// Parent PID read by getppid without taking the large PCB lock.
+    #[cfg(feature = "process_identity_cache")]
+    parent_pid: AtomicUsize,
+    /// Lock-free hint for another thread observing process exit on trap return.
+    #[cfg(feature = "return_work_cache")]
+    zombie_work_pending: AtomicBool,
     /// Signal delivered to the parent when this process exits.
     pub clone_exit_signal: u32,
     /// mutable
@@ -1016,6 +1022,10 @@ impl ProcessControlBlock {
         cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,
+            #[cfg(feature = "process_identity_cache")]
+            parent_pid: AtomicUsize::new(0),
+            #[cfg(feature = "return_work_cache")]
+            zombie_work_pending: AtomicBool::new(false),
             clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1261,6 +1271,8 @@ impl ProcessControlBlock {
             task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
             task_inner.signal_mask_backup = None;
         }
+        #[cfg(feature = "trap_context_cache")]
+        task.update_trap_context_cache(trap_cx_ppn, new_token);
         crate::signal::refresh_current_signal_work_pending();
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
@@ -1389,6 +1401,10 @@ impl ProcessControlBlock {
             .as_ref()
             .map(Arc::downgrade)
             .unwrap_or_else(|| Arc::downgrade(self));
+        #[cfg(feature = "process_identity_cache")]
+        let child_parent_pid = clone_parent_target
+            .as_ref()
+            .map_or_else(|| self.getpid(), |parent| parent.getpid());
         let parent_shm_attachments = parent.shm_attachments.clone();
         let parent_fd_count = parent.fd_table.len();
         // alloc a pid
@@ -1408,6 +1424,10 @@ impl ProcessControlBlock {
         let child_pcb_start_ns = get_time_ns();
         let child = Arc::new(Self {
             pid,
+            #[cfg(feature = "process_identity_cache")]
+            parent_pid: AtomicUsize::new(child_parent_pid),
+            #[cfg(feature = "return_work_cache")]
+            zombie_work_pending: AtomicBool::new(false),
             clone_exit_signal: exit_signal,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1551,6 +1571,11 @@ impl ProcessControlBlock {
         *trap_cx = parent_trap_cx;
         trap_cx.set_kernel_sp(task.kstack.get_top());
         trap_cx.set_syscall_ret(0);
+        #[cfg(all(
+            target_arch = "riscv64",
+            any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+        ))]
+        trap_cx.set_reg(0, 0);
         if child_stack != 0 {
             // Linux clone ABI 要求子进程从指定用户栈继续执行。
             trap_cx.set_user_sp(child_stack);
@@ -1678,6 +1703,10 @@ impl ProcessControlBlock {
         }
         let child = Arc::new(Self {
             pid,
+            #[cfg(feature = "process_identity_cache")]
+            parent_pid: AtomicUsize::new(self.getpid()),
+            #[cfg(feature = "return_work_cache")]
+            zombie_work_pending: AtomicBool::new(false),
             clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1781,6 +1810,31 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+    /// Return the cached parent PID used by the getppid fast read path.
+    #[cfg(feature = "process_identity_cache")]
+    #[inline]
+    pub fn getppid_cached(&self) -> usize {
+        self.parent_pid.load(Ordering::Acquire)
+    }
+    /// Publish a parent change after the protected parent pointer is updated.
+    #[cfg(feature = "process_identity_cache")]
+    #[inline]
+    pub(crate) fn set_ppid_cached(&self, ppid: usize) {
+        self.parent_pid.store(ppid, Ordering::Release);
+    }
+    /// Return whether process exit requires the locked trap-return slow path.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub fn zombie_work_pending(&self) -> bool {
+        self.zombie_work_pending.load(Ordering::Acquire)
+    }
+
+    /// Publish process zombie state while process-inner is held.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub(crate) fn mark_zombie_work_pending(&self) {
+        self.zombie_work_pending.store(true, Ordering::Release);
     }
     /// Return whether this process has exited and is waiting to be reaped.
     pub fn is_zombie(&self) -> bool {
@@ -2433,6 +2487,7 @@ impl ProcessControlBlock {
         // The trampoline already switched to the kernel ASID. Stale user TLB
         // entries may remain locally, but generation tracking guarantees an
         // ASID fence before this hart next returns to an edited address space.
+        #[cfg(not(feature = "trap_active_harts_probe"))]
         inner.memory_set.mark_user_inactive(crate::hal::hartid());
         match inner.accounting_state {
             CpuAccountingState::User => {
@@ -2460,6 +2515,7 @@ impl ProcessControlBlock {
         inner.accounting_state = CpuAccountingState::User;
         inner.accounting_timestamp = now;
         // 即将跳回用户态，后续其他 hart 修改该 mm 时需要把当前 hart 作为 shootdown 目标。
+        #[cfg(not(feature = "trap_active_harts_probe"))]
         inner.memory_set.mark_user_active(crate::hal::hartid());
     }
 

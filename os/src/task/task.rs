@@ -12,7 +12,7 @@ use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
@@ -155,6 +155,17 @@ pub struct TaskControlBlock {
     /// stale true values are cleared by the locked slow path, while producers
     /// publish true after making pending state visible.
     signal_work_pending: AtomicBool,
+    /// Lock-free hint for the deferred-reschedule slow path.
+    #[cfg(feature = "return_work_cache")]
+    resched_work_pending: AtomicBool,
+    /// Physical trap-frame page, userspace VA and address-space token cached
+    /// for the lifetime of the current exec image.
+    #[cfg(feature = "trap_context_cache")]
+    trap_cx_ppn_cache: AtomicUsize,
+    #[cfg(feature = "trap_context_cache")]
+    trap_cx_user_va_cache: usize,
+    #[cfg(feature = "trap_context_cache")]
+    user_token_cache: AtomicUsize,
 }
 
 impl TaskControlBlock {
@@ -163,10 +174,43 @@ impl TaskControlBlock {
         self.inner.lock()
     }
     /// Get the current user address-space token for this task.
+    #[cfg(not(feature = "trap_context_cache"))]
     pub fn get_user_token(&self) -> AddressSpaceToken {
         let process = self.process.upgrade().unwrap();
         let inner = process.inner_exclusive_access();
         inner.memory_set.token()
+    }
+    /// Get the token snapshot for the task's current exec image.
+    #[cfg(feature = "trap_context_cache")]
+    #[inline]
+    pub fn get_user_token(&self) -> AddressSpaceToken {
+        self.user_token_cache.load(Ordering::Acquire)
+    }
+
+    /// Get the current trap frame without acquiring task-inner.
+    #[cfg(feature = "trap_context_cache")]
+    #[inline]
+    pub fn cached_trap_cx(&self) -> &'static mut TrapContext {
+        PhysPageNum(self.trap_cx_ppn_cache.load(Ordering::Acquire)).get_mut()
+    }
+
+    /// Get the fixed userspace trap-frame VA for this task.
+    #[cfg(feature = "trap_context_cache")]
+    #[inline]
+    pub fn cached_trap_cx_user_va(&self) -> usize {
+        self.trap_cx_user_va_cache
+    }
+
+    /// Publish trap metadata after exec has installed the replacement image.
+    #[cfg(feature = "trap_context_cache")]
+    pub(crate) fn update_trap_context_cache(
+        &self,
+        trap_cx_ppn: PhysPageNum,
+        user_token: AddressSpaceToken,
+    ) {
+        self.trap_cx_ppn_cache
+            .store(trap_cx_ppn.0, Ordering::Release);
+        self.user_token_cache.store(user_token, Ordering::Release);
     }
 
     /// Return whether user-return signal handling needs the locked slow path.
@@ -185,6 +229,30 @@ impl TaskControlBlock {
     #[inline]
     pub(crate) fn set_signal_work_pending(&self, pending: bool) {
         self.signal_work_pending.store(pending, Ordering::Release);
+    }
+
+    /// Return whether trap exit needs to inspect the locked reschedule reason.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub fn resched_work_pending(&self) -> bool {
+        self.resched_work_pending.load(Ordering::Acquire)
+    }
+
+    /// Update the authoritative reschedule reason and its lock-free hint.
+    ///
+    /// The caller must hold this task's inner lock. Keeping both writes in one
+    /// helper prevents a locked producer from racing with a lockless hint clear
+    /// and leaving `Some(reason)` paired with a false hint.
+    #[inline]
+    pub(crate) fn set_resched_reason_locked(
+        &self,
+        task_inner: &mut TaskControlBlockInner,
+        reason: Option<ReschedReason>,
+    ) {
+        task_inner.sched.resched_reason = reason;
+        #[cfg(feature = "return_work_cache")]
+        self.resched_work_pending
+            .store(reason.is_some(), Ordering::Release);
     }
 }
 
@@ -316,6 +384,10 @@ impl TaskControlBlock {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res)?;
         let task_user_res_ns = get_time_ns() - task_user_res_start_ns;
         let trap_cx_ppn = res.trap_cx_ppn();
+        #[cfg(feature = "trap_context_cache")]
+        let trap_cx_user_va = res.trap_cx_user_va();
+        #[cfg(feature = "trap_context_cache")]
+        let user_token = process.inner_exclusive_access().get_user_token();
         let tid = res.tid;
         let thread_id = res.thread_id();
         let kstack_alloc_start_ns = get_time_ns();
@@ -328,6 +400,14 @@ impl TaskControlBlock {
             kstack,
             on_cpu: AtomicBool::new(false),
             signal_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "return_work_cache")]
+            resched_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_ppn_cache: AtomicUsize::new(trap_cx_ppn.0),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_user_va_cache: trap_cx_user_va,
+            #[cfg(feature = "trap_context_cache")]
+            user_token_cache: AtomicUsize::new(user_token),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -377,6 +457,14 @@ impl TaskControlBlock {
             kstack,
             on_cpu: AtomicBool::new(false),
             signal_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "return_work_cache")]
+            resched_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_ppn_cache: AtomicUsize::new(0),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_user_va_cache: 0,
+            #[cfg(feature = "trap_context_cache")]
+            user_token_cache: AtomicUsize::new(0),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: None,
                 trap_cx_ppn: PhysPageNum(0),

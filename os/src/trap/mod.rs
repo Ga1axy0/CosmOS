@@ -34,6 +34,56 @@ use crate::task::{
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
 
+/// Diagnostic-only lmbench-null/getppid path.
+///
+/// This deliberately bypasses accounting, TLB mailbox polling, interrupt
+/// enablement, syscall dispatch, signal delivery and scheduler exit work.  It
+/// is not a production syscall implementation: its only purpose is to measure
+/// how much of `lat_syscall null` is outside the architectural trap entry/exit
+/// plus one snapshot of the current task/process state.
+#[cfg(all(feature = "getpid_path_probe", target_arch = "riscv64"))]
+fn try_getpid_path_probe(trap_info: &crate::hal::traits::TrapInfo) {
+    if !matches!(trap_info.cause, TrapCause::UserSyscall) {
+        return;
+    }
+
+    let task = current_task().expect("getpid probe without a current task");
+    let process = task
+        .process
+        .upgrade()
+        .expect("getpid probe without a current process");
+    let (trap_cx_user_va, trap_cx) = {
+        let task_inner = task.inner_exclusive_access();
+        let trap_cx_user_va = task_inner
+            .res
+            .as_ref()
+            .expect("getpid probe without user resources")
+            .trap_cx_user_va();
+        (trap_cx_user_va, task_inner.get_trap_cx())
+    };
+
+    if trap_cx.syscall_nr() != crate::syscall::SYSCALL_GETPPID {
+        return;
+    }
+
+    let parent_pid = {
+        let parent = process.inner_exclusive_access().parent.clone();
+        parent
+            .and_then(|parent| parent.upgrade())
+            .map_or(0, |parent| parent.getpid())
+    };
+    trap_cx.advance_user_pc(ArchTrapMachine::syscall_instruction_len());
+    trap_cx.set_syscall_ret(parent_pid);
+    trap_cx.in_syscall = true;
+    trap_cx.restartable_syscall = false;
+    trap_cx.set_kernel_hartid(hartid());
+
+    let user_token = process.inner_exclusive_access().get_user_token();
+    #[cfg(not(feature = "trap_stvec_probe"))]
+    set_user_trap_entry();
+    unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
+}
+
 #[cfg(target_arch = "riscv64")]
 fn faulting_user_instruction(stval: usize, pc: usize) -> Option<u32> {
     if stval != 0 {
@@ -348,16 +398,36 @@ fn handle_reschedule_ipi() {
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
+    #[cfg(not(all(target_arch = "riscv64", feature = "trap_stvec_probe")))]
     set_kernel_trap_entry();
+    #[cfg(all(target_arch = "riscv64", feature = "trap_stvec_probe"))]
+    {
+        let trap_info = ArchTrapMachine::read_trap_info();
+        try_getpid_path_probe(&trap_info);
+        // Non-getppid traps continue through the normal kernel path.
+        set_kernel_trap_entry();
+    }
+    #[cfg(all(
+        feature = "getpid_path_probe",
+        not(feature = "trap_stvec_probe"),
+        target_arch = "riscv64"
+    ))]
+    {
+        let trap_info = ArchTrapMachine::read_trap_info();
+        try_getpid_path_probe(&trap_info);
+    }
     // The trampoline has already switched to the kernel page table.  Ack an
     // older shootdown snapshot before taking locks or relying on SIE delivery.
+    #[cfg(not(feature = "trap_tlb_poll_probe"))]
     crate::mm::poll_pending_shootdown();
+    #[cfg(not(feature = "trap_accounting_probe"))]
     current_process().enter_kernel(get_time());
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::UserSyscall => {
+            #[cfg(not(feature = "trap_irq_guard_probe"))]
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
@@ -370,6 +440,15 @@ pub fn trap_handler() -> ! {
             let result = syscall(syscall_id, syscall_args);
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
+            #[cfg(all(
+                target_arch = "riscv64",
+                any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+            ))]
+            if syscall_id == crate::syscall::SYSCALL_GETPPID && result >= 0 {
+                // x0 has no architectural restore action, so the probe build
+                // can cache ppid+1; zero remains the "not cached" marker.
+                cx.set_reg(0, result as usize + 1);
+            }
             cx.set_syscall_ret(result as usize);
             cx.in_syscall = true;
         }
@@ -658,6 +737,7 @@ pub fn trap_return() -> ! {
     let trap_cx_user_va = current_trap_cx_user_va();
     current_trap_cx().set_kernel_hartid(hartid());
     let user_token = current_user_token();
+    #[cfg(not(feature = "trap_accounting_probe"))]
     current_process().enter_user(get_time());
     unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
 }
