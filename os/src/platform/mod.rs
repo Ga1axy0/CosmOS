@@ -27,9 +27,9 @@ pub use riscv::qemu_virt::{
     mmio_phys_to_virt, platform_name, probe_platform_devices, rtc_is_supported, shutdown,
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console, BlockDeviceImpl,
     CharDeviceImpl, QEMUExit, SbiPlatform as PlatformImpl, CLOCK_FREQ, INTERP_BASE,
-    KERNEL_HEAP_BASE, MMIO, QEMU_EXIT_HANDLE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE,
-    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE, VIRT_RTC,
-    VIRT_UART,
+    KERNEL_ADDR_OFFSET, KERNEL_HEAP_BASE, MMIO, QEMU_EXIT_HANDLE, TRAMPOLINE, USER_MMAP_BASE,
+    USER_STACK_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
+    VIRT_RTC, VIRT_UART,
 };
 
 #[cfg(target_arch = "loongarch64")]

@@ -149,10 +149,9 @@ fn try_handle_lazy_user_fp(_stval: usize) -> bool {
 
 /// Snapshot the address-space state at a user fault.
 ///
-/// The trap entry has already switched `satp` to the kernel address space by
-/// the time this function runs.  Therefore both the post-trap kernel token and
-/// the process' user token are recorded explicitly; confusing the two makes
-/// TLB/address-space races very difficult to diagnose.
+/// Trap entry keeps the process address space active. Record both the hardware
+/// token and the process token so diagnostics can verify that invariant and
+/// expose TLB/address-space races.
 fn log_user_fault_mapping(fault_addr: usize) {
     let process = current_process();
     let task = current_task();
@@ -416,8 +415,9 @@ pub fn trap_handler() -> ! {
         let trap_info = ArchTrapMachine::read_trap_info();
         try_getpid_path_probe(&trap_info);
     }
-    // The trampoline has already switched to the kernel page table.  Ack an
-    // older shootdown snapshot before taking locks or relying on SIE delivery.
+    // The trampoline has entered kernel mode without changing the process page
+    // table. Ack an older shootdown snapshot before taking locks or relying on
+    // interrupt delivery.
     #[cfg(not(feature = "trap_tlb_poll_probe"))]
     crate::mm::poll_pending_shootdown();
     #[cfg(not(feature = "trap_accounting_probe"))]

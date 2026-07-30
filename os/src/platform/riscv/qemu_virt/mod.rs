@@ -11,7 +11,15 @@ pub use board::{
 };
 pub use sbi::SbiPlatform;
 
-pub const KERNEL_HEAP_BASE: usize = 0xffff_ffc0_0000_0000;
+/// Sv39 high-half base.  Normal RAM is directly mapped at
+/// `KERNEL_ADDR_OFFSET + physical_address`.
+pub const KERNEL_ADDR_OFFSET: usize = 0xffff_ffc0_0000_0000;
+const PHYSICAL_RAM_BASE: usize = 0x8000_0000;
+/// Dedicated high-half MMIO aperture.  Keeping MMIO out of the low half lets
+/// every process reserve all low root entries for its private user mappings.
+pub const KERNEL_MMIO_OFFSET: usize = 0xffff_ffe0_0000_0000;
+const KERNEL_MMIO_SIZE: usize = 0x4000_0000;
+pub const KERNEL_HEAP_BASE: usize = KERNEL_ADDR_OFFSET;
 pub const TRAMPOLINE: usize = usize::MAX - 0x1000 + 1;
 
 /// Initialize platform external interrupt routing on the bootstrap hart.
@@ -79,10 +87,7 @@ pub fn platform_name() -> &'static str {
 
 /// Discover stopped harts via SBI HSM and start them on QEMU `virt`.
 pub fn start_secondary_harts(bootstrap_hart_id: usize) {
-    extern "C" {
-        fn _start();
-    }
-
+    const PHYSICAL_ENTRY: usize = 0x8020_0000;
     const SBI_SUCCESS: isize = 0;
     const SBI_ERR_INVALID_PARAM: isize = -3;
     const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
@@ -117,7 +122,7 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
         }
 
         if let sbi::HartState::Stopped = state {
-            let ret = sbi::hart_start(target_hart, _start as usize, 0);
+            let ret = sbi::hart_start(target_hart, PHYSICAL_ENTRY, 0);
             match ret.error {
                 SBI_SUCCESS => info!(
                     "hart {} requested startup for hart {}",
@@ -138,22 +143,43 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
 
 /// Translate one direct-mapped physical address into the kernel VA used on this platform.
 pub fn direct_map_phys_to_virt(pa: usize) -> usize {
-    pa
+    KERNEL_ADDR_OFFSET.wrapping_add(pa)
 }
 
 /// Translate one direct-mapped kernel VA back into a physical address.
 pub fn direct_map_virt_to_phys(va: usize) -> usize {
-    va
+    if (KERNEL_MMIO_OFFSET..KERNEL_MMIO_OFFSET + KERNEL_MMIO_SIZE).contains(&va) {
+        va.wrapping_sub(KERNEL_MMIO_OFFSET)
+    } else if va >= KERNEL_ADDR_OFFSET {
+        va.wrapping_sub(KERNEL_ADDR_OFFSET)
+    } else {
+        // Early firmware pointers are physical until the high-half bootstrap
+        // mapping is installed.
+        va
+    }
 }
 
 /// Translate a direct-mapped kernel VA into a physical address when applicable.
-pub fn translate_direct_mapped_kernel_va(_va: usize) -> Option<usize> {
+pub fn translate_direct_mapped_kernel_va(va: usize) -> Option<usize> {
+    /*
+     * Root entry 256 is the separately-backed virtual kernel heap, not a
+     * linear physical alias.  The QEMU RAM alias starts at PA 0x8000_0000
+     * (root entry 258), so heap buffers must fall through to a page-table walk
+     * when a device asks for their physical address.
+     */
+    let ram_alias_start = KERNEL_ADDR_OFFSET + PHYSICAL_RAM_BASE;
+    if (ram_alias_start..KERNEL_MMIO_OFFSET).contains(&va) {
+        return Some(va - KERNEL_ADDR_OFFSET);
+    }
+    if (KERNEL_MMIO_OFFSET..KERNEL_MMIO_OFFSET + KERNEL_MMIO_SIZE).contains(&va) {
+        return Some(va - KERNEL_MMIO_OFFSET);
+    }
     None
 }
 
 /// Translate one MMIO physical address into the VA used by drivers.
 pub fn mmio_phys_to_virt(paddr: usize) -> usize {
-    paddr
+    KERNEL_MMIO_OFFSET.wrapping_add(paddr)
 }
 
 /// Whether the Goldfish RTC is supported on this platform.

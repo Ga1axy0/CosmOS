@@ -81,6 +81,8 @@ pub struct LoongArchTrapContextFrame {
     pub prmd: usize,
     pub era: usize,
     pub kernel_hartid: usize,
+    /// Legacy kernel-token slot retained to keep the cross-architecture trap
+    /// frame ABI stable. Ordinary trap entry does not consume it.
     pub kernel_pgdl: usize,
     pub kernel_sp: usize,
     pub trap_handler: usize,

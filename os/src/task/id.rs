@@ -7,6 +7,8 @@ use crate::mm::{
     shootdown, DeferredUserReclaim, MapPermission, MmError, PhysPageNum, ShootdownKind, VirtAddr,
     Vma, KERNEL_SPACE,
 };
+#[cfg(target_arch = "loongarch64")]
+use crate::mm::{frame_alloc_contiguous, ContiguousFrames};
 use crate::sync::SpinNoIrqLock;
 use crate::timer::get_time_ns;
 use alloc::{
@@ -117,6 +119,7 @@ impl Drop for ThreadIdHandle {
 }
 
 /// Return (bottom, top) of a kernel stack in kernel space.
+#[cfg(target_arch = "riscv64")]
 pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
     let top = TRAMPOLINE - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
@@ -124,12 +127,28 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 }
 
 /// Kernel stack for a task
+#[cfg(target_arch = "riscv64")]
 pub struct KernelStack(pub usize);
 
+/// LoongArch kernel stacks use one physically contiguous DMW range. They are
+/// therefore reachable in every process address space without any PGDL entry.
+#[cfg(target_arch = "loongarch64")]
+pub struct KernelStack {
+    id: usize,
+    frames: ContiguousFrames,
+}
+
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn cached_kstack_count() -> usize {
     KSTACK_CACHE.lock().len()
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn cached_kstack_count() -> usize {
+    0
+}
+
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn reclaim_cached_kstacks(target_cached: usize) -> usize {
     let mut kstack_ids = Vec::new();
     {
@@ -160,10 +179,17 @@ pub(crate) fn reclaim_cached_kstacks(target_cached: usize) -> usize {
     reclaimed
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn reclaim_cached_kstacks(_target_cached: usize) -> usize {
+    0
+}
+
+#[cfg(target_arch = "riscv64")]
 fn try_take_cached_kstack() -> Option<usize> {
     KSTACK_CACHE.lock().pop()
 }
 
+#[cfg(target_arch = "riscv64")]
 fn try_cache_kstack(kstack_id: usize) -> bool {
     let mut cache = KSTACK_CACHE.lock();
     if cache.len() >= KSTACK_CACHE_LIMIT {
@@ -174,6 +200,7 @@ fn try_cache_kstack(kstack_id: usize) -> bool {
 }
 
 /// Allocate a kernel stack for a task
+#[cfg(target_arch = "riscv64")]
 pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     let total_start_ns = get_time_ns();
     let deferred_kstack_before = deferred_kstack_id_count();
@@ -240,6 +267,23 @@ pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     Ok(KernelStack(kstack_id))
 }
 
+/// Allocate a DMW-backed kernel stack on LoongArch.  The stack has no PTEs, so
+/// dropping it needs neither a TLB shootdown nor deferred virtual-address
+/// recycling.
+#[cfg(target_arch = "loongarch64")]
+pub fn kstack_alloc() -> Result<KernelStack, MmError> {
+    let id = KSTACK_ALLOCATOR.lock().alloc();
+    let pages = KERNEL_STACK_SIZE / PAGE_SIZE;
+    match frame_alloc_contiguous(pages, pages) {
+        Some(frames) => Ok(KernelStack { id, frames }),
+        None => {
+            KSTACK_ALLOCATOR.lock().dealloc(id);
+            Err(MmError::OutOfMemory)
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
 impl Drop for KernelStack {
     fn drop(&mut self) {
         if try_cache_kstack(self.0) {
@@ -272,6 +316,13 @@ impl Drop for KernelStack {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        KSTACK_ALLOCATOR.lock().dealloc(self.id);
+    }
+}
+
 /// 将完成 TLB flush 的 kernel stack id 重新放回分配器。
 pub(crate) fn recycle_deferred_kstack_ids(mut kstack_ids: Vec<usize>) {
     if kstack_ids.is_empty() {
@@ -299,8 +350,16 @@ impl KernelStack {
     }
     /// return the top of the kernel stack
     pub fn get_top(&self) -> usize {
-        let (_, kernel_stack_top) = kernel_stack_position(self.0);
-        kernel_stack_top
+        #[cfg(target_arch = "riscv64")]
+        {
+            let (_, kernel_stack_top) = kernel_stack_position(self.0);
+            return kernel_stack_top;
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let start_pa = self.frames.start_ppn().0 * PAGE_SIZE;
+            crate::platform::direct_map_phys_to_virt(start_pa) + self.frames.pages() * PAGE_SIZE
+        }
     }
 }
 

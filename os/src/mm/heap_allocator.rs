@@ -1323,8 +1323,10 @@ fn unmap_heap_pages(start_va: usize, pages: usize) {
         if reclaimed_count != 0 {
             // Do not hold HEAP_PT_LOCK across this synchronous IPI barrier: a
             // target hart may currently be spinning on that IRQ-disabling lock.
-            // Dynamic heap PTEs are non-global, so kernel ASID 0 is sufficient.
-            crate::mm::shootdown_asid_quiet(usize::MAX, crate::mm::KERNEL_ASID);
+            // The heap subtree is shared by every process root and marked
+            // global at its root entry, so stale translations must be removed
+            // from every hart including global TLB entries.
+            crate::mm::shootdown_global_quiet();
             for ppn in reclaimed_ppns[..reclaimed_count].iter().copied() {
                 frame_dealloc(PhysPageNum(ppn));
             }

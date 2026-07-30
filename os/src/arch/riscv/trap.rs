@@ -68,7 +68,8 @@ pub struct RiscvTrapContextFrame {
     pub sepc: usize,
     /// Kernel hart id restored into `tp` on trap entry.
     pub kernel_hartid: usize,
-    /// Kernel address-space token installed on trap entry.
+    /// Legacy kernel-token slot retained for the diagnostic SATP-switch probe.
+    /// Ordinary trap entry does not consume it.
     pub kernel_satp: usize,
     /// Kernel stack pointer used on trap entry.
     pub kernel_sp: usize,

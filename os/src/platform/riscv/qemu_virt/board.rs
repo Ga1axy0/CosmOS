@@ -1,5 +1,7 @@
 //! Static board description for the RISC-V QEMU `virt` machine.
 
+use super::KERNEL_MMIO_OFFSET;
+
 /// default base address for anonymous mmap allocations
 pub const USER_MMAP_BASE: usize = 0x1_0000_0000;
 
@@ -14,18 +16,18 @@ pub const CLOCK_FREQ: usize = 12_500_000;
 
 /// MMIO windows exposed by the machine.
 pub const MMIO: &[(usize, usize)] = &[
-    (0x0C00_0000, 0x400000),  // PLIC
-    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC
-    (0x1000_0000, 0x100),     // UART0 (NS16550a)
-    (0x1000_1000, 0x8000),    // VirtIO MMIO devices, 8 slots, each slot occupies 0x1000 bytes
+    (KERNEL_MMIO_OFFSET + 0x0C00_0000, 0x400000),  // PLIC
+    (KERNEL_MMIO_OFFSET + 0x0010_0000, 0x00_2000), // VIRT_TEST/RTC
+    (KERNEL_MMIO_OFFSET + 0x1000_0000, 0x100),     // UART0 (NS16550a)
+    (KERNEL_MMIO_OFFSET + 0x1000_1000, 0x8000),    // VirtIO MMIO devices
 ];
 
 /// UART0 MMIO base address.
-pub const VIRT_UART: usize = 0x1000_0000;
+pub const VIRT_UART: usize = KERNEL_MMIO_OFFSET + 0x1000_0000;
 /// Goldfish RTC MMIO base address.
-pub const VIRT_RTC: usize = 0x0010_1000;
+pub const VIRT_RTC: usize = KERNEL_MMIO_OFFSET + 0x0010_1000;
 /// VirtIO MMIO window base address.
-pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+pub const VIRTIO_MMIO_BASE: usize = KERNEL_MMIO_OFFSET + 0x1000_1000;
 /// Size of each VirtIO MMIO slot.
 pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 /// Number of VirtIO MMIO slots exposed by the machine.
@@ -104,7 +106,7 @@ impl QEMUExit for RISCV64 {
     }
 }
 
-const VIRT_TEST: u64 = 0x100000;
+const VIRT_TEST: u64 = (KERNEL_MMIO_OFFSET + 0x100000) as u64;
 
 /// Global QEMU exit handle using the sifive_test device.
 pub const QEMU_EXIT_HANDLE: RISCV64 = RISCV64::new(VIRT_TEST);

@@ -8,7 +8,10 @@ use super::__switch;
 use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
 use crate::hal::traits::AddressSpaceToken;
-use crate::hal::{enable_irqs_and_wait, hartid};
+use crate::hal::{
+    activate_address_space, current_address_space_token, enable_irqs_and_wait, hartid,
+};
+use crate::mm::AddressSpaceRoot;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
 use crate::timer::get_time;
@@ -26,6 +29,12 @@ use lazy_static::*;
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
     pending_task_release: Option<Arc<TaskControlBlock>>,
+    /// Address space currently installed on this hart.
+    ///
+    /// Idle borrows the last process root instead of switching through the
+    /// permanent kernel page table.  The strong root guard prevents exit/exec
+    /// from reclaiming a root that is still loaded by the hardware walker.
+    active_address_space: Option<AddressSpaceRoot>,
 
     ///The basic control flow of each core, helping to select and switch process
     idle_task_cx: TaskContext,
@@ -36,6 +45,7 @@ impl Processor {
         Self {
             current: None,
             pending_task_release: None,
+            active_address_space: None,
             idle_task_cx: TaskContext::zero_init(),
         }
     }
@@ -70,6 +80,10 @@ impl Processor {
 
     fn take_pending_task_release(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.pending_task_release.take()
+    }
+
+    fn replace_active_address_space(&mut self, next: AddressSpaceRoot) -> Option<AddressSpaceRoot> {
+        self.active_address_space.replace(next)
     }
 }
 
@@ -110,6 +124,32 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
         .unwrap_or_else(|| panic!("hart {} exceeds MAX_HARTS {}", hart_id, MAX_HARTS))
 }
 
+/// Install and pin one address space on the current hart.
+///
+/// The caller supplies a strong root guard before the hardware token changes.
+/// The previous guard is released only after the new root is active, so exit
+/// and exec cannot recycle a page-table root underneath the hardware walker.
+#[inline]
+pub(crate) fn activate_current_address_space(next: AddressSpaceRoot) {
+    let token = next.token();
+    let irqs_were_enabled = crate::hal::local_irqs_enabled();
+    if irqs_were_enabled {
+        unsafe { crate::hal::disable_local_irqs() };
+    }
+    unsafe {
+        if current_address_space_token() != token {
+            activate_address_space(token);
+        }
+    }
+    let previous = current_processor()
+        .lock()
+        .replace_active_address_space(next);
+    drop(previous);
+    if irqs_were_enabled {
+        unsafe { crate::hal::enable_local_irqs() };
+    }
+}
+
 ///The main part of process execution and scheduling
 ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
 pub(crate) fn run_tasks() {
@@ -129,6 +169,14 @@ pub(crate) fn run_tasks() {
             //     task.process.upgrade().unwrap().getpid()
             // );
             let process = task.process.upgrade().unwrap();
+            // Read the PCB's authoritative token instead of the task's cached
+            // trap metadata. During exec the MemorySet is replaced before the
+            // new trap frame/cache is fully constructed, and this task may be
+            // preempted inside that interval.
+            let next_address_space = process
+                .inner_exclusive_access()
+                .memory_set
+                .address_space_root();
             let mut processor = current_processor().lock();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
 
@@ -153,6 +201,9 @@ pub(crate) fn run_tasks() {
             drop(processor);
             process.resume_in_kernel(get_time());
 
+            // Switch directly from the previously borrowed process root to the
+            // next one. Same-address-space scheduling performs no CSR write.
+            activate_current_address_space(next_address_space);
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
@@ -315,6 +366,10 @@ pub(crate) fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = current_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
+    // Lazy active-mm: idle keeps the outgoing process root installed. Every
+    // process root contains the kernel mappings needed by the scheduler, and
+    // Processor::active_address_space pins the root until a direct switch to a
+    // different address space has completed.
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }

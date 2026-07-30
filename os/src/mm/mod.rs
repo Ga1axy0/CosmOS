@@ -80,8 +80,8 @@ pub use oom::{log_oom, warn_heap_state};
 #[cfg(feature = "cosmos-meminfo")]
 pub use page_table::{page_table_stats, reset_page_table_stats, PageTableStats};
 pub use page_table::{
-    translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
-    PageTableEntry, UserBuffer, UserBufferIterator,
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, AddressSpaceRoot,
+    PageTable, PageTableEntry, UserBuffer, UserBufferIterator,
 };
 pub use tlb_shootdown::{
     clear_deferred, defer_release, deferred_frame_count, deferred_kstack_id_count,

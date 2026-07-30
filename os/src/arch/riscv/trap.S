@@ -87,7 +87,7 @@ __alltraps:
     # entry/restore and satp-switch overhead without Rust or lock traffic.
     #
     # mode 1: restore directly in the still-active user address space.
-    # mode 2: perform the normal user->kernel->user satp writes, but no Rust.
+    # mode 2: perform the legacy user->kernel->user satp writes for comparison.
     .if GETPID_ASM_PROBE
     # a7 retains the syscall number across user timer interrupts.  Check the
     # cause first so an interrupt during the benchmark cannot masquerade as a
@@ -128,31 +128,21 @@ __alltraps:
 
     # restore kernel hart id into tp before entering Rust
     ld tp, 34*8(sp)
-    # load kernel_satp into t0
-    ld t0, 35*8(sp)
     # load trap_handler into t1
     ld t1, 37*8(sp)
     # move to kernel_sp
     ld sp, 36*8(sp)
-    # Switch to kernel ASID 0.  A nonzero userspace ASID keeps both address
-    # spaces' translations independently tagged, so changing satp needs no
-    # fence.  ASID 0 is the compatibility fallback and still requires the old
-    # full flush because it shares the kernel's tag.
-    csrr t2, satp
-    # Drop MODE by shifting ASID[15:0] to the top before extracting it.
-    slli t2, t2, 4
-    srli t2, t2, 48
-    csrw satp, t0
-    bnez t2, .Lkernel_satp_ready
-    sfence.vma
-.Lkernel_satp_ready:
+    # Kernel text, direct-map memory and every kernel stack are shared in the
+    # high half of the current process page table. Keep satp unchanged.
     # jump to trap_handler
     jr t1
 
 __restore:
     # a0: *TrapContext in user space(Constant); a1: user space token
-    # Switch to the user page table without evicting either ASID.  Tokens with
-    # ASID 0 use the conservative fallback path.
+    # Ordinary trap return keeps the same root. A process switch changes satp
+    # here, before touching the new process' private trap frame.
+    csrr t0, satp
+    beq t0, a1, .Luser_satp_ready
     csrw satp, a1
     slli t2, a1, 4
     srli t2, t2, 48

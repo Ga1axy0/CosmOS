@@ -1163,6 +1163,7 @@ impl ProcessControlBlock {
 
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
+        let new_address_space = memory_set.address_space_root();
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
         // Remove sibling tasks while the old address space is still active:
         // their TaskUserRes destructors must detach mappings from the old
@@ -1197,6 +1198,12 @@ impl ProcessControlBlock {
                 old_shm_attachments,
             )
         };
+        // Trap entry keeps the current process page table active. After exec
+        // replaces the MemorySet, move the hardware walker to the new root
+        // before tearing down or dropping the old process-owned root frame.
+        // A scheduling interruption around this point is also safe: the
+        // scheduler reads the authoritative token from the PCB.
+        crate::sched::activate_current_address_space(new_address_space);
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
         let old_mask = old_memory_set.record_local_tlb_change();
@@ -2484,9 +2491,9 @@ impl ProcessControlBlock {
     /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
     pub fn enter_kernel(&self, now: usize) {
         let mut inner = self.inner.lock();
-        // The trampoline already switched to the kernel ASID. Stale user TLB
-        // entries may remain locally, but generation tracking guarantees an
-        // ASID fence before this hart next returns to an edited address space.
+        // The process page table remains active in kernel mode. Kernel
+        // user-memory helpers walk it explicitly, while generation tracking
+        // guarantees an ASID fence before returning to an edited user mapping.
         #[cfg(not(feature = "trap_active_harts_probe"))]
         inner.memory_set.mark_user_inactive(crate::hal::hartid());
         match inner.accounting_state {

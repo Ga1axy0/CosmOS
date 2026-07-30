@@ -25,7 +25,13 @@ pub use crate::platform::{
 };
 
 /// the virtual addr of trap context
-pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
+///
+/// Trap contexts are process-private mappings.  Keep them in the canonical
+/// low half so every process can share the complete kernel half of its root
+/// page table without colliding with per-task trap frames.  The very last
+/// low-half page remains available for architectures whose user trap
+/// trampoline is also placed at the top of the low half.
+pub const TRAP_CONTEXT_BASE: usize = (1usize << (crate::hal::virt_addr_bits() - 1)) - 2 * PAGE_SIZE;
 /// 用户态 signal trampoline 页起始地址。
 pub const USER_VDSO_BASE: usize = USER_MMAP_BASE - PAGE_SIZE;
 /// 用户态 rt_sigreturn trampoline 入口地址。

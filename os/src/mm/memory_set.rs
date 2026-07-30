@@ -4,7 +4,7 @@ use super::elf_loader::{ElfLoadInfo, ElfLoader};
 use super::{
     frame_alloc_with_reclaim, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind,
 };
-use super::{PTEFlags, PageTable, PageTableEntry};
+use super::{AddressSpaceRoot, PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
@@ -270,9 +270,9 @@ fn map_kernel_ram_fragment(memory_set: &mut MemorySet, start: usize, end: usize)
     memory_set
         .insert_vma(
             Vma::new(
-                start.into(),
-                end.into(),
-                MapType::Identical,
+                crate::platform::direct_map_phys_to_virt(start).into(),
+                crate::platform::direct_map_phys_to_virt(end).into(),
+                MapType::Direct,
                 MapPermission::R | MapPermission::W,
                 VmaKind::Kernel,
             ),
@@ -304,11 +304,12 @@ pub struct MemorySet {
     pub vmas: BTreeMap<VirtPageNum, Vma>,
     /// Hardware address-space ID encoded into this memory set's token.
     asid: usize,
-    /// Harts currently executing userspace with this address space loaded.
+    /// Harts currently eligible to execute userspace from this address space.
     ///
-    /// The bit is cleared after trap entry has switched to the kernel ASID.
-    /// Inactive harts may still retain stale entries, but `tlb_generation`
-    /// forces an ASID-wide fence before they return to this address space.
+    /// Trap entry now retains this page-table root, but the bit is still
+    /// cleared once the hart has left user mode: kernel user-memory helpers
+    /// walk the process table explicitly. Inactive harts may retain stale user
+    /// entries; `tlb_generation` forces an ASID-wide fence before user return.
     active_user_harts: AtomicUsize,
     /// Incremented after every page-table edit visible to an existing task.
     tlb_generation: AtomicUsize,
@@ -559,11 +560,19 @@ impl MemorySet {
         // non-recycled ASID from this boot's finite namespace.
         let mut memory_set = Self::new_bare_with_asid(super::asid::KERNEL_ASID)?;
         memory_set.asid = super::asid::allocate_user_asid();
+        #[cfg(target_arch = "riscv64")]
+        memory_set
+            .page_table
+            .share_kernel_half_from(&KERNEL_SPACE.lock().page_table);
         Ok(memory_set)
     }
     /// Get he page table token
     pub fn token(&self) -> AddressSpaceToken {
         crate::hal::with_address_space_id(self.page_table.token(), self.asid)
+    }
+    /// Pin the root frame while a hart may keep this address space installed.
+    pub fn address_space_root(&self) -> AddressSpaceRoot {
+        self.page_table.address_space_root(self.token())
     }
     /// Mark one hart active immediately before returning to userspace.
     ///
@@ -591,12 +600,14 @@ impl MemorySet {
             mask
         );
     }
-    /// Mark one hart inactive after trap entry switched to the kernel ASID.
+    /// Mark one hart inactive after it has left user mode.
     pub fn mark_user_inactive(&self, hart_id: usize) {
         if hart_id >= MAX_HARTS {
             return;
         }
-        // Do not advance `seen_tlb_generation` here.  A page-table editor
+        // The process root remains loaded in the shared-page-table design, but
+        // ordinary kernel code does not dereference user VAs directly. Do not
+        // advance `seen_tlb_generation` here. A page-table editor
         // publishes the new generation under process-inner, then launches the
         // remote shootdown after dropping that lock.  This hart can acquire
         // process-inner in between those two steps; retaining the old seen
@@ -779,6 +790,9 @@ impl MemorySet {
     }
     /// 将一段区域登记到地址空间并立即建立页表映射；若与现有区域冲突则失败。
     pub fn insert_vma(&mut self, mut vma: Vma, data: Option<&[u8]>) -> Result<(), MmError> {
+        if vma.is_user_accessible() && VirtAddr::from(vma.end_vpn()).0 > USER_SPACE_END {
+            return Err(MmError::PermissionDenied);
+        }
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
             return Err(MmError::Conflict);
         }
@@ -982,9 +996,9 @@ impl MemorySet {
         memory_set
             .map_trampoline()
             .expect("failed to map boot-time kernel trampoline");
-        // On LoongArch, kernel sections / physical memory / MMIO are covered by
-        // DMW windows, but trap trampoline and task kernel stacks live in the
-        // low-half page-table space and are mapped explicitly.
+        // On LoongArch, kernel sections, physical memory and task kernel stacks
+        // are covered by DMW windows. Only the user-trap trampoline needs an
+        // explicit page-table mapping.
         #[cfg(not(target_arch = "loongarch64"))]
         {
             // map kernel sections
@@ -1001,7 +1015,7 @@ impl MemorySet {
                     Vma::new(
                         (stext as usize).into(),
                         (etext as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R | MapPermission::X,
                         VmaKind::Kernel,
                     ),
@@ -1014,7 +1028,7 @@ impl MemorySet {
                     Vma::new(
                         (srodata as usize).into(),
                         (erodata as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R,
                         VmaKind::Kernel,
                     ),
@@ -1027,7 +1041,7 @@ impl MemorySet {
                     Vma::new(
                         (sdata as usize).into(),
                         (edata as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R | MapPermission::W,
                         VmaKind::Kernel,
                     ),
@@ -1040,7 +1054,7 @@ impl MemorySet {
                     Vma::new(
                         (sbss_with_stack as usize).into(),
                         (ebss as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R | MapPermission::W,
                         VmaKind::Kernel,
                     ),
@@ -1048,8 +1062,8 @@ impl MemorySet {
                 )
                 .expect("failed to map kernel bss");
             info!("mapping physical memory");
-            let kernel_start = skernel as usize;
-            let kernel_end = ekernel as usize;
+            let kernel_start = crate::platform::direct_map_virt_to_phys(skernel as usize);
+            let kernel_end = crate::platform::direct_map_virt_to_phys(ekernel as usize);
             bootinfo::for_each_usable_memory_region(|region| {
                 let start = align_up_to_page(region.start);
                 let end = align_down_to_page(region.end);
@@ -1063,7 +1077,7 @@ impl MemorySet {
                         Vma::new(
                             (*pair).0.into(),
                             ((*pair).0 + (*pair).1).into(),
-                            MapType::Identical,
+                            MapType::Direct,
                             MapPermission::R | MapPermission::W,
                             VmaKind::Kernel,
                         ),
@@ -1072,6 +1086,8 @@ impl MemorySet {
                     .expect("failed to map mmio window");
             }
         } // end #[cfg(not(loongarch64))]
+        #[cfg(target_arch = "riscv64")]
+        memory_set.page_table.mark_kernel_half_global();
         memory_set
     }
     /// Load an ELF file and construct the initial user address space.
@@ -1079,6 +1095,7 @@ impl MemorySet {
         file: Arc<OSInode>,
     ) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
         let mut memory_set = Self::new_bare()?;
+        #[cfg(target_arch = "loongarch64")]
         memory_set.map_trampoline()?;
         memory_set.map_user_vdso()?;
         let loaded = ElfLoader::new(&mut memory_set).load_file(&file)?;
@@ -1107,6 +1124,7 @@ impl MemorySet {
     /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo).
     pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
         let mut memory_set = Self::new_bare()?;
+        #[cfg(target_arch = "loongarch64")]
         memory_set.map_trampoline()?;
         memory_set.map_user_vdso()?;
         let loaded = ElfLoader::new(&mut memory_set).load_bytes(elf_data)?;
@@ -1122,7 +1140,7 @@ impl MemorySet {
     pub fn from_existed_user(user_space: &mut Self) -> Result<(Self, bool), MmError> {
         let clone_start_ns = get_time_ns();
         let mut memory_set = Self::new_bare()?;
-        // map trampoline
+        #[cfg(target_arch = "loongarch64")]
         memory_set.map_trampoline()?;
         let mut parent_tlb_needs_flush = false;
         let mut shared_anon_vmas = 0usize;
@@ -2133,6 +2151,10 @@ impl MemorySet {
         let map_perm = area.map_perm;
         let ppn: PhysPageNum = match map_type {
             MapType::Identical => PhysPageNum(vpn.0),
+            MapType::Direct => {
+                let va = usize::from(VirtAddr::from(vpn));
+                PhysAddr::from(crate::platform::direct_map_virt_to_phys(va)).floor()
+            }
             MapType::Framed => {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
                 let page = Arc::new(PrivatePage::new(frame));
@@ -3275,7 +3297,7 @@ impl Vma {
         for vpn in framed_vpns {
             self.unmap_present_one_deferred(page_table, vpn, batch);
         }
-        if self.map_type == MapType::Identical {
+        if matches!(self.map_type, MapType::Identical | MapType::Direct) {
             for vpn in self.vpn_range {
                 let _ = page_table.clear(vpn);
             }
@@ -3313,7 +3335,7 @@ impl Vma {
             };
             frames.push(page.into_frame());
         }
-        if self.map_type == MapType::Identical {
+        if matches!(self.map_type, MapType::Identical | MapType::Direct) {
             for vpn in self.vpn_range {
                 let _ = page_table.clear(vpn);
             }
@@ -3326,6 +3348,10 @@ impl Vma {
         match self.map_type {
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
+            }
+            MapType::Direct => {
+                let va = usize::from(VirtAddr::from(vpn));
+                ppn = PhysAddr::from(crate::platform::direct_map_virt_to_phys(va)).floor();
             }
             MapType::Framed => {
                 let page = Arc::new(PrivatePage::new(
@@ -3440,6 +3466,8 @@ impl Vma {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum MapType {
     Identical,
+    /// Platform kernel direct-map VA translated back to its physical page.
+    Direct,
     Framed,
 }
 

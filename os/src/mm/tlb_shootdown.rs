@@ -421,8 +421,8 @@ fn service_pending_shootdown_quiet() -> Option<(usize, ShootdownKind)> {
 
 /// 在普通内核路径中主动轮询一次 shootdown 请求。
 ///
-/// 用户 trap 入口调用此函数，使一个已经切换到 kernel page table、但尚未重新
-/// 开启中断的 hart 也能及时确认发起方早先拍摄到的 active-user hart 快照。
+/// 用户 trap 入口调用此函数，使一个仍保留进程页表、但尚未重新开启中断的
+/// hart 也能及时确认发起方早先拍摄到的 active-user hart 快照。
 pub fn poll_pending_shootdown() -> bool {
     service_pending_shootdown_quiet().is_some()
 }
@@ -612,9 +612,7 @@ pub fn shootdown_range_quiet(hart_mask: usize, asid: usize, start: usize, end: u
     }
 }
 
-/// 完成一次“刷新 kernel ASID 后提交 deferred 回收”的同步点。
-///
-/// 当前 deferred 状态只承载不带 G 位的动态内核栈映射。
+/// 完成一次共享内核映射的全局刷新后提交 deferred 回收。
 pub fn flush_deferred(hart_mask: usize) {
     let deferred_ranges = deferred_range_count();
     let deferred_frames = deferred_frame_count();
@@ -626,7 +624,7 @@ pub fn flush_deferred(hart_mask: usize) {
         "[tlb] flush deferred recycle on mask={:#b}, ranges={}, frames={}",
         hart_mask, deferred_ranges, deferred_frames
     );
-    shootdown_asid(hart_mask, super::asid::KERNEL_ASID);
+    shootdown(hart_mask, ShootdownKind::Global);
     debug!(
         "[tlb] reclaim deferred batch: ranges={}, frames={}",
         batch.ranges.len(),

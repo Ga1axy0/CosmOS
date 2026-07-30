@@ -73,18 +73,20 @@ __alltraps:
     st.d    $t0, $sp, 70*8
 
     ld.d    $tp, $sp, 34*8
-    ld.d    $t0, $sp, 35*8
     ld.d    $t1, $sp, 37*8
     ld.d    $sp, $sp, 36*8
-    csrwr   $t0, 0x19
-    invtlb  0x00, $zero, $zero
+    # Kernel text/data and this task's kernel stack are DMW-backed. Keep the
+    # current process PGDL active across the privilege transition.
     jr      $t1
 
 __restore:
     csrwr   $a0, CSR_SAVE
     csrrd   $a0, CSR_SAVE
+    csrrd   $t0, 0x19
+    beq     $t0, $a1, 1f
     csrwr   $a1, 0x19
     invtlb  0x00, $zero, $zero
+1:
     move    $sp, $a0
     ld.d    $t0, $sp, 32*8
     ld.d    $t1, $sp, 33*8

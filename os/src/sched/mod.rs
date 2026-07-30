@@ -25,8 +25,8 @@ pub use policy::{
     SCHED_RT_PRIO_MIN,
 };
 pub(crate) use processor::{
-    current_kstack_top, current_processor, defer_task_release_after_switch, run_tasks, schedule,
-    restore_current_task, take_current_task,
+    activate_current_address_space, current_kstack_top, defer_task_release_after_switch,
+    restore_current_task, run_tasks, schedule, take_current_task,
 };
 pub use processor::{
     current_process, current_task, current_trap_cx, current_trap_cx_user_va, current_user_token,
