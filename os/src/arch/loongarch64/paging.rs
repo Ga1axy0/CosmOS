@@ -146,7 +146,7 @@ impl PagingArch for LoongArchPaging {
     }
 
     fn trap_context_flags() -> PTEFlags {
-        PTEFlags::R | PTEFlags::W | PTEFlags::U
+        PTEFlags::R | PTEFlags::W
     }
 
     fn vpn_index(vpn: usize, level: usize) -> usize {

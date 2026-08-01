@@ -1,9 +1,9 @@
 //! Key management syscalls used by LTP `add_key0x`.
 
 use crate::keys;
-use crate::mm::{translated_str, PageFaultAccess};
-use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::translated_byte_buffer_with_access;
+use crate::mm::PageFaultAccess;
+use crate::syscall::errno::ERRNO;
+use crate::syscall::{read_cstring_from_user, translated_byte_buffer_with_access};
 use crate::syscall_body;
 use crate::task::current_process;
 
@@ -16,9 +16,8 @@ pub fn sys_add_key(
     ringid: i32,
 ) -> isize {
     syscall_body!({
-        let token = crate::task::current_user_token();
-        let key_type = translated_str(token, type_ptr).or_errno(ERRNO::EFAULT)?;
-        let description = translated_str(token, desc_ptr).or_errno(ERRNO::EFAULT)?;
+        let key_type = read_cstring_from_user(type_ptr, 4096)?;
+        let description = read_cstring_from_user(desc_ptr, 4096)?;
 
         if !keys::key_type_supported(key_type.as_str()) {
             return Err(ERRNO::ENODEV);
@@ -63,8 +62,7 @@ pub fn sys_keyctl(cmd: i32, arg2: usize, arg3: usize, _arg4: usize, _arg5: usize
                 let name = if arg2 == 0 {
                     None
                 } else {
-                    let token = crate::task::current_user_token();
-                    Some(translated_str(token, arg2 as *const u8).or_errno(ERRNO::EFAULT)?)
+                    Some(read_cstring_from_user(arg2 as *const u8, 4096)?)
                 };
                 Ok(keys::join_session_keyring(&process, name.as_deref())? as isize)
             }

@@ -16,7 +16,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::array;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 
 const RT_QUEUE_LEVELS: usize = SCHED_RT_PRIO_MAX as usize + 1;
@@ -75,8 +75,7 @@ impl RunQueue {
     /// Raw pointer identities of every runnable task in this runqueue
     /// (all RT levels + the CFS tree). `stop_task` is intentionally excluded:
     /// it is a dying-task reference held for kernel-stack safety, not a
-    /// runnable entry. Debug invariant checker only.
-    #[cfg(feature = "sched_invariant_checks")]
+    /// runnable entry. Used by scheduler diagnostics.
     pub(super) fn runnable_ptrs(&self) -> Vec<usize> {
         let mut v = Vec::new();
         for q in self.rt_queues.iter() {
@@ -319,6 +318,11 @@ lazy_static! {
         SpinNoIrqLock::new(BTreeMap::new());
 }
 
+static LOST_RUNNABLE_SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOST_RUNNABLE_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOST_RUNNABLE_REPAIR_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOST_RUNNABLE_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 fn normalize_hart(hart: usize) -> usize {
     hart.min(MAX_HARTS.saturating_sub(1))
 }
@@ -441,6 +445,165 @@ fn notify_enqueued_task(target_hart: usize, incoming: EnqueuedTaskInfo) {
     }
 }
 
+fn should_log_sched_sample(count: usize) -> bool {
+    count <= 16 || count.is_power_of_two()
+}
+
+static ENQUEUE_SKIP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn task_is_current_on_any_hart(task: &Arc<TaskControlBlock>) -> bool {
+    (0..MAX_HARTS).any(|hart| {
+        processor_for_hart(hart)
+            .lock()
+            .current()
+            .is_some_and(|current| Arc::ptr_eq(&current, task))
+    })
+}
+
+/// WARN diagnostics for tasks that are marked runnable but are not owned by
+/// any scheduler container.
+pub(crate) fn warn_lost_runnable_tasks(reason: &'static str) {
+    if reason == "idle_no_task" {
+        if normalize_hart(hartid()) != 0 {
+            return;
+        }
+        let scan_count = LOST_RUNNABLE_SCAN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if scan_count & 0x3f != 0 {
+            return;
+        }
+    }
+
+    // Snapshot each hart's processor/runqueue state in SHORT per-hart critical
+    // sections rather than holding all locks at once. Each `SpinNoIrqLock`
+    // disables local interrupts while held; locking every processor and runqueue
+    // simultaneously keeps THIS hart's interrupts off for the entire scan, which
+    // blocks any in-flight global TLB shootdown IPI from being serviced here —
+    // observed to wedge the whole machine when this scan ran from the timer
+    // tick. Lock/drop per hart keeps each IRQs-off window tiny, so a pending
+    // shootdown IPI is handled between snapshots.
+    let current_ptrs: Vec<usize> = (0..MAX_HARTS)
+        .filter_map(|h| processor_for_hart(h).lock().current_ptr())
+        .collect();
+
+    let mut runnable_ptrs = Vec::new();
+    let rq_snapshot: Vec<(usize, usize, usize, Option<u8>)> = (0..MAX_HARTS)
+        .map(|h| {
+            let rq = RUN_QUEUES[h].lock();
+            runnable_ptrs.extend(rq.runnable_ptrs());
+            (h, rq.rt_nr_running, rq.cfs_nr_running, rq.highest_rt_prio)
+        })
+        .collect();
+
+    let processes: Vec<(usize, Arc<ProcessControlBlock>)> = PID2PCB
+        .lock()
+        .iter()
+        .map(|(pid, process)| (*pid, Arc::clone(process)))
+        .collect();
+
+    // Collect lost-runnable orphans here, then re-enqueue them after the scan so
+    // `wakeup_task` (which takes task/runqueue locks) is never called while we
+    // hold process/task locks.
+    let mut orphans: Vec<Arc<TaskControlBlock>> = Vec::new();
+
+    for (pid, process) in processes {
+        // Do not nest process-inner -> task-inner here.  exec rebuilds the
+        // current task's user resources by briefly taking task-inner and then
+        // process-inner; retaining the process lock while waiting for that task
+        // produces an AB-BA deadlock.  Snapshot the stable Arc references and
+        // process metadata, then inspect every task after dropping the process
+        // lock.
+        let (pgid, process_zombie, exec_path, tasks) = {
+            let process_inner = process.inner_exclusive_access();
+            let tasks: Vec<(usize, Arc<TaskControlBlock>)> = process_inner
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(tid, task)| task.as_ref().map(|task| (tid, Arc::clone(task))))
+                .collect();
+            (
+                process_inner.cred.pgid,
+                process_inner.is_zombie,
+                process_inner.exec_path.clone(),
+                tasks,
+            )
+        };
+        for (tid, task) in tasks {
+            let task_ptr = Arc::as_ptr(&task) as usize;
+            let task_inner = task.inner_exclusive_access();
+            // Read `on_cpu` under the task-inner lock so it is consistent with
+            // status/on_rq (every on_cpu writer holds this lock). A torn read
+            // here would either miss a real orphan or cry wolf on a task that is
+            // actually on-CPU, needlessly tripping the self-heal.
+            let on_cpu = task.on_cpu.load(Ordering::Relaxed);
+            if !matches!(task_inner.task_status, TaskStatus::Runnable)
+                || on_cpu
+                || task_inner.sched.on_rq
+                || current_ptrs.contains(&task_ptr)
+                || runnable_ptrs.contains(&task_ptr)
+            {
+                continue;
+            }
+
+            // Confirmed lost-runnable orphan: collect it for self-heal below.
+            orphans.push(Arc::clone(&task));
+
+            let thread_id = task_inner.res.as_ref().map(|res| res.thread_id);
+
+            let count = LOST_RUNNABLE_ERROR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if !should_log_sched_sample(count) {
+                continue;
+            }
+
+            error!(
+                "[sched-inv][lost-runnable] reason={} count={} scan_hart={} task={:#x} pid={} \
+                 tid={} thread_id={:?} pgid={} exec={} process_zombie={} wait={:?} last_cpu={} \
+                 policy={:?} on_cpu={} on_rq={} has_wq={} task_pending={:#x} \
+                 mask={:#x} resched={:?} currents={:?} rq_snapshot={:?} \
+                 last_sched_op={:?}",
+                reason,
+                count,
+                hartid(),
+                task_ptr,
+                pid,
+                tid,
+                thread_id,
+                pgid,
+                exec_path,
+                process_zombie,
+                task_inner.wait_reason,
+                task_inner.sched.last_cpu,
+                task_inner.sched.policy,
+                on_cpu,
+                task_inner.sched.on_rq,
+                task_inner.current_wq_handle.is_some(),
+                task_inner.pending_signals.bits(),
+                task_inner.signal_mask.bits(),
+                task_inner.sched.resched_reason,
+                current_ptrs,
+                rq_snapshot,
+                task_inner.last_sched_op,
+            );
+        }
+    }
+
+    // Self-heal: re-enqueue every lost-runnable orphan collected above. A
+    // Runnable task that is on no runqueue and no CPU is unreachable by the
+    // normal wake path; `wakeup_task` routes it through `enqueue_wakeup_task`'s
+    // repair branch, which places it back on a runqueue. This is a safety net
+    // that downgrades a permanent lost-runnable hang into a brief stall.
+    for orphan in orphans {
+        let count = LOST_RUNNABLE_SELF_HEAL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 16 || count.is_power_of_two() {
+            error!(
+                "[sched-inv][self-heal] count={} task={:#x} — re-enqueueing lost-runnable orphan",
+                count,
+                Arc::as_ptr(&orphan) as usize
+            );
+        }
+        wakeup_task(orphan);
+    }
+}
+
 /// Returns whether this hart already has runnable RT work at or above `prio`.
 pub fn has_runnable_task_at_or_above(hart: usize, prio: u8) -> bool {
     RUN_QUEUES[normalize_hart(hart)]
@@ -524,51 +687,147 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         task_inner.wait_reason = None;
         task_inner.sched.last_cpu = target_hart;
         task_inner.sched.on_rq = true;
-        rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint)
+        let incoming = rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint);
+        incoming
     };
     notify_enqueued_task(target_hart, incoming);
 }
 
 fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool {
     let current_vruntime_hint = running_cfs_vruntime_snapshot(target_hart);
-    let incoming = {
+    let (incoming, repair_info) = {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
-        match task_inner.task_status {
-            TaskStatus::Interruptible | TaskStatus::Uninterruptible => {}
-            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return true,
-        }
+        let repair_lost_runnable = match task_inner.task_status {
+            TaskStatus::Interruptible | TaskStatus::Uninterruptible => false,
+            // A normal Runnable task should either be queued or on a CPU.
+            // If both ownership markers are clear, preserve the wakeup by
+            // routing it through the regular enqueue path and log the repair.
+            TaskStatus::Runnable => {
+                if task_inner.sched.on_rq || task.on_cpu.load(Ordering::Relaxed) {
+                    return true;
+                }
+                true
+            }
+            TaskStatus::Running | TaskStatus::Zombie => return true,
+        };
         if task_inner.sched.on_rq || task.on_cpu.load(Ordering::Relaxed) {
             task_inner.task_status = TaskStatus::Runnable;
             task_inner.wait_reason = None;
             task_inner.current_wq_handle = None;
             return true;
         }
+        let repair_info = repair_lost_runnable.then_some((
+            task_inner.sched.last_cpu,
+            task_inner.sched.policy,
+            task_inner.pending_signals.bits(),
+            task_inner.signal_mask.bits(),
+            task_inner.sched.resched_reason,
+        ));
         task_inner.task_status = TaskStatus::Runnable;
         task_inner.wait_reason = None;
         task_inner.current_wq_handle = None;
         if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
             task_inner.reset_time_slice();
         }
-        task_inner.sched.on_rq = true;
         task_inner.sched.last_cpu = target_hart;
-        rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint)
+        task_inner.sched.on_rq = true;
+        let incoming = rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint);
+        (incoming, repair_info)
     };
+    if let Some((last_cpu, policy, pending, mask, resched)) = repair_info {
+        let count = LOST_RUNNABLE_REPAIR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_sched_sample(count) {
+            warn!(
+                "[sched][repair-lost-runnable] count={} task={:#x} target_hart={} \
+                 last_cpu={} policy={:?} pending={:#x} mask={:#x} resched={:?}",
+                count,
+                Arc::as_ptr(&task) as usize,
+                target_hart,
+                last_cpu,
+                policy,
+                pending,
+                mask,
+                resched,
+            );
+        }
+    }
     notify_enqueued_task(target_hart, incoming);
     true
 }
 
-fn wake_running_or_queued_task(task: &Arc<TaskControlBlock>) -> bool {
-    {
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.task_status = TaskStatus::Runnable;
-        task_inner.wait_reason = None;
-        task_inner.current_wq_handle = None;
-        if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
-            task_inner.reset_time_slice();
+fn mark_task_woken(task_inner: &mut TaskControlBlockInner) {
+    task_inner.task_status = TaskStatus::Runnable;
+    task_inner.wait_reason = None;
+    task_inner.current_wq_handle = None;
+    if matches!(task_inner.sched.policy, SchedPolicy::Rr) {
+        task_inner.reset_time_slice();
+    }
+}
+
+enum OnCpuWakeAction {
+    Done,
+    Enqueue {
+        preferred_hart: usize,
+        affinity_mask: usize,
+        policy: SchedPolicy,
+    },
+    WaitForSwitch {
+        last_cpu: usize,
+        affinity_mask: usize,
+        policy: SchedPolicy,
+    },
+}
+
+/// Revalidate and wake a task that was observed with `on_cpu=true`.
+///
+/// The processor lock is deliberately acquired before the task lock, matching
+/// `run_tasks`.  Holding both across the `processor.current` check and the
+/// Runnable transition prevents the owning hart from committing a block in
+/// between those two operations.
+fn resolve_on_cpu_wake(task: &Arc<TaskControlBlock>, last_cpu: usize) -> OnCpuWakeAction {
+    let processor = processor_for_hart(last_cpu).lock();
+    let mut task_inner = task.inner_exclusive_access();
+
+    if !matches!(
+        task_inner.task_status,
+        TaskStatus::Interruptible | TaskStatus::Uninterruptible
+    ) {
+        return OnCpuWakeAction::Done;
+    }
+    if task_inner.sched.on_rq {
+        mark_task_woken(&mut task_inner);
+        return OnCpuWakeAction::Done;
+    }
+
+    let is_still_current = processor
+        .current()
+        .is_some_and(|current| Arc::ptr_eq(&current, task));
+    if is_still_current {
+        mark_task_woken(&mut task_inner);
+        let target_hart = normalize_hart(task_inner.sched.last_cpu);
+        drop(task_inner);
+        drop(processor);
+        resched_hart(target_hart);
+        return OnCpuWakeAction::Done;
+    }
+
+    let preferred_hart = task_inner.sched.last_cpu;
+    let affinity_mask = task_inner.sched.cpu_affinity_mask;
+    let policy = task_inner.sched.policy;
+    if task.on_cpu.load(Ordering::Acquire) {
+        OnCpuWakeAction::WaitForSwitch {
+            last_cpu,
+            affinity_mask,
+            policy,
+        }
+    } else {
+        OnCpuWakeAction::Enqueue {
+            preferred_hart,
+            affinity_mask,
+            policy,
         }
     }
-    true
 }
 
 /// Pop one runnable task from the selected hart's runqueue.
@@ -647,71 +906,43 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     }
                     return true;
                 }
-                if task.on_cpu.load(Ordering::Relaxed) {
+                if task.on_cpu.load(Ordering::Acquire) {
                     let last_cpu = normalize_hart(task_inner.sched.last_cpu);
-                    let is_still_current = processor_for_hart(last_cpu)
-                        .lock()
-                        .current()
-                        .is_some_and(|current| Arc::ptr_eq(&current, &task));
-                    if is_still_current {
-                        // Task is still the running task on `last_cpu`: just mark
-                        // it Runnable without enqueueing. The running hart keeps it
-                        // on-CPU (and if it is about to block, its
-                        // `block_current_and_run_next` observes Runnable and skips
-                        // the switch). Enqueueing a running task would corrupt it.
-                        drop(task_inner);
-                        return wake_running_or_queued_task(&task);
-                    }
-                    // Transition window: `take_current_task()` already cleared
-                    // `processor.current` on `last_cpu`, but the context switch is
-                    // still in flight, so `on_cpu` is still true. It is cleared
-                    // post-switch by `finish_pending_task_release`, *after* the
-                    // task's registers are safely saved. Enqueueing now would let
-                    // another hart `__switch` into a half-saved context — the
-                    // confirmed SMP wake/block race. Snapshot the target fields
-                    // (stable across the transition), drop the lock, and spin
-                    // until the owning hart finishes the switch, then enqueue. The
-                    // wait is bounded: `finish_pending_task_release` runs as the
-                    // very next step after that hart returns to its idle loop.
-                    let affinity_mask = task_inner.sched.cpu_affinity_mask;
-                    let policy = task_inner.sched.policy;
                     drop(task_inner);
-                    // Defensive tripwire. The deferred release of `on_cpu` is
-                    // owned by `last_cpu`; if that is THIS hart, the only thing
-                    // that can clear `on_cpu` (`finish_pending_task_release`,
-                    // run when this hart next reaches its idle loop) cannot make
-                    // progress while we execute here — so the spin below would
-                    // never terminate. That is exactly the cyclictest
-                    // self-deadlock: a timer hardirq on the owning hart woke the
-                    // half-blocked task and spun on its still-set `on_cpu`. The
-                    // block/suspend transition is now kept IRQ-atomic, which
-                    // makes this state unreachable; panic loudly if it ever
-                    // recurs so it is debuggable instead of a silent 100%-CPU
-                    // hang.
-                    if last_cpu == normalize_hart(hartid()) {
-                        panic!(
-                            "[sched] wakeup_task: task {:#x} is mid-block (on_cpu set) with \
-                             last_cpu={} == this hart {} — the deferred `on_cpu` release cannot \
-                             complete while we run here; this should be unreachable now that the \
-                             block/suspend transition is IRQ-atomic",
-                            Arc::as_ptr(&task) as usize,
+                    match resolve_on_cpu_wake(&task, last_cpu) {
+                        OnCpuWakeAction::Done => return true,
+                        OnCpuWakeAction::Enqueue {
+                            preferred_hart,
+                            affinity_mask,
+                            policy,
+                        } => Some((preferred_hart, affinity_mask, policy)),
+                        OnCpuWakeAction::WaitForSwitch {
                             last_cpu,
-                            hartid(),
-                        );
+                            affinity_mask,
+                            policy,
+                        } => {
+                            // `take_current_task()` has already removed the
+                            // task from its processor, but the owning hart has
+                            // not finished saving its context.  Wait without
+                            // holding scheduler locks, then let the enqueue path
+                            // revalidate ownership under runqueue+task locks.
+                            if last_cpu == normalize_hart(hartid()) {
+                                panic!(
+                                    "[sched] wakeup_task: task {:#x} is mid-block (on_cpu set) with \
+                                     last_cpu={} == this hart {} — the deferred `on_cpu` release cannot \
+                                     complete while we run here; this should be unreachable now that the \
+                                     block/suspend transition is IRQ-atomic",
+                                    Arc::as_ptr(&task) as usize,
+                                    last_cpu,
+                                    hartid(),
+                                );
+                            }
+                            while task.on_cpu.load(Ordering::Acquire) {
+                                core::hint::spin_loop();
+                            }
+                            Some((last_cpu, affinity_mask, policy))
+                        }
                     }
-                    // Lock-free spin: pair with the `Release` store in
-                    // `finish_pending_task_release`. Seeing on_cpu==false means
-                    // the owning hart has finished saving this task's context, so
-                    // it is safe for us to enqueue it (and for another hart to
-                    // later switch into it).
-                    while task.on_cpu.load(Ordering::Acquire) {
-                        core::hint::spin_loop();
-                    }
-                    // `enqueue_wakeup_task` re-validates on_rq/on_cpu under the
-                    // runqueue+task locks, so a task that was re-picked (on_cpu
-                    // flipped back to true) or already woken by a rival (on_rq)
-                    // during the spin is handled safely.
-                    Some((last_cpu, affinity_mask, policy))
                 } else {
                     Some((
                         task_inner.sched.last_cpu,
@@ -720,7 +951,27 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
                     ))
                 }
             }
-            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Zombie => return true,
+            TaskStatus::Runnable => {
+                // Ordinary Runnable tasks are already owned by a runqueue or
+                // a hart. Only repair the observed SMP invariant violation:
+                // Runnable, not current anywhere, and not queued anywhere.
+                if task_inner.sched.on_rq || task.on_cpu.load(Ordering::Relaxed) {
+                    return true;
+                }
+                let target = (
+                    task_inner.sched.last_cpu,
+                    task_inner.sched.cpu_affinity_mask,
+                    task_inner.sched.policy,
+                );
+                drop(task_inner);
+                if task_is_current_on_any_hart(&task) {
+                    return true;
+                }
+                Some(target)
+            }
+            TaskStatus::Running | TaskStatus::Zombie => {
+                return true;
+            }
         }
     };
     if let Some((preferred_hart, affinity_mask, policy)) = wake_target {
@@ -816,8 +1067,10 @@ pub(crate) fn check_sched_invariants() {
 
 /// Remove a task from all local runqueues.
 pub fn remove_task(task: Arc<TaskControlBlock>) {
-    for rq in RUN_QUEUES.iter() {
+    let mut removed_from = None;
+    for (hart, rq) in RUN_QUEUES.iter().enumerate() {
         if rq.lock().remove_task(&task) {
+            removed_from = Some(hart);
             break;
         }
     }

@@ -1,7 +1,8 @@
 //! Minimal procfs implementation for `/proc`.
 //!
 //! Provides:
-//! - `/proc/meminfo` — basic memory statistics.
+//! - `/proc/meminfo` — standard memory statistics.
+//! - `/proc/cosmos_meminfo` — xxOS memory and performance counters.
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.
@@ -26,20 +27,27 @@ use crate::fs::inode::snapshot_mount_table;
 use crate::fs::page_cache;
 use crate::fs::PAGE_CACHE_MANAGER;
 use crate::keys;
+#[cfg(feature = "cosmos-meminfo")]
 use crate::mm::{
-    deferred_frame_count, deferred_kstack_id_count, deferred_range_count, frame_allocator_stats,
-    MapPermission, VmaKind, KERNEL_HEAP_BYTES, KERNEL_HEAP_USED_BYTES,
+    anonymous_page_stats, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
+    kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats, KERNEL_HEAP_BYTES,
 };
+use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
 #[cfg(feature = "perf_probe")]
 use crate::perf_probe;
 #[cfg(feature = "mm_perf_counters")]
 use crate::perf_sampler;
+#[cfg(feature = "io_perf_counters")]
+use crate::poll;
 use crate::sched::{list_pids, pid2process};
 use crate::signal::{MAX_SIG, SIG_IGN};
-use crate::task::{cached_kstack_count, current_process, TaskStatus};
+#[cfg(feature = "cosmos-meminfo")]
+use crate::task::{cached_kstack_count, process_lifecycle_stats};
+use crate::task::{current_process, TaskStatus};
 use crate::timer::{get_time, time_to_ticks};
+#[cfg(feature = "cosmos-meminfo")]
 use core::sync::atomic::Ordering;
 
 fn parse_pid(name: &str) -> Option<usize> {
@@ -52,27 +60,168 @@ fn parse_pid(name: &str) -> Option<usize> {
 fn build_meminfo() -> String {
     let stats = frame_allocator_stats();
     let cached_pages = PAGE_CACHE_MANAGER.lock().cached_pages;
-    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire);
-    let heap_used = KERNEL_HEAP_USED_BYTES.load(Ordering::Acquire);
     let page_kb = (PAGE_SIZE as u64) / 1024;
     let mem_total = stats.total_pages as u64 * page_kb;
     let mem_free = stats.free_pages as u64 * page_kb;
     let cached = cached_pages as u64 * page_kb;
-    let mem_available = mem_free.saturating_add(cached);
+    // Cached pages are reclaimable, but they are also included in
+    // FrameAllocated. Cap the contribution by the currently allocated frame
+    // count and never report more available memory than MemTotal.
+    let reclaimable_cached = cached.min(stats.allocated_pages as u64 * page_kb);
+    let mem_available = mem_free.saturating_add(reclaimable_cached).min(mem_total);
 
     let mut out = String::new();
     let _ = writeln!(&mut out, "MemTotal:       {} kB", mem_total);
     let _ = writeln!(&mut out, "MemFree:        {} kB", mem_free);
     let _ = writeln!(&mut out, "MemAvailable:   {} kB", mem_available);
     let _ = writeln!(&mut out, "Cached:         {} kB", cached);
+    out
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+fn build_cosmos_meminfo() -> String {
+    let stats = frame_allocator_stats();
+    let anon = anonymous_page_stats();
+    let page_table = page_table_stats();
+    let tlb = tlb_shootdown_stats();
+    let process = process_lifecycle_stats();
+    let heap_committed = KERNEL_HEAP_BYTES.load(Ordering::Acquire) as u64;
+    let heap_stats = kernel_heap_allocator_stats();
+    let heap_used = heap_stats.requested_bytes as u64;
+
+    let mut out = String::new();
     let _ = writeln!(&mut out, "FrameAllocated: {} pages", stats.allocated_pages);
     let _ = writeln!(&mut out, "FrameOom:       {}", stats.oom_count);
+    let _ = writeln!(&mut out, "FrameAllocCalls: {}", stats.alloc_calls);
+    let _ = writeln!(&mut out, "FrameDeallocCalls: {}", stats.dealloc_calls);
+    let _ = writeln!(
+        &mut out,
+        "FrameContiguousAllocCalls: {}",
+        stats.contiguous_alloc_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameRangeDeallocCalls: {}",
+        stats.range_dealloc_calls
+    );
+    let _ = writeln!(&mut out, "FrameFreeScanSteps: {}", stats.free_scan_steps);
+    let _ = writeln!(&mut out, "FrameSplitOps: {}", stats.split_ops);
+    let _ = writeln!(&mut out, "FrameMergeOps: {}", stats.merge_ops);
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddySearchCalls: {}",
+        stats.buddy_search_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddySearchHits: {}",
+        stats.buddy_search_hits
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddySearchMisses: {}",
+        stats.buddy_search_misses
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameBuddyBitmapEnabled: {}",
+        stats.bitmap_enabled as usize
+    );
+    let _ = writeln!(
+        &mut out,
+        "FrameAllocatorLockWaitTicks: {}",
+        stats.lock_wait_ticks
+    );
+    let _ = writeln!(&mut out, "FrameZeroedPages: {}", stats.zeroed_pages);
+    let _ = writeln!(&mut out, "FrameZeroedBytes: {}", stats.zeroed_bytes);
+    let _ = writeln!(&mut out, "FrameZeroTimeTicks: {}", stats.zero_time_ticks);
+    let _ = writeln!(&mut out, "AnonZeroPageMapHits: {}", anon.zero_page_map_hits);
+    let _ = writeln!(
+        &mut out,
+        "AnonZeroPageWriteMaterializations: {}",
+        anon.zero_page_write_materializations
+    );
+    let _ = writeln!(
+        &mut out,
+        "AnonPrivateFirstFaultsRead: {}",
+        anon.private_first_faults_read
+    );
+    let _ = writeln!(
+        &mut out,
+        "AnonPrivateFirstFaultsWrite: {}",
+        anon.private_first_faults_write
+    );
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCacheEnabled: {}",
+        stats.per_cpu_cache_enabled as usize
+    );
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCacheHits: {}",
+        stats.per_cpu_cache_hits
+    );
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCacheMisses: {}",
+        stats.per_cpu_cache_misses
+    );
+    let _ = writeln!(&mut out, "PageTableAllocCalls: {}", page_table.alloc_calls);
+    let _ = writeln!(&mut out, "PageTableFreeCalls: {}", page_table.free_calls);
+    let _ = writeln!(
+        &mut out,
+        "PageTableUntrackedAllocCalls: {}",
+        page_table.untracked_alloc_calls
+    );
+    let _ = writeln!(&mut out, "TlbShootdownCalls: {}", tlb.calls);
+    let _ = writeln!(&mut out, "TlbShootdownIpiTargets: {}", tlb.ipi_targets);
+    let _ = writeln!(&mut out, "TlbShootdownAckWaits: {}", tlb.ack_waits);
+    let _ = writeln!(&mut out, "TlbShootdownAckWaitTicks: {}", tlb.ack_wait_ticks);
+    let _ = writeln!(&mut out, "ProcessCreateCalls: {}", process.create_calls);
+    let _ = writeln!(&mut out, "ProcessExecCalls: {}", process.exec_calls);
+    let _ = writeln!(&mut out, "ProcessExitCalls: {}", process.exit_calls);
     let _ = writeln!(&mut out, "KernelHeapCommitted: {} bytes", heap_committed);
     let _ = writeln!(&mut out, "KernelHeapUsed:      {} bytes", heap_used);
     let _ = writeln!(
         &mut out,
         "KernelHeapFree:      {} bytes",
         heap_committed.saturating_sub(heap_used)
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapAllocated: {} bytes",
+        heap_stats.allocated_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapActualFree: {} bytes",
+        heap_stats.actual_free_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapLargestFree: {} bytes",
+        heap_stats.largest_free_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapFreeScanSteps: {}",
+        heap_stats.free_scan_steps
+    );
+    let _ = writeln!(&mut out, "KernelHeapFreeCalls: {}", heap_stats.free_calls);
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapBuddyFreeCalls: {}",
+        heap_stats.buddy_free_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapSlabReserved: {} bytes",
+        heap_stats.slab_reserved_bytes
+    );
+    let _ = writeln!(
+        &mut out,
+        "KernelHeapSlabFree: {} bytes",
+        heap_stats.slab_free_bytes
     );
     let _ = writeln!(&mut out, "KStackCached:   {}", cached_kstack_count());
     let _ = writeln!(&mut out, "DeferredRanges: {}", deferred_range_count());
@@ -155,6 +304,7 @@ fn build_partitions() -> String {
 
 #[cfg(feature = "io_perf_counters")]
 fn reset_io_perf() {
+    poll::reset_perf_counters();
     crate::fs::reset_perf_counters();
     ::fs::vfs::reset_perf_counters();
     ::fs::block_cache::reset_perf_counters();
@@ -166,6 +316,7 @@ fn reset_io_perf() {
 #[cfg(feature = "io_perf_counters")]
 fn build_io_perf() -> String {
     let mut out = String::new();
+    out.push_str(&poll::render_perf_counters());
     out.push_str(&crate::fs::render_perf_counters());
     out.push_str(&::fs::vfs::render_perf_counters());
     out.push_str(&block_drivers::render_perf_counters());
@@ -304,6 +455,7 @@ fn mask_to_cpu_list(mask: usize) -> String {
 fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
     let process = pid2process(pid).ok_or(FS_ERRNO::ENOENT)?;
     let now = get_time();
+    let live_thread_count = process.thread_count();
     let (
         comm,
         ppid,
@@ -332,9 +484,7 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
         let pgrp = inner.cred.pgid;
         let session = inner.cred.sid;
         let is_zombie = inner.is_zombie;
-        let num_threads = inner
-            .thread_count()
-            .max(if inner.is_zombie { 1 } else { 0 });
+        let num_threads = live_thread_count.max(if inner.is_zombie { 1 } else { 0 });
         let vsize = inner.address_space_bytes();
         let start_stack = inner.vm_layout.start_stack;
         let start_brk = inner.vm_layout.start_brk;
@@ -483,6 +633,7 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
 
 fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     let process = pid2process(pid).ok_or(FS_ERRNO::ENOENT)?;
+    let live_thread_count = process.thread_count();
     let (
         name,
         umask,
@@ -527,9 +678,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
         let session = inner.cred.sid;
         let proc_pending = inner.pending_signals.bits();
         let fd_size = inner.fd_table.len();
-        let num_threads = inner
-            .thread_count()
-            .max(if inner.is_zombie { 1 } else { 0 });
+        let num_threads = live_thread_count.max(if inner.is_zombie { 1 } else { 0 });
         let vsize = inner.address_space_bytes();
         let start_brk = inner.vm_layout.start_brk;
         let current_brk = inner.vm_layout.brk;
@@ -753,6 +902,8 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("cpuinfo"), VfsFileType::Regular));
         entries.push((String::from("filesystems"), VfsFileType::Regular));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
+        #[cfg(feature = "cosmos-meminfo")]
+        entries.push((String::from("cosmos_meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
         entries.push((String::from("partitions"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
@@ -779,6 +930,8 @@ impl VfsNode for ProcRootNode {
             "cpuinfo" => Some(Arc::new(ProcCpuinfoNode::new()) as Arc<dyn VfsNode>),
             "filesystems" => Some(Arc::new(ProcFilesystemsNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "cosmos-meminfo")]
+            "cosmos_meminfo" => Some(Arc::new(ProcCosmosMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
             "partitions" => Some(Arc::new(ProcPartitionsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
@@ -1598,6 +1751,69 @@ impl VfsNode for ProcMeminfoNode {
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         read_string_at(build_meminfo(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/cosmos_meminfo` node.
+#[cfg(feature = "cosmos-meminfo")]
+#[derive(Default, Debug)]
+pub struct ProcCosmosMeminfoNode;
+
+#[cfg(feature = "cosmos-meminfo")]
+impl ProcCosmosMeminfoNode {
+    /// Create a new xxOS memory statistics node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+impl VfsNode for ProcCosmosMeminfoNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_cosmos_meminfo().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_cosmos_meminfo(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {

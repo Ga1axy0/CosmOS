@@ -2,7 +2,9 @@ use super::cgroupfs::{new_cgroup2_root, CgroupDirNode};
 use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use super::tmpfs::new_tmpfs_root;
-use super::{discard_inode, page_cache, File, Stat, StatFs64, StatMode};
+use super::{
+    discard_inode, page_cache, File, FileReadAheadPlan, Stat, StatFs64, StatMode,
+};
 use crate::drivers::block::{block_device_name, BLOCK_DEVICES};
 use crate::fs::devfs::{
     ensure_ltp_scratch_device, BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode,
@@ -55,6 +57,51 @@ impl OSInode {
     /// 返回当前普通文件对应的 page mapping；目录或不可缓存对象返回 `None`。
     fn page_mapping(&self) -> Option<page_cache::PageMappingHandle> {
         page_cache::mapping_for_inode(&self.inode)
+    }
+
+    fn read_user_buffer_at(
+        &self,
+        offset: usize,
+        mut buf: UserBuffer,
+        read_ahead: Option<FileReadAheadPlan>,
+    ) -> usize {
+        let mapping = self.page_mapping();
+
+        let mut file_off = offset;
+        let mut total_read_size = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            let read_size = if let Some(mapping) = mapping.as_ref() {
+                mapping.read(file_off, *slice)
+            } else {
+                self.inode.read_at(file_off, *slice)
+            };
+            if read_size == 0 {
+                break;
+            }
+            file_off += read_size;
+            total_read_size += read_size;
+            if read_size < slice.len() {
+                break;
+            }
+        }
+        if let (Some(mapping), Some(plan)) = (mapping.as_ref(), read_ahead) {
+            mapping.prefetch_for_sequential_read(
+                plan.start,
+                plan.len,
+                offset,
+                total_read_size,
+            );
+        }
+        total_read_size
+    }
+
+    pub(crate) fn read_at_with_readahead(
+        &self,
+        offset: usize,
+        buf: UserBuffer,
+        read_ahead: Option<FileReadAheadPlan>,
+    ) -> usize {
+        self.read_user_buffer_at(offset, buf, read_ahead)
     }
 
     /// read all data from the inode in memory
@@ -603,23 +650,36 @@ pub fn list_apps() {
 /// - Otherwise it is concatenated after `cwd`.
 /// - `.` and `..` components are collapsed.
 pub fn canonicalize(cwd: &str, path: &str) -> String {
-    let base = if path.starts_with('/') {
-        String::from(path)
-    } else {
-        let mut s = String::from(cwd);
-        s.push('/');
-        s.push_str(path);
-        s
-    };
-
     let mut stack: Vec<&str> = Vec::new();
-    for component in base.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                stack.pop();
+
+    if path.starts_with('/') {
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                c => stack.push(c),
             }
-            c => stack.push(c),
+        }
+    } else {
+        for component in cwd.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                c => stack.push(c),
+            }
+        }
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                c => stack.push(c),
+            }
         }
     }
 
@@ -640,27 +700,59 @@ pub fn canonicalize(cwd: &str, path: &str) -> String {
 /// Walk the virtual filesystem from the root to the node at `abs_path`.
 /// Returns `None` if any component along the path is not found.
 pub fn lookup_inode(abs_path: &str) -> Option<Arc<Inode>> {
-    let components: Vec<&str> = abs_path.split('/').filter(|s| !s.is_empty()).collect();
-    if components.is_empty() {
-        return Some(Arc::clone(&ROOT_INODE));
-    }
     let mut cur: Arc<Inode> = Arc::clone(&ROOT_INODE);
-    for component in components {
+    for component in abs_path.split('/').filter(|s| !s.is_empty()) {
         cur = cur.find(component)?;
     }
     Some(cur)
 }
 
-fn join_remaining(target: &str, rest: &[String]) -> String {
-    if rest.is_empty() {
-        return String::from(target);
-    }
+fn join_remaining<'a, I>(target: &str, rest: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let mut out = String::from(target);
-    if !out.ends_with('/') {
-        out.push('/');
-    }
-    for (idx, component) in rest.iter().enumerate() {
+    for (idx, component) in rest.into_iter().enumerate() {
+        if idx == 0 && !out.ends_with('/') {
+            out.push('/');
+        }
         if idx != 0 {
+            out.push('/');
+        }
+        out.push_str(component);
+    }
+    out
+}
+
+/// Build a path from already borrowed components. This is used only when a
+/// symlink forces a restart, so ordinary lookups do not pay for a path string.
+fn path_from_components<'a, I>(components: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out = String::from("/");
+    for component in components {
+        if out != "/" {
+            out.push('/');
+        }
+        out.push_str(component);
+    }
+    out
+}
+
+/// Append borrowed path components to a base path. This is also a symlink
+/// restart helper; the normal dirfd lookup path keeps the components borrowed
+/// without constructing this string.
+fn path_with_components<'a, I>(base_path: &str, components: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out = String::from(base_path);
+    for component in components {
+        if component == "." {
+            continue;
+        }
+        if out != "/" {
             out.push('/');
         }
         out.push_str(component);
@@ -675,6 +767,21 @@ pub fn lookup_inode_follow_with_path(
     path: &str,
     follow_final: bool,
 ) -> Result<(Arc<Inode>, String), ERRNO> {
+    let (inode, resolved_path) = lookup_inode_follow_impl(cwd, path, follow_final, true)?;
+    Ok((inode, resolved_path.expect("path requested from resolver")))
+}
+
+/// Resolve a path while optionally retaining the final canonical path.
+///
+/// Most callers only need the inode. Keeping the path optional prevents the
+/// common lookup path from producing and then immediately dropping a second
+/// owned result string.
+fn lookup_inode_follow_impl(
+    cwd: &str,
+    path: &str,
+    follow_final: bool,
+    return_path: bool,
+) -> Result<(Arc<Inode>, Option<String>), ERRNO> {
     let start_us = get_time_us();
     let mut abs = canonicalize(cwd, path);
     let mut depth = 0usize;
@@ -682,20 +789,19 @@ pub fn lookup_inode_follow_with_path(
     let mut components_walked = 0usize;
 
     let result = 'walk: loop {
-        let components: Vec<String> = abs
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-        if components.is_empty() {
-            break 'walk Ok((Arc::clone(&ROOT_INODE), String::from("/")));
+        let mut components = abs.split('/').filter(|s| !s.is_empty()).peekable();
+        if components.peek().is_none() {
+            break 'walk Ok((
+                Arc::clone(&ROOT_INODE),
+                return_path.then(|| String::from("/")),
+            ));
         }
 
         let mut cur = Arc::clone(&ROOT_INODE);
-        let mut cur_path = String::from("/");
         let mut restart: Option<String> = None;
+        let mut component_idx = 0usize;
 
-        for (idx, component) in components.iter().enumerate() {
+        while let Some(component) = components.next() {
             components_walked += 1;
             if !cur.is_dir() {
                 break 'walk Err(ERRNO::ENOTDIR);
@@ -703,7 +809,7 @@ pub fn lookup_inode_follow_with_path(
             let Some(child) = cur.find(component) else {
                 break 'walk Err(ERRNO::ENOENT);
             };
-            let is_final = idx + 1 == components.len();
+            let is_final = components.peek().is_none();
             if child.is_symlink() && (!is_final || follow_final) {
                 depth += 1;
                 if depth > MAX_SYMLINK_DEPTH {
@@ -716,25 +822,24 @@ pub fn lookup_inode_follow_with_path(
                 let base = if target.starts_with('/') {
                     String::from("/")
                 } else {
-                    cur_path.clone()
+                    path_from_components(
+                        abs.split('/').filter(|s| !s.is_empty()).take(component_idx),
+                    )
                 };
-                let combined = join_remaining(target.as_str(), &components[idx + 1..]);
+                let combined = join_remaining(target.as_str(), components);
                 restart = Some(canonicalize(base.as_str(), combined.as_str()));
                 restarts += 1;
                 break;
             }
 
             cur = child;
-            if cur_path != "/" {
-                cur_path.push('/');
-            }
-            cur_path.push_str(component);
+            component_idx += 1;
         }
 
         if let Some(next_abs) = restart {
             abs = next_abs;
         } else {
-            break 'walk Ok((cur, abs));
+            break 'walk Ok((cur, return_path.then_some(abs)));
         }
     };
     super::record_lookup_inode_follow_perf(
@@ -765,46 +870,50 @@ pub fn lookup_inode_from(
         return lookup_inode_follow("/", path, follow_final);
     }
 
-    let components: Vec<String> = path
+    if path
         .split('/')
         .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
-    if components.is_empty() {
-        return Ok(Arc::clone(base_inode));
-    }
-    if components.iter().any(|component| component == "..") {
+        .any(|component| component == "..")
+    {
         return lookup_inode_follow(base_path, path, follow_final);
     }
 
-    let mut cur = Arc::clone(base_inode);
-    let mut cur_path = String::from(base_path);
+    let mut components = path.split('/').filter(|s| !s.is_empty()).peekable();
+    if components.peek().is_none() {
+        return Ok(Arc::clone(base_inode));
+    }
 
-    for (idx, component) in components.iter().enumerate() {
+    let mut cur = Arc::clone(base_inode);
+    let mut component_idx = 0usize;
+
+    while let Some(component) = components.next() {
         if component == "." {
+            component_idx += 1;
             continue;
         }
         if !cur.is_dir() {
             return Err(ERRNO::ENOTDIR);
         }
         let child = cur.find(component).ok_or(ERRNO::ENOENT)?;
-        let is_final = idx + 1 == components.len();
+        let is_final = components.peek().is_none();
         if child.is_symlink() && (!is_final || follow_final) {
             let target = child.read_link().map_err(ERRNO::from)?;
             let restart_base = if target.starts_with('/') {
                 String::from("/")
             } else {
-                cur_path.clone()
+                path_with_components(
+                    base_path,
+                    path.split('/')
+                        .filter(|s| !s.is_empty())
+                        .take(component_idx),
+                )
             };
-            let combined = join_remaining(target.as_str(), &components[idx + 1..]);
+            let combined = join_remaining(target.as_str(), components);
             return lookup_inode_follow(restart_base.as_str(), combined.as_str(), true);
         }
 
         cur = child;
-        if cur_path != "/" {
-            cur_path.push('/');
-        }
-        cur_path.push_str(component);
+        component_idx += 1;
     }
 
     Ok(cur)
@@ -812,19 +921,24 @@ pub fn lookup_inode_from(
 
 /// Resolve a path and optionally leave the final symlink unresolved.
 pub fn lookup_inode_follow(cwd: &str, path: &str, follow_final: bool) -> Result<Arc<Inode>, ERRNO> {
-    lookup_inode_follow_with_path(cwd, path, follow_final).map(|(inode, _)| inode)
+    lookup_inode_follow_impl(cwd, path, follow_final, false).map(|(inode, _)| inode)
 }
 
 /// Resolve parent directory with symlinks followed in all parent components.
 fn resolve_parent_follow(cwd: &str, path: &str) -> Result<(Arc<Inode>, String, String), ERRNO> {
     let abs = canonicalize(cwd, path);
+    resolve_parent_follow_abs(abs.as_str())
+}
+
+/// Resolve a path that has already been canonicalized.
+fn resolve_parent_follow_abs(abs: &str) -> Result<(Arc<Inode>, String, String), ERRNO> {
     if abs == "/" {
         return Err(ERRNO::ENOENT);
     }
     let (parent_path, filename) = match abs.rfind('/') {
         Some(0) => (String::from("/"), String::from(&abs[1..])),
         Some(idx) => (String::from(&abs[..idx]), String::from(&abs[idx + 1..])),
-        None => (String::from("/"), abs.clone()),
+        None => (String::from("/"), String::from(abs)),
     };
     if filename.is_empty() {
         return Err(ERRNO::ENOENT);
@@ -873,7 +987,7 @@ pub fn open_file_at_with_status(
 
     if flags.contains(OpenFlags::CREATE) {
         // Navigate to the parent directory and create the file there.
-        let (parent, name, parent_path) = resolve_parent_follow(cwd, path)?;
+        let (parent, name, parent_path) = resolve_parent_follow_abs(abs.as_str())?;
         if let Some(existing) = parent.find(&name) {
             // 已存在文件时，`O_CREAT` 只负责“存在则直接打开”，不能隐式截断。
             debug!("EXCL flag valid: {}", flags.contains(OpenFlags::EXCL));
@@ -884,8 +998,7 @@ pub fn open_file_at_with_status(
                 return Err(ERRNO::ELOOP);
             }
             let mut inode = if existing.is_symlink() {
-                let existing_path = canonicalize(parent_path.as_str(), name.as_str());
-                lookup_inode_follow("/", existing_path.as_str(), true)?
+                lookup_inode_from(&parent, parent_path.as_str(), name.as_str(), true)?
             } else {
                 existing
             };
@@ -900,12 +1013,12 @@ pub fn open_file_at_with_status(
             Ok((Arc::new(OSInode::new(inode, abs.clone())), false))
         } else {
             parent
-                .create(&name)
+                .create_result(&name)
                 .map(|inode| {
                     let _ = inode.set_times_now(inode_now());
                     (Arc::new(OSInode::new(inode, abs.clone())), true)
                 })
-                .ok_or(ERRNO::EIO)
+                .map_err(ERRNO::from)
         }
     } else {
         let mut inode = lookup_inode_follow(cwd, path, !flags.contains(OpenFlags::NOFOLLOW))?;
@@ -948,12 +1061,9 @@ pub fn mkdir_at_with_inode(cwd: &str, path: &str) -> Result<Arc<Inode>, ERRNO> {
             return Err(ERRNO::ENOTDIR);
         }
         // 创建失败
-        if let Some(inode) = parent.mkdir(&name) {
-            let _ = inode.set_times_now(inode_now());
-            Ok(inode)
-        } else {
-            Err(ERRNO::EIO)
-        }
+        let inode = parent.mkdir_result(&name).map_err(ERRNO::from)?;
+        let _ = inode.set_times_now(inode_now());
+        Ok(inode)
     } else if lookup_inode_follow(cwd, path, true).is_ok() {
         Err(ERRNO::EEXIST)
     } else {
@@ -1130,17 +1240,18 @@ pub fn rename_at(
     Ok(())
 }
 
-/// Remove a link at `path` relative to `cwd`.
-pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
-    debug!("unlinkat: cwd={}, path={}, flags={:#x}", cwd, path, flags);
+/// Remove a named child from an already-resolved parent directory.
+///
+/// Both path-based and direct-dirfd unlinkat paths must use this helper so
+/// hard-link and page-cache lifetime rules cannot diverge.
+pub fn unlink_child(parent: &Arc<Inode>, name: &str, flags: u32) -> Result<(), ERRNO> {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(ERRNO::EINVAL);
     }
-    let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
     if name.is_empty() {
         return Err(ERRNO::ENOENT);
     }
-    let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
+    let inode = parent.find(name).ok_or(ERRNO::ENOENT)?;
     if inode.is_dir() {
         if flags & AT_REMOVEDIR == 0 {
             return Err(ERRNO::EISDIR);
@@ -1150,22 +1261,31 @@ pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
             // Contains at least one entry other than `.` and `..`
             return Err(ERRNO::ENOTEMPTY);
         }
-        parent.rmdir(name.as_str())?
+        parent.rmdir(name)?
     } else {
         if flags & AT_REMOVEDIR != 0 {
             return Err(ERRNO::ENOTDIR);
         }
-        // 删除普通文件前丢弃旧页，避免已经解除目录项后仍有脏页迟到回写。
-        discard_inode(&inode);
-        if let Err(err) = parent.unlink(name.as_str()) {
-            error!(
-                "[unlinkat] unlink regular file failed: cwd={} path={} name={} errno={}",
-                cwd, path, name, err as i32
-            );
-            return Err(err.into());
+        // A hard-linked file remains reachable after removing this name. Its
+        // page cache may contain the only current copy of dirty data and the
+        // grown logical size, so discarding it would make the surviving name
+        // observe a stale (often zero-length) backing inode.
+        let discard_after_unlink = inode.nlink() <= 1;
+        parent.unlink(name)?;
+        if discard_after_unlink {
+            // Detach only after a successful final unlink, so an error cannot
+            // destroy data belonging to a still-visible file.
+            discard_inode(&inode);
         }
     }
     Ok(())
+}
+
+/// Remove a link at `path` relative to `cwd`.
+pub fn unlinkat(cwd: &str, path: &str, flags: u32) -> Result<(), ERRNO> {
+    debug!("unlinkat: cwd={}, path={}, flags={:#x}", cwd, path, flags);
+    let (parent, name) = resolve_parent(cwd, path).ok_or(ERRNO::ENOENT)?;
+    unlink_child(&parent, name.as_str(), flags)
 }
 
 impl File for OSInode {
@@ -1186,26 +1306,8 @@ impl File for OSInode {
     fn is_dir(&self) -> bool {
         self.inode.is_dir()
     }
-    fn read_at(&self, offset: usize, mut buf: UserBuffer) -> usize {
-        let mapping = self.page_mapping();
-        let mut file_off = offset;
-        let mut total_read_size = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            let read_size = if let Some(mapping) = mapping.as_ref() {
-                mapping.read(file_off, *slice)
-            } else {
-                self.inode.read_at(file_off, *slice)
-            };
-            if read_size == 0 {
-                break;
-            }
-            file_off += read_size;
-            total_read_size += read_size;
-            if read_size < slice.len() {
-                break;
-            }
-        }
-        total_read_size
+    fn read_at(&self, offset: usize, buf: UserBuffer) -> usize {
+        self.read_user_buffer_at(offset, buf, None)
     }
     fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, ERRNO> {
         let mapping = self.page_mapping();
@@ -1288,10 +1390,11 @@ impl File for OSInode {
     }
 
     fn sync(&self) -> Result<(), ERRNO> {
-        if let Some(mapping) = self.page_mapping() {
-            mapping.sync();
-        }
-        Ok(())
+        page_cache::sync_inode(&self.inode)?;
+        // Directory operations and ext4 inode metadata bypass the regular
+        // file page cache and use fs::block_cache directly.  fsync on a
+        // directory must therefore flush that lower cache as well.
+        crate::fs::sync_block_cache_all()
     }
 
     fn path(&self) -> Option<String> {
@@ -1332,7 +1435,10 @@ pub fn inode_stat(inode: &Arc<Inode>) -> Stat {
         attrs.size
     };
     let stat = Stat {
-        dev: 0,
+        // `st_dev` identifies the mounted filesystem containing this inode.
+        // Keeping it aligned with the VFS cache key also lets userspace
+        // distinguish mount boundaries while reconstructing a physical cwd.
+        dev: inode.fs_id(),
         ino: attrs.ino,
         mode,
         nlink: attrs.nlink,

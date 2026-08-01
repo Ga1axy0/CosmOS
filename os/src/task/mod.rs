@@ -23,7 +23,7 @@ use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::sched::{
     add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
-    take_current_task, TaskContext,
+    resched_hart, take_current_task, TaskContext,
 };
 pub use crate::sched::{
     block_current_and_run_next, current_process, current_task, current_trap_cx,
@@ -39,6 +39,167 @@ use crate::timer::get_time_ns;
 use crate::timer::remove_timer;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Terminate every sibling task before the current process installs a new
+/// image with `execve`.
+///
+/// `execve` keeps the calling thread and the process identity, but all other
+/// threads must disappear before the old address space is recycled.  This is
+/// deliberately separate from `exit_group_current_and_run_next`: the current
+/// task must continue running and the PCB must remain usable after the image
+/// replacement.
+pub(crate) fn terminate_other_threads_for_exec(
+    process: &Arc<ProcessControlBlock>,
+    leader: &Arc<TaskControlBlock>,
+) {
+    let siblings = {
+        let process_inner = process.inner_exclusive_access();
+        process_inner
+            .tasks
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|task| !Arc::ptr_eq(task, leader))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if siblings.is_empty() {
+        return;
+    }
+
+    debug!(
+        "[exec] terminate sibling threads: pid={} count={}",
+        process.getpid(),
+        siblings.len()
+    );
+
+    let mut active_siblings = Vec::<(Arc<TaskControlBlock>, usize)>::new();
+    let mut running_siblings = Vec::<(Arc<TaskControlBlock>, usize)>::new();
+    let mut recycle_res = Vec::<TaskUserRes>::new();
+
+    for sibling in siblings {
+        let state = {
+            let mut task_inner = sibling.inner_exclusive_access();
+            if task_inner.exit_code.is_some() {
+                None
+            } else {
+                let tid = task_inner.res.as_ref().map(|res| res.tid);
+                let thread_id = task_inner.res.as_ref().map(|res| res.thread_id());
+                let clear_child_tid = task_inner.clear_child_tid;
+                let wait_handle = task_inner.current_wq_handle.take();
+                let was_on_cpu = sibling.on_cpu.load(Ordering::Acquire);
+                let last_cpu = task_inner.sched.last_cpu;
+                task_inner.exit_code = Some(0);
+                task_inner.task_status = TaskStatus::Zombie;
+                task_inner.wait_reason = None;
+                sibling.set_resched_reason_locked(
+                    &mut task_inner,
+                    Some(crate::sched::ReschedReason::HigherRtPriority),
+                );
+                task_inner.clear_child_tid = 0;
+                Some((
+                    tid,
+                    thread_id,
+                    clear_child_tid,
+                    wait_handle,
+                    was_on_cpu,
+                    last_cpu,
+                ))
+            }
+        };
+        let Some((tid, thread_id, clear_child_tid, wait_handle, was_on_cpu, last_cpu)) = state
+        else {
+            continue;
+        };
+
+        if let Some(wait_handle) = wait_handle {
+            wait_handle.remove_waiter(&sibling);
+        }
+        cleanup_signal_wait_for_task(&sibling);
+        cleanup_futex_wait_for_task(&sibling);
+        if should_remove_non_futex_timers_on_exit(&sibling) {
+            remove_timer(Arc::clone(&sibling));
+        }
+        if let Some(thread_id) = thread_id {
+            remove_from_tid2task(thread_id);
+        }
+        if let Some(tid) = tid {
+            let mut process_inner = process.inner_exclusive_access();
+            process_inner.mutex_detector.clear_thread(tid);
+            process_inner.semaphore_detector.clear_thread(tid);
+        }
+
+        if clear_child_tid != 0 {
+            if let Err(err) = write_pod_to_process_user(
+                process,
+                clear_child_tid as *mut i32,
+                &0i32,
+            ) {
+                warn!(
+                    "[exec] failed to clear sibling child_tid: pid={} tid={:?} addr={:#x} err={:?}",
+                    process.getpid(),
+                    tid,
+                    clear_child_tid,
+                    err
+                );
+            }
+            if let Err(err) = futex_wake_addr_in_process(process, clear_child_tid, 1, false) {
+                warn!(
+                    "[exec] failed to wake sibling child_tid futex: pid={} tid={:?} addr={:#x} err={:?}",
+                    process.getpid(),
+                    tid,
+                    clear_child_tid,
+                    err
+                );
+            }
+        }
+
+        remove_task(Arc::clone(&sibling));
+        if let Some(tid) = tid {
+            active_siblings.push((Arc::clone(&sibling), tid));
+        }
+        if was_on_cpu {
+            resched_hart(last_cpu);
+            running_siblings.push((sibling, last_cpu));
+        } else if let Some(res) = sibling.inner_exclusive_access().res.take() {
+            recycle_res.push(res);
+        }
+    }
+
+    // A sibling may currently be executing on another hart.  Its next
+    // scheduling transition observes TaskStatus::Zombie and will not return
+    // it to a runqueue.  Wait until its kernel stack and old user context are
+    // no longer active before replacing the address space.
+    while running_siblings
+        .iter()
+        .any(|(task, _)| task.on_cpu.load(Ordering::Acquire))
+    {
+        core::hint::spin_loop();
+    }
+    for (sibling, _) in running_siblings {
+        if let Some(res) = sibling.inner_exclusive_access().res.take() {
+            recycle_res.push(res);
+        }
+    }
+
+    // Remove the dead tasks from the process task table.  Their resources are
+    // dropped only after releasing process_inner because TaskUserRes::drop
+    // needs to acquire that same lock while removing the old VMAs.
+    {
+        let mut process_inner = process.inner_exclusive_access();
+        for (sibling, tid) in active_siblings {
+            let slot_matches = process_inner
+                .tasks
+                .get(tid)
+                .and_then(|slot| slot.as_ref())
+                .is_some_and(|registered| Arc::ptr_eq(registered, &sibling));
+            if slot_matches {
+                process_inner.tasks[tid] = None;
+            }
+        }
+    }
+    drop(recycle_res);
+}
+#[cfg(feature = "cosmos-meminfo")]
 pub(crate) use id::cached_kstack_count;
 pub(crate) use id::reclaim_cached_kstacks;
 pub(crate) use id::recycle_deferred_kstack_ids;
@@ -55,6 +216,50 @@ static DEBUG_DUMP_PGRP: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_REMAINING: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_DUMP_DEADLINE_NS: AtomicUsize = AtomicUsize::new(0);
 const DEBUG_DUMP_INTERVAL_NS: usize = 1_000_000_000;
+
+#[cfg(feature = "cosmos-meminfo")]
+static PROCESS_CREATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static PROCESS_EXEC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static PROCESS_EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "cosmos-meminfo")]
+#[derive(Clone, Copy, Debug, Default)]
+/// Cumulative process lifecycle counters exported through `/proc/cosmos_meminfo`.
+pub struct ProcessLifecycleStats {
+    /// Number of successfully published processes.
+    pub create_calls: usize,
+    /// Number of successful `execve` transitions.
+    pub exec_calls: usize,
+    /// Number of processes transitioned to zombie state.
+    pub exit_calls: usize,
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+pub(crate) fn account_process_create() {
+    PROCESS_CREATE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+pub(crate) fn account_process_exec() {
+    PROCESS_EXEC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "cosmos-meminfo")]
+pub(crate) fn account_process_exit() {
+    PROCESS_EXIT_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Return cumulative process lifecycle counters.
+#[cfg(feature = "cosmos-meminfo")]
+pub fn process_lifecycle_stats() -> ProcessLifecycleStats {
+    ProcessLifecycleStats {
+        create_calls: PROCESS_CREATE_CALLS.load(Ordering::Acquire),
+        exec_calls: PROCESS_EXEC_CALLS.load(Ordering::Acquire),
+        exit_calls: PROCESS_EXIT_CALLS.load(Ordering::Acquire),
+    }
+}
 pub use crate::sched::{
     clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, DEFAULT_TIME_SLICE_TICKS,
     MAX_NICE, MIN_NICE, NICE_0_LOAD, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
@@ -68,10 +273,11 @@ pub use process::{
     CloneResourceFlags, ExitReason, FdEntry, FdFlags, ProcessKeyrings, ShmAttachment,
 };
 pub(crate) use task::TaskControlBlockInner;
-pub use task::{all_cpu_affinity_mask, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason};
+pub use task::{
+    all_cpu_affinity_mask, LastSchedOp, TaskControlBlock, TaskSchedState, TaskStatus, WaitReason,
+};
 pub use wait_queue::{WaitQueue, WaitQueueHandle, WaitQueueKeyed};
 
-use crate::platform::QEMUExit;
 use alloc::string::String;
 
 fn child_exit_autoreap(parent: &Arc<ProcessControlBlock>, exit_signal: u32) -> bool {
@@ -107,24 +313,51 @@ fn reap_zombie_child_from_parent(
         else {
             return false;
         };
-        let removed_child = parent_inner.children.remove(idx);
-        {
-            let child_inner = removed_child.inner_exclusive_access();
-            if !child_inner.is_zombie {
-                parent_inner.children.push(Arc::clone(&removed_child));
-                return false;
-            }
-            parent_inner.child_user_time = parent_inner
-                .child_user_time
-                .saturating_add(child_inner.user_time)
-                .saturating_add(child_inner.child_user_time);
-            parent_inner.child_kernel_time = parent_inner
-                .child_kernel_time
-                .saturating_add(child_inner.kernel_time)
-                .saturating_add(child_inner.child_kernel_time);
-        }
-        removed_child
+        parent_inner.children.remove(idx)
     };
+
+    // The child must be inspected after releasing the parent PCB lock. The
+    // exit path can hold a child PCB lock while notifying/reparenting it.
+    let child_data = {
+        let child_inner = removed_child.inner_exclusive_access();
+        if child_inner.is_zombie {
+            Some((
+                child_inner.user_time,
+                child_inner.child_user_time,
+                child_inner.kernel_time,
+                child_inner.child_kernel_time,
+            ))
+        } else {
+            None
+        }
+    };
+
+    let Some((user_time, child_user_time, kernel_time, child_kernel_time)) = child_data else {
+        // A concurrent state transition made the snapshot stale. Restore the
+        // relationship without holding the child's lock.
+        let mut parent_inner = parent.inner_exclusive_access();
+        if !parent_inner
+            .children
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &removed_child))
+        {
+            parent_inner.children.push(Arc::clone(&removed_child));
+        }
+        return false;
+    };
+
+    // Update parent accounting only after the child lock has been released.
+    {
+        let mut parent_inner = parent.inner_exclusive_access();
+        parent_inner.child_user_time = parent_inner
+            .child_user_time
+            .saturating_add(user_time)
+            .saturating_add(child_user_time);
+        parent_inner.child_kernel_time = parent_inner
+            .child_kernel_time
+            .saturating_add(kernel_time)
+            .saturating_add(child_kernel_time);
+    }
 
     let found_pid = removed_child.getpid();
     unregister_file_mappings_for_process(&removed_child);
@@ -217,7 +450,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     task_inner.task_status = TaskStatus::Zombie;
     task.on_cpu.store(false, Ordering::Relaxed);
     task_inner.sched.on_rq = false;
-    task_inner.sched.resched_reason = None;
+    task.set_resched_reason_locked(&mut task_inner, None);
     task_inner.clear_child_tid = 0;
     // The current kernel stack must stay alive until after the context switch.
     // Legacy threads remain attached for sys_waittid; clear_child_tid threads
@@ -285,19 +518,16 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // If this is the main thread or exit_group was requested, the process
     // should terminate at once.
     if tid == Some(0) || force_process_exit {
+        // A vfork parent must also be released when the child exits before
+        // reaching execve, for example when execve itself fails.
+        process.release_vfork_parent();
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
                 "[kernel] Initproc process exit with exit_code {} ...",
                 task_exit_code
             );
-            if task_exit_code != 0 {
-                //crate::sbi::shutdown(255); //255 == -1 for err hint
-                crate::platform::QEMU_EXIT_HANDLE.exit_failure();
-            } else {
-                //crate::sbi::shutdown(0); //0 for success hint
-                crate::platform::QEMU_EXIT_HANDLE.exit_success();
-            }
+            crate::sbi::shutdown_with_code(task_exit_code);
         }
         let mut process_inner = process.inner_exclusive_access();
         if process_inner.is_zombie {
@@ -314,7 +544,11 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             return;
         }
         // mark this process as a zombie process
+        #[cfg(feature = "cosmos-meminfo")]
+        account_process_exit();
         process_inner.is_zombie = true;
+        #[cfg(feature = "return_work_cache")]
+        process.mark_zombie_work_pending();
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
         let clone_shared_resources = process_inner.clone_shared_resources;
@@ -329,13 +563,20 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             .contains(CloneResourceFlags::SIGHAND)
             .then(|| process_inner.signal_actions.clone());
         let children_to_reparent = core::mem::take(&mut process_inner.children);
-        for child in children_to_reparent.iter() {
-            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-        }
+        // Do not hold the exiting process's PCB lock while taking any child
+        // PCB lock or INITPROC's PCB lock. Those paths can run concurrently
+        // with wait4/child-exit notification and otherwise create a cycle.
+        drop(process_inner);
+
         let reparented_zombies = children_to_reparent
             .iter()
-            .filter(|child| child.inner_exclusive_access().is_zombie)
-            .map(Arc::clone)
+            .filter_map(|child| {
+                let mut child_inner = child.inner_exclusive_access();
+                child_inner.parent = Some(Arc::downgrade(&INITPROC));
+                #[cfg(feature = "process_identity_cache")]
+                child.set_ppid_cached(INITPROC.getpid());
+                child_inner.is_zombie.then(|| Arc::clone(child))
+            })
             .collect::<Vec<_>>();
         {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
@@ -343,7 +584,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 initproc_inner.children.push(child);
             }
         }
-        drop(process_inner);
         for child in reparented_zombies {
             let autoreap = notify_parent_child_exit(&INITPROC, child.clone_exit_signal);
             if autoreap {
@@ -372,16 +612,29 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         let mut recycle_res = Vec::<TaskUserRes>::new();
         let mut running_tasks = Vec::new();
         let mut running_harts = Vec::new();
-        let process_inner = process.inner_exclusive_access();
-        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-            let task = task.as_ref().unwrap();
+        // Snapshot task references under the PCB lock, then inspect and
+        // mutate each task after releasing it.  Holding process-inner while
+        // taking task-inner creates the opposite lock order to task paths
+        // that need to update their process, which can deadlock SMP teardown.
+        let tasks = {
+            let process_inner = process.inner_exclusive_access();
+            process_inner
+                .tasks
+                .iter()
+                .filter_map(|slot| slot.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        for task in tasks {
             let (thread_id, was_on_cpu, last_cpu, wait_handle) = {
                 let mut task_inner = task.inner_exclusive_access();
                 task_inner.exit_code.get_or_insert(task_exit_code);
                 task_inner.task_status = TaskStatus::Zombie;
                 task_inner.wait_reason = None;
                 task_inner.sched.on_rq = false;
-                task_inner.sched.resched_reason = Some(ReschedReason::HigherRtPriority);
+                task.set_resched_reason_locked(
+                    &mut task_inner,
+                    Some(ReschedReason::HigherRtPriority),
+                );
                 (
                     task_inner.res.as_ref().map(|res| res.thread_id()),
                     task.on_cpu.load(Ordering::Relaxed),
@@ -390,14 +643,14 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 )
             };
             if let Some(wait_handle) = wait_handle {
-                wait_handle.remove_waiter(task);
+                wait_handle.remove_waiter(&task);
             }
             if let Some(thread_id) = thread_id {
                 remove_from_tid2task(thread_id);
             }
-            if was_on_cpu && !Arc::ptr_eq(task, &exiting_task) {
+            if was_on_cpu && !Arc::ptr_eq(&task, &exiting_task) {
                 running_harts.push(last_cpu);
-                running_tasks.push(Arc::clone(task));
+                running_tasks.push(Arc::clone(&task));
                 continue;
             }
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
@@ -414,10 +667,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 recycle_res.push(res);
             }
         }
-        // dealloc_tid and dealloc_user_res require access to PCB inner, so we
-        // need to collect those user res first, then release process_inner
-        // for now to avoid deadlock/double borrow problem.
-        drop(process_inner);
         for hart in running_harts {
             crate::sched::resched_hart(hart);
         }
@@ -427,16 +676,16 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         {
             core::hint::spin_loop();
         }
-        {
-            let _process_inner = process.inner_exclusive_access();
-            for task in running_tasks {
-                let mut task_inner = task.inner_exclusive_access();
-                if let Some(res) = task_inner.res.take() {
-                    recycle_res.push(res);
-                }
-                task.on_cpu.store(false, Ordering::Relaxed);
-                task_inner.sched.on_rq = false;
+        // Do not reacquire process-inner while extracting resources.  The
+        // TaskUserRes destructor needs that same PCB lock when the vector is
+        // dropped below.
+        for task in running_tasks {
+            let mut task_inner = task.inner_exclusive_access();
+            if let Some(res) = task_inner.res.take() {
+                recycle_res.push(res);
             }
+            task.on_cpu.store(false, Ordering::Relaxed);
+            task_inner.sched.on_rq = false;
         }
         recycle_res.clear();
 
@@ -445,8 +694,8 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             let mut process_inner = process.inner_exclusive_access();
             // deallocate other data in user space i.e. program code/data section
             let token = process_inner.memory_set.token();
-            let mask = process_inner.memory_set.loaded_user_harts();
             let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
+            let mask = process_inner.memory_set.record_local_tlb_change();
             // warn_heap_state_lockfree("exit_after_vmas_clear", pid);
             let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。
@@ -470,6 +719,9 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         };
         reclaim.flush_then_release();
         // warn_heap_state("exit_after_user_reclaim", pid);
+        for entry in &closed_fds {
+            entry.desc.release_posix_locks_for_owner(pid);
+        }
         drop(closed_fds);
         // warn_heap_state("exit_after_fd_drop", pid);
         crate::keys::release_process_thread_keyring(keyrings_to_release);
@@ -580,18 +832,19 @@ fn wake_signal_waiters(tasks: Vec<Arc<TaskControlBlock>>) {
 /// 因为只检查致命信号，所以可不复位pending_signals
 pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
     let task = current_task().unwrap();
+    if !task.signal_work_pending() {
+        return None;
+    }
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
     let pending = (task_inner.pending_signals | process_inner.pending_signals)
         & !task_inner.signal_mask.without_unblockable();
-    for signum in 1..=MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if !pending.contains(flag) {
-            continue;
-        }
+    let mut remaining = pending;
+    while !remaining.is_empty() {
+        let signum = remaining.bits().trailing_zeros() as usize + 1;
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
         let action = process_inner.signal_actions.table[signum];
         if action.handler == SIG_DFL {
             if let Some(error) = flag.check_error() {
@@ -599,26 +852,31 @@ pub fn check_fatal_signals_of_current() -> Option<(i32, &'static str)> {
             }
         }
     }
+    task.set_signal_work_pending(crate::signal::signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
     None
 }
 
 /// Check if the current process is a zombie process (i.e. has exited but not yet been reaped by its parent).
 pub fn current_process_is_zombie() -> bool {
     let process = current_process();
+    #[cfg(feature = "return_work_cache")]
+    {
+        return process.zombie_work_pending();
+    }
+    #[cfg(not(feature = "return_work_cache"))]
     let process_inner = process.inner_exclusive_access();
+    #[cfg(not(feature = "return_work_cache"))]
     process_inner.is_zombie
 }
 
 fn first_signum_in_set(signal: SignalBit) -> Option<usize> {
-    for signum in 1..=MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if signal.contains(flag) {
-            return Some(signum);
-        }
-    }
-    None
+    let bits = signal.bits();
+    (bits != 0).then(|| bits.trailing_zeros() as usize + 1)
 }
 
 /// Add signal to target process.
@@ -650,6 +908,13 @@ pub fn add_signal_to_process_with_siginfo(
         process_inner.pending_signals |= signal;
         if let Some(signum) = first_signum_in_set(signal) {
             process_inner.pending_siginfo[signum] = siginfo;
+        }
+        // Publish the slow-path hint before releasing process-inner, so a
+        // concurrently returning task cannot miss both the signal and its
+        // notification.  Masked tasks may take one conservative slow path and
+        // clear the hint again.
+        for task in &tasks {
+            task.mark_signal_work_pending();
         }
         (process.getpid(), newly_pending, tasks)
     };
@@ -699,6 +964,9 @@ pub fn add_signal_to_task_with_siginfo(
         if let Some(signum) = first_signum_in_set(signal) {
             task_inner.pending_siginfo[signum] = siginfo;
         }
+        // Set the hint while holding task-inner.  The locked consumer can then
+        // safely clear it only after observing the newly published bit.
+        task.mark_signal_work_pending();
         (
             task_inner.res.as_ref().unwrap().thread_id(),
             task_inner.res.as_ref().unwrap().tid,
@@ -766,34 +1034,105 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
     for process in targets {
         let pid = process.getpid();
         let exec_path = process.exec_path();
-        let process_inner = process.inner_exclusive_access();
+        // Snapshot process + task state under the locks, then DROP the locks
+        // before formatting/printing. Holding process_inner/task_inner (SpinNoIrq,
+        // IRQs disabled) across the warn! calls — which do string formatting AND
+        // byte-by-byte UART output, both slow — blocked in-flight global TLB
+        // shootdown IPIs and wedged the machine when several harts dumped at
+        // once after Ctrl+C. The lock is now held only to copy fields.
+        let (ppid, pgid, is_zombie, pending, tasks) = {
+            let process_inner = process.inner_exclusive_access();
+            let p_ppid = process_inner
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid())
+                .unwrap_or(0);
+            let p_pgid = process_inner.cred.pgid;
+            let p_zombie = process_inner.is_zombie;
+            let p_pending = process_inner.pending_signals.bits();
+            let tasks: Vec<(usize, Arc<TaskControlBlock>)> = process_inner
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(tid, task)| task.as_ref().map(|task| (tid, Arc::clone(task))))
+                .collect();
+            (p_ppid, p_pgid, p_zombie, p_pending, tasks)
+        };
+        // Never hold process-inner while taking task-inner.  This diagnostic
+        // runs from the Ctrl-C/scheduler path, where another hart may be
+        // unwinding a task and acquiring the locks in the reverse order.
+        let task_snaps: Vec<(
+            usize,
+            TaskStatus,
+            Option<WaitReason>,
+            bool,
+            bool,
+            usize,
+            bool,
+            u64,
+            u64,
+            Option<ReschedReason>,
+            LastSchedOp,
+        )> = tasks
+            .into_iter()
+            .map(|(tid, task)| {
+                let task_inner = task.inner_exclusive_access();
+                (
+                    tid,
+                    task_inner.task_status,
+                    task_inner.wait_reason,
+                    task.on_cpu.load(Ordering::Relaxed),
+                    task_inner.sched.on_rq,
+                    task_inner.sched.last_cpu,
+                    task_inner.current_wq_handle.is_some(),
+                    task_inner.pending_signals.bits(),
+                    task_inner.signal_mask.bits(),
+                    task_inner.sched.resched_reason,
+                    task_inner.last_sched_op,
+                )
+            })
+            .collect();
         warn!(
-            "[task-dump] pid={} pgid={} zombie={} pending_signals={:#x} exec={}",
-            pid,
-            process_inner.cred.pgid,
-            process_inner.is_zombie,
-            process_inner.pending_signals.bits(),
-            exec_path
+            "[task-dump] pid={} ppid={} pgid={} zombie={} pending_signals={:#x} exec={}",
+            pid, ppid, pgid, is_zombie, pending, exec_path
         );
-        for (tid, task) in process_inner.tasks.iter().enumerate() {
-            let Some(task) = task.as_ref() else {
-                continue;
-            };
-            let task_inner = task.inner_exclusive_access();
+        for (
+            tid,
+            status,
+            wait,
+            on_cpu,
+            on_rq,
+            last_cpu,
+            has_wq,
+            task_pending,
+            mask,
+            resched,
+            last_sched_op,
+        ) in task_snaps
+        {
             warn!(
-                "[task-dump]   pid={} tid={} status={:?} wait={:?} on_cpu={} on_rq={} last_cpu={} has_wq={} task_pending={:#x} mask={:#x} resched={:?}",
+                "[task-dump]   pid={} tid={} status={:?} wait={:?} on_cpu={} on_rq={} last_cpu={} has_wq={} task_pending={:#x} mask={:#x} resched={:?} last_sched_op={:?}",
                 pid,
                 tid,
-                task_inner.task_status,
-                task_inner.wait_reason,
-                task.on_cpu.load(Ordering::Relaxed),
-                task_inner.sched.on_rq,
-                task_inner.sched.last_cpu,
-                task_inner.current_wq_handle.is_some(),
-                task_inner.pending_signals.bits(),
-                task_inner.signal_mask.bits(),
-                task_inner.sched.resched_reason
+                status,
+                wait,
+                on_cpu,
+                on_rq,
+                last_cpu,
+                has_wq,
+                task_pending,
+                mask,
+                resched,
+                last_sched_op,
             );
+            if let Some(WaitReason::Futex(uaddr, expected)) = wait {
+                let current = read_pod_from_process_user::<i32>(&process, uaddr as *const i32).ok();
+                warn!(
+                    "[task-dump]     futex pid={} tid={} uaddr={:#x} expected={} current={:?}",
+                    pid, tid, uaddr, expected, current
+                );
+            }
         }
     }
 }

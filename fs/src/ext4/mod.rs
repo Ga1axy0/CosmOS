@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::{Arc, Weak}, vec, vec::Vec};
 use core::any::Any;
 use core::cmp::min;
 use core::fmt;
@@ -9,9 +9,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use log::{debug, info};
 
 use crate::block_cache::{
-    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges, read_block_cache_range,
+    get_block_cache, overwrite_block_cache_range, overwrite_block_cache_ranges,
+    read_block_cache_range, read_block_cache_ranges,
 };
-use crate::block_dev::{BlockDevice as OsBlockDevice, BlockWrite as OsBlockWrite};
+use crate::block_dev::{
+    BlockDevice as OsBlockDevice, BlockRead as OsBlockRead, BlockWrite as OsBlockWrite,
+};
 use crate::dentry_cache::insert_dentry;
 use crate::errno::FS_ERRNO;
 use crate::sleep_mutex::SleepMutex as Mutex;
@@ -38,6 +41,18 @@ static WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static WRITE_OFFSETS_MANY_ALIGNED_ITEMS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITE_OFFSETS_MANY_UNALIGNED_ITEMS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PAGE_CACHE_READ_PLAN_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PAGE_CACHE_READ_PLAN_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PAGE_CACHE_READ_PLAN_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PAGE_CACHE_READ_PLAN_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PAGE_CACHE_READ_PLAN_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PAGE_CACHE_READ_IO_US: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static DIR_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -108,6 +123,81 @@ impl Ext4BlockDevice for Ext4BlockDeviceAdapter {
         let mut out = vec![0u8; len];
         out.copy_from_slice(&aligned[src_start..src_start + len]);
         out
+    }
+
+    fn read_offset_uncached(&self, offset: usize) -> Vec<u8> {
+        let len = ext4_rs::BLOCK_SIZE;
+        let start_block = offset / BLOCK_SZ;
+        let end_block = (offset + len).div_ceil(BLOCK_SZ);
+        let aligned_offset = start_block * BLOCK_SZ;
+        let aligned_len = (end_block - start_block) * BLOCK_SZ;
+        let mut aligned = vec![0u8; aligned_len];
+        self.inner.read_blocks(start_block, &mut aligned);
+
+        let src_start = offset - aligned_offset;
+        if src_start == 0 && aligned_len == len {
+            return aligned;
+        }
+        let mut out = vec![0u8; len];
+        out.copy_from_slice(&aligned[src_start..src_start + len]);
+        out
+    }
+
+    fn read_offsets(&self, offsets: &[usize], data: &mut [u8]) {
+        assert_eq!(data.len(), offsets.len() * ext4_rs::BLOCK_SIZE);
+        let mut pending: Vec<OsBlockRead<'_>> = Vec::new();
+        let mut run_start = 0;
+        let mut data_rest = data;
+        while run_start < offsets.len() {
+            let mut run_end = run_start + 1;
+            while run_end < offsets.len()
+                && offsets[run_end] == offsets[run_end - 1] + ext4_rs::BLOCK_SIZE
+            {
+                run_end += 1;
+            }
+            let run_len = (run_end - run_start) * ext4_rs::BLOCK_SIZE;
+            let (run_data, rest) = data_rest.split_at_mut(run_len);
+            let start_block = offsets[run_start] / BLOCK_SZ;
+            pending.push(OsBlockRead {
+                start_block,
+                data: run_data,
+            });
+            data_rest = rest;
+            run_start = run_end;
+        }
+        read_block_cache_ranges(Arc::clone(&self.inner), &mut pending);
+    }
+
+    fn read_offsets_uncached(&self, offsets: &[usize], data: &mut [u8]) {
+        assert_eq!(data.len(), offsets.len() * ext4_rs::BLOCK_SIZE);
+        if offsets.is_empty() {
+            return;
+        }
+
+        // Merge physically contiguous filesystem blocks into larger direct
+        // block-device requests.  The block cache is deliberately not
+        // touched by this path.
+        let mut pending: Vec<OsBlockRead<'_>> = Vec::new();
+        let mut run_start = 0;
+        let mut data_rest = data;
+        while run_start < offsets.len() {
+            let mut run_end = run_start + 1;
+            while run_end < offsets.len()
+                && offsets[run_end] == offsets[run_end - 1] + ext4_rs::BLOCK_SIZE
+            {
+                run_end += 1;
+            }
+            let run_len = (run_end - run_start) * ext4_rs::BLOCK_SIZE;
+            let (run_data, rest) = data_rest.split_at_mut(run_len);
+            assert_eq!(offsets[run_start] % BLOCK_SZ, 0);
+            pending.push(OsBlockRead {
+                start_block: offsets[run_start] / BLOCK_SZ,
+                data: run_data,
+            });
+            data_rest = rest;
+            run_start = run_end;
+        }
+        self.inner.read_blocks_many(&mut pending);
     }
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
@@ -231,6 +321,12 @@ pub fn reset_perf_counters() {
     WRITE_OFFSETS_MANY_SINGLE_ITEM_CALLS.store(0, Ordering::Relaxed);
     WRITE_OFFSETS_MANY_ALIGNED_ITEMS.store(0, Ordering::Relaxed);
     WRITE_OFFSETS_MANY_UNALIGNED_ITEMS.store(0, Ordering::Relaxed);
+    PAGE_CACHE_READ_PLAN_CALLS.store(0, Ordering::Relaxed);
+    PAGE_CACHE_READ_PLAN_HITS.store(0, Ordering::Relaxed);
+    PAGE_CACHE_READ_PLAN_FALLBACKS.store(0, Ordering::Relaxed);
+    PAGE_CACHE_READ_PLAN_BLOCKS.store(0, Ordering::Relaxed);
+    PAGE_CACHE_READ_PLAN_US.store(0, Ordering::Relaxed);
+    PAGE_CACHE_READ_IO_US.store(0, Ordering::Relaxed);
     DIR_LOOKUP_CALLS.store(0, Ordering::Relaxed);
     DIR_LOOKUP_HITS.store(0, Ordering::Relaxed);
     DIR_LOOKUP_MISSES.store(0, Ordering::Relaxed);
@@ -279,6 +375,36 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  write_offsets_many_unaligned_items {}",
         perf_load(&WRITE_OFFSETS_MANY_UNALIGNED_ITEMS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  page_cache_read_plan_calls {}",
+        perf_load(&PAGE_CACHE_READ_PLAN_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  page_cache_read_plan_hits {}",
+        perf_load(&PAGE_CACHE_READ_PLAN_HITS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  page_cache_read_plan_fallbacks {}",
+        perf_load(&PAGE_CACHE_READ_PLAN_FALLBACKS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  page_cache_read_plan_blocks {}",
+        perf_load(&PAGE_CACHE_READ_PLAN_BLOCKS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  page_cache_read_plan_us {}",
+        perf_load(&PAGE_CACHE_READ_PLAN_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  page_cache_read_io_us {}",
+        perf_load(&PAGE_CACHE_READ_IO_US)
     );
     let _ = writeln!(&mut out, "  getdents_calls {}", getdents_calls);
     let _ = writeln!(
@@ -372,6 +498,10 @@ pub fn render_perf_counters() -> String {
 
 pub struct Ext4FileSystem {
     ext4: Mutex<Ext4>,
+    /// Canonical per-inode mapping locks.  The weak table makes separately
+    /// constructed VFS wrappers for one inode coordinate without retaining
+    /// every inode ever observed by the filesystem.
+    inode_mapping_locks: Mutex<BTreeMap<u32, Weak<Mutex<()>>>>,
 }
 
 impl Ext4FileSystem {
@@ -380,7 +510,18 @@ impl Ext4FileSystem {
         let ext4 = Ext4::open(ext4_dev);
         Arc::new(Self {
             ext4: Mutex::new(ext4),
+            inode_mapping_locks: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    fn inode_mapping_lock(&self, inode_num: u32) -> Arc<Mutex<()>> {
+        let mut locks = self.inode_mapping_locks.lock();
+        if let Some(lock) = locks.get(&inode_num).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(inode_num, Arc::downgrade(&lock));
+        lock
     }
 
     /// 返回根目录对应的稳定内存 inode。
@@ -393,23 +534,31 @@ pub struct Ext4Inode {
     fs: Arc<Ext4FileSystem>,
     inode_num: u32,
     file_type: VfsFileType,
+    /// Stabilizes this inode's extent mapping while prepared data I/O is in
+    /// flight.  This is deliberately narrower than the filesystem-wide ext4
+    /// metadata lock.
+    mapping_lock: Arc<Mutex<()>>,
 }
 
 impl Ext4Inode {
     /// 创建新的 ext4 内存 inode 包装对象。
     fn new(fs: Arc<Ext4FileSystem>, inode_num: u32, is_dir: bool) -> Self {
+        let mapping_lock = fs.inode_mapping_lock(inode_num);
         Self {
             fs,
             inode_num,
             file_type: if is_dir { VfsFileType::Directory } else { VfsFileType::Regular },
+            mapping_lock,
         }
     }
 
     fn new_with_type(fs: Arc<Ext4FileSystem>, inode_num: u32, file_type: VfsFileType) -> Self {
+        let mapping_lock = fs.inode_mapping_lock(inode_num);
         Self {
             fs,
             inode_num,
             file_type,
+            mapping_lock,
         }
     }
 
@@ -583,6 +732,10 @@ impl Ext4Inode {
             return Err(FS_ERRNO::EISDIR);
         }
 
+        // Acquire the inode-local mapping lock before the global ext4 lock.
+        // Prepared reads retain this guard while their data I/O is in flight,
+        // so truncate cannot free and reassign a resolved physical block.
+        let _mapping_guard = self.mapping_lock.lock();
         let ext4 = self.fs.ext4.lock();
         let old_size = ext4.get_inode_ref(self.inode_num).inode.size() as usize;
         debug!(
@@ -658,40 +811,62 @@ impl Ext4Inode {
             return Err(FS_ERRNO::EXDEV);
         }
 
-        let ext4 = self.fs.ext4.lock();
-        let old_entry = ext4
-            .ext4_dir_get_entries(self.inode_num)
-            .into_iter()
-            .find(|de| de.get_name() == old_name)
-            .ok_or(FS_ERRNO::ENOENT)?;
-        let child_ino = old_entry.inode;
-        let child_ref = ext4.get_inode_ref(child_ino);
-        let child_is_dir = child_ref.inode.is_dir();
+        loop {
+            // Replacing an existing target may truncate and free its extent
+            // tree. Resolve its inode first, acquire that inode's mapping
+            // lock, then revalidate under the ext4 lock before committing.
+            let expected_target_ino = {
+                let ext4 = self.fs.ext4.lock();
+                ext4
+                    .ext4_dir_get_entries(new_parent.inode_num)
+                    .into_iter()
+                    .find(|de| de.get_name() == new_name)
+                    .map(|de| de.inode)
+            };
+            let target_mapping_lock = expected_target_ino
+                .map(|inode_num| self.fs.inode_mapping_lock(inode_num));
+            let _target_mapping_guard =
+                target_mapping_lock.as_ref().map(|lock| lock.lock());
 
-        if let Some(target_entry) = ext4
-            .ext4_dir_get_entries(new_parent.inode_num)
-            .into_iter()
-            .find(|de| de.get_name() == new_name)
-        {
-            let target_ino = target_entry.inode;
-            let target_ref = ext4.get_inode_ref(target_ino);
-            let target_is_dir = target_ref.inode.is_dir();
-            if child_ino == target_ino {
-                return Ok(());
+            let ext4 = self.fs.ext4.lock();
+            let old_entry = ext4
+                .ext4_dir_get_entries(self.inode_num)
+                .into_iter()
+                .find(|de| de.get_name() == old_name)
+                .ok_or(FS_ERRNO::ENOENT)?;
+            let child_ino = old_entry.inode;
+            let child_ref = ext4.get_inode_ref(child_ino);
+            let child_is_dir = child_ref.inode.is_dir();
+            let target_entry = ext4
+                .ext4_dir_get_entries(new_parent.inode_num)
+                .into_iter()
+                .find(|de| de.get_name() == new_name);
+            if target_entry.as_ref().map(|entry| entry.inode) != expected_target_ino {
+                drop(ext4);
+                continue;
             }
-            if child_is_dir && !target_is_dir {
-                return Err(FS_ERRNO::ENOTDIR);
+
+            if let Some(target_entry) = target_entry {
+                let target_ino = target_entry.inode;
+                let target_ref = ext4.get_inode_ref(target_ino);
+                let target_is_dir = target_ref.inode.is_dir();
+                if child_ino == target_ino {
+                    return Ok(());
+                }
+                if child_is_dir && !target_is_dir {
+                    return Err(FS_ERRNO::ENOTDIR);
+                }
+                if !child_is_dir && target_is_dir {
+                    return Err(FS_ERRNO::EISDIR);
+                }
+                if target_is_dir && ext4.dir_has_entry(target_ino) {
+                    return Err(FS_ERRNO::ENOTEMPTY);
+                }
             }
-            if !child_is_dir && target_is_dir {
-                return Err(FS_ERRNO::EISDIR);
-            }
-            if target_is_dir && ext4.dir_has_entry(target_ino) {
-                return Err(FS_ERRNO::ENOTEMPTY);
-            }
+
+            ext4.rename_entry(self.inode_num, old_name, new_parent.inode_num, new_name)?;
+            return Ok(());
         }
-
-        ext4.rename_entry(self.inode_num, old_name, new_parent.inode_num, new_name)?;
-        Ok(())
     }
 }
 
@@ -752,25 +927,33 @@ impl VfsNode for Ext4Inode {
     }
 
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        self.create_result(name).ok()
+    }
+
+    fn create_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
         if self.file_type != VfsFileType::Directory {
-            return None;
+            return Err(FS_ERRNO::ENOTDIR);
         }
         let ext4 = self.fs.ext4.lock();
         let inode = ext4
             .create(self.inode_num, name, InodeFileType::S_IFREG.bits())
-            .ok()?;
-        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Regular)) as Arc<dyn VfsNode>)
+            .map_err(FS_ERRNO::from)?;
+        Ok(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Regular)) as Arc<dyn VfsNode>)
     }
 
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        self.mkdir_result(name).ok()
+    }
+
+    fn mkdir_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
         if self.file_type != VfsFileType::Directory {
-            return None;
+            return Err(FS_ERRNO::ENOTDIR);
         }
         let ext4 = self.fs.ext4.lock();
         let inode = ext4
             .create(self.inode_num, name, InodeFileType::S_IFDIR.bits())
-            .ok()?;
-        Some(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Directory)) as Arc<dyn VfsNode>)
+            .map_err(FS_ERRNO::from)?;
+        Ok(Arc::new(Self::new_with_type(Arc::clone(&self.fs), inode.inode_num, VfsFileType::Directory)) as Arc<dyn VfsNode>)
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
@@ -871,13 +1054,66 @@ impl VfsNode for Ext4Inode {
         ext4.read_at(self.inode_num, offset, buf).unwrap_or(0)
     }
 
+    fn read_at_page_cache(&self, offset: usize, buf: &mut [u8]) -> usize {
+        // The inode-local guard stabilizes the physical mapping after the
+        // global ext4 metadata lock is released.  This first implementation
+        // serializes reads of one inode, but no longer serializes unrelated
+        // inode and directory operations behind data-device latency.
+        let _mapping_guard = self.mapping_lock.lock();
+        #[cfg(feature = "io_perf_counters")]
+        PAGE_CACHE_READ_PLAN_CALLS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "io_perf_counters")]
+        let plan_start_us = perf_now_us();
+        let prepared = {
+            let ext4 = self.fs.ext4.lock();
+            match ext4.prepare_aligned_read_at(self.inode_num, offset, buf.len()) {
+                Ok(Some((read_len, physical_offsets))) => Some((
+                    Arc::clone(&ext4.block_device),
+                    read_len,
+                    physical_offsets,
+                )),
+                Ok(None) => None,
+                Err(_) => return 0,
+            }
+        };
+        #[cfg(feature = "io_perf_counters")]
+        PAGE_CACHE_READ_PLAN_US.fetch_add(perf_elapsed_us(plan_start_us), Ordering::Relaxed);
+
+        if let Some((block_device, read_len, physical_offsets)) = prepared {
+            #[cfg(feature = "io_perf_counters")]
+            {
+                PAGE_CACHE_READ_PLAN_HITS.fetch_add(1, Ordering::Relaxed);
+                PAGE_CACHE_READ_PLAN_BLOCKS
+                    .fetch_add(physical_offsets.len(), Ordering::Relaxed);
+            }
+            #[cfg(feature = "io_perf_counters")]
+            let io_start_us = perf_now_us();
+            block_device.read_offsets_uncached(
+                &physical_offsets,
+                &mut buf[..read_len],
+            );
+            #[cfg(feature = "io_perf_counters")]
+            PAGE_CACHE_READ_IO_US.fetch_add(perf_elapsed_us(io_start_us), Ordering::Relaxed);
+            return read_len;
+        }
+
+        #[cfg(feature = "io_perf_counters")]
+        PAGE_CACHE_READ_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        let ext4 = self.fs.ext4.lock();
+        ext4.read_at_uncached(self.inode_num, offset, buf).unwrap_or(0)
+    }
+
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        let _mapping_guard = self.mapping_lock.lock();
         let ext4 = self.fs.ext4.lock();
         ext4.write_at(self.inode_num, offset, buf).unwrap_or(0)
     }
 
     /// ext4 写入需要保留 ENOSPC/ENOTSUP，供 page cache 回写路径处理失败页。
     fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
+        // Keep the mapping stable between write-plan preparation and device
+        // submission for the same reason as the prepared read path.
+        let _mapping_guard = self.mapping_lock.lock();
         let prepared = {
             let ext4 = self.fs.ext4.lock();
             let block_device = Arc::clone(&ext4.block_device);
@@ -1010,31 +1246,44 @@ impl VfsNode for Ext4Inode {
             return Err(FS_ERRNO::ENOTDIR);
         }
         debug!("Ext4Inode unlink: parent_inode={}, name='{}'", self.inode_num, name);
-        let (child_ino, child_type) = self.lookup_child_meta(name).ok_or(FS_ERRNO::ENOENT)?;
-        if child_type == VfsFileType::Directory {
-            return Err(FS_ERRNO::EISDIR);
-        }
-        let ext4 = self.fs.ext4.lock();
-        let mut parent_ref = ext4.get_inode_ref(self.inode_num);
-        let mut child_ref = ext4.get_inode_ref(child_ino);
-        // Hard-link case: remove only this directory entry and decrement nlink.
-        if child_ref.inode.links_count() > 1 {
-            ext4.dir_remove_entry(&mut parent_ref, name)?;
-            let new_links = child_ref.inode.links_count() - 1;
-            child_ref.inode.set_links_count(new_links);
-            ext4.write_back_inode(&mut parent_ref);
-            ext4.write_back_inode(&mut child_ref);
-            log::debug!("Ext4Inode unlink: removed link '{}', new links_count={}", name, new_links);
+        loop {
+            let (child_ino, child_type) =
+                self.lookup_child_meta(name).ok_or(FS_ERRNO::ENOENT)?;
+            if child_type == VfsFileType::Directory {
+                return Err(FS_ERRNO::EISDIR);
+            }
+            let child_mapping_lock = self.fs.inode_mapping_lock(child_ino);
+            let _child_mapping_guard = child_mapping_lock.lock();
+            let ext4 = self.fs.ext4.lock();
+            let locked_child_ino = ext4
+                .ext4_dir_lookup_with_stats(self.inode_num, name)
+                .map(|(inode_num, _, _, _)| inode_num);
+            if locked_child_ino != Some(child_ino) {
+                drop(ext4);
+                continue;
+            }
+
+            let mut parent_ref = ext4.get_inode_ref(self.inode_num);
+            let mut child_ref = ext4.get_inode_ref(child_ino);
+            // Hard-link case: remove only this directory entry and decrement nlink.
+            if child_ref.inode.links_count() > 1 {
+                ext4.dir_remove_entry(&mut parent_ref, name)?;
+                let new_links = child_ref.inode.links_count() - 1;
+                child_ref.inode.set_links_count(new_links);
+                ext4.write_back_inode(&mut parent_ref);
+                ext4.write_back_inode(&mut child_ref);
+                log::debug!("Ext4Inode unlink: removed link '{}', new links_count={}", name, new_links);
+                return Ok(());
+            }
+            // Normal case: remove directory entry, decrement nlink, and truncate if this is the last link.
+            if child_ref.inode.links_count() == 1 {
+                ext4.truncate_inode(&mut child_ref, 0)?;
+                log::debug!("Ext4Inode unlink: truncated inode {} to 0 length", child_ino);
+            }
+            ext4.unlink(&mut parent_ref, &mut child_ref, name)
+                .map(|_| ())?;
             return Ok(());
         }
-        // Normal case: remove directory entry, decrement nlink, and truncate if this is the last link.
-        if child_ref.inode.links_count() == 1 {
-            ext4.truncate_inode(&mut child_ref, 0)?;
-            log::debug!("Ext4Inode unlink: truncated inode {} to 0 length", child_ino);
-        }
-        ext4.unlink(&mut parent_ref, &mut child_ref, name)
-            .map(|_| ())?;
-        Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<(), FS_ERRNO> {

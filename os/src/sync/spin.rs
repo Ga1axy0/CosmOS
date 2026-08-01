@@ -50,6 +50,17 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
+    /// Try to acquire the lock without waiting.
+    ///
+    /// This is useful for subsystem-specific wait loops that must perform
+    /// progress work while another hart owns the lock.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard { lock: self })
+    }
+
     /// Get mutable access without locking.
     ///
     /// # Safety
@@ -127,6 +138,14 @@ impl<T> SpinNoIrqLock<T> {
             // Keep interrupts disabled while spinning to preserve irqsave
             // semantics and avoid deadlocks with interrupt handlers that
             // might take the same or nested locks.
+            //
+            // A remote hart may be waiting for this hart to acknowledge a TLB
+            // shootdown at exactly this point.  Since SIE is intentionally
+            // clear, the IPI handler cannot run; service the allocation-free
+            // shootdown mailbox from the spin path instead.  The helper only
+            // touches atomics and performs the local fence, so it is safe to
+            // call while another lock is held.
+            let _ = crate::mm::poll_pending_shootdown();
             core::hint::spin_loop();
         }
         crate::trap::enter_noirq_lock();

@@ -308,27 +308,35 @@ impl VfsNode for VirtualDirNode {
     // -----------------------------------------------------------------------
 
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        self.create_result(name).ok()
+    }
+
+    fn create_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
         // File creation is entirely delegated to the overlay.
         let overlay = {
             let inner = self.inner.lock();
             inner.overlay.clone()
         };
-        overlay?.create(name)
+        overlay.ok_or(FS_ERRNO::EROFS)?.create_result(name)
     }
 
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+        self.mkdir_result(name).ok()
+    }
+
+    fn mkdir_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
         // Prefer the overlay so the directory ends up on-disk.
-        let from_overlay: Option<Arc<dyn VfsNode>> = {
+        let overlay = {
             let inner = self.inner.lock();
-            inner.overlay.as_ref().and_then(|ov| ov.mkdir(name))
+            inner.overlay.clone()
         };
-        if let Some(new_node) = from_overlay {
-            return Some(new_node);
+        if let Some(overlay) = overlay {
+            return overlay.mkdir_result(name);
         }
         // Fallback: create a virtual in-memory sub-directory.
         let new_dir = VirtualDirNode::new();
         self.bind(name, Arc::clone(&new_dir) as Arc<dyn VfsNode>);
-        Some(new_dir as Arc<dyn VfsNode>)
+        Ok(new_dir as Arc<dyn VfsNode>)
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {

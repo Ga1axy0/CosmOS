@@ -189,6 +189,15 @@ fn reclaim_one_inode() -> bool {
         return true;
     }
 
+    // A dirty page-cache mapping may be the sole owner of the newest file
+    // length and bytes while the backing inode is still zero-length. Clean
+    // mappings remain reclaimable so read-heavy workloads do not pin every
+    // inode they have ever touched.
+    if entry.inode.page_cache_retained() {
+        cache.inactive.push_back(key);
+        return true;
+    }
+
     cache.table.remove(&key);
     true
 }

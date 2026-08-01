@@ -639,6 +639,20 @@ pub fn shutdown(fd: usize, how: usize) -> isize {
     sys_shutdown(fd, how)
 }
 
+pub fn setsockopt_bytes(fd: usize, level: i32, optname: i32, optval: &[u8]) -> isize {
+    sys_setsockopt(fd, level, optname, optval.as_ptr(), optval.len())
+}
+
+pub fn setsockopt_timeval(fd: usize, level: i32, optname: i32, tv: &TimeVal) -> isize {
+    sys_setsockopt(
+        fd,
+        level,
+        optname,
+        tv as *const _ as *const u8,
+        core::mem::size_of::<TimeVal>(),
+    )
+}
+
 pub fn sendmsg(fd: usize, msg: &net::MsgHdr, flags: usize) -> isize {
     sys_sendmsg(fd, msg as *const _, flags)
 }

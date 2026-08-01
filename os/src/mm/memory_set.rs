@@ -1,19 +1,20 @@
 //! Address Space [`MemorySet`] management of Process
 
+use super::elf_loader::{ElfLoadInfo, ElfLoader};
 use super::{
     frame_alloc_with_reclaim, shootdown, FrameTracker, MmError, PageFaultHandled, ShootdownKind,
 };
-use super::{PTEFlags, PageTable, PageTableEntry};
+use super::{AddressSpaceRoot, PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
 use crate::config::{
-    MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_PIE_BASE, USER_STACK_BASE, USER_STACK_SIZE,
+    MAX_HARTS, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
     USER_VDSO_BASE,
 };
 use crate::fs::{
     mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
-    FileDescription,
+    FileDescription, OSInode,
 };
 use crate::hal::traits::{AddressSpaceToken, TrapMachine};
 use crate::hal::ArchTrapMachine;
@@ -44,23 +45,88 @@ extern "C" {
     fn strampoline();
 }
 
-/// ELF 加载结果，包含动态链接所需的额外信息
-pub struct ElfLoadInfo {
-    /// 程序入口点
-    pub entry_point: usize,
-    /// 程序头表在内存中的地址（用于 AT_PHDR）
-    pub phdr_vaddr: usize,
-    /// 程序头表项大小（用于 AT_PHENT）
-    pub phent_size: usize,
-    /// 程序头表项数量（用于 AT_PHNUM）
-    pub phnum: usize,
-    /// 动态链接器路径（如果存在 INTERP 段）
-    pub interp_path: Option<String>,
+const FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
+
+/// Counters for the anonymous-page zero-page/COW experiment.
+///
+/// The zero-page counters are intentionally kept here before the shared-zero
+/// page implementation lands, so `/proc/cosmos_meminfo` has a stable baseline
+/// interface.  They remain zero until the corresponding mapping and
+/// materialization paths call the record helpers below.
+#[cfg(feature = "cosmos-meminfo")]
+static ANON_ZERO_PAGE_MAP_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static ANON_PRIVATE_FIRST_FAULTS_READ: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static ANON_PRIVATE_FIRST_FAULTS_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+/// Runtime counters for private anonymous-page first faults and zero-page use.
+#[cfg(feature = "cosmos-meminfo")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnonymousPageStats {
+    /// Read or instruction-faults satisfied by the shared zero page.
+    pub zero_page_map_hits: usize,
+    /// Writes that materialized a private page from the shared zero page.
+    pub zero_page_write_materializations: usize,
+    /// Private anonymous first faults caused by a read or instruction fetch.
+    pub private_first_faults_read: usize,
+    /// Private anonymous first faults caused by a write.
+    pub private_first_faults_write: usize,
 }
 
-/// `R_RISCV_RELATIVE` relocation used by static PIE executables.
-const R_RISCV_RELATIVE: u32 = 3;
-const FORK_MEMORYSET_TIMING_WARN_THRESHOLD_NS: u64 = 5_000_000;
+/// Return cumulative anonymous-page instrumentation counters.
+#[cfg(feature = "cosmos-meminfo")]
+pub fn anonymous_page_stats() -> AnonymousPageStats {
+    AnonymousPageStats {
+        zero_page_map_hits: ANON_ZERO_PAGE_MAP_HITS.load(Ordering::Acquire),
+        zero_page_write_materializations: ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS
+            .load(Ordering::Acquire),
+        private_first_faults_read: ANON_PRIVATE_FIRST_FAULTS_READ.load(Ordering::Acquire),
+        private_first_faults_write: ANON_PRIVATE_FIRST_FAULTS_WRITE.load(Ordering::Acquire),
+    }
+}
+
+/// Reset anonymous-page instrumentation after the memory subsystem is ready.
+#[cfg(feature = "cosmos-meminfo")]
+pub fn reset_anonymous_page_stats() {
+    ANON_ZERO_PAGE_MAP_HITS.store(0, Ordering::Release);
+    ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS.store(0, Ordering::Release);
+    ANON_PRIVATE_FIRST_FAULTS_READ.store(0, Ordering::Release);
+    ANON_PRIVATE_FIRST_FAULTS_WRITE.store(0, Ordering::Release);
+}
+
+/// Record one shared-zero-page mapping hit.
+///
+/// This is exposed for the eventual zero-page fault path; keeping the counter
+/// update in one place prevents the `/proc` ABI from changing when that path is
+/// enabled.
+#[cfg(feature = "cosmos-meminfo")]
+#[allow(dead_code)]
+pub fn record_anonymous_zero_page_map_hit() {
+    ANON_ZERO_PAGE_MAP_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one write fault that materialized a private page from the zero page.
+#[cfg(feature = "cosmos-meminfo")]
+#[allow(dead_code)]
+pub fn record_anonymous_zero_page_write_materialization() {
+    ANON_ZERO_PAGE_WRITE_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+#[cfg(feature = "cosmos-meminfo")]
+fn record_private_anonymous_first_fault(access: PageFaultAccess) {
+    match access {
+        PageFaultAccess::Write => {
+            ANON_PRIVATE_FIRST_FAULTS_WRITE.fetch_add(1, Ordering::Relaxed);
+        }
+        PageFaultAccess::Read | PageFaultAccess::Exec => {
+            ANON_PRIVATE_FIRST_FAULTS_READ.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 lazy_static! {
     /// The kernel's initial memory mapping(kernel address space)
@@ -204,9 +270,9 @@ fn map_kernel_ram_fragment(memory_set: &mut MemorySet, start: usize, end: usize)
     memory_set
         .insert_vma(
             Vma::new(
-                start.into(),
-                end.into(),
-                MapType::Identical,
+                crate::platform::direct_map_phys_to_virt(start).into(),
+                crate::platform::direct_map_phys_to_virt(end).into(),
+                MapType::Direct,
                 MapPermission::R | MapPermission::W,
                 VmaKind::Kernel,
             ),
@@ -230,184 +296,25 @@ fn format_hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn add_load_bias(addr: usize, load_bias: usize) -> Result<usize, MmError> {
-    addr.checked_add(load_bias).ok_or(MmError::InvalidElf)
-}
-
-fn relocated_value(load_bias: usize, addend: i64) -> Result<usize, MmError> {
-    if addend >= 0 {
-        load_bias
-            .checked_add(addend as usize)
-            .ok_or(MmError::InvalidElf)
-    } else {
-        load_bias
-            .checked_sub(addend.unsigned_abs() as usize)
-            .ok_or(MmError::InvalidElf)
-    }
-}
-
-fn write_user_usize(memory_set: &mut MemorySet, va: usize, value: usize) -> Result<(), MmError> {
-    for (idx, byte) in value.to_le_bytes().iter().copied().enumerate() {
-        let pa = memory_set
-            .page_table
-            .translate_va(VirtAddr(va + idx))
-            .ok_or(MmError::NoMapping)?;
-        *pa.get_mut::<u8>() = byte;
-    }
-    Ok(())
-}
-
-fn file_offset_for_vaddr(elf: &xmas_elf::ElfFile<'_>, vaddr: usize) -> Option<usize> {
-    let ph_count = elf.header.pt2.ph_count();
-    for i in 0..ph_count {
-        let ph = elf.program_header(i).ok()?;
-        if ph.get_type().ok()? != xmas_elf::program::Type::Load {
-            continue;
-        }
-        let seg_start = ph.virtual_addr() as usize;
-        let seg_size = ph.file_size() as usize;
-        let seg_end = seg_start.checked_add(seg_size)?;
-        if vaddr < seg_start || vaddr >= seg_end {
-            continue;
-        }
-        let within_seg = vaddr.checked_sub(seg_start)?;
-        return (ph.offset() as usize).checked_add(within_seg);
-    }
-    None
-}
-
-fn read_dynsym_value(
-    elf: &xmas_elf::ElfFile<'_>,
-    symtab_vaddr: usize,
-    sym_ent: usize,
-    sym_index: u32,
-) -> Result<(usize, u16), MmError> {
-    if sym_ent != 24 {
-        return Err(MmError::InvalidElf);
-    }
-    let symtab_offset = file_offset_for_vaddr(elf, symtab_vaddr).ok_or(MmError::InvalidElf)?;
-    let sym_offset = symtab_offset
-        .checked_add(
-            sym_ent
-                .checked_mul(sym_index as usize)
-                .ok_or(MmError::InvalidElf)?,
-        )
-        .ok_or(MmError::InvalidElf)?;
-    let sym_end = sym_offset.checked_add(sym_ent).ok_or(MmError::InvalidElf)?;
-    let sym = elf
-        .input
-        .get(sym_offset..sym_end)
-        .ok_or(MmError::InvalidElf)?;
-    let shndx = u16::from_le_bytes(sym[6..8].try_into().map_err(|_| MmError::InvalidElf)?);
-    let value = usize::from_le_bytes(sym[8..16].try_into().map_err(|_| MmError::InvalidElf)?);
-    Ok((value, shndx))
-}
-
-fn apply_static_pie_relocations(
-    memory_set: &mut MemorySet,
-    elf: &xmas_elf::ElfFile<'_>,
-    load_bias: usize,
-) -> Result<(), MmError> {
-    let mut rela_vaddr: Option<usize> = None;
-    let mut rela_size = 0usize;
-    let mut rela_ent = 0usize;
-    let mut symtab_vaddr: Option<usize> = None;
-    let mut sym_ent = 0usize;
-    let ph_count = elf.header.pt2.ph_count();
-
-    for i in 0..ph_count {
-        let ph = elf.program_header(i).map_err(|_| MmError::InvalidElf)?;
-        if ph.get_type().map_err(|_| MmError::InvalidElf)? != xmas_elf::program::Type::Dynamic {
-            continue;
-        }
-        let entries = ph.get_data(elf).map_err(|_| MmError::InvalidElf)?;
-        let xmas_elf::program::SegmentData::Dynamic64(entries) = entries else {
-            return Err(MmError::InvalidElf);
-        };
-        for entry in entries {
-            match entry.get_tag().map_err(|_| MmError::InvalidElf)? {
-                xmas_elf::dynamic::Tag::Rela => {
-                    rela_vaddr = Some(entry.get_ptr().map_err(|_| MmError::InvalidElf)? as usize);
-                }
-                xmas_elf::dynamic::Tag::RelaSize => {
-                    rela_size = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
-                }
-                xmas_elf::dynamic::Tag::RelaEnt => {
-                    rela_ent = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
-                }
-                xmas_elf::dynamic::Tag::SymTab => {
-                    symtab_vaddr = Some(entry.get_ptr().map_err(|_| MmError::InvalidElf)? as usize);
-                }
-                xmas_elf::dynamic::Tag::SymEnt => {
-                    sym_ent = entry.get_val().map_err(|_| MmError::InvalidElf)? as usize;
-                }
-                xmas_elf::dynamic::Tag::Rel | xmas_elf::dynamic::Tag::JmpRel => {
-                    return Err(MmError::InvalidElf);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if rela_size == 0 {
-        return Ok(());
-    }
-    if rela_ent != 24 {
-        return Err(MmError::InvalidElf);
-    }
-
-    let rela_vaddr = rela_vaddr.ok_or(MmError::InvalidElf)?;
-    let rela_offset = file_offset_for_vaddr(elf, rela_vaddr).ok_or(MmError::InvalidElf)?;
-    let rela_end = rela_offset
-        .checked_add(rela_size)
-        .ok_or(MmError::InvalidElf)?;
-    let rela_bytes = elf
-        .input
-        .get(rela_offset..rela_end)
-        .ok_or(MmError::InvalidElf)?;
-    if rela_bytes.len() % rela_ent != 0 {
-        return Err(MmError::InvalidElf);
-    }
-
-    for chunk in rela_bytes.chunks_exact(rela_ent) {
-        let offset = usize::from_le_bytes(chunk[0..8].try_into().map_err(|_| MmError::InvalidElf)?);
-        let info = u64::from_le_bytes(chunk[8..16].try_into().map_err(|_| MmError::InvalidElf)?);
-        let addend = i64::from_le_bytes(chunk[16..24].try_into().map_err(|_| MmError::InvalidElf)?);
-        let rel_type = info as u32;
-        let sym_index = (info >> 32) as u32;
-        let target = add_load_bias(offset, load_bias)?;
-        let value = match rel_type {
-            R_RISCV_RELATIVE => {
-                if sym_index != 0 {
-                    return Err(MmError::InvalidElf);
-                }
-                relocated_value(load_bias, addend)?
-            }
-            2 => {
-                let symtab_vaddr = symtab_vaddr.ok_or(MmError::InvalidElf)?;
-                let (sym_value, shndx) = read_dynsym_value(elf, symtab_vaddr, sym_ent, sym_index)?;
-                if shndx == 0 {
-                    return Err(MmError::InvalidElf);
-                }
-                let sym_addr = add_load_bias(sym_value, load_bias)?;
-                relocated_value(sym_addr, addend)?
-            }
-            _ => return Err(MmError::InvalidElf),
-        };
-        write_user_usize(memory_set, target, value)?;
-    }
-
-    Ok(())
-}
-
 /// address space
 pub struct MemorySet {
     /// page table
     pub page_table: PageTable,
     /// virtual memory areas, keyed by start VPN.
     pub vmas: BTreeMap<VirtPageNum, Vma>,
-    /// 当前仍在用户态装载该地址空间的 hart 掩码。
-    loaded_user_harts: AtomicUsize,
+    /// Hardware address-space ID encoded into this memory set's token.
+    asid: usize,
+    /// Harts currently eligible to execute userspace from this address space.
+    ///
+    /// Trap entry now retains this page-table root, but the bit is still
+    /// cleared once the hart has left user mode: kernel user-memory helpers
+    /// walk the process table explicitly. Inactive harts may retain stale user
+    /// entries; `tlb_generation` forces an ASID-wide fence before user return.
+    active_user_harts: AtomicUsize,
+    /// Incremented after every page-table edit visible to an existing task.
+    tlb_generation: AtomicUsize,
+    /// Last generation synchronized locally by each hart.
+    seen_tlb_generation: [AtomicUsize; MAX_HARTS],
 }
 
 /// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
@@ -479,14 +386,59 @@ pub struct DeferredUserReclaim {
     token: usize,
     /// 需要接收 shootdown 的 hart 掩码。
     mask: usize,
+    /// 精确刷新语义。
+    flush: DeferredUserFlush,
     /// shootdown 完成后才能释放的旧页对象。
     batch: UserReleaseBatch,
+}
+
+#[derive(Copy, Clone)]
+enum DeferredUserFlush {
+    AddressSpace,
+    Page { vaddr: usize },
+    Range { start: usize, end: usize },
 }
 
 impl DeferredUserReclaim {
     /// 基于锁内快照创建一次用户页表延迟回收动作。
     pub(crate) fn new(token: usize, mask: usize, batch: UserReleaseBatch) -> Self {
-        Self { token, mask, batch }
+        Self {
+            token,
+            mask,
+            flush: DeferredUserFlush::AddressSpace,
+            batch,
+        }
+    }
+
+    /// 创建一次单页 VA+ASID 延迟回收动作。
+    pub(crate) fn new_page(
+        token: usize,
+        mask: usize,
+        vaddr: usize,
+        batch: UserReleaseBatch,
+    ) -> Self {
+        Self {
+            token,
+            mask,
+            flush: DeferredUserFlush::Page { vaddr },
+            batch,
+        }
+    }
+
+    /// 创建一次范围 VA+ASID 延迟回收动作。
+    pub(crate) fn new_range(
+        token: usize,
+        mask: usize,
+        start: usize,
+        end: usize,
+        batch: UserReleaseBatch,
+    ) -> Self {
+        Self {
+            token,
+            mask,
+            flush: DeferredUserFlush::Range { start, end },
+            batch,
+        }
     }
 
     /// 判断本次回收是否实际持有旧页对象。
@@ -496,18 +448,66 @@ impl DeferredUserReclaim {
 
     /// 在目标 hart 完成 TLB shootdown 后释放旧页对象。
     pub fn flush_then_release(self) {
-        if self.mask != 0 && !self.batch.is_empty() {
+        // Permission-only edits (for example an exclusive COW page becoming
+        // writable) can leave the release batch empty while still requiring
+        // remote harts to discard a restrictive translation.  The mask is the
+        // authoritative indication that this address space may still be loaded
+        // elsewhere; page ownership is only relevant to the deferred release.
+        if self.mask != 0 {
             debug!(
                 "[tlb] deferred user reclaim shootdown: token={:#x} mask={:#b}",
                 self.token, self.mask
             );
-            shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
+            match self.flush {
+                DeferredUserFlush::AddressSpace => {
+                    shootdown(self.mask, ShootdownKind::AddressSpace { token: self.token });
+                }
+                DeferredUserFlush::Page { vaddr } => shootdown(
+                    self.mask,
+                    ShootdownKind::Page {
+                        asid: crate::hal::address_space_id_from_token(self.token),
+                        vaddr,
+                    },
+                ),
+                DeferredUserFlush::Range { start, end } => shootdown(
+                    self.mask,
+                    ShootdownKind::Range {
+                        asid: crate::hal::address_space_id_from_token(self.token),
+                        start,
+                        end,
+                    },
+                ),
+            }
         }
         // self 在函数返回时析构，batch 的 Drop 会真正释放旧页引用。
     }
 }
 
 impl MemorySet {
+    /// Flush every local non-global translation tagged with this memory set's ASID.
+    #[inline]
+    fn flush_local_tlb_asid(&self) {
+        unsafe { crate::hal::flush_tlb_asid(self.asid) };
+    }
+
+    /// Flush one local non-global page translation tagged with this ASID.
+    #[inline]
+    fn flush_local_tlb_page_asid(&self, vaddr: usize) {
+        unsafe { crate::hal::flush_tlb_page_asid(vaddr, self.asid) };
+    }
+
+    /// Flush one local virtual page number tagged with this ASID.
+    #[inline]
+    fn flush_local_tlb_vpn_asid(&self, vpn: VirtPageNum) {
+        self.flush_local_tlb_page_asid(VirtAddr::from(vpn).0);
+    }
+
+    /// Flush a bounded local VA range, falling back to ASID-wide for large ranges.
+    #[inline]
+    fn flush_local_tlb_range_asid(&self, start: usize, end: usize) {
+        super::tlb_shootdown::local_sfence_vma_range_asid(start, end, self.asid);
+    }
+
     fn map_perm_to_pte_flags(map_perm: MapPermission) -> PTEFlags {
         let mut flags = PTEFlags::empty();
         if map_perm.contains(MapPermission::R) {
@@ -525,63 +525,133 @@ impl MemorySet {
         crate::hal::normalize_leaf_pte_flags(flags)
     }
 
+    /// Return whether a resident leaf PTE permits one user-mode access.
+    fn pte_allows_user_access(pte: PageTableEntry, access: PageFaultAccess) -> bool {
+        pte.is_user()
+            && match access {
+                PageFaultAccess::Read => pte.readable(),
+                PageFaultAccess::Write => pte.writable(),
+                PageFaultAccess::Exec => pte.executable(),
+            }
+    }
+
     /// 完成一次会返回延迟回收 batch 的本地页表修改。
     fn finish_deferred_page_table_edit(&self) {
         // 本地 hart 可能刚刚使用过被拆除的翻译，必须先清掉本地 TLB；
         // 远端 hart 的同步由调用方构造 `DeferredUserReclaim` 后在锁外完成。
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_asid();
     }
 
-    /// Create a new empty `MemorySet`.
-    pub fn new_bare() -> Result<Self, MmError> {
+    fn new_bare_with_asid(asid: usize) -> Result<Self, MmError> {
         Ok(Self {
             page_table: PageTable::new()?,
             vmas: BTreeMap::new(),
-            loaded_user_harts: AtomicUsize::new(0),
+            asid,
+            active_user_harts: AtomicUsize::new(0),
+            // Generation zero means "never synchronized" for a new hart.
+            tlb_generation: AtomicUsize::new(1),
+            seen_tlb_generation: [const { AtomicUsize::new(0) }; MAX_HARTS],
         })
+    }
+    /// Create a new empty user `MemorySet` with a boot-unique ASID when
+    /// supported by the current architecture.
+    pub fn new_bare() -> Result<Self, MmError> {
+        // Allocate the page-table root first so an OOM failure does not burn a
+        // non-recycled ASID from this boot's finite namespace.
+        let mut memory_set = Self::new_bare_with_asid(super::asid::KERNEL_ASID)?;
+        memory_set.asid = super::asid::allocate_user_asid();
+        #[cfg(target_arch = "riscv64")]
+        memory_set
+            .page_table
+            .share_kernel_half_from(&KERNEL_SPACE.lock().page_table);
+        Ok(memory_set)
     }
     /// Get he page table token
     pub fn token(&self) -> AddressSpaceToken {
-        self.page_table.token()
+        crate::hal::with_address_space_id(self.page_table.token(), self.asid)
     }
-    /// 标记某个 hart 即将返回用户态并装载该地址空间。
-    pub fn mark_user_loaded(&self, hart_id: usize) {
+    /// Pin the root frame while a hart may keep this address space installed.
+    pub fn address_space_root(&self) -> AddressSpaceRoot {
+        self.page_table.address_space_root(self.token())
+    }
+    /// Mark one hart active immediately before returning to userspace.
+    ///
+    /// A hart that missed page-table shootdowns while inactive synchronizes the
+    /// whole ASID once here. Ordinary traps whose generation did not change do
+    /// not execute a fence.
+    pub fn mark_user_active(&self, hart_id: usize) {
+        let generation = self.tlb_generation.load(Ordering::Acquire);
+        if hart_id >= MAX_HARTS {
+            self.flush_local_tlb_asid();
+            return;
+        }
+        if self.seen_tlb_generation[hart_id].load(Ordering::Acquire) != generation {
+            self.flush_local_tlb_asid();
+            self.seen_tlb_generation[hart_id].store(generation, Ordering::Release);
+        }
         let bit = 1usize << hart_id;
-        let mask = self.loaded_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
+        let mask = self.active_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
         trace!(
-            "[tlb] user mm loaded on hart {} token={:#x} mask={:#b}",
+            "[tlb] user ASID active on hart {} token={:#x} asid={} generation={} mask={:#b}",
             hart_id,
             self.token(),
+            self.asid,
+            generation,
             mask
         );
     }
-    /// 标记某个 hart 已经离开用户态，不再需要作为该地址空间的远端 shootdown 目标。
-    pub fn mark_user_unloaded(&self, hart_id: usize) {
+    /// Mark one hart inactive after it has left user mode.
+    pub fn mark_user_inactive(&self, hart_id: usize) {
+        if hart_id >= MAX_HARTS {
+            return;
+        }
+        // The process root remains loaded in the shared-page-table design, but
+        // ordinary kernel code does not dereference user VAs directly. Do not
+        // advance `seen_tlb_generation` here. A page-table editor
+        // publishes the new generation under process-inner, then launches the
+        // remote shootdown after dropping that lock.  This hart can acquire
+        // process-inner in between those two steps; retaining the old seen
+        // value forces `mark_user_active()` to fence before any such stale
+        // translation can be used again.
         let bit = 1usize << hart_id;
-        let mask = self.loaded_user_harts.fetch_and(!bit, Ordering::AcqRel) & !bit;
-        trace!(
-            "[tlb] user mm unloaded from hart {} token={:#x} mask={:#b}",
-            hart_id,
-            self.token(),
-            mask
-        );
+        self.active_user_harts.fetch_and(!bit, Ordering::AcqRel);
     }
-    /// 返回当前仍在用户态装载该地址空间的 hart 掩码。
-    pub fn loaded_user_harts(&self) -> usize {
-        self.loaded_user_harts.load(Ordering::Acquire)
+    /// Return harts currently executing userspace with this address space.
+    pub fn active_user_harts(&self) -> usize {
+        self.active_user_harts.load(Ordering::Acquire)
     }
-    /// 对当前仍在用户态装载该地址空间的 hart 发起同步 TLB shootdown。
+    /// Publish one locally synchronized page-table generation and snapshot the
+    /// harts that must be synchronously shot down.
     ///
-    /// 调用方不能持有对应进程锁等待 ack。用户态 IPI 进入内核后会先更新进程
-    /// 运行态信息，持锁等待可能导致远端 hart 无法进入 softirq 分支。
-    ///
-    /// 这里依赖当前 trap 语义：hart 从用户态进入内核时已经切到 kernel satp
-    /// 并执行本地 `sfence.vma`，因此不在该掩码中的 hart 不应再持有这个用户
-    /// 地址空间的旧翻译。若后续去掉 trap 入口 flush 或引入 ASID，需要重新审查。
-    pub fn shootdown_loaded_user_harts(&self) {
-        let mask = self.loaded_user_harts();
+    /// Page-table edit helpers already flush the current hart before calling
+    /// this method, so its seen generation can advance without another fence.
+    /// Inactive harts are omitted from the synchronous mask and will observe the
+    /// new generation in `mark_user_active()` before their next user return.
+    fn advance_tlb_generation(&self) -> usize {
+        let generation = self
+            .tlb_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let hart_id = crate::hal::hartid();
+        if hart_id < MAX_HARTS {
+            self.seen_tlb_generation[hart_id].store(generation, Ordering::Release);
+        }
+        self.active_user_harts()
+    }
+    /// Record a page-table edit after the caller has already synchronized the
+    /// current hart's TLB.
+    pub fn record_local_tlb_change(&self) -> usize {
+        self.advance_tlb_generation()
+    }
+    /// Synchronize the current hart for this ASID, then publish a new page-table
+    /// generation and return the active remote target mask.
+    pub fn record_tlb_change_with_local_fence(&self) -> usize {
+        self.flush_local_tlb_asid();
+        self.advance_tlb_generation()
+    }
+    /// 对当前正在用户态执行该地址空间的 hart 发起同步 TLB shootdown。
+    pub fn shootdown_active_user_harts(&self) {
+        let mask = self.active_user_harts();
         self.shootdown_user_harts(mask);
     }
     /// 对指定 hart 掩码发起该地址空间的同步 TLB shootdown。
@@ -589,14 +659,14 @@ impl MemorySet {
     /// 这个接口用于调用方已经在锁内快照出目标 mask，随后释放锁再执行同步等待
     /// 的场景。
     ///
-    /// snapshot 只覆盖“页表修改完成时仍在用户态运行该 mm”的 hart。修改完成后
-    /// 才从内核态返回用户态的 hart，必须已经经过 trap 入口的本地 flush 同步点。
+    /// snapshot 只覆盖当前 active harts；inactive harts 会在下一次返回该 mm
+    /// 前根据 TLB generation 执行一次本地 ASID-wide fence。
     pub fn shootdown_user_harts(&self, mask: usize) {
         if mask == 0 {
             return;
         }
         debug!(
-            "[tlb] shootdown user mm token={:#x} loaded_mask={:#b}",
+            "[tlb] shootdown user mm token={:#x} active_mask={:#b}",
             self.token(),
             mask
         );
@@ -720,6 +790,9 @@ impl MemorySet {
     }
     /// 将一段区域登记到地址空间并立即建立页表映射；若与现有区域冲突则失败。
     pub fn insert_vma(&mut self, mut vma: Vma, data: Option<&[u8]>) -> Result<(), MmError> {
+        if vma.is_user_accessible() && VirtAddr::from(vma.end_vpn()).0 > USER_SPACE_END {
+            return Err(MmError::PermissionDenied);
+        }
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
             return Err(MmError::Conflict);
         }
@@ -917,15 +990,15 @@ impl MemorySet {
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
-        let mut memory_set =
-            Self::new_bare().expect("failed to allocate boot-time kernel root page table");
+        let mut memory_set = Self::new_bare_with_asid(super::asid::KERNEL_ASID)
+            .expect("failed to allocate boot-time kernel root page table");
         // map trampoline
         memory_set
             .map_trampoline()
             .expect("failed to map boot-time kernel trampoline");
-        // On LoongArch, kernel sections / physical memory / MMIO are covered by
-        // DMW windows, but trap trampoline and task kernel stacks live in the
-        // low-half page-table space and are mapped explicitly.
+        // On LoongArch, kernel sections, physical memory and task kernel stacks
+        // are covered by DMW windows. Only the user-trap trampoline needs an
+        // explicit page-table mapping.
         #[cfg(not(target_arch = "loongarch64"))]
         {
             // map kernel sections
@@ -942,7 +1015,7 @@ impl MemorySet {
                     Vma::new(
                         (stext as usize).into(),
                         (etext as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R | MapPermission::X,
                         VmaKind::Kernel,
                     ),
@@ -955,7 +1028,7 @@ impl MemorySet {
                     Vma::new(
                         (srodata as usize).into(),
                         (erodata as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R,
                         VmaKind::Kernel,
                     ),
@@ -968,7 +1041,7 @@ impl MemorySet {
                     Vma::new(
                         (sdata as usize).into(),
                         (edata as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R | MapPermission::W,
                         VmaKind::Kernel,
                     ),
@@ -981,7 +1054,7 @@ impl MemorySet {
                     Vma::new(
                         (sbss_with_stack as usize).into(),
                         (ebss as usize).into(),
-                        MapType::Identical,
+                        MapType::Direct,
                         MapPermission::R | MapPermission::W,
                         VmaKind::Kernel,
                     ),
@@ -989,8 +1062,8 @@ impl MemorySet {
                 )
                 .expect("failed to map kernel bss");
             info!("mapping physical memory");
-            let kernel_start = skernel as usize;
-            let kernel_end = ekernel as usize;
+            let kernel_start = crate::platform::direct_map_virt_to_phys(skernel as usize);
+            let kernel_end = crate::platform::direct_map_virt_to_phys(ekernel as usize);
             bootinfo::for_each_usable_memory_region(|region| {
                 let start = align_up_to_page(region.start);
                 let end = align_down_to_page(region.end);
@@ -1004,7 +1077,7 @@ impl MemorySet {
                         Vma::new(
                             (*pair).0.into(),
                             ((*pair).0 + (*pair).1).into(),
-                            MapType::Identical,
+                            MapType::Direct,
                             MapPermission::R | MapPermission::W,
                             VmaKind::Kernel,
                         ),
@@ -1013,141 +1086,61 @@ impl MemorySet {
                     .expect("failed to map mmio window");
             }
         } // end #[cfg(not(loongarch64))]
+        #[cfg(target_arch = "riscv64")]
+        memory_set.page_table.mark_kernel_half_global();
         memory_set
     }
-    /// Include ELF segments and trampoline, and compute initial process VM layout.
-    /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo)
-    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
+    /// Load an ELF file and construct the initial user address space.
+    pub fn from_elf_file(
+        file: Arc<OSInode>,
+    ) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
         let mut memory_set = Self::new_bare()?;
-        // map trampoline
+        #[cfg(target_arch = "loongarch64")]
         memory_set.map_trampoline()?;
         memory_set.map_user_vdso()?;
-        // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| MmError::InvalidElf)?;
-        let elf_header = elf.header;
-        let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
-        let elf_type = elf_header.pt2.type_().as_type();
-        let load_bias = if elf_type == xmas_elf::header::Type::SharedObject {
-            USER_PIE_BASE
-        } else {
-            0
-        };
-        let ph_count = elf_header.pt2.ph_count();
-        let mut max_end_vpn = VirtPageNum(0);
-
-        // 收集动态链接信息
-        let mut interp_path: Option<String> = None;
-        let phdr_vaddr = elf_header.pt2.ph_offset() as usize; // 程序头表文件偏移
-        let mut phdr_load_vaddr: Option<usize> = None; // 程序头表加载后的虚拟地址
-
-        for i in 0..ph_count {
-            let ph = elf.program_header(i).map_err(|_| MmError::InvalidElf)?;
-            let ph_type = ph.get_type().map_err(|_| MmError::InvalidElf)?;
-
-            // 检查 INTERP 段
-            if ph_type == xmas_elf::program::Type::Interp {
-                debug!("Found INTERP segment in ELF program header");
-                let offset = ph.offset() as usize;
-                let size = ph.file_size() as usize;
-                if size > 0 && offset + size <= elf_data.len() {
-                    let interp_bytes = &elf_data[offset..offset + size];
-                    // INTERP 段内容是以 null 结尾的字符串
-                    let end = interp_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(interp_bytes.len());
-                    if let Ok(path) = core::str::from_utf8(&interp_bytes[..end]) {
-                        interp_path = Some(String::from(path));
-                        debug!("Found INTERP segment: {}", path);
-                    }
-                }
-            }
-
-            if ph_type == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr =
-                    add_load_bias(ph.virtual_addr() as usize, load_bias)?.into();
-                let end_va: VirtAddr =
-                    add_load_bias((ph.virtual_addr() + ph.mem_size()) as usize, load_bias)?.into();
-
-                // 检查程序头表是否在这个 LOAD 段内
-                if phdr_load_vaddr.is_none() {
-                    let seg_file_start = ph.offset() as usize;
-                    let seg_file_end = seg_file_start + ph.file_size() as usize;
-                    if phdr_vaddr >= seg_file_start && phdr_vaddr < seg_file_end {
-                        // 程序头表在此段内，计算其虚拟地址
-                        let offset_in_seg = phdr_vaddr - seg_file_start;
-                        phdr_load_vaddr = Some(add_load_bias(
-                            ph.virtual_addr() as usize + offset_in_seg,
-                            load_bias,
-                        )?);
-                    }
-                }
-
-                let mut map_perm = MapPermission::U;
-                let ph_flags = ph.flags();
-                if ph_flags.is_read() {
-                    map_perm |= MapPermission::R;
-                }
-                if ph_flags.is_write() {
-                    map_perm |= MapPermission::W;
-                }
-                if ph_flags.is_execute() {
-                    map_perm |= MapPermission::X;
-                }
-                debug!(
-                    "mapping ELF segment: [{:#x}, {:#x}) with flags {:?}",
-                    &(usize::from(start_va)),
-                    &(usize::from(end_va)),
-                    map_perm
-                );
-                let vma = Vma::new_elf(start_va, end_va, map_perm);
-                max_end_vpn = vma.end_vpn();
-                // start_va may not be page-aligned (p_vaddr % p_align == p_offset % p_align).
-                // copy_data writes from the start of the first mapped page, so we must pad
-                // the data with zeros equal to start_va's within-page offset so that each
-                // ELF byte lands at the correct virtual address.
-                let page_off = start_va.page_offset();
-                let raw = &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
-                let padded: Vec<u8>;
-                let seg_data: &[u8] = if page_off != 0 {
-                    let mut buf = alloc::vec![0u8; page_off + raw.len()];
-                    buf[page_off..].copy_from_slice(raw);
-                    padded = buf;
-                    &padded
-                } else {
-                    raw
-                };
-                memory_set.insert_vma(vma, Some(seg_data))?;
-            }
-        }
-        if elf_type == xmas_elf::header::Type::SharedObject && interp_path.is_none() {
-            apply_static_pie_relocations(&mut memory_set, &elf, load_bias)?;
-        }
-        let max_end_va: VirtAddr = max_end_vpn.into();
-        let start_brk: usize = max_end_va.into();
+        let loaded = ElfLoader::new(&mut memory_set).load_file(&file)?;
         let layout = UserSpaceLayout {
-            start_brk,
+            start_brk: loaded.image_end,
             mmap_base: USER_MMAP_BASE,
             ustack_base: USER_STACK_BASE,
             start_stack: USER_STACK_BASE + USER_STACK_SIZE,
         };
+        Ok((memory_set, layout, loaded.info))
+    }
 
-        let load_info = ElfLoadInfo {
-            entry_point: add_load_bias(elf.header.pt2.entry_point() as usize, load_bias)?,
-            phdr_vaddr: phdr_load_vaddr.unwrap_or(0),
-            phent_size: elf.header.pt2.ph_entry_size() as usize,
-            phnum: ph_count as usize,
-            interp_path,
+    /// Load one ELF file into an existing address space. The optional forced
+    /// load bias is used for the dynamic linker; None selects the normal
+    /// ET_EXEC/PIE policy used by the main executable.
+    pub fn load_elf_file_at(
+        &mut self,
+        file: &Arc<OSInode>,
+        forced_load_bias: Option<usize>,
+    ) -> Result<(ElfLoadInfo, usize), MmError> {
+        let loaded = ElfLoader::new(self).load_file_at(file, forced_load_bias)?;
+        Ok((loaded.info, loaded.image_end))
+    }
+
+    /// Include ELF segments and trampoline, and compute initial process VM layout.
+    /// Returns (MemorySet, UserSpaceLayout, ElfLoadInfo).
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, UserSpaceLayout, ElfLoadInfo), MmError> {
+        let mut memory_set = Self::new_bare()?;
+        #[cfg(target_arch = "loongarch64")]
+        memory_set.map_trampoline()?;
+        memory_set.map_user_vdso()?;
+        let loaded = ElfLoader::new(&mut memory_set).load_bytes(elf_data)?;
+        let layout = UserSpaceLayout {
+            start_brk: loaded.image_end,
+            mmap_base: USER_MMAP_BASE,
+            ustack_base: USER_STACK_BASE,
+            start_stack: USER_STACK_BASE + USER_STACK_SIZE,
         };
-
-        Ok((memory_set, layout, load_info))
+        Ok((memory_set, layout, loaded.info))
     }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &mut Self) -> Result<(Self, bool), MmError> {
         let clone_start_ns = get_time_ns();
         let mut memory_set = Self::new_bare()?;
-        // map trampoline
+        #[cfg(target_arch = "loongarch64")]
         memory_set.map_trampoline()?;
         let mut parent_tlb_needs_flush = false;
         let mut shared_anon_vmas = 0usize;
@@ -1277,9 +1270,7 @@ impl MemorySet {
             }
         }
         if parent_tlb_needs_flush {
-            unsafe {
-                crate::hal::flush_tlb();
-            }
+            user_space.flush_local_tlb_asid();
             debug!("[cow] fork flush parent local TLB after write-protecting shared private pages");
         }
         let total_ns = get_time_ns() - clone_start_ns;
@@ -1300,45 +1291,99 @@ impl MemorySet {
         Ok((memory_set, parent_tlb_needs_flush))
     }
 
-    /// Create a new address space for `clone(CLONE_VM)` process-style clones.
+    /// Create a vfork-compatible address space for a process-style
+    /// `clone(CLONE_VM)`.
     ///
-    /// User private pages that are safe to share are installed into the child
-    /// page table with their current permissions. Kernel-managed per-task pages
-    /// such as trap contexts still get copied, so each task keeps independent
-    /// saved register state.
-    pub fn from_existed_user_shared_vm(user_space: &mut Self) -> Result<Self, MmError> {
+    /// The child needs a distinct page table because kernel-managed per-task
+    /// pages such as trap contexts cannot be shared.  Resident user pages are
+    /// nevertheless mapped to the same physical pages.  Before doing so,
+    /// writable pages that still carry fork COW protection are detached for
+    /// the parent and then shared writable with the CLONE_VM child.  Otherwise
+    /// a child write (notably glibc's posix_spawn `args.err`) would COW into a
+    /// child-private page and remain invisible to the resumed parent.
+    ///
+    /// Returns whether parent PTEs were relaxed/replaced and therefore require
+    /// a parent-address-space TLB shootdown.
+    pub fn from_existed_user_shared_vm(user_space: &mut Self) -> Result<(Self, bool), MmError> {
         let mut memory_set = Self::new_bare()?;
         memory_set.map_trampoline()?;
+        let mut parent_tlb_needs_flush = false;
         let parent_vma_starts: Vec<_> = user_space.vmas.keys().copied().collect();
         for area_start in parent_vma_starts {
-            let Some(area) = user_space.vmas.get(&area_start) else {
-                continue;
+            let (
+                share_private_pages,
+                cow_private_pages,
+                new_area,
+                private_pages,
+                direct_cache_pages,
+                inherit_direct_cache_pages,
+                map_perm,
+            ) = {
+                let Some(area) = user_space.vmas.get(&area_start) else {
+                    continue;
+                };
+                let cow_private_pages = area.supports_private_page_sharing();
+                (
+                    cow_private_pages || area.shared_anon || area.is_shared_anonymous(),
+                    cow_private_pages,
+                    area.clone_metadata(),
+                    area.data_frames
+                        .iter()
+                        .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                        .collect::<Vec<_>>(),
+                    area.direct_cache_pages
+                        .iter()
+                        .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                        .collect::<Vec<_>>(),
+                    area.file.is_some(),
+                    area.map_perm,
+                )
             };
-            let share_private_pages = area.supports_private_page_sharing()
-                || area.shared_anon
-                || area.is_shared_anonymous();
-            let new_area = area.clone_metadata();
             if share_private_pages {
                 memory_set.register_vma_metadata(new_area)?;
             } else {
                 memory_set.insert_vma(new_area, None)?;
             }
 
-            let private_pages: Vec<_> = area
-                .data_frames
-                .iter()
-                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
-                .collect();
-            let direct_cache_pages: Vec<_> = area
-                .direct_cache_pages
-                .iter()
-                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
-                .collect();
-            let inherit_direct_cache_pages = area.file.is_some();
-
-            for (vpn, page) in private_pages {
+            for (vpn, mut page) in private_pages {
                 if share_private_pages {
-                    let flags = user_space.translate(vpn).unwrap().flags();
+                    let mut flags = user_space.translate(vpn).ok_or(MmError::NoMapping)?.flags();
+
+                    // A normal fork can leave a writable VMA backed by a
+                    // read-only COW page.  Sharing that PTE unchanged would
+                    // make the CLONE_VM child take a private COW fault, which
+                    // violates vfork/posix_spawn's shared-memory contract.
+                    if cow_private_pages
+                        && map_perm.contains(MapPermission::W)
+                        && page.is_cow()
+                        && !flags.contains(PTEFlags::W)
+                    {
+                        let shared_page = Arc::new(PrivatePage::new(
+                            frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
+                        ));
+                        shared_page
+                            .ppn()
+                            .get_bytes_array()
+                            .copy_from_slice(page.ppn().get_bytes_array());
+                        let mut writable_flags = flags;
+                        writable_flags.insert(PTEFlags::W);
+                        writable_flags.remove(PTEFlags::D);
+                        if !user_space
+                            .page_table
+                            .replace(vpn, shared_page.ppn(), writable_flags)
+                        {
+                            return Err(MmError::NoMapping);
+                        }
+                        user_space
+                            .vmas
+                            .get_mut(&area_start)
+                            .ok_or(MmError::NoMapping)?
+                            .data_frames
+                            .insert(vpn, Arc::clone(&shared_page));
+                        page = shared_page;
+                        flags = writable_flags;
+                        parent_tlb_needs_flush = true;
+                    }
                     memory_set.map_existing_private_page(vpn, page, flags)?;
                     continue;
                 }
@@ -1362,12 +1407,12 @@ impl MemorySet {
                 }
             }
         }
-        Ok(memory_set)
+        Ok((memory_set, parent_tlb_needs_flush))
     }
     /// Change page table by activating the current architecture token.
     pub fn activate(&self) {
         unsafe {
-            crate::hal::activate_address_space(self.page_table.token());
+            crate::hal::activate_address_space(self.token());
         }
     }
     /// Translate a virtual page number to a page table entry
@@ -1377,6 +1422,10 @@ impl MemorySet {
 
     /// 拆除全部用户 VMA，并把旧页对象放入延迟释放批次。
     pub(crate) fn recycle_data_pages_deferred(&mut self) -> UserReleaseBatch {
+        // Process exit and exec bypass the syscall-level munmap path.  Flush
+        // shared file mappings here as well so mmap writers do not lose their
+        // output merely because the process exits or replaces its image.
+        let _ = self.msync_range(VirtAddr::from(0), VirtAddr::from(USER_SPACE_END));
         let mut batch = UserReleaseBatch::new();
         for area in self.vmas.values_mut() {
             area.teardown_user_deferred(&mut self.page_table, &mut batch);
@@ -1392,9 +1441,7 @@ impl MemorySet {
             let _ = area.teardown_deferred(&mut self.page_table);
         }
         self.vmas.clear();
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_asid();
     }
 
     /// 将用户区域收缩到新的上界，并延迟释放被拆下的旧页对象。
@@ -1475,6 +1522,10 @@ impl MemorySet {
                 continue;
             }
 
+            // A direct_cache_pages entry aliases the page-cache frame.
+            // page_cache::truncate_mapping() owns zeroing the retained tail,
+            // so the VM layer only removes mappings that now lie wholly
+            // beyond EOF.
             let direct_vpns: Vec<_> = area.direct_cache_pages.keys().copied().collect();
             for vpn in direct_vpns {
                 let Some(page_idx) = area.file_page_index(vpn) else {
@@ -1482,15 +1533,12 @@ impl MemorySet {
                 };
                 let page_start = page_idx as usize * PAGE_SIZE;
                 if page_start >= new_size {
-                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    area.unmap_present_one_deferred_after_truncate(
+                        &mut self.page_table,
+                        vpn,
+                        &mut batch,
+                    );
                     pte_changed = true;
-                    continue;
-                }
-                if new_size < page_start + PAGE_SIZE {
-                    if let Some(page) = area.direct_cache_pages.get(&vpn) {
-                        let page = page.lock();
-                        page.ppn().get_bytes_array()[new_size - page_start..].fill(0);
-                    }
                 }
             }
 
@@ -1501,7 +1549,11 @@ impl MemorySet {
                 };
                 let page_start = page_idx as usize * PAGE_SIZE;
                 if page_start >= new_size {
-                    area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                    area.unmap_present_one_deferred_after_truncate(
+                        &mut self.page_table,
+                        vpn,
+                        &mut batch,
+                    );
                     pte_changed = true;
                     continue;
                 }
@@ -1534,9 +1586,7 @@ impl MemorySet {
     pub fn shrink_metadata_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self.vmas.get_mut(&start.floor()) {
             area.shrink_present_to(&mut self.page_table, new_end.ceil());
-            unsafe {
-                crate::hal::flush_tlb();
-            }
+            self.flush_local_tlb_asid();
             true
         } else {
             false
@@ -1659,6 +1709,7 @@ impl MemorySet {
         permission: MapPermission,
         shared: bool,
     ) -> Result<(), MmError> {
+        let start_vpn = start_va.floor();
         debug!(
             "[mmap] register anonymous VMA: start={:#x} end={:#x} perm={:?} shared={} eager={}",
             usize::from(start_va),
@@ -1674,11 +1725,11 @@ impl MemorySet {
         };
         if shared {
             self.insert_vma_eager(vma)?;
+            self.merge_vma_around(start_vpn);
+            self.flush_local_tlb_range_asid(start_va.0, end_va.0);
         } else {
             self.register_vma_metadata(vma)?;
-        }
-        unsafe {
-            crate::hal::flush_tlb();
+            self.merge_vma_around(start_vpn);
         }
         Ok(())
     }
@@ -1706,10 +1757,203 @@ impl MemorySet {
             Vma::new_file(start_va, end_va, permission, file, pgoff, shared),
             None,
         )?;
-        unsafe {
-            crate::hal::flush_tlb();
-        }
         Ok(())
+    }
+
+    /// Check whether a range is fully covered by user-accessible VMAs.
+    fn range_is_user_mapped(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let Some((_, area)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.contains_vpn(cursor))
+            else {
+                return false;
+            };
+            if !area.is_user_accessible() {
+                return false;
+            }
+            cursor = area.end_vpn().min(end_vpn);
+        }
+        true
+    }
+
+    /// Resize or relocate one complete user VMA.
+    ///
+    /// The syscall layer selects the destination address.  This method keeps
+    /// the VMA metadata, present PTEs, private pages and direct page-cache
+    /// references in sync.  Any pages removed from a fixed destination are
+    /// returned in `UserReleaseBatch` and must only be dropped after the
+    /// caller has completed the address-space shootdown.
+    pub(crate) fn mremap(
+        &mut self,
+        old_start_va: VirtAddr,
+        old_end_va: VirtAddr,
+        new_start_va: VirtAddr,
+        new_end_va: VirtAddr,
+    ) -> Result<(VirtAddr, UserReleaseBatch), MmError> {
+        let old_start_vpn = old_start_va.floor();
+        let old_end_vpn = old_end_va.ceil();
+        let new_start_vpn = new_start_va.floor();
+        let new_end_vpn = new_end_va.ceil();
+
+        if old_start_vpn >= old_end_vpn || new_start_vpn >= new_end_vpn {
+            return Err(MmError::InvalidRange);
+        }
+        if new_start_vpn != old_start_vpn
+            && old_start_vpn < new_end_vpn
+            && new_start_vpn < old_end_vpn
+        {
+            return Err(MmError::InvalidRange);
+        }
+
+        let Some(source) = self.vmas.get(&old_start_vpn) else {
+            return Err(MmError::NoMapping);
+        };
+        if source.start_vpn() != old_start_vpn
+            || source.end_vpn() != old_end_vpn
+            || !source.is_user_accessible()
+            || !source.supports_mremap()
+        {
+            // Keeping the first implementation to one complete mmap VMA
+            // avoids changing heap/stack bookkeeping or merging unrelated
+            // permission/file regions during a relocation.
+            return Err(MmError::InvalidRange);
+        }
+
+        let mut batch = UserReleaseBatch::new();
+
+        if new_start_vpn == old_start_vpn {
+            let mut area = self.vmas.remove(&old_start_vpn).ok_or(MmError::NoMapping)?;
+
+            if new_end_vpn < old_end_vpn {
+                area.shrink_to_deferred(&mut self.page_table, new_end_vpn, &mut batch);
+            } else if new_end_vpn > old_end_vpn {
+                if self.overlaps_vma_range(old_end_vpn, new_end_vpn) {
+                    self.insert_vma_unchecked(area);
+                    return Err(MmError::AddressUnavailable);
+                }
+                if area.should_eager_map() {
+                    for vpn in VPNRange::new(old_end_vpn, new_end_vpn) {
+                        if let Err(err) = self.page_table.ensure_leaf(vpn) {
+                            self.insert_vma_unchecked(area);
+                            return Err(err);
+                        }
+                    }
+                    if let Err(err) = area.append_to_checked(&mut self.page_table, new_end_vpn) {
+                        self.insert_vma_unchecked(area);
+                        return Err(err);
+                    }
+                } else {
+                    area.vpn_range = VPNRange::new(old_start_vpn, new_end_vpn);
+                }
+            }
+
+            self.insert_vma_unchecked(area);
+            self.merge_vma_around(old_start_vpn);
+            self.finish_deferred_page_table_edit();
+            return Ok((new_start_va, batch));
+        }
+
+        if new_end_vpn.0 > USER_SPACE_END / PAGE_SIZE {
+            return Err(MmError::InvalidRange);
+        }
+
+        // MREMAP_FIXED replaces the destination mapping.  The syscall layer
+        // has already rejected source/destination overlap; holes in the
+        // destination are deliberately not treated as a partial replacement
+        // in this first implementation.
+        let destination_occupied = self.overlaps_vma_range(new_start_vpn, new_end_vpn);
+        if destination_occupied && !self.range_is_user_mapped(new_start_vpn, new_end_vpn) {
+            return Err(MmError::AddressUnavailable);
+        }
+
+        // PageTable::map can allocate intermediate tables.  Prepare every
+        // destination leaf first, so a later PTE move cannot fail halfway
+        // through after the old mapping has been modified.
+        for vpn in VPNRange::new(new_start_vpn, new_end_vpn) {
+            self.page_table.ensure_leaf(vpn)?;
+        }
+
+        // Shared anonymous mappings are eagerly populated in this kernel.
+        // Allocate their growth pages before changing either the destination
+        // or source mapping; the frame allocator can still fail atomically.
+        let source_eager = source.should_eager_map();
+        let source_map_perm = source.map_perm;
+        let old_pages = old_end_vpn.0 - old_start_vpn.0;
+        let new_pages = new_end_vpn.0 - new_start_vpn.0;
+        let mut extra_pages = Vec::new();
+        if source_eager && new_pages > old_pages {
+            for offset in old_pages..new_pages {
+                let page = Arc::new(PrivatePage::new(
+                    frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
+                ));
+                extra_pages.push((VirtPageNum(new_start_vpn.0 + offset), page));
+            }
+        }
+
+        if destination_occupied {
+            let _ = self.msync_range(new_start_va, new_end_va);
+            let mut destination_batch = self
+                .munmap_deferred(new_start_va, new_end_va)
+                .ok_or(MmError::AddressUnavailable)?;
+            batch.append(&mut destination_batch);
+        }
+
+        let mut area = self.vmas.remove(&old_start_vpn).ok_or(MmError::NoMapping)?;
+
+        let mut present = Vec::new();
+        for offset in 0..old_pages {
+            let old_vpn = VirtPageNum(old_start_vpn.0 + offset);
+            if let Some(pte) = self.page_table.translate(old_vpn) {
+                present.push((offset, pte));
+            }
+        }
+
+        let pte_flags = Self::map_perm_to_pte_flags(source_map_perm);
+        for (vpn, page) in &extra_pages {
+            self.page_table
+                .map(*vpn, page.ppn(), pte_flags)
+                .expect("mremap destination page-table leaf was preflighted");
+        }
+
+        for (offset, pte) in &present {
+            let new_vpn = VirtPageNum(new_start_vpn.0 + *offset);
+            self.page_table
+                .map(new_vpn, pte.ppn(), pte.flags())
+                .expect("mremap destination page-table leaf was preflighted");
+        }
+        for offset in 0..old_pages {
+            let old_vpn = VirtPageNum(old_start_vpn.0 + offset);
+            let _ = self.page_table.clear(old_vpn);
+        }
+
+        let old_data_frames = core::mem::take(&mut area.data_frames);
+        for (vpn, page) in old_data_frames {
+            let offset = vpn.0 - old_start_vpn.0;
+            area.data_frames
+                .insert(VirtPageNum(new_start_vpn.0 + offset), page);
+        }
+        let old_direct_cache_pages = core::mem::take(&mut area.direct_cache_pages);
+        for (vpn, page) in old_direct_cache_pages {
+            let offset = vpn.0 - old_start_vpn.0;
+            area.direct_cache_pages
+                .insert(VirtPageNum(new_start_vpn.0 + offset), page);
+        }
+        for (vpn, page) in extra_pages {
+            area.data_frames.insert(vpn, page);
+        }
+        area.vpn_range = VPNRange::new(new_start_vpn, new_end_vpn);
+
+        self.insert_vma_unchecked(area);
+        self.merge_vma_around(new_start_vpn);
+        self.finish_deferred_page_table_edit();
+        Ok((new_start_va, batch))
     }
 
     /// 按给定用户区间拆除映射，并返回需要在 shootdown 后释放的旧页对象。
@@ -1723,76 +1967,66 @@ impl MemorySet {
     ) -> Option<UserReleaseBatch> {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
-        // debug!(
-        //     "[munmap] begin teardown: start={:#x} end={:#x} start_vpn={:#x} end_vpn={:#x}",
-        //     usize::from(start_va),
-        //     usize::from(end_va),
-        //     start_vpn.0,
-        //     end_vpn.0
-        // );
-        for vpn in VPNRange::new(start_vpn, end_vpn) {
-            let Some(area) = self.find_vma_containing(vpn) else {
+        // 先按 VMA 级别验证整段区间都被用户态映射覆盖，避免按页查找导致
+        // many-small munmap 在大量碎片 VMA 下退化得过于明显。
+        let mut overlap_starts = Vec::new();
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let Some((area_start, area)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.contains_vpn(cursor))
+            else {
                 return None;
             };
             if !area.is_user_accessible() {
                 return None;
             }
+            overlap_starts.push(*area_start);
+            cursor = area.end_vpn().min(end_vpn);
         }
 
         let mut batch = UserReleaseBatch::new();
-        let old_vmas = core::mem::take(&mut self.vmas);
-        let mut new_areas: Vec<Vma> = Vec::with_capacity(old_vmas.len() + 1);
-        for mut area in old_vmas.into_values() {
+        let mut merge_candidates = Vec::with_capacity(overlap_starts.len() * 2);
+        for area_start in overlap_starts {
+            let mut area = self.vmas.remove(&area_start)?;
             let area_start = area.start_vpn();
             let area_end = area.end_vpn();
-            let overlap_start = if area_start > start_vpn {
-                area_start
-            } else {
-                start_vpn
-            };
-            let overlap_end = if area_end < end_vpn {
-                area_end
-            } else {
-                end_vpn
-            };
+            let overlap_start = area_start.max(start_vpn);
+            let overlap_end = area_end.min(end_vpn);
 
-            if overlap_start >= overlap_end {
-                new_areas.push(area);
-                continue;
-            }
-
-            // debug!(
-            //     "[munmap] overlap VMA: area_start={:#x} area_end={:#x} overlap_start={:#x} overlap_end={:#x} file_backed={} direct_cache_pages={} private_pages={}",
-            //     area_start.0,
-            //     area_end.0,
-            //     overlap_start.0,
-            //     overlap_end.0,
-            //     area.file.is_some(),
-            //     area.direct_cache_pages.len(),
-            //     area.data_frames.len()
-            // );
+            let right_area = if overlap_end < area_end {
+                area.split_off(overlap_end)
+            } else {
+                None
+            };
+            let mut overlap_area = if area_start < overlap_start {
+                let overlap_area = area
+                    .split_off(overlap_start)
+                    .expect("validated overlap split should succeed");
+                let left_start = area.start_vpn();
+                self.insert_vma_unchecked(area);
+                merge_candidates.push(left_start);
+                overlap_area
+            } else {
+                area
+            };
 
             for vpn in VPNRange::new(overlap_start, overlap_end) {
-                area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+                overlap_area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
             }
 
-            if area_start < overlap_start {
-                if let Some(left_tail) = area.split_off(overlap_start) {
-                    let overlap_area = left_tail;
-                    new_areas.push(area);
-                    area = overlap_area;
-                }
-            }
-
-            if overlap_end < area_end {
-                if let Some(right_area) = area.split_off(overlap_end) {
-                    new_areas.push(right_area);
-                }
+            if let Some(right_area) = right_area {
+                let right_start = right_area.start_vpn();
+                self.insert_vma_unchecked(right_area);
+                merge_candidates.push(right_start);
             }
         }
-        self.rebuild_vmas_from_vec(new_areas);
-        self.merge_adjacent_vmas();
-        self.finish_deferred_page_table_edit();
+        for start in merge_candidates {
+            self.merge_vma_around(start);
+        }
+        self.flush_local_tlb_range_asid(start_va.0, end_va.0);
         debug!(
             "[munmap] complete teardown: start_vpn={:#x} end_vpn={:#x}",
             start_vpn.0, end_vpn.0
@@ -1805,26 +2039,73 @@ impl MemorySet {
         &self,
         fault_va: VirtAddr,
         access: PageFaultAccess,
-    ) -> Option<FilePageFaultPlan> {
+    ) -> FilePageFaultPrepare {
         let vpn = fault_va.floor();
-        if self.page_table.translate(vpn).is_some() {
-            return None;
+        if let Some(pte) = self.page_table.translate(vpn) {
+            let vma_allows = self
+                .find_vma_containing(vpn)
+                .is_some_and(|area| area.is_user_accessible() && area.allows_fault_access(access));
+            if vma_allows && Self::pte_allows_user_access(pte, access) {
+                // The PTE may have been installed by another hart after the
+                // trap dispatcher performed its first resident-PTE check but
+                // before it reached this file-fault path.  Treat that state as
+                // a resolved stale translation instead of returning a miss
+                // that the trap layer would turn into SIGSEGV.
+                warn!(
+                    "[tlb] retry file fault with present user PTE: hart={} vpn={:#x} \
+                     access={:?} pte_bits={:#x} ppn={:#x} flags={:?}",
+                    crate::hal::hartid(),
+                    vpn.0,
+                    access,
+                    pte.bits,
+                    pte.ppn().0,
+                    pte.flags(),
+                );
+                self.flush_local_tlb_page_asid(fault_va.0);
+                return FilePageFaultPrepare::Resolved;
+            }
+            warn!(
+                "[mmap] file fault sees incompatible PTE: hart={} vpn={:#x} access={:?} \
+                 pte_bits={:#x} ppn={:#x} flags={:?} vma_allows={}",
+                crate::hal::hartid(),
+                vpn.0,
+                access,
+                pte.bits,
+                pte.ppn().0,
+                pte.flags(),
+                vma_allows,
+            );
+            return FilePageFaultPrepare::NotHandled;
         }
-        let area = self.find_vma_containing(vpn)?;
+        let Some(area) = self.find_vma_containing(vpn) else {
+            return FilePageFaultPrepare::NotHandled;
+        };
         if !area.is_user_accessible() || !area.allows_fault_access(access) {
-            return None;
+            return FilePageFaultPrepare::NotHandled;
         }
-        let file = area.file.as_ref()?;
+        let Some(file) = area.file.as_ref() else {
+            return FilePageFaultPrepare::NotHandled;
+        };
+        let Some(page_idx) = area.file_page_index(vpn) else {
+            return FilePageFaultPrepare::NotHandled;
+        };
+        let available_pages = area.end_vpn().0.saturating_sub(vpn.0);
+        let read_ahead_pages = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
+            file.fault_read_window(page_idx, access, available_pages)
+        } else {
+            1
+        };
         let plan = FilePageFaultPlan {
             vpn,
             vma_start: area.start_vpn(),
             vma_end: area.end_vpn(),
             map_perm: area.map_perm,
             file: Arc::clone(&file.file),
-            page_idx: area.file_page_index(vpn)?,
+            page_idx,
             pgoff: file.pgoff,
             shared: file.shared,
             access,
+            read_ahead_pages,
         };
         debug!(
             "[mmap] prepared lazy fault plan: va={:#x} vpn={:#x} page_idx={} access={:?} shared={} path={:?}",
@@ -1835,7 +2116,7 @@ impl MemorySet {
             plan.shared,
             plan.file.path()
         );
-        Some(plan)
+        FilePageFaultPrepare::Pending(plan)
     }
 
     /// 检查某个缺页计划在慢路径返回后是否仍然与当前地址空间匹配。
@@ -1870,6 +2151,10 @@ impl MemorySet {
         let map_perm = area.map_perm;
         let ppn: PhysPageNum = match map_type {
             MapType::Identical => PhysPageNum(vpn.0),
+            MapType::Direct => {
+                let va = usize::from(VirtAddr::from(vpn));
+                PhysAddr::from(crate::platform::direct_map_virt_to_phys(va)).floor()
+            }
             MapType::Framed => {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
                 let page = Arc::new(PrivatePage::new(frame));
@@ -1895,7 +2180,29 @@ impl MemorySet {
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
         let vpn = fault_va.floor();
-        if self.page_table.translate(vpn).is_some() {
+        if let Some(pte) = self.page_table.translate(vpn) {
+            let vma_allows = self
+                .find_vma_containing(vpn)
+                .is_some_and(|area| area.is_user_accessible() && area.allows_fault_access(access));
+            if vma_allows && Self::pte_allows_user_access(pte, access) {
+                // Another hart may have installed or relaxed this PTE after
+                // the current hart cached an invalid/restrictive translation.
+                // The in-memory PTE is already sufficient, so invalidate the
+                // local translation and retry the faulting instruction instead
+                // of incorrectly delivering SIGSEGV.
+                warn!(
+                    "[tlb] retry stale present user PTE: hart={} vpn={:#x} access={:?} \
+                     pte_bits={:#x} ppn={:#x} flags={:?}",
+                    crate::hal::hartid(),
+                    vpn.0,
+                    access,
+                    pte.bits,
+                    pte.ppn().0,
+                    pte.flags(),
+                );
+                self.flush_local_tlb_page_asid(fault_va.0);
+                return Ok(PageFaultHandled::Handled);
+            }
             return Ok(PageFaultHandled::NotHandled);
         }
         let Some(area) = self.find_vma_containing(vpn) else {
@@ -1905,9 +2212,11 @@ impl MemorySet {
             return Ok(PageFaultHandled::NotHandled);
         }
         self.map_private_page_in_vma(vpn)?;
-        unsafe {
-            crate::hal::flush_tlb();
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            record_private_anonymous_first_fault(access);
         }
+        self.flush_local_tlb_page_asid(fault_va.0);
         Ok(PageFaultHandled::Handled)
     }
 
@@ -1918,6 +2227,11 @@ impl MemorySet {
         page: Arc<SpinNoIrqLock<CachePage>>,
     ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
+            // Another hart installed the demand page after our lock-free
+            // prepare phase.  The current hart may still cache the invalid
+            // translation that caused this fault, so retry only after a local
+            // ASID fence.
+            self.flush_local_tlb_vpn_asid(plan.vpn);
             return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
@@ -1945,9 +2259,7 @@ impl MemorySet {
             release_mapped_page(&old_page);
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_vpn_asid(plan.vpn);
         debug!(
             "[mmap] committed MAP_SHARED fault: vpn={:#x} page_idx={} ppn={:#x} writable={} path={:?}",
             plan.vpn.0,
@@ -1957,6 +2269,86 @@ impl MemorySet {
             plan.file.path()
         );
         Ok(PageFaultHandled::Handled)
+    }
+
+    /// Install a bounded set of already-uptodate page-cache pages around a
+    /// read/execute fault.  The caller has performed the cache lookup without
+    /// holding the process lock; revalidate the original VMA before changing
+    /// any PTE, then populate all neighbours under one lock and one TLB flush.
+    pub fn map_file_cache_pages_around(
+        &mut self,
+        plan: &FilePageFaultPlan,
+        pages: Vec<(VirtPageNum, Arc<SpinNoIrqLock<CachePage>>)>,
+    ) -> Result<PageFaultHandled, MmError> {
+        if !matches!(plan.access, PageFaultAccess::Read | PageFaultAccess::Exec)
+            || (!plan.shared && plan.map_perm.contains(MapPermission::W))
+        {
+            return Ok(PageFaultHandled::NotHandled);
+        }
+        if !self.can_commit_file_page_fault(plan) {
+            return Ok(PageFaultHandled::NotHandled);
+        }
+
+        // Allocate every required intermediate page-table page before taking
+        // cache-page mapping references.  Once this succeeds, the commit loop
+        // cannot leave a half-installed batch due to page-table OOM.
+        for (vpn, _) in &pages {
+            if *vpn >= plan.vma_start
+                && *vpn < plan.vma_end
+                && self.page_table.translate(*vpn).is_none()
+            {
+                self.page_table.ensure_leaf(*vpn)?;
+            }
+        }
+
+        let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
+        if plan.shared {
+            if plan.map_perm.contains(MapPermission::W) {
+                pte_flags.remove(PTEFlags::W);
+            }
+        } else {
+            pte_flags.remove(PTEFlags::W);
+            pte_flags.remove(PTEFlags::D);
+        }
+
+        let mut mapped_fault_page = self.page_table.translate(plan.vpn).is_some();
+        let mut mapped_any = false;
+        let mut mapped_start = usize::MAX;
+        let mut mapped_end = 0usize;
+        for (vpn, page) in pages {
+            if vpn < plan.vma_start
+                || vpn >= plan.vma_end
+                || self.page_table.translate(vpn).is_some()
+            {
+                continue;
+            }
+            let ppn = page.lock().ppn();
+            retain_mapped_page(&page);
+            let area = self
+                .find_vma_containing_mut(vpn)
+                .expect("validated fault-around VMA disappeared");
+            if let Some(old_page) = area.direct_cache_pages.insert(vpn, Arc::clone(&page)) {
+                release_mapped_page(&old_page);
+            }
+            self.page_table.map(vpn, ppn, pte_flags)?;
+            mapped_any = true;
+            mapped_fault_page |= vpn == plan.vpn;
+            let page_start = VirtAddr::from(vpn).0;
+            mapped_start = mapped_start.min(page_start);
+            mapped_end = mapped_end.max(page_start + PAGE_SIZE);
+        }
+        if mapped_any {
+            self.flush_local_tlb_range_asid(mapped_start, mapped_end);
+        } else if mapped_fault_page {
+            // The demand page can have been installed concurrently after the
+            // prepare phase even when this fault-around batch added no page.
+            self.flush_local_tlb_vpn_asid(plan.vpn);
+        }
+        Ok(if mapped_fault_page {
+            PageFaultHandled::Handled
+        } else {
+            PageFaultHandled::NotHandled
+        })
     }
 
     /// 对当前地址空间内指定范围的 MAP_SHARED 文件映射执行同步。
@@ -1988,6 +2380,24 @@ impl MemorySet {
             let page_count = overlap_end.0 - overlap_start.0;
             let file_offset = (file.pgoff + start_idx) * PAGE_SIZE;
             let byte_len = page_count * PAGE_SIZE;
+
+            // A writable MAP_SHARED page normally becomes dirty on its first
+            // write-protection fault.  A file writer can, however, receive a
+            // writable PTE through a prior read/population fault and then
+            // modify it without another trap.  At teardown there is no later
+            // fault to repair the missed notification.  All pages that are
+            // actually present in a writable shared mapping are therefore
+            // conservatively flushed here.  Pages that were never faulted in
+            // are absent and are not touched.
+            if file.shared && area.map_perm.contains(MapPermission::W) {
+                for page in area
+                    .direct_cache_pages
+                    .range(overlap_start..overlap_end)
+                    .map(|(_, page)| page)
+                {
+                    mark_cached_page_dirty(page);
+                }
+            }
             sync_inode_range(&inode, file_offset, byte_len)?;
         }
 
@@ -2022,10 +2432,8 @@ impl MemorySet {
             release_mapped_page(&old_page);
         }
         self.page_table.map(plan.vpn, ppn, pte_flags)?;
-        unsafe {
-            crate::hal::flush_tlb();
-        }
-        debug!(
+        self.flush_local_tlb_vpn_asid(plan.vpn);
+        trace!(
             "[cow] install MAP_PRIVATE readonly cache page: vpn={:#x} page_idx={} ppn={:#x} access={:?} path={:?}",
             plan.vpn.0,
             plan.page_idx,
@@ -2070,9 +2478,7 @@ impl MemorySet {
         }
         // 首次写 fault 时立即把 page cache 页记脏，避免等待 teardown 才传播脏状态。
         mark_cached_page_dirty(&page);
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_vpn_asid(vpn);
         debug!(
             "[mmap] shared write-notify fault: vpn={:#x} ppn={:#x} path={:?}",
             vpn.0,
@@ -2095,7 +2501,7 @@ impl MemorySet {
         if pte.writable() {
             // 可能是其他 hart 已经把该页从 COW 只读状态放宽为可写，
             // 当前 hart 仍命中了陈旧的只读 TLB。刷新本地后让用户态重试。
-            self.finish_deferred_page_table_edit();
+            self.flush_local_tlb_vpn_asid(vpn);
             return Ok((PageFaultHandled::Handled, Some(batch)));
         }
         let file_private_cache_page = {
@@ -2136,8 +2542,8 @@ impl MemorySet {
             if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
-            self.finish_deferred_page_table_edit();
-            debug!(
+            self.flush_local_tlb_vpn_asid(vpn);
+            trace!(
                 "[cow] materialize MAP_PRIVATE page on write fault: vpn={:#x} cache_ppn={:#x} new_ppn={:#x} path={:?}",
                 vpn.0,
                 cache_page.lock().ppn().0,
@@ -2183,8 +2589,8 @@ impl MemorySet {
             if !self.page_table.update_flags(vpn, writable_flags) {
                 return Ok((PageFaultHandled::NotHandled, None));
             }
-            self.finish_deferred_page_table_edit();
-            debug!(
+            self.flush_local_tlb_vpn_asid(vpn);
+            trace!(
                 "[cow] reuse exclusive private page: vpn={:#x} ppn={:#x} path={:?}",
                 vpn.0,
                 page.ppn().0,
@@ -2209,8 +2615,8 @@ impl MemorySet {
         if !self.page_table.replace(vpn, new_page.ppn(), writable_flags) {
             return Ok((PageFaultHandled::NotHandled, None));
         }
-        self.finish_deferred_page_table_edit();
-        debug!(
+        self.flush_local_tlb_vpn_asid(vpn);
+        trace!(
             "[cow] copy private page on write fault: vpn={:#x} old_ppn={:#x} new_ppn={:#x} path={:?}",
             vpn.0,
             page.ppn().0,
@@ -2227,6 +2633,9 @@ impl MemorySet {
         page: Arc<SpinNoIrqLock<CachePage>>,
     ) -> Result<PageFaultHandled, MmError> {
         if self.page_table.translate(plan.vpn).is_some() {
+            // A concurrent fault resolved this page after prepare.  Discard
+            // the current hart's stale invalid translation before retrying.
+            self.flush_local_tlb_vpn_asid(plan.vpn);
             return Ok(PageFaultHandled::Handled);
         }
         if !self.can_commit_file_page_fault(plan) {
@@ -2247,10 +2656,8 @@ impl MemorySet {
         let page_guard = page.lock();
         let src = page_guard.ppn().get_bytes_array();
         dst.copy_from_slice(src);
-        unsafe {
-            crate::hal::flush_tlb();
-        }
-        debug!(
+        self.flush_local_tlb_vpn_asid(plan.vpn);
+        trace!(
             "[cow] materialize MAP_PRIVATE page on first write fault: vpn={:#x} page_idx={} dst_ppn={:#x} path={:?}",
             plan.vpn.0,
             plan.page_idx,
@@ -2343,9 +2750,7 @@ impl MemorySet {
         for key in changed_keys {
             self.merge_vma_around(key);
         }
-        unsafe {
-            crate::hal::flush_tlb();
-        }
+        self.flush_local_tlb_range_asid(start_va.0, end_va.0);
         true
     }
 }
@@ -2380,7 +2785,6 @@ pub enum VmaKind {
 }
 
 /// 文件映射区域附带的底层对象信息。
-#[derive(Clone)]
 pub struct FileVma {
     /// 建立映射时引用的打开文件描述。
     pub file: Arc<FileDescription>,
@@ -2388,6 +2792,59 @@ pub struct FileVma {
     pub pgoff: usize,
     /// 是否为 `MAP_SHARED` 映射。
     pub shared: bool,
+    /// 当前 VMA 自己的 fault readahead 流状态。VMA 分裂和 fork 时复制
+    /// 状态快照，与同一文件上的其他独立 mmap 流互不干扰。
+    fault_read_ahead: Arc<SpinNoIrqLock<FileVmaReadAheadState>>,
+}
+
+impl Clone for FileVma {
+    fn clone(&self) -> Self {
+        let fault_read_ahead = *self.fault_read_ahead.lock();
+        Self {
+            file: Arc::clone(&self.file),
+            pgoff: self.pgoff,
+            shared: self.shared,
+            fault_read_ahead: Arc::new(SpinNoIrqLock::new(fault_read_ahead)),
+        }
+    }
+}
+
+const FILE_FAULT_READAHEAD_PAGES: usize = 32;
+const FILE_RANDOM_EXEC_READAHEAD_PAGES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FileVmaReadAheadState {
+    previous_fault_page: Option<u64>,
+    window_end: u64,
+}
+
+impl FileVma {
+    fn fault_read_window(
+        &self,
+        page_idx: u64,
+        access: PageFaultAccess,
+        available_pages: usize,
+    ) -> usize {
+        let mut state = self.fault_read_ahead.lock();
+        let begins_mapping = page_idx == self.pgoff as u64;
+        let adjacent = state
+            .previous_fault_page
+            .is_some_and(|previous| page_idx == previous.saturating_add(1));
+        let extends_window = page_idx == state.window_end;
+        let sequential = begins_mapping || adjacent || extends_window;
+        state.previous_fault_page = Some(page_idx);
+        let desired_pages = if sequential {
+            FILE_FAULT_READAHEAD_PAGES
+        } else if access == PageFaultAccess::Exec {
+            FILE_RANDOM_EXEC_READAHEAD_PAGES
+        } else {
+            return 1;
+        };
+
+        let count = desired_pages.min(available_pages).max(1);
+        state.window_end = page_idx.saturating_add(count as u64);
+        count
+    }
 }
 
 /// 页错误对应的访问类型。
@@ -2399,6 +2856,16 @@ pub enum PageFaultAccess {
     Write,
     /// 指令取值缺页。
     Exec,
+}
+
+/// Result of checking a file-backed page fault while the process MM lock is held.
+pub enum FilePageFaultPrepare {
+    /// A compatible resident PTE already resolves the fault after a local flush.
+    Resolved,
+    /// The page is absent and must be loaded through the file/page-cache slow path.
+    Pending(FilePageFaultPlan),
+    /// The address is not a compatible file-backed user mapping.
+    NotHandled,
 }
 
 /// file-backed 缺页在锁外执行慢路径时携带的最小计划。
@@ -2422,6 +2889,8 @@ pub struct FilePageFaultPlan {
     pub shared: bool,
     /// 触发本次缺页的访问类型。
     pub access: PageFaultAccess,
+    /// 本次 fault 应同步装入的向前页窗口。
+    pub read_ahead_pages: usize,
 }
 
 /// 一张可在多个地址空间之间共享的私有页。
@@ -2592,6 +3061,7 @@ impl Vma {
             file,
             pgoff,
             shared,
+            fault_read_ahead: Arc::new(SpinNoIrqLock::new(FileVmaReadAheadState::default())),
         });
         vma
     }
@@ -2631,6 +3101,13 @@ impl Vma {
     /// 判断当前区域是否表示某个线程的 Trap 上下文页。
     pub fn is_trap_context(&self) -> bool {
         matches!(self.kind, VmaKind::TrapContext { .. })
+    }
+    /// Whether this VMA is a relocatable mmap-style user mapping.
+    pub fn supports_mremap(&self) -> bool {
+        matches!(
+            &self.kind,
+            VmaKind::Anonymous | VmaKind::SharedAnonymous | VmaKind::File
+        )
     }
     /// 返回区域覆盖的字节长度。
     pub fn byte_len(&self) -> usize {
@@ -2741,14 +3218,41 @@ impl Vma {
         vpn: VirtPageNum,
         batch: &mut UserReleaseBatch,
     ) {
+        self.unmap_present_one_deferred_inner(page_table, vpn, batch, true);
+    }
+
+    /// Remove a file mapping after truncate has committed.
+    ///
+    /// Bytes beyond the new EOF are intentionally discarded, so a dirty PTE
+    /// must not re-dirty a cache page that `page_cache::truncate_mapping()` may
+    /// already have removed from the mapping.
+    pub(crate) fn unmap_present_one_deferred_after_truncate(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        batch: &mut UserReleaseBatch,
+    ) {
+        self.unmap_present_one_deferred_inner(page_table, vpn, batch, false);
+    }
+
+    fn unmap_present_one_deferred_inner(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        batch: &mut UserReleaseBatch,
+        mark_shared_dirty: bool,
+    ) {
         if let Some(page) = self.direct_cache_pages.remove(&vpn) {
             let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
-            debug!(
+            trace!(
                 "[munmap] defer file cache mapping release: vpn={:#x} shared={}",
                 vpn.0, shared_file_mapping
             );
             if let Some(old_pte) = page_table.clear(vpn) {
-                if shared_file_mapping && old_pte.flags().contains(PTEFlags::D) {
+                if mark_shared_dirty
+                    && shared_file_mapping
+                    && old_pte.flags().contains(PTEFlags::D)
+                {
                     mark_cached_page_dirty(&page);
                 }
             }
@@ -2793,7 +3297,7 @@ impl Vma {
         for vpn in framed_vpns {
             self.unmap_present_one_deferred(page_table, vpn, batch);
         }
-        if self.map_type == MapType::Identical {
+        if matches!(self.map_type, MapType::Identical | MapType::Direct) {
             for vpn in self.vpn_range {
                 let _ = page_table.clear(vpn);
             }
@@ -2831,7 +3335,7 @@ impl Vma {
             };
             frames.push(page.into_frame());
         }
-        if self.map_type == MapType::Identical {
+        if matches!(self.map_type, MapType::Identical | MapType::Direct) {
             for vpn in self.vpn_range {
                 let _ = page_table.clear(vpn);
             }
@@ -2844,6 +3348,10 @@ impl Vma {
         match self.map_type {
             MapType::Identical => {
                 ppn = PhysPageNum(vpn.0);
+            }
+            MapType::Direct => {
+                let va = usize::from(VirtAddr::from(vpn));
+                ppn = PhysAddr::from(crate::platform::direct_map_virt_to_phys(va)).floor();
             }
             MapType::Framed => {
                 let page = Arc::new(PrivatePage::new(
@@ -2896,11 +3404,40 @@ impl Vma {
     #[allow(unused)]
     /// 将当前区域向高地址扩展到新的上界，并补齐新增页映射。
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
-        for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
-            self.map_one(page_table, vpn)
-                .expect("failed to append eagerly mapped VMA");
+        self.append_to_checked(page_table, new_end)
+            .expect("failed to append eagerly mapped VMA");
+    }
+
+    /// Extend an eagerly mapped VMA, rolling back newly mapped pages on error.
+    pub fn append_to_checked(
+        &mut self,
+        page_table: &mut PageTable,
+        new_end: VirtPageNum,
+    ) -> Result<(), MmError> {
+        let old_end = self.vpn_range.get_end();
+        if new_end <= old_end {
+            return Ok(());
+        }
+
+        let mut mapped = Vec::new();
+        for vpn in VPNRange::new(old_end, new_end) {
+            if page_table.translate(vpn).is_some() {
+                for rollback_vpn in mapped {
+                    self.unmap_present_one(page_table, rollback_vpn);
+                }
+                return Err(MmError::Conflict);
+            }
+            if let Err(err) = self.map_one(page_table, vpn) {
+                self.unmap_present_one(page_table, vpn);
+                for rollback_vpn in mapped {
+                    self.unmap_present_one(page_table, rollback_vpn);
+                }
+                return Err(err);
+            }
+            mapped.push(vpn);
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        Ok(())
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
@@ -2929,6 +3466,8 @@ impl Vma {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum MapType {
     Identical,
+    /// Platform kernel direct-map VA translated back to its physical page.
+    Direct,
     Framed,
 }
 

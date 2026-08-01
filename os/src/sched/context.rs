@@ -10,7 +10,10 @@ pub struct TaskContext {
     sp: usize,
     /// s0-11 register, callee saved
     s: [usize; 12],
-    /// fs0-11 register, callee saved
+    /// Architecture-reserved FP callee-save area.
+    ///
+    /// This preserves kernel hard-float ABI state across task switches; user
+    /// FP state remains independently owned by the user trap frame.
     fs: [usize; 12],
 }
 

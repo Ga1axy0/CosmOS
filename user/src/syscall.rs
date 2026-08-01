@@ -14,6 +14,7 @@ pub const SYSCALL_FSTATFS64: usize = 44;
 pub const SYSCALL_TRUNCATE: usize = 45;
 pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_CHDIR: usize = 49;
+pub const SYSCALL_FCHDIR: usize = 50;
 pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
 pub const SYSCALL_PIPE: usize = 59;
@@ -23,6 +24,7 @@ pub const SYSCALL_READ: usize = 63;
 pub const SYSCALL_WRITE: usize = 64;
 pub const SYSCALL_PREAD64: usize = 67;
 pub const SYSCALL_PWRITE64: usize = 68;
+pub const SYSCALL_PPOLL_TIME32: usize = 73;
 pub const SYSCALL_READLINKAT: usize = 78;
 pub const SYSCALL_NEWFSTATAT: usize = 79;
 pub const SYSCALL_FSTAT: usize = 80;
@@ -69,6 +71,8 @@ pub const SYSCALL_GETSOCKNAME: usize = 204;
 pub const SYSCALL_GETPEERNAME: usize = 205;
 pub const SYSCALL_SENDTO: usize = 206;
 pub const SYSCALL_RECVFROM: usize = 207;
+pub const SYSCALL_SETSOCKOPT: usize = 208;
+pub const SYSCALL_GETSOCKOPT: usize = 209;
 pub const SYSCALL_SHUTDOWN: usize = 210;
 pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
@@ -78,6 +82,7 @@ pub const SYSCALL_CLONE3: usize = 435;
 pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
 pub const SYSCALL_RENAMEAT2: usize = 276;
+pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 pub const SYSCALL_BRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
 pub const SYSCALL_MMAP: usize = 222;
@@ -112,6 +117,21 @@ pub struct Clone3Args {
     pub set_tid: u64,
     pub set_tid_size: u64,
     pub cgroup: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OldTimespec32 {
+    pub tv_sec: i32,
+    pub tv_nsec: i32,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -546,6 +566,39 @@ pub fn sys_shutdown(fd: usize, how: usize) -> isize {
     syscall(SYSCALL_SHUTDOWN, [fd, how, 0])
 }
 
+pub fn sys_setsockopt(
+    fd: usize,
+    level: i32,
+    optname: i32,
+    optval: *const u8,
+    optlen: usize,
+) -> isize {
+    syscall6(
+        SYSCALL_SETSOCKOPT,
+        [fd, level as usize, optname as usize, optval as usize, optlen, 0],
+    )
+}
+
+pub fn sys_getsockopt(
+    fd: usize,
+    level: i32,
+    optname: i32,
+    optval: *mut u8,
+    optlen: *mut i32,
+) -> isize {
+    syscall6(
+        SYSCALL_GETSOCKOPT,
+        [
+            fd,
+            level as usize,
+            optname as usize,
+            optval as usize,
+            optlen as usize,
+            0,
+        ],
+    )
+}
+
 pub fn sys_sendmsg(fd: usize, msg: *const crate::net::MsgHdr, flags: usize) -> isize {
     syscall(SYSCALL_SENDMSG, [fd, msg as usize, flags])
 }
@@ -656,6 +709,21 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: i32) -> isize {
 
 pub fn sys_pipe(pipe: &mut [i32]) -> isize {
     syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0])
+}
+
+pub fn sys_ppoll_time32(fds: &mut [PollFd], timeout: Option<&OldTimespec32>) -> isize {
+    let timeout_ptr = timeout.map_or(core::ptr::null(), |value| value as *const _);
+    syscall6(
+        SYSCALL_PPOLL_TIME32,
+        [
+            fds.as_mut_ptr() as usize,
+            fds.len(),
+            timeout_ptr as usize,
+            0,
+            0,
+            0,
+        ],
+    )
 }
 
 pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
@@ -771,6 +839,31 @@ pub fn sys_mkdirat(dirfd: usize, path: &str, mode: u32) -> isize {
 
 pub fn sys_chdir(path: &str) -> isize {
     syscall(SYSCALL_CHDIR, [path.as_ptr() as usize, 0, 0])
+}
+
+pub fn sys_fchdir(fd: usize) -> isize {
+    syscall(SYSCALL_FCHDIR, [fd, 0, 0])
+}
+
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> isize {
+    syscall6(
+        SYSCALL_COPY_FILE_RANGE,
+        [
+            fd_in,
+            off_in as usize,
+            fd_out,
+            off_out as usize,
+            len,
+            flags as usize,
+        ],
+    )
 }
 
 pub fn sys_getdents64(fd: usize, buffer: &mut [u8]) -> isize {

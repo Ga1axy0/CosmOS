@@ -12,6 +12,12 @@ pub struct BlockWrite<'a> {
     pub data: &'a [u8],
 }
 
+/// A contiguous 512-byte-block read request.
+pub struct BlockRead<'a> {
+    pub start_block: usize,
+    pub data: &'a mut [u8],
+}
+
 pub trait BlockDevice: Send + Sync + Any {
     /// Return this block device as `Any` for downcasting.
     fn as_any(&self) -> &dyn Any;
@@ -38,6 +44,18 @@ pub trait BlockDevice: Send + Sync + Any {
         for write in writes {
             if !write.data.is_empty() {
                 self.write_blocks(write.start_block, write.data);
+            }
+        }
+    }
+
+    /// Read multiple independent contiguous ranges.
+    ///
+    /// Devices with a request queue should override this to submit several
+    /// requests before waiting for completions.
+    fn read_blocks_many(&self, reads: &mut [BlockRead<'_>]) {
+        for read in reads {
+            if !read.data.is_empty() {
+                self.read_blocks(read.start_block, read.data);
             }
         }
     }

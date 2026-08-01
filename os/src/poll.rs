@@ -10,8 +10,14 @@
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::task::{TaskControlBlock, WaitQueueKeyed, WaitReason};
+#[cfg(feature = "io_perf_counters")]
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(feature = "io_perf_counters")]
+use core::fmt::Write;
+#[cfg(feature = "io_perf_counters")]
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 
 /// Readable event bit.
@@ -25,6 +31,139 @@ pub(crate) const POLLHUP: u16 = 0x010;
 
 const MAX_KERNEL_FD: usize = 128;
 const MAX_POLL_KEYS: usize = 128;
+
+#[cfg(feature = "io_perf_counters")]
+static PERF_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_SCANNED_FDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_READY_FDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_NOTIFY_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_REGISTRY_LOCK_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_REGISTRY_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "io_perf_counters")]
+static PERF_REGISTRY_LOCK_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+fn perf_inc(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+fn perf_add(counter: &AtomicU64, value: u64) {
+    counter.fetch_add(value, Ordering::Relaxed);
+}
+
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+fn perf_update_max(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
+}
+
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+fn record_registry_lock_wait(start_ns: u64) {
+    let wait_ns = crate::timer::get_time_ns().saturating_sub(start_ns);
+    perf_inc(&PERF_REGISTRY_LOCK_ACQUIRES);
+    perf_add(&PERF_REGISTRY_LOCK_WAIT_NS, wait_ns);
+    perf_update_max(&PERF_REGISTRY_LOCK_WAIT_MAX_NS, wait_ns);
+}
+
+macro_rules! lock_poll_registry {
+    () => {{
+        #[cfg(feature = "io_perf_counters")]
+        let start_ns = crate::timer::get_time_ns();
+        let guard = POLL_REGISTRY.lock();
+        #[cfg(feature = "io_perf_counters")]
+        record_registry_lock_wait(start_ns);
+        guard
+    }};
+}
+
+/// Record one complete readiness scan over a userspace poll set.
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+pub(crate) fn record_scan(scanned_fds: usize, ready_fds: usize) {
+    perf_inc(&PERF_SCAN_CALLS);
+    perf_add(&PERF_SCANNED_FDS, scanned_fds as u64);
+    perf_add(&PERF_READY_FDS, ready_fds as u64);
+}
+
+/// Compile out poll scan accounting when I/O counters are disabled.
+#[cfg(not(feature = "io_perf_counters"))]
+#[inline]
+pub(crate) fn record_scan(_scanned_fds: usize, _ready_fds: usize) {}
+
+/// Record one registration-capacity fallback iteration.
+#[cfg(feature = "io_perf_counters")]
+#[inline]
+pub(crate) fn record_fallback() {
+    perf_inc(&PERF_FALLBACK_COUNT);
+}
+
+/// Compile out fallback accounting when I/O counters are disabled.
+#[cfg(not(feature = "io_perf_counters"))]
+#[inline]
+pub(crate) fn record_fallback() {}
+
+/// Reset all poll/ppoll performance counters.
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn reset_perf_counters() {
+    for counter in [
+        &PERF_SCAN_CALLS,
+        &PERF_SCANNED_FDS,
+        &PERF_READY_FDS,
+        &PERF_FALLBACK_COUNT,
+        &PERF_NOTIFY_CALLS,
+        &PERF_REGISTRY_LOCK_ACQUIRES,
+        &PERF_REGISTRY_LOCK_WAIT_NS,
+        &PERF_REGISTRY_LOCK_WAIT_MAX_NS,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Render poll/ppoll performance counters for `/proc/io_perf`.
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn render_perf_counters() -> String {
+    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    let lock_acquires = load(&PERF_REGISTRY_LOCK_ACQUIRES);
+    let lock_wait_ns = load(&PERF_REGISTRY_LOCK_WAIT_NS);
+    let lock_wait_avg_ns = if lock_acquires == 0 {
+        0
+    } else {
+        lock_wait_ns / lock_acquires
+    };
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "poll:");
+    let _ = writeln!(&mut out, "  scan_calls {}", load(&PERF_SCAN_CALLS));
+    let _ = writeln!(&mut out, "  scanned_fds {}", load(&PERF_SCANNED_FDS));
+    let _ = writeln!(&mut out, "  ready_fds {}", load(&PERF_READY_FDS));
+    let _ = writeln!(&mut out, "  fallback_count {}", load(&PERF_FALLBACK_COUNT));
+    let _ = writeln!(&mut out, "  notify_calls {}", load(&PERF_NOTIFY_CALLS));
+    let _ = writeln!(&mut out, "  registry_lock_acquires {}", lock_acquires);
+    let _ = writeln!(&mut out, "  registry_lock_wait_ns {}", lock_wait_ns);
+    let _ = writeln!(&mut out, "  registry_lock_wait_avg_ns {}", lock_wait_avg_ns);
+    let _ = writeln!(
+        &mut out,
+        "  registry_lock_wait_max_ns {}",
+        load(&PERF_REGISTRY_LOCK_WAIT_MAX_NS)
+    );
+    out
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PollKeyState {
@@ -293,7 +432,7 @@ pub(crate) fn register_poll_wait(
     interests: &[(usize, usize, u16)],
 ) -> Result<PollWaitHandle, ERRNO> {
     let task_ptr = Arc::as_ptr(task) as usize;
-    let mut registry = POLL_REGISTRY.lock();
+    let mut registry = lock_poll_registry!();
     let handle = registry.alloc_key(task_ptr, pid)?;
     let key_idx = handle.key_idx as usize;
     let key_bit = key_bit(key_idx);
@@ -324,12 +463,12 @@ pub(crate) fn register_poll_wait(
 
 /// Remove all bitmap registrations bound to this wait key and free the key slot.
 pub(crate) fn cleanup_poll_wait(handle: PollWaitHandle) {
-    POLL_REGISTRY.lock().cleanup_key(handle);
+    lock_poll_registry!().cleanup_key(handle);
 }
 
 /// Check whether wait should be skipped because key has already been triggered.
 pub(crate) fn poll_wait_should_skip(handle: PollWaitHandle) -> bool {
-    let registry = POLL_REGISTRY.lock();
+    let registry = lock_poll_registry!();
     if !registry.key_valid(handle) {
         return true;
     }
@@ -339,7 +478,7 @@ pub(crate) fn poll_wait_should_skip(handle: PollWaitHandle) -> bool {
 
 /// Query current wake state for this wait key.
 pub(crate) fn poll_wait_state(handle: PollWaitHandle) -> PollWakeState {
-    let registry = POLL_REGISTRY.lock();
+    let registry = lock_poll_registry!();
     if !registry.key_valid(handle) {
         return PollWakeState::Canceled;
     }
@@ -362,9 +501,11 @@ pub(crate) fn wait_poll_key(handle: PollWaitHandle) {
 /// Notify readiness for a source id and wake interested wait keys.
 pub(crate) fn notify_poll_source(source_id: usize, ready_mask: u16) {
     // debug!("notify_poll_source: source_id={}, ready_mask={:#x}", source_id, ready_mask);
+    #[cfg(feature = "io_perf_counters")]
+    perf_inc(&PERF_NOTIFY_CALLS);
     let mut wait_keys = Vec::new();
     {
-        let mut registry = POLL_REGISTRY.lock();
+        let mut registry = lock_poll_registry!();
         let mut wake_bits = 0u128;
 
         for row in 0..MAX_KERNEL_FD {
@@ -401,6 +542,10 @@ pub(crate) fn notify_poll_source(source_id: usize, ready_mask: u16) {
     for key in wait_keys {
         POLL_WAIT_QUEUE.wake_selected(key);
     }
+
+    // Persistent epoll subscriptions are indexed by source id and therefore
+    // do not participate in the transient poll registry's full row scan.
+    crate::fs::epoll::notify_source(source_id, ready_mask);
 }
 
 /// Notify pending signal delivery for a process and wake all active poll waiters of that pid.
@@ -408,7 +553,7 @@ pub(crate) fn notify_poll_signal_pid(pid: usize) {
     debug!("notify_poll_signal_pid: pid={}", pid);
     let mut wait_keys = Vec::new();
     {
-        let mut registry = POLL_REGISTRY.lock();
+        let mut registry = lock_poll_registry!();
         for key_idx in 0..MAX_POLL_KEYS {
             let slot = &mut registry.key_slots[key_idx];
             if slot.owner_pid != pid || !matches!(slot.state, PollKeyState::Active) {
@@ -427,7 +572,7 @@ pub(crate) fn notify_poll_signal_pid(pid: usize) {
 /// Check whether a task currently has an in-flight keyed poll wait entry.
 pub(crate) fn task_has_inflight_keyed_poll_wait(task: &Arc<TaskControlBlock>) -> bool {
     let task_ptr = Arc::as_ptr(task) as usize;
-    let registry = POLL_REGISTRY.lock();
+    let registry = lock_poll_registry!();
     registry
         .key_slots
         .iter()
@@ -443,7 +588,7 @@ pub(crate) fn handle_poll_timeout(tag: PollTimerTag, task: &Arc<TaskControlBlock
         key_generation: tag.key_generation,
     };
     let wait_key = {
-        let mut registry = POLL_REGISTRY.lock();
+        let mut registry = lock_poll_registry!();
         if !registry.key_valid(handle) {
             return true;
         }

@@ -1,15 +1,18 @@
 use crate::fs::devfs::BlockDevNode;
+use crate::fs::epoll::{EpollEvent, EpollFile, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
+use crate::fs::EventFdFile;
 use crate::fs::Pipe;
 use crate::fs::{
-    canonicalize, discard_inode, do_bind_mount, do_move_mount, do_umount, inode_stat,
-    linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
-    make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
-    mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
-    rename_at, symlinkat, sync_page_cache_all, sync_page_cache_fs, truncate_inode, unlinkat,
-    AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags, Stat, StatFs64,
-    StatMode, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    canonicalize, do_bind_mount, do_move_mount, do_umount, inode_stat, linkat_with_flags,
+    lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, make_pipe,
+    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
+    open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path, rename_at,
+    symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all, truncate_inode,
+    unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime,
+    OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode,
+    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
-use crate::mm::{translated_byte_buffer, translated_str, PageFaultAccess, UserBuffer};
+use crate::mm::{translated_byte_buffer, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
 use crate::poll::{self, PollWakeState};
 use crate::sched::block_current_and_run_next;
@@ -483,6 +486,34 @@ fn alloc_anonymous_fd_with_bits(
         AccessMode::ReadWrite,
         status_flags,
         status_fixed_bits,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    let mut entry = FdEntry::new(desc);
+    if cloexec {
+        entry.flags |= FdFlags::CLOEXEC;
+    }
+    inner.fd_table[fd] = Some(entry);
+    Ok(fd as isize)
+}
+
+fn alloc_eventfd(
+    initval: u32,
+    status_flags: FileStatusFlags,
+    cloexec: bool,
+    semaphore: bool,
+) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        Arc::new(EventFdFile::new(
+            initval,
+            semaphore,
+            status_flags.contains(FileStatusFlags::NONBLOCK),
+        )),
+        AccessMode::ReadWrite,
+        status_flags,
+        0,
     ));
 
     let process = current_process();
@@ -1184,11 +1215,16 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
         }
     }
 
+    drop(inner);
+    poll::record_scan(pollfds.len(), ready_cnt);
     ready_cnt
 }
 
 fn has_unmasked_pending_signal() -> bool {
     let task = current_task().unwrap();
+    if !task.signal_work_pending() {
+        return false;
+    }
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
@@ -1196,13 +1232,11 @@ fn has_unmasked_pending_signal() -> bool {
     let pending = (thread_pending | process_inner.pending_signals)
         & !task_inner.signal_mask.without_unblockable();
 
-    for signum in 1..=crate::task::MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if !pending.contains(flag) {
-            continue;
-        }
+    let mut remaining = pending;
+    while !remaining.is_empty() {
+        let signum = remaining.bits().trailing_zeros() as usize + 1;
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
 
         let from_thread = thread_pending.contains(flag);
         let action = process_inner.signal_actions.table[signum];
@@ -1225,6 +1259,12 @@ fn has_unmasked_pending_signal() -> bool {
         return true;
     }
 
+    task.set_signal_work_pending(crate::signal::signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
     false
 }
 
@@ -1280,12 +1320,15 @@ fn apply_temp_signal_mask(
     let mut inner = task.inner_exclusive_access();
     let old = inner.signal_mask;
     inner.signal_mask = new_mask;
+    task.mark_signal_work_pending();
     Ok(Some(old))
 }
 
 fn restore_temp_signal_mask(old_mask: Option<SignalBit>) {
     if let Some(old) = old_mask {
-        current_task().unwrap().inner_exclusive_access().signal_mask = old;
+        let task = current_task().unwrap();
+        task.inner_exclusive_access().signal_mask = old;
+        task.mark_signal_work_pending();
     }
 }
 
@@ -1336,6 +1379,7 @@ where
         let handle = match poll::register_poll_wait(pid, &task, &interests) {
             Ok(handle) => handle,
             Err(ERRNO::ENOSPC) => {
+                poll::record_fallback();
                 // 回退路径：全局 poll 键/行耗尽时，短周期睡眠后重新扫描 fd 集，
                 // 避免直接失败，同时不引入忙等。
                 let sleep_until_ns = if let Some(deadline_ns) = deadline_ns {
@@ -1359,6 +1403,39 @@ where
             }
             Err(e) => return Err(e),
         };
+
+        // Close the readiness-notification race between the first fd scan and
+        // registering this poll key:
+        //
+        // 1. the first scan observes no readiness;
+        // 2. a producer makes an fd ready and notifies before registration;
+        // 3. no registered key records that notification;
+        // 4. the producer blocks (for example, after filling a pipe);
+        // 5. the poller would otherwise sleep forever waiting for a new edge.
+        //
+        // Once the key is registered, scan the level-triggered fd state again.
+        // Notifications after this scan are safe: they mark the key Ready, and
+        // wait_poll_key() rechecks that state after enqueueing the task.
+        let ready = scan_pollfds(pollfds);
+        if let Err(e) = write_back(pollfds) {
+            poll::cleanup_poll_wait(handle);
+            return Err(e);
+        }
+        if ready > 0 {
+            poll::cleanup_poll_wait(handle);
+            return Ok(ready as isize);
+        }
+        if has_unmasked_pending_signal() {
+            poll::cleanup_poll_wait(handle);
+            return Err(ERRNO::EINTR);
+        }
+        if let Some(deadline_ns) = deadline_ns {
+            if get_time_ns() >= deadline_ns {
+                poll::cleanup_poll_wait(handle);
+                return Ok(0);
+            }
+        }
+
         if let Some(deadline_ns) = deadline_ns {
             add_timer_with_poll_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
         }
@@ -1973,7 +2050,14 @@ const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+const F_GETLK: i32 = 5;
+const F_SETLK: i32 = 6;
+const F_SETLKW: i32 = 7;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+const SEEK_SET: i16 = 0;
 
 const F_OK: i32 = 0;
 const X_OK: i32 = 1;
@@ -2157,6 +2241,84 @@ impl FcntlFdFlag {
     const ALL_BITS: i32 = Self::Cloexec as i32;
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Flock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+impl Pod for Flock {}
+
+fn flock_type_from_abi(lock_type: i16) -> Result<PosixLockType, ERRNO> {
+    match lock_type {
+        F_RDLCK => Ok(PosixLockType::Read),
+        F_WRLCK => Ok(PosixLockType::Write),
+        F_UNLCK => Ok(PosixLockType::Unlock),
+        _ => Err(ERRNO::EINVAL),
+    }
+}
+
+fn flock_type_to_abi(lock_type: PosixLockType) -> i16 {
+    match lock_type {
+        PosixLockType::Read => F_RDLCK,
+        PosixLockType::Write => F_WRLCK,
+        PosixLockType::Unlock => F_UNLCK,
+    }
+}
+
+fn flock_range_from_abi(lock: &Flock) -> Result<PosixLockRange, ERRNO> {
+    if lock.l_whence != SEEK_SET {
+        return Err(ERRNO::EINVAL);
+    }
+    if lock.l_start < 0 || lock.l_len < 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    let start = lock.l_start as u64;
+    let len = if lock.l_len == 0 {
+        None
+    } else {
+        let len = lock.l_len as u64;
+        start.checked_add(len).ok_or(ERRNO::EINVAL)?;
+        Some(len)
+    };
+    Ok(PosixLockRange { start, len })
+}
+
+fn write_flock_conflict(
+    lock: &mut Flock,
+    conflict: Option<PosixLockConflict>,
+) -> Result<(), ERRNO> {
+    if let Some(conflict) = conflict {
+        lock.l_type = flock_type_to_abi(conflict.lock_type);
+        lock.l_whence = SEEK_SET;
+        lock.l_start = i64::try_from(conflict.range.start).map_err(|_| ERRNO::EINVAL)?;
+        lock.l_len = match conflict.range.len {
+            Some(len) => i64::try_from(len).map_err(|_| ERRNO::EINVAL)?,
+            None => 0,
+        };
+        lock.l_pid = i32::try_from(conflict.owner_pid).map_err(|_| ERRNO::EINVAL)?;
+    } else {
+        lock.l_type = F_UNLCK;
+        lock.l_pid = 0;
+    }
+    Ok(())
+}
+
+fn validate_fcntl_lock_access(
+    desc: &FileDescription,
+    lock_type: PosixLockType,
+) -> Result<(), ERRNO> {
+    match lock_type {
+        PosixLockType::Read if !desc.readable() => Err(ERRNO::EBADF),
+        PosixLockType::Write if !desc.writable() => Err(ERRNO::EBADF),
+        _ => Ok(()),
+    }
+}
+
 /// 过滤并校验 `openat` 的路径打开语义位。
 fn filter_open_flags(flags: i32) -> Result<OpenFileState, ERRNO> {
     const O_APPEND: i32 = FileStatusFlags::APPEND.bits();
@@ -2268,10 +2430,7 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 }
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
                 let new_fd = inner.alloc_fd_from(min_fd as usize)?;
-                inner.fd_table[new_fd] = Some(FdEntry {
-                    desc,
-                    flags: FdFlags::empty(),
-                });
+                inner.fd_table[new_fd] = Some(FdEntry::with_flags(desc, FdFlags::empty()));
                 Ok(new_fd as isize)
             }
             F_GETFL => {
@@ -2293,11 +2452,36 @@ pub fn sys_fcntl(fd: u32, cmd: i32, arg: usize) -> isize {
                 }
                 let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
                 let new_fd = inner.alloc_fd_from(min_fd as usize)?;
-                inner.fd_table[new_fd] = Some(FdEntry {
-                    desc,
-                    flags: FdFlags::CLOEXEC,
-                });
+                inner.fd_table[new_fd] = Some(FdEntry::with_flags(desc, FdFlags::CLOEXEC));
                 Ok(new_fd as isize)
+            }
+            F_GETLK | F_SETLK | F_SETLKW => {
+                let desc = Arc::clone(&inner.fd_table[fd].as_ref().ok_or(ERRNO::EBADF)?.desc);
+                drop(inner);
+
+                let mut flock = read_pod_from_user(arg as *const Flock)?;
+                let lock_type = flock_type_from_abi(flock.l_type)?;
+                let range = flock_range_from_abi(&flock)?;
+                validate_fcntl_lock_access(&desc, lock_type)?;
+                let owner_pid = process.getpid();
+
+                match cmd {
+                    F_GETLK => {
+                        let conflict = desc.get_posix_lock(owner_pid, lock_type, range)?;
+                        write_flock_conflict(&mut flock, conflict)?;
+                        write_pod_to_user(arg as *mut Flock, &flock)?;
+                        Ok(0)
+                    }
+                    F_SETLK => {
+                        desc.set_posix_lock(owner_pid, lock_type, range, false)?;
+                        Ok(0)
+                    }
+                    F_SETLKW => {
+                        desc.set_posix_lock(owner_pid, lock_type, range, true)?;
+                        Ok(0)
+                    }
+                    _ => unreachable!(),
+                }
             }
             _ => Err(ERRNO::EINVAL),
         }
@@ -2655,6 +2839,159 @@ pub fn sys_splice(
     })
 }
 
+/// copy_file_range syscall: copy bytes directly between two regular files.
+///
+/// A NULL input/output offset uses and advances the corresponding open file
+/// description offset.  A non-NULL offset is used as an independent position
+/// and is advanced in user space by the number of bytes actually copied.
+pub fn sys_copy_file_range(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_copy_file_range",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if fd_in < 0 || fd_out < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        if flags != 0 || len > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let in_desc = get_file_description(fd_in as usize)?;
+        let out_desc = get_file_description(fd_out as usize)?;
+        // Linux reports EISDIR for directory operands before checking the
+        // requested access mode (including a read-only destination fd).
+        if in_desc.is_dir() || out_desc.is_dir() {
+            return Err(ERRNO::EISDIR);
+        }
+        if in_desc.is_path() || !in_desc.readable() {
+            return Err(ERRNO::EBADF);
+        }
+        if out_desc.is_path() || !out_desc.writable() {
+            return Err(ERRNO::EBADF);
+        }
+        if !is_regular_file(&in_desc) || !is_regular_file(&out_desc) {
+            return Err(ERRNO::EINVAL);
+        }
+        if !in_desc.is_seekable() || !out_desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        // Linux rejects copy_file_range for an O_APPEND destination, even
+        // when off_out is NULL (the destination offset cannot be honored).
+        if out_desc.status_flags().contains(FileStatusFlags::APPEND) {
+            return Err(ERRNO::EBADF);
+        }
+
+        // Read and validate offset pointers before handling a zero-length
+        // request, matching the normal syscall pointer/error ordering.
+        let mut in_pos = if off_in.is_null() {
+            usize::try_from(in_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?
+        } else {
+            parse_pos64(read_pod_from_user(off_in as *const i64)?)?
+        };
+        let mut out_pos = if off_out.is_null() {
+            usize::try_from(out_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?
+        } else {
+            parse_pos64(read_pod_from_user(off_out as *const i64)?)?
+        };
+
+        // The kernel rejects overlapping in-place copies.  Compare stable
+        // filesystem/inode identities so separate descriptors for the same
+        // file are covered as well.
+        if len > 0 {
+            if let (Some(inode_in), Some(inode_out)) =
+                (in_desc.backing_inode(), out_desc.backing_inode())
+            {
+                if inode_in.fs_id() == inode_out.fs_id() && inode_in.ino() == inode_out.ino() {
+                    let last = len.checked_sub(1).ok_or(ERRNO::EINVAL)?;
+                    let in_end = in_pos.checked_add(last).ok_or(ERRNO::EINVAL)?;
+                    let out_end = out_pos.checked_add(last).ok_or(ERRNO::EINVAL)?;
+                    if in_end >= out_pos && in_pos <= out_end {
+                        return Err(ERRNO::EINVAL);
+                    }
+                } else if inode_in.fs_id() != inode_out.fs_id() {
+                    // copy_file_range is restricted to one filesystem; the
+                    // userspace caller can fall back to read/write on EXDEV.
+                    return Err(ERRNO::EXDEV);
+                }
+            }
+        }
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let chunk_len = len.min(SENDFILE_CHUNK_SIZE);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(chunk_len)
+            .map_err(|_| ERRNO::ENOMEM)?;
+        buf.resize(chunk_len, 0);
+
+        let mut copied = 0usize;
+        let result: Result<isize, ERRNO> = (|| {
+            while copied < len {
+                let want = (len - copied).min(buf.len());
+                let read = match in_desc.read_bytes_at(in_pos, &mut buf[..want]) {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if read == 0 {
+                    break;
+                }
+
+                // A NULL destination offset operates on the shared file
+                // offset.  O_APPEND was rejected above, as required here.
+                let written = if off_out.is_null() {
+                    out_desc.write_bytes(&buf[..read])
+                } else {
+                    out_desc.write_bytes_at(out_pos, &buf[..read])
+                };
+                let written = match written {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if written == 0 {
+                    break;
+                }
+
+                in_pos = in_pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if !off_out.is_null() {
+                    out_pos = out_pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                }
+                copied = copied.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if written < read {
+                    break;
+                }
+            }
+            Ok(copied as isize)
+        })();
+
+        // For a NULL input offset we used positional reads, so commit the
+        // resulting position to the open file description.  A NULL output
+        // offset was advanced by write_bytes() itself; only explicit offsets
+        // need a user-space write-back.
+        if off_in.is_null() {
+            in_desc.seek(in_pos as i64, 0)?;
+        } else {
+            write_pod_to_user(off_in, &(in_pos as i64))?;
+        }
+        if !off_out.is_null() {
+            write_pod_to_user(off_out, &(out_pos as i64))?;
+        }
+
+        result
+    })
+}
+
 /// fadvise64 syscall：接受用户态的文件访问模式提示。
 pub fn sys_fadvise64(fd: i32, _offset: i64, _len: usize, advice: i32) -> isize {
     trace!(
@@ -2826,6 +3163,8 @@ const BLKGETSIZE64_COMPAT_SIGNED: usize = 0xffff_ffff_8004_1272;
 const BLKGETSIZE64_SIGNED: usize = 0xffff_ffff_8008_1272;
 const LOOP_SET_FD: usize = 0x4c00;
 const LOOP_CLR_FD: usize = 0x4c01;
+/// `ioctl(FIONBIO)`：切换文件描述的非阻塞状态。
+const FIONBIO: usize = 0x5421;
 
 /// ioctl 系统调用：校验 fd 后转发到具体文件对象。
 pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
@@ -2836,6 +3175,22 @@ pub fn sys_ioctl(fd: u32, req: usize, arg: usize) -> isize {
     syscall_body!({
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
+
+        // Linux 的 Rust 标准库会对捕获的子进程管道调用 FIONBIO，而不是
+        // 通过 fcntl(F_SETFL) 设置 O_NONBLOCK。这个请求属于打开文件描述
+        // 的通用状态，不应依赖具体的 Pipe/TTY 文件对象实现。
+        if req == FIONBIO {
+            let enabled: i32 = read_pod_from_user(arg as *const i32)?;
+            let mut status_flags = desc.status_flags();
+            if enabled != 0 {
+                status_flags.insert(FileStatusFlags::NONBLOCK);
+            } else {
+                status_flags.remove(FileStatusFlags::NONBLOCK);
+            }
+            desc.set_status_flags(status_flags);
+            return Ok(0);
+        }
+
         if let Some(inode) = desc.as_inode() {
             let vfs_node = inode.vfs_node();
             if let Some(block) = vfs_node.as_any().downcast_ref::<BlockDevNode>() {
@@ -2871,11 +3226,10 @@ pub fn sys_open(dirfd: isize, path: *const u8, flags: i32, mode: u32) -> isize {
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let process = current_process();
-    let token = current_user_token();
     syscall_body!({
         // TODO: 目前只有O_CLOEXEC位会落入FD层处理。
         const O_CLOEXEC: i32 = 0x80000;
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -2929,10 +3283,9 @@ pub fn sys_truncate(path: *const u8, len: isize) -> isize {
         "kernel:pid[{}] sys_truncate",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         let new_size = parse_truncate_len(len)?;
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -2975,18 +3328,249 @@ pub fn sys_ftruncate(fd: u32, len: isize) -> isize {
     })
 }
 
-pub fn sys_eventfd2(_initval: u32, flags: i32) -> isize {
+pub fn sys_eventfd2(initval: u32, flags: i32) -> isize {
     syscall_body!({
-        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
-        alloc_anonymous_fd(status_flags, cloexec)
+        const EFD_SEMAPHORE: i32 = 0x1;
+        let allowed = O_NONBLOCK | O_CLOEXEC | EFD_SEMAPHORE;
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, allowed)?;
+        alloc_eventfd(
+            initval,
+            status_flags,
+            cloexec,
+            (flags & EFD_SEMAPHORE) != 0,
+        )
     })
 }
 
 pub fn sys_epoll_create1(flags: i32) -> isize {
     syscall_body!({
-        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC)?;
-        alloc_anonymous_fd(status_flags, cloexec)
+        let (_, cloexec) = parse_anon_fd_flags(flags, O_CLOEXEC)?;
+        let desc = Arc::new(FileDescription::new(
+            Arc::new(EpollFile::new()),
+            AccessMode::ReadWrite,
+            FileStatusFlags::empty(),
+            0,
+        ));
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        let fd = inner.alloc_fd()?;
+        let mut entry = FdEntry::new(desc);
+        if cloexec {
+            entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[fd] = Some(entry);
+        Ok(fd as isize)
     })
+}
+
+// Linux only packs this structure on x86_64.  Generic 64-bit ABIs, including
+// RISC-V, align the u64 payload to 8 bytes and use a 16-byte array stride.
+#[cfg(target_arch = "x86_64")]
+const EPOLL_EVENT_DATA_OFFSET: usize = 4;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_EVENT_DATA_OFFSET: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const EPOLL_EVENT_SIZE: usize = 12;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_EVENT_SIZE: usize = 16;
+const EPOLL_MAX_EVENTS: usize = i32::MAX as usize / EPOLL_EVENT_SIZE;
+
+fn read_epoll_event(event: *const u8) -> Result<EpollEvent, ERRNO> {
+    if event.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let bytes = read_bytes_from_user(event, EPOLL_EVENT_SIZE)?;
+    let events = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+    let data = u64::from_ne_bytes(
+        bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + size_of::<u64>()]
+            .try_into()
+            .unwrap(),
+    );
+    Ok(EpollEvent { events, data })
+}
+
+fn write_epoll_event(event: *mut u8, value: EpollEvent) -> Result<(), ERRNO> {
+    let mut bytes = [0u8; EPOLL_EVENT_SIZE];
+    bytes[0..4].copy_from_slice(&value.events.to_ne_bytes());
+    bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&value.data.to_ne_bytes());
+    write_bytes_to_user(event, &bytes)
+}
+
+/// Change one registration in an epoll interest set.
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> isize {
+    syscall_body!({
+        if epfd < 0 || fd < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        let epoll_desc = get_file_description(epfd as usize)?;
+        let epoll = epoll_desc
+            .as_any()
+            .downcast_ref::<EpollFile>()
+            .ok_or(ERRNO::EINVAL)?;
+        let target = get_file_description(fd as usize)?;
+        if Arc::ptr_eq(&epoll_desc, &target) {
+            return Err(ERRNO::EINVAL);
+        }
+        match op {
+            EPOLL_CTL_ADD => epoll.ctl_add(fd, target, read_epoll_event(event)?)?,
+            EPOLL_CTL_MOD => epoll.ctl_mod(fd, &target, read_epoll_event(event)?)?,
+            EPOLL_CTL_DEL => epoll.ctl_del(fd, &target)?,
+            _ => return Err(ERRNO::EINVAL),
+        }
+        Ok(0)
+    })
+}
+
+fn epoll_timeout_ms_to_deadline(timeout_ms: i32) -> Result<Option<u64>, ERRNO> {
+    if timeout_ms < 0 {
+        return Ok(None);
+    }
+    let timeout_ns = (timeout_ms as u64)
+        .checked_mul(1_000_000)
+        .ok_or(ERRNO::EINVAL)?;
+    get_time_ns()
+        .checked_add(timeout_ns)
+        .map(Some)
+        .ok_or(ERRNO::EINVAL)
+}
+
+fn epoll_timespec_to_deadline(timeout: *const Timespec) -> Result<Option<u64>, ERRNO> {
+    if timeout.is_null() {
+        return Ok(None);
+    }
+    let timeout = read_pod_from_user(timeout)?;
+    if timeout.tv_nsec >= 1_000_000_000 {
+        return Err(ERRNO::EINVAL);
+    }
+    let timeout_ns = (timeout.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(timeout.tv_nsec as u64))
+        .ok_or(ERRNO::EINVAL)?;
+    get_time_ns()
+        .checked_add(timeout_ns)
+        .map(Some)
+        .ok_or(ERRNO::EINVAL)
+}
+
+fn epoll_pwait_common(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    deadline_ns: Option<u64>,
+    sigmask: *const u8,
+    sigsetsize: usize,
+    syscall_name: &str,
+) -> Result<isize, ERRNO> {
+    if epfd < 0 {
+        return Err(ERRNO::EBADF);
+    }
+    if maxevents <= 0 {
+        return Err(ERRNO::EINVAL);
+    }
+    if maxevents as usize > EPOLL_MAX_EVENTS {
+        return Err(ERRNO::EINVAL);
+    }
+    if events.is_null() {
+        return Err(ERRNO::EFAULT);
+    }
+    let output_len = (maxevents as usize)
+        .checked_mul(EPOLL_EVENT_SIZE)
+        .ok_or(ERRNO::EINVAL)?;
+    // Fault writable pages in before sleeping and before consuming ready items.
+    drop(translated_byte_buffer_with_access(
+        events as *const u8,
+        output_len,
+        PageFaultAccess::Write,
+    )?);
+
+    let epoll_desc = get_file_description(epfd as usize)?;
+    let epoll = epoll_desc
+        .as_any()
+        .downcast_ref::<EpollFile>()
+        .ok_or(ERRNO::EINVAL)?;
+    let old_mask = apply_temp_signal_mask(sigmask, sigsetsize, syscall_name)?;
+    let result = epoll.wait(epfd as usize, maxevents as usize, deadline_ns);
+    restore_temp_signal_mask(old_mask);
+    let ready = result?;
+    for (index, event) in ready.iter().copied().enumerate() {
+        write_epoll_event(events.wrapping_add(index * EPOLL_EVENT_SIZE), event)?;
+    }
+    Ok(ready.len() as isize)
+}
+
+/// Generic-ABI epoll wait syscall used by libc's `epoll_wait` wrapper.
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    timeout_ms: i32,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> isize {
+    warn!(
+        "[epoll-diag] enter syscall=epoll_pwait epfd={} events={:#x} maxevents={} timeout_ms={} sigmask={:#x} sigsetsize={}",
+        epfd,
+        events as usize,
+        maxevents,
+        timeout_ms,
+        sigmask as usize,
+        sigsetsize
+    );
+    let result = syscall_body!({
+        let deadline_ns = epoll_timeout_ms_to_deadline(timeout_ms)?;
+        epoll_pwait_common(
+            epfd,
+            events,
+            maxevents,
+            deadline_ns,
+            sigmask,
+            sigsetsize,
+            "sys_epoll_pwait",
+        )
+    });
+    warn!(
+        "[epoll-diag] exit syscall=epoll_pwait epfd={} maxevents={} timeout_ms={} result={}",
+        epfd, maxevents, timeout_ms, result
+    );
+    result
+}
+
+/// Nanosecond-resolution epoll wait syscall.
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    timeout: *const Timespec,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> isize {
+    warn!(
+        "[epoll-diag] enter syscall=epoll_pwait2 epfd={} events={:#x} maxevents={} timeout_ptr={:#x} sigmask={:#x} sigsetsize={}",
+        epfd,
+        events as usize,
+        maxevents,
+        timeout as usize,
+        sigmask as usize,
+        sigsetsize
+    );
+    let result = syscall_body!({
+        let deadline_ns = epoll_timespec_to_deadline(timeout)?;
+        epoll_pwait_common(
+            epfd,
+            events,
+            maxevents,
+            deadline_ns,
+            sigmask,
+            sigsetsize,
+            "sys_epoll_pwait2",
+        )
+    });
+    warn!(
+        "[epoll-diag] exit syscall=epoll_pwait2 epfd={} maxevents={} timeout_ptr={:#x} result={}",
+        epfd, maxevents, timeout as usize, result
+    );
+    result
 }
 
 pub fn sys_inotify_init1(flags: i32) -> isize {
@@ -3187,6 +3771,9 @@ pub fn sys_close(fd: u32) -> isize {
         }
         closed_entry
     };
+    if let Some(entry) = closed_entry.as_ref() {
+        entry.desc.release_posix_locks_for_owner(process.getpid());
+    }
     drop(closed_entry);
     0
 }
@@ -3251,6 +3838,9 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
             parent.inner_exclusive_access().fd_table = fd_table;
         }
     }
+    for entry in &closed_entries {
+        entry.desc.release_posix_locks_for_owner(process.getpid());
+    }
     drop(closed_entries);
     0
 }
@@ -3258,7 +3848,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
 /// sync syscall
 pub fn sys_sync() -> isize {
     syscall_body!({
-        sync_page_cache_all()?;
+        sync_storage_all()?;
         Ok(0)
     })
 }
@@ -3275,7 +3865,8 @@ pub fn sys_fsync(fd: u32) -> isize {
 /// fdatasync syscall
 pub fn sys_fdatasync(fd: u32) -> isize {
     syscall_body!({
-        sync_page_cache_all()?;
+        let file = get_any_file(fd as usize)?;
+        file.sync()?;
         Ok(0)
     })
 }
@@ -3286,39 +3877,57 @@ pub fn sys_syncfs(fd: u32) -> isize {
         let file = get_any_file(fd as usize)?;
         let inode = file.backing_inode().ok_or(ERRNO::EINVAL)?;
         sync_page_cache_fs(inode.fs_id())?;
+        sync_block_cache_all()?;
         Ok(0)
     })
 }
 
-/// pipe syscall
-pub fn sys_pipe2(pipefd: *mut i32, _flags: i32) -> isize {
+/// `pipe2(2)` syscall.
+pub fn sys_pipe2(pipefd: *mut i32, flags: i32) -> isize {
     trace!(
-        "kernel:pid[{}] sys_pipe",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+        "kernel:pid[{}] sys_pipe2 flags={:#x}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        flags
     );
     let process = current_process();
     syscall_body!({
+        let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
         let mut inner = process.inner_exclusive_access();
         inner.ensure_fd_capacity(2)?;
         let (pipe_read, pipe_write) = make_pipe();
         let read_fd = inner.alloc_fd()?;
-        inner.fd_table[read_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
+        let mut read_entry = FdEntry::new(Arc::new(FileDescription::new(
             pipe_read,
             AccessMode::ReadOnly,
-            FileStatusFlags::empty(),
+            status_flags,
             0,
-        ))));
+        )));
+        if cloexec {
+            read_entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[read_fd] = Some(read_entry);
         let write_fd = inner.alloc_fd()?;
-        inner.fd_table[write_fd] = Some(FdEntry::new(Arc::new(FileDescription::new(
+        let mut write_entry = FdEntry::new(Arc::new(FileDescription::new(
             pipe_write,
             AccessMode::WriteOnly,
-            FileStatusFlags::empty(),
+            status_flags,
             0,
-        ))));
+        )));
+        if cloexec {
+            write_entry.flags |= FdFlags::CLOEXEC;
+        }
+        inner.fd_table[write_fd] = Some(write_entry);
         drop(inner);
         write_pod_to_user(pipefd, &(read_fd as i32))?;
         write_pod_to_user(unsafe { pipefd.add(1) }, &(write_fd as i32))?;
-        debug!("sys_pipe: read_fd = {}, write_fd = {}", read_fd, write_fd);
+        debug!(
+            "sys_pipe2: flags={:#x} read_fd={} write_fd={} cloexec={} nonblock={}",
+            flags,
+            read_fd,
+            write_fd,
+            cloexec,
+            status_flags.contains(FileStatusFlags::NONBLOCK),
+        );
         Ok(0)
     })
 }
@@ -3341,10 +3950,7 @@ pub fn sys_dup(fd: u32) -> isize {
         }
         let new_fd = inner.alloc_fd()?;
         let desc = Arc::clone(&inner.fd_table[fd].as_ref().unwrap().desc);
-        inner.fd_table[new_fd] = Some(FdEntry {
-            desc,
-            flags: FdFlags::empty(),
-        });
+        inner.fd_table[new_fd] = Some(FdEntry::with_flags(desc, FdFlags::empty()));
         Ok(new_fd as isize)
     })
 }
@@ -3383,14 +3989,14 @@ pub fn sys_dup2(oldfd: u32, newfd: u32) -> isize {
             // 先把旧 `newfd` 表项拿出来，等离开进程自旋锁后再 drop。
             replaced_entry = inner.take_fd(newfd);
             let desc = Arc::clone(&inner.fd_table[oldfd].as_ref().unwrap().desc);
-            inner.fd_table[newfd] = Some(FdEntry {
-                desc,
-                flags: FdFlags::empty(),
-            });
+            inner.fd_table[newfd] = Some(FdEntry::with_flags(desc, FdFlags::empty()));
             Ok(newfd as isize)
         });
         (result, replaced_entry)
     };
+    if let Some(entry) = replaced_entry.as_ref() {
+        entry.desc.release_posix_locks_for_owner(process.getpid());
+    }
     drop(replaced_entry);
     result
 }
@@ -3714,13 +4320,12 @@ pub fn sys_linkat(
         "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if flags & !AT_SYMLINK_FOLLOW != 0 {
             return Err(ERRNO::EINVAL);
         }
-        let old_path = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
-        let new_path = translated_str(token, new_name).or_errno(ERRNO::EFAULT)?;
+        let old_path = read_cstring_from_user(old_name, PATH_MAX)?;
+        let new_path = read_cstring_from_user(new_name, PATH_MAX)?;
         if old_path.is_empty() || new_path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3746,10 +4351,9 @@ pub fn sys_symlinkat(target: *const u8, new_dirfd: isize, linkpath: *const u8) -
         "kernel:pid[{}] sys_symlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let target = translated_str(token, target).or_errno(ERRNO::EFAULT)?;
-        let linkpath = translated_str(token, linkpath).or_errno(ERRNO::EFAULT)?;
+        let target = read_cstring_from_user(target, PATH_MAX)?;
+        let linkpath = read_cstring_from_user(linkpath, PATH_MAX)?;
         if target.is_empty() || linkpath.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3765,12 +4369,11 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         "kernel:pid[{}] sys_readlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if bufsiz == 0 {
             return Err(ERRNO::EINVAL);
         }
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3793,30 +4396,16 @@ pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
         "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
         if flags & !AT_REMOVEDIR != 0 {
             return Err(ERRNO::EINVAL);
         }
-        let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
+        let name = read_cstring_from_user(name, PATH_MAX)?;
         if name.is_empty() {
             return Err(ERRNO::ENOENT);
         }
         if let Some(parent) = resolve_simple_dirfd_inode(dirfd, name.as_str())? {
-            if flags & AT_REMOVEDIR == 0 {
-                let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
-                if inode.is_dir() {
-                    return Err(ERRNO::EISDIR);
-                }
-                discard_inode(&inode);
-                parent.unlink(name.as_str())?;
-            } else {
-                let inode = parent.find(name.as_str()).ok_or(ERRNO::ENOENT)?;
-                if !inode.is_dir() {
-                    return Err(ERRNO::ENOTDIR);
-                }
-                parent.rmdir(name.as_str())?;
-            }
+            unlink_child(&parent, name.as_str(), flags)?;
         } else {
             let cwd = resolve_dirfd_base(dirfd, name.as_str())?;
             unlinkat(cwd.as_str(), &name, flags)?;
@@ -3827,23 +4416,25 @@ pub fn sys_unlinkat(dirfd: isize, name: *const u8, flags: u32) -> isize {
 
 /// getcwd – copy the current working directory into a user-space buffer.
 ///
-/// Returns the buffer address as `isize` on success, −errno on failure.
+/// The raw Linux syscall returns the number of bytes copied, including the
+/// trailing NUL, on success. The libc `getcwd(3)` wrapper converts that length
+/// back into the caller's buffer pointer.
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_getcwd",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
-        if size == 0 || buf.is_null() {
-            return Err(ERRNO::EINVAL);
-        }
         let cwd = current_process().inner_exclusive_access().cwd.clone();
         let cwd_bytes = cwd.as_bytes();
-        if size < cwd_bytes.len() + 1 {
+        let total = cwd_bytes.len() + 1;
+        // Linux checks the required size before touching the user pointer, so
+        // a NULL buffer that is also too small reports ERANGE rather than
+        // EFAULT.
+        if size < total {
             return Err(ERRNO::ERANGE);
         }
         // Write cwd + null terminator into the user buffer in one pass.
-        let total = cwd_bytes.len() + 1;
         let src: Vec<u8> = cwd_bytes
             .iter()
             .copied()
@@ -3851,7 +4442,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
             .collect();
         debug_assert_eq!(src.len(), total);
         write_bytes_to_user(buf, &src)?;
-        Ok(buf as isize)
+        Ok(total as isize)
     })
 }
 
@@ -3864,9 +4455,8 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         "kernel:pid[{}] sys_mkdirat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(path, PATH_MAX)?;
         if path.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -3874,7 +4464,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
             if parent.find(path.as_str()).is_some() {
                 return Err(ERRNO::EEXIST);
             }
-            parent.mkdir(path.as_str()).ok_or(ERRNO::EIO)?
+            parent.mkdir_result(path.as_str()).map_err(ERRNO::from)?
         } else {
             let cwd = resolve_dirfd_base(dirfd, path.as_str())?;
             mkdir_at_with_inode(cwd.as_str(), path.as_str())?
@@ -3918,6 +4508,28 @@ pub fn sys_chdir(path: *const u8) -> isize {
             return Err(ERRNO::ENOTDIR);
         }
         process.inner_exclusive_access().cwd = new_abs;
+        Ok(0)
+    })
+}
+
+/// fchdir – change the current working directory to the directory referred to
+/// by `fd`.
+pub fn sys_fchdir(fd: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fchdir",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    syscall_body!({
+        let desc = get_file_description(fd as usize)?;
+        if !desc.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        // The path is retained by directory-backed File implementations and
+        // is also the base used by the *at() syscalls.  Refuse descriptors
+        // without one rather than installing an unusable CWD.
+        let cwd = desc.path().ok_or(ERRNO::ENOTDIR)?;
+        process.inner_exclusive_access().cwd = cwd;
         Ok(0)
     })
 }
@@ -4015,7 +4627,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const Timespec, flag
         let path = if path.is_null() && (effective_flags & AT_EMPTY_PATH as i32 != 0) {
             String::new()
         } else {
-            translated_str(token, path).or_errno(ERRNO::EFAULT)?
+            read_cstring_from_user(path, PATH_MAX)?
         };
         debug!(
             "sys_utimensat: dirfd = {}, path = {}, flags = {}, effective_flags = {}",
@@ -4277,9 +4889,8 @@ pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
         "kernel:pid[{}] sys_umount",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let name = translated_str(token, name).or_errno(ERRNO::EFAULT)?;
+        let name = read_cstring_from_user(name, PATH_MAX)?;
         let cwd = current_process().inner_exclusive_access().cwd.clone();
         let abs = canonicalize(&cwd, &name);
         do_umount(&abs)?;
@@ -4393,10 +5004,9 @@ pub fn sys_renameat2(
     if flags != 0 {
         return -(ERRNO::EINVAL as isize);
     }
-    let token = current_user_token();
     syscall_body!({
-        let old_name = translated_str(token, old_name).or_errno(ERRNO::EFAULT)?;
-        let new_name = translated_str(token, new_name).or_errno(ERRNO::EFAULT)?;
+        let old_name = read_cstring_from_user(old_name, PATH_MAX)?;
+        let new_name = read_cstring_from_user(new_name, PATH_MAX)?;
         if old_name.is_empty() || new_name.is_empty() {
             return Err(ERRNO::ENOENT);
         }
@@ -4413,9 +5023,8 @@ pub fn sys_statfs64(path: *const u8, buf: *mut u8) -> isize {
         "kernel:pid[{}] sys_statfs64",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path_str = translated_str(token, path).ok_or(ERRNO::EFAULT)?;
+        let path_str = read_cstring_from_user(path, PATH_MAX)?;
         let cwd = resolve_dirfd_base(AT_FDCWD, path_str.as_str())?;
         debug!("sys_statfs64: cwd = '{}', path = '{}'", cwd, path_str);
         let inode = lookup_inode_follow(cwd.as_str(), rooted_lookup_path(path_str.as_str()), true)?;

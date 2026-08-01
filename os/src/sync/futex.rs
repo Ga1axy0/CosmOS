@@ -16,6 +16,9 @@ use lazy_static::lazy_static;
 
 const MAX_FUTEX_WAITERS: usize = 1024;
 const MAX_CACHED_FUTEX_KEYS: usize = 1024;
+const FUTEX_TIMEOUT_DIAG_SLOTS: usize = 32;
+const FUTEX_TIMEOUT_STALL_NS: u64 = 10_000_000_000;
+const FUTEX_TIMEOUT_DUMP_INTERVAL_NS: u64 = 30_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FutexKey {
@@ -57,6 +60,120 @@ lazy_static! {
         SpinNoIrqLock::new(HashMap::new());
     static ref FUTEX_WAIT_REGISTRY: SpinNoIrqLock<FutexWaitRegistry> =
         SpinNoIrqLock::new(FutexWaitRegistry::new());
+    static ref FUTEX_TIMEOUT_DIAG: SpinNoIrqLock<FutexTimeoutDiag> =
+        SpinNoIrqLock::new(FutexTimeoutDiag::new());
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FutexTimeoutDiagEntry {
+    task_ptr: usize,
+    uaddr: usize,
+    expected: i32,
+    timeout_count: usize,
+    first_timeout_ns: u64,
+    last_seen_ns: u64,
+    last_dump_ns: u64,
+}
+
+impl FutexTimeoutDiagEntry {
+    const EMPTY: Self = Self {
+        task_ptr: 0,
+        uaddr: 0,
+        expected: 0,
+        timeout_count: 0,
+        first_timeout_ns: 0,
+        last_seen_ns: 0,
+        last_dump_ns: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FutexTimeoutStall {
+    timeout_count: usize,
+    elapsed_ns: u64,
+}
+
+struct FutexTimeoutDiag {
+    entries: [FutexTimeoutDiagEntry; FUTEX_TIMEOUT_DIAG_SLOTS],
+}
+
+impl FutexTimeoutDiag {
+    const fn new() -> Self {
+        Self {
+            entries: [FutexTimeoutDiagEntry::EMPTY; FUTEX_TIMEOUT_DIAG_SLOTS],
+        }
+    }
+
+    fn record_timeout(
+        &mut self,
+        task: &Arc<TaskControlBlock>,
+        uaddr: usize,
+        expected: i32,
+        now_ns: u64,
+    ) -> Option<FutexTimeoutStall> {
+        let task_ptr = Arc::as_ptr(task) as usize;
+        let idx = self
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.task_ptr == task_ptr && entry.uaddr == uaddr && entry.expected == expected
+            })
+            .or_else(|| self.entries.iter().position(|entry| entry.task_ptr == 0))
+            .unwrap_or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.last_seen_ns)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            });
+        let entry = &mut self.entries[idx];
+        if entry.task_ptr != task_ptr || entry.uaddr != uaddr || entry.expected != expected {
+            *entry = FutexTimeoutDiagEntry {
+                task_ptr,
+                uaddr,
+                expected,
+                timeout_count: 0,
+                first_timeout_ns: now_ns,
+                last_seen_ns: now_ns,
+                last_dump_ns: 0,
+            };
+        }
+        entry.timeout_count = entry.timeout_count.saturating_add(1);
+        entry.last_seen_ns = now_ns;
+        let elapsed_ns = now_ns.saturating_sub(entry.first_timeout_ns);
+        if elapsed_ns < FUTEX_TIMEOUT_STALL_NS {
+            return None;
+        }
+        if entry.last_dump_ns != 0
+            && now_ns.saturating_sub(entry.last_dump_ns) < FUTEX_TIMEOUT_DUMP_INTERVAL_NS
+        {
+            return None;
+        }
+        entry.last_dump_ns = now_ns;
+        Some(FutexTimeoutStall {
+            timeout_count: entry.timeout_count,
+            elapsed_ns,
+        })
+    }
+
+    fn clear_wait(&mut self, task: &Arc<TaskControlBlock>, uaddr: usize, expected: i32) {
+        let task_ptr = Arc::as_ptr(task) as usize;
+        for entry in self.entries.iter_mut() {
+            if entry.task_ptr == task_ptr && entry.uaddr == uaddr && entry.expected == expected {
+                *entry = FutexTimeoutDiagEntry::EMPTY;
+            }
+        }
+    }
+
+    fn clear_task(&mut self, task: &Arc<TaskControlBlock>) {
+        let task_ptr = Arc::as_ptr(task) as usize;
+        for entry in self.entries.iter_mut() {
+            if entry.task_ptr == task_ptr {
+                *entry = FutexTimeoutDiagEntry::EMPTY;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -268,6 +385,8 @@ pub fn cleanup_futex_wait_for_task(task: &Arc<TaskControlBlock>) {
             slot.task_ptr = 0;
         }
     }
+    drop(registry);
+    FUTEX_TIMEOUT_DIAG.lock().clear_task(task);
 }
 
 fn futex_wait_state(handle: FutexWaitHandle) -> FutexWakeState {
@@ -555,6 +674,9 @@ pub fn futex_wait_addr(
     let task = current_task().unwrap();
     let current = read_pod_from_user(uaddr)?;
     if current != expected {
+        FUTEX_TIMEOUT_DIAG
+            .lock()
+            .clear_wait(&task, uaddr as usize, expected);
         return Err(ERRNO::EAGAIN);
     }
 
@@ -585,7 +707,7 @@ pub fn futex_wait_addr(
         );
         add_timer_with_futex_tag(deadline_ns, Arc::clone(&task), Some(handle.timer_tag()));
     }
-    queue.wait_with_reason_or_skip(WaitReason::Futex, || {
+    queue.wait_with_reason_or_skip(WaitReason::Futex(uaddr as usize, expected), || {
         let current_after_enqueue = read_pod_from_user(uaddr);
         let value_changed = current_after_enqueue
             .as_ref()
@@ -610,10 +732,55 @@ pub fn futex_wait_addr(
         );
         cleanup_futex_wait(handle);
         match wake_state {
-            FutexWakeState::Ready => return Ok(0),
-            FutexWakeState::TimedOut => return Err(ERRNO::ETIMEDOUT),
-            FutexWakeState::Canceled => {}
+            FutexWakeState::Ready => {
+                FUTEX_TIMEOUT_DIAG
+                    .lock()
+                    .clear_wait(&task, uaddr as usize, expected);
+                return Ok(0);
+            }
+            FutexWakeState::TimedOut => {
+                let now_ns = get_time_ns();
+                let stall = FUTEX_TIMEOUT_DIAG.lock().record_timeout(
+                    &task,
+                    uaddr as usize,
+                    expected,
+                    now_ns,
+                );
+                if let Some(stall) = stall {
+                    let process = task.process.upgrade();
+                    let pgrp = process
+                        .as_ref()
+                        .map(|process| process.getpgid())
+                        .unwrap_or(0);
+                    let current_value = read_pod_from_user(uaddr).ok();
+                    error!(
+                        "[futex-stall] pid={} tid={} thread_id={} pgrp={} uaddr={:#x} expected={} current={:?} consecutive_timeouts={} elapsed_ms={} action=dump_pgrp",
+                        pid,
+                        tid,
+                        thread_id,
+                        pgrp,
+                        uaddr as usize,
+                        expected,
+                        current_value,
+                        stall.timeout_count,
+                        stall.elapsed_ns / 1_000_000,
+                    );
+                    crate::task::debug_dump_pgrp_tasks(pgrp, "futex-timeout-streak");
+                }
+                return Err(ERRNO::ETIMEDOUT);
+            }
+            FutexWakeState::Canceled => {
+                FUTEX_TIMEOUT_DIAG
+                    .lock()
+                    .clear_wait(&task, uaddr as usize, expected);
+            }
         }
+    } else {
+        // A successful or signal-interrupted non-timed wait breaks any older
+        // timed-out streak for this same task/futex tuple.
+        FUTEX_TIMEOUT_DIAG
+            .lock()
+            .clear_wait(&task, uaddr as usize, expected);
     }
     if crate::signal::has_unmasked_pending_signal() {
         return Err(ERRNO::EINTR);

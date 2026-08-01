@@ -16,6 +16,10 @@ pub const SYSCALL_GETCWD: usize = 17;
 pub const SYSCALL_EVENTFD2: usize = 19;
 /// epoll_create1 syscall
 pub const SYSCALL_EPOLL_CREATE1: usize = 20;
+/// epoll_ctl syscall
+pub const SYSCALL_EPOLL_CTL: usize = 21;
+/// epoll_pwait syscall
+pub const SYSCALL_EPOLL_PWAIT: usize = 22;
 /// dup syscall
 pub const SYSCALL_DUP: usize = 23;
 /// dup2 syscall
@@ -54,6 +58,8 @@ pub const SYSCALL_FALLOCATE: usize = 47;
 pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 pub const SYSCALL_CHDIR: usize = 49;
+/// fchdir syscall
+pub const SYSCALL_FCHDIR: usize = 50;
 /// chroot syscall
 pub const SYSCALL_CHROOT: usize = 51;
 /// fchmod syscall
@@ -182,6 +188,8 @@ pub const SYSCALL_SIGSUSPEND: usize = 133;
 pub const SYSCALL_SIGACTION: usize = 134;
 /// sigprocmask syscall
 pub const SYSCALL_SIGPROCMASK: usize = 135;
+/// rt_sigpending syscall
+pub const SYSCALL_RT_SIGPENDING: usize = 136;
 /// rt_sigtimedwait_time32 syscall
 pub const SYSCALL_RT_SIGTIMEDWAIT_TIME32: usize = 137;
 /// sigreturn syscall
@@ -200,8 +208,12 @@ pub const SYSCALL_SETREUID: usize = 145;
 pub const SYSCALL_SETUID: usize = 146;
 /// setresuid syscall
 pub const SYSCALL_SETRESUID: usize = 147;
+/// getresuid syscall
+pub const SYSCALL_GETRESUID: usize = 148;
 /// setresgid syscall
 pub const SYSCALL_SETRESGID: usize = 149;
+/// getresgid syscall
+pub const SYSCALL_GETRESGID: usize = 150;
 /// times syscall
 pub const SYSCALL_TIMES: usize = 153;
 /// setpgid syscall
@@ -298,6 +310,8 @@ pub const SYSCALL_SENDMSG: usize = 211;
 pub const SYSCALL_RECVMSG: usize = 212;
 /// brk syscall
 pub const SYSCALL_BRK: usize = 214;
+/// mremap syscall
+pub const SYSCALL_MREMAP: usize = 216;
 /// add_key syscall
 pub const SYSCALL_ADD_KEY: usize = 217;
 /// keyctl syscall
@@ -354,6 +368,8 @@ pub const SYSCALL_MEMFD_CREATE: usize = 279;
 pub const SYSCALL_BPF: usize = 280;
 /// userfaultfd syscall
 pub const SYSCALL_USERFAULTFD: usize = 282;
+/// copy_file_range syscall
+pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 /// statx syscall
 pub const SYSCALL_STATX: usize = 291;
 /// spawn syscall
@@ -376,6 +392,8 @@ pub const SYSCALL_PIDFD_OPEN: usize = 434;
 pub const SYSCALL_CLOSE_RANGE: usize = 436;
 /// faccessat2 syscall
 pub const SYSCALL_FACCESSAT2: usize = 439;
+/// epoll_pwait2 syscall
+pub const SYSCALL_EPOLL_PWAIT2: usize = 441;
 /// memfd_secret syscall
 pub const SYSCALL_MEMFD_SECRET: usize = 447;
 /*
@@ -448,6 +466,8 @@ mod utils;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::syscall::random::*;
 use fs::*;
@@ -551,6 +571,28 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let result = match syscall_id {
         SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as i32),
         SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as i32),
+        SYSCALL_EPOLL_CTL => sys_epoll_ctl(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *const u8,
+        ),
+        SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as i32,
+            args[4] as *const u8,
+            args[5],
+        ),
+        SYSCALL_EPOLL_PWAIT2 => sys_epoll_pwait2(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as *const Timespec,
+            args[4] as *const u8,
+            args[5],
+        ),
         SYSCALL_DUP => sys_dup(args[0] as u32),
         SYSCALL_DUP2 => sys_dup2(args[0] as u32, args[1] as u32),
         SYSCALL_FCNTL => sys_fcntl(args[0] as u32, args[1] as i32, args[2]),
@@ -662,6 +704,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
             args[5] as u32,
         ),
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0] as i32,
+            args[1] as *mut i64,
+            args[2] as i32,
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
         SYSCALL_FADVISE64 => sys_fadvise64(args[0] as i32, args[1] as i64, args[2], args[3] as i32),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
@@ -716,6 +766,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_FCHDIR => sys_fchdir(args[0] as u32),
         SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_SYNC => sys_sync(),
@@ -874,7 +925,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETREUID => sys_setreuid(args[0] as u32, args[1] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
         SYSCALL_SETRESUID => sys_setresuid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETRESUID => sys_getresuid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_SETRESGID => sys_setresgid(args[0] as u32, args[1] as u32, args[2] as u32),
+        SYSCALL_GETRESGID => sys_getresgid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_GETUID => sys_getuid(),
@@ -909,6 +970,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_ADJTIMEX => sys_adjtimex(args[0] as *mut Timex),
         SYSCALL_TIMES => sys_times(args[0] as *mut Tms),
         SYSCALL_BRK => sys_brk(args[0]),
+        SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2] as i32),
@@ -975,6 +1037,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut u64,
             args[3],
         ),
+        SYSCALL_RT_SIGPENDING => sys_rt_sigpending(args[0] as *mut u64, args[1]),
         SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u64, args[1]),
         SYSCALL_RT_SIGTIMEDWAIT_TIME32 => sys_rt_sigtimedwait_time32(
             args[0] as *const u64,
@@ -1018,19 +1081,19 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     };
     if (-4095..0).contains(&result) {
         let errno = -result;
-        warn!(
-            "syscall error: id={} errno={}({}) result={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-            syscall_id,
-            errno,
-            errno_name(errno),
-            result,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-        );
+        // warn!(
+        //     "syscall error: id={} errno={}({}) result={} args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+        //     syscall_id,
+        //     errno,
+        //     errno_name(errno),
+        //     result,
+        //     args[0],
+        //     args[1],
+        //     args[2],
+        //     args[3],
+        //     args[4],
+        //     args[5],
+        // );
     }
     result
 }

@@ -4,8 +4,11 @@ use super::ProcessControlBlock;
 use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::mm::{
     defer_release, deferred_frame_count, deferred_kstack_id_count, flush_deferred, online_mask,
-    DeferredUserReclaim, MapPermission, MmError, PhysPageNum, VirtAddr, Vma, KERNEL_SPACE,
+    shootdown, DeferredUserReclaim, MapPermission, MmError, PhysPageNum, ShootdownKind, VirtAddr,
+    Vma, KERNEL_SPACE,
 };
+#[cfg(target_arch = "loongarch64")]
+use crate::mm::{frame_alloc_contiguous, ContiguousFrames};
 use crate::sync::SpinNoIrqLock;
 use crate::timer::get_time_ns;
 use alloc::{
@@ -66,13 +69,13 @@ lazy_static! {
     };
     /// Global allocator for kernel stack
     static ref KSTACK_ALLOCATOR: SpinNoIrqLock<RecycleAllocator> = SpinNoIrqLock::new(RecycleAllocator::new());
-    /// Cache of fully mapped kernel stacks that can be reused without a global TLB flush.
+    /// Cache of fully mapped kernel stacks that can be reused without a kernel-ASID TLB flush.
     static ref KSTACK_CACHE: SpinNoIrqLock<Vec<usize>> = SpinNoIrqLock::new(Vec::new());
 }
 
-/// deferred kernel stack id 超过该水位时触发一次全局 flush 回收。
+/// deferred kernel stack id 超过该水位时触发一次 kernel-ASID flush 回收。
 const KSTACK_DEFERRED_RECYCLE_WATERMARK: usize = 64;
-/// deferred 物理页超过该水位时触发一次全局 flush 回收。
+/// deferred 物理页超过该水位时触发一次 kernel-ASID flush 回收。
 const DEFERRED_FRAME_RECYCLE_WATERMARK: usize = 16 * 1024 * 1024 / PAGE_SIZE;
 /// Keep a small bounded pool of mapped kernel stacks for reuse without letting
 /// fork/exit storms permanently withhold large amounts of memory.
@@ -116,6 +119,7 @@ impl Drop for ThreadIdHandle {
 }
 
 /// Return (bottom, top) of a kernel stack in kernel space.
+#[cfg(target_arch = "riscv64")]
 pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
     let top = TRAMPOLINE - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
@@ -123,12 +127,28 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 }
 
 /// Kernel stack for a task
+#[cfg(target_arch = "riscv64")]
 pub struct KernelStack(pub usize);
 
+/// LoongArch kernel stacks use one physically contiguous DMW range. They are
+/// therefore reachable in every process address space without any PGDL entry.
+#[cfg(target_arch = "loongarch64")]
+pub struct KernelStack {
+    id: usize,
+    frames: ContiguousFrames,
+}
+
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn cached_kstack_count() -> usize {
     KSTACK_CACHE.lock().len()
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn cached_kstack_count() -> usize {
+    0
+}
+
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn reclaim_cached_kstacks(target_cached: usize) -> usize {
     let mut kstack_ids = Vec::new();
     {
@@ -159,10 +179,17 @@ pub(crate) fn reclaim_cached_kstacks(target_cached: usize) -> usize {
     reclaimed
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn reclaim_cached_kstacks(_target_cached: usize) -> usize {
+    0
+}
+
+#[cfg(target_arch = "riscv64")]
 fn try_take_cached_kstack() -> Option<usize> {
     KSTACK_CACHE.lock().pop()
 }
 
+#[cfg(target_arch = "riscv64")]
 fn try_cache_kstack(kstack_id: usize) -> bool {
     let mut cache = KSTACK_CACHE.lock();
     if cache.len() >= KSTACK_CACHE_LIMIT {
@@ -173,6 +200,7 @@ fn try_cache_kstack(kstack_id: usize) -> bool {
 }
 
 /// Allocate a kernel stack for a task
+#[cfg(target_arch = "riscv64")]
 pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     let total_start_ns = get_time_ns();
     let deferred_kstack_before = deferred_kstack_id_count();
@@ -239,6 +267,23 @@ pub fn kstack_alloc() -> Result<KernelStack, MmError> {
     Ok(KernelStack(kstack_id))
 }
 
+/// Allocate a DMW-backed kernel stack on LoongArch.  The stack has no PTEs, so
+/// dropping it needs neither a TLB shootdown nor deferred virtual-address
+/// recycling.
+#[cfg(target_arch = "loongarch64")]
+pub fn kstack_alloc() -> Result<KernelStack, MmError> {
+    let id = KSTACK_ALLOCATOR.lock().alloc();
+    let pages = KERNEL_STACK_SIZE / PAGE_SIZE;
+    match frame_alloc_contiguous(pages, pages) {
+        Some(frames) => Ok(KernelStack { id, frames }),
+        None => {
+            KSTACK_ALLOCATOR.lock().dealloc(id);
+            Err(MmError::OutOfMemory)
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
 impl Drop for KernelStack {
     fn drop(&mut self) {
         if try_cache_kstack(self.0) {
@@ -260,7 +305,7 @@ impl Drop for KernelStack {
             kernel_stack_bottom,
             deferred_frames.len()
         );
-        // 这里先把拆下来的页框挂到 deferred 容器里；真正的 global TLB flush
+        // 这里先把拆下来的页框挂到 deferred 容器里；真正的 kernel-ASID TLB flush
         // 与批量并回 frame allocator 的同步点在下一步接入。
         defer_release(
             kernel_stack_bottom,
@@ -268,6 +313,13 @@ impl Drop for KernelStack {
             Some(self.0),
             deferred_frames,
         );
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        KSTACK_ALLOCATOR.lock().dealloc(self.id);
     }
 }
 
@@ -298,8 +350,16 @@ impl KernelStack {
     }
     /// return the top of the kernel stack
     pub fn get_top(&self) -> usize {
-        let (_, kernel_stack_top) = kernel_stack_position(self.0);
-        kernel_stack_top
+        #[cfg(target_arch = "riscv64")]
+        {
+            let (_, kernel_stack_top) = kernel_stack_position(self.0);
+            return kernel_stack_top;
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let start_pa = self.frames.start_ppn().0 * PAGE_SIZE;
+            crate::platform::direct_map_phys_to_virt(start_pa) + self.frames.pages() * PAGE_SIZE
+        }
     }
 }
 
@@ -392,37 +452,59 @@ impl TaskUserRes {
     /// Allocate user resource for a task
     pub fn alloc_user_res(&self) -> Result<(), MmError> {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        // alloc user stack
-        let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
-        let ustack_top = ustack_bottom + USER_STACK_SIZE;
-        let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
-        if self.tid == 0 {
-            // Main thread needs eager mapping: kernel writes args/auxv before start.
-            process_inner.memory_set.insert_vma_eager(ustack_vma)?;
-        } else {
-            process_inner.memory_set.insert_vma(ustack_vma, None)?;
+        let (token, mask) = {
+            let mut process_inner = process.inner_exclusive_access();
+            // alloc user stack
+            let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
+            let ustack_top = ustack_bottom + USER_STACK_SIZE;
+            let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), self.tid);
+            if self.tid == 0 {
+                // Main thread needs eager mapping: kernel writes args/auxv before start.
+                process_inner.memory_set.insert_vma_eager(ustack_vma)?;
+            } else {
+                process_inner.memory_set.insert_vma(ustack_vma, None)?;
+            }
+            // alloc trap_cx
+            let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+            let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+            process_inner.memory_set.insert_vma(
+                Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+                None,
+            )?;
+            (
+                process_inner.memory_set.token(),
+                process_inner
+                    .memory_set
+                    .record_tlb_change_with_local_fence(),
+            )
+        };
+        if mask != 0 {
+            shootdown(mask, ShootdownKind::AddressSpace { token });
         }
-        // alloc trap_cx
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
-        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_vma(
-            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
-            None,
-        )?;
         Ok(())
     }
 
     /// Allocate only the trap context mapping for a Linux `CLONE_VM` thread.
     pub fn alloc_trap_cx(&self) -> Result<(), MmError> {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
-        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_vma(
-            Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
-            None,
-        )?;
+        let (token, mask) = {
+            let mut process_inner = process.inner_exclusive_access();
+            let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+            let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
+            process_inner.memory_set.insert_vma(
+                Vma::new_trap_context(trap_cx_bottom.into(), trap_cx_top.into(), self.tid),
+                None,
+            )?;
+            (
+                process_inner.memory_set.token(),
+                process_inner
+                    .memory_set
+                    .record_tlb_change_with_local_fence(),
+            )
+        };
+        if mask != 0 {
+            shootdown(mask, ShootdownKind::AddressSpace { token });
+        }
         Ok(())
     }
     /// Deallocate user resource for a task
@@ -432,7 +514,6 @@ impl TaskUserRes {
         let reclaim = {
             let mut process_inner = process.inner_exclusive_access();
             let token = process_inner.memory_set.token();
-            let mask = process_inner.memory_set.loaded_user_harts();
             // 用户栈可能在 fork 后与子进程共享 COW 页，不能使用 kernel stack
             // 专用的独占 frame deferred helper。
             let ustack_bottom_va: VirtAddr =
@@ -445,6 +526,7 @@ impl TaskUserRes {
                 .memory_set
                 .remove_vma_with_start_vpn_user_deferred(trap_cx_bottom_va.into());
             release_batch.append(&mut trap_cx_batch);
+            let mask = process_inner.memory_set.record_local_tlb_change();
             DeferredUserReclaim::new(token, mask, release_batch)
         };
         if !reclaim.is_empty() {

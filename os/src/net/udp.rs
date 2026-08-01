@@ -181,19 +181,14 @@ impl UdpSocketFile {
         let bind_ep = listen_endpoint_from_bind(IpEndpoint::new(ep.addr, port));
         let stack_ep = if bind_ep.addr.is_some() {
             bind_ep
-        } else if self.family == AF_INET_FAMILY {
-            IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))),
-                port: bind_ep.port,
-            }
         } else if self.family == super::AF_INET6 as i32 && self.ipv6_only() {
             IpListenEndpoint {
                 addr: Some(IpAddress::Ipv6(Ipv6Address::LOCALHOST)),
                 port: bind_ep.port,
             }
         } else {
-            // AF_INET6 wildcard with IPV6_V6ONLY=0 keeps addr=None so one UDP
-            // socket can accept both IPv6 and IPv4 loopback datagrams.
+            // Keep wildcard UDP binds as addr=None so the socket can reach
+            // external peers (e.g. DNS) while still matching loopback traffic.
             bind_ep
         };
         debug!(
@@ -252,6 +247,15 @@ impl UdpSocketFile {
     }
 
     pub(crate) fn send_to(&self, data: &[u8], ep: IpEndpoint) -> Result<usize, ERRNO> {
+        self.send_to_with_nonblock(data, ep, false)
+    }
+
+    fn send_to_with_nonblock(
+        &self,
+        data: &[u8],
+        ep: IpEndpoint,
+        nonblocking: bool,
+    ) -> Result<usize, ERRNO> {
         trace!(
             "udp send_to: data_len={} ep={} handle={:?}",
             data.len(),
@@ -326,6 +330,9 @@ impl UdpSocketFile {
             }
             debug!("udp socket {:?} cannot send, waiting", self.st.handle);
             drop(guard);
+            if nonblocking {
+                return Err(ERRNO::EAGAIN);
+            }
             if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();
@@ -395,30 +402,55 @@ impl UdpSocketFile {
         buf: &UserBuffer,
         ep: IpEndpoint,
     ) -> Result<usize, ERRNO> {
+        self.send_user_buffer_to_with_nonblock(buf, ep, false)
+    }
+
+    pub(crate) fn send_user_buffer_to_with_nonblock(
+        &self,
+        buf: &UserBuffer,
+        ep: IpEndpoint,
+        nonblocking: bool,
+    ) -> Result<usize, ERRNO> {
         let total = buf.len();
         if total == 0 {
             return Ok(0);
         }
         if buf.buffers.len() == 1 {
-            return self.send_to(buf.buffers[0], ep);
+            return self.send_to_with_nonblock(buf.buffers[0], ep, nonblocking);
         }
 
         let mut data = Vec::with_capacity(total);
         for slice in buf.buffers.iter() {
             data.extend_from_slice(slice);
         }
-        self.send_to(data.as_slice(), ep)
+        self.send_to_with_nonblock(data.as_slice(), ep, nonblocking)
     }
 
     pub(crate) fn send_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
+        self.send_user_buffer_with_nonblock(buf, false)
+    }
+
+    pub(crate) fn send_user_buffer_with_nonblock(
+        &self,
+        buf: &UserBuffer,
+        nonblocking: bool,
+    ) -> Result<usize, ERRNO> {
         let ep = *self.connected.lock();
         let ep = ep.ok_or(ERRNO::EDESTADDRREQ)?;
-        self.send_user_buffer_to(buf, ep)
+        self.send_user_buffer_to_with_nonblock(buf, ep, nonblocking)
     }
 
     pub(crate) fn recv_from_user_buffer(
         &self,
         out: &mut UserBuffer,
+    ) -> Result<(usize, IpEndpoint), ERRNO> {
+        self.recv_from_user_buffer_with_nonblock(out, false)
+    }
+
+    pub(crate) fn recv_from_user_buffer_with_nonblock(
+        &self,
+        out: &mut UserBuffer,
+        nonblocking: bool,
     ) -> Result<(usize, IpEndpoint), ERRNO> {
         let timeout_ns = timeout_ns_to_deadline_ns(self.recv_timeout_ns())?;
         let mut timeout_handle = None;
@@ -453,6 +485,9 @@ impl UdpSocketFile {
                 }
             }
             drop(guard);
+            if nonblocking {
+                return Err(ERRNO::EAGAIN);
+            }
             if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();

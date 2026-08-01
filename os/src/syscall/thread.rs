@@ -103,42 +103,70 @@ pub fn sys_waittid(tid: usize) -> i32 {
     );
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let task_inner = task.inner_exclusive_access();
-    let mut process_inner = process.inner_exclusive_access();
     // a thread cannot wait for itself
-    if task_inner.res.as_ref().unwrap().tid == tid {
+    let current_tid = {
+        let task_inner = task.inner_exclusive_access();
+        let Some(res) = task_inner.res.as_ref() else {
+            return -(ERRNO::ESRCH as i32);
+        };
+        res.tid
+    };
+    if current_tid == tid {
         return -(ERRNO::EINVAL as i32);
     }
-    let waited_task = process_inner.tasks.get(tid).and_then(|t| t.as_ref());
-    let exit_code = match waited_task {
-        None => return -(ERRNO::ESRCH as i32), // thread does not exist
-        Some(t) => t.inner_exclusive_access().exit_code,
+    // Take only an Arc snapshot under process-inner.  Reading the target task
+    // while holding that lock would invert the task -> process order used by
+    // the caller and by the scheduler's exit path.
+    let waited_task = {
+        let process_inner = process.inner_exclusive_access();
+        process_inner
+            .tasks
+            .get(tid)
+            .and_then(|slot| slot.as_ref().cloned())
     };
-    if let Some(code) = exit_code {
-        // Take the task out of the slot so we can drop it after releasing locks.
-        let waited_task = process_inner.tasks[tid].take();
-        if let Some(waited_task) = waited_task.as_ref() {
-            let thread_id = waited_task
-                .inner_exclusive_access()
-                .res
-                .as_ref()
-                .unwrap()
-                .thread_id();
-            remove_from_tid2task(thread_id);
+    let Some(waited_task) = waited_task else {
+        return -(ERRNO::ESRCH as i32);
+    };
+    let exit_code = waited_task.inner_exclusive_access().exit_code;
+    let Some(code) = exit_code else {
+        return -(ERRNO::EAGAIN as i32);
+    };
+
+    // Revalidate and detach atomically with respect to another waiter.  The
+    // target task lock is deliberately acquired only after process-inner has
+    // been released.
+    let detached_task = {
+        let mut process_inner = process.inner_exclusive_access();
+        let slot_matches = process_inner
+            .tasks
+            .get(tid)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|registered| Arc::ptr_eq(registered, &waited_task));
+        if slot_matches {
+            process_inner.tasks[tid].take()
+        } else {
+            None
         }
-        // Extract user resources from the zombie task to avoid deadlock:
-        // TaskUserRes::drop() needs the process lock, so we must drop it first.
-        let res = waited_task
-            .as_ref()
-            .and_then(|t| t.inner_exclusive_access().res.take());
-        drop(process_inner);
-        drop(task_inner);
-        drop(res);
-        drop(waited_task);
-        code
-    } else {
-        -(ERRNO::EAGAIN as i32) // thread has not exited yet
+    };
+    let Some(detached_task) = detached_task else {
+        return -(ERRNO::ESRCH as i32);
+    };
+
+    let (thread_id, res) = {
+        let mut waited_inner = detached_task.inner_exclusive_access();
+        (
+            waited_inner.res.as_ref().map(|res| res.thread_id()),
+            waited_inner.res.take(),
+        )
+    };
+    if let Some(thread_id) = thread_id {
+        remove_from_tid2task(thread_id);
     }
+    // TaskUserRes::drop() acquires process-inner, so dropping it is kept out
+    // of both the task and process critical sections.
+    drop(res);
+    drop(detached_task);
+    code
 }
 
 /// 临时实现，只返回当前线程的 tid

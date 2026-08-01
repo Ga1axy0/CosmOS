@@ -9,8 +9,13 @@ use crate::hal::hartid;
 use crate::sync::SpinNoIrqLock;
 use lazy_static::*;
 
-/// QEMU virt PLIC base.
-const PLIC_BASE: usize = 0x0C00_0000;
+/// QEMU virt PLIC physical base.
+const PLIC_PHYS_BASE: usize = 0x0C00_0000;
+
+#[inline(always)]
+fn plic_base() -> usize {
+    crate::platform::mmio_phys_to_virt(PLIC_PHYS_BASE)
+}
 
 /// QEMU virt UART0 interrupt source id.
 const UART0_IRQ: u32 = 10;
@@ -25,25 +30,25 @@ const MAX_IRQ_ID: usize = 32;
 
 #[inline(always)]
 fn priority_ptr(irq: u32) -> *mut u32 {
-    (PLIC_BASE + (irq as usize) * 4) as *mut u32
+    (plic_base() + (irq as usize) * 4) as *mut u32
 }
 
 #[inline(always)]
 fn enable_ptr(context: usize, irq: u32) -> *mut u32 {
     // enable bits start at 0x2000, each context has 0x80 bytes
-    let base = PLIC_BASE + 0x2000 + context * 0x80;
+    let base = plic_base() + 0x2000 + context * 0x80;
     (base + ((irq as usize) / 32) * 4) as *mut u32
 }
 
 #[inline(always)]
 fn threshold_ptr(context: usize) -> *mut u32 {
-    (PLIC_BASE + 0x200000 + context * 0x1000) as *mut u32
+    (plic_base() + 0x200000 + context * 0x1000) as *mut u32
 }
 
 #[inline(always)]
 fn claim_complete_ptr(context: usize) -> *mut u32 {
     // claim/complete is at threshold + 4
-    (PLIC_BASE + 0x200000 + context * 0x1000 + 4) as *mut u32
+    (plic_base() + 0x200000 + context * 0x1000 + 4) as *mut u32
 }
 
 fn enable_irq(context: usize, irq: u32) {

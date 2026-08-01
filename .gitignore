@@ -30,6 +30,7 @@ os/vendor/
 notes
 base.img
 disk.img
+disk.img.xz
 disk-la.img 
 kernel-rv
 kernel-la
@@ -39,4 +40,6 @@ second-fat32.img
 bootloader/loongarch64-direct/target/*
 sdcard-la.img
 sdcard-rv.img.xz
+sdcard-la-pub.img
+sdcard-rv-pub.img
 cosmos_docs

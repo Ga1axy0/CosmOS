@@ -12,7 +12,7 @@ use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
 
@@ -148,6 +148,24 @@ pub struct TaskControlBlock {
     /// registers are saved; a remote waker spins on it with `Acquire`. All other
     /// accesses are under the inner lock and use `Relaxed`.
     pub on_cpu: AtomicBool,
+    /// Lock-free hint for the user-return signal slow path.
+    ///
+    /// `true` means that this task may have an unmasked thread/process signal,
+    /// or deferred signal-mask restoration work.  It is deliberately a hint:
+    /// stale true values are cleared by the locked slow path, while producers
+    /// publish true after making pending state visible.
+    signal_work_pending: AtomicBool,
+    /// Lock-free hint for the deferred-reschedule slow path.
+    #[cfg(feature = "return_work_cache")]
+    resched_work_pending: AtomicBool,
+    /// Physical trap-frame page, userspace VA and address-space token cached
+    /// for the lifetime of the current exec image.
+    #[cfg(feature = "trap_context_cache")]
+    trap_cx_ppn_cache: AtomicUsize,
+    #[cfg(feature = "trap_context_cache")]
+    trap_cx_user_va_cache: usize,
+    #[cfg(feature = "trap_context_cache")]
+    user_token_cache: AtomicUsize,
 }
 
 impl TaskControlBlock {
@@ -156,10 +174,85 @@ impl TaskControlBlock {
         self.inner.lock()
     }
     /// Get the current user address-space token for this task.
+    #[cfg(not(feature = "trap_context_cache"))]
     pub fn get_user_token(&self) -> AddressSpaceToken {
         let process = self.process.upgrade().unwrap();
         let inner = process.inner_exclusive_access();
         inner.memory_set.token()
+    }
+    /// Get the token snapshot for the task's current exec image.
+    #[cfg(feature = "trap_context_cache")]
+    #[inline]
+    pub fn get_user_token(&self) -> AddressSpaceToken {
+        self.user_token_cache.load(Ordering::Acquire)
+    }
+
+    /// Get the current trap frame without acquiring task-inner.
+    #[cfg(feature = "trap_context_cache")]
+    #[inline]
+    pub fn cached_trap_cx(&self) -> &'static mut TrapContext {
+        PhysPageNum(self.trap_cx_ppn_cache.load(Ordering::Acquire)).get_mut()
+    }
+
+    /// Get the fixed userspace trap-frame VA for this task.
+    #[cfg(feature = "trap_context_cache")]
+    #[inline]
+    pub fn cached_trap_cx_user_va(&self) -> usize {
+        self.trap_cx_user_va_cache
+    }
+
+    /// Publish trap metadata after exec has installed the replacement image.
+    #[cfg(feature = "trap_context_cache")]
+    pub(crate) fn update_trap_context_cache(
+        &self,
+        trap_cx_ppn: PhysPageNum,
+        user_token: AddressSpaceToken,
+    ) {
+        self.trap_cx_ppn_cache
+            .store(trap_cx_ppn.0, Ordering::Release);
+        self.user_token_cache.store(user_token, Ordering::Release);
+    }
+
+    /// Return whether user-return signal handling needs the locked slow path.
+    #[inline]
+    pub fn signal_work_pending(&self) -> bool {
+        self.signal_work_pending.load(Ordering::Acquire)
+    }
+
+    /// Publish that signal delivery or mask-restoration work may be pending.
+    #[inline]
+    pub(crate) fn mark_signal_work_pending(&self) {
+        self.signal_work_pending.store(true, Ordering::Release);
+    }
+
+    /// Refresh the signal-work hint from state protected by signal locks.
+    #[inline]
+    pub(crate) fn set_signal_work_pending(&self, pending: bool) {
+        self.signal_work_pending.store(pending, Ordering::Release);
+    }
+
+    /// Return whether trap exit needs to inspect the locked reschedule reason.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub fn resched_work_pending(&self) -> bool {
+        self.resched_work_pending.load(Ordering::Acquire)
+    }
+
+    /// Update the authoritative reschedule reason and its lock-free hint.
+    ///
+    /// The caller must hold this task's inner lock. Keeping both writes in one
+    /// helper prevents a locked producer from racing with a lockless hint clear
+    /// and leaving `Some(reason)` paired with a false hint.
+    #[inline]
+    pub(crate) fn set_resched_reason_locked(
+        &self,
+        task_inner: &mut TaskControlBlockInner,
+        reason: Option<ReschedReason>,
+    ) {
+        task_inner.sched.resched_reason = reason;
+        #[cfg(feature = "return_work_cache")]
+        self.resched_work_pending
+            .store(reason.is_some(), Ordering::Release);
     }
 }
 
@@ -193,6 +286,43 @@ pub struct TaskControlBlockInner {
     pub signal_mask_backup: Option<SignalBit>,
     /// Whether this task may still have non-futex timers that require eager removal on exit.
     pub may_have_non_futex_timer: bool,
+    /// Debug: the last scheduler-container transition that touched this task.
+    /// Updated best-effort at each enqueue/dequeue/wake/block/remove site via
+    /// [`TaskControlBlockInner::stamp_sched`]. Dumped by the lost-runnable
+    /// detector so an orphaned task's final operation is visible. Zero runtime
+    /// cost except at transitions; produces no log output on its own.
+    pub last_sched_op: LastSchedOp,
+}
+
+/// Record of the last scheduler transition that touched a task, used to
+/// diagnose lost-runnable orphans. `op` names the transition, `hart` is the
+/// hart that performed it, `status`/`on_rq` are the resulting task state, and
+/// `seq` is a per-task monotonic counter so the freshness of the stamp is
+/// visible. `Default` is the "just constructed" stamp.
+#[derive(Clone, Copy, Debug)]
+pub struct LastSchedOp {
+    /// Short name of the transition (e.g. `"enqueue_wake"`, `"dequeue_run"`).
+    pub op: &'static str,
+    /// Hart that performed the transition.
+    pub hart: usize,
+    /// Task status as observed *after* the transition.
+    pub status: TaskStatus,
+    /// `sched.on_rq` as observed after the transition.
+    pub on_rq: bool,
+    /// Per-task monotonic sequence number, so freshness of the stamp is visible.
+    pub seq: u32,
+}
+
+impl Default for LastSchedOp {
+    fn default() -> Self {
+        Self {
+            op: "init",
+            hart: 0,
+            status: TaskStatus::Runnable,
+            on_rq: false,
+            seq: 0,
+        }
+    }
 }
 
 impl TaskControlBlockInner {
@@ -254,6 +384,10 @@ impl TaskControlBlock {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res)?;
         let task_user_res_ns = get_time_ns() - task_user_res_start_ns;
         let trap_cx_ppn = res.trap_cx_ppn();
+        #[cfg(feature = "trap_context_cache")]
+        let trap_cx_user_va = res.trap_cx_user_va();
+        #[cfg(feature = "trap_context_cache")]
+        let user_token = process.inner_exclusive_access().get_user_token();
         let tid = res.tid;
         let thread_id = res.thread_id();
         let kstack_alloc_start_ns = get_time_ns();
@@ -265,6 +399,15 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             on_cpu: AtomicBool::new(false),
+            signal_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "return_work_cache")]
+            resched_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_ppn_cache: AtomicUsize::new(trap_cx_ppn.0),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_user_va_cache: trap_cx_user_va,
+            #[cfg(feature = "trap_context_cache")]
+            user_token_cache: AtomicUsize::new(user_token),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -280,6 +423,7 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
                 may_have_non_futex_timer: false,
+                last_sched_op: LastSchedOp::default(),
             }),
         };
         let build_ns = get_time_ns() - build_start_ns;
@@ -312,6 +456,15 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             on_cpu: AtomicBool::new(false),
+            signal_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "return_work_cache")]
+            resched_work_pending: AtomicBool::new(false),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_ppn_cache: AtomicUsize::new(0),
+            #[cfg(feature = "trap_context_cache")]
+            trap_cx_user_va_cache: 0,
+            #[cfg(feature = "trap_context_cache")]
+            user_token_cache: AtomicUsize::new(0),
             inner: SpinNoIrqLock::new(TaskControlBlockInner {
                 res: None,
                 trap_cx_ppn: PhysPageNum(0),
@@ -327,6 +480,7 @@ impl TaskControlBlock {
                 signal_mask: SignalBit::empty(),
                 signal_mask_backup: None,
                 may_have_non_futex_timer: false,
+                last_sched_op: LastSchedOp::default(),
             }),
         })
     }
@@ -343,20 +497,30 @@ pub enum WaitReason {
     Semaphore,
     /// Waiting for a mutex to become available.
     Mutex,
-    /// Waiting on a Linux futex word.
-    Futex,
-    /// Parent is waiting for child process exit.
-    ProcessWaitExit,
+    /// Waiting for a POSIX file lock to become available.
+    FileLock,
+    /// Waiting on a Linux futex word: `(user_address, expected_value)`.
+    Futex(usize, i32),
+    /// Parent is waiting for a child selected by the wait4/waitpid `pid` argument.
+    ProcessWaitExit(isize),
     /// Waiting for UART RX data.
     UartRx,
     /// Waiting for pipe to become readable.
     PipeReadable,
     /// Waiting for pipe to become writable.
     PipeWritable,
+    /// Waiting for an eventfd counter to become readable.
+    EventFdReadable,
+    /// Waiting for an eventfd counter to have writable capacity.
+    EventFdWritable,
     /// Waiting for nanosleep timer expiration.
     Nanosleep,
     /// Waiting for block device I/O completion.
     BlockDeviceIo,
+    /// Waiting for the active page-cache direct reclaimer to release ownership.
+    PageCacheReclaim,
+    /// Background page-cache readahead worker waiting for queued work.
+    PageCacheReadahead,
     /// Waiting for poll/ppoll readiness notification.
     Poll,
     /// Waiting for network device TX completion.

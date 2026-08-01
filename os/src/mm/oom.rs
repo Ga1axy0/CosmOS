@@ -37,24 +37,6 @@ pub fn warn_heap_state(label: &str, pid: usize) {
     );
 }
 
-/// Lock-free variant of [`warn_heap_state`] that avoids acquiring
-/// `PID2PCB`; safe to call while holding a per-process inner lock.
-pub fn warn_heap_state_lockfree(label: &str, pid: usize) {
-    let heap_bytes = KERNEL_HEAP_BYTES.load(Ordering::Acquire);
-    let heap_used = KERNEL_HEAP_USED_BYTES.load(Ordering::Acquire);
-    let stats = frame_allocator_stats();
-    warn!(
-        "[heap_trace] {} pid={} heap_used={} heap_committed={} heap_internal_free={} frames_free={} frames_allocated={}",
-        label,
-        pid,
-        heap_used,
-        heap_bytes,
-        heap_bytes.saturating_sub(heap_used),
-        stats.free_pages,
-        stats.allocated_pages,
-    );
-}
-
 /// Log one allocation failure at a syscall or user-fault boundary.
 pub fn log_oom(context: &str, access: Option<&str>, fault_addr: Option<usize>) {
     let stats = frame_allocator_stats();

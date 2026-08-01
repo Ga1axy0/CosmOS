@@ -8,13 +8,20 @@ use super::__switch;
 use super::{add_task, pick_next_task, TaskContext};
 use crate::config::MAX_HARTS;
 use crate::hal::traits::AddressSpaceToken;
-use crate::hal::{enable_irqs_and_wait, hartid};
+use crate::hal::{
+    activate_address_space, current_address_space_token, enable_irqs_and_wait, hartid,
+};
+use crate::mm::AddressSpaceRoot;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ProcessControlBlock, SchedPolicy, TaskControlBlock, TaskStatus, INITPROC};
 use crate::timer::get_time;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use core::array;
+#[cfg(feature = "current_task_cache")]
+use core::ptr;
+#[cfg(feature = "current_task_cache")]
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 use lazy_static::*;
 
@@ -22,6 +29,12 @@ use lazy_static::*;
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
     pending_task_release: Option<Arc<TaskControlBlock>>,
+    /// Address space currently installed on this hart.
+    ///
+    /// Idle borrows the last process root instead of switching through the
+    /// permanent kernel page table.  The strong root guard prevents exit/exec
+    /// from reclaiming a root that is still loaded by the hardware walker.
+    active_address_space: Option<AddressSpaceRoot>,
 
     ///The basic control flow of each core, helping to select and switch process
     idle_task_cx: TaskContext,
@@ -32,6 +45,7 @@ impl Processor {
         Self {
             current: None,
             pending_task_release: None,
+            active_address_space: None,
             idle_task_cx: TaskContext::zero_init(),
         }
     }
@@ -55,9 +69,6 @@ impl Processor {
         self.current = Some(task);
     }
 
-    /// Identity of the current task on this hart for the debug invariant
-    /// checker (raw pointer value, no refcount bump).
-    #[cfg(feature = "sched_invariant_checks")]
     pub(super) fn current_ptr(&self) -> Option<usize> {
         self.current.as_ref().map(|t| Arc::as_ptr(t) as usize)
     }
@@ -70,11 +81,32 @@ impl Processor {
     fn take_pending_task_release(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.pending_task_release.take()
     }
+
+    fn replace_active_address_space(&mut self, next: AddressSpaceRoot) -> Option<AddressSpaceRoot> {
+        self.active_address_space.replace(next)
+    }
 }
 
 lazy_static! {
     pub static ref PROCESSORS: [SpinNoIrqLock<Processor>; MAX_HARTS] =
         array::from_fn(|_| SpinNoIrqLock::new(Processor::new()));
+}
+
+#[cfg(feature = "current_task_cache")]
+static CURRENT_TASK_PTRS: [AtomicPtr<TaskControlBlock>; MAX_HARTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; MAX_HARTS];
+
+#[cfg(feature = "current_task_cache")]
+#[inline]
+fn publish_current_task(task: Option<&Arc<TaskControlBlock>>) {
+    let ptr = task.map_or(ptr::null_mut(), |task| Arc::as_ptr(task).cast_mut());
+    CURRENT_TASK_PTRS[hartid()].store(ptr, Ordering::Release);
+}
+
+#[cfg(feature = "current_task_cache")]
+#[inline]
+fn current_task_ptr() -> *mut TaskControlBlock {
+    CURRENT_TASK_PTRS[hartid()].load(Ordering::Acquire)
 }
 
 /// 返回当前 hart 对应的 `Processor` 存储入口。
@@ -90,6 +122,32 @@ pub fn processor_for_hart(hart_id: usize) -> &'static SpinNoIrqLock<Processor> {
     PROCESSORS
         .get(hart_id)
         .unwrap_or_else(|| panic!("hart {} exceeds MAX_HARTS {}", hart_id, MAX_HARTS))
+}
+
+/// Install and pin one address space on the current hart.
+///
+/// The caller supplies a strong root guard before the hardware token changes.
+/// The previous guard is released only after the new root is active, so exit
+/// and exec cannot recycle a page-table root underneath the hardware walker.
+#[inline]
+pub(crate) fn activate_current_address_space(next: AddressSpaceRoot) {
+    let token = next.token();
+    let irqs_were_enabled = crate::hal::local_irqs_enabled();
+    if irqs_were_enabled {
+        unsafe { crate::hal::disable_local_irqs() };
+    }
+    unsafe {
+        if current_address_space_token() != token {
+            activate_address_space(token);
+        }
+    }
+    let previous = current_processor()
+        .lock()
+        .replace_active_address_space(next);
+    drop(previous);
+    if irqs_were_enabled {
+        unsafe { crate::hal::enable_local_irqs() };
+    }
 }
 
 ///The main part of process execution and scheduling
@@ -111,6 +169,14 @@ pub(crate) fn run_tasks() {
             //     task.process.upgrade().unwrap().getpid()
             // );
             let process = task.process.upgrade().unwrap();
+            // Read the PCB's authoritative token instead of the task's cached
+            // trap metadata. During exec the MemorySet is replaced before the
+            // new trap frame/cache is fully constructed, and this task may be
+            // preempted inside that interval.
+            let next_address_space = process
+                .inner_exclusive_access()
+                .memory_set
+                .address_space_root();
             let mut processor = current_processor().lock();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
 
@@ -121,7 +187,7 @@ pub(crate) fn run_tasks() {
             task_inner.sched.last_cpu = hartid();
             task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.on_rq = false;
-            task_inner.sched.resched_reason = None;
+            task.set_resched_reason_locked(&mut task_inner, None);
             if matches!(task_inner.sched.policy, SchedPolicy::Other) {
                 let now_ns = crate::timer::get_time_ns();
                 task_inner.sched.exec_start_ns = now_ns;
@@ -130,9 +196,14 @@ pub(crate) fn run_tasks() {
             drop(task_inner);
 
             processor.current = Some(task);
+            #[cfg(feature = "current_task_cache")]
+            publish_current_task(processor.current.as_ref());
             drop(processor);
             process.resume_in_kernel(get_time());
 
+            // Switch directly from the previously borrowed process root to the
+            // next one. Same-address-space scheduling performs no CSR write.
+            activate_current_address_space(next_address_space);
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
@@ -150,6 +221,13 @@ pub(crate) fn run_tasks() {
                 // fallback before the EXTIOI/PCH-PIC chain is configured.
                 crate::fs::console_receive();
             }
+
+            // A task can become Runnable without being owned by either a
+            // runqueue or a hart if a wake/block transition loses the enqueue.
+            // Scan only from the idle path, where no local task can make
+            // progress anyway; the scanner is internally rate-limited and
+            // re-enqueues every orphan it finds.
+            super::warn_lost_runnable_tasks("idle_no_task");
 
             crate::trap::set_kernel_trap_entry();
 
@@ -182,17 +260,61 @@ fn finish_pending_task_release() {
 
 /// Get current task through take, leaving a None in its place
 pub(crate) fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    current_processor().lock().take_current()
+    let mut processor = current_processor().lock();
+    let task = processor.take_current();
+    #[cfg(feature = "current_task_cache")]
+    publish_current_task(None);
+    task
+}
+
+/// Restore ownership of the running task after a block attempt was cancelled.
+pub(crate) fn restore_current_task(task: Arc<TaskControlBlock>) {
+    let mut processor = current_processor().lock();
+    processor.set_current(task);
+    #[cfg(feature = "current_task_cache")]
+    publish_current_task(processor.current.as_ref());
 }
 
 /// Get a copy of the current task
+#[cfg(not(feature = "current_task_cache"))]
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     current_processor().lock().current()
 }
 
+/// Get a copy of the current task without taking Processor's spinlock.
+///
+/// The Processor-held `Arc` remains the ownership source. Only the owning hart
+/// publishes or clears this pointer, with local interrupts disabled by the
+/// Processor lock. CosmOS does not preempt executing kernel code, so this hart
+/// cannot drop that owner between the load and strong-count increment.
+#[cfg(feature = "current_task_cache")]
+pub fn current_task() -> Option<Arc<TaskControlBlock>> {
+    let ptr = current_task_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
+}
+
 /// get current process
+#[cfg(not(feature = "process_identity_cache"))]
 pub fn current_process() -> Arc<ProcessControlBlock> {
     current_task().unwrap().process.upgrade().unwrap()
+}
+
+/// Get the current process without first constructing a temporary task Arc.
+///
+/// The Processor-owned task Arc cannot disappear while this hart executes
+/// non-preemptible kernel code.  The process itself is still returned as an
+/// owned Arc through the task's Weak pointer.
+#[cfg(feature = "process_identity_cache")]
+pub fn current_process() -> Arc<ProcessControlBlock> {
+    let ptr = current_task_ptr();
+    assert!(!ptr.is_null(), "current process requested without a task");
+    unsafe { (*ptr).process.upgrade().unwrap() }
 }
 
 /// Get the current user address-space token.
@@ -203,6 +325,11 @@ pub fn current_user_token() -> AddressSpaceToken {
 
 /// Get the mutable reference to trap context of current task
 pub fn current_trap_cx() -> &'static mut TrapContext {
+    #[cfg(feature = "trap_context_cache")]
+    {
+        return current_task().unwrap().cached_trap_cx();
+    }
+    #[cfg(not(feature = "trap_context_cache"))]
     current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -211,6 +338,11 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 
 /// get the user virtual address of trap context
 pub fn current_trap_cx_user_va() -> usize {
+    #[cfg(feature = "trap_context_cache")]
+    {
+        return current_task().unwrap().cached_trap_cx_user_va();
+    }
+    #[cfg(not(feature = "trap_context_cache"))]
     current_task()
         .unwrap()
         .inner_exclusive_access()
@@ -234,6 +366,10 @@ pub(crate) fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = current_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
+    // Lazy active-mm: idle keeps the outgoing process root installed. Every
+    // process root contains the kernel mappings needed by the scheduler, and
+    // Processor::active_address_space pins the root until a direct switch to a
+    // different address space has completed.
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }

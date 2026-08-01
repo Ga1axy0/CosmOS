@@ -23,19 +23,206 @@ use crate::sched::{
     on_timer_tick, request_current_task_resched, schedule_if_needed, ReschedReason,
 };
 use crate::signal::{handle_signals, SignalBit, SignalNum};
+#[cfg(target_arch = "riscv64")]
+use crate::syscall::translated_byte_buffer_with_access;
 use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::task::{
     check_fatal_signals_of_current, check_itimers_of_all_processes, current_add_signal,
-    current_process, current_process_is_zombie, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, exit_current_and_run_next, exit_group_current_and_run_next, ExitReason,
+    current_process, current_process_is_zombie, current_task, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    exit_group_current_and_run_next, ExitReason,
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+
+/// Diagnostic-only lmbench-null/getppid path.
+///
+/// This deliberately bypasses accounting, TLB mailbox polling, interrupt
+/// enablement, syscall dispatch, signal delivery and scheduler exit work.  It
+/// is not a production syscall implementation: its only purpose is to measure
+/// how much of `lat_syscall null` is outside the architectural trap entry/exit
+/// plus one snapshot of the current task/process state.
+#[cfg(all(feature = "getpid_path_probe", target_arch = "riscv64"))]
+fn try_getpid_path_probe(trap_info: &crate::hal::traits::TrapInfo) {
+    if !matches!(trap_info.cause, TrapCause::UserSyscall) {
+        return;
+    }
+
+    let task = current_task().expect("getpid probe without a current task");
+    let process = task
+        .process
+        .upgrade()
+        .expect("getpid probe without a current process");
+    let (trap_cx_user_va, trap_cx) = {
+        let task_inner = task.inner_exclusive_access();
+        let trap_cx_user_va = task_inner
+            .res
+            .as_ref()
+            .expect("getpid probe without user resources")
+            .trap_cx_user_va();
+        (trap_cx_user_va, task_inner.get_trap_cx())
+    };
+
+    if trap_cx.syscall_nr() != crate::syscall::SYSCALL_GETPPID {
+        return;
+    }
+
+    let parent_pid = {
+        let parent = process.inner_exclusive_access().parent.clone();
+        parent
+            .and_then(|parent| parent.upgrade())
+            .map_or(0, |parent| parent.getpid())
+    };
+    trap_cx.advance_user_pc(ArchTrapMachine::syscall_instruction_len());
+    trap_cx.set_syscall_ret(parent_pid);
+    trap_cx.in_syscall = true;
+    trap_cx.restartable_syscall = false;
+    trap_cx.set_kernel_hartid(hartid());
+
+    let user_token = process.inner_exclusive_access().get_user_token();
+    #[cfg(not(feature = "trap_stvec_probe"))]
+    set_user_trap_entry();
+    unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn faulting_user_instruction(stval: usize, pc: usize) -> Option<u32> {
+    if stval != 0 {
+        let instruction = stval as u32;
+        return Some(if instruction & 0b11 == 0b11 {
+            instruction
+        } else {
+            instruction & 0xffff
+        });
+    }
+
+    // `stval` is allowed to be zero for illegal-instruction traps.  Read with
+    // execute permission rather than assuming an executable page is also
+    // readable, and collect through the sliced translation so an instruction
+    // spanning two pages remains supported.
+    let read_instruction_bytes = |len: usize| -> Option<u32> {
+        let buffers =
+            translated_byte_buffer_with_access(pc as *const u8, len, PageFaultAccess::Exec).ok()?;
+        let mut bytes = [0u8; 4];
+        let mut copied = 0usize;
+        for buffer in buffers {
+            let copy_len = buffer.len().min(len.saturating_sub(copied));
+            bytes[copied..copied + copy_len].copy_from_slice(&buffer[..copy_len]);
+            copied += copy_len;
+            if copied == len {
+                break;
+            }
+        }
+        (copied == len).then(|| u32::from_le_bytes(bytes))
+    };
+
+    let low = read_instruction_bytes(2)? as u16;
+    if low & 0b11 != 0b11 {
+        Some(low as u32)
+    } else {
+        read_instruction_bytes(4)
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn try_handle_lazy_user_fp(stval: usize) -> bool {
+    let pc = current_trap_cx().user_pc();
+    let Some(instruction) = faulting_user_instruction(stval, pc) else {
+        return false;
+    };
+    let handled =
+        crate::arch::riscv::trap::try_enable_user_fp(&mut current_trap_cx().arch, instruction);
+    if handled {
+        trace!(
+            "[trap] lazy FP enable: hart={} pc={:#x} instruction={:#010x}",
+            hartid(),
+            pc,
+            instruction
+        );
+    }
+    handled
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn try_handle_lazy_user_fp(_stval: usize) -> bool {
+    false
+}
+
+/// Snapshot the address-space state at a user fault.
+///
+/// Trap entry keeps the process address space active. Record both the hardware
+/// token and the process token so diagnostics can verify that invariant and
+/// expose TLB/address-space races.
+fn log_user_fault_mapping(fault_addr: usize) {
+    let process = current_process();
+    let task = current_task();
+    let (tid, thread_id) = task
+        .as_ref()
+        .and_then(|task| {
+            let inner = task.inner_exclusive_access();
+            inner
+                .res
+                .as_ref()
+                .map(|res| (Some(res.tid), Some(res.thread_id)))
+        })
+        .unwrap_or((None, None));
+    let kernel_satp = unsafe { crate::hal::current_address_space_token() };
+    let vpn = crate::mm::VirtAddr::from(fault_addr).floor();
+    let page_offset = fault_addr & (PAGE_SIZE - 1);
+
+    let (user_token, active_user_harts, pte_info, vma_info) = {
+        let inner = process.inner_exclusive_access();
+        let memory_set = &inner.memory_set;
+        let pte_info = memory_set
+            .page_table
+            .translate(vpn)
+            .map(|pte| (pte.bits, pte.ppn().0, pte.flags()));
+        let vma_info = memory_set.find_vma_containing(vpn).map(|vma| {
+            let file_info = vma
+                .file
+                .as_ref()
+                .map(|file| (file.pgoff, file.shared, file.file.path()));
+            (
+                vma.start_vpn().0,
+                vma.end_vpn().0,
+                vma.map_perm,
+                vma.kind.clone(),
+                file_info,
+                vma.file_page_index(vpn),
+            )
+        });
+        (
+            memory_set.token(),
+            memory_set.active_user_harts(),
+            pte_info,
+            vma_info,
+        )
+    };
+
+    error!(
+        "[kernel] user fault mapping: hart={} pid={} tid={:?} thread_id={:?} \
+         addr={:#x} vpn={:#x} page_offset={:#x} kernel_satp={:#x} user_token={:#x} \
+         active_user_harts={:#b} pte={:?} vma={:?}",
+        hartid(),
+        process.getpid(),
+        tid,
+        thread_id,
+        fault_addr,
+        vpn.0,
+        page_offset,
+        kernel_satp,
+        user_token,
+        active_user_harts,
+        pte_info,
+        vma_info,
+    );
+}
 
 /// 输出用户态致命异常现场，区分 fault 地址、用户 PC 与关键寄存器。
 fn log_user_fault(reason: &str, access: &str, fault_addr: usize, signal: &str) {
     let cx = current_trap_cx();
     let summary = cx.fault_dump_summary();
     let detail = cx.fault_dump_detail();
+    log_user_fault_mapping(fault_addr);
     error!(
         "[kernel] user fault: reason={}, access={}, pid={}, fault_addr={:#x}, user_pc={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, {}={:#x}, signal={}",
         reason,
@@ -210,13 +397,37 @@ fn handle_reschedule_ipi() {
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
+    #[cfg(not(all(target_arch = "riscv64", feature = "trap_stvec_probe")))]
     set_kernel_trap_entry();
+    #[cfg(all(target_arch = "riscv64", feature = "trap_stvec_probe"))]
+    {
+        let trap_info = ArchTrapMachine::read_trap_info();
+        try_getpid_path_probe(&trap_info);
+        // Non-getppid traps continue through the normal kernel path.
+        set_kernel_trap_entry();
+    }
+    #[cfg(all(
+        feature = "getpid_path_probe",
+        not(feature = "trap_stvec_probe"),
+        target_arch = "riscv64"
+    ))]
+    {
+        let trap_info = ArchTrapMachine::read_trap_info();
+        try_getpid_path_probe(&trap_info);
+    }
+    // The trampoline has entered kernel mode without changing the process page
+    // table. Ack an older shootdown snapshot before taking locks or relying on
+    // interrupt delivery.
+    #[cfg(not(feature = "trap_tlb_poll_probe"))]
+    crate::mm::poll_pending_shootdown();
+    #[cfg(not(feature = "trap_accounting_probe"))]
     current_process().enter_kernel(get_time());
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::UserSyscall => {
+            #[cfg(not(feature = "trap_irq_guard_probe"))]
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
@@ -229,12 +440,22 @@ pub fn trap_handler() -> ! {
             let result = syscall(syscall_id, syscall_args);
             // cx is changed during sys_execve, so we have to call it again
             cx = current_trap_cx();
+            #[cfg(all(
+                target_arch = "riscv64",
+                any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+            ))]
+            if syscall_id == crate::syscall::SYSCALL_GETPPID && result >= 0 {
+                // x0 has no architectural restore action, so the probe build
+                // can cache ppid+1; zero remains the "not cached" marker.
+                cx.set_reg(0, result as usize + 1);
+            }
             cx.set_syscall_ret(result as usize);
             cx.in_syscall = true;
         }
         TrapCause::StorePageFault => {
+            let _probe = crate::probe_scope!("trap.user_page_fault.store");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
-            debug!(
+            trace!(
                 "[mmap] trap store page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
                 current_trap_cx().user_pc()
@@ -311,6 +532,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::LoadPageFault => {
+            let _probe = crate::probe_scope!("trap.user_page_fault.load");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // debug!(
             //     "[mmap] trap load page fault: bad_addr={:#x} sepc={:#x}",
@@ -357,8 +579,9 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::InstructionPageFault => {
+            let _probe = crate::probe_scope!("trap.user_page_fault.exec");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
-            debug!(
+            trace!(
                 "[mmap] trap instruction page fault: bad_addr={:#x} sepc={:#x}",
                 trap_info.fault_addr,
                 current_trap_cx().user_pc()
@@ -420,13 +643,15 @@ pub fn trap_handler() -> ! {
             current_add_signal(SignalBit::SIGSEGV);
         }
         TrapCause::IllegalInstruction => {
-            log_user_fault(
-                "illegal instruction",
-                "exec",
-                trap_info.fault_addr,
-                "SIGILL",
-            );
-            current_add_signal(SignalBit::SIGILL);
+            if !try_handle_lazy_user_fp(trap_info.fault_addr) {
+                log_user_fault(
+                    "illegal instruction",
+                    "exec",
+                    trap_info.fault_addr,
+                    "SIGILL",
+                );
+                current_add_signal(SignalBit::SIGILL);
+            }
         }
         TrapCause::TimerInterrupt => {
             let _hardirq = irq::HardIrqGuard::enter();
@@ -463,7 +688,30 @@ pub fn trap_handler() -> ! {
     }
     // check signals
     if let Some((signum, msg)) = check_fatal_signals_of_current() {
-        trace!("[kernel] trap_handler: .. check signals {}", msg);
+        let task = current_task();
+        let (tid, thread_id) = task
+            .as_ref()
+            .and_then(|task| {
+                let inner = task.inner_exclusive_access();
+                inner
+                    .res
+                    .as_ref()
+                    .map(|res| (Some(res.tid), Some(res.thread_id)))
+            })
+            .unwrap_or((None, None));
+        let cx = current_trap_cx();
+        warn!(
+            "[signal] fatal signum={} hart={} pid={} tid={:?} thread_id={:?} \
+             reason={} user_pc={:#x} user_sp={:#x}",
+            signum,
+            hartid(),
+            current_process().getpid(),
+            tid,
+            thread_id,
+            msg,
+            cx.user_pc(),
+            cx.user_sp(),
+        );
         exit_current_and_run_next(ExitReason::Signal(signum as u32));
     }
     if current_process_is_zombie() {
@@ -489,6 +737,7 @@ pub fn trap_return() -> ! {
     let trap_cx_user_va = current_trap_cx_user_va();
     current_trap_cx().set_kernel_hartid(hartid());
     let user_token = current_user_token();
+    #[cfg(not(feature = "trap_accounting_probe"))]
     current_process().enter_user(get_time());
     unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
 }
@@ -496,6 +745,27 @@ pub fn trap_return() -> ! {
 /// handle trap from kernel
 #[no_mangle]
 pub fn trap_from_kernel() {
+    trap_from_kernel_impl(None);
+}
+
+/// RISC-V kernel-trap entry carrying the fault-time register frame saved by
+/// `__trap_from_kernel`. LoongArch keeps using the frame-less compatibility
+/// entry above until it grows an equivalent architecture-specific dump.
+#[cfg(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics"))]
+#[no_mangle]
+pub extern "C" fn trap_from_kernel_riscv(
+    frame: *const crate::arch::riscv::trap::RiscvKernelTrapFrame,
+) {
+    trap_from_kernel_impl(Some(frame));
+}
+
+fn trap_from_kernel_impl(
+    #[cfg(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics"))] riscv_frame: Option<
+        *const crate::arch::riscv::trap::RiscvKernelTrapFrame,
+    >,
+    #[cfg(not(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics")))]
+    _riscv_frame: Option<()>,
+) {
     let _hardirq = irq::HardIrqGuard::enter();
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
@@ -527,6 +797,12 @@ pub fn trap_from_kernel() {
             handle_reschedule_ipi();
         }
         _ => {
+            #[cfg(all(target_arch = "riscv64", feature = "kernel_trap_diagnostics"))]
+            if let Some(frame) = riscv_frame {
+                // SAFETY: the RISC-V assembly entry owns this frame until this
+                // handler returns. Fatal traps panic before the frame can escape.
+                unsafe { crate::arch::riscv::trap::log_kernel_trap_frame(frame) };
+            }
             panic!(
                 "Kernel trap: {:?}, fault_addr = {:#x}",
                 trap_info.cause, trap_info.fault_addr

@@ -6,8 +6,59 @@ use super::{
 use crate::config::PAGE_SIZE;
 use crate::hal::traits::{AddressSpaceToken, PTEFlags, PagingArch};
 use alloc::string::String;
-use alloc::vec;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(feature = "cosmos-meminfo")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(feature = "cosmos-meminfo")]
+static PAGE_TABLE_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static PAGE_TABLE_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static PAGE_TABLE_UNTRACKED_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "cosmos-meminfo")]
+#[derive(Clone, Copy, Debug, Default)]
+/// Runtime counters for page-table frame ownership and permanent mappings.
+pub struct PageTableStats {
+    /// Tracked page-table frames allocated through an owned `PageTable`.
+    pub alloc_calls: usize,
+    /// Tracked page-table frames released when an owned `PageTable` is dropped.
+    pub free_calls: usize,
+    /// Page-table frames allocated without ownership tracking (kernel tables).
+    pub untracked_alloc_calls: usize,
+}
+
+/// Reset page-table counters after the boot allocator has been initialized.
+#[cfg(feature = "cosmos-meminfo")]
+pub fn reset_page_table_stats() {
+    PAGE_TABLE_ALLOC_CALLS.store(0, Ordering::Release);
+    PAGE_TABLE_FREE_CALLS.store(0, Ordering::Release);
+    PAGE_TABLE_UNTRACKED_ALLOC_CALLS.store(0, Ordering::Release);
+}
+
+/// Return page-table frame allocation counters.
+#[cfg(feature = "cosmos-meminfo")]
+pub fn page_table_stats() -> PageTableStats {
+    PageTableStats {
+        alloc_calls: PAGE_TABLE_ALLOC_CALLS.load(Ordering::Acquire),
+        free_calls: PAGE_TABLE_FREE_CALLS.load(Ordering::Acquire),
+        untracked_alloc_calls: PAGE_TABLE_UNTRACKED_ALLOC_CALLS.load(Ordering::Acquire),
+    }
+}
+
+#[inline]
+#[cfg(feature = "cosmos-meminfo")]
+fn account_tracked_page_table_alloc() {
+    PAGE_TABLE_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+#[cfg(feature = "cosmos-meminfo")]
+fn account_untracked_page_table_alloc() {
+    PAGE_TABLE_UNTRACKED_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -58,9 +109,48 @@ impl PageTableEntry {
     }
 }
 
+/// Owned root frame of one hardware address space.
+///
+/// A hart may keep a process page table installed while it runs the idle
+/// scheduler.  Keeping the root frame independently reference-counted lets the
+/// process tear down or replace its `MemorySet` without invalidating the
+/// hardware page-table root still loaded by that hart.
+struct PageTableRootFrame {
+    _frame: FrameTracker,
+}
+
+impl Drop for PageTableRootFrame {
+    fn drop(&mut self) {
+        #[cfg(feature = "cosmos-meminfo")]
+        PAGE_TABLE_FREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Strong lifetime guard for a hardware page-table root and its token.
+///
+/// The guard intentionally pins only the root frame.  While a hart is idle it
+/// executes solely through permanent kernel mappings: Sv39 process roots share
+/// the kernel-half directory frames with `KERNEL_SPACE`, and LoongArch kernel
+/// execution uses DMW mappings.  User page-table descendants may therefore be
+/// reclaimed after exit/exec while the old root remains borrowed by idle.
+#[derive(Clone)]
+pub struct AddressSpaceRoot {
+    token: AddressSpaceToken,
+    _root: Arc<PageTableRootFrame>,
+}
+
+impl AddressSpaceRoot {
+    /// Hardware token selecting this root.
+    #[inline]
+    pub fn token(&self) -> AddressSpaceToken {
+        self.token
+    }
+}
+
 /// page table structure
 pub struct PageTable {
     root_ppn: PhysPageNum,
+    root_frame: Option<Arc<PageTableRootFrame>>,
     frames: Vec<FrameTracker>,
 }
 
@@ -68,15 +158,45 @@ impl PageTable {
     /// Create a new page table
     pub fn new() -> Result<Self, MmError> {
         let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+        #[cfg(feature = "cosmos-meminfo")]
+        account_tracked_page_table_alloc();
+        let root_ppn = frame.ppn;
         Ok(PageTable {
-            root_ppn: frame.ppn,
-            frames: vec![frame],
+            root_ppn,
+            root_frame: Some(Arc::new(PageTableRootFrame { _frame: frame })),
+            frames: Vec::new(),
         })
     }
+
+    /// Share the complete Sv39 kernel half from the permanent kernel page
+    /// table. Only this root frame is process-owned; the referenced kernel
+    /// directory frames live for the lifetime of `KERNEL_SPACE`.
+    #[cfg(target_arch = "riscv64")]
+    pub fn share_kernel_half_from(&mut self, kernel: &PageTable) {
+        let entry_count = 1usize << crate::hal::page_table_index_bits();
+        let kernel_start = entry_count / 2;
+        let dst = self.root_ppn.get_pte_array();
+        let src = kernel.root_ppn.get_pte_array();
+        dst[kernel_start..entry_count].copy_from_slice(&src[kernel_start..entry_count]);
+    }
+
+    /// Mark every present Sv39 kernel root entry global. A global non-leaf
+    /// entry makes every translation below it global as well.
+    #[cfg(target_arch = "riscv64")]
+    pub fn mark_kernel_half_global(&mut self) {
+        let entry_count = 1usize << crate::hal::page_table_index_bits();
+        for pte in &mut self.root_ppn.get_pte_array()[entry_count / 2..entry_count] {
+            if pte.is_valid() {
+                pte.bits |= PTEFlags::G.bits() as usize;
+            }
+        }
+    }
+
     /// Temporarily used to get arguments from user space.
     pub fn from_token(token: AddressSpaceToken) -> Self {
         Self {
             root_ppn: PhysPageNum::from(crate::hal::root_ppn_from_token(token)),
+            root_frame: None,
             frames: Vec::new(),
         }
     }
@@ -94,6 +214,8 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+                #[cfg(feature = "cosmos-meminfo")]
+                account_tracked_page_table_alloc();
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 self.frames.push(frame);
             }
@@ -115,6 +237,8 @@ impl PageTable {
             }
             if !pte.is_valid() {
                 let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+                #[cfg(feature = "cosmos-meminfo")]
+                account_untracked_page_table_alloc();
                 pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
                 core::mem::forget(frame);
             }
@@ -151,6 +275,15 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         Ok(())
     }
+    /// Ensure that the leaf page-table slot for `vpn` exists.
+    ///
+    /// This is used by virtual-address relocation paths to preflight all
+    /// intermediate page-table allocations before changing the old mapping.
+    pub fn ensure_leaf(&mut self, vpn: VirtPageNum) -> Result<(), MmError> {
+        self.find_pte_create(vpn)?
+            .ok_or(MmError::NoMapping)
+            .map(|_| ())
+    }
     /// Map a permanent kernel page without recording page-table frames in `frames`.
     pub fn map_kernel_untracked(
         &mut self,
@@ -182,8 +315,14 @@ impl PageTable {
         let pte = &mut self.root_ppn.get_pte_array()[idx];
         if !pte.is_valid() {
             let frame = frame_alloc().unwrap();
+            #[cfg(feature = "cosmos-meminfo")]
+            account_untracked_page_table_alloc();
             pte.bits = crate::hal::make_dir_entry(frame.ppn.0);
             core::mem::forget(frame);
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            pte.bits |= PTEFlags::G.bits() as usize;
         }
         pte.ppn()
     }
@@ -240,6 +379,29 @@ impl PageTable {
     /// get the token from the page table
     pub fn token(&self) -> AddressSpaceToken {
         crate::hal::make_address_space_token(self.root_ppn.0)
+    }
+
+    /// Pin this owned root while a hart may retain it in the hardware walker.
+    pub fn address_space_root(&self, token: AddressSpaceToken) -> AddressSpaceRoot {
+        AddressSpaceRoot {
+            token,
+            _root: Arc::clone(
+                self.root_frame
+                    .as_ref()
+                    .expect("cannot pin a borrowed page-table token"),
+            ),
+        }
+    }
+}
+
+impl Drop for PageTable {
+    fn drop(&mut self) {
+        #[cfg(feature = "cosmos-meminfo")]
+        {
+            // The independently reference-counted root accounts for its own
+            // release when the final active-address-space guard disappears.
+            PAGE_TABLE_FREE_CALLS.fetch_add(self.frames.len(), Ordering::Relaxed);
+        }
     }
 }
 

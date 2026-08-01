@@ -46,6 +46,10 @@ const TIOCSWINSZ: usize = 0x5414;
 const TIOCNOTTY: usize = 0x5422;
 /// `ioctl(TIOCGSID)`：读取该终端所属会话 id。
 const TIOCGSID: usize = 0x5429;
+/// xterm/VT compatible query: report text area size in characters.
+const XTWINOPS_REPORT_CHARS: &[u8] = b"\x1b[18t";
+/// Terminal-response scratch space for `CSI 8 ; rows ; cols t`.
+const WINSIZE_REPORT_MAX_LEN: usize = 32;
 
 /// `TCFLSH` 参数：刷新输入队列。
 const TCIFLUSH: usize = 0;
@@ -260,6 +264,8 @@ impl Default for WinSize {
 struct TtyState {
     termios: Termios,
     winsize: WinSize,
+    winsize_probe_pending: bool,
+    winsize_parser: WinSizeReportParser,
     /// Bytes ready to be returned to a reader (a complete canonical line, or
     /// raw bytes in non-canonical mode).
     input_buf: VecDeque<u8>,
@@ -275,11 +281,41 @@ struct TtyState {
     eof: bool,
 }
 
+#[derive(Clone, Copy)]
+enum WinSizeReportParser {
+    Idle,
+    Esc {
+        len: usize,
+        buf: [u8; WINSIZE_REPORT_MAX_LEN],
+    },
+    Csi {
+        len: usize,
+        buf: [u8; WINSIZE_REPORT_MAX_LEN],
+        field: u8,
+        value: u32,
+        kind: u32,
+        rows: u32,
+        cols: u32,
+    },
+}
+
+impl WinSizeReportParser {
+    const fn idle() -> Self {
+        Self::Idle
+    }
+}
+
 /// One post-processing action produced by feeding a byte through the line
 /// discipline, to be performed after the state lock is dropped.
 enum RxOutcome {
     /// Nothing to do beyond what already happened under the lock.
     None,
+    /// Replay the collected bytes as ordinary tty input after aborting a failed
+    /// terminal-response parse.
+    Replay {
+        buf: [u8; WINSIZE_REPORT_MAX_LEN],
+        len: usize,
+    },
     /// Echo `len` bytes from the accompanying buffer.
     Echo { buf: [u8; 8], len: usize },
     /// Deliver `signal` to the foreground process group, after echoing the
@@ -313,6 +349,8 @@ impl TtyCore {
             state: SpinNoIrqLock::new(TtyState {
                 termios: Termios::default(),
                 winsize: WinSize::default(),
+                winsize_probe_pending: false,
+                winsize_parser: WinSizeReportParser::idle(),
                 input_buf: VecDeque::new(),
                 line_buf: VecDeque::new(),
                 session: 0,
@@ -327,7 +365,9 @@ impl TtyCore {
     /// 创建基于全局 UART 的默认控制台 tty。
     pub fn new_console() -> Self {
         let driver: Arc<dyn CharDevice> = UART.clone();
-        Self::new(driver)
+        let tty = Self::new(driver);
+        tty.request_winsize_probe();
+        tty
     }
 
     /// 是否已有可直接返回给用户的输入字节。
@@ -380,8 +420,34 @@ impl TtyCore {
 
     /// 让一个原始输入字节通过行规程（n_tty 风格）处理。
     fn receive_byte(&self, raw: u8) {
-        match self.process_byte(raw) {
+        match self.process_byte(raw, true) {
             RxOutcome::None => {}
+            RxOutcome::Replay { buf, len } => {
+                for &byte in buf[..len].iter() {
+                    self.receive_replayed_byte(byte);
+                }
+            }
+            RxOutcome::Echo { buf, len } => {
+                self.echo_bytes(&buf[..len]);
+            }
+            RxOutcome::Signal {
+                signal,
+                signum,
+                buf,
+                len,
+            } => {
+                if len > 0 {
+                    self.echo_bytes(&buf[..len]);
+                }
+                self.deliver_foreground_signal(signal, signum);
+            }
+        }
+    }
+
+    fn receive_replayed_byte(&self, raw: u8) {
+        match self.process_byte(raw, false) {
+            RxOutcome::None => {}
+            RxOutcome::Replay { .. } => unreachable!("replayed bytes must skip winsize parsing"),
             RxOutcome::Echo { buf, len } => {
                 self.echo_bytes(&buf[..len]);
             }
@@ -400,8 +466,23 @@ impl TtyCore {
     }
 
     /// 在状态锁内处理单个字节，返回需要在锁外完成的后续动作。
-    fn process_byte(&self, raw: u8) -> RxOutcome {
+    fn process_byte(&self, raw: u8, allow_winsize_parse: bool) -> RxOutcome {
         let mut state = self.state.lock();
+        if allow_winsize_parse {
+            match Self::consume_winsize_report_byte(&mut state, raw) {
+                WinSizeReportResult::NotHandled => {}
+                WinSizeReportResult::Consumed => return RxOutcome::None,
+                WinSizeReportResult::Replay { buf, len } => return RxOutcome::Replay { buf, len },
+                WinSizeReportResult::Resized => {
+                    return RxOutcome::Signal {
+                        signal: SignalBit::SIGWINCH,
+                        signum: SignalNum::SIGWINCH.number(),
+                        buf: [0; 8],
+                        len: 0,
+                    };
+                }
+            }
+        }
         let termios = state.termios;
         let mut ch = raw;
 
@@ -511,6 +592,130 @@ impl TtyCore {
             RxOutcome::Echo { buf, len: echo_len }
         } else {
             RxOutcome::None
+        }
+    }
+
+    fn consume_winsize_report_byte(state: &mut TtyState, raw: u8) -> WinSizeReportResult {
+        let parser = state.winsize_parser;
+        match parser {
+            WinSizeReportParser::Idle => {
+                if !state.winsize_probe_pending || raw != 0x1b {
+                    return WinSizeReportResult::NotHandled;
+                }
+                let mut buf = [0u8; WINSIZE_REPORT_MAX_LEN];
+                buf[0] = raw;
+                state.winsize_parser = WinSizeReportParser::Esc { len: 1, buf };
+                WinSizeReportResult::Consumed
+            }
+            WinSizeReportParser::Esc { mut len, mut buf } => {
+                if len >= buf.len() {
+                    state.winsize_parser = WinSizeReportParser::idle();
+                    state.winsize_probe_pending = false;
+                    return WinSizeReportResult::Replay { buf, len };
+                }
+                buf[len] = raw;
+                len += 1;
+                if raw == b'[' {
+                    state.winsize_parser = WinSizeReportParser::Csi {
+                        len,
+                        buf,
+                        field: 0,
+                        value: 0,
+                        kind: 0,
+                        rows: 0,
+                        cols: 0,
+                    };
+                    WinSizeReportResult::Consumed
+                } else {
+                    state.winsize_parser = WinSizeReportParser::idle();
+                    WinSizeReportResult::Replay { buf, len }
+                }
+            }
+            WinSizeReportParser::Csi {
+                mut len,
+                mut buf,
+                mut field,
+                mut value,
+                mut kind,
+                mut rows,
+                mut cols,
+            } => {
+                if len >= buf.len() {
+                    state.winsize_parser = WinSizeReportParser::idle();
+                    state.winsize_probe_pending = false;
+                    return WinSizeReportResult::Replay { buf, len };
+                }
+                buf[len] = raw;
+                len += 1;
+                match raw {
+                    b'0'..=b'9' => {
+                        value = value.saturating_mul(10).saturating_add((raw - b'0') as u32);
+                        state.winsize_parser = WinSizeReportParser::Csi {
+                            len,
+                            buf,
+                            field,
+                            value,
+                            kind,
+                            rows,
+                            cols,
+                        };
+                        WinSizeReportResult::Consumed
+                    }
+                    b';' => {
+                        match field {
+                            0 => kind = value,
+                            1 => rows = value,
+                            2 => cols = value,
+                            _ => {
+                                state.winsize_parser = WinSizeReportParser::idle();
+                                state.winsize_probe_pending = false;
+                                return WinSizeReportResult::Replay { buf, len };
+                            }
+                        }
+                        field = field.saturating_add(1);
+                        value = 0;
+                        state.winsize_parser = WinSizeReportParser::Csi {
+                            len,
+                            buf,
+                            field,
+                            value,
+                            kind,
+                            rows,
+                            cols,
+                        };
+                        WinSizeReportResult::Consumed
+                    }
+                    b't' => {
+                        state.winsize_probe_pending = false;
+                        state.winsize_parser = WinSizeReportParser::idle();
+                        if field == 2 {
+                            cols = value;
+                            if kind == 8
+                                && rows > 0
+                                && rows <= u16::MAX as u32
+                                && cols > 0
+                                && cols <= u16::MAX as u32
+                            {
+                                let changed = state.winsize.rows != rows as u16
+                                    || state.winsize.cols != cols as u16;
+                                state.winsize.rows = rows as u16;
+                                state.winsize.cols = cols as u16;
+                                return if changed {
+                                    WinSizeReportResult::Resized
+                                } else {
+                                    WinSizeReportResult::Consumed
+                                };
+                            }
+                        }
+                        WinSizeReportResult::Replay { buf, len }
+                    }
+                    _ => {
+                        state.winsize_parser = WinSizeReportParser::idle();
+                        state.winsize_probe_pending = false;
+                        WinSizeReportResult::Replay { buf, len }
+                    }
+                }
+            }
         }
     }
 
@@ -632,8 +837,14 @@ impl TtyCore {
     }
 
     /// 更新当前窗口大小。
-    pub fn set_winsize(&self, winsize: WinSize) {
-        self.state.lock().winsize = winsize;
+    pub fn set_winsize(&self, winsize: WinSize) -> bool {
+        let mut state = self.state.lock();
+        let changed = state.winsize.rows != winsize.rows
+            || state.winsize.cols != winsize.cols
+            || state.winsize.xpixel != winsize.xpixel
+            || state.winsize.ypixel != winsize.ypixel;
+        state.winsize = winsize;
+        changed
     }
 
     /// 读取前台进程组。
@@ -672,6 +883,28 @@ impl TtyCore {
         state.line_buf.clear();
         state.eof = false;
     }
+
+    fn request_winsize_probe(&self) {
+        {
+            let mut state = self.state.lock();
+            if state.winsize_probe_pending {
+                return;
+            }
+            state.winsize_probe_pending = true;
+            state.winsize_parser = WinSizeReportParser::idle();
+        }
+        self.echo_bytes(XTWINOPS_REPORT_CHARS);
+    }
+}
+
+enum WinSizeReportResult {
+    NotHandled,
+    Consumed,
+    Replay {
+        buf: [u8; WINSIZE_REPORT_MAX_LEN],
+        len: usize,
+    },
+    Resized,
 }
 
 lazy_static! {
@@ -881,8 +1114,10 @@ impl File for TtyFile {
             }
             TIOCSWINSZ => {
                 let winsize = *translated_ref(token, arg as *const WinSize).ok_or(ERRNO::EFAULT)?;
-                // TODO: 更新窗口大小后，后续需要补发 SIGWINCH。
-                self.core.set_winsize(winsize);
+                if self.core.set_winsize(winsize) {
+                    self.core
+                        .deliver_foreground_signal(SignalBit::SIGWINCH, SignalNum::SIGWINCH.number());
+                }
                 Ok(0)
             }
             TIOCGPGRP => {

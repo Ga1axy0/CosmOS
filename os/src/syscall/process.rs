@@ -5,20 +5,21 @@ use crate::mm::{
 };
 use crate::sched::{add_task, list_pids, pid2process, remove_from_pid2process};
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::{read_bytes_from_user, read_pod_from_user, write_pod_to_user, Pod};
+use crate::syscall::{
+    read_bytes_from_user, read_cstring_from_user, read_pod_from_user, write_pod_to_user, Pod,
+};
 use crate::syscall_body;
 use crate::timer::get_time_ns;
 use crate::{
     config::PAGE_SIZE,
     fs::{
-        canonicalize, open_file, open_file_at, AccessMode, File, FileDescription, FileStatusFlags,
-        OSInode, OpenFlags, Stat, StatMode,
+        canonicalize, discard_inode, open_file, open_file_at, sync_page_cache_inode, AccessMode,
+        File, FileDescription, FileStatusFlags, OSInode, OpenFlags, Stat, StatMode,
     },
     hal::hartid,
     ipc::{self, IPC_RMID},
-    mm::{translated_ref, translated_str},
     task::{
-        current_process, current_task, current_trap_cx, current_user_token,
+        current_process, current_task, current_trap_cx,
         exit_current_and_run_next, exit_group_current_and_run_next, reclaim_cached_kstacks,
         thread_id2task, CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock,
         ShmAttachment, SigInfo, SignalBit, TaskUserResAlloc, WaitReason,
@@ -35,8 +36,72 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const CAP_SETPCAP: usize = 8;
 const CAP_LAST_CAP: usize = 63;
 const NGROUPS_MAX: usize = 32;
+/// Maximum length of one pathname passed to `execve`.
+const EXEC_PATH_MAX: usize = 4096;
+/// Linux-compatible per-string bound for argv/envp strings.
+const EXEC_ARG_STRING_MAX: usize = 128 * 1024;
 const PR_CAPBSET_READ: i32 = 23;
 const PR_CAPBSET_DROP: i32 = 24;
+
+/// Child state captured without holding the caller's PCB lock.
+///
+/// Process PCB locks must never be nested. In particular, callers must not
+/// hold the parent PCB's `inner` lock while taking a child's `inner` lock:
+/// the exit/reparent path takes the reverse order when it publishes children
+/// to INITPROC.
+#[derive(Clone, Copy, Debug)]
+struct WaitChildSnapshot {
+    pid: usize,
+    ppid: usize,
+    pgid: u32,
+    is_zombie: bool,
+}
+
+/// Snapshot the current child list, then inspect each child after releasing
+/// the parent PCB lock. The returned `Arc`s keep the processes alive while
+/// their state is being examined and while a candidate is revalidated.
+fn snapshot_wait_children(
+    process: &Arc<ProcessControlBlock>,
+) -> Vec<(Arc<ProcessControlBlock>, WaitChildSnapshot)> {
+    let children = {
+        let inner = process.inner_exclusive_access();
+        inner.children.iter().cloned().collect::<Vec<_>>()
+    };
+
+    children
+        .into_iter()
+        .map(|child| {
+            let child_inner = child.inner_exclusive_access();
+            let ppid = child_inner
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid())
+                .unwrap_or(0);
+            let snapshot = WaitChildSnapshot {
+                pid: child.getpid(),
+                ppid,
+                pgid: child_inner.cred.pgid,
+                is_zombie: child_inner.is_zombie,
+            };
+            drop(child_inner);
+            (child, snapshot)
+        })
+        .collect()
+}
+
+fn wait_child_matches(pid: isize, current_pgid: u32, child: WaitChildSnapshot) -> bool {
+    if pid == -1 {
+        return true;
+    }
+    if pid == 0 {
+        return child.pgid == current_pgid;
+    }
+    if pid > 0 {
+        return child.pid == pid as usize;
+    }
+    child.pgid == (-pid) as u32
+}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -76,8 +141,8 @@ fn unprivileged_gid_change_allowed(
 }
 /// `execve` 在解析脚本后得到的最终执行目标。
 struct ResolvedExecImage {
-    /// 最终需要交给 ELF 装载器处理的字节内容。
-    elf_data: Vec<u8>,
+    /// 最终需要交给 ELF 装载器处理的文件对象；装载器按段读取。
+    elf_file: Arc<OSInode>,
     /// 按 shebang 规则重写后的参数列表。
     argv: Vec<String>,
     /// 最终执行映像的绝对路径。
@@ -164,22 +229,45 @@ fn resolve_exec_image(
     }
 
     let abs_path = canonicalize(cwd, path);
-    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
+    // Preserve the filesystem errno.  In particular, exec callers must be
+    // able to distinguish a genuinely missing image from transient I/O or
+    // memory pressure; flattening every lookup failure to ENOENT makes libc
+    // report those failures as the posix_spawn sentinel exit status 127.
+    let inode = open_file_at(cwd, path, OpenFlags::RDONLY)?;
     if inode.is_dir() {
         return Err(ERRNO::EISDIR);
     }
 
+    // A freshly linked program may have been produced through a shared mmap
+    // (for example by lld).  The writer and this exec path can use different
+    // inode handles, so sync the mapping indexed by the stable (fs_id, ino)
+    // key rather than synchronizing unrelated files before probing the
+    // executable.
+    let backing_inode = inode.backing_inode().ok_or(ERRNO::ENOENT)?;
+    sync_page_cache_inode(&backing_inode)?;
+
     // 先仅读取首行，避免在 shebang 脚本路径上无谓地把整个文件搬进内核内存。
-    let (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    let (mut first_line, mut first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+    if !is_elf_image(&first_line) {
+        // The linker may have completed a file through a mapping that was
+        // subsequently flushed, while this inode still has an older clean
+        // first page in the cache.  ENOEXEC would make the shell interpret a
+        // perfectly valid ELF as a script.  Once the first probe is not an
+        // ELF, discard this inode's clean cache and retry from the backing
+        // filesystem; the sync above has already made dirty pages durable.
+        if let Some(backing_inode) = inode.backing_inode() {
+            discard_inode(&backing_inode);
+            (first_line, first_line_complete) = inode.read_first_line_limited(EXEC_PROBE_SIZE);
+        }
+    }
     debug!(
         "First line of exec target: {:?}, complete={}",
         core::str::from_utf8(&first_line).unwrap_or("<invalid utf-8>"),
         first_line_complete
     );
     if is_elf_image(&first_line) {
-        let file_data = inode.read_all();
         return Ok(ResolvedExecImage {
-            elf_data: file_data,
+            elf_file: inode,
             argv,
             exec_path: abs_path,
         });
@@ -244,12 +332,23 @@ pub fn sys_getpid() -> isize {
 
 /// getppid syscall
 pub fn sys_getppid() -> isize {
+    #[cfg(feature = "process_identity_cache")]
+    {
+        let process = current_process();
+        trace!("kernel: sys_getppid pid:{}", process.getpid());
+        return process.getppid_cached() as isize;
+    }
+
+    #[cfg(not(feature = "process_identity_cache"))]
     trace!(
         "kernel: sys_getppid pid:{}",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
+    #[cfg(not(feature = "process_identity_cache"))]
     let process = current_process();
+    #[cfg(not(feature = "process_identity_cache"))]
     let parent = process.inner_exclusive_access().parent.clone();
+    #[cfg(not(feature = "process_identity_cache"))]
     if let Some(parent) = parent.and_then(|parent| parent.upgrade()) {
         parent.getpid() as isize
     } else {
@@ -283,6 +382,36 @@ pub fn sys_getegid() -> isize {
     let process = current_process();
     trace!("kernel: sys_getegid pid:{}", process.getpid());
     process.getegid() as isize
+}
+
+/// getresuid syscall
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        let (real, effective, saved) = {
+            let inner = process.inner_exclusive_access();
+            (inner.cred.uid, inner.cred.euid, inner.cred.suid)
+        };
+        write_pod_to_user(ruid, &real)?;
+        write_pod_to_user(euid, &effective)?;
+        write_pod_to_user(suid, &saved)?;
+        Ok(0)
+    })
+}
+
+/// getresgid syscall
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
+    let process = current_process();
+    syscall_body!({
+        let (real, effective, saved) = {
+            let inner = process.inner_exclusive_access();
+            (inner.cred.gid, inner.cred.egid, inner.cred.sgid)
+        };
+        write_pod_to_user(rgid, &real)?;
+        write_pod_to_user(egid, &effective)?;
+        write_pod_to_user(sgid, &saved)?;
+        Ok(0)
+    })
 }
 
 /// getgroups syscall
@@ -1280,6 +1409,10 @@ bitflags! {
         const CLONE_NEWNET = 0x4000_0000;
         /// Place the child into a cgroup v2 directory fd.
         const CLONE_INTO_CGROUP = 0x2_0000_0000;
+        /// Clear inherited signal handlers in a fork-like child.  The
+        /// current process clone already owns an independent signal table,
+        /// so recognizing this clone3-only flag is sufficient here.
+        const CLONE_CLEAR_SIGHAND = 0x1_0000_0000;
     }
 }
 
@@ -1304,16 +1437,33 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             child_tid,
         } = req;
         let clone_flags_arg = flags | exit_signal;
+        let caller_task = current_task().ok_or(ERRNO::ESRCH)?;
+        let caller_pid = caller_task
+            .process
+            .upgrade()
+            .ok_or(ERRNO::ESRCH)?
+            .getpid();
+        let caller_tid = caller_task
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .ok_or(ERRNO::ESRCH)?
+            .thread_id();
+        let caller_process = current_process();
+        let caller_thread_count = caller_process.thread_count();
         trace!(
             "kernel:pid[{}] sys_clone flags={:#x} stack={:#x} stack_size={:#x}",
-            current_task().unwrap().process.upgrade().unwrap().getpid(),
+            caller_pid,
             clone_flags_arg,
             stack,
             stack_size,
         );
         debug!(
-            "kernel: sys_clone enter flags={:#x} parent_tid={:#x} child_tid={:#x}",
-            clone_flags_arg, parent_tid, child_tid
+            "[clone-diag] enter pid={} caller_tid={} thread_count={} flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x}",
+            caller_pid,
+            caller_tid,
+            caller_thread_count,
+            clone_flags_arg, stack, stack_size, parent_tid, child_tid
         );
 
         let raw_clone_flags = flags & !CLONE_EXIT_SIGNAL_MASK;
@@ -1372,6 +1522,13 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             child_tls = Some(tls);
         }
         let current_process = current_process();
+        if current_process.exec_in_progress() {
+            warn!(
+                "kernel: sys_clone rejected during exec: pid={}",
+                current_process.getpid()
+            );
+            return Err(ERRNO::EAGAIN);
+        }
         if thread_clone {
             let parent_task = current_task().unwrap();
             let (ustack_base, sched_attr, affinity_mask, signal_mask) = {
@@ -1430,6 +1587,11 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 *trap_cx = inherited_cx;
                 trap_cx.set_kernel_sp(new_task.kstack.get_top());
                 trap_cx.set_syscall_ret(0);
+                #[cfg(all(
+                    target_arch = "riscv64",
+                    any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+                ))]
+                trap_cx.set_reg(0, 0);
                 if child_user_sp != 0 {
                     trap_cx.set_user_sp(child_user_sp);
                 }
@@ -1445,11 +1607,35 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             }
             current_process.attach_task(Arc::clone(&new_task));
             add_task(new_task);
+            let process_thread_count = current_process.thread_count();
+            debug!(
+                "[clone-diag] thread child parent_pid={} parent_caller_tid={} new_tid={} inner_tid={} process_thread_count={} flags={:#x}",
+                current_process.getpid(),
+                caller_tid,
+                new_tid,
+                new_inner_tid,
+                process_thread_count,
+                clone_flags_arg
+            );
             Ok(new_tid as isize)
         } else {
             if vfork_clone {
                 debug!("kernel: sys_clone emulate CLONE_VM|CLONE_VFORK as fork-like process clone");
             }
+            // clone3 describes the child stack as a base plus a size, while
+            // the legacy clone path passes the initial stack pointer directly.
+            // The process path must use the stack top just like the thread
+            // path above; otherwise a vfork child starts at the mapping's
+            // lower boundary and its first stack write faults below the VMA.
+            let child_user_sp = if stack_size != 0 {
+                if stack == 0 {
+                    warn!("kernel: sys_clone clone3 stack_size set without a stack base");
+                    return Err(ERRNO::EINVAL);
+                }
+                stack.checked_add(stack_size).ok_or(ERRNO::EINVAL)?
+            } else {
+                stack
+            };
             let mut shared_resources = CloneResourceFlags::empty();
             if flags.contains(CloneFlags::CLONE_VM) {
                 shared_resources.insert(CloneResourceFlags::VM);
@@ -1470,12 +1656,13 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 shared_resources.insert(CloneResourceFlags::NEWNET);
             }
             let new_process = current_process.clone_process(
-                stack,
+                child_user_sp,
                 child_tls,
                 parent_set_tid,
                 child_set_tid,
                 shared_resources,
                 exit_signal as u32,
+                vfork_clone,
             )?;
             let child_pid = new_process.getpid() as i32;
             if let Some(cgroup_fd) = cgroup {
@@ -1492,12 +1679,60 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_tid,
                 child_pid
             );
+            let child_ppid = {
+                let child_inner = new_process.inner_exclusive_access();
+                child_inner
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.upgrade())
+                    .map(|parent| parent.getpid())
+                    .unwrap_or(0)
+            };
+            let child_thread_count = new_process.thread_count();
+            warn!(
+                "[clone-diag] process child parent_pid={} parent_caller_tid={} child_pid={} child_ppid={} child_thread_count={} flags={:#x} clone_parent={} vfork={}",
+                caller_pid,
+                caller_tid,
+                child_pid,
+                child_ppid,
+                child_thread_count,
+                clone_flags_arg,
+                flags.contains(CloneFlags::CLONE_PARENT),
+                vfork_clone
+            );
             if vfork_clone {
-                current_process
-                    .wait_exit_queue
-                    .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
-                        new_process.is_zombie()
-                    });
+                // A vfork parent is released by the child's successful
+                // execve (or by _exit), not only after the child becomes a
+                // zombie.  Keep checking the predicate after every wake: a
+                // signal or another consumer of the shared child wait queue
+                // must not let the parent resume while the child still uses
+                // its CLONE_VM address space.
+                while !new_process.vfork_parent_released() {
+                    new_process.wait_exit_queue.wait_with_reason_or_skip(
+                        WaitReason::ProcessWaitExit(child_pid as isize),
+                        || new_process.vfork_parent_released(),
+                    );
+                    // Linux's vfork completion wait is killable: a fatal
+                    // signal (including a sibling-exec teardown SIGKILL) must
+                    // be allowed to remove this thread instead of deadlocking
+                    // the exec initiator.  Non-fatal/spurious wakes continue
+                    // to wait for the child-owned shared VM to be released.
+                    if crate::task::check_fatal_signals_of_current().is_some() {
+                        warn!(
+                            "[vfork] parent wait interrupted by fatal signal: parent_pid={} child_pid={}",
+                            current_process.getpid(),
+                            child_pid
+                        );
+                        break;
+                    }
+                    if !new_process.vfork_parent_released() {
+                        warn!(
+                            "[vfork] parent woke before child release: parent_pid={} child_pid={}",
+                            current_process.getpid(),
+                            child_pid
+                        );
+                    }
+                }
             }
             Ok(child_pid as isize)
         }
@@ -1596,31 +1831,40 @@ pub fn sys_unshare(flags: usize) -> isize {
 }
 /// sys_execve
 pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
+    let _probe = crate::probe_scope!("syscall.execve");
     trace!(
         "kernel:pid[{}] sys_execve",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, path).or_errno(ERRNO::EFAULT)?;
+        // These helpers prefault lazy anonymous/file-backed pages before
+        // copying from userspace.  Cargo commonly stores Command argv/envp
+        // in cold heap pages, so raw page-table translation is insufficient.
+        let path = read_cstring_from_user(path, EXEC_PATH_MAX)?;
         let mut args_vec: Vec<String> = Vec::new();
         loop {
-            let arg_str_ptr = *translated_ref(token, args).or_errno(ERRNO::EFAULT)?;
+            let arg_str_ptr = read_pod_from_user(args)?;
             if arg_str_ptr == 0 {
                 break;
             }
-            args_vec.push(translated_str(token, arg_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
+            args_vec.push(read_cstring_from_user(
+                arg_str_ptr as *const u8,
+                EXEC_ARG_STRING_MAX,
+            )?);
             unsafe {
                 args = args.add(1);
             }
         }
         let mut envs_vec: Vec<String> = Vec::new();
         loop {
-            let env_str_ptr = *translated_ref(token, envp).or_errno(ERRNO::EFAULT)?;
+            let env_str_ptr = read_pod_from_user(envp)?;
             if env_str_ptr == 0 {
                 break;
             }
-            envs_vec.push(translated_str(token, env_str_ptr as *const u8).or_errno(ERRNO::EFAULT)?);
+            envs_vec.push(read_cstring_from_user(
+                env_str_ptr as *const u8,
+                EXEC_ARG_STRING_MAX,
+            )?);
             unsafe {
                 envp = envp.add(1);
             }
@@ -1654,24 +1898,38 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
         let resolved = match resolve_exec_image(cwd.as_str(), path.as_str(), args_vec, 0) {
             Ok(resolved) => resolved,
             Err(errno) => {
-                if path.contains("acct02") {
-                    debug!(
-                        "[execve] resolve failed pid={} cwd='{}' path='{}': {:?}",
-                        process.getpid(),
-                        cwd,
-                        path,
-                        errno
-                    );
-                }
+                warn!(
+                    "[execve][resolve-failed] pid={} cwd='{}' path='{}' errno={:?}",
+                    process.getpid(),
+                    cwd,
+                    path,
+                    errno
+                );
                 return Err(errno);
             }
         };
         debug!(" ------------------- End Resolve -----------------------");
         let ResolvedExecImage {
-            elf_data,
+            elf_file,
             argv,
             exec_path,
         } = resolved;
+        let caller_tid = current_task()
+            .ok_or(ERRNO::ESRCH)?
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .ok_or(ERRNO::ESRCH)?
+            .thread_id();
+        let thread_count = process.thread_count();
+        debug!(
+            "[exec-diag] pid={} caller_tid={} thread_count={} exec_path='{}' argv_len={}",
+            process.getpid(),
+            caller_tid,
+            thread_count,
+            exec_path,
+            argv.len()
+        );
         if exec_path.contains("acct02") || argv.iter().any(|arg| arg.contains("acct02")) {
             debug!(
                 "[execve] resolved pid={} exec_path='{}' argv={:?}",
@@ -1680,7 +1938,10 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
                 argv
             );
         }
-        process.exec(elf_data.as_slice(), argv, envs_vec, exec_path)?;
+        process.exec(elf_file, argv, envs_vec, exec_path)?;
+        // CLONE_VFORK releases its parent after the new image has been
+        // installed, before returning to the new user image.
+        process.release_vfork_parent();
         // Linux execve succeeds by returning 0 through the trap return path.
         // RISC-V glibc reads argc/argv from the new user stack; a0 is rtld_fini.
         Ok(0)
@@ -1705,9 +1966,20 @@ const WAIT_RECOGNIZED: isize = WNOHANG | WUNTRACED | WCONTINUED | WNOWAIT | W_IN
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -EAGAIN.
 pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize {
+    let _probe = crate::probe_scope!("syscall.wait4");
     trace!("kernel: sys_wait4");
     let process = current_process();
-    syscall_body!({
+    let caller_pid = process.getpid();
+    let children_snapshot = snapshot_wait_children(&process)
+        .into_iter()
+        .map(|(_, child)| (child.pid, child.ppid, child.is_zombie))
+        .collect::<Vec<_>>();
+    warn!(
+        "[wait4-diag] enter caller_pid={} target_pid={} options={:#x} children={:?}",
+        caller_pid, pid, options, children_snapshot
+    );
+
+    let result = syscall_body!({
         // 只在低 32 位上校验选项，避免符号扩展把 `__WCLONE`(0x80000000) 误判为非法位。
         // `WUNTRACED`/`WCONTINUED` 当前没有额外的停止/继续状态可上报（本内核不实现
         // 作业控制停止），按 Linux 语义安全地忽略即可——这正是 shell 前台等待
@@ -1718,77 +1990,117 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
         let current_pgid = process.getpgid();
 
         loop {
-            let mut inner = process.inner_exclusive_access();
-            let matches_wait_pid = |child: &Arc<ProcessControlBlock>| -> bool {
-                if pid == -1 {
-                    return true;
-                }
-                if pid == 0 {
-                    return child.getpgid() == current_pgid;
-                }
-                if pid > 0 {
-                    return child.getpid() == pid as usize;
-                }
-                child.getpgid() == (-pid) as u32
-            };
+            // Snapshot the child list under the parent lock, then inspect each
+            // child after releasing it. No two PCB `inner` locks are nested.
+            let child_snapshots = snapshot_wait_children(&process);
 
             // 1) 没有任何匹配的子进程
-            let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
+            let has_target_child = child_snapshots
+                .iter()
+                .any(|(_, child)| wait_child_matches(pid, current_pgid, *child));
 
             if !has_target_child {
                 return Err(ERRNO::ECHILD);
             }
 
             // 2) 查找已经退出的目标子进程
-            let zombie_idx = inner.children.iter().position(|p| {
-                let p_inner = p.inner_exclusive_access();
-                if !p_inner.is_zombie {
-                    return false;
-                }
-                if pid == -1 {
-                    return true;
-                }
-                if pid == 0 {
-                    return p_inner.cred.pgid == current_pgid;
-                }
-                if pid > 0 {
-                    return p.getpid() == pid as usize;
-                }
-                p_inner.cred.pgid == (-pid) as u32
-            });
+            let zombie_child = child_snapshots
+                .iter()
+                .find(|(_, child)| child.is_zombie && wait_child_matches(pid, current_pgid, *child))
+                .map(|(child, _)| Arc::clone(child));
 
-            if let Some(idx) = zombie_idx {
-                let child = inner.children.remove(idx);
+            if let Some(zombie_child) = zombie_child {
+                // Claim the child from the parent list without taking the
+                // child's lock. A concurrent reaper may have won the race;
+                // in that case simply rescan the child list.
+                let child = {
+                    let mut inner = process.inner_exclusive_access();
+                    let Some(idx) = inner
+                        .children
+                        .iter()
+                        .position(|candidate| Arc::ptr_eq(candidate, &zombie_child))
+                    else {
+                        continue;
+                    };
+                    inner.children.remove(idx)
+                };
                 let found_pid = child.getpid();
-                // warn_heap_state("reap_begin", found_pid);
-                let child_inner = child.inner_exclusive_access();
-                // 编码为wstatus
-                let exit_status = match child_inner.exit_reason {
-                    ExitReason::Exit(code) => (code & 0xff) << 8,
-                    ExitReason::Signal(signum) => {
-                        // 低 7 位为终止信号；若该信号默认动作会转储核心，
-                        // 置上 0x80（WCOREDUMP）以满足 `WCOREDUMP(status)`。
-                        let mut status = (signum & 0x7f) as i32;
-                        let dumps_core = crate::signal::SignalNum::from_number(signum)
-                            .map(|sig| sig.dumps_core())
-                            .unwrap_or(false);
-                        if dumps_core {
-                            status |= 0x80;
-                        }
-                        status
+                // Read the child's exit data only after releasing the parent
+                // lock. Revalidate the snapshot in case of a concurrent race.
+                let child_data = {
+                    let child_inner = child.inner_exclusive_access();
+                    let child_snapshot = WaitChildSnapshot {
+                        pid: found_pid,
+                        ppid: 0,
+                        pgid: child_inner.cred.pgid,
+                        is_zombie: child_inner.is_zombie,
+                    };
+                    if !child_inner.is_zombie
+                        || !wait_child_matches(pid, current_pgid, child_snapshot)
+                    {
+                        None
+                    } else {
+                        // 编码为wstatus
+                        let exit_status = match child_inner.exit_reason {
+                            ExitReason::Exit(code) => (code & 0xff) << 8,
+                            ExitReason::Signal(signum) => {
+                                // 低 7 位为终止信号；若该信号默认动作会转储核心，
+                                // 置上 0x80（WCOREDUMP）以满足 `WCOREDUMP(status)`。
+                                let mut status = (signum & 0x7f) as i32;
+                                let dumps_core = crate::signal::SignalNum::from_number(signum)
+                                    .map(|sig| sig.dumps_core())
+                                    .unwrap_or(false);
+                                if dumps_core {
+                                    status |= 0x80;
+                                }
+                                status
+                            }
+                        };
+                        Some((
+                            exit_status,
+                            child_inner.user_time,
+                            child_inner.child_user_time,
+                            child_inner.kernel_time,
+                            child_inner.child_kernel_time,
+                        ))
                     }
                 };
-                inner.child_user_time = inner
-                    .child_user_time
-                    .saturating_add(child_inner.user_time)
-                    .saturating_add(child_inner.child_user_time);
-                inner.child_kernel_time = inner
-                    .child_kernel_time
-                    .saturating_add(child_inner.kernel_time)
-                    .saturating_add(child_inner.child_kernel_time);
-                let no_remaining_children = inner.children.is_empty();
-                drop(child_inner);
-                drop(inner);
+
+                let Some((
+                    exit_status,
+                    child_user_time,
+                    child_child_user_time,
+                    child_kernel_time,
+                    child_child_kernel_time,
+                )) = child_data
+                else {
+                    // The child was claimed based on a stale snapshot. Restore
+                    // it without taking its lock and rescan on the next loop.
+                    let mut inner = process.inner_exclusive_access();
+                    if !inner
+                        .children
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, &child))
+                    {
+                        inner.children.push(child);
+                    }
+                    continue;
+                };
+
+                // Update parent accounting after releasing the child lock.
+                let no_remaining_children = {
+                    let mut inner = process.inner_exclusive_access();
+                    inner.child_user_time = inner
+                        .child_user_time
+                        .saturating_add(child_user_time)
+                        .saturating_add(child_child_user_time);
+                    inner.child_kernel_time = inner
+                        .child_kernel_time
+                        .saturating_add(child_kernel_time)
+                        .saturating_add(child_child_kernel_time);
+                    inner.children.is_empty()
+                };
+
                 unregister_file_mappings_for_process(&child);
                 remove_from_pid2process(found_pid);
                 drop(child);
@@ -1814,41 +2126,35 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 return Ok(0);
             }
 
-            // 4) 阻塞等待；这里必须先释放 inner，再检查信号/睡眠。
-            drop(inner);
+            // 4) 阻塞等待；谓词同样使用无嵌套锁的快照。
             if crate::signal::has_interrupting_signal() {
                 return Err(ERRNO::EINTR);
             }
 
-            process
-                .wait_exit_queue
-                .wait_with_reason_or_skip(WaitReason::ProcessWaitExit, || {
-                    let inner = process.inner_exclusive_access();
-                    let has_target_child = inner.children.iter().any(|p| matches_wait_pid(p));
-                    let has_target_zombie = inner.children.iter().any(|p| {
-                        let p_inner = p.inner_exclusive_access();
-                        if !p_inner.is_zombie {
-                            return false;
-                        }
-                        if pid == -1 {
-                            return true;
-                        }
-                        if pid == 0 {
-                            return p_inner.cred.pgid == current_pgid;
-                        }
-                        if pid > 0 {
-                            return p.getpid() == pid as usize;
-                        }
-                        p_inner.cred.pgid == (-pid) as u32
+            process.wait_exit_queue.wait_with_reason_or_skip(
+                WaitReason::ProcessWaitExit(pid),
+                || {
+                    let child_snapshots = snapshot_wait_children(&process);
+                    let has_target_child = child_snapshots
+                        .iter()
+                        .any(|(_, child)| wait_child_matches(pid, current_pgid, *child));
+                    let has_target_zombie = child_snapshots.iter().any(|(_, child)| {
+                        child.is_zombie && wait_child_matches(pid, current_pgid, *child)
                     });
                     !has_target_child || has_target_zombie
-                });
+                },
+            );
 
             // Re-scan child state after every wake. A child exit can also queue
             // a user-handled signal, but wait status must win over EINTR.
             continue;
         }
-    })
+    });
+    warn!(
+        "[wait4-diag] exit caller_pid={} target_pid={} result={}",
+        caller_pid, pid, result
+    );
+    result
 }
 
 /// kill syscall.
@@ -1981,9 +2287,8 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    let token = current_user_token();
     syscall_body!({
-        let path = translated_str(token, _path).or_errno(ERRNO::EFAULT)?;
+        let path = read_cstring_from_user(_path, EXEC_PATH_MAX)?;
         let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_errno(ERRNO::ENOENT)?;
         let parent = current_process();
         let all_data = app_inode.read_all();

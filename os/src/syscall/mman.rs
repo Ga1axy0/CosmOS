@@ -91,6 +91,11 @@ bitflags! {
     }
 }
 
+/// `mremap(2)` flags supported by this kernel.
+const MREMAP_MAYMOVE: usize = 1;
+const MREMAP_FIXED: usize = 2;
+const MREMAP_DONTUNMAP: usize = 4;
+
 const MS_ASYNC: i32 = 1;
 const MS_INVALIDATE: i32 = 2;
 const MS_SYNC: i32 = 4;
@@ -123,6 +128,7 @@ pub fn sys_mmap(
     fd: usize,
     offset: usize,
 ) -> isize {
+    let _probe = crate::probe_scope!("syscall.mmap");
     trace!(
         "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -208,7 +214,7 @@ pub fn sys_mmap(
         }
         let map_addr = if addr == 0 {
             // Linux-style mmap(NULL, ...): choose a free user VA automatically.
-            let (chosen, chosen_end, hint) = {
+            let (chosen, chosen_end, hint, token, tlb_mask) = {
                 let mut inner = process.inner_exclusive_access();
                 inner.ensure_address_space_capacity(len_aligned)?;
                 let hint = inner.vm_layout.mmap_hint;
@@ -237,8 +243,28 @@ pub fn sys_mmap(
                 };
                 mapped.map_err(|_| ERRNO::ENOMEM)?;
                 inner.vm_layout.mmap_hint = chosen_end;
-                (chosen, chosen_end, hint)
+                // MAP_SHARED anonymous mappings are eagerly populated.  The
+                // fixed-address path goes through ProcessControlBlock::mmap,
+                // but this atomic choose-and-map path must publish the same
+                // TLB generation before releasing process-inner.
+                let (token, tlb_mask) = if file_desc.is_none() && is_shared {
+                    (
+                        inner.memory_set.token(),
+                        inner.memory_set.record_local_tlb_change(),
+                    )
+                } else {
+                    (0, 0)
+                };
+                (chosen, chosen_end, hint, token, tlb_mask)
             };
+            if tlb_mask != 0 {
+                crate::mm::shootdown_range(
+                    tlb_mask,
+                    crate::hal::address_space_id_from_token(token),
+                    chosen,
+                    chosen_end,
+                );
+            }
             debug!(
                 "[mmap-debug] auto-selected pid={} start={:#x} end={:#x} hint_in={:#x} hint_out={:#x} file_backed={} shared={} lazy={}",
                 pid,
@@ -339,6 +365,120 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
             // Unmapping an invalid/unmapped range is treated as ENOMEM.
             Err(ERRNO::ENOMEM)
         }
+    })
+}
+
+/// Resize or relocate an existing mmap-style mapping.
+///
+/// The first implementation supports the traditional MAYMOVE/FIXED modes.
+/// DONTUNMAP deliberately returns EOPNOTSUPP because preserving the old
+/// mapping while installing the new one needs separate VMA alias semantics.
+pub fn sys_mremap(
+    old_addr: usize,
+    old_len: usize,
+    new_len: usize,
+    flags: usize,
+    new_addr: usize,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_mremap",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let supported = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
+        if flags & MREMAP_DONTUNMAP != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        if flags & !supported != 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+        if old_addr & (PAGE_SIZE - 1) != 0 || old_addr >= USER_SPACE_END {
+            return Err(ERRNO::EINVAL);
+        }
+        if old_len == 0 || new_len == 0 {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let old_len =
+            old_len.checked_add(PAGE_SIZE - 1).ok_or(ERRNO::EOVERFLOW)? & !(PAGE_SIZE - 1);
+        let new_len =
+            new_len.checked_add(PAGE_SIZE - 1).ok_or(ERRNO::EOVERFLOW)? & !(PAGE_SIZE - 1);
+        let old_end = old_addr.checked_add(old_len).ok_or(ERRNO::EOVERFLOW)?;
+        if old_end > USER_SPACE_END {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let process = current_process();
+        let old_start = VirtAddr::from(old_addr);
+        let old_end_va = VirtAddr::from(old_end);
+
+        if flags & MREMAP_FIXED != 0 {
+            if new_addr == 0 || new_addr & (PAGE_SIZE - 1) != 0 || new_addr >= USER_SPACE_END {
+                return Err(ERRNO::EINVAL);
+            }
+            let new_end = new_addr.checked_add(new_len).ok_or(ERRNO::EOVERFLOW)?;
+            if new_end > USER_SPACE_END {
+                return Err(ERRNO::EINVAL);
+            }
+            let result = process.mremap(
+                old_start,
+                old_end_va,
+                VirtAddr::from(new_addr),
+                VirtAddr::from(new_end),
+            )?;
+            return Ok(result as isize);
+        }
+
+        let new_end_in_place = old_addr.checked_add(new_len).ok_or(ERRNO::EOVERFLOW)?;
+        if flags & MREMAP_MAYMOVE == 0 || new_len <= old_len {
+            let result = process.mremap(
+                old_start,
+                old_end_va,
+                old_start,
+                VirtAddr::from(new_end_in_place),
+            )?;
+            return Ok(result as isize);
+        }
+
+        // Linux normally keeps the old address when the mapping can grow in
+        // place.  If the range is occupied, select a new free range below.
+        match process.mremap(
+            old_start,
+            old_end_va,
+            old_start,
+            VirtAddr::from(new_end_in_place),
+        ) {
+            Ok(result) => return Ok(result as isize),
+            Err(ERRNO::ENOMEM) => {}
+            Err(err) => return Err(err),
+        }
+
+        let new_addr = {
+            let inner = process.inner_exclusive_access();
+            inner
+                .memory_set
+                .find_free_mmap_area(
+                    inner.vm_layout.mmap_hint,
+                    inner.vm_layout.mmap_base,
+                    new_len,
+                )
+                .ok_or(ERRNO::ENOMEM)?
+        };
+        let new_end = new_addr.checked_add(new_len).ok_or(ERRNO::EOVERFLOW)?;
+        let result = process.mremap(
+            old_start,
+            old_end_va,
+            VirtAddr::from(new_addr),
+            VirtAddr::from(new_end),
+        )?;
+        {
+            let mut inner = process.inner_exclusive_access();
+            inner.vm_layout.mmap_hint = new_end;
+        }
+        Ok(result as isize)
     })
 }
 

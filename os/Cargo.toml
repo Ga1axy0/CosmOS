@@ -10,7 +10,6 @@ edition = "2021"
 riscv = { path = "../vendor/riscv", features = ["inline-asm"] }
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 log = "0.4"
-buddy_system_allocator = "0.6"
 bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
@@ -40,6 +39,41 @@ net_perf_counters = []
 mm_perf_counters = []
 oom_diagnostics = []
 perf_probe = []
+# Diagnostic-only getpid path used to bound generic trap/syscall overhead.
+# It is never enabled by the normal build.
+getpid_path_probe = []
+# Assembly-only variants of the same diagnostic.  The first never enters the
+# kernel page table; the second bounces user -> kernel -> user before restoring.
+getpid_asm_probe = []
+getpid_asm_satp_probe = []
+# Publish the current task in a per-hart atomic pointer so read-side lookups do
+# not acquire Processor's irq-disabling spinlock.
+current_task_cache = []
+# Cache process identity on top of current_task_cache.  This is kept separate
+# while benchmarking so the cost of each lookup layer can be measured.
+process_identity_cache = ["current_task_cache"]
+# Lock-free hints for the common no-signal/no-reschedule/non-zombie return path.
+return_work_cache = ["process_identity_cache"]
+# Snapshot immutable-per-exec trap metadata on the TCB, avoiding repeated TCB
+# and PCB locks in the common trap path.
+trap_context_cache = ["return_work_cache"]
+# Diagnostic-only bound for the per-trap process accounting and active-user
+# address-space bookkeeping. Never enable in a production kernel.
+trap_accounting_probe = ["return_work_cache"]
+# Diagnostic-only bound for polling the global TLB-shootdown mailbox on every
+# user trap. This is safe only for the controlled single-hart benchmark.
+trap_tlb_poll_probe = ["trap_accounting_probe"]
+# Diagnostic-only bound for the per-syscall interrupt-enable guard. This is
+# safe only for a nonblocking syscall in the controlled benchmark.
+trap_irq_guard_probe = ["trap_context_cache"]
+# Diagnostic-only bound for the two stvec writes around the minimal Rust
+# getppid probe. Other syscalls still install the kernel vector normally.
+trap_stvec_probe = ["getpid_path_probe"]
+# Diagnostic-only bound for the two active-user-hart mask updates nested in
+# process accounting. Safe only when the benchmark does not edit page tables.
+trap_active_harts_probe = ["trap_context_cache"]
 legacy-vdb-names = []
 sched_invariant_checks = []
+kernel_trap_diagnostics = []
+cosmos-meminfo = []
 default = ["ext4", "platform-qemu-virt", "net_perf_counters", "mm_perf_counters", "legacy-vdb-names"]

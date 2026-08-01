@@ -6,20 +6,20 @@ use super::WaitQueue;
 use super::{insert_into_tid2task, SchedAttr, TaskControlBlock};
 use super::{pid_alloc, PidHandle};
 use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
-use crate::config::PAGE_SIZE;
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{
     canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription,
-    OpenFlags,
+    OSInode, OpenFlags,
 };
 use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
 use crate::mm::{
-    register_file_mapping, shootdown, translated_refmut, DeferredUserReclaim, InodeKey,
-    MapPermission, MemorySet, MmError, PageFaultAccess, PageFaultHandled, ShootdownKind,
-    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
+    register_file_mapping, shootdown, shootdown_page, shootdown_range, translated_refmut,
+    DeferredUserReclaim, FilePageFaultPrepare, InodeKey, MapPermission, MemorySet, MmError,
+    PageFaultAccess, PageFaultHandled, ShootdownKind, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
-use crate::sched::add_task;
 use crate::sched::insert_into_pid2process;
+use crate::sched::{add_task, current_task};
 use crate::sync::{Condvar, DeadlockDetector, Mutex, Semaphore, SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::{write_pod_to_process_user, ResourceLimits};
@@ -29,10 +29,12 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// 新进程默认文件创建掩码，贴近常见 Linux 用户态环境。
 const DEFAULT_UMASK: u32 = 0o022;
+/// Match Linux's default 64 KiB file fault-around span on 4 KiB pages.
+const FILE_FAULT_AROUND_PAGES: usize = 32;
 
 const INIT_CWD: &str = "/root";
 const INIT_INTERPRETER_MAX_DEPTH: usize = 4;
@@ -50,11 +52,23 @@ const INIT_ENV: &[&str] = &[
     "PWD=/root",
 ];
 
+/// Prevent thread creation from racing with a process-wide `execve` transition.
+struct ExecInProgressGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for ExecInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 fn mm_error_to_errno(err: MmError) -> ERRNO {
     match err {
         MmError::OutOfMemory => ERRNO::ENOMEM,
         MmError::InvalidRange => ERRNO::EINVAL,
         MmError::Conflict => ERRNO::EACCES,
+        MmError::AddressUnavailable => ERRNO::ENOMEM,
         MmError::NoMapping => ERRNO::EFAULT,
         MmError::PermissionDenied => ERRNO::EFAULT,
         MmError::BeyondFileEnd => ERRNO::ENXIO,
@@ -71,7 +85,6 @@ bitflags! {
 }
 
 /// fd 表中的单个表项，区分 fd 自身标志与底层文件对象。
-#[derive(Clone)]
 pub struct FdEntry {
     /// 当前 fd 引用的打开文件描述。
     pub desc: Arc<FileDescription>,
@@ -82,10 +95,26 @@ pub struct FdEntry {
 impl FdEntry {
     /// 基于文件对象创建默认 fd 表项。
     pub fn new(desc: Arc<FileDescription>) -> Self {
-        Self {
-            desc,
-            // TODO: 后续补齐 `fcntl/open(O_CLOEXEC)` 后，应在创建时设置真实 fd 标志位。
-            flags: FdFlags::empty(),
+        Self::with_flags(desc, FdFlags::empty())
+    }
+
+    /// 基于文件对象和 fd-local flags 创建表项。
+    pub fn with_flags(desc: Arc<FileDescription>, flags: FdFlags) -> Self {
+        desc.retain_fd_ref();
+        Self { desc, flags }
+    }
+}
+
+impl Clone for FdEntry {
+    fn clone(&self) -> Self {
+        Self::with_flags(Arc::clone(&self.desc), self.flags)
+    }
+}
+
+impl Drop for FdEntry {
+    fn drop(&mut self) {
+        if self.desc.release_fd_ref() {
+            crate::fs::epoll::notify_file_description_closed(self.desc.identity());
         }
     }
 }
@@ -159,12 +188,27 @@ enum Auxv {
 pub struct ProcessControlBlock {
     /// immutable
     pub pid: PidHandle,
+    /// Parent PID read by getppid without taking the large PCB lock.
+    #[cfg(feature = "process_identity_cache")]
+    parent_pid: AtomicUsize,
+    /// Lock-free hint for another thread observing process exit on trap return.
+    #[cfg(feature = "return_work_cache")]
+    zombie_work_pending: AtomicBool,
     /// Signal delivered to the parent when this process exits.
     pub clone_exit_signal: u32,
     /// mutable
     inner: SpinNoIrqLock<ProcessControlBlockInner>,
     /// wait queue for wait4/waitpid
     pub wait_exit_queue: Arc<WaitQueue>,
+    /// Whether a parent blocked by CLONE_VFORK may resume.
+    ///
+    /// This is separate from `is_zombie`: a vfork parent is released after
+    /// the child successfully execs, while the child may continue running.
+    /// It starts as `true` for ordinary processes so their exec/exit paths do
+    /// not spuriously wake normal waitpid callers.
+    vfork_released: AtomicBool,
+    /// Whether this process is currently replacing its image with `execve`.
+    exec_in_progress: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -518,7 +562,7 @@ fn init_user_stack_from_strings(
 }
 
 struct ResolvedInitImage {
-    elf_data: Vec<u8>,
+    elf_file: Arc<OSInode>,
     argv: Vec<String>,
 }
 
@@ -583,7 +627,7 @@ fn resolve_init_image(
     let (first_line, first_line_complete) = inode.read_first_line_limited(INIT_PROBE_SIZE);
     if is_elf_image(&first_line) {
         return Ok(ResolvedInitImage {
-            elf_data: inode.read_all(),
+            elf_file: inode,
             argv,
         });
     }
@@ -616,11 +660,11 @@ fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
 }
 
 fn load_process_image(
-    elf_data: &[u8],
+    elf_file: Arc<OSInode>,
     cwd: &str,
 ) -> Result<(MemorySet, UserSpaceLayout, usize, Vec<(Auxv, usize)>), ERRNO> {
     let (mut memory_set, user_layout, app_load_info) =
-        MemorySet::from_elf(elf_data).map_err(mm_error_to_errno)?;
+        MemorySet::from_elf_file(Arc::clone(&elf_file)).map_err(mm_error_to_errno)?;
 
     let (final_entry, auxv_extra) = if let Some(interp_path) = &app_load_info.interp_path {
         debug!(
@@ -640,59 +684,12 @@ fn load_process_image(
             return Err(ERRNO::EISDIR);
         }
 
-        let interp_data = interp_inode.read_all();
-        let interp_elf = xmas_elf::ElfFile::new(&interp_data).map_err(|_| ERRNO::ENOEXEC)?;
-        let interp_entry = interp_elf.header.pt2.entry_point() as usize;
-        let ph_count = interp_elf.header.pt2.ph_count();
         let interp_base = crate::config::INTERP_BASE;
         debug!("Loading interpreter at base address: {:#x}", interp_base);
-        debug!("Interpreter original entry: {:#x}", interp_entry);
-
-        for i in 0..ph_count {
-            let ph = interp_elf.program_header(i).map_err(|_| ERRNO::ELIBBAD)?;
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (interp_base + ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr =
-                    (interp_base + (ph.virtual_addr() + ph.mem_size()) as usize).into();
-                let mut map_perm = MapPermission::U;
-                let ph_flags = ph.flags();
-                if ph_flags.is_read() {
-                    map_perm |= MapPermission::R;
-                }
-                if ph_flags.is_write() {
-                    map_perm |= MapPermission::W;
-                }
-                if ph_flags.is_execute() {
-                    map_perm |= MapPermission::X;
-                }
-
-                debug!(
-                    "mapping interpreter segment: [{:#x}, {:#x}) with flags {:?}",
-                    usize::from(start_va),
-                    usize::from(end_va),
-                    map_perm
-                );
-
-                let vma = Vma::new_elf(start_va, end_va, map_perm);
-                let page_off = start_va.page_offset();
-                let raw =
-                    &interp_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize];
-                let padded: Vec<u8>;
-                let seg_data: &[u8] = if page_off != 0 {
-                    let mut buf = alloc::vec![0u8; page_off + raw.len()];
-                    buf[page_off..].copy_from_slice(raw);
-                    padded = buf;
-                    &padded
-                } else {
-                    raw
-                };
-                memory_set
-                    .insert_vma(vma, Some(seg_data))
-                    .map_err(mm_error_to_errno)?;
-            }
-        }
-
-        let relocated_entry = interp_base + interp_entry;
+        let (interp_load_info, _) = memory_set
+            .load_elf_file_at(&interp_inode, Some(interp_base))
+            .map_err(mm_error_to_errno)?;
+        let relocated_entry = interp_load_info.entry_point;
         debug!("Interpreter relocated entry: {:#x}", relocated_entry);
         debug!(
             "App PHDR vaddr: {:#x}, phnum: {}",
@@ -834,14 +831,6 @@ impl ProcessControlBlockInner {
     pub fn dealloc_tid(&mut self, tid: usize) {
         self.task_res_allocator.dealloc(tid)
     }
-    /// the count of tasks(threads) in this process
-    pub fn thread_count(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter_map(|task| task.as_ref())
-            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
-            .count()
-    }
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
@@ -856,6 +845,24 @@ impl ProcessControlBlock {
     /// inner_exclusive_access
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
+    }
+
+    /// Return the number of live tasks without nesting process-inner and
+    /// task-inner.  Snapshot the task Arcs first, then inspect each task after
+    /// releasing the PCB lock.
+    pub fn thread_count(&self) -> usize {
+        let tasks = {
+            let inner = self.inner.lock();
+            inner
+                .tasks
+                .iter()
+                .filter_map(|slot| slot.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        tasks
+            .iter()
+            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
+            .count()
     }
 
     /// Apply this process's effective time namespace offset to CLOCK_MONOTONIC.
@@ -983,8 +990,19 @@ impl ProcessControlBlock {
         let res = task_inner.res.as_ref().unwrap();
         let tid = res.tid;
         let thread_id = res.thread_id();
+        let thread_pending = task_inner.pending_signals;
+        let signal_mask = task_inner.signal_mask;
+        let restore_mask = task_inner.signal_mask_backup.is_some();
         drop(task_inner);
         let mut inner = self.inner_exclusive_access();
+        if crate::signal::signal_work_needed(
+            thread_pending,
+            inner.pending_signals,
+            signal_mask,
+            restore_mask,
+        ) {
+            task.mark_signal_work_pending();
+        }
         while inner.tasks.len() <= tid {
             inner.tasks.push(None);
         }
@@ -1001,7 +1019,7 @@ impl ProcessControlBlock {
         let resolved = resolve_init_image("/", exec_path.as_str(), init_argv, 0)
             .expect("failed to resolve init image");
         let (memory_set, user_layout, entry_point, auxv_extra) =
-            load_process_image(resolved.elf_data.as_slice(), "/")
+            load_process_image(resolved.elf_file, "/")
                 .expect("failed to build init process address space");
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
@@ -1014,6 +1032,10 @@ impl ProcessControlBlock {
         cred.pgid = pid_handle.0 as u32;
         let process = Arc::new(Self {
             pid: pid_handle,
+            #[cfg(feature = "process_identity_cache")]
+            parent_pid: AtomicUsize::new(0),
+            #[cfg(feature = "return_work_cache")]
+            zombie_work_pending: AtomicBool::new(false),
             clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1064,6 +1086,8 @@ impl ProcessControlBlock {
                 shm_attachments: Vec::new(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
+            vfork_released: AtomicBool::new(true),
+            exec_in_progress: AtomicBool::new(false),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = process
@@ -1094,35 +1118,73 @@ impl ProcessControlBlock {
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // publish main thread to scheduler only after the process/task state is fully initialized
         add_task(task);
+        #[cfg(feature = "cosmos-meminfo")]
+        super::account_process_create();
         process
     }
 
-    /// Only support processes with a single thread.
+    /// Replace this process's image with `execve` semantics.
+    ///
+    /// The current implementation supports the common case where the process
+    /// leader calls `execve`: sibling threads are terminated first and the
+    /// leader is retained as the sole thread.  A non-leader caller is rejected
+    /// for now because the rest of the task lifecycle still assumes tid 0 is
+    /// the process leader.
     pub fn exec(
         self: &Arc<Self>,
-        elf_data: &[u8],
+        elf_file: Arc<OSInode>,
         args: Vec<String>,
         envs: Vec<String>,
         exec_path: String,
     ) -> Result<(), ERRNO> {
         trace!("kernel: exec");
-        assert_eq!(self.inner_exclusive_access().thread_count(), 1);
+        let task = current_task().ok_or(ERRNO::ESRCH)?;
+        let caller_tid = task
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .ok_or(ERRNO::ESRCH)?
+            .tid;
+        if caller_tid != 0 {
+            warn!(
+                "kernel: exec from non-leader thread is not supported: pid={} tid={}",
+                self.getpid(),
+                caller_tid
+            );
+            return Err(ERRNO::EINVAL);
+        }
+        if self
+            .exec_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            warn!("kernel: concurrent exec rejected: pid={}", self.getpid());
+            return Err(ERRNO::EAGAIN);
+        }
+        let _exec_guard = ExecInProgressGuard {
+            flag: &self.exec_in_progress,
+        };
+        let owner_pid = self.getpid();
 
         trace!("kernel: exec .. load process image");
         let cwd = self.inner_exclusive_access().cwd.clone();
         let (memory_set, user_layout, final_entry, auxv_extra) =
-            load_process_image(elf_data, cwd.as_str())?;
+            load_process_image(elf_file, cwd.as_str())?;
 
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
+        let new_address_space = memory_set.address_space_root();
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
+        // Remove sibling tasks while the old address space is still active:
+        // their TaskUserRes destructors must detach mappings from the old
+        // MemorySet, not from the newly installed image.
+        super::terminate_other_threads_for_exec(self, &task);
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        let (mut old_memory_set, old_token, old_mask, cloexec_entries, old_shm_attachments) = {
+        let (mut old_memory_set, old_token, cloexec_entries, old_shm_attachments) = {
             let mut inner = self.inner_exclusive_access();
             let old_memory_set = core::mem::replace(&mut inner.memory_set, memory_set);
             let old_token = old_memory_set.token();
-            let old_mask = old_memory_set.loaded_user_harts();
             inner.vm_layout = vm_layout;
             inner.exec_path = exec_path;
             inner.environment = envs.clone();
@@ -1142,14 +1204,23 @@ impl ProcessControlBlock {
             (
                 old_memory_set,
                 old_token,
-                old_mask,
                 cloexec_entries,
                 old_shm_attachments,
             )
         };
+        // Trap entry keeps the current process page table active. After exec
+        // replaces the MemorySet, move the hardware walker to the new root
+        // before tearing down or dropping the old process-owned root frame.
+        // A scheduling interruption around this point is also safe: the
+        // scheduler reads the authoritative token from the PCB.
+        crate::sched::activate_current_address_space(new_address_space);
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let old_batch = old_memory_set.recycle_data_pages_deferred();
+        let old_mask = old_memory_set.record_local_tlb_change();
         DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
+        for entry in &cloexec_entries {
+            entry.desc.release_posix_locks_for_owner(owner_pid);
+        }
         drop(cloexec_entries);
         for attachment in old_shm_attachments {
             ipc::detach_segment(attachment.shmid);
@@ -1157,18 +1228,69 @@ impl ProcessControlBlock {
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
-        let task = self.inner_exclusive_access().get_task(0);
-        let mut task_inner = task.inner_exclusive_access();
-        task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
-        task_inner
-            .res
-            .as_mut()
-            .unwrap()
-            .alloc_user_res()
-            .map_err(mm_error_to_errno)?;
-        task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        task_inner.pending_signals = SignalBit::empty();
-        task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
+        // Capture the mapping layout without retaining task-inner.  In
+        // particular, TaskUserRes::{alloc_user_res,trap_cx_ppn} both acquire
+        // process-inner, so calling them under task-inner inverts the scheduler's
+        // normal process-inner -> task-inner order and can deadlock against a
+        // process/task scan.
+        let (tid, ustack_bottom, ustack_top, trap_cx_bottom) = {
+            let mut task_inner = task.inner_exclusive_access();
+            let res = task_inner.res.as_mut().unwrap();
+            res.ustack_base = ustack_base;
+            let ustack_top = res.ustack_top();
+            (
+                res.tid,
+                ustack_top - USER_STACK_SIZE,
+                ustack_top,
+                res.trap_cx_user_va(),
+            )
+        };
+
+        // Recreate both VMAs while holding only process-inner.  This mirrors
+        // TaskUserRes::alloc_user_res, but deliberately keeps task-inner out of
+        // the critical section.
+        let trap_cx_ppn = {
+            let mut process_inner = self.inner_exclusive_access();
+            let ustack_vma = Vma::new_user_stack(ustack_bottom.into(), ustack_top.into(), tid);
+            if tid == 0 {
+                process_inner
+                    .memory_set
+                    .insert_vma_eager(ustack_vma)
+                    .map_err(mm_error_to_errno)?;
+            } else {
+                process_inner
+                    .memory_set
+                    .insert_vma(ustack_vma, None)
+                    .map_err(mm_error_to_errno)?;
+            }
+            process_inner
+                .memory_set
+                .insert_vma(
+                    Vma::new_trap_context(
+                        trap_cx_bottom.into(),
+                        (trap_cx_bottom + PAGE_SIZE).into(),
+                        tid,
+                    ),
+                    None,
+                )
+                .map_err(mm_error_to_errno)?;
+            process_inner
+                .memory_set
+                .translate(VirtAddr::from(trap_cx_bottom).into())
+                .unwrap()
+                .ppn()
+        };
+
+        {
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.trap_cx_ppn = trap_cx_ppn;
+            task_inner.pending_signals = SignalBit::empty();
+            task_inner.pending_siginfo = [SigInfo::default(); MAX_SIG + 1];
+            task_inner.signal_mask_backup = None;
+        }
+        #[cfg(feature = "trap_context_cache")]
+        task.update_trap_context_cache(trap_cx_ppn, new_token);
+        crate::signal::refresh_current_signal_work_pending();
         // push arguments on user stack — Linux ELF ABI layout:
         //   [sp]  argc
         //         argv[0..argc-1], NULL
@@ -1178,7 +1300,7 @@ impl ProcessControlBlock {
         trace!("kernel: exec .. push arguments on user stack");
         let user_sp = init_user_stack_from_strings(
             new_token,
-            task_inner.res.as_mut().unwrap().ustack_top(),
+            ustack_top,
             args.as_slice(),
             envs.as_slice(),
             auxv_extra.as_slice(),
@@ -1206,7 +1328,10 @@ impl ProcessControlBlock {
             trap_cx.reg(10),
             trap_cx.reg(11)
         );
-        *task_inner.get_trap_cx() = trap_cx;
+        // Re-acquire task_inner only to install the trap context.
+        *task.inner_exclusive_access().get_trap_cx() = trap_cx;
+        #[cfg(feature = "cosmos-meminfo")]
+        super::account_process_exec();
         Ok(())
     }
     /// 按 Linux `clone` 的进程分支创建子进程。
@@ -1220,39 +1345,74 @@ impl ProcessControlBlock {
         child_set_tid: Option<usize>,
         shared_resources: CloneResourceFlags,
         exit_signal: u32,
+        vfork_clone: bool,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
         let clone_start_ns = get_time_ns();
         // warn_heap_state("fork_begin", self.getpid());
+        // Snapshot the calling task before taking the parent PCB lock.  The
+        // task lock is also acquired by signal/scheduler paths before they
+        // update process state; acquiring it under parent-inner here creates
+        // an AB-BA cycle on SMP.
+        let parent_task = current_task().ok_or(ERRNO::ESRCH)?;
+        let (
+            parent_ustack_base,
+            parent_sched_attr,
+            parent_vruntime_ns,
+            parent_cfs_initialized,
+            parent_affinity_mask,
+            parent_signal_mask,
+            parent_trap_cx,
+        ) = {
+            let parent_task_inner = parent_task.inner_exclusive_access();
+            (
+                parent_task_inner.res.as_ref().unwrap().ustack_base(),
+                parent_task_inner.sched_attr(),
+                parent_task_inner.sched.vruntime_ns,
+                parent_task_inner.sched.cfs_initialized,
+                parent_task_inner.sched.cpu_affinity_mask,
+                parent_task_inner.signal_mask,
+                *parent_task_inner.get_trap_cx(),
+            )
+        };
+        let parent_thread_count = self.thread_count();
         let mut parent = self.inner_exclusive_access();
-        // assert_eq!(parent.thread_count(), 1);
-        if parent.thread_count() != 1 {
-            warn!(
-                "clone_process with multiple threads is not fully supported: parent_pid={} thread_count={}",
+        // Linux fork/clone 允许从多线程进程创建一个只包含调用线程的子进程。
+        // 子进程随后通常会立即 exec（例如 glibc 的 posix_spawn），因此不能
+        // 因为父进程还有其他线程就拒绝这条路径。
+        if parent_thread_count != 1 {
+            debug!(
+                "clone_process from multithreaded parent: parent_pid={} thread_count={}",
                 self.getpid(),
-                parent.thread_count()
+                parent_thread_count
             );
-            return Err(ERRNO::EINVAL);
         }
         debug!(
             "[cow] clone_process begin: parent_pid={} parent_threads={}",
             self.getpid(),
-            parent.thread_count()
+            parent_thread_count
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let addr_space_start_ns = get_time_ns();
         let (memory_set, parent_token, parent_mask) = if shared_resources
             .contains(CloneResourceFlags::VM)
         {
-            let memory_set = MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
-                .map_err(mm_error_to_errno)?;
-            (memory_set, parent.memory_set.token(), 0)
+            let (memory_set, parent_tlb_needs_flush) =
+                MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
+                    .map_err(mm_error_to_errno)?;
+            let parent_token = parent.memory_set.token();
+            let parent_mask = if parent_tlb_needs_flush {
+                parent.memory_set.record_local_tlb_change()
+            } else {
+                0
+            };
+            (memory_set, parent_token, parent_mask)
         } else {
             let (memory_set, parent_tlb_needs_flush) =
                 MemorySet::from_existed_user(&mut parent.memory_set).map_err(mm_error_to_errno)?;
             let parent_token = parent.memory_set.token();
             let parent_mask = if parent_tlb_needs_flush {
-                parent.memory_set.loaded_user_harts()
+                parent.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -1283,6 +1443,10 @@ impl ProcessControlBlock {
             .as_ref()
             .map(Arc::downgrade)
             .unwrap_or_else(|| Arc::downgrade(self));
+        #[cfg(feature = "process_identity_cache")]
+        let child_parent_pid = clone_parent_target
+            .as_ref()
+            .map_or_else(|| self.getpid(), |parent| parent.getpid());
         let parent_shm_attachments = parent.shm_attachments.clone();
         let parent_fd_count = parent.fd_table.len();
         // alloc a pid
@@ -1302,6 +1466,10 @@ impl ProcessControlBlock {
         let child_pcb_start_ns = get_time_ns();
         let child = Arc::new(Self {
             pid,
+            #[cfg(feature = "process_identity_cache")]
+            parent_pid: AtomicUsize::new(child_parent_pid),
+            #[cfg(feature = "return_work_cache")]
+            zombie_work_pending: AtomicBool::new(false),
             clone_exit_signal: exit_signal,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1356,18 +1524,11 @@ impl ProcessControlBlock {
                 shm_attachments: parent_shm_attachments.clone(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
+            vfork_released: AtomicBool::new(!vfork_clone),
+            exec_in_progress: AtomicBool::new(false),
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
-        let parent_task = parent.get_task(0);
-        let parent_task_inner = parent_task.inner_exclusive_access();
-        let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
-        let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_vruntime_ns = parent_task_inner.sched.vruntime_ns;
-        let parent_cfs_initialized = parent_task_inner.sched.cfs_initialized;
-        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
-        let parent_signal_mask = parent_task_inner.signal_mask;
-        drop(parent_task_inner);
         if !shared_resources.contains(CloneResourceFlags::PARENT) {
             parent.children.push(Arc::clone(&child));
         }
@@ -1439,8 +1600,14 @@ impl ProcessControlBlock {
         // patches the inherited return register, breaking fork semantics.
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
+        *trap_cx = parent_trap_cx;
         trap_cx.set_kernel_sp(task.kstack.get_top());
         trap_cx.set_syscall_ret(0);
+        #[cfg(all(
+            target_arch = "riscv64",
+            any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+        ))]
+        trap_cx.set_reg(0, 0);
         if child_stack != 0 {
             // Linux clone ABI 要求子进程从指定用户栈继续执行。
             trap_cx.set_user_sp(child_stack);
@@ -1518,6 +1685,8 @@ impl ProcessControlBlock {
         let publish_start_ns = get_time_ns();
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        #[cfg(feature = "cosmos-meminfo")]
+        super::account_process_create();
         let publish_ns = get_time_ns() - publish_start_ns;
         let total_ns = get_time_ns() - clone_start_ns;
         if total_ns >= CLONE_PROCESS_TIMING_WARN_THRESHOLD_NS {
@@ -1548,6 +1717,26 @@ impl ProcessControlBlock {
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
+        // Snapshot task 0 before taking the parent PCB lock used to construct
+        // the child.  The task lock is acquired only after the short PCB
+        // snapshot, preserving the old leader-inheritance semantics without
+        // nesting process-inner and task-inner.
+        let parent_task = {
+            let parent_inner = self.inner_exclusive_access();
+            parent_inner
+                .tasks
+                .first()
+                .and_then(|task| task.as_ref().cloned())
+                .ok_or(ERRNO::ESRCH)?
+        };
+        let (parent_sched_attr, parent_affinity_mask, parent_signal_mask) = {
+            let parent_task_inner = parent_task.inner_exclusive_access();
+            (
+                parent_task_inner.sched_attr(),
+                parent_task_inner.sched.cpu_affinity_mask,
+                parent_task_inner.signal_mask,
+            )
+        };
         let mut parent = self.inner_exclusive_access();
         let cred = parent.cred;
         let parent_keyrings = ProcessKeyrings {
@@ -1566,6 +1755,10 @@ impl ProcessControlBlock {
         }
         let child = Arc::new(Self {
             pid,
+            #[cfg(feature = "process_identity_cache")]
+            parent_pid: AtomicUsize::new(self.getpid()),
+            #[cfg(feature = "return_work_cache")]
+            zombie_work_pending: AtomicBool::new(false),
             clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1616,14 +1809,10 @@ impl ProcessControlBlock {
                 shm_attachments: Vec::new(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
+            vfork_released: AtomicBool::new(true),
+            exec_in_progress: AtomicBool::new(false),
         });
         parent.children.push(Arc::clone(&child));
-        let parent_task = parent.get_task(0);
-        let parent_task_inner = parent_task.inner_exclusive_access();
-        let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
-        let parent_signal_mask = parent_task_inner.signal_mask;
-        drop(parent_task_inner);
         drop(parent);
 
         let task = child
@@ -1660,15 +1849,64 @@ impl ProcessControlBlock {
         child.attach_task(Arc::clone(&task));
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
+        #[cfg(feature = "cosmos-meminfo")]
+        super::account_process_create();
         Ok(child)
     }
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
     }
+    /// Return the cached parent PID used by the getppid fast read path.
+    #[cfg(feature = "process_identity_cache")]
+    #[inline]
+    pub fn getppid_cached(&self) -> usize {
+        self.parent_pid.load(Ordering::Acquire)
+    }
+    /// Publish a parent change after the protected parent pointer is updated.
+    #[cfg(feature = "process_identity_cache")]
+    #[inline]
+    pub(crate) fn set_ppid_cached(&self, ppid: usize) {
+        self.parent_pid.store(ppid, Ordering::Release);
+    }
+    /// Return whether process exit requires the locked trap-return slow path.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub fn zombie_work_pending(&self) -> bool {
+        self.zombie_work_pending.load(Ordering::Acquire)
+    }
+
+    /// Publish process zombie state while process-inner is held.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub(crate) fn mark_zombie_work_pending(&self) {
+        self.zombie_work_pending.store(true, Ordering::Release);
+    }
     /// Return whether this process has exited and is waiting to be reaped.
     pub fn is_zombie(&self) -> bool {
         self.inner.lock().is_zombie
+    }
+
+    /// Return whether a process-wide `execve` transition is in progress.
+    pub(crate) fn exec_in_progress(&self) -> bool {
+        self.exec_in_progress.load(Ordering::Acquire)
+    }
+
+    /// Release a parent blocked by `CLONE_VFORK`.
+    ///
+    /// The operation is idempotent because both the exec and exit paths may
+    /// perform the notification.  The queue is also used by normal waitpid
+    /// callers; their predicates will simply fail and make them sleep again.
+    pub fn release_vfork_parent(&self) {
+        if !self.vfork_released.swap(true, Ordering::AcqRel) {
+            debug!("[vfork] release parent for pid={}", self.getpid());
+            self.wait_exit_queue.wake_all();
+        }
+    }
+
+    /// Return whether a parent blocked by `CLONE_VFORK` may resume.
+    pub fn vfork_parent_released(&self) -> bool {
+        self.vfork_released.load(Ordering::Acquire)
     }
     /// Get absolute path of the last executed image.
     pub fn exec_path(&self) -> String {
@@ -1738,12 +1976,31 @@ impl ProcessControlBlock {
         shared: bool,
     ) -> Result<(), ERRNO> {
         let len = usize::from(end).saturating_sub(usize::from(start));
-        let mut inner = self.inner.lock();
-        inner.ensure_address_space_capacity(len)?;
-        inner
-            .memory_set
-            .mmap_anonymous(start, end, perm, shared)
-            .map_err(mm_error_to_errno)
+        let (token, mask) = {
+            let mut inner = self.inner.lock();
+            inner.ensure_address_space_capacity(len)?;
+            inner
+                .memory_set
+                .mmap_anonymous(start, end, perm, shared)
+                .map_err(mm_error_to_errno)?;
+            if shared {
+                (
+                    inner.memory_set.token(),
+                    inner.memory_set.record_local_tlb_change(),
+                )
+            } else {
+                (0, 0)
+            }
+        };
+        if mask != 0 {
+            shootdown_range(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                start.0,
+                end.0,
+            );
+        }
+        Ok(())
     }
     /// 登记一个 file-backed 映射区域，后续由缺页路径按需接入 page cache。
     pub fn mmap_file(
@@ -1775,10 +2032,14 @@ impl ProcessControlBlock {
         let reclaim = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
-            let mask = inner.memory_set.loaded_user_harts();
             let batch = inner
                 .memory_set
                 .invalidate_file_mappings_after_truncate_deferred(inode, new_size);
+            let mask = if batch.is_empty() {
+                0
+            } else {
+                inner.memory_set.record_local_tlb_change()
+            };
             DeferredUserReclaim::new(token, mask, batch)
         };
         reclaim.flush_then_release();
@@ -1804,17 +2065,58 @@ impl ProcessControlBlock {
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
         let Some(reclaim) = ({
             let mut inner = self.inner.lock();
+            let _ = inner.memory_set.msync_range(start, end);
             let token = inner.memory_set.token();
-            let mask = inner.memory_set.loaded_user_harts();
-            inner
-                .memory_set
-                .munmap_deferred(start, end)
-                .map(|batch| DeferredUserReclaim::new(token, mask, batch))
+            inner.memory_set.munmap_deferred(start, end).map(|batch| {
+                let mask = inner.memory_set.record_local_tlb_change();
+                DeferredUserReclaim::new_range(token, mask, start.0, end.0, batch)
+            })
         }) else {
             return false;
         };
         reclaim.flush_then_release();
         true
+    }
+
+    /// Resize or relocate one mmap-style user mapping.
+    pub fn mremap(
+        &self,
+        old_start: VirtAddr,
+        old_end: VirtAddr,
+        new_start: VirtAddr,
+        new_end: VirtAddr,
+    ) -> Result<usize, ERRNO> {
+        let (result, token, mask, reclaim) = {
+            let mut inner = self.inner.lock();
+            let old_len = usize::from(old_end).saturating_sub(usize::from(old_start));
+            let new_len = usize::from(new_end).saturating_sub(usize::from(new_start));
+            if new_len > old_len {
+                inner.ensure_address_space_capacity(new_len - old_len)?;
+            }
+
+            let token = inner.memory_set.token();
+            let (result, batch) = inner
+                .memory_set
+                .mremap(old_start, old_end, new_start, new_end)
+                .map_err(mm_error_to_errno)?;
+            let mask = inner.memory_set.record_local_tlb_change();
+            let reclaim = DeferredUserReclaim::new(token, mask, batch);
+            (usize::from(result), token, mask, reclaim)
+        };
+
+        // mremap changes PTEs even when it does not remove any pages, so an
+        // empty deferred batch must still receive a TLB shootdown.
+        if mask != 0 {
+            debug!(
+                "[tlb] mremap shootdown: pid={} token={:#x} mask={:#b}",
+                self.getpid(),
+                token,
+                mask
+            );
+            shootdown(mask, ShootdownKind::AddressSpace { token });
+        }
+        drop(reclaim);
+        Ok(result)
     }
 
     /// Record a successful SysV shared-memory attachment.
@@ -1849,13 +2151,15 @@ impl ProcessControlBlock {
         let (handled, reclaim) = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
-            let mask = inner.memory_set.loaded_user_harts();
             let (handled, batch) = inner
                 .memory_set
                 .handle_private_cow_fault(VirtAddr::from(fault_addr))?;
             (
                 handled,
-                batch.map(|batch| DeferredUserReclaim::new(token, mask, batch)),
+                batch.map(|batch| {
+                    let mask = inner.memory_set.record_local_tlb_change();
+                    DeferredUserReclaim::new_page(token, mask, fault_addr, batch)
+                }),
             )
         };
         if let Some(reclaim) = reclaim {
@@ -1869,10 +2173,27 @@ impl ProcessControlBlock {
         fault_addr: usize,
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
-        self.inner
-            .lock()
-            .memory_set
-            .handle_lazy_user_fault(VirtAddr::from(fault_addr), access)
+        let (handled, token, mask) = {
+            let mut inner = self.inner.lock();
+            let handled = inner
+                .memory_set
+                .handle_lazy_user_fault(VirtAddr::from(fault_addr), access)?;
+            let token = inner.memory_set.token();
+            let mask = if handled == PageFaultHandled::Handled {
+                inner.memory_set.record_local_tlb_change()
+            } else {
+                0
+            };
+            (handled, token, mask)
+        };
+        if mask != 0 {
+            shootdown_page(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                fault_addr,
+            );
+        }
+        Ok(handled)
     }
     /// 处理当前进程的 file-backed 缺页。
     pub fn handle_file_page_fault(
@@ -1880,21 +2201,36 @@ impl ProcessControlBlock {
         fault_addr: usize,
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
-        debug!(
+        let _probe = crate::probe_scope!("mmap.handle_file_page_fault");
+        trace!(
             "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
             self.getpid(),
             fault_addr,
             access
         );
         if access == PageFaultAccess::Write {
-            let notified = {
+            let (notified, token, mask) = {
                 let mut inner = self.inner.lock();
-                inner
+                let notified = inner
                     .memory_set
-                    .handle_shared_write_fault(VirtAddr::from(fault_addr))
+                    .handle_shared_write_fault(VirtAddr::from(fault_addr));
+                let token = inner.memory_set.token();
+                let mask = if notified {
+                    inner.memory_set.record_local_tlb_change()
+                } else {
+                    0
+                };
+                (notified, token, mask)
             };
             if notified {
-                debug!(
+                if mask != 0 {
+                    shootdown_page(
+                        mask,
+                        crate::hal::address_space_id_from_token(token),
+                        fault_addr,
+                    );
+                }
+                trace!(
                     "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
                     self.getpid(),
                     fault_addr
@@ -1902,20 +2238,46 @@ impl ProcessControlBlock {
                 return Ok(PageFaultHandled::Handled);
             }
         }
-        let plan = {
+        let (prepared, token, mask) = {
             let inner = self.inner.lock();
-            inner
+            let prepared = inner
                 .memory_set
-                .prepare_file_page_fault(VirtAddr::from(fault_addr), access)
+                .prepare_file_page_fault(VirtAddr::from(fault_addr), access);
+            let token = inner.memory_set.token();
+            let mask = if matches!(&prepared, FilePageFaultPrepare::Resolved) {
+                inner.memory_set.record_local_tlb_change()
+            } else {
+                0
+            };
+            (prepared, token, mask)
         };
-        let Some(plan) = plan else {
-            debug!(
-                "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
-                self.getpid(),
-                fault_addr,
-                access
-            );
-            return Ok(PageFaultHandled::NotHandled);
+        let plan = match prepared {
+            FilePageFaultPrepare::Resolved => {
+                if mask != 0 {
+                    shootdown_page(
+                        mask,
+                        crate::hal::address_space_id_from_token(token),
+                        fault_addr,
+                    );
+                }
+                trace!(
+                    "[mmap] page fault resolved by present PTE: pid={} addr={:#x} access={:?}",
+                    self.getpid(),
+                    fault_addr,
+                    access
+                );
+                return Ok(PageFaultHandled::Handled);
+            }
+            FilePageFaultPrepare::Pending(plan) => plan,
+            FilePageFaultPrepare::NotHandled => {
+                trace!(
+                    "[mmap] page fault miss: pid={} addr={:#x} access={:?}",
+                    self.getpid(),
+                    fault_addr,
+                    access
+                );
+                return Ok(PageFaultHandled::NotHandled);
+            }
         };
         let Some(inode) = plan.file.backing_inode() else {
             return Ok(PageFaultHandled::NotHandled);
@@ -1926,7 +2288,7 @@ impl ProcessControlBlock {
         let page_start = plan.page_idx as usize * PAGE_SIZE;
         let file_size = mapping.size();
         if page_start >= file_size {
-            debug!(
+            trace!(
                 "[mmap] file-backed fault beyond EOF: pid={} vpn={:#x} page_idx={} page_start={:#x} file_size={:#x}",
                 self.getpid(),
                 plan.vpn.0,
@@ -1936,7 +2298,7 @@ impl ProcessControlBlock {
             );
             return Err(MmError::BeyondFileEnd);
         };
-        debug!(
+        trace!(
             "[mmap] page fault lazy load: pid={} vpn={:#x} page_idx={} shared={} path={:?}",
             self.getpid(),
             plan.vpn.0,
@@ -1944,16 +2306,85 @@ impl ProcessControlBlock {
             plan.shared,
             plan.file.path()
         );
-        let page = mapping.try_get_page(plan.page_idx)?;
-        let mut inner = self.inner.lock();
-        // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
-        // 后续补齐更严格的 `mm_seq` 代际校验与跨 hart TLB shootdown。
-        let committed = if plan.shared {
-            inner.memory_set.map_shared_file_page(&plan, page)
+        let page = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
+            // Keep the conservative 64 KiB demand prefix synchronous, then
+            // let the page-cache worker fill any confirmed sequential tail.
+            mapping.try_get_page_with_fault_window(plan.page_idx, plan.read_ahead_pages)?
         } else {
-            inner.memory_set.map_private_file_page(&plan, page)
-        }?;
-        debug!(
+            mapping.try_get_page(plan.page_idx)?
+        };
+        let fault_around_pages =
+            (matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
+                && (plan.shared || !plan.map_perm.contains(MapPermission::W)))
+            .then(|| {
+                let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
+                let first_vpn = aligned_start.max(plan.vma_start.0);
+                let end_vpn = aligned_start
+                    .saturating_add(FILE_FAULT_AROUND_PAGES)
+                    .min(plan.vma_end.0);
+                let first_page_idx = plan
+                    .pgoff
+                    .saturating_add(first_vpn.saturating_sub(plan.vma_start.0))
+                    as u64;
+                let mut pages: Vec<_> = mapping
+                    .cached_uptodate_pages(first_page_idx, end_vpn.saturating_sub(first_vpn))
+                    .into_iter()
+                    .filter_map(|(page_idx, cached_page)| {
+                        let delta = page_idx.checked_sub(first_page_idx)? as usize;
+                        Some((
+                            crate::mm::VirtPageNum(first_vpn.saturating_add(delta)),
+                            cached_page,
+                        ))
+                    })
+                    .collect();
+                // Preserve the existing demand-fault guarantee even if a
+                // concurrent reclaim removed the page from the mapping
+                // between loading it above and scanning the resident range.
+                if !pages.iter().any(|(vpn, _)| *vpn == plan.vpn) {
+                    pages.push((plan.vpn, Arc::clone(&page)));
+                }
+                pages
+            });
+        let fault_flush_range = fault_around_pages.as_ref().and_then(|pages| {
+            let first_vpn = pages.iter().map(|(vpn, _)| *vpn).min()?;
+            let last_vpn = pages.iter().map(|(vpn, _)| *vpn).max()?;
+            Some((
+                VirtAddr::from(first_vpn).0,
+                VirtAddr::from(last_vpn).0 + PAGE_SIZE,
+            ))
+        });
+        let (committed, token, mask) = {
+            let mut inner = self.inner.lock();
+            // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
+            // 后续补齐更严格的 `mm_seq` 代际校验。
+            let committed = if let Some(pages) = fault_around_pages {
+                inner.memory_set.map_file_cache_pages_around(&plan, pages)
+            } else if plan.shared {
+                inner.memory_set.map_shared_file_page(&plan, page)
+            } else {
+                inner.memory_set.map_private_file_page(&plan, page)
+            }?;
+            let token = inner.memory_set.token();
+            let mask = if committed == PageFaultHandled::Handled {
+                inner.memory_set.record_local_tlb_change()
+            } else {
+                0
+            };
+            (committed, token, mask)
+        };
+        // File-backed PTEs are shared by all threads in this process.  The
+        // mapping helper has already flushed the faulting hart locally; flush
+        // every other hart that was running this address space before allowing
+        // it to continue with a cached invalid or restrictive translation.
+        if mask != 0 {
+            let asid = crate::hal::address_space_id_from_token(token);
+            if let Some((start, end)) = fault_flush_range {
+                shootdown_range(mask, asid, start, end);
+            } else {
+                shootdown_page(mask, asid, fault_addr);
+            }
+        }
+        trace!(
             "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
             self.getpid(),
             plan.vpn.0,
@@ -1972,10 +2403,10 @@ impl ProcessControlBlock {
             // 锁内只快照目标 hart，锁外再等待 ack。远端用户态 IPI 进入
             // trap_handler 前会调用 enter_kernel()，持进程锁等待会造成死锁。
             //
-            // 这个快照依赖 trap 入口本地 sfence.vma：快照后才返回用户态的 hart
-            // 已经经过本地 flush，不需要包含在本次远端 shootdown 里。
+            // 这个快照只覆盖当前 active harts。inactive hart 会在下一次返回
+            // 该 mm 前根据 TLB generation 自行执行 ASID fence。
             let mask = if ok {
-                inner.memory_set.loaded_user_harts()
+                inner.memory_set.record_local_tlb_change()
             } else {
                 0
             };
@@ -1988,7 +2419,12 @@ impl ProcessControlBlock {
                 token,
                 mask
             );
-            shootdown(mask, ShootdownKind::AddressSpace { token });
+            shootdown_range(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                start.0,
+                end.0,
+            );
         }
         ok
     }
@@ -2069,10 +2505,10 @@ impl ProcessControlBlock {
 
             inner.vm_layout.brk = new_brk;
             let reclaim = batch.map(|batch| {
-                // 锁内快照仍在用户态运行该 mm 的 hart，锁外等待 shootdown ack。
+                // 锁内快照所有可能缓存该 ASID 的 hart，锁外等待 shootdown ack。
                 DeferredUserReclaim::new(
                     inner.memory_set.token(),
-                    inner.memory_set.loaded_user_harts(),
+                    inner.memory_set.record_local_tlb_change(),
                     batch,
                 )
             });
@@ -2094,8 +2530,11 @@ impl ProcessControlBlock {
     /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
     pub fn enter_kernel(&self, now: usize) {
         let mut inner = self.inner.lock();
-        // trap 入口已经切到内核页表并做过本地 sfence.vma，此 hart 不再持有该用户 mm。
-        inner.memory_set.mark_user_unloaded(crate::hal::hartid());
+        // The process page table remains active in kernel mode. Kernel
+        // user-memory helpers walk it explicitly, while generation tracking
+        // guarantees an ASID fence before returning to an edited user mapping.
+        #[cfg(not(feature = "trap_active_harts_probe"))]
+        inner.memory_set.mark_user_inactive(crate::hal::hartid());
         match inner.accounting_state {
             CpuAccountingState::User => {
                 inner.user_time = inner
@@ -2122,7 +2561,8 @@ impl ProcessControlBlock {
         inner.accounting_state = CpuAccountingState::User;
         inner.accounting_timestamp = now;
         // 即将跳回用户态，后续其他 hart 修改该 mm 时需要把当前 hart 作为 shootdown 目标。
-        inner.memory_set.mark_user_loaded(crate::hal::hartid());
+        #[cfg(not(feature = "trap_active_harts_probe"))]
+        inner.memory_set.mark_user_active(crate::hal::hartid());
     }
 
     /// Flush the current running slice into the corresponding accumulator.

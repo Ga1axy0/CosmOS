@@ -477,6 +477,23 @@ pub fn handle_timer_interrupt() -> bool {
         }
     };
 
+    if periodic_fired {
+        crate::drivers::block::warn_if_stalled(current_ns as usize);
+        // NOTE: a periodic `warn_lost_runnable_tasks("timer_scan")` call used to
+        // live here but was removed — see the comment below.
+        //
+        // Running the full all-tasks orphan scan from the timer tick is unsafe:
+        // it walks every process/task and locks each `task_inner` (a
+        // `SpinNoIrqLock`, IRQs disabled). Under load, long-holding paths such
+        // as `exec` (string/unicode formatting) hold a `task_inner` for a long
+        // time, so the scan spins on it WITH INTERRUPTS DISABLED, which blocks
+        // any in-flight global TLB shootdown IPI from being serviced on this
+        // hart — a hard system-wide wedge that even Ctrl+C cannot break. The
+        // orphan scan is therefore restricted to the idle path (see
+        // `run_tasks`), where contention is low. The block-worker orphan has
+        // its own cheap single-task self-heal in `block::warn_if_stalled`.
+    }
+ 
     program_next_trigger_for_hart(hart, now_raw as usize);
     periodic_fired
 }

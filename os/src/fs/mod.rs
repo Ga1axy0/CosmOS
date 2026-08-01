@@ -2,6 +2,8 @@
 
 pub mod cgroupfs;
 pub mod devfs;
+pub(crate) mod epoll;
+mod eventfd;
 mod inode;
 mod page_cache;
 mod pipe;
@@ -13,11 +15,14 @@ pub mod sysfs;
 pub mod tmpfs;
 mod tty;
 
+use crate::config::PAGE_SIZE;
 use crate::mm::UserBuffer;
+use crate::task::{WaitQueue, WaitReason};
 use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
 use crate::timer::get_time_us;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -25,18 +30,32 @@ use core::any::Any;
 #[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
-pub use fs::vfs::{InodeTime, VfsFileType};
+pub use fs::vfs::{InodeTime, VfsDirEntry, VfsFileType};
 use fs::{
     dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode,
     InodeCacheStats,
 };
 use lazy_static::*;
 pub use page_cache::{
-    discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats, reclaim_if_needed,
-    release_mapped_page, retain_mapped_page, sync_all as sync_page_cache_all,
-    sync_fs as sync_page_cache_fs, sync_inode_range, truncate_inode, CachePage, PageCacheStats,
-    PAGE_CACHE_MANAGER,
+    discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats,
+    reclaim_for_frame_allocation, reclaim_if_needed, release_mapped_page, retain_mapped_page,
+    start_workers as start_page_cache_workers,
+    sync_all as sync_page_cache_all,
+    sync_fs as sync_page_cache_fs, sync_inode as sync_page_cache_inode, sync_inode_range,
+    truncate_inode, CachePage, PageCacheStats, PAGE_CACHE_MANAGER,
 };
+
+/// Flush all modified entries in the lower-level block cache.
+pub fn sync_block_cache_all() -> Result<(), ERRNO> {
+    fs::block_cache_sync_all();
+    Ok(())
+}
+
+/// Flush both the file page cache and the filesystem block cache.
+pub fn sync_storage_all() -> Result<(), ERRNO> {
+    sync_page_cache_all()?;
+    sync_block_cache_all()
+}
 
 /// Cumulative directory-iteration counters used by `/proc/mm_perf`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -350,25 +369,21 @@ pub fn render_perf_counters() -> String {
     out
 }
 
-fn encode_dirent64_records(
-    entries: &[(String, VfsFileType)],
-    offset: usize,
-    buf: &mut [u8],
-) -> usize {
+fn encode_dirent64_records(entries: &[VfsDirEntry], offset: usize, buf: &mut [u8]) -> usize {
     let mut written = 0usize;
 
-    for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
-        let name_bytes = name.as_bytes();
+    for (i, entry) in entries.iter().enumerate().skip(offset) {
+        let name_bytes = entry.name.as_bytes();
         let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
         if written + reclen > buf.len() {
             break;
         }
 
-        buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+        buf[written..written + 8].copy_from_slice(&entry.ino.to_le_bytes());
         let next_off = (i + 1) as i64;
         buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
         buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        buf[written + 18] = match file_type {
+        buf[written + 18] = match entry.file_type {
             VfsFileType::Directory => 4,
             VfsFileType::Symlink => 10,
             VfsFileType::Char => 2,
@@ -425,6 +440,37 @@ bitflags! {
     }
 }
 
+/// POSIX 记录锁类型。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PosixLockType {
+    /// 共享读锁。
+    Read,
+    /// 排他写锁。
+    Write,
+    /// 解锁。
+    Unlock,
+}
+
+/// POSIX 记录锁区间，`len=None` 表示直到 EOF。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PosixLockRange {
+    /// 起始偏移。
+    pub start: u64,
+    /// 锁定长度；`None` 表示直到 EOF。
+    pub len: Option<u64>,
+}
+
+/// `F_GETLK` 返回的冲突锁信息。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PosixLockConflict {
+    /// 冲突锁类型。
+    pub lock_type: PosixLockType,
+    /// 冲突区间。
+    pub range: PosixLockRange,
+    /// 持锁进程 pid。
+    pub owner_pid: usize,
+}
+
 /// 文件访问模式，对应 `O_RDONLY/O_WRONLY/O_RDWR`。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessMode {
@@ -455,8 +501,204 @@ struct FlockRecord {
     kind: FlockKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PosixLockRecord {
+    owner_pid: usize,
+    lock_type: PosixLockType,
+    start: u64,
+    end: Option<u64>,
+}
+
+struct PosixLockState {
+    entries: SpinNoIrqLock<Vec<PosixLockRecord>>,
+    wait_queue: WaitQueue,
+}
+
 lazy_static! {
     static ref FLOCK_TABLE: SpinNoIrqLock<Vec<FlockRecord>> = SpinNoIrqLock::new(Vec::new());
+    static ref POSIX_LOCK_TABLE: SpinNoIrqLock<BTreeMap<(u64, u64), Arc<PosixLockState>>> =
+        SpinNoIrqLock::new(BTreeMap::new());
+}
+
+impl PosixLockState {
+    fn new() -> Self {
+        Self {
+            entries: SpinNoIrqLock::new(Vec::new()),
+            wait_queue: WaitQueue::new(),
+        }
+    }
+}
+
+fn posix_lock_state(fs_id: u64, ino: u64, create: bool) -> Option<Arc<PosixLockState>> {
+    let mut table = POSIX_LOCK_TABLE.lock();
+    if let Some(state) = table.get(&(fs_id, ino)) {
+        return Some(Arc::clone(state));
+    }
+    if !create {
+        return None;
+    }
+    let state = Arc::new(PosixLockState::new());
+    table.insert((fs_id, ino), Arc::clone(&state));
+    Some(state)
+}
+
+fn posix_lock_overlaps(
+    left_start: u64,
+    left_end: Option<u64>,
+    right_start: u64,
+    right_end: Option<u64>,
+) -> bool {
+    let left_before_right = matches!(left_end, Some(end) if end <= right_start);
+    let right_before_left = matches!(right_end, Some(end) if end <= left_start);
+    !left_before_right && !right_before_left
+}
+
+fn posix_lock_conflicts(existing: PosixLockType, requested: PosixLockType) -> bool {
+    existing == PosixLockType::Write || requested == PosixLockType::Write
+}
+
+fn posix_lock_max_end(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (None, _) | (_, None) => None,
+        (Some(left), Some(right)) => Some(left.max(right)),
+    }
+}
+
+fn posix_lock_sort_and_merge(entries: &mut Vec<PosixLockRecord>) {
+    entries.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.owner_pid.cmp(&right.owner_pid))
+            .then_with(|| {
+                let left_kind = match left.lock_type {
+                    PosixLockType::Read => 0u8,
+                    PosixLockType::Write => 1u8,
+                    PosixLockType::Unlock => 2u8,
+                };
+                let right_kind = match right.lock_type {
+                    PosixLockType::Read => 0u8,
+                    PosixLockType::Write => 1u8,
+                    PosixLockType::Unlock => 2u8,
+                };
+                left_kind.cmp(&right_kind)
+            })
+    });
+
+    let mut merged: Vec<PosixLockRecord> = Vec::with_capacity(entries.len());
+    for record in entries.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            let contiguous = match last.end {
+                None => true,
+                Some(end) => record.start <= end,
+            };
+            if last.owner_pid == record.owner_pid
+                && last.lock_type == record.lock_type
+                && contiguous
+            {
+                last.end = posix_lock_max_end(last.end, record.end);
+                continue;
+            }
+        }
+        merged.push(record);
+    }
+    *entries = merged;
+}
+
+fn posix_lock_find_conflict(
+    entries: &[PosixLockRecord],
+    owner_pid: usize,
+    request_type: PosixLockType,
+    request_start: u64,
+    request_end: Option<u64>,
+) -> Option<PosixLockConflict> {
+    if request_type == PosixLockType::Unlock {
+        return None;
+    }
+    entries.iter().find_map(|record| {
+        if record.owner_pid == owner_pid
+            || !posix_lock_conflicts(record.lock_type, request_type)
+            || !posix_lock_overlaps(record.start, record.end, request_start, request_end)
+        {
+            return None;
+        }
+        Some(PosixLockConflict {
+            lock_type: record.lock_type,
+            range: PosixLockRange {
+                start: record.start,
+                len: record.end.map(|end| end - record.start),
+            },
+            owner_pid: record.owner_pid,
+        })
+    })
+}
+
+fn posix_lock_apply(
+    entries: &mut Vec<PosixLockRecord>,
+    owner_pid: usize,
+    request_type: PosixLockType,
+    request_start: u64,
+    request_end: Option<u64>,
+) -> bool {
+    let original = entries.clone();
+    let mut updated = Vec::with_capacity(entries.len() + 2);
+
+    for record in entries.drain(..) {
+        if record.owner_pid != owner_pid
+            || !posix_lock_overlaps(record.start, record.end, request_start, request_end)
+        {
+            updated.push(record);
+            continue;
+        }
+
+        if record.start < request_start {
+            updated.push(PosixLockRecord {
+                owner_pid: record.owner_pid,
+                lock_type: record.lock_type,
+                start: record.start,
+                end: Some(request_start),
+            });
+        }
+
+        match (record.end, request_end) {
+            (Some(record_end), Some(request_end)) if request_end < record_end => {
+                updated.push(PosixLockRecord {
+                    owner_pid: record.owner_pid,
+                    lock_type: record.lock_type,
+                    start: request_end,
+                    end: Some(record_end),
+                });
+            }
+            (None, Some(request_end)) => {
+                updated.push(PosixLockRecord {
+                    owner_pid: record.owner_pid,
+                    lock_type: record.lock_type,
+                    start: request_end,
+                    end: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if request_type != PosixLockType::Unlock {
+        updated.push(PosixLockRecord {
+            owner_pid,
+            lock_type: request_type,
+            start: request_start,
+            end: request_end,
+        });
+    }
+
+    posix_lock_sort_and_merge(&mut updated);
+    let changed = updated != original;
+    *entries = updated;
+    changed
+}
+
+fn posix_lock_release_owner(entries: &mut Vec<PosixLockRecord>, owner_pid: usize) -> bool {
+    let original_len = entries.len();
+    entries.retain(|record| record.owner_pid != owner_pid);
+    original_len != entries.len()
 }
 
 impl AccessMode {
@@ -490,6 +732,87 @@ impl AccessMode {
     }
 }
 
+const FILE_READAHEAD_INITIAL_PAGES: usize = 32;
+const FILE_READAHEAD_MAX_PAGES: usize = 64;
+
+/// One bounded page-cache fill requested by a sequential buffered reader.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FileReadAheadPlan {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+/// Per-open-file sequential-read state.
+///
+/// Keeping this state on the open file description, rather than on the inode
+/// mapping, prevents independent readers from perturbing one another.
+#[derive(Clone, Copy, Debug, Default)]
+struct FileReadAheadState {
+    previous_end: Option<usize>,
+    window_pages: usize,
+    window_end: usize,
+    trigger: usize,
+    eof: bool,
+}
+
+impl FileReadAheadState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn prepare(&mut self, offset: usize, request_len: usize) -> Option<FileReadAheadPlan> {
+        if request_len == 0 {
+            return None;
+        }
+
+        let starts_at_file_beginning = self.previous_end.is_none() && offset == 0;
+        let continues_previous_read = self.previous_end == Some(offset);
+        if !starts_at_file_beginning && !continues_previous_read {
+            self.reset();
+            return None;
+        }
+        if self.eof {
+            return None;
+        }
+
+        let request_end = offset.saturating_add(request_len);
+        if self.window_pages != 0 && request_end < self.trigger {
+            return None;
+        }
+
+        let window_pages = if self.window_pages == 0 {
+            FILE_READAHEAD_INITIAL_PAGES
+        } else {
+            self.window_pages
+                .saturating_mul(2)
+                .min(FILE_READAHEAD_MAX_PAGES)
+        };
+        let current_page_start = offset / PAGE_SIZE * PAGE_SIZE;
+        let start = if self.window_pages == 0 {
+            current_page_start
+        } else {
+            self.window_end.max(current_page_start)
+        };
+        let len = window_pages.saturating_mul(PAGE_SIZE);
+        let end = start.saturating_add(len);
+
+        self.window_pages = window_pages;
+        self.window_end = end;
+        // Refill once half of the newly submitted window remains.  The
+        // current implementation completes this fill synchronously, but the
+        // marker also provides the right state transition for a later
+        // asynchronous readahead worker.
+        self.trigger = end.saturating_sub(len / 2);
+
+        Some(FileReadAheadPlan { start, len })
+    }
+
+    fn complete(&mut self, offset: usize, requested: usize, read: usize) {
+        self.previous_end = Some(offset.saturating_add(read));
+        self.eof = requested != 0 && read < requested;
+    }
+}
+
 /// 打开文件描述内部状态，对应 Linux 的 open file description 可变部分。
 struct FileDescriptionInner {
     /// 当前文件偏移。
@@ -497,7 +820,9 @@ struct FileDescriptionInner {
     /// 当前文件状态位。
     status_flags: FileStatusFlags,
     /// 目录项快照，避免遍历期间删除目录项导致位置漂移漏读。
-    dirent_snapshot: Option<Vec<(String, VfsFileType)>>,
+    dirent_snapshot: Option<Vec<VfsDirEntry>>,
+    /// 普通文件顺序读取的自适应预读状态。
+    read_ahead: FileReadAheadState,
 }
 
 /// 套接字的不可变元信息。
@@ -523,6 +848,9 @@ pub struct FileDescription {
     socket_spec: Option<SocketSpec>,
     /// 共享的偏移与状态位。
     inner: SleepMutex<FileDescriptionInner>,
+    /// Number of descriptor-table entries referring to this open file
+    /// description.  Epoll interests deliberately do not contribute here.
+    fd_refs: AtomicUsize,
 }
 
 impl FileDescription {
@@ -542,7 +870,9 @@ impl FileDescription {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
+                read_ahead: FileReadAheadState::default(),
             }),
+            fd_refs: AtomicUsize::new(0),
         }
     }
 
@@ -564,8 +894,33 @@ impl FileDescription {
                 offset: 0,
                 status_flags,
                 dirent_snapshot: None,
+                read_ahead: FileReadAheadState::default(),
             }),
+            fd_refs: AtomicUsize::new(0),
         }
+    }
+
+    /// Stable identity of this open file description while it is Arc-owned.
+    pub(crate) fn identity(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// Account for one descriptor-table reference.
+    pub(crate) fn retain_fd_ref(&self) {
+        self.fd_refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Report whether a userspace descriptor-table entry still refers to this
+    /// open file description.
+    pub(crate) fn has_fd_refs(&self) -> bool {
+        self.fd_refs.load(Ordering::Acquire) != 0
+    }
+
+    /// Release one descriptor-table reference and report whether it was last.
+    pub(crate) fn release_fd_ref(&self) -> bool {
+        let previous = self.fd_refs.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "FileDescription fd_refs underflow");
+        previous == 1
     }
 
     /// 返回底层文件对象是否允许当前描述执行读操作。
@@ -585,9 +940,35 @@ impl FileDescription {
 
     /// 顺序读取并推进共享文件偏移，同时保留底层 errno。
     pub fn read_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
+        // eventfd's blocking mode is an open-file-description flag, so it
+        // cannot be captured permanently by the underlying File object.
+        // Route reads through the counter implementation with the current
+        // status snapshot instead of its creation-time default.
+        if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
+            return eventfd.read_with_nonblock(
+                buf,
+                self.status_flags().contains(FileStatusFlags::NONBLOCK),
+            );
+        }
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
-            let read_size = self.file.read_at_result(inner.offset, buf)?;
+            let offset = inner.offset;
+            let requested = buf.len();
+            let read_result =
+                if let Some(inode) = self.file.as_any().downcast_ref::<inode::OSInode>() {
+                    let plan = inner.read_ahead.prepare(offset, requested);
+                    Ok(inode.read_at_with_readahead(offset, buf, plan))
+                } else {
+                    self.file.read_at_result(offset, buf)
+                };
+            let read_size = match read_result {
+                Ok(read_size) => read_size,
+                Err(err) => {
+                    inner.read_ahead.reset();
+                    return Err(err);
+                }
+            };
+            inner.read_ahead.complete(offset, requested, read_size);
             inner.offset += read_size;
             return Ok(read_size);
         }
@@ -606,6 +987,12 @@ impl FileDescription {
 
     /// 顺序写入并推进共享文件偏移，同时保留底层 errno。
     pub fn write_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
+        if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
+            return eventfd.write_with_nonblock(
+                buf,
+                self.status_flags().contains(FileStatusFlags::NONBLOCK),
+            );
+        }
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
             if inner.status_flags.contains(FileStatusFlags::APPEND) {
@@ -742,6 +1129,120 @@ impl FileDescription {
         self.file.backing_inode()
     }
 
+    fn posix_lock_key(&self) -> Result<(u64, u64), ERRNO> {
+        let inode = self.backing_inode().ok_or(ERRNO::EINVAL)?;
+        Ok((inode.fs_id(), inode.ino()))
+    }
+
+    /// 查询与给定请求冲突的 POSIX 记录锁。
+    pub fn get_posix_lock(
+        &self,
+        owner_pid: usize,
+        request_type: PosixLockType,
+        range: PosixLockRange,
+    ) -> Result<Option<PosixLockConflict>, ERRNO> {
+        let (fs_id, ino) = self.posix_lock_key()?;
+        let Some(state) = posix_lock_state(fs_id, ino, false) else {
+            return Ok(None);
+        };
+        let request_end = match range.len {
+            Some(len) => Some(range.start.checked_add(len).ok_or(ERRNO::EINVAL)?),
+            None => None,
+        };
+        let entries = state.entries.lock();
+        Ok(posix_lock_find_conflict(
+            &entries,
+            owner_pid,
+            request_type,
+            range.start,
+            request_end,
+        ))
+    }
+
+    /// 设置、修改或释放 POSIX 记录锁。
+    pub fn set_posix_lock(
+        &self,
+        owner_pid: usize,
+        request_type: PosixLockType,
+        range: PosixLockRange,
+        wait: bool,
+    ) -> Result<(), ERRNO> {
+        let (fs_id, ino) = self.posix_lock_key()?;
+        let state = posix_lock_state(fs_id, ino, true).ok_or(ERRNO::EINVAL)?;
+        let request_end = match range.len {
+            Some(len) => Some(range.start.checked_add(len).ok_or(ERRNO::EINVAL)?),
+            None => None,
+        };
+
+        loop {
+            let changed = {
+                let mut entries = state.entries.lock();
+                if posix_lock_find_conflict(
+                    &entries,
+                    owner_pid,
+                    request_type,
+                    range.start,
+                    request_end,
+                )
+                .is_some()
+                {
+                    None
+                } else {
+                    Some(posix_lock_apply(
+                        &mut entries,
+                        owner_pid,
+                        request_type,
+                        range.start,
+                        request_end,
+                    ))
+                }
+            };
+
+            match changed {
+                Some(changed) => {
+                    if changed {
+                        state.wait_queue.wake_all();
+                    }
+                    return Ok(());
+                }
+                None if !wait => return Err(ERRNO::EAGAIN),
+                None => {
+                    if crate::signal::has_interrupting_signal() {
+                        return Err(ERRNO::EINTR);
+                    }
+                    state.wait_queue.wait_with_reason_or_skip(WaitReason::FileLock, || {
+                        let entries = state.entries.lock();
+                        posix_lock_find_conflict(
+                            &entries,
+                            owner_pid,
+                            request_type,
+                            range.start,
+                            request_end,
+                        )
+                        .is_none()
+                    });
+                }
+            }
+        }
+    }
+
+    /// 释放指定进程在该文件上的全部 POSIX 记录锁。
+    pub fn release_posix_locks_for_owner(&self, owner_pid: usize) {
+        let Ok((fs_id, ino)) = self.posix_lock_key() else {
+            return;
+        };
+        let Some(state) = posix_lock_state(fs_id, ino, false) else {
+            return;
+        };
+        let changed = {
+            let mut entries = state.entries.lock();
+            posix_lock_release_owner(&mut entries, owner_pid)
+        };
+        if changed {
+            state.wait_queue.wake_all();
+        }
+    }
+
     /// Apply a BSD `flock(2)` lock to this open file description.
     pub fn flock(&self, operation: i32) -> Result<(), ERRNO> {
         let op = operation & !LOCK_NB;
@@ -802,7 +1303,7 @@ impl FileDescription {
                 } else {
                     if inner.offset == 0 || inner.dirent_snapshot.is_none() {
                         let snapshot_start_us = get_time_us();
-                        let snapshot = inode.ls();
+                        let snapshot = inode.dir_entries();
                         record_dir_snapshot_perf(
                             snapshot.len(),
                             get_time_us().saturating_sub(snapshot_start_us),
@@ -894,6 +1395,7 @@ impl FileDescription {
         }
         inner.offset = new_offset as usize;
         inner.dirent_snapshot = None;
+        inner.read_ahead.reset();
         Ok(new_offset as u64)
     }
 }
@@ -1117,10 +1619,11 @@ pub use inode::{
     lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, mkdir_at,
     mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
     open_file, open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat,
-    unlinkat, OSInode, OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW,
-    AT_SYMLINK_NOFOLLOW,
+    unlink_child, unlinkat, OSInode, OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,
+    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
+pub(crate) use eventfd::EventFdFile;
 pub use stdio::new_stdio_files;
 pub use tty::{
     console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize,

@@ -223,7 +223,7 @@ pub fn sys_sigaction(
                 let word_ptr =
                     (action as usize + i * core::mem::size_of::<usize>()) as *const usize;
                 match translated_ref(token, word_ptr) {
-                    Some(word) => debug!(
+                    Some(word) => trace!(
                         "sys_sigaction signum={} raw action[{}] addr={:#x} value={:#x}",
                         signum, i, word_ptr as usize, *word
                     ),
@@ -265,7 +265,7 @@ pub fn sys_sigaction(
         if !old_action.is_null() {
             let user_old = ArchSignalAbi::encode_user_sigaction(old);
             write_pod_to_user(old_action, &user_old)?;
-            debug!(
+            trace!(
                 "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
                 signum, old.handler, old.sa_flags
             );
@@ -310,6 +310,10 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
                     2 => inner.signal_mask = new_mask,       // SIG_SETMASK
                     _ => return Err(ERRNO::EINVAL),
                 }
+                // A previously masked pending signal may have become
+                // deliverable.  Let the user-return slow path recompute the
+                // exact state under both signal locks.
+                task.mark_signal_work_pending();
             }
             old_mask
         };
@@ -317,6 +321,39 @@ pub fn sys_sigprocmask(how: i32, set: *const u64, oset: *mut u64, sigsetsize: us
         // If user requested old mask, write it out after dropping process.inner.
         write_user_sigset(oset, sigsetsize, old_bits)?;
 
+        Ok(0)
+    })
+}
+
+/// `rt_sigpending(2)`：返回当前线程被阻塞的 pending signal 集合。
+///
+/// Linux 语义要求返回“线程级 pending ∪ 进程级 pending”再与当前 signal mask
+/// 取交集后的结果，并按用户态 `sigset_t` 布局写回。
+pub fn sys_rt_sigpending(set: *mut u64, sigsetsize: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_rt_sigpending set={:#x} sigsetsize={}",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        set as usize,
+        sigsetsize
+    );
+    syscall_body!({
+        if set.is_null() {
+            return Err(ERRNO::EFAULT);
+        }
+        if sigsetsize < core::mem::size_of::<u32>() {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let pending = {
+            let task = current_task().unwrap();
+            let process = current_process();
+            let process_inner = process.inner_exclusive_access();
+            let task_inner = task.inner_exclusive_access();
+            (task_inner.pending_signals | process_inner.pending_signals)
+                & task_inner.signal_mask.without_unblockable()
+        };
+
+        write_user_sigset(set, sigsetsize, pending)?;
         Ok(0)
     })
 }
@@ -366,6 +403,7 @@ pub fn sys_sigreturn() -> isize {
             let mask = SignalBit::from_user_bits(ArchSignalAbi::signal_mask(&ucontext));
             inner.signal_mask = mask;
             inner.signal_mask_backup = None;
+            task.mark_signal_work_pending();
             debug!("sys_sigreturn: restored signal mask to {:#x}", mask.bits());
         }
 
@@ -419,6 +457,9 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
             let old = inner.signal_mask;
             inner.signal_mask = new_mask;
             inner.signal_mask_backup = Some(old);
+            // Even before a signal arrives, the return path must restore the
+            // pre-sigsuspend mask if this sleep is canceled or wakes spuriously.
+            task.mark_signal_work_pending();
             debug!(
                 "sys_sigsuspend: changed mask from {:#x} to {:#x}",
                 old.bits(),

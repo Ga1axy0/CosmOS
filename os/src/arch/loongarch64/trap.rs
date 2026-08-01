@@ -21,6 +21,7 @@ const CSR_ESTAT: usize = 0x5;
 const CSR_ERA: usize = 0x6;
 const CSR_BADV: usize = 0x7;
 const CSR_BADI: usize = 0x8;
+const CSR_PGDL: usize = 0x19;
 const CSR_EENTRY: usize = 0xc;
 const CSR_TLBRENTRY: usize = 0x88;
 const CSR_TLBREHI: usize = 0x8e;
@@ -46,6 +47,9 @@ const ECODE_PME: usize = 0x4;
 const ECODE_ADE: usize = 0x8;
 const ECODE_SYS: usize = 0xb;
 const ECODE_INE: usize = 0xd;
+const ECODE_FPD: usize = 0xf;
+const ECODE_LSXDIS: usize = 0x10;
+const ECODE_LASXDIS: usize = 0x11;
 
 const ESTAT_ECODE_SHIFT: usize = 16;
 const ESTAT_ECODE_MASK: usize = 0x3f;
@@ -81,11 +85,17 @@ pub struct LoongArchTrapContextFrame {
     pub prmd: usize,
     pub era: usize,
     pub kernel_hartid: usize,
+    /// Legacy kernel-token slot retained to keep the cross-architecture trap
+    /// frame ABI stable. Ordinary trap entry does not consume it.
     pub kernel_pgdl: usize,
     pub kernel_sp: usize,
     pub trap_handler: usize,
     pub f: [u64; 32],
     pub fcsr: usize,
+    /// High 64-bit halves of the LSX vector registers.  The low halves alias
+    /// `f[]` and are saved by the existing scalar FP instructions; LSX code
+    /// needs this second half preserved across every user trap as well.
+    pub fp_high: [u64; 32],
 }
 
 /// LoongArch musl raw `rt_sigaction` syscall layout:
@@ -282,7 +292,14 @@ impl TrapMachine for LoongArchTrapMachine {
             ECODE_PIS | ECODE_PME => TrapCause::StorePageFault,
             ECODE_PIL => TrapCause::LoadPageFault,
             ECODE_PIF => TrapCause::InstructionPageFault,
-            ECODE_INE => TrapCause::IllegalInstruction,
+            // An unavailable FP/vector unit is a user instruction fault from
+            // the common handler's point of view.  Normally FP and LSX are
+            // enabled per hart, but decode these explicitly so a future
+            // unsupported extension produces SIGILL instead of a kernel
+            // panic.
+            ECODE_INE | ECODE_FPD | ECODE_LSXDIS | ECODE_LASXDIS => {
+                TrapCause::IllegalInstruction
+            }
             ECODE_ADE => match esubcode {
                 ESUBCODE_ADEF => TrapCause::InstructionFault,
                 ESUBCODE_ADEM => TrapCause::DataAddressFault,
@@ -291,6 +308,21 @@ impl TrapMachine for LoongArchTrapMachine {
             ECODE_INT => decode_interrupt_cause(estat, ecfg),
             _ => TrapCause::Unknown,
         };
+        if matches!(cause, TrapCause::Unknown) {
+            let badi = read_badi();
+            warn!(
+                "[loongarch-trap] unknown cause: estat={:#x} ecfg={:#x} ecode={:#x} \
+                 esubcode={:#x} badv={:#x} badi={:#x} era={:#x} pgdl={:#x}",
+                estat,
+                ecfg,
+                ecode,
+                esubcode,
+                badv,
+                badi,
+                read_era(),
+                read_pgdl(),
+            );
+        }
         TrapInfo {
             cause,
             fault_addr: badv,
@@ -434,6 +466,7 @@ impl TrapContextAbi for LoongArchTrapContextAbi {
             trap_handler,
             f: [0; 32],
             fcsr: 0,
+            fp_high: [0; 32],
         };
         frame.r[3] = sp;
         frame
@@ -677,6 +710,20 @@ fn read_badv() -> usize {
 fn read_badi() -> usize {
     let value: usize;
     unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_BADI) };
+    value
+}
+
+#[inline]
+fn read_era() -> usize {
+    let value: usize;
+    unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_ERA) };
+    value
+}
+
+#[inline]
+fn read_pgdl() -> usize {
+    let value: usize;
+    unsafe { asm!("csrrd {}, {}", out(reg) value, const CSR_PGDL) };
     value
 }
 

@@ -25,8 +25,8 @@ pub use policy::{
     SCHED_RT_PRIO_MIN,
 };
 pub(crate) use processor::{
-    current_kstack_top, current_processor, defer_task_release_after_switch, run_tasks, schedule,
-    take_current_task,
+    activate_current_address_space, current_kstack_top, defer_task_release_after_switch,
+    restore_current_task, run_tasks, schedule, take_current_task,
 };
 pub use processor::{
     current_process, current_task, current_trap_cx, current_trap_cx_user_va, current_user_token,
@@ -37,6 +37,7 @@ pub use runqueue::wakeup_task;
 pub(crate) use runqueue::{
     add_stopping_task, add_task, boost_process_cfs_tasks, cfs_should_preempt, clear_stopping_task,
     enqueue_task_on, has_runnable_task_at_or_above, insert_into_pid2process, list_pids,
-    pick_next_task, pid2process, remove_from_pid2process, remove_task, resched_hart, PID2PCB,
+    pick_next_task, pid2process, remove_from_pid2process, remove_task, resched_hart,
+    warn_lost_runnable_tasks, PID2PCB,
 };
 pub use switch::__switch;

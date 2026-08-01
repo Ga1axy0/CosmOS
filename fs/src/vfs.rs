@@ -1,14 +1,16 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 use core::fmt::Debug;
 #[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
 #[cfg(feature = "io_perf_counters")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use log::warn;
-use core::any::Any;
 use spin::Mutex;
 
-use crate::dentry_cache::{insert_dentry, lookup_dentry, remove_dentry};
+use crate::dentry_cache::{
+    insert_dentry, insert_negative_dentry, lookup_dentry, remove_dentry, DentryLookup,
+};
 use crate::errno::FS_ERRNO;
 use crate::inode_cache::{get_or_create_inode, remove_cached_inode, remove_cached_node};
 
@@ -20,6 +22,10 @@ static DENTRY_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 static DENTRY_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static DENTRY_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static DENTRY_NEGATIVE_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static BACKEND_NEGATIVE_INSERTS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static BACKEND_FIND_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -42,6 +48,8 @@ pub fn reset_perf_counters() {
     DENTRY_LOOKUPS.store(0, Ordering::Relaxed);
     DENTRY_HITS.store(0, Ordering::Relaxed);
     DENTRY_MISSES.store(0, Ordering::Relaxed);
+    DENTRY_NEGATIVE_HITS.store(0, Ordering::Relaxed);
+    BACKEND_NEGATIVE_INSERTS.store(0, Ordering::Relaxed);
     BACKEND_FIND_HITS.store(0, Ordering::Relaxed);
     BACKEND_FIND_MISSES.store(0, Ordering::Relaxed);
     STAT_ATTRS_CALLS.store(0, Ordering::Relaxed);
@@ -58,16 +66,37 @@ pub fn render_perf_counters() -> String {
     let _ = writeln!(&mut out, "  find_calls {}", perf_load(&FIND_CALLS));
     let _ = writeln!(&mut out, "  dentry_lookups {}", dentry_lookups);
     let _ = writeln!(&mut out, "  dentry_hits {}", perf_load(&DENTRY_HITS));
+    let _ = writeln!(
+        &mut out,
+        "  dentry_negative_hits {}",
+        perf_load(&DENTRY_NEGATIVE_HITS)
+    );
     let _ = writeln!(&mut out, "  dentry_misses {}", perf_load(&DENTRY_MISSES));
-    let _ = writeln!(&mut out, "  backend_find_hits {}", perf_load(&BACKEND_FIND_HITS));
-    let _ = writeln!(&mut out, "  backend_find_misses {}", perf_load(&BACKEND_FIND_MISSES));
+    let _ = writeln!(
+        &mut out,
+        "  backend_negative_inserts {}",
+        perf_load(&BACKEND_NEGATIVE_INSERTS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  backend_find_hits {}",
+        perf_load(&BACKEND_FIND_HITS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  backend_find_misses {}",
+        perf_load(&BACKEND_FIND_MISSES)
+    );
     let _ = writeln!(
         &mut out,
         "  dentry_hit_rate_x100 {}",
         if dentry_lookups == 0 {
             0
         } else {
-            perf_load(&DENTRY_HITS).saturating_mul(100) / dentry_lookups
+            perf_load(&DENTRY_HITS)
+                .saturating_add(perf_load(&DENTRY_NEGATIVE_HITS))
+                .saturating_mul(100)
+                / dentry_lookups
         }
     );
     let _ = writeln!(&mut out, "  stat_attrs_calls {}", stat_attrs_calls);
@@ -168,6 +197,15 @@ pub enum VfsFileType {
     Unknown,
 }
 
+/// A directory entry together with the inode number exposed through
+/// `linux_dirent64::d_ino`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsDirEntry {
+    pub name: String,
+    pub file_type: VfsFileType,
+    pub ino: u64,
+}
+
 /// Common VFS node interface.
 ///
 /// The kernel keeps `Arc<Inode>` handles and uses these methods for file operations.
@@ -176,28 +214,51 @@ pub trait VfsNode: Send + Sync + Any + Debug {
     fn as_any(&self) -> &dyn Any;
     /// List directory entries as `(name, file_type)` pairs.
     fn ls(&self) -> Vec<(String, VfsFileType)>;
+    /// List directory entries with the inode number reported by `stat(2)` for
+    /// the same child.
+    ///
+    /// Backends with a native directory iterator may override this to avoid
+    /// the per-name lookup. The default keeps the legacy `ls()` interface but
+    /// resolves each visible child so `getdents64().d_ino` is not confused
+    /// with the directory-entry position.
+    fn dir_entries(&self) -> Vec<VfsDirEntry> {
+        self.ls()
+            .into_iter()
+            .map(|(name, file_type)| {
+                let ino = self
+                    .find(name.as_str())
+                    .map(|child| child.ino())
+                    .unwrap_or(0);
+                VfsDirEntry {
+                    name,
+                    file_type,
+                    ino,
+                }
+            })
+            .collect()
+    }
     /// Fill `buf` with `linux_dirent64` records starting from the backend-defined
     /// directory position `offset`.
     ///
     /// The default implementation preserves the historical behavior used by the
     /// in-tree backends: `offset` is treated as an entry index and the method
-    /// is implemented on top of `ls()`.
+    /// is implemented on top of `dir_entries()`.
     fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
-        let entries = self.ls();
+        let entries = self.dir_entries();
         let mut written = 0usize;
 
-        for (i, (name, file_type)) in entries.iter().enumerate().skip(offset) {
-            let name_bytes = name.as_bytes();
+        for (i, entry) in entries.iter().enumerate().skip(offset) {
+            let name_bytes = entry.name.as_bytes();
             let reclen = (19 + name_bytes.len() + 1 + 7) & !7usize;
             if written + reclen > buf.len() {
                 break;
             }
 
-            buf[written..written + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+            buf[written..written + 8].copy_from_slice(&entry.ino.to_le_bytes());
             let next_off = (i + 1) as i64;
             buf[written + 8..written + 16].copy_from_slice(&next_off.to_le_bytes());
             buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            buf[written + 18] = match file_type {
+            buf[written + 18] = match entry.file_type {
                 VfsFileType::Directory => 4,
                 VfsFileType::Symlink => 10,
                 VfsFileType::Char => 2,
@@ -228,9 +289,19 @@ pub trait VfsNode: Send + Sync + Any + Debug {
     }
     fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
     fn create(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
+    /// Create a regular file while preserving a backend-specific error.
+    /// Backends that still implement only the legacy `Option` API retain the
+    /// historical EIO fallback.
+    fn create_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        self.create(name).ok_or(FS_ERRNO::EIO)
+    }
     /// Create a sub-directory named `name` inside this directory.
     /// Returns the new directory inode, or `None` on failure.
     fn mkdir(&self, name: &str) -> Option<Arc<dyn VfsNode>>;
+    /// Create a directory while preserving a backend-specific error.
+    fn mkdir_result(&self, name: &str) -> Result<Arc<dyn VfsNode>, FS_ERRNO> {
+        self.mkdir(name).ok_or(FS_ERRNO::EIO)
+    }
     /// Returns true if this node is a directory.
     fn file_type(&self) -> VfsFileType;
     fn is_dir(&self) -> bool {
@@ -255,6 +326,13 @@ pub trait VfsNode: Send + Sync + Any + Debug {
         Err(FS_ERRNO::EOPNOTSUPP)
     }
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize;
+    /// Read file payload for the page cache without using a lower-level data
+    /// cache when the backend can provide such a path.  Metadata reads remain
+    /// under the backend's normal cache policy.  Backends without a distinct
+    /// direct path retain the regular read behavior.
+    fn read_at_page_cache(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.read_at(offset, buf)
+    }
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize;
     /// 向固定偏移写入数据，并保留底层文件系统返回的真实错误。
     fn write_at_result(&self, offset: usize, buf: &[u8]) -> Result<usize, FS_ERRNO> {
@@ -408,6 +486,9 @@ pub struct Inode {
 struct InodeState {
     /// 由 OS 层按需挂载的 page cache 宿主对象。
     page_cache: Option<Arc<dyn Any + Send + Sync>>,
+    /// Page-cache data is newer than the backing inode and must keep this
+    /// stable inode alive until writeback or explicit discard completes.
+    page_cache_retained: bool,
     /// 最近一次读取到的 stat 元数据快照。
     stat_attrs: Option<VfsAttrs>,
 }
@@ -419,6 +500,7 @@ impl Inode {
             inner,
             state: Mutex::new(InodeState {
                 page_cache: None,
+                page_cache_retained: false,
                 stat_attrs: None,
             }),
         }
@@ -443,6 +525,12 @@ impl Inode {
         self.inner.ls()
     }
 
+    /// Return a directory snapshot whose inode numbers agree with stat-like
+    /// metadata for the corresponding children.
+    pub fn dir_entries(&self) -> Vec<VfsDirEntry> {
+        self.inner.dir_entries()
+    }
+
     pub fn getdents64(&self, offset: usize, buf: &mut [u8]) -> usize {
         self.inner.getdents64(offset, buf)
     }
@@ -460,13 +548,22 @@ impl Inode {
         if fs_id != 0 {
             #[cfg(feature = "io_perf_counters")]
             DENTRY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
-            if let Some(child) = lookup_dentry(fs_id, self.ino(), name) {
-                #[cfg(feature = "io_perf_counters")]
-                DENTRY_HITS.fetch_add(1, Ordering::Relaxed);
-                return Some(child);
+            match lookup_dentry(fs_id, self.ino(), name) {
+                DentryLookup::Positive(child) => {
+                    #[cfg(feature = "io_perf_counters")]
+                    DENTRY_HITS.fetch_add(1, Ordering::Relaxed);
+                    return Some(child);
+                }
+                DentryLookup::Negative => {
+                    #[cfg(feature = "io_perf_counters")]
+                    DENTRY_NEGATIVE_HITS.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                DentryLookup::Miss => {
+                    #[cfg(feature = "io_perf_counters")]
+                    DENTRY_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            #[cfg(feature = "io_perf_counters")]
-            DENTRY_MISSES.fetch_add(1, Ordering::Relaxed);
         }
         let child = self.inner.find(name).map(Self::wrap);
         #[cfg(feature = "io_perf_counters")]
@@ -475,17 +572,30 @@ impl Inode {
                 BACKEND_FIND_HITS.fetch_add(1, Ordering::Relaxed);
             } else {
                 BACKEND_FIND_MISSES.fetch_add(1, Ordering::Relaxed);
+                if fs_id != 0 {
+                    BACKEND_NEGATIVE_INSERTS.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        let child = child?;
-        if fs_id != 0 {
-            insert_dentry(fs_id, self.ino(), name, &child);
+        if let Some(child) = child {
+            if fs_id != 0 {
+                insert_dentry(fs_id, self.ino(), name, &child);
+            }
+            Some(child)
+        } else {
+            if fs_id != 0 {
+                insert_negative_dentry(fs_id, self.ino(), name);
+            }
+            None
         }
-        Some(child)
     }
 
     pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
-        let child = self.inner.create(name).map(|i| {
+        self.create_result(name).ok()
+    }
+
+    pub fn create_result(&self, name: &str) -> Result<Arc<Inode>, FS_ERRNO> {
+        let child = self.inner.create_result(name).map(|i| {
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o644u32 & perms_mask);
@@ -498,11 +608,15 @@ impl Inode {
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), name, &child);
         }
-        Some(child)
+        Ok(child)
     }
 
     pub fn mkdir(&self, name: &str) -> Option<Arc<Inode>> {
-        let child = self.inner.mkdir(name).map(|i|{
+        self.mkdir_result(name).ok()
+    }
+
+    pub fn mkdir_result(&self, name: &str) -> Result<Arc<Inode>, FS_ERRNO> {
+        let child = self.inner.mkdir_result(name).map(|i| {
             if let Some(cur_mode) = i.mode() {
                 let perms_mask: u32 = 0x0fff; // lower 12 bits
                 let new_mode = (cur_mode & !perms_mask) | (0o755u32 & perms_mask);
@@ -515,7 +629,7 @@ impl Inode {
         if fs_id != 0 {
             insert_dentry(fs_id, self.ino(), name, &child);
         }
-        Some(child)
+        Ok(child)
     }
 
     pub fn is_dir(&self) -> bool {
@@ -565,6 +679,12 @@ impl Inode {
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         self.inner.read_at(offset, buf)
+    }
+
+    /// Read regular-file data for page-cache population without filling a
+    /// lower-level data cache when the filesystem supports it.
+    pub fn read_at_page_cache(&self, offset: usize, buf: &mut [u8]) -> usize {
+        self.inner.read_at_page_cache(offset, buf)
     }
 
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
@@ -686,12 +806,12 @@ impl Inode {
         let fs_id = self.fs_id();
         if let Err(err) = self.inner.unlink(name) {
             if matches!(err, FS_ERRNO::ENOENT) && fs_id != 0 {
-                remove_dentry(fs_id, self.ino(), name);
+                insert_negative_dentry(fs_id, self.ino(), name);
             }
             return Err(err);
         }
         if fs_id != 0 {
-            remove_dentry(fs_id, self.ino(), name);
+            insert_negative_dentry(fs_id, self.ino(), name);
         }
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
@@ -705,12 +825,12 @@ impl Inode {
         let fs_id = self.fs_id();
         if let Err(err) = self.inner.rmdir(name) {
             if matches!(err, FS_ERRNO::ENOENT) && fs_id != 0 {
-                remove_dentry(fs_id, self.ino(), name);
+                insert_negative_dentry(fs_id, self.ino(), name);
             }
             return Err(err);
         }
         if fs_id != 0 {
-            remove_dentry(fs_id, self.ino(), name);
+            insert_negative_dentry(fs_id, self.ino(), name);
         }
         if let Some((child_fs, child_ino)) = child_to_drop {
             remove_cached_inode(child_fs, child_ino);
@@ -749,23 +869,36 @@ impl Inode {
         Ok(())
     }
 
-    pub fn rename_child(&self, old_name: &str, new_parent: &Inode, new_name: &str) -> Result<(), FS_ERRNO> {
-        let old_child = self.find(old_name).map(|child| (child.fs_id(), child.ino()));
+    pub fn rename_child(
+        &self,
+        old_name: &str,
+        new_parent: &Inode,
+        new_name: &str,
+    ) -> Result<(), FS_ERRNO> {
+        // Keep the stable in-memory inode alive across the backend rename. Its
+        // page-cache state can contain dirty bytes and a newer logical size
+        // than the backing inode until writeback completes.
+        let old_child = self.find(old_name);
+        let old_child_key = old_child.as_ref().map(|child| (child.fs_id(), child.ino()));
         let replaced_child = new_parent
             .find(new_name)
             .filter(|child| {
                 let child_key = (child.fs_id(), child.ino());
-                Some(child_key) != old_child && (child.is_dir() || child.nlink() <= 1)
+                Some(child_key) != old_child_key && (child.is_dir() || child.nlink() <= 1)
             })
             .map(|child| (child.fs_id(), child.ino()));
-        self.inner.rename_child(old_name, &new_parent.inner, new_name)?;
+        self.inner
+            .rename_child(old_name, &new_parent.inner, new_name)?;
         let old_fs = self.fs_id();
         if old_fs != 0 {
-            remove_dentry(old_fs, self.ino(), old_name);
+            insert_negative_dentry(old_fs, self.ino(), old_name);
         }
         let new_fs = new_parent.fs_id();
         if new_fs != 0 {
             remove_dentry(new_fs, new_parent.ino(), new_name);
+            if let Some(old_child) = old_child.as_ref() {
+                insert_dentry(new_fs, new_parent.ino(), new_name, old_child);
+            }
         }
         if let Some((child_fs, child_ino)) = replaced_child {
             remove_cached_inode(child_fs, child_ino);
@@ -791,7 +924,25 @@ impl Inode {
 
     /// 为当前 inode 安装 page cache 宿主对象。
     pub fn set_page_cache_state<T: Any + Send + Sync>(&self, state: Arc<T>) {
-        self.state.lock().page_cache = Some(state);
+        let mut state_guard = self.state.lock();
+        state_guard.page_cache = Some(state);
+        state_guard.page_cache_retained = false;
+    }
+
+    /// Record whether upper-layer page-cache state contains data newer than
+    /// the backing inode.
+    ///
+    /// The generic VFS cache cannot inspect the type-erased mapping. This
+    /// explicit bit lets it preserve dirty mappings while still reclaiming
+    /// clean read-cache state.
+    pub fn set_page_cache_retained(&self, retained: bool) {
+        let mut state_guard = self.state.lock();
+        state_guard.page_cache_retained = retained && state_guard.page_cache.is_some();
+    }
+
+    /// Return whether dropping this stable inode could lose page-cache data.
+    pub fn page_cache_retained(&self) -> bool {
+        self.state.lock().page_cache_retained
     }
 
     /// 原子地获取或安装当前 inode 挂载的 page cache 宿主对象。
@@ -811,13 +962,15 @@ impl Inode {
         let state = init();
         let erased: Arc<dyn Any + Send + Sync> = state.clone();
         state_guard.page_cache = Some(erased);
+        state_guard.page_cache_retained = false;
         (state, true)
     }
 
     /// 移除当前 inode 挂载的 page cache 宿主对象。
     pub fn take_page_cache_state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-        self.state
-            .lock()
+        let mut state_guard = self.state.lock();
+        state_guard.page_cache_retained = false;
+        state_guard
             .page_cache
             .take()
             .and_then(|state| state.downcast::<T>().ok())
@@ -829,5 +982,115 @@ impl Inode {
     /// (e.g. an ext4 root) so it can be stored as a mount-point overlay.
     pub fn vfs_node(&self) -> Arc<dyn VfsNode> {
         Arc::clone(&self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::convert::TryInto;
+
+    #[derive(Debug)]
+    struct TestFile {
+        ino: u64,
+    }
+
+    impl VfsNode for TestFile {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn ls(&self) -> Vec<(String, VfsFileType)> {
+            Vec::new()
+        }
+
+        fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn file_type(&self) -> VfsFileType {
+            VfsFileType::Regular
+        }
+
+        fn clear(&self) {}
+
+        fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+            0
+        }
+
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+            0
+        }
+
+        fn ino(&self) -> u64 {
+            self.ino
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestDir {
+        child_ino: u64,
+    }
+
+    impl VfsNode for TestDir {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn ls(&self) -> Vec<(String, VfsFileType)> {
+            alloc::vec![(String::from("child"), VfsFileType::Regular)]
+        }
+
+        fn find(&self, name: &str) -> Option<Arc<dyn VfsNode>> {
+            (name == "child").then(|| {
+                Arc::new(TestFile {
+                    ino: self.child_ino,
+                }) as Arc<dyn VfsNode>
+            })
+        }
+
+        fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+            None
+        }
+
+        fn file_type(&self) -> VfsFileType {
+            VfsFileType::Directory
+        }
+
+        fn clear(&self) {}
+
+        fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> usize {
+            0
+        }
+
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn default_getdents64_reports_the_child_inode() {
+        let expected = 0x1234_5678_9abc_def0;
+        let dir = TestDir {
+            child_ino: expected,
+        };
+        let mut buf = [0u8; 64];
+
+        let written = dir.getdents64(0, &mut buf);
+
+        assert!(written >= 19 + "child".len() + 1);
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), expected);
     }
 }

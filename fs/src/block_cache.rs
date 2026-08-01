@@ -1,7 +1,7 @@
 //! Block Cache Layer
 //! Implements about the disk block cache functionality
-use super::{BlockDevice, BlockWrite, BLOCK_SZ};
-use alloc::collections::{BTreeMap, VecDeque};
+use super::{BlockDevice, BlockRead, BlockWrite, BLOCK_SZ};
+use alloc::collections::BTreeMap;
 #[cfg(feature = "io_perf_counters")]
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -10,7 +10,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
 #[cfg(feature = "io_perf_counters")]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::*;
 
 use crate::sleep_mutex::SleepMutex as Mutex;
@@ -56,6 +57,10 @@ pub struct BlockCache {
     block_id: usize,
     block_device: Arc<dyn BlockDevice>,
     modified: bool,
+    /// Approximate CLOCK reference bit.  It is atomic because cache hits
+    /// already hold the entry mutex only while copying data; the manager
+    /// needs to sample/clear this bit while choosing a victim.
+    ref_bit: AtomicBool,
 }
 
 impl BlockCache {
@@ -69,6 +74,7 @@ impl BlockCache {
             block_id,
             block_device,
             modified: false,
+            ref_bit: AtomicBool::new(true),
         }
     }
 
@@ -82,6 +88,7 @@ impl BlockCache {
             block_id,
             block_device,
             modified: true,
+            ref_bit: AtomicBool::new(true),
         }
     }
 
@@ -95,7 +102,18 @@ impl BlockCache {
             block_id,
             block_device,
             modified: false,
+            ref_bit: AtomicBool::new(true),
         }
+    }
+
+    #[inline]
+    fn touch(&self) {
+        self.ref_bit.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn take_ref_bit(&self) -> bool {
+        self.ref_bit.swap(false, Ordering::Relaxed)
     }
 
     /// Get the slice in the block cache according to the offset.
@@ -109,6 +127,7 @@ impl BlockCache {
     {
         let type_size = core::mem::size_of::<T>();
         assert!(offset + type_size <= BLOCK_SZ);
+        self.touch();
         let addr = self.addr_of_offset(offset);
         unsafe { &*(addr as *const T) }
     }
@@ -120,6 +139,7 @@ impl BlockCache {
         let type_size = core::mem::size_of::<T>();
         assert!(offset + type_size <= BLOCK_SZ);
         self.modified = true;
+        self.touch();
         let addr = self.addr_of_offset(offset);
         unsafe { &mut *(addr as *mut T) }
     }
@@ -138,6 +158,7 @@ impl BlockCache {
     /// because it avoids creating potentially unaligned typed references.
     pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) {
         assert!(offset + buf.len() <= BLOCK_SZ);
+        self.touch();
         buf.copy_from_slice(&self.cache[offset..offset + buf.len()]);
     }
 
@@ -147,6 +168,7 @@ impl BlockCache {
     pub fn write_bytes(&mut self, offset: usize, data: &[u8]) {
         assert!(offset + data.len() <= BLOCK_SZ);
         self.modified = true;
+        self.touch();
         self.cache[offset..offset + data.len()].copy_from_slice(data);
     }
 
@@ -165,12 +187,18 @@ impl Drop for BlockCache {
     }
 }
 
-const BLOCK_CACHE_SIZE: usize = 8192;
+const BLOCK_CACHE_SIZE: usize = 65536;
 
 /// BlockCacheManager is a manager for BlockCache.
 pub struct BlockCacheManager {
-    /// Cache keys in insertion order, used only to choose eviction victims.
-    queue: VecDeque<(usize, usize)>,
+    /// Cache keys arranged in a circular CLOCK hand.
+    ///
+    /// Unlike an LRU list, a hit only sets the entry's reference bit and does
+    /// not move anything in this vector.  Victim slots are reused in place so
+    /// the queue does not grow during repeated evictions.
+    queue: Vec<(usize, usize)>,
+    /// Next slot examined by the CLOCK hand.
+    clock_hand: usize,
     /// Cache entries indexed by `(device_id, block_id)` for fast lookup.
     map: BTreeMap<(usize, usize), Arc<Mutex<BlockCache>>>,
 }
@@ -179,7 +207,8 @@ impl BlockCacheManager {
     /// Create a new BlockCacheManager with an empty queue.
     pub fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
+            queue: Vec::new(),
+            clock_hand: 0,
             map: BTreeMap::new(),
         }
     }
@@ -188,33 +217,74 @@ impl BlockCacheManager {
         Arc::as_ptr(block_device) as *const () as usize
     }
 
-    fn evict_one_if_needed(&mut self) {
+    /// Make room for one insertion and return a reusable queue slot.
+    ///
+    /// A referenced, unpinned entry receives a second chance: its reference
+    /// bit is cleared and the hand advances.  Pinned entries are skipped
+    /// until they become available.  The returned slot is replaced by the
+    /// caller after the new entry has been constructed.
+    fn evict_one_if_needed(&mut self) -> Option<usize> {
         if self.map.len() < BLOCK_CACHE_SIZE {
-            return;
+            return None;
         }
-        if let Some((idx, _)) = self
-            .queue
-            .iter()
-            .enumerate()
-            .find(|(_, key)| {
-                self.map
-                    .get(key)
-                    .map(|cache| Arc::strong_count(cache) == 1)
-                    .unwrap_or(true)
-            })
-        {
-            #[cfg(feature = "io_perf_counters")]
-            EVICT_SCAN_STEPS.fetch_add(idx + 1, Ordering::Relaxed);
-            #[cfg(feature = "io_perf_counters")]
-            EVICTIONS.fetch_add(1, Ordering::Relaxed);
-            if let Some(evicted_key) = self.queue.remove(idx) {
-                self.map.remove(&evicted_key);
+
+        let queue_len = self.queue.len();
+        if queue_len == 0 {
+            panic!("BlockCache queue is empty while cache map is full");
+        }
+
+        // Two passes are sufficient for CLOCK: the first pass clears all
+        // second-chance bits, and the second pass can select an unpinned
+        // unreferenced entry.  A pinned entry remains ineligible.
+        let max_scan = queue_len.saturating_mul(2).max(1);
+        for scanned in 0..max_scan {
+            #[cfg(not(feature = "io_perf_counters"))]
+            let _ = scanned;
+            let idx = self.clock_hand % queue_len;
+            let key = self.queue[idx];
+            let Some(cache) = self.map.get(&key) else {
+                // This should not normally happen, but recovering here keeps
+                // a stale queue slot from wedging the cache manager.
+                self.clock_hand = (idx + 1) % queue_len;
+                #[cfg(feature = "io_perf_counters")]
+                EVICT_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+
+            if Arc::strong_count(cache) == 1 && !cache.lock().take_ref_bit() {
+                #[cfg(feature = "io_perf_counters")]
+                EVICT_SCAN_STEPS.fetch_add(scanned + 1, Ordering::Relaxed);
+                #[cfg(feature = "io_perf_counters")]
+                EVICTIONS.fetch_add(1, Ordering::Relaxed);
+
+                // Removing the manager's Arc may synchronously write back a
+                // dirty entry through BlockCache::Drop, preserving the old
+                // correctness behavior.  The slot itself is reused below.
+                self.map.remove(&key);
+                self.clock_hand = (idx + 1) % queue_len;
+                return Some(idx);
             }
-        } else {
-            #[cfg(feature = "io_perf_counters")]
-            EVICT_SCAN_STEPS.fetch_add(self.queue.len(), Ordering::Relaxed);
-            panic!("Run out of BlockCache!");
+
+            self.clock_hand = (idx + 1) % queue_len;
         }
+
+        #[cfg(feature = "io_perf_counters")]
+        EVICT_SCAN_STEPS.fetch_add(max_scan, Ordering::Relaxed);
+        panic!("Run out of BlockCache: all entries are pinned");
+    }
+
+    fn install_entry(
+        &mut self,
+        key: (usize, usize),
+        block_cache: Arc<Mutex<BlockCache>>,
+        reusable_slot: Option<usize>,
+    ) {
+        if let Some(idx) = reusable_slot {
+            self.queue[idx] = key;
+        } else {
+            self.queue.push(key);
+        }
+        self.map.insert(key, block_cache);
     }
 
     fn insert_prefetched_block(
@@ -227,26 +297,14 @@ impl BlockCacheManager {
         if let Some(block_cache) = self.map.get(&key) {
             return Arc::clone(block_cache);
         }
-        self.evict_one_if_needed();
+        let reusable_slot = self.evict_one_if_needed();
         let block_cache = Arc::new(Mutex::new(BlockCache::new_from_bytes(
             block_id,
             Arc::clone(&block_device),
             data,
         )));
-        self.queue.push_back(key);
-        self.map.insert(key, Arc::clone(&block_cache));
+        self.install_entry(key, Arc::clone(&block_cache), reusable_slot);
         block_cache
-    }
-
-    fn read_miss_run(&mut self, start_block: usize, block_device: Arc<dyn BlockDevice>, buf: &mut [u8]) {
-        assert!(buf.len() % BLOCK_SZ == 0);
-        if buf.is_empty() {
-            return;
-        }
-        block_device.read_blocks(start_block, buf);
-        for (idx, block) in buf.chunks(BLOCK_SZ).enumerate() {
-            self.insert_prefetched_block(start_block + idx, Arc::clone(&block_device), block);
-        }
     }
 
     /// Get a block cache from the queue. according to the block_id.
@@ -263,19 +321,19 @@ impl BlockCacheManager {
         if let Some(block_cache) = self.map.get(&key) {
             #[cfg(feature = "io_perf_counters")]
             GET_HITS.fetch_add(1, Ordering::Relaxed);
+            block_cache.lock().touch();
             return Arc::clone(block_cache);
         }
         #[cfg(feature = "io_perf_counters")]
         GET_MISSES.fetch_add(1, Ordering::Relaxed);
 
-        self.evict_one_if_needed();
+        let reusable_slot = self.evict_one_if_needed();
         // load block into mem and push back
         let block_cache = Arc::new(Mutex::new(BlockCache::new(
             block_id,
             Arc::clone(&block_device),
         )));
-        self.queue.push_back(key);
-        self.map.insert(key, Arc::clone(&block_cache));
+        self.install_entry(key, Arc::clone(&block_cache), reusable_slot);
         block_cache
     }
 
@@ -288,52 +346,87 @@ impl BlockCacheManager {
         block_device: Arc<dyn BlockDevice>,
         buf: &mut [u8],
     ) {
-        assert!(buf.len() % BLOCK_SZ == 0);
-        let block_count = buf.len() / BLOCK_SZ;
-        #[cfg(feature = "io_perf_counters")]
-        GET_CALLS.fetch_add(block_count, Ordering::Relaxed);
-        if block_count == 0 {
-            return;
-        }
+        let mut read = BlockRead { start_block, data: buf };
+        self.read_block_cache_ranges(block_device, core::slice::from_mut(&mut read));
+    }
 
+    /// Read several independent ranges and submit all cold miss runs as one
+    /// device batch, while preserving the shared block-cache contents.
+    pub fn read_block_cache_ranges(
+        &mut self,
+        block_device: Arc<dyn BlockDevice>,
+        ranges: &mut [BlockRead<'_>],
+    ) {
         let device_id = Self::device_id(&block_device);
-        let mut idx = 0usize;
-        while idx < block_count {
-            #[cfg(feature = "io_perf_counters")]
-            LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
-            let key = (device_id, start_block + idx);
-            if let Some(block_cache) = self.map.get(&key).cloned() {
-                #[cfg(feature = "io_perf_counters")]
-                GET_HITS.fetch_add(1, Ordering::Relaxed);
-                let offset = idx * BLOCK_SZ;
-                block_cache
-                    .lock()
-                    .read_bytes(0, &mut buf[offset..offset + BLOCK_SZ]);
-                idx += 1;
-                continue;
-            }
+        let mut pending_meta = Vec::new();
 
-            let miss_start = idx;
-            idx += 1;
+        for (range_idx, range) in ranges.iter_mut().enumerate() {
+            assert!(range.data.len() % BLOCK_SZ == 0);
+            let block_count = range.data.len() / BLOCK_SZ;
+            #[cfg(feature = "io_perf_counters")]
+            GET_CALLS.fetch_add(block_count, Ordering::Relaxed);
+
+            let mut idx = 0usize;
             while idx < block_count {
                 #[cfg(feature = "io_perf_counters")]
                 LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
-                let key = (device_id, start_block + idx);
-                if self.map.contains_key(&key) {
-                    break;
+                let key = (device_id, range.start_block + idx);
+                if let Some(block_cache) = self.map.get(&key).cloned() {
+                    #[cfg(feature = "io_perf_counters")]
+                    GET_HITS.fetch_add(1, Ordering::Relaxed);
+                    let offset = idx * BLOCK_SZ;
+                    block_cache
+                        .lock()
+                        .read_bytes(0, &mut range.data[offset..offset + BLOCK_SZ]);
+                    idx += 1;
+                    continue;
                 }
+
+                let miss_start = idx;
                 idx += 1;
+                while idx < block_count {
+                    #[cfg(feature = "io_perf_counters")]
+                    LOOKUP_SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
+                    let key = (device_id, range.start_block + idx);
+                    if self.map.contains_key(&key) {
+                        break;
+                    }
+                    idx += 1;
+                }
+                #[cfg(feature = "io_perf_counters")]
+                GET_MISSES.fetch_add(idx - miss_start, Ordering::Relaxed);
+                pending_meta.push((range_idx, miss_start, idx));
             }
-            let miss_blocks = idx - miss_start;
-            #[cfg(feature = "io_perf_counters")]
-            GET_MISSES.fetch_add(miss_blocks, Ordering::Relaxed);
+        }
+
+        let mut pending = Vec::with_capacity(pending_meta.len());
+        for &(range_idx, miss_start, miss_end) in &pending_meta {
+            // The metadata pass has ended. Miss intervals are disjoint, so
+            // these reborrows do not alias the other pending requests.
+            let range = unsafe { &mut *ranges.as_mut_ptr().add(range_idx) };
             let byte_start = miss_start * BLOCK_SZ;
-            let byte_end = idx * BLOCK_SZ;
-            self.read_miss_run(
-                start_block + miss_start,
-                Arc::clone(&block_device),
-                &mut buf[byte_start..byte_end],
-            );
+            let byte_end = miss_end * BLOCK_SZ;
+            let data = unsafe {
+                core::slice::from_raw_parts_mut(
+                    range.data.as_mut_ptr().add(byte_start),
+                    byte_end - byte_start,
+                )
+            };
+            pending.push(BlockRead {
+                start_block: range.start_block + miss_start,
+                data,
+            });
+        }
+
+        block_device.read_blocks_many(&mut pending);
+        for read in &pending {
+            for (idx, block) in read.data.chunks(BLOCK_SZ).enumerate() {
+                self.insert_prefetched_block(
+                    read.start_block + idx,
+                    Arc::clone(&block_device),
+                    block,
+                );
+            }
         }
     }
 
@@ -515,6 +608,16 @@ pub fn read_block_cache_range(
     BLOCK_CACHE_MANAGER
         .lock()
         .read_block_cache_range(start_block, block_device, buf)
+}
+
+/// Read several independent ranges through the shared block cache.
+pub fn read_block_cache_ranges(
+    block_device: Arc<dyn BlockDevice>,
+    ranges: &mut [BlockRead<'_>],
+) {
+    BLOCK_CACHE_MANAGER
+        .lock()
+        .read_block_cache_ranges(block_device, ranges)
 }
 
 /// Overwrite a complete block cache entry without first loading old disk data.

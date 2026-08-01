@@ -7,7 +7,7 @@ use crate::{
         ArchSignalAbi, ArchTrapContextAbi, ArchTrapMachine,
     },
     syscall::write_pod_to_user,
-    task::{current_task, current_trap_cx},
+    task::{current_process, current_task, current_trap_cx, TaskControlBlock},
 };
 
 mod action;
@@ -50,6 +50,60 @@ pub const SIG_DFL: usize = 0;
 /// Ignore signal
 pub const SIG_IGN: usize = 1;
 
+#[inline]
+fn first_pending_signum(pending: SignalBit) -> Option<usize> {
+    let bits = pending.bits();
+    (bits != 0).then(|| bits.trailing_zeros() as usize + 1)
+}
+
+/// Return whether one task needs the locked signal slow path before user
+/// return.  Callers supply a consistent snapshot protected by process/task
+/// signal locks.
+pub(crate) fn signal_work_needed(
+    thread_pending: SignalBit,
+    process_pending: SignalBit,
+    signal_mask: SignalBit,
+    restore_mask: bool,
+) -> bool {
+    restore_mask
+        || !((thread_pending | process_pending) & !signal_mask.without_unblockable()).is_empty()
+}
+
+/// Recompute the current task's lock-free signal-work hint.
+pub(crate) fn refresh_current_signal_work_pending() {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let Some(process) = task.process.upgrade() else {
+        task.set_signal_work_pending(false);
+        return;
+    };
+    let process_inner = process.inner_exclusive_access();
+    let task_inner = task.inner_exclusive_access();
+    task.set_signal_work_pending(signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
+}
+
+#[inline]
+fn refresh_signal_work_pending_locked(
+    task: &TaskControlBlock,
+    thread_pending: SignalBit,
+    process_pending: SignalBit,
+    signal_mask: SignalBit,
+    restore_mask: bool,
+) {
+    task.set_signal_work_pending(signal_work_needed(
+        thread_pending,
+        process_pending,
+        signal_mask,
+        restore_mask,
+    ));
+}
+
 /// Returns whether the current task has an unmasked pending signal that should
 /// interrupt a blocking syscall with `EINTR`.
 ///
@@ -62,6 +116,9 @@ pub const SIG_IGN: usize = 1;
 /// turn a Ctrl+C-induced wakeup into an `EINTR` return.
 pub fn has_interrupting_signal() -> bool {
     let task = current_task().unwrap();
+    if !task.signal_work_pending() {
+        return false;
+    }
     let process = crate::task::current_process();
     let process_inner = process.inner_exclusive_access();
     let task_inner = task.inner_exclusive_access();
@@ -70,13 +127,10 @@ pub fn has_interrupting_signal() -> bool {
     if pending.is_empty() {
         return false;
     }
-    for signum in 1..=MAX_SIG {
-        let Some(flag) = SignalBit::from_signum(signum as u32) else {
-            continue;
-        };
-        if !pending.contains(flag) {
-            continue;
-        }
+    let mut remaining = pending;
+    while let Some(signum) = first_pending_signum(remaining) {
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
         let handler = process_inner.signal_actions.table[signum].handler;
         if handler == SIG_IGN {
             continue;
@@ -103,6 +157,9 @@ pub fn has_interrupting_signal() -> bool {
 /// Handles SIG_IGN by clearing the signal, and SIG_DFL by default behavior.
 pub fn check_signals_of_current() -> Option<(i32, SignalAction, SigInfo)> {
     let task = current_task().unwrap();
+    if !task.signal_work_pending() {
+        return None;
+    }
     let process = crate::task::current_process();
     let mut process_inner = process.inner_exclusive_access();
     let mut task_inner = task.inner_exclusive_access();
@@ -110,74 +167,86 @@ pub fn check_signals_of_current() -> Option<(i32, SignalAction, SigInfo)> {
     let pending = (thread_pending | process_inner.pending_signals)
         & !task_inner.signal_mask.without_unblockable();
 
-    // Find the first pending signal
-    for signum in 1..=MAX_SIG {
-        let flag = SignalBit::from_signum(signum as u32);
-        if let Some(flag) = flag {
-            if pending.contains(flag) {
-                let from_thread = thread_pending.contains(flag);
-                let action = process_inner.signal_actions.table[signum];
+    // Visit only signals that are actually pending instead of scanning all 64
+    // signal numbers on every slow-path entry.
+    let mut remaining = pending;
+    while let Some(signum) = first_pending_signum(remaining) {
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
+        let from_thread = thread_pending.contains(flag);
+        let action = process_inner.signal_actions.table[signum];
 
-                // SIG_IGN: clear the signal and continue
-                if action.handler == SIG_IGN {
-                    if from_thread {
-                        task_inner.pending_signals &= !flag;
-                    } else {
-                        process_inner.pending_signals &= !flag;
-                    }
-                    debug!("check_signals: signum={} ignored (SIG_IGN)", signum);
-                    continue;
-                }
-
-                // SIG_DFL: use default behavior
-                if action.handler == SIG_DFL {
-                    // Check if this is a fatal signal with default behavior
-                    if flag.check_error().is_some() {
-                        continue;
-                    } else {
-                        if from_thread {
-                            task_inner.pending_signals &= !flag;
-                        } else {
-                            process_inner.pending_signals &= !flag;
-                        }
-                        debug!(
-                            "check_signals: signum={} cleared (SIG_DFL, non-fatal)",
-                            signum
-                        );
-                        continue;
-                    }
-                }
-
-                // User-defined handler
-                if action.handler > 1 {
-                    let siginfo = if from_thread {
-                        task_inner.pending_siginfo[signum]
-                    } else {
-                        process_inner.pending_siginfo[signum]
-                    };
-                    if from_thread {
-                        task_inner.pending_signals &= !flag;
-                    } else {
-                        process_inner.pending_signals &= !flag;
-                    }
-                    debug!(
-                        "check_signals: signum={} dispatching to handler={:#x}, flags={:#x}, si_code={}, si_pid={}, si_uid={}, from_thread={}",
-                        signum,
-                        action.handler,
-                        action.sa_flags,
-                        siginfo.si_code,
-                        siginfo.si_pid,
-                        siginfo.si_uid,
-                        from_thread
-                    );
-                    return Some((signum as i32, action, siginfo));
-                }
+        // SIG_IGN: clear the signal and continue.
+        if action.handler == SIG_IGN {
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
             }
+            debug!("check_signals: signum={} ignored (SIG_IGN)", signum);
+            continue;
+        }
+
+        // Fatal default actions are handled by the preceding fatal-signal
+        // check.  Non-fatal defaults are consumed here.
+        if action.handler == SIG_DFL {
+            if flag.check_error().is_some() {
+                continue;
+            }
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
+            }
+            debug!(
+                "check_signals: signum={} cleared (SIG_DFL, non-fatal)",
+                signum
+            );
+            continue;
+        }
+
+        // User-defined handler.
+        if action.handler > 1 {
+            let siginfo = if from_thread {
+                task_inner.pending_siginfo[signum]
+            } else {
+                process_inner.pending_siginfo[signum]
+            };
+            if from_thread {
+                task_inner.pending_signals &= !flag;
+            } else {
+                process_inner.pending_signals &= !flag;
+            }
+            refresh_signal_work_pending_locked(
+                &task,
+                task_inner.pending_signals,
+                process_inner.pending_signals,
+                task_inner.signal_mask,
+                task_inner.signal_mask_backup.is_some(),
+            );
+            debug!(
+                "check_signals: signum={} dispatching to handler={:#x}, flags={:#x}, si_code={}, si_pid={}, si_uid={}, from_thread={}",
+                signum,
+                action.handler,
+                action.sa_flags,
+                siginfo.si_code,
+                siginfo.si_pid,
+                siginfo.si_uid,
+                from_thread
+            );
+            return Some((signum as i32, action, siginfo));
         }
     }
     if let Some(old_mask) = task_inner.signal_mask_backup.take() {
         task_inner.signal_mask = old_mask;
     }
+    refresh_signal_work_pending_locked(
+        &task,
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    );
     None
 }
 
@@ -203,7 +272,9 @@ pub fn handle_signals() -> Option<i32> {
 
     let trap_cx = current_trap_cx();
     // Save the current user stack pointer
-    let mut user_sp = trap_cx.user_sp();
+    let original_pc = trap_cx.user_pc();
+    let original_sp = trap_cx.user_sp();
+    let mut user_sp = original_sp;
 
     // Construct sigframe on user stack
     // Layout: sp points to ucontext, siginfo is above it if SA_SIGINFO
@@ -323,6 +394,7 @@ pub fn handle_signals() -> Option<i32> {
             inner.signal_mask.insert(new_mask);
         }
     }
+    refresh_current_signal_work_pending();
 
     // Set up trap context to call signal handler
     // sp points to ucontext (aligned)
@@ -357,6 +429,43 @@ pub fn handle_signals() -> Option<i32> {
 
     // Jump to signal handler
     trap_cx.set_user_pc(action.handler);
+
+    // SIGINT/SIGSEGV/SIGBUS delivery is intentionally visible at WARN level:
+    // these are the signals most useful when correlating Ctrl+C, fault
+    // handling, and rt_sigreturn/context-restoration failures.  Ordinary
+    // signal delivery remains at the existing DEBUG level.
+    if matches!(signum, 2 | 7 | 11) {
+        let process = current_process();
+        let task = current_task();
+        let (tid, thread_id) = task
+            .as_ref()
+            .and_then(|task| {
+                let inner = task.inner_exclusive_access();
+                inner
+                    .res
+                    .as_ref()
+                    .map(|res| (Some(res.tid), Some(res.thread_id)))
+            })
+            .unwrap_or((None, None));
+        warn!(
+            "[signal] deliver signum={} hart={} pid={} tid={:?} thread_id={:?} \
+             old_pc={:#x} old_sp={:#x} handler={:#x} restorer={:#x} \
+             new_sp={:#x} ucontext={:#x} siginfo={:#x} flags={:#x}",
+            signum,
+            crate::hal::hartid(),
+            process.getpid(),
+            tid,
+            thread_id,
+            original_pc,
+            original_sp,
+            action.handler,
+            trap_cx.ra(),
+            user_sp,
+            ucontext_ptr,
+            siginfo_ptr,
+            action.sa_flags,
+        );
+    }
 
     debug!(
         "handle_signals: setup complete, jumping to handler={:#x}, ra={:#x}, sp={:#x}",

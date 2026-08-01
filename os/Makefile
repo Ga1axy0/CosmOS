@@ -2,9 +2,16 @@
 ARCH ?= riscv64
 # EXTRA_FEATURES ?=
 # EXTRA_FEATURES ?= --features io_perf_counters --features net_perf_counters
-EXTRA_FEATURES ?= --features legacy-vdb-names --features io_perf_counters
+EXTRA_FEATURES ?= --features legacy-vdb-names --features trap_context_cache --features process_identity_cache --features return_work_cache --features current_task_cache
+# EXTRA_FEATURES ?= --features legacy-vdb-names --features trap_context_cache --features process_identity_cache --features return_work_cache --features current_task_cache --features io_perf_counters --features cosmos-meminfo
 ifeq ($(PERF_PROBE),1)
 EXTRA_FEATURES += --features perf_probe
+endif
+ifeq ($(KERNEL_TRAP_DIAGNOSTICS),1)
+EXTRA_FEATURES += --features kernel_trap_diagnostics
+endif
+ifeq ($(COSMOS_MEMINFO),1)
+EXTRA_FEATURES += --features cosmos-meminfo
 endif
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')

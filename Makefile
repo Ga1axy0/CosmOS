@@ -11,19 +11,40 @@ KERNEL_RV_ELF := os/target/$(TARGET)/release/os
 KERNEL_LA_ELF := os/target/loongarch64-unknown-none/release/os
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
-MEM ?= 1G
+LINUX_RV_DIR ?= .make/linux-rv
+LINUX_RV_IMAGE ?= $(LINUX_RV_DIR)/arch/riscv/boot/Image
+LINUX_RV_SOURCE ?= ../linux
+LINUX_RV_CROSS_COMPILE ?= /opt/riscv64-linux-musl-cross/bin/riscv64-linux-musl-
+MEM ?= 4G
 SMP ?= 1
 TEST_FS ?= sdcard-$(RUN_ARCH).img
 # 本地调试可设为 1，保留评测测试盘镜像。
 KEEP_SDCARD ?= 0
 # make run 使用写时复制副本，避免 QEMU 写坏原始测试镜像。
 RUN_TEST_FS ?= .make/sdcard-$(RUN_ARCH)-run.img
+# fast-run FINAL=1 directly boots the public test image without copying it.
+FINAL ?= 0
+FINAL_TEST_FS ?= sdcard-rv-pub.img
+FINAL_TEST_FS_LA ?= sdcard-la-pub.img
+FINAL_ENABLED := $(if $(filter 1 yes true on,$(FINAL)),1,0)
+ifeq ($(FINAL_ENABLED),1)
+FAST_RUN_TEST_FS := $(FINAL_TEST_FS)
+FAST_RUN_MODE_ARGS := -snapshot
+FAST_RUN_TEST_FS_LA = $(FINAL_TEST_FS_LA)
+FAST_RUN_LA_MODE_ARGS := -snapshot
+else
+FAST_RUN_TEST_FS := $(RUN_TEST_FS)
+FAST_RUN_MODE_ARGS :=
+FAST_RUN_TEST_FS_LA = $(RUN_TEST_FS_LA)
+FAST_RUN_LA_MODE_ARGS :=
+endif
 TEST_FS_LA ?= sdcard-la.img
 RUN_TEST_FS_LA ?= .make/sdcard-la-run.img
 QEMU_NETDEV ?= user,id=net
 FAST_RUN_QEMU_NETDEV ?= user,id=net,hostfwd=tcp::7777-:7777
 QEMU_TRACE_ARGS ?=
 QEMU_COMP_BLK_ARGS = -drive file=$(RUN_TEST_FS),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+FAST_RUN_QEMU_BLK_ARGS = -drive file=$(FAST_RUN_TEST_FS),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 QEMU_COMP_EXTRA_BLK_ARGS = -drive file=$(RUN_DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 
 STAMP_DIR := .make
@@ -33,7 +54,11 @@ KERNEL_BUILD_STAMP_RV := $(STAMP_DIR)/kernel-build-rv.stamp
 KERNEL_BUILD_STAMP_LA := $(STAMP_DIR)/kernel-build-la.stamp
 KERNEL_LOG_KEY := $(if $(strip $(LOG)),$(strip $(LOG)),OFF)
 KERNEL_PERF_PROBE_KEY := $(if $(filter 1,$(PERF_PROBE)),ON,OFF)
-KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY)
+KERNEL_TRAP_DIAGNOSTICS ?= 0
+KERNEL_TRAP_DIAGNOSTICS_KEY := $(if $(filter 1,$(KERNEL_TRAP_DIAGNOSTICS)),ON,OFF)
+COSMOS_MEMINFO ?= 0
+COSMOS_MEMINFO_KEY := $(if $(filter 1,$(COSMOS_MEMINFO)),ON,OFF)
+KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY) KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS_KEY) COSMOS_MEMINFO=$(COSMOS_MEMINFO_KEY)
 KERNEL_CONFIG_STAMP_RV := $(STAMP_DIR)/kernel-config-rv.stamp
 KERNEL_CONFIG_STAMP_LA := $(STAMP_DIR)/kernel-config-la.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
@@ -48,15 +73,42 @@ ROOTFS_RV_BUILD_DIR := $(ROOTFS_REPO)/build/rv
 ROOTFS_LA_BUILD_DIR := $(ROOTFS_REPO)/build/la
 ROOTFS_RV_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-rv
 ROOTFS_LA_STAMP_DIR := $(ROOTFS_REPO)/build/.stamps-la
-ROOTFS_RV_FILES := $(shell if [ -d $(ROOTFS_RV_DIR) ]; then find $(ROOTFS_RV_DIR) -type f | sort; fi)
-ROOTFS_LA_FILES := $(shell if [ -d $(ROOTFS_LA_DIR) ]; then find $(ROOTFS_LA_DIR) -type f | sort; fi)
+ROOTFS_RV_INIT_STAMP := $(ROOTFS_RV_STAMP_DIR)/.rootfs-init.stamp
+ROOTFS_RV_CARGO_STAMP := $(ROOTFS_RV_STAMP_DIR)/.cargo-offline.stamp
+ROOTFS_LA_INIT_STAMP := $(ROOTFS_LA_STAMP_DIR)/.rootfs-init.stamp
+ROOTFS_CARGO_CACHE_HELPER := $(ROOTFS_BASE_DIR)/root/prepare-cargo-cache
+ROOTFS_CAGENT_WRAPPER := $(ROOTFS_BASE_DIR)/root/cagent-run-glibc
+ROOTFS_BUILDSTORM_WRAPPER := $(ROOTFS_BASE_DIR)/root/buildstorm-run-glibc
+ROOTFS_FINAL_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/final_auto_run
+# Keep the canonical base rootfs intact, but optionally omit TGOSKits from the
+# generated architecture variants.  The RV Cargo cache is controlled by the
+# same switch because it is prepared solely for root/tgoskits.
+WITH_TGOSKITS ?= 0
+WITH_TGOSKITS_ENABLED := $(if $(filter 1 yes true on,$(WITH_TGOSKITS)),1,0)
+WITH_TGOSKITS_KEY := $(if $(filter 1,$(WITH_TGOSKITS_ENABLED)),ON,OFF)
+ROOTFS_RV_VARIANT_CONFIG_STAMP := $(ROOTFS_RV_STAMP_DIR)/.variant-config.stamp
+ROOTFS_LA_VARIANT_CONFIG_STAMP := $(ROOTFS_LA_STAMP_DIR)/.variant-config.stamp
+# Cargo's registry/index is useful even when the source tree itself is omitted
+# from the generated image.  Prepare it on the host for every RISC-V rootfs.
+ROOTFS_RV_READY_STAMP := $(ROOTFS_RV_CARGO_STAMP)
+# The RV guest uses the Rust toolchain carried by sdcard-rv-pub.img at /mnt.
+# Set WITH_RUST=1 to restore the optional toolchain in the generated rootfs.
+WITH_RUST ?= 0
+WITH_LIBCLANG ?= $(WITH_RUST)
+ROOTFS_SCRIPT_FILES := $(shell find $(ROOTFS_REPO)/scripts -type f | sort)
+LA_ROOTFS_ARCH_FILES := bin/busybox usr/bin/bash lib/libc.so
 DISK_RV_IMG := disk.img
 DISK_LA_IMG := disk-la.img
 QEMU_LA_BLK_ARGS = -drive file=$(RUN_TEST_FS_LA),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0,id=x0
+FAST_RUN_QEMU_LA_BLK_ARGS = -drive file=$(FAST_RUN_TEST_FS_LA),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0,id=x0
 QEMU_LA_EXTRA_BLK_ARGS = -drive file=$(DISK_LA_IMG),if=none,format=raw,id=x1 -device virtio-blk-pci,drive=x1,id=x1
 RV_ROOTFS_TARGET ?= riscv64-linux-musl
 RV_TOOLCHAIN_BIN ?= /opt/riscv64-linux-musl-cross/bin
 RV_GLIBC_LIB ?= /usr/riscv64-linux-gnu/lib
+RV_GLIBC_SYSROOT ?= /usr/riscv64-linux-gnu
+RV_GLIBC_SYSROOT_DIR ?= /opt/riscv64-linux-gnu-sysroot
+RV_GLIBC_HOST_TARGET ?= riscv64gc-unknown-linux-gnu
+RV_GLIBC_HOST_LINKER ?= /usr/bin/riscv64gc-unknown-linux-gnu-gcc
 RV_MUSL_LIB ?= /opt/riscv64-linux-musl-cross/riscv64-linux-musl/lib
 RV_MUSL_ARCH ?= riscv64
 RV_MUSL_LOADER_ALIASES ?= ld-musl-riscv64.so.1 ld-musl-riscv64-sf.so.1
@@ -68,7 +120,7 @@ LA_MUSL_ARCH ?= loongarch64
 LA_MUSL_LOADER_ALIASES ?= ld-musl-loongarch64.so.1
 LA_BOOTLOADER_ELF ?= $(LA_BOOTLOADER_DIR)/target/loongarch64-unknown-none/release/loongarch64-direct-boot
 LA_KERNEL_ENTRY_PA ?= 0x90000000
-MEM_LA ?= 1G
+MEM_LA ?= 4G
 QEMU_LA_NETDEV ?= user,id=net0
 OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 
@@ -101,7 +153,7 @@ else
 $(error unsupported RUN_ARCH=$(RUN_ARCH), expected rv or la)
 endif
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready prepare-run-test-fs prepare-run-test-fs-la force
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la linux snapshot-fast-run snapshot-linux clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
 
 all:
 	$(MAKE) submodules
@@ -158,11 +210,11 @@ $(KERNEL_CONFIG_STAMP_LA): force | $(STAMP_DIR)
 	fi
 
 $(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) $(KERNEL_CONFIG_STAMP_RV) | $(STAMP_DIR)
-	$(MAKE) -C os kernel ARCH=riscv64
+	$(MAKE) -C os kernel ARCH=riscv64 KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS) COSMOS_MEMINFO=$(COSMOS_MEMINFO)
 	touch $@
 
 $(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) $(KERNEL_CONFIG_STAMP_LA) | $(STAMP_DIR)
-	$(MAKE) -C os kernel ARCH=loongarch64
+	$(MAKE) -C os kernel ARCH=loongarch64 KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS) COSMOS_MEMINFO=$(COSMOS_MEMINFO)
 	touch $@
 
 kernel-rv: $(KERNEL_BUILD_STAMP_RV)
@@ -186,12 +238,96 @@ sync-rootfs-variants:
 		exit 1; \
 	}
 	@for dir in "$(ROOTFS_RV_DIR)" "$(ROOTFS_LA_DIR)"; do \
-		echo "[SYNC] $(ROOTFS_BASE_DIR) -> $$dir"; \
-		mkdir -p "$$dir"; \
-		cp -a "$(ROOTFS_BASE_DIR)"/. "$$dir"/; \
+		if [ ! -d "$$dir" ]; then \
+			echo "[SYNC] initialize $(ROOTFS_BASE_DIR) -> $$dir"; \
+			if [ "$(WITH_TGOSKITS_ENABLED)" = 1 ]; then \
+				cp -a "$(ROOTFS_BASE_DIR)" "$$dir"; \
+			else \
+				mkdir -p "$$dir"; \
+				tar -C "$(ROOTFS_BASE_DIR)" --exclude='./root/tgoskits' --exclude='./root/.cargo' -cf - . | tar -C "$$dir" -xf -; \
+			fi; \
+		else \
+			echo "[SYNC] keep existing $$dir"; \
+		fi; \
 	done
+	@if [ "$(WITH_TGOSKITS_ENABLED)" = 1 ]; then \
+		for dir in "$(ROOTFS_RV_DIR)" "$(ROOTFS_LA_DIR)"; do \
+			if [ ! -d "$$dir/root/tgoskits" ]; then \
+				echo "[SYNC] restore tgoskits into $$dir"; \
+				cp -a "$(ROOTFS_BASE_DIR)/root/tgoskits" "$$dir/root/"; \
+			fi; \
+		done; \
+	else \
+		for dir in "$(ROOTFS_RV_DIR)" "$(ROOTFS_LA_DIR)"; do \
+			echo "[SYNC] exclude tgoskits from $$dir"; \
+			rm -rf "$$dir/root/tgoskits" "$$dir/root/.cargo"; \
+		done; \
+	fi
 
-rootfs-rv: sync-rootfs-variants
+rootfs-rv: $(ROOTFS_RV_READY_STAMP)
+
+rootfs-la: $(ROOTFS_LA_INIT_STAMP)
+
+$(ROOTFS_RV_VARIANT_CONFIG_STAMP): force
+	@mkdir -p "$(ROOTFS_RV_STAMP_DIR)"
+	@key='TGOSKITS=$(WITH_TGOSKITS_KEY)'; \
+	if [ ! -f "$@" ] || [ "$$(cat "$@")" != "$$key" ]; then \
+		printf '%s\n' "$$key" > "$@"; \
+	fi
+
+$(ROOTFS_LA_VARIANT_CONFIG_STAMP): force
+	@mkdir -p "$(ROOTFS_LA_STAMP_DIR)"
+	@key='TGOSKITS=$(WITH_TGOSKITS_KEY)'; \
+	if [ ! -f "$@" ] || [ "$$(cat "$@")" != "$$key" ]; then \
+		printf '%s\n' "$$key" > "$@"; \
+	fi
+
+# Keep both spellings in sync: older RISC-V init files invoke the
+# hyphenated path, while the canonical source uses an underscore.
+$(ROOTFS_RV_INIT_STAMP): Makefile $(ROOTFS_SCRIPT_FILES) $(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_RV_VARIANT_CONFIG_STAMP) $(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) $(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
+	@test -d "$(ROOTFS_BASE_DIR)" || { \
+		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_BASE_DIR)/root" || { \
+		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
+		exit 1; \
+	}
+	@if [ ! -d "$(ROOTFS_RV_DIR)" ]; then \
+		if [ "$(WITH_TGOSKITS_ENABLED)" = 1 ]; then \
+			cp -a "$(ROOTFS_BASE_DIR)" "$(ROOTFS_RV_DIR)"; \
+		else \
+			mkdir -p "$(ROOTFS_RV_DIR)"; \
+			tar -C "$(ROOTFS_BASE_DIR)" --exclude='./root/tgoskits' --exclude='./root/.cargo' -cf - . | tar -C "$(ROOTFS_RV_DIR)" -xf -; \
+		fi; \
+	fi
+ifeq ($(WITH_TGOSKITS_ENABLED),1)
+	@if [ ! -d "$(ROOTFS_RV_DIR)/root/tgoskits" ]; then cp -a "$(ROOTFS_BASE_DIR)/root/tgoskits" "$(ROOTFS_RV_DIR)/root/"; fi
+else
+	@echo "[ROOTFS] omit tgoskits and Cargo cache from $(ROOTFS_RV_DIR)"
+	@rm -rf "$(ROOTFS_RV_DIR)/root/tgoskits" "$(ROOTFS_RV_DIR)/root/.cargo"
+endif
+	@if [ -f "$(ROOTFS_CARGO_CACHE_HELPER)" ]; then \
+		cp -f "$(ROOTFS_CARGO_CACHE_HELPER)" "$(ROOTFS_RV_DIR)/root/prepare-cargo-cache"; \
+		chmod 0755 "$(ROOTFS_RV_DIR)/root/prepare-cargo-cache"; \
+	fi
+	@if [ -f "$(ROOTFS_BUILDSTORM_WRAPPER)" ]; then \
+		cp -f "$(ROOTFS_BUILDSTORM_WRAPPER)" "$(ROOTFS_RV_DIR)/root/buildstorm-run-glibc"; \
+		chmod 0755 "$(ROOTFS_RV_DIR)/root/buildstorm-run-glibc"; \
+	fi
+	@if [ -f "$(ROOTFS_CAGENT_WRAPPER)" ]; then \
+		cp -f "$(ROOTFS_CAGENT_WRAPPER)" "$(ROOTFS_RV_DIR)/root/cagent-run-glibc"; \
+		chmod 0755 "$(ROOTFS_RV_DIR)/root/cagent-run-glibc"; \
+	fi
+	@if [ -f "$(ROOTFS_FINAL_AUTO_RUN)" ]; then \
+		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final_auto_run"; \
+		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final-auto-run"; \
+		chmod 0755 "$(ROOTFS_RV_DIR)/root/final_auto_run" "$(ROOTFS_RV_DIR)/root/final-auto-run"; \
+	fi
+	@if [ -f "$(ROOTFS_BASE_DIR)/sbin/init" ]; then \
+		cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/init"; \
+		chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init"; \
+	fi
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
 		BUILD_ROOT="$(CURDIR)/$(ROOTFS_RV_BUILD_DIR)" \
@@ -200,11 +336,68 @@ rootfs-rv: sync-rootfs-variants
 		TOOLCHAIN_BIN=$(RV_TOOLCHAIN_BIN) \
 		BUSYBOX_ARCH=riscv \
 		GLIBC_LIB=$(RV_GLIBC_LIB) \
+		RV_GLIBC_SYSROOT=$(RV_GLIBC_SYSROOT) \
+		RV_GLIBC_SYSROOT_DIR=$(RV_GLIBC_SYSROOT_DIR) \
+		RV_GLIBC_HOST_TARGET=$(RV_GLIBC_HOST_TARGET) \
+		RV_GLIBC_HOST_LINKER=$(RV_GLIBC_HOST_LINKER) \
 		MUSL_LIB=$(RV_MUSL_LIB) \
 		MUSL_ARCH=$(RV_MUSL_ARCH) \
+		WITH_RUST=$(WITH_RUST) \
+		WITH_LIBCLANG=$(WITH_LIBCLANG) \
 		MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)"
+	@touch "$@"
 
-rootfs-la: sync-rootfs-variants
+$(ROOTFS_RV_CARGO_STAMP): $(ROOTFS_RV_INIT_STAMP) \
+		$(ROOTFS_BASE_DIR)/root/tgoskits/Cargo.lock \
+		scripts/prepare-rootfs-rv-cargo-offline.sh
+	ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
+	WORKSPACE_DIR_OVERRIDE="$(CURDIR)/$(ROOTFS_BASE_DIR)/root/tgoskits" \
+	GUEST_CARGO_HOME_OVERRIDE="$(CURDIR)/$(ROOTFS_RV_DIR)/root/.cargo" \
+	GLIBC_HOST_TARGET="$(RV_GLIBC_HOST_TARGET)" \
+	GLIBC_HOST_LINKER="$(RV_GLIBC_HOST_LINKER)" \
+		bash scripts/prepare-rootfs-rv-cargo-offline.sh
+	@touch "$@"
+
+$(ROOTFS_LA_INIT_STAMP): Makefile $(ROOTFS_SCRIPT_FILES) $(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_LA_VARIANT_CONFIG_STAMP) $(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) $(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
+	@test -d "$(ROOTFS_BASE_DIR)" || { \
+		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' first" >&2; \
+		exit 1; \
+	}
+	@test -d "$(ROOTFS_BASE_DIR)/root" || { \
+		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
+		exit 1; \
+	}
+	@if [ ! -d "$(ROOTFS_LA_DIR)" ]; then \
+		if [ "$(WITH_TGOSKITS_ENABLED)" = 1 ]; then \
+			cp -a "$(ROOTFS_BASE_DIR)" "$(ROOTFS_LA_DIR)"; \
+		else \
+			mkdir -p "$(ROOTFS_LA_DIR)"; \
+			tar -C "$(ROOTFS_BASE_DIR)" --exclude='./root/tgoskits' --exclude='./root/.cargo' -cf - . | tar -C "$(ROOTFS_LA_DIR)" -xf -; \
+		fi; \
+	fi
+ifeq ($(WITH_TGOSKITS_ENABLED),1)
+	@if [ ! -d "$(ROOTFS_LA_DIR)/root/tgoskits" ]; then cp -a "$(ROOTFS_BASE_DIR)/root/tgoskits" "$(ROOTFS_LA_DIR)/root/"; fi
+else
+	@echo "[ROOTFS] omit tgoskits and Cargo cache from $(ROOTFS_LA_DIR)"
+	@rm -rf "$(ROOTFS_LA_DIR)/root/tgoskits" "$(ROOTFS_LA_DIR)/root/.cargo"
+endif
+	@if [ -f "$(ROOTFS_CARGO_CACHE_HELPER)" ]; then \
+		cp -f "$(ROOTFS_CARGO_CACHE_HELPER)" "$(ROOTFS_LA_DIR)/root/prepare-cargo-cache"; \
+		chmod 0755 "$(ROOTFS_LA_DIR)/root/prepare-cargo-cache"; \
+	fi
+	@if [ -f "$(ROOTFS_FINAL_AUTO_RUN)" ]; then \
+		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final_auto_run"; \
+		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final-auto-run"; \
+		chmod 0755 "$(ROOTFS_LA_DIR)/root/final_auto_run" "$(ROOTFS_LA_DIR)/root/final-auto-run"; \
+	fi
+	@if [ -f "$(ROOTFS_CAGENT_WRAPPER)" ]; then \
+		cp -f "$(ROOTFS_CAGENT_WRAPPER)" "$(ROOTFS_LA_DIR)/root/cagent-run-glibc"; \
+		chmod 0755 "$(ROOTFS_LA_DIR)/root/cagent-run-glibc"; \
+	fi
+	@if [ -f "$(ROOTFS_BUILDSTORM_WRAPPER)" ]; then \
+		cp -f "$(ROOTFS_BUILDSTORM_WRAPPER)" "$(ROOTFS_LA_DIR)/root/buildstorm-run-glibc"; \
+		chmod 0755 "$(ROOTFS_LA_DIR)/root/buildstorm-run-glibc"; \
+	fi
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_LA_DIR)" \
 		BUILD_ROOT="$(CURDIR)/$(ROOTFS_LA_BUILD_DIR)" \
@@ -215,7 +408,9 @@ rootfs-la: sync-rootfs-variants
 		GLIBC_TOOLCHAIN=$(LA_GLIBC_TOOLCHAIN) \
 		MUSL_LIB=$(LA_MUSL_LIB) \
 		MUSL_ARCH=$(LA_MUSL_ARCH) \
+		WITH_RUST=0 \
 		MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)"
+	@touch "$@"
 
 rv disk-rv: $(DISK_RV_IMG)
 
@@ -295,10 +490,38 @@ check-rootfs-la-ready:
 		exit 1; \
 	}
 
-$(DISK_RV_IMG): force check-user-apps-rv rootfs-rv check-rootfs-rv-ready $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_RV_FILES) scripts/pack-disk-img.sh
+# A previous interrupted/old build may leave valid-looking stamps while the
+# architecture-specific files have been overwritten by the base RISC-V rootfs.
+# Invalidate only the affected LA package stamps so the next rootfs build
+# repairs the files instead of silently skipping them.
+check-rootfs-la-arch: force
+	@if [ -d "$(ROOTFS_LA_DIR)" ]; then \
+		bad=0; \
+		for path in $(LA_ROOTFS_ARCH_FILES); do \
+			if [ ! -f "$(ROOTFS_LA_DIR)/$$path" ] || ! file -L "$(ROOTFS_LA_DIR)/$$path" | grep -q 'LoongArch'; then \
+				echo "[WARN] stale/non-LoongArch LA rootfs file: $(ROOTFS_LA_DIR)/$$path" >&2; \
+				bad=1; \
+			fi; \
+		done; \
+		if [ "$$bad" -ne 0 ]; then \
+			rm -f "$(ROOTFS_LA_INIT_STAMP)" \
+				"$(ROOTFS_LA_STAMP_DIR)/build-busybox.stamp" \
+				"$(ROOTFS_LA_STAMP_DIR)/build-bash.stamp" \
+				"$(ROOTFS_LA_STAMP_DIR)/install-libc.stamp"; \
+		fi; \
+	fi
+
+$(DISK_RV_IMG): $(USER_BUILD_STAMP_RV) $(ROOTFS_RV_READY_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh
 	MUSL_ARCH=$(RV_MUSL_ARCH) MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR_RV) $@
 
-$(DISK_LA_IMG): force check-user-apps-la rootfs-la check-rootfs-la-ready $(OPTIONAL_RUNTIME_FILES) $(ROOTFS_LA_FILES) scripts/pack-disk-img.sh
+
+$(DISK_LA_IMG): $(USER_BUILD_STAMP_LA) $(ROOTFS_LA_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh | check-rootfs-la-arch
+	@for path in $(LA_ROOTFS_ARCH_FILES); do \
+		file -L "$(ROOTFS_LA_DIR)/$$path" | grep -q 'LoongArch' || { \
+			echo "LA rootfs architecture check failed: $(ROOTFS_LA_DIR)/$$path" >&2; \
+			exit 1; \
+		}; \
+	done
 	MUSL_ARCH=$(LA_MUSL_ARCH) MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR_LA) $@
 
 force:
@@ -327,13 +550,34 @@ run-la: check-kernel-la $(LA_BOOTLOADER_ELF) $(DISK_LA_IMG) prepare-run-test-fs-
 	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS)
 
 fast-run: check-kernel
-	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
+	@if [ "$(FINAL_ENABLED)" = "1" ] && [ ! -f "$(FINAL_TEST_FS)" ]; then \
+		echo "Final test image not found: $(FINAL_TEST_FS)" >&2; \
+		exit 2; \
+	fi
+	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(FAST_RUN_MODE_ARGS) $(FAST_RUN_QEMU_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
+
+$(LINUX_RV_IMAGE): $(LINUX_RV_SOURCE)/Makefile
+	$(MAKE) -C $(LINUX_RV_SOURCE) O=$(abspath $(LINUX_RV_DIR)) ARCH=riscv CROSS_COMPILE=$(LINUX_RV_CROSS_COMPILE) defconfig
+	$(MAKE) -C $(LINUX_RV_SOURCE) O=$(abspath $(LINUX_RV_DIR)) ARCH=riscv CROSS_COMPILE=$(LINUX_RV_CROSS_COMPILE) -j$${JOBS:-$$(nproc)} Image
+
+linux: $(LINUX_RV_IMAGE) $(DISK_RV_IMG)
+	$(QEMU) -machine virt -kernel $(LINUX_RV_IMAGE) -m $(MEM) -nographic -smp $(SMP) -bios default -drive file=$(DISK_RV_IMG),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -append 'console=ttyS0 root=/dev/vda rw rootwait init=/bin/sh' -no-reboot -rtc base=utc
+
+snapshot-linux: $(LINUX_RV_IMAGE) $(DISK_RV_IMG)
+	$(QEMU) -snapshot -machine virt -kernel $(LINUX_RV_IMAGE) -m $(MEM) -nographic -smp $(SMP) -bios default -drive file=$(DISK_RV_IMG),if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -append 'console=ttyS0 root=/dev/vda rw rootwait init=/bin/sh' -no-reboot -rtc base=utc
+
+snapshot-fast-run: check-kernel
+	$(QEMU) -snapshot -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS)
 
 fast-run-trace: check-kernel
 	$(QEMU) -machine virt -kernel kernel-rv -m $(MEM) -nographic -smp $(SMP) -bios default $(QEMU_COMP_BLK_ARGS) -device virtio-net-device,netdev=net -netdev $(FAST_RUN_QEMU_NETDEV) -no-reboot -rtc base=utc $(QEMU_COMP_EXTRA_BLK_ARGS) $(QEMU_TRACE_ARGS) -d int,in_asm -D qemu.log
 
 fast-run-la: check-kernel-la $(LA_BOOTLOADER_ELF)
-	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS)
+	@if [ "$(FINAL_ENABLED)" = "1" ] && [ ! -f "$(FINAL_TEST_FS_LA)" ]; then \
+		echo "Final LA test image not found: $(FINAL_TEST_FS_LA)" >&2; \
+		exit 2; \
+	fi
+	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(FAST_RUN_LA_MODE_ARGS) $(FAST_RUN_QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS)
 
 fast-run-la-trace: check-kernel-la $(LA_BOOTLOADER_ELF)
 	$(QEMU_LA) -machine virt -cpu la464 -kernel $(LA_BOOTLOADER_ELF) -device loader,file=kernel-la,addr=$(LA_KERNEL_ENTRY_PA) -m $(MEM_LA) -nographic -smp $(SMP) $(QEMU_LA_BLK_ARGS) -device virtio-net-pci,netdev=net0,id=net0 -netdev $(QEMU_LA_NETDEV) -no-reboot -rtc base=utc $(QEMU_LA_EXTRA_BLK_ARGS) -d int,in_asm -D qemu.log

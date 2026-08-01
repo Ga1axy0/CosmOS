@@ -269,7 +269,7 @@ impl FdtSource {
             return None;
         }
 
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         let ptr = if ptr < crate::platform::KERNEL_ADDR_OFFSET {
             crate::platform::direct_map_phys_to_virt(ptr)
         } else {

@@ -3,8 +3,9 @@
 
 #![allow(unused)]
 
-use crate::fs::sync_page_cache_all;
+use crate::fs::sync_storage_all;
 use crate::hal::traits::HartCtrl as _;
+use crate::platform::QEMUExit as _;
 
 #[cfg(target_arch = "riscv64")]
 use core::arch::asm;
@@ -170,8 +171,20 @@ pub(crate) fn shutdown_raw() -> ! {
 
 /// Shut down the machine through the current platform backend.
 pub fn shutdown() -> ! {
-    let _ = sync_page_cache_all();
+    let _ = sync_storage_all();
     crate::platform::shutdown()
+}
+
+/// Flush storage before terminating QEMU with the requested process status.
+pub fn shutdown_with_code(exit_code: i32) -> ! {
+    if let Err(err) = sync_storage_all() {
+        warn!("[shutdown] storage sync failed: errno={:?}", err);
+    }
+    if exit_code == 0 {
+        crate::platform::QEMU_EXIT_HANDLE.exit_success()
+    } else {
+        crate::platform::QEMU_EXIT_HANDLE.exit_failure()
+    }
 }
 
 /// 发送 IPI 到给定 hart mask。
