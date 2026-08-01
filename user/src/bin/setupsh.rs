@@ -46,6 +46,16 @@ const MNT_MUSL_LTPROOT: &str = "/mnt/musl/ltp";
 const MNT_GLIBC_LTPROOT: &str = "/mnt/glibc/ltp";
 const MNT_MUSL_LTP_ENV_SH: &str = "/mnt/musl/ltp_env.sh";
 const MNT_GLIBC_LTP_ENV_SH: &str = "/mnt/glibc/ltp_env.sh";
+// The public RISC-V test disk carries a host-prepared Cargo cache under
+// /mnt/root.  The guest process HOME is /root, so make that cache visible at
+// the path Cargo actually uses before launching the shell.
+const MNT_CARGO_HOME: &str = "/mnt/root/.cargo";
+const MNT_CARGO_HOME_DOT_CSTR: &str = "/mnt/root/.cargo/.\0";
+const CARGO_HOME: &str = "/root/.cargo";
+const CARGO_HOME_CSTR: &str = "/root/.cargo/\0";
+const CARGO_CACHE_MARKER: &str = "/root/.cargo/.cosmos-host-cache-ready";
+const CP_ARG_CSTR: &str = "cp\0";
+const CP_ARCHIVE_ARG_CSTR: &str = "-a\0";
 #[cfg(target_arch = "riscv64")]
 const MUSL_AR: &str = "/usr/lib/riscv64-linux-musl/ar";
 #[cfg(target_arch = "riscv64")]
@@ -213,6 +223,18 @@ fn exec_glibc_busybox_install() -> isize {
 fn exec_bin_sh() -> isize {
     let argv = [BIN_SH_CSTR.as_ptr(), ptr::null()];
     exec_ptr(BIN_SH_CSTR.as_ptr(), &argv)
+}
+
+fn exec_sync_cargo_cache() -> isize {
+    let argv = [
+        BUSYBOX_ARG0_CSTR.as_ptr(),
+        CP_ARG_CSTR.as_ptr(),
+        CP_ARCHIVE_ARG_CSTR.as_ptr(),
+        MNT_CARGO_HOME_DOT_CSTR.as_ptr(),
+        CARGO_HOME_CSTR.as_ptr(),
+        ptr::null(),
+    ];
+    exec_ptr(BIN_BUSYBOX_CSTR.as_ptr(), &argv)
 }
 
 /// 打印阶段进度，便于观察 `setupsh` 当前执行到哪一步。
@@ -607,6 +629,32 @@ fn write_file(path: &str, content: &[u8]) -> bool {
     true
 }
 
+/// Import the host-prepared Cargo registry once, if the root filesystem does
+/// not already contain a cache prepared during image construction.
+fn sync_cargo_cache() -> bool {
+    if path_exists(CARGO_HOME) && path_exists(CARGO_CACHE_MARKER) {
+        return true;
+    }
+    if path_exists(CARGO_HOME) && path_exists(join_path(CARGO_HOME, "registry").as_str()) {
+        // A rootfs built by the host-side prefetch step already has a usable
+        // cache; avoid copying the mounted seed on every boot.
+        return true;
+    }
+    if !path_exists(MNT_CARGO_HOME) {
+        return true;
+    }
+    if !ensure_dir(CARGO_HOME) {
+        return false;
+    }
+
+    let exit_code = spawn_and_wait(exec_sync_cargo_cache, "busybox cp -a cargo cache");
+    if exit_code != 0 {
+        println!("[setupsh] Cargo cache sync failed: {}", exit_code);
+        return false;
+    }
+    write_file(CARGO_CACHE_MARKER, b"host-prepared Cargo cache\n")
+}
+
 fn ltp_env_script(ltproot: &str) -> String {
     let mut script = String::new();
     script.push_str("#!/bin/sh\n\n");
@@ -730,7 +778,7 @@ fn cleanup_ltp_runtime_state() -> bool {
 
 #[no_mangle]
 fn main(_argc: usize, argv: &[&str]) -> i32 {
-    const TOTAL_STEPS: usize = 11;
+    const TOTAL_STEPS: usize = 12;
     if let Some(arg) = argv.get(1) {
         println!(
             "[setupsh] ignoring legacy libc selector '{}'; installing musl and glibc",
@@ -787,17 +835,22 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(8, TOTAL_STEPS, "install ltp helper commands");
+    print_step(8, TOTAL_STEPS, "sync host-prepared Cargo cache");
+    if !sync_cargo_cache() {
+        return 1;
+    }
+
+    print_step(9, TOTAL_STEPS, "install ltp helper commands");
     if !install_ltp_helper_commands() {
         return 1;
     }
 
-    print_step(9, TOTAL_STEPS, "install minimal account database");
+    print_step(10, TOTAL_STEPS, "install minimal account database");
     if !install_account_files() {
         return 1;
     }
 
-    print_step(10, TOTAL_STEPS, "write kernel config fallback");
+    print_step(11, TOTAL_STEPS, "write kernel config fallback");
     if !install_kernel_config_file() {
         return 1;
     }
@@ -805,7 +858,7 @@ fn main(_argc: usize, argv: &[&str]) -> i32 {
         return 1;
     }
 
-    print_step(11, TOTAL_STEPS, "launch /bin/sh");
+    print_step(12, TOTAL_STEPS, "launch /bin/sh");
     let chdir_ret = chdir(ROOT_HOME_DIR);
     if chdir_ret < 0 {
         println!(

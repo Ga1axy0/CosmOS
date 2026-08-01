@@ -1,7 +1,7 @@
     .section .text.entry
     .equ BOOT_STACK_SHIFT, 20
     .equ BOOT_STACK_SIZE, 1 << BOOT_STACK_SHIFT
-    .equ BOOT_STACK_HARTS, 8
+    .equ BOOT_STACK_HARTS, 12
     .equ KERNEL_OFFSET, 0xffffffc000000000
     .equ EARLY_RAM_GIGAPAGE_PTE, 0x200000ef
     .equ NEXT_RAM_GIGAPAGE_PTE, 0x10000000

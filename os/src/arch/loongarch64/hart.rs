@@ -11,6 +11,11 @@ const CSR_TCFG: usize = 0x41;
 const CSR_TICLR: usize = 0x44;
 const CRMD_IE: usize = 1 << 2;
 const EUEN_FPEN: usize = 1 << 0;
+// QEMU's `la464` exposes the 128-bit LSX extension and glibc uses it for
+// optimized memcpy/memset paths.  Leaving EUEN.SXE clear turns the first such
+// instruction into EXCCODE_LSXDIS (0x10), which the generic trap path cannot
+// recover from.
+const EUEN_SXEN: usize = 1 << 1;
 const TCFG_ENABLE: usize = 1 << 0;
 const TCFG_PERIODIC: usize = 1 << 1;
 const TICLR_CLEAR: usize = 1 << 0;
@@ -52,7 +57,7 @@ impl HartId for LoongArchHartId {
     unsafe fn enable_fp() {
         let mut euen: usize;
         asm!("csrrd {}, {}", out(reg) euen, const CSR_EUEN);
-        euen |= EUEN_FPEN;
+        euen |= EUEN_FPEN | EUEN_SXEN;
         asm!("csrwr {}, {}", in(reg) euen, const CSR_EUEN);
     }
 

@@ -363,6 +363,9 @@ pub(crate) struct TcpSocketFile {
     family: i32,
     st: SpinNoIrqLock<Arc<TcpSocketState>>,
     bound_endpoint: SpinNoIrqLock<Option<IpListenEndpoint>>,
+    /// Tracks whether this descriptor has an outstanding or completed connect
+    /// attempt, so SO_ERROR does not report an error on a fresh socket.
+    connect_started: AtomicBool,
     listening: AtomicBool,
     listener: SpinNoIrqLock<Option<Arc<TcpListenerShared>>>,
     ipv6_only: AtomicBool,
@@ -382,6 +385,7 @@ impl TcpSocketFile {
             family,
             st: SpinNoIrqLock::new(st),
             bound_endpoint: SpinNoIrqLock::new(None),
+            connect_started: AtomicBool::new(false),
             listening: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
             ipv6_only: AtomicBool::new(false),
@@ -460,6 +464,7 @@ impl TcpSocketFile {
             stack.poll();
         }
         *self.bound_endpoint.lock() = None;
+        self.connect_started.store(false, Ordering::Release);
         st.read_wait.wake_all();
         st.write_wait.wake_all();
         notify_poll_source(st.source_id(), POLLIN | POLLOUT | POLLHUP);
@@ -483,6 +488,7 @@ impl TcpSocketFile {
             family: super::AF_INET as i32,
             st: SpinNoIrqLock::new(self.state()),
             bound_endpoint: SpinNoIrqLock::new(Some(listen_endpoint_from_bind(local))),
+            connect_started: AtomicBool::new(false),
             listening: AtomicBool::new(false),
             listener: SpinNoIrqLock::new(None),
             ipv6_only: AtomicBool::new(false),
@@ -503,6 +509,15 @@ impl TcpSocketFile {
 
     pub(crate) fn set_send_timeout_ns(&self, timeout_ns: u64) {
         self.send_timeout_ns.store(timeout_ns, Ordering::Release);
+    }
+
+    pub(crate) fn set_nodelay(&self, enabled: bool) -> Result<(), ERRNO> {
+        let st = self.state();
+        let mut guard = NET_STACK.lock();
+        let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+        let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        socket.set_nagle_enabled(!enabled);
+        Ok(())
     }
 
     pub(crate) fn send_timeout_ns(&self) -> u64 {
@@ -754,6 +769,7 @@ impl TcpSocketFile {
                     family: self.family,
                     st: SpinNoIrqLock::new(Arc::clone(&st)),
                     bound_endpoint: SpinNoIrqLock::new(local.map(listen_endpoint_from_bind)),
+                    connect_started: AtomicBool::new(false),
                     listening: AtomicBool::new(false),
                     listener: SpinNoIrqLock::new(None),
                     ipv6_only: AtomicBool::new(self.ipv6_only()),
@@ -784,7 +800,7 @@ impl TcpSocketFile {
         }
     }
 
-    pub(crate) fn connect(&self, mut ep: IpEndpoint) -> Result<(), ERRNO> {
+    pub(crate) fn connect(&self, mut ep: IpEndpoint, nonblocking: bool) -> Result<(), ERRNO> {
         if self.listening.load(Ordering::Acquire) {
             info!("Tcp connect failed: socket is listening");
             return Err(ERRNO::EINVAL);
@@ -838,6 +854,7 @@ impl TcpSocketFile {
             socket
                 .connect(stack.iface.context(), ep, local_endpoint)
                 .map_err(|_| ERRNO::EADDRINUSE)?;
+            self.connect_started.store(true, Ordering::Release);
             debug!(
                 "Tcp connect submitted: handle={:?} state={}",
                 st.handle,
@@ -848,6 +865,18 @@ impl TcpSocketFile {
         }
 
         NEED_POLL.store(true, Ordering::Release);
+
+        if nonblocking {
+            let st = self.state();
+            let mut guard = NET_STACK.lock();
+            let stack = guard.as_mut().ok_or(ERRNO::ENETDOWN)?;
+            let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+            return match socket.state() {
+                tcp_socket::State::Established | tcp_socket::State::CloseWait => Ok(()),
+                tcp_socket::State::Closed | tcp_socket::State::TimeWait => Err(ERRNO::ECONNREFUSED),
+                _ => Err(ERRNO::EINPROGRESS),
+            };
+        }
 
         loop {
             if crate::signal::has_unmasked_pending_signal() {
@@ -919,7 +948,39 @@ impl TcpSocketFile {
         Ok(())
     }
 
+    /// Return the pending connection error for `getsockopt(SO_ERROR)`.
+    ///
+    /// A nonblocking connect is writable only after it reaches a terminal
+    /// state.  Keep the fresh-socket case distinct from a failed connect so a
+    /// caller can safely probe SO_ERROR before calling connect.
+    pub(crate) fn so_error(&self) -> i32 {
+        if !self.connect_started.load(Ordering::Acquire) {
+            return 0;
+        }
+        let st = self.state();
+        let mut guard = NET_STACK.lock();
+        let Some(stack) = guard.as_mut() else {
+            return ERRNO::ENETDOWN as i32;
+        };
+        let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        match socket.state() {
+            tcp_socket::State::Closed | tcp_socket::State::TimeWait => {
+                self.connect_started.store(false, Ordering::Release);
+                ERRNO::ECONNREFUSED as i32
+            }
+            _ => 0,
+        }
+    }
+
     pub(crate) fn recv_into_user_buffer(&self, buf: &mut UserBuffer) -> Result<usize, ERRNO> {
+        self.recv_into_user_buffer_with_nonblock(buf, false)
+    }
+
+    pub(crate) fn recv_into_user_buffer_with_nonblock(
+        &self,
+        buf: &mut UserBuffer,
+        nonblocking: bool,
+    ) -> Result<usize, ERRNO> {
         // debug!("tcp recv_into_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
         if self.listening.load(Ordering::Acquire) {
             return Err(ERRNO::EINVAL);
@@ -985,6 +1046,9 @@ impl TcpSocketFile {
                     socket.may_recv()
                 );
             }
+            if nonblocking {
+                return Err(ERRNO::EAGAIN);
+            }
             if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
                     let task = current_task().unwrap();
@@ -1048,6 +1112,14 @@ impl TcpSocketFile {
     }
 
     pub(crate) fn send_from_user_buffer(&self, buf: &UserBuffer) -> Result<usize, ERRNO> {
+        self.send_from_user_buffer_with_nonblock(buf, false)
+    }
+
+    pub(crate) fn send_from_user_buffer_with_nonblock(
+        &self,
+        buf: &UserBuffer,
+        nonblocking: bool,
+    ) -> Result<usize, ERRNO> {
         // debug!("tcp send_from_user_buffer: total_len={}: {:?}", buf.len(), buf.buffers);
 
         if self.listening.load(Ordering::Acquire) {
@@ -1110,6 +1182,9 @@ impl TcpSocketFile {
                     }
                     return Ok(0);
                 }
+            }
+            if nonblocking {
+                return Err(ERRNO::EAGAIN);
             }
             if let Some(timeout_ns) = timeout_ns {
                 if timeout_handle.is_none() {
@@ -1196,7 +1271,14 @@ impl TcpSocketFile {
             return true;
         };
         let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-        socket.can_recv() || !socket.may_recv()
+        socket.can_recv()
+            || (!socket.may_recv()
+                && !matches!(
+                    socket.state(),
+                    tcp_socket::State::Listen
+                        | tcp_socket::State::SynSent
+                        | tcp_socket::State::SynReceived
+                ))
     }
 
     fn send_ready(&self) -> bool {
@@ -1206,7 +1288,14 @@ impl TcpSocketFile {
             return true;
         };
         let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
-        socket.can_send() || !socket.may_send()
+        socket.can_send()
+            || (!socket.may_send()
+                && !matches!(
+                    socket.state(),
+                    tcp_socket::State::Listen
+                        | tcp_socket::State::SynSent
+                        | tcp_socket::State::SynReceived
+                ))
     }
 }
 
@@ -1484,17 +1573,25 @@ impl File for TcpSocketFile {
             return POLLHUP;
         };
         let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
+        let handshake_pending = matches!(
+            socket.state(),
+            tcp_socket::State::Listen
+                | tcp_socket::State::SynSent
+                | tcp_socket::State::SynReceived
+        );
 
         if (events & POLLIN) != 0 {
-            if socket.can_recv() || !socket.may_recv() {
+            if socket.can_recv() || (!handshake_pending && !socket.may_recv()) {
                 ready |= POLLIN;
             }
-            if !socket.may_recv() {
+            if !handshake_pending && !socket.may_recv() {
                 ready |= POLLHUP;
             }
         }
 
-        if (events & POLLOUT) != 0 && (socket.can_send() || !socket.may_send()) {
+        if (events & POLLOUT) != 0
+            && (socket.can_send() || (!handshake_pending && !socket.may_send()))
+        {
             ready |= POLLOUT;
         }
 

@@ -287,6 +287,7 @@ impl UnixSocketPairEnd {
         buf: UserBuffer,
         ancillary: UnixSocketAncillaryData,
         strict_shutdown: bool,
+        nonblocking: bool,
     ) -> Result<usize, ERRNO> {
         let data_len = buf.len();
         if data_len == 0 {
@@ -311,7 +312,18 @@ impl UnixSocketPairEnd {
             state.tx.as_ref().cloned().unwrap()
         };
 
-        let written = tx.write_at(0, buf);
+        let written = if nonblocking {
+            tx.write_nonblocking(buf)
+        } else {
+            Ok(tx.write_at(0, buf))
+        };
+        let written = match written {
+            Ok(written) => written,
+            Err(err) => {
+                self.tx_seq_lock.unlock();
+                return Err(err);
+            }
+        };
         if written == 0 && tx.write_peer_closed() {
             self.tx_seq_lock.unlock();
             current_add_signal(SignalBit::SIGPIPE);
@@ -340,15 +352,36 @@ impl UnixSocketPairEnd {
         buf: UserBuffer,
         ancillary: UnixSocketAncillaryData,
     ) -> Result<usize, ERRNO> {
+        self.sendmsg_with_nonblock(buf, ancillary, false)
+    }
+
+    /// `sendmsg` with the open-file-description/`MSG_DONTWAIT` mode supplied
+    /// by the syscall layer.
+    pub fn sendmsg_with_nonblock(
+        &self,
+        buf: UserBuffer,
+        ancillary: UnixSocketAncillaryData,
+        nonblocking: bool,
+    ) -> Result<usize, ERRNO> {
         if buf.len() == 0 && !ancillary.is_empty() {
             // MVP：避免“无负载仅控制消息”语义歧义。
             return Err(ERRNO::EINVAL);
         }
-        self.write_with_ancillary(buf, ancillary, true)
+        self.write_with_ancillary(buf, ancillary, true, nonblocking)
     }
 
     /// `recvmsg` 路径：读取流数据并回收/交付对应控制消息。
     pub fn recvmsg(&self, buf: UserBuffer) -> Result<(usize, UnixSocketAncillaryData), ERRNO> {
+        self.recvmsg_with_nonblock(buf, false)
+    }
+
+    /// `recvmsg` with the open-file-description/`MSG_DONTWAIT` mode supplied
+    /// by the syscall layer.
+    pub fn recvmsg_with_nonblock(
+        &self,
+        buf: UserBuffer,
+        nonblocking: bool,
+    ) -> Result<(usize, UnixSocketAncillaryData), ERRNO> {
         {
             let state = self.state.lock();
             if state.read_shutdown {
@@ -366,7 +399,18 @@ impl UnixSocketPairEnd {
             }
         }
 
-        let read_len = self.rx.read_at(0, buf);
+        let read_len = if nonblocking {
+            self.rx.read_nonblocking(buf)
+        } else {
+            Ok(self.rx.read_at(0, buf))
+        };
+        let read_len = match read_len {
+            Ok(read_len) => read_len,
+            Err(err) => {
+                self.rx_seq_lock.unlock();
+                return Err(err);
+            }
+        };
         let ancillary = self.consume_rx_meta(read_len, true);
         if read_len > 0 {
             self.notify_peer(POLLOUT);
@@ -575,6 +619,14 @@ impl UnixDatagramSocketFile {
     }
 
     pub(crate) fn recv_from(&self, buf: UserBuffer) -> Result<(usize, Option<Vec<u8>>), ERRNO> {
+        self.recv_from_with_nonblock(buf, false)
+    }
+
+    pub(crate) fn recv_from_with_nonblock(
+        &self,
+        buf: UserBuffer,
+        nonblocking: bool,
+    ) -> Result<(usize, Option<Vec<u8>>), ERRNO> {
         loop {
             if let Some(msg) = self.state.lock().queue.pop_front() {
                 let mut written = 0usize;
@@ -588,6 +640,9 @@ impl UnixDatagramSocketFile {
                     written += 1;
                 }
                 return Ok((written, msg.from));
+            }
+            if nonblocking {
+                return Err(ERRNO::EAGAIN);
             }
             let wait_queue = Arc::clone(&self.wait_queue);
             wait_queue.wait_with_reason_or_skip(WaitReason::PipeReadable, || {
@@ -781,7 +836,7 @@ impl File for UnixSocketPairEnd {
 
     fn write_at(&self, offset: usize, buf: UserBuffer) -> usize {
         let _ = offset;
-        self.write_with_ancillary(buf, UnixSocketAncillaryData::default(), false)
+        self.write_with_ancillary(buf, UnixSocketAncillaryData::default(), false, false)
             .unwrap_or(0)
     }
 

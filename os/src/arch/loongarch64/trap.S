@@ -16,6 +16,16 @@
     .macro    LOAD_FP n
     fld.d     $f\n, $sp, (38+\n)*8
     .endm
+    # LSX vector registers alias the scalar FP registers in their low 64 bits.
+    # Save/restore the high half explicitly so a user vector value survives a
+    # syscall, interrupt, signal delivery, or preemptive context switch.
+    .macro    STORE_FP_HIGH n
+    vstelm.d  $vr\n, $sp, (71+\n)*8, 1
+    .endm
+    .macro    LOAD_FP_HIGH n
+    ld.d      $t0, $sp, (71+\n)*8
+    vinsgr2vr.d $vr\n, $t0, 1
+    .endm
     .globl __tlb_refill
     .balign 4096
 __tlb_refill:
@@ -69,24 +79,29 @@ __alltraps:
     STORE_FP %n
     .set    n, n + 1
     .endr
+    .set    n, 0
+    .rept   32
+    STORE_FP_HIGH %n
+    .set    n, n + 1
+    .endr
     movfcsr2gr $t0, $fcsr0
     st.d    $t0, $sp, 70*8
 
     ld.d    $tp, $sp, 34*8
+    ld.d    $t0, $sp, 35*8
     ld.d    $t1, $sp, 37*8
     ld.d    $sp, $sp, 36*8
-    # Kernel text/data and this task's kernel stack are DMW-backed. Keep the
-    # current process PGDL active across the privilege transition.
+    # LoongArch keeps separate kernel and user PGDL roots.  User MemorySets
+    # do not share the kernel half, so enter Rust with the kernel root active.
+    csrwr   $t0, 0x19
+    invtlb  0x00, $zero, $zero
     jr      $t1
 
 __restore:
     csrwr   $a0, CSR_SAVE
     csrrd   $a0, CSR_SAVE
-    csrrd   $t0, 0x19
-    beq     $t0, $a1, 1f
     csrwr   $a1, 0x19
     invtlb  0x00, $zero, $zero
-1:
     move    $sp, $a0
     ld.d    $t0, $sp, 32*8
     ld.d    $t1, $sp, 33*8
@@ -99,6 +114,11 @@ __restore:
     .set    n, 0
     .rept   32
     LOAD_FP %n
+    .set    n, n + 1
+    .endr
+    .set    n, 0
+    .rept   32
+    LOAD_FP_HIGH %n
     .set    n, n + 1
     .endr
     ld.d    $ra, $sp, 1*8

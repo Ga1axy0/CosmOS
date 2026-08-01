@@ -14,6 +14,7 @@ pub const SYSCALL_FSTATFS64: usize = 44;
 pub const SYSCALL_TRUNCATE: usize = 45;
 pub const SYSCALL_FTRUNCATE: usize = 46;
 pub const SYSCALL_CHDIR: usize = 49;
+pub const SYSCALL_FCHDIR: usize = 50;
 pub const SYSCALL_OPENAT: usize = 56;
 pub const SYSCALL_CLOSE: usize = 57;
 pub const SYSCALL_PIPE: usize = 59;
@@ -81,6 +82,7 @@ pub const SYSCALL_CLONE3: usize = 435;
 pub const SYSCALL_EXECVE: usize = 221;
 pub const SYSCALL_WAITPID: usize = 260;
 pub const SYSCALL_RENAMEAT2: usize = 276;
+pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 pub const SYSCALL_BRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
 pub const SYSCALL_MMAP: usize = 222;
@@ -837,6 +839,31 @@ pub fn sys_mkdirat(dirfd: usize, path: &str, mode: u32) -> isize {
 
 pub fn sys_chdir(path: &str) -> isize {
     syscall(SYSCALL_CHDIR, [path.as_ptr() as usize, 0, 0])
+}
+
+pub fn sys_fchdir(fd: usize) -> isize {
+    syscall(SYSCALL_FCHDIR, [fd, 0, 0])
+}
+
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> isize {
+    syscall6(
+        SYSCALL_COPY_FILE_RANGE,
+        [
+            fd_in,
+            off_in as usize,
+            fd_out,
+            off_out as usize,
+            len,
+            flags as usize,
+        ],
+    )
 }
 
 pub fn sys_getdents64(fd: usize, buffer: &mut [u8]) -> isize {

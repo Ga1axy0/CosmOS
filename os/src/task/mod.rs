@@ -612,9 +612,19 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         let mut recycle_res = Vec::<TaskUserRes>::new();
         let mut running_tasks = Vec::new();
         let mut running_harts = Vec::new();
-        let process_inner = process.inner_exclusive_access();
-        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-            let task = task.as_ref().unwrap();
+        // Snapshot task references under the PCB lock, then inspect and
+        // mutate each task after releasing it.  Holding process-inner while
+        // taking task-inner creates the opposite lock order to task paths
+        // that need to update their process, which can deadlock SMP teardown.
+        let tasks = {
+            let process_inner = process.inner_exclusive_access();
+            process_inner
+                .tasks
+                .iter()
+                .filter_map(|slot| slot.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        for task in tasks {
             let (thread_id, was_on_cpu, last_cpu, wait_handle) = {
                 let mut task_inner = task.inner_exclusive_access();
                 task_inner.exit_code.get_or_insert(task_exit_code);
@@ -633,14 +643,14 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 )
             };
             if let Some(wait_handle) = wait_handle {
-                wait_handle.remove_waiter(task);
+                wait_handle.remove_waiter(&task);
             }
             if let Some(thread_id) = thread_id {
                 remove_from_tid2task(thread_id);
             }
-            if was_on_cpu && !Arc::ptr_eq(task, &exiting_task) {
+            if was_on_cpu && !Arc::ptr_eq(&task, &exiting_task) {
                 running_harts.push(last_cpu);
-                running_tasks.push(Arc::clone(task));
+                running_tasks.push(Arc::clone(&task));
                 continue;
             }
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
@@ -657,10 +667,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 recycle_res.push(res);
             }
         }
-        // dealloc_tid and dealloc_user_res require access to PCB inner, so we
-        // need to collect those user res first, then release process_inner
-        // for now to avoid deadlock/double borrow problem.
-        drop(process_inner);
         for hart in running_harts {
             crate::sched::resched_hart(hart);
         }
@@ -670,16 +676,16 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         {
             core::hint::spin_loop();
         }
-        {
-            let _process_inner = process.inner_exclusive_access();
-            for task in running_tasks {
-                let mut task_inner = task.inner_exclusive_access();
-                if let Some(res) = task_inner.res.take() {
-                    recycle_res.push(res);
-                }
-                task.on_cpu.store(false, Ordering::Relaxed);
-                task_inner.sched.on_rq = false;
+        // Do not reacquire process-inner while extracting resources.  The
+        // TaskUserRes destructor needs that same PCB lock when the vector is
+        // dropped below.
+        for task in running_tasks {
+            let mut task_inner = task.inner_exclusive_access();
+            if let Some(res) = task_inner.res.take() {
+                recycle_res.push(res);
             }
+            task.on_cpu.store(false, Ordering::Relaxed);
+            task_inner.sched.on_rq = false;
         }
         recycle_res.clear();
 
@@ -1034,7 +1040,7 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
         // byte-by-byte UART output, both slow — blocked in-flight global TLB
         // shootdown IPIs and wedged the machine when several harts dumped at
         // once after Ctrl+C. The lock is now held only to copy fields.
-        let (ppid, pgid, is_zombie, pending, task_snaps) = {
+        let (ppid, pgid, is_zombie, pending, tasks) = {
             let process_inner = process.inner_exclusive_access();
             let p_ppid = process_inner
                 .parent
@@ -1045,42 +1051,48 @@ pub fn debug_dump_pgrp_tasks(pgrp: u32, reason: &str) {
             let p_pgid = process_inner.cred.pgid;
             let p_zombie = process_inner.is_zombie;
             let p_pending = process_inner.pending_signals.bits();
-            let snaps: Vec<(
-                usize,
-                TaskStatus,
-                Option<WaitReason>,
-                bool,
-                bool,
-                usize,
-                bool,
-                u64,
-                u64,
-                Option<ReschedReason>,
-                LastSchedOp,
-            )> = process_inner
+            let tasks: Vec<(usize, Arc<TaskControlBlock>)> = process_inner
                 .tasks
                 .iter()
                 .enumerate()
-                .filter_map(|(tid, task)| {
-                    let task = task.as_ref()?;
-                    let task_inner = task.inner_exclusive_access();
-                    Some((
-                        tid,
-                        task_inner.task_status,
-                        task_inner.wait_reason,
-                        task.on_cpu.load(Ordering::Relaxed),
-                        task_inner.sched.on_rq,
-                        task_inner.sched.last_cpu,
-                        task_inner.current_wq_handle.is_some(),
-                        task_inner.pending_signals.bits(),
-                        task_inner.signal_mask.bits(),
-                        task_inner.sched.resched_reason,
-                        task_inner.last_sched_op,
-                    ))
-                })
+                .filter_map(|(tid, task)| task.as_ref().map(|task| (tid, Arc::clone(task))))
                 .collect();
-            (p_ppid, p_pgid, p_zombie, p_pending, snaps)
+            (p_ppid, p_pgid, p_zombie, p_pending, tasks)
         };
+        // Never hold process-inner while taking task-inner.  This diagnostic
+        // runs from the Ctrl-C/scheduler path, where another hart may be
+        // unwinding a task and acquiring the locks in the reverse order.
+        let task_snaps: Vec<(
+            usize,
+            TaskStatus,
+            Option<WaitReason>,
+            bool,
+            bool,
+            usize,
+            bool,
+            u64,
+            u64,
+            Option<ReschedReason>,
+            LastSchedOp,
+        )> = tasks
+            .into_iter()
+            .map(|(tid, task)| {
+                let task_inner = task.inner_exclusive_access();
+                (
+                    tid,
+                    task_inner.task_status,
+                    task_inner.wait_reason,
+                    task.on_cpu.load(Ordering::Relaxed),
+                    task_inner.sched.on_rq,
+                    task_inner.sched.last_cpu,
+                    task_inner.current_wq_handle.is_some(),
+                    task_inner.pending_signals.bits(),
+                    task_inner.signal_mask.bits(),
+                    task_inner.sched.resched_reason,
+                    task_inner.last_sched_op,
+                )
+            })
+            .collect();
         warn!(
             "[task-dump] pid={} ppid={} pgid={} zombie={} pending_signals={:#x} exec={}",
             pid, ppid, pgid, is_zombie, pending, exec_path

@@ -199,6 +199,13 @@ fn get_file_description(fd: usize) -> Result<Arc<FileDescription>, ERRNO> {
     Ok(desc)
 }
 
+fn socket_nonblocking(fd: usize, flags: u32) -> Result<bool, ERRNO> {
+    Ok(get_file_description(fd)?
+        .status_flags()
+        .contains(FileStatusFlags::NONBLOCK)
+        || (flags & MSG_DONTWAIT) != 0)
+}
+
 fn with_unix_socket<R>(
     fd: usize,
     f: impl FnOnce(&UnixSocketPairEnd) -> Result<R, ERRNO>,
@@ -1534,6 +1541,7 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
         }
 
         let fd = fd as usize;
+        let nonblocking = socket_nonblocking(fd, 0)?;
         match socket_backend(fd)? {
             SocketBackendKind::Udp | SocketBackendKind::Tcp => {
                 let family = read_sockaddr_family(addr as *const u8, addrlen)?;
@@ -1549,7 +1557,9 @@ pub fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: i32) -> isize {
                 let ep = sockaddr_to_socket_endpoint(spec, addr, addrlen)?;
                 match socket_backend(fd)? {
                     SocketBackendKind::Udp => with_udp_socket(fd, |udp| udp.connect(ep))?,
-                    SocketBackendKind::Tcp => with_tcp_socket(fd, |tcp| tcp.connect(ep))?,
+                    SocketBackendKind::Tcp => {
+                        with_tcp_socket(fd, |tcp| tcp.connect(ep, nonblocking))?
+                    }
                     SocketBackendKind::RawIpv6
                     | SocketBackendKind::UnixStream
                     | SocketBackendKind::UnixDatagram
@@ -1742,9 +1752,6 @@ pub fn sys_sendto(
     addrlen: i32,
 ) -> isize {
     syscall_body!({
-        if flags & !MSG_NOSIGNAL != 0 {
-            return Err(ERRNO::EOPNOTSUPP);
-        }
         if len == 0 {
             return Ok(0);
         }
@@ -1760,21 +1767,39 @@ pub fn sys_sendto(
         )?);
 
         let fd = fd as usize;
-        let n = match socket_backend(fd)? {
+        let backend = socket_backend(fd)?;
+        let allowed_flags = match backend {
+            SocketBackendKind::Tcp
+            | SocketBackendKind::Udp
+            | SocketBackendKind::UnixStream
+            | SocketBackendKind::UnixDatagram => MSG_NOSIGNAL | MSG_DONTWAIT,
+            _ => MSG_NOSIGNAL,
+        };
+        if flags & !allowed_flags != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        let nonblocking = socket_nonblocking(fd, flags)?;
+        let n = match backend {
             SocketBackendKind::Udp => {
                 if addr.is_null() {
-                    with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
+                    with_udp_socket(fd, |udp| {
+                        udp.send_user_buffer_with_nonblock(&ubuf, nonblocking)
+                    })?
                 } else {
                     if addrlen < 0 {
                         return Err(ERRNO::EINVAL);
                     }
                     let ep = sockaddr_to_socket_endpoint(socket_spec(fd)?, addr, addrlen as usize)?;
-                    with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
+                    with_udp_socket(fd, |udp| {
+                        udp.send_user_buffer_to_with_nonblock(&ubuf, ep, nonblocking)
+                    })?
                 }
             }
             SocketBackendKind::Tcp => {
                 if addr.is_null() {
-                    with_tcp_socket(fd, |tcp| tcp.send_from_user_buffer(&ubuf))?
+                    with_tcp_socket(fd, |tcp| {
+                        tcp.send_from_user_buffer_with_nonblock(&ubuf, nonblocking)
+                    })?
                 } else {
                     return Err(ERRNO::ENOTSOCK);
                 }
@@ -1827,14 +1852,16 @@ pub fn sys_sendto(
                     return Err(ERRNO::EISCONN);
                 }
                 with_unix_socket(fd, |unix| {
-                    unix.sendmsg(ubuf, UnixSocketAncillaryData::default())
+                    unix.sendmsg_with_nonblock(
+                        ubuf,
+                        UnixSocketAncillaryData::default(),
+                        nonblocking,
+                    )
                 })?
             }
-            SocketBackendKind::CompatIfreq => {
-                return Err(ERRNO::ENOTSOCK)
-            }
+            SocketBackendKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
             SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => {
-                return Err(ERRNO::EOPNOTSUPP)
+                return Err(ERRNO::EOPNOTSUPP);
             }
         };
 
@@ -1870,19 +1897,26 @@ pub fn sys_recvfrom(
         let fd = fd as usize;
         let backend = socket_backend(fd)?;
         let allowed_flags = match backend {
+            SocketBackendKind::Tcp
+            | SocketBackendKind::Udp
+            | SocketBackendKind::UnixStream
+            | SocketBackendKind::UnixDatagram => MSG_DONTWAIT,
             SocketBackendKind::NetlinkRoute => MSG_PEEK | MSG_DONTWAIT,
             _ => 0,
         };
         if flags & !allowed_flags != 0 {
             return Err(ERRNO::EOPNOTSUPP);
         }
+        let nonblocking = socket_nonblocking(fd, flags)?;
 
         let (n, ep) = match backend {
-            SocketBackendKind::Udp => {
-                with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?
-            }
+            SocketBackendKind::Udp => with_udp_socket(fd, |udp| {
+                udp.recv_from_user_buffer_with_nonblock(&mut ubuf, nonblocking)
+            })?,
             SocketBackendKind::Tcp => {
-                let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
+                let n = with_tcp_socket(fd, |tcp| {
+                    tcp.recv_into_user_buffer_with_nonblock(&mut ubuf, nonblocking)
+                })?;
                 let ep = if addr.is_null() {
                     unspecified_endpoint_for_family(socket_spec(fd)?.family)
                 } else {
@@ -1940,7 +1974,9 @@ pub fn sys_recvfrom(
                 return Ok(packet.data.len() as isize);
             }
             SocketBackendKind::UnixDatagram => {
-                let (n, from) = with_unix_dgram_socket(fd, |socket| socket.recv_from(ubuf))?;
+                let (n, from) = with_unix_dgram_socket(fd, |socket| {
+                    socket.recv_from_with_nonblock(ubuf, nonblocking)
+                })?;
                 if !addr.is_null() {
                     let sockaddr = sockaddr_un_bytes(from.as_deref().unwrap_or(&[]));
                     copy_raw_sockaddr_to_user(addr as *mut u8, addrlen, sockaddr.as_slice())?;
@@ -1955,15 +1991,14 @@ pub fn sys_recvfrom(
                     return Err(ERRNO::EOPNOTSUPP);
                 }
                 let n = with_unix_socket(fd, |unix| {
-                    unix.recvmsg(ubuf).map(|(n, _ancillary)| n)
+                    unix.recvmsg_with_nonblock(ubuf, nonblocking)
+                        .map(|(n, _ancillary)| n)
                 })?;
                 return Ok(n as isize);
             }
-            SocketBackendKind::CompatIfreq => {
-                return Err(ERRNO::ENOTSOCK)
-            }
+            SocketBackendKind::CompatIfreq => return Err(ERRNO::ENOTSOCK),
             SocketBackendKind::AlgSocket | SocketBackendKind::AlgRequest => {
-                return Err(ERRNO::EOPNOTSUPP)
+                return Err(ERRNO::EOPNOTSUPP);
             }
         };
 
@@ -2182,6 +2217,18 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
                     warn!("setsockopt(fd={}, level={}, optname={}) not implemented for SOL_IP, ignored", fd, level, optname);
                     Ok(0)
                 }
+            },
+            Some(SocketLevel::IpProtoTcp) => match PosixTcpSocketOption::from_repr(optname) {
+                Some(PosixTcpSocketOption::NoDelay) => {
+                    if backend != SocketBackendKind::Tcp {
+                        return Err(ERRNO::ENOPROTOOPT);
+                    }
+                    let token = current_user_token();
+                    let enabled = read_sockopt_i32(token, optval, optlen)? != 0;
+                    with_tcp_socket(fd, |tcp| tcp.set_nodelay(enabled))?;
+                    Ok(0)
+                }
+                _ => Err(ERRNO::ENOPROTOOPT),
             },
             Some(SocketLevel::IpProtoIpv6) => {
                 if spec.family != AF_INET6 as i32 {
@@ -2436,7 +2483,12 @@ pub fn sys_getsockopt(
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoError) => {
-                    write_getsockopt_i32(token, optval, optlen, 0)?;
+                    let error = if backend == SocketBackendKind::Tcp {
+                        with_tcp_socket(fd, |tcp| Ok(tcp.so_error()))?
+                    } else {
+                        0
+                    };
+                    write_getsockopt_i32(token, optval, optlen, error)?;
                     Ok(0)
                 }
                 Some(PosixSocketOption::SoPassCred) => {
@@ -2578,9 +2630,6 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
         if msg.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        if flags & !MSG_NOSIGNAL != 0 {
-            return Err(ERRNO::EOPNOTSUPP);
-        }
 
         let token = current_user_token();
         let msghdr = *translated_ref(token, msg).or_errno(ERRNO::EFAULT)?;
@@ -2596,20 +2645,35 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
         let ubuf = iovecs_to_user_buffer(token, &iovecs, PageFaultAccess::Read)?;
 
         let fd = fd as usize;
-        let n = match socket_backend(fd)? {
+        let backend = socket_backend(fd)?;
+        let allowed_flags = match backend {
+            SocketBackendKind::Tcp | SocketBackendKind::Udp | SocketBackendKind::UnixStream => {
+                MSG_NOSIGNAL | MSG_DONTWAIT
+            }
+            _ => MSG_NOSIGNAL,
+        };
+        if flags & !allowed_flags != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        let nonblocking = socket_nonblocking(fd, flags)?;
+        let n = match backend {
             SocketBackendKind::Udp => {
                 if msghdr.msg_controllen != 0 {
                     return Err(ERRNO::EOPNOTSUPP);
                 }
                 if msghdr.msg_name == 0 {
-                    with_udp_socket(fd, |udp| udp.send_user_buffer(&ubuf))?
+                    with_udp_socket(fd, |udp| {
+                        udp.send_user_buffer_with_nonblock(&ubuf, nonblocking)
+                    })?
                 } else {
                     let ep = sockaddr_to_socket_endpoint(
                         socket_spec(fd)?,
                         msghdr.msg_name as *const SockAddrIn,
                         msghdr.msg_namelen,
                     )?;
-                    with_udp_socket(fd, |udp| udp.send_user_buffer_to(&ubuf, ep))?
+                    with_udp_socket(fd, |udp| {
+                        udp.send_user_buffer_to_with_nonblock(&ubuf, ep, nonblocking)
+                    })?
                 }
             }
             SocketBackendKind::Tcp => {
@@ -2619,7 +2683,9 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
                 if msghdr.msg_name != 0 {
                     return Err(ERRNO::EISCONN);
                 }
-                with_tcp_socket(fd, |tcp| tcp.send_from_user_buffer(&ubuf))?
+                with_tcp_socket(fd, |tcp| {
+                    tcp.send_from_user_buffer_with_nonblock(&ubuf, nonblocking)
+                })?
             }
             SocketBackendKind::UnixStream => {
                 let ancillary = if msghdr.msg_controllen == 0 {
@@ -2640,7 +2706,9 @@ pub fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: u32) -> isize {
                     return Err(ERRNO::EINVAL);
                 }
 
-                with_unix_socket(fd, |unix| unix.sendmsg(ubuf, ancillary))?
+                with_unix_socket(fd, |unix| {
+                    unix.sendmsg_with_nonblock(ubuf, ancillary, nonblocking)
+                })?
             }
             SocketBackendKind::AlgRequest => {
                 let params = if msghdr.msg_controllen == 0 {
@@ -2699,9 +2767,6 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         if msg.is_null() {
             return Err(ERRNO::EFAULT);
         }
-        if flags & !MSG_CMSG_CLOEXEC != 0 {
-            return Err(ERRNO::EOPNOTSUPP);
-        }
 
         let token = current_user_token();
         let mut msghdr = *translated_ref(token, msg as *const MsgHdr).or_errno(ERRNO::EFAULT)?;
@@ -2721,6 +2786,16 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
 
         let fd = fd as usize;
         let backend = socket_backend(fd)?;
+        let allowed_flags = match backend {
+            SocketBackendKind::Tcp | SocketBackendKind::Udp | SocketBackendKind::UnixStream => {
+                MSG_CMSG_CLOEXEC | MSG_DONTWAIT
+            }
+            _ => MSG_CMSG_CLOEXEC,
+        };
+        if flags & !allowed_flags != 0 {
+            return Err(ERRNO::EOPNOTSUPP);
+        }
+        let nonblocking = socket_nonblocking(fd, flags)?;
         let (n, name_ep, ancillary, raw_control): (
             usize,
             Option<IpEndpoint>,
@@ -2729,17 +2804,21 @@ pub fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: u32) -> isize {
         ) = match backend {
             SocketBackendKind::Udp => {
                 let mut ubuf = ubuf;
-                let (n, ep) = with_udp_socket(fd, |udp| udp.recv_from_user_buffer(&mut ubuf))?;
+                let (n, ep) = with_udp_socket(fd, |udp| {
+                    udp.recv_from_user_buffer_with_nonblock(&mut ubuf, nonblocking)
+                })?;
                 (n, Some(ep), UnixSocketAncillaryData::default(), Vec::new())
             }
             SocketBackendKind::Tcp => {
                 let mut ubuf = ubuf;
-                let n = with_tcp_socket(fd, |tcp| tcp.recv_into_user_buffer(&mut ubuf))?;
+                let n = with_tcp_socket(fd, |tcp| {
+                    tcp.recv_into_user_buffer_with_nonblock(&mut ubuf, nonblocking)
+                })?;
                 let ep = with_tcp_socket(fd, |tcp| Ok(tcp.remote_endpoint()))?;
                 (n, ep, UnixSocketAncillaryData::default(), Vec::new())
             }
             SocketBackendKind::UnixStream => with_unix_socket(fd, |unix| {
-                let (n, mut ancillary) = unix.recvmsg(ubuf)?;
+                let (n, mut ancillary) = unix.recvmsg_with_nonblock(ubuf, nonblocking)?;
                 if !unix.passcred_enabled() {
                     ancillary.credentials = None;
                 }

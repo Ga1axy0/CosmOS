@@ -1449,9 +1449,8 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             .as_ref()
             .ok_or(ERRNO::ESRCH)?
             .thread_id();
-        let caller_thread_count = current_process()
-            .inner_exclusive_access()
-            .thread_count();
+        let caller_process = current_process();
+        let caller_thread_count = caller_process.thread_count();
         trace!(
             "kernel:pid[{}] sys_clone flags={:#x} stack={:#x} stack_size={:#x}",
             caller_pid,
@@ -1608,7 +1607,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             }
             current_process.attach_task(Arc::clone(&new_task));
             add_task(new_task);
-            let process_thread_count = current_process.inner_exclusive_access().thread_count();
+            let process_thread_count = current_process.thread_count();
             debug!(
                 "[clone-diag] thread child parent_pid={} parent_caller_tid={} new_tid={} inner_tid={} process_thread_count={} flags={:#x}",
                 current_process.getpid(),
@@ -1680,16 +1679,16 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_tid,
                 child_pid
             );
-            let (child_thread_count, child_ppid) = {
+            let child_ppid = {
                 let child_inner = new_process.inner_exclusive_access();
-                let child_ppid = child_inner
+                child_inner
                     .parent
                     .as_ref()
                     .and_then(|parent| parent.upgrade())
                     .map(|parent| parent.getpid())
-                    .unwrap_or(0);
-                (child_inner.thread_count(), child_ppid)
+                    .unwrap_or(0)
             };
+            let child_thread_count = new_process.thread_count();
             warn!(
                 "[clone-diag] process child parent_pid={} parent_caller_tid={} child_pid={} child_ppid={} child_thread_count={} flags={:#x} clone_parent={} vfork={}",
                 caller_pid,
@@ -1922,7 +1921,7 @@ pub fn sys_execve(path: *const u8, mut args: *const usize, mut envp: *const usiz
             .as_ref()
             .ok_or(ERRNO::ESRCH)?
             .thread_id();
-        let thread_count = process.inner_exclusive_access().thread_count();
+        let thread_count = process.thread_count();
         debug!(
             "[exec-diag] pid={} caller_tid={} thread_count={} exec_path='{}' argv_len={}",
             process.getpid(),

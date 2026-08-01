@@ -12,6 +12,11 @@ ROOTFS_DIR="${ROOTFS_DIR:?ROOTFS_DIR is required}"
 ROOTFS_DIR="$(cd "$ROOTFS_DIR" && pwd)"
 WORKSPACE_DIR="$ROOTFS_DIR/root/tgoskits"
 GUEST_CARGO_HOME="$ROOTFS_DIR/root/.cargo"
+# The workspace may live in the base rootfs while tgoskits is omitted from the
+# architecture-specific image.  Make both paths overridable so the host can
+# prepare only Cargo's data without copying the source tree into the image.
+WORKSPACE_DIR="${WORKSPACE_DIR_OVERRIDE:-$WORKSPACE_DIR}"
+GUEST_CARGO_HOME="${GUEST_CARGO_HOME_OVERRIDE:-$GUEST_CARGO_HOME}"
 
 HOST_CARGO="${HOST_CARGO:-cargo}"
 HOST_CARGO_HOME="${HOST_CARGO_HOME:-$HOME/.cargo}"
@@ -120,6 +125,11 @@ CC_${GLIBC_HOST_TARGET//-/_} = "${GLIBC_HOST_LINKER}"
 [target.${GLIBC_HOST_TARGET}]
 linker = "${GLIBC_HOST_LINKER}"
 CONFIG_EOF
+
+# Let guest-side test scripts detect that this cache was populated during the
+# host build. The marker is deliberately written last, after registry/git
+# data and Cargo's offline configuration are complete.
+printf '%s\n' 'host-prepared Cargo cache' > "$GUEST_CARGO_HOME/.cosmos-host-cache-ready"
 
 echo "[INFO] guest Cargo cache size:"
 du -sh "$GUEST_CARGO_HOME" 2>/dev/null || true

@@ -58,6 +58,8 @@ pub const SYSCALL_FALLOCATE: usize = 47;
 pub const SYSCALL_FACCESSAT: usize = 48;
 /// chdir syscall
 pub const SYSCALL_CHDIR: usize = 49;
+/// fchdir syscall
+pub const SYSCALL_FCHDIR: usize = 50;
 /// chroot syscall
 pub const SYSCALL_CHROOT: usize = 51;
 /// fchmod syscall
@@ -366,6 +368,8 @@ pub const SYSCALL_MEMFD_CREATE: usize = 279;
 pub const SYSCALL_BPF: usize = 280;
 /// userfaultfd syscall
 pub const SYSCALL_USERFAULTFD: usize = 282;
+/// copy_file_range syscall
+pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 /// statx syscall
 pub const SYSCALL_STATX: usize = 291;
 /// spawn syscall
@@ -700,6 +704,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
             args[5] as u32,
         ),
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0] as i32,
+            args[1] as *mut i64,
+            args[2] as i32,
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
         SYSCALL_FADVISE64 => sys_fadvise64(args[0] as i32, args[1] as i64, args[2], args[3] as i32),
         SYSCALL_READLINKAT => sys_readlinkat(
             args[0] as isize,
@@ -754,6 +766,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_FCHDIR => sys_fchdir(args[0] as u32),
         SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0] as u32, args[1] as *mut u8, args[2]),
         SYSCALL_SYNC => sys_sync(),

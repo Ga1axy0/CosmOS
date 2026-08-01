@@ -831,14 +831,6 @@ impl ProcessControlBlockInner {
     pub fn dealloc_tid(&mut self, tid: usize) {
         self.task_res_allocator.dealloc(tid)
     }
-    /// the count of tasks(threads) in this process
-    pub fn thread_count(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter_map(|task| task.as_ref())
-            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
-            .count()
-    }
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
@@ -853,6 +845,24 @@ impl ProcessControlBlock {
     /// inner_exclusive_access
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
+    }
+
+    /// Return the number of live tasks without nesting process-inner and
+    /// task-inner.  Snapshot the task Arcs first, then inspect each task after
+    /// releasing the PCB lock.
+    pub fn thread_count(&self) -> usize {
+        let tasks = {
+            let inner = self.inner.lock();
+            inner
+                .tasks
+                .iter()
+                .filter_map(|slot| slot.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        tasks
+            .iter()
+            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
+            .count()
     }
 
     /// Apply this process's effective time namespace offset to CLOCK_MONOTONIC.
@@ -1340,11 +1350,36 @@ impl ProcessControlBlock {
         trace!("kernel: clone_process");
         let clone_start_ns = get_time_ns();
         // warn_heap_state("fork_begin", self.getpid());
+        // Snapshot the calling task before taking the parent PCB lock.  The
+        // task lock is also acquired by signal/scheduler paths before they
+        // update process state; acquiring it under parent-inner here creates
+        // an AB-BA cycle on SMP.
+        let parent_task = current_task().ok_or(ERRNO::ESRCH)?;
+        let (
+            parent_ustack_base,
+            parent_sched_attr,
+            parent_vruntime_ns,
+            parent_cfs_initialized,
+            parent_affinity_mask,
+            parent_signal_mask,
+            parent_trap_cx,
+        ) = {
+            let parent_task_inner = parent_task.inner_exclusive_access();
+            (
+                parent_task_inner.res.as_ref().unwrap().ustack_base(),
+                parent_task_inner.sched_attr(),
+                parent_task_inner.sched.vruntime_ns,
+                parent_task_inner.sched.cfs_initialized,
+                parent_task_inner.sched.cpu_affinity_mask,
+                parent_task_inner.signal_mask,
+                *parent_task_inner.get_trap_cx(),
+            )
+        };
+        let parent_thread_count = self.thread_count();
         let mut parent = self.inner_exclusive_access();
         // Linux fork/clone 允许从多线程进程创建一个只包含调用线程的子进程。
         // 子进程随后通常会立即 exec（例如 glibc 的 posix_spawn），因此不能
         // 因为父进程还有其他线程就拒绝这条路径。
-        let parent_thread_count = parent.thread_count();
         if parent_thread_count != 1 {
             debug!(
                 "clone_process from multithreaded parent: parent_pid={} thread_count={}",
@@ -1355,7 +1390,7 @@ impl ProcessControlBlock {
         debug!(
             "[cow] clone_process begin: parent_pid={} parent_threads={}",
             self.getpid(),
-            parent.thread_count()
+            parent_thread_count
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let addr_space_start_ns = get_time_ns();
@@ -1494,16 +1529,6 @@ impl ProcessControlBlock {
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
-        let parent_task = current_task().ok_or(ERRNO::ESRCH)?;
-        let parent_task_inner = parent_task.inner_exclusive_access();
-        let parent_ustack_base = parent_task_inner.res.as_ref().unwrap().ustack_base();
-        let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_vruntime_ns = parent_task_inner.sched.vruntime_ns;
-        let parent_cfs_initialized = parent_task_inner.sched.cfs_initialized;
-        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
-        let parent_signal_mask = parent_task_inner.signal_mask;
-        let parent_trap_cx = *parent_task_inner.get_trap_cx();
-        drop(parent_task_inner);
         if !shared_resources.contains(CloneResourceFlags::PARENT) {
             parent.children.push(Arc::clone(&child));
         }
@@ -1692,6 +1717,26 @@ impl ProcessControlBlock {
         let entry_point = load_info.entry_point;
         let ustack_base = user_layout.ustack_base;
         let vm_layout = ProcessVmLayout::from_user_layout(user_layout);
+        // Snapshot task 0 before taking the parent PCB lock used to construct
+        // the child.  The task lock is acquired only after the short PCB
+        // snapshot, preserving the old leader-inheritance semantics without
+        // nesting process-inner and task-inner.
+        let parent_task = {
+            let parent_inner = self.inner_exclusive_access();
+            parent_inner
+                .tasks
+                .first()
+                .and_then(|task| task.as_ref().cloned())
+                .ok_or(ERRNO::ESRCH)?
+        };
+        let (parent_sched_attr, parent_affinity_mask, parent_signal_mask) = {
+            let parent_task_inner = parent_task.inner_exclusive_access();
+            (
+                parent_task_inner.sched_attr(),
+                parent_task_inner.sched.cpu_affinity_mask,
+                parent_task_inner.signal_mask,
+            )
+        };
         let mut parent = self.inner_exclusive_access();
         let cred = parent.cred;
         let parent_keyrings = ProcessKeyrings {
@@ -1768,12 +1813,6 @@ impl ProcessControlBlock {
             exec_in_progress: AtomicBool::new(false),
         });
         parent.children.push(Arc::clone(&child));
-        let parent_task = parent.get_task(0);
-        let parent_task_inner = parent_task.inner_exclusive_access();
-        let parent_sched_attr = parent_task_inner.sched_attr();
-        let parent_affinity_mask = parent_task_inner.sched.cpu_affinity_mask;
-        let parent_signal_mask = parent_task_inner.signal_mask;
-        drop(parent_task_inner);
         drop(parent);
 
         let task = child

@@ -455,6 +455,7 @@ fn mask_to_cpu_list(mask: usize) -> String {
 fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
     let process = pid2process(pid).ok_or(FS_ERRNO::ENOENT)?;
     let now = get_time();
+    let live_thread_count = process.thread_count();
     let (
         comm,
         ppid,
@@ -483,9 +484,7 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
         let pgrp = inner.cred.pgid;
         let session = inner.cred.sid;
         let is_zombie = inner.is_zombie;
-        let num_threads = inner
-            .thread_count()
-            .max(if inner.is_zombie { 1 } else { 0 });
+        let num_threads = live_thread_count.max(if inner.is_zombie { 1 } else { 0 });
         let vsize = inner.address_space_bytes();
         let start_stack = inner.vm_layout.start_stack;
         let start_brk = inner.vm_layout.start_brk;
@@ -634,6 +633,7 @@ fn build_pid_stat(pid: usize) -> Result<String, FS_ERRNO> {
 
 fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
     let process = pid2process(pid).ok_or(FS_ERRNO::ENOENT)?;
+    let live_thread_count = process.thread_count();
     let (
         name,
         umask,
@@ -678,9 +678,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
         let session = inner.cred.sid;
         let proc_pending = inner.pending_signals.bits();
         let fd_size = inner.fd_table.len();
-        let num_threads = inner
-            .thread_count()
-            .max(if inner.is_zombie { 1 } else { 0 });
+        let num_threads = live_thread_count.max(if inner.is_zombie { 1 } else { 0 });
         let vsize = inner.address_space_bytes();
         let start_brk = inner.vm_layout.start_brk;
         let current_brk = inner.vm_layout.brk;

@@ -2839,6 +2839,159 @@ pub fn sys_splice(
     })
 }
 
+/// copy_file_range syscall: copy bytes directly between two regular files.
+///
+/// A NULL input/output offset uses and advances the corresponding open file
+/// description offset.  A non-NULL offset is used as an independent position
+/// and is advanced in user space by the number of bytes actually copied.
+pub fn sys_copy_file_range(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_copy_file_range",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        if fd_in < 0 || fd_out < 0 {
+            return Err(ERRNO::EBADF);
+        }
+        if flags != 0 || len > isize::MAX as usize {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let in_desc = get_file_description(fd_in as usize)?;
+        let out_desc = get_file_description(fd_out as usize)?;
+        // Linux reports EISDIR for directory operands before checking the
+        // requested access mode (including a read-only destination fd).
+        if in_desc.is_dir() || out_desc.is_dir() {
+            return Err(ERRNO::EISDIR);
+        }
+        if in_desc.is_path() || !in_desc.readable() {
+            return Err(ERRNO::EBADF);
+        }
+        if out_desc.is_path() || !out_desc.writable() {
+            return Err(ERRNO::EBADF);
+        }
+        if !is_regular_file(&in_desc) || !is_regular_file(&out_desc) {
+            return Err(ERRNO::EINVAL);
+        }
+        if !in_desc.is_seekable() || !out_desc.is_seekable() {
+            return Err(ERRNO::ESPIPE);
+        }
+        // Linux rejects copy_file_range for an O_APPEND destination, even
+        // when off_out is NULL (the destination offset cannot be honored).
+        if out_desc.status_flags().contains(FileStatusFlags::APPEND) {
+            return Err(ERRNO::EBADF);
+        }
+
+        // Read and validate offset pointers before handling a zero-length
+        // request, matching the normal syscall pointer/error ordering.
+        let mut in_pos = if off_in.is_null() {
+            usize::try_from(in_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?
+        } else {
+            parse_pos64(read_pod_from_user(off_in as *const i64)?)?
+        };
+        let mut out_pos = if off_out.is_null() {
+            usize::try_from(out_desc.seek(0, 1)?).map_err(|_| ERRNO::EINVAL)?
+        } else {
+            parse_pos64(read_pod_from_user(off_out as *const i64)?)?
+        };
+
+        // The kernel rejects overlapping in-place copies.  Compare stable
+        // filesystem/inode identities so separate descriptors for the same
+        // file are covered as well.
+        if len > 0 {
+            if let (Some(inode_in), Some(inode_out)) =
+                (in_desc.backing_inode(), out_desc.backing_inode())
+            {
+                if inode_in.fs_id() == inode_out.fs_id() && inode_in.ino() == inode_out.ino() {
+                    let last = len.checked_sub(1).ok_or(ERRNO::EINVAL)?;
+                    let in_end = in_pos.checked_add(last).ok_or(ERRNO::EINVAL)?;
+                    let out_end = out_pos.checked_add(last).ok_or(ERRNO::EINVAL)?;
+                    if in_end >= out_pos && in_pos <= out_end {
+                        return Err(ERRNO::EINVAL);
+                    }
+                } else if inode_in.fs_id() != inode_out.fs_id() {
+                    // copy_file_range is restricted to one filesystem; the
+                    // userspace caller can fall back to read/write on EXDEV.
+                    return Err(ERRNO::EXDEV);
+                }
+            }
+        }
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let chunk_len = len.min(SENDFILE_CHUNK_SIZE);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(chunk_len)
+            .map_err(|_| ERRNO::ENOMEM)?;
+        buf.resize(chunk_len, 0);
+
+        let mut copied = 0usize;
+        let result: Result<isize, ERRNO> = (|| {
+            while copied < len {
+                let want = (len - copied).min(buf.len());
+                let read = match in_desc.read_bytes_at(in_pos, &mut buf[..want]) {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if read == 0 {
+                    break;
+                }
+
+                // A NULL destination offset operates on the shared file
+                // offset.  O_APPEND was rejected above, as required here.
+                let written = if off_out.is_null() {
+                    out_desc.write_bytes(&buf[..read])
+                } else {
+                    out_desc.write_bytes_at(out_pos, &buf[..read])
+                };
+                let written = match written {
+                    Ok(n) => n,
+                    Err(err) if copied > 0 => return Ok(copied as isize),
+                    Err(err) => return Err(err),
+                };
+                if written == 0 {
+                    break;
+                }
+
+                in_pos = in_pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if !off_out.is_null() {
+                    out_pos = out_pos.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                }
+                copied = copied.checked_add(written).ok_or(ERRNO::EINVAL)?;
+                if written < read {
+                    break;
+                }
+            }
+            Ok(copied as isize)
+        })();
+
+        // For a NULL input offset we used positional reads, so commit the
+        // resulting position to the open file description.  A NULL output
+        // offset was advanced by write_bytes() itself; only explicit offsets
+        // need a user-space write-back.
+        if off_in.is_null() {
+            in_desc.seek(in_pos as i64, 0)?;
+        } else {
+            write_pod_to_user(off_in, &(in_pos as i64))?;
+        }
+        if !off_out.is_null() {
+            write_pod_to_user(off_out, &(out_pos as i64))?;
+        }
+
+        result
+    })
+}
+
 /// fadvise64 syscall：接受用户态的文件访问模式提示。
 pub fn sys_fadvise64(fd: i32, _offset: i64, _len: usize, advice: i32) -> isize {
     trace!(
@@ -4355,6 +4508,28 @@ pub fn sys_chdir(path: *const u8) -> isize {
             return Err(ERRNO::ENOTDIR);
         }
         process.inner_exclusive_access().cwd = new_abs;
+        Ok(0)
+    })
+}
+
+/// fchdir – change the current working directory to the directory referred to
+/// by `fd`.
+pub fn sys_fchdir(fd: u32) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_fchdir",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    let process = current_process();
+    syscall_body!({
+        let desc = get_file_description(fd as usize)?;
+        if !desc.is_dir() {
+            return Err(ERRNO::ENOTDIR);
+        }
+        // The path is retained by directory-backed File implementations and
+        // is also the base used by the *at() syscalls.  Refuse descriptors
+        // without one rather than installing an unusable CWD.
+        let cwd = desc.path().ok_or(ERRNO::ENOTDIR)?;
+        process.inner_exclusive_access().cwd = cwd;
         Ok(0)
     })
 }
