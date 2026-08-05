@@ -6,7 +6,9 @@ set -euo pipefail
 # This script runs on the host while rootfs-rv is being assembled.  Cargo
 # registry/git contents are architecture-independent and can be downloaded on
 # the host, but compiled Cargo binaries must not be copied: they would have the
-# host architecture and cannot run inside the RISC-V guest.
+# host architecture and cannot run inside the RISC-V guest.  Guest compiler and
+# linker setup is deliberately left to /root/prepare-cargo-cache at runtime,
+# because the compiler is supplied by the mounted public RISC-V disk.
 
 ROOTFS_DIR="${ROOTFS_DIR:?ROOTFS_DIR is required}"
 ROOTFS_DIR="$(cd "$ROOTFS_DIR" && pwd)"
@@ -18,6 +20,8 @@ GUEST_CARGO_HOME="$ROOTFS_DIR/root/.cargo"
 WORKSPACE_DIR="${WORKSPACE_DIR_OVERRIDE:-$WORKSPACE_DIR}"
 GUEST_CARGO_HOME="${GUEST_CARGO_HOME_OVERRIDE:-$GUEST_CARGO_HOME}"
 
+PREFETCH_STARRY_TOOLS=0
+
 HOST_CARGO="${HOST_CARGO:-cargo}"
 HOST_CARGO_HOME="${HOST_CARGO_HOME:-$HOME/.cargo}"
 # ksym 0.6 uses the unstable `let_chains` feature.  The host's default
@@ -25,8 +29,6 @@ HOST_CARGO_HOME="${HOST_CARGO_HOME:-$HOME/.cargo}"
 # nightly explicitly.  Set HOST_RUST_TOOLCHAIN= to use HOST_CARGO directly.
 HOST_RUST_TOOLCHAIN="${HOST_RUST_TOOLCHAIN:-nightly-2026-05-28}"
 PREFETCH_STARRY_TOOLS="${PREFETCH_STARRY_TOOLS:-1}"
-GLIBC_HOST_TARGET="${GLIBC_HOST_TARGET:-riscv64gc-unknown-linux-gnu}"
-GLIBC_HOST_LINKER="${GLIBC_HOST_LINKER:-/usr/bin/riscv64gc-unknown-linux-gnu-gcc}"
 
 HOST_CARGO_ARGS=()
 if [[ -n "$HOST_RUST_TOOLCHAIN" ]]; then
@@ -41,7 +43,6 @@ die() {
 command -v "$HOST_CARGO" >/dev/null 2>&1 || die "host cargo not found: $HOST_CARGO"
 [ -f "$WORKSPACE_DIR/Cargo.toml" ] || die "TGOSKits workspace not found: $WORKSPACE_DIR"
 [ -f "$WORKSPACE_DIR/Cargo.lock" ] || die "Cargo.lock not found: $WORKSPACE_DIR/Cargo.lock"
-[ -x "$ROOTFS_DIR$GLIBC_HOST_LINKER" ] || die "guest glibc host linker not found: $ROOTFS_DIR$GLIBC_HOST_LINKER"
 
 host_cargo_version="$($HOST_CARGO "${HOST_CARGO_ARGS[@]}" --version)" || \
     die "cannot run host Cargo with toolchain ${HOST_RUST_TOOLCHAIN:-<direct>}; set HOST_RUST_TOOLCHAIN= or install the requested toolchain"
@@ -111,24 +112,10 @@ offline = true
 git-fetch-with-cli = true
 CONFIG_EOF
 
-# Build scripts and proc-macros for Starry's none-elf target execute on the
-# RISC-V Linux host.  Select the isolated glibc linker for that host target;
-# the target-specific Starry linker configuration remains owned by tgoskits.
-cat >> "$guest_config" <<CONFIG_EOF
-
-[env]
-# cc-rs treats HOST == TARGET as a native build and otherwise falls back to
-# /usr/bin/cc, which is the guest's musl compiler.  Select the matching glibc
-# wrapper for C dependencies of GNU-host build scripts such as libz-sys.
-CC_${GLIBC_HOST_TARGET//-/_} = "${GLIBC_HOST_LINKER}"
-
-[target.${GLIBC_HOST_TARGET}]
-linker = "${GLIBC_HOST_LINKER}"
-CONFIG_EOF
-
-# Let guest-side test scripts detect that this cache was populated during the
-# host build. The marker is deliberately written last, after registry/git
-# data and Cargo's offline configuration are complete.
+# Keep this marker about the cache only.  The guest-side helper must still run
+# its mounted-disk linker setup even when this marker already exists.
+# The marker is deliberately written last, after registry/git data and
+# Cargo's offline configuration are complete.
 printf '%s\n' 'host-prepared Cargo cache' > "$GUEST_CARGO_HOME/.cosmos-host-cache-ready"
 
 echo "[INFO] guest Cargo cache size:"

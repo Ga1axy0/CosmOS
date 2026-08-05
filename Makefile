@@ -353,8 +353,6 @@ $(ROOTFS_RV_CARGO_STAMP): $(ROOTFS_RV_INIT_STAMP) \
 	ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
 	WORKSPACE_DIR_OVERRIDE="$(CURDIR)/$(ROOTFS_BASE_DIR)/root/tgoskits" \
 	GUEST_CARGO_HOME_OVERRIDE="$(CURDIR)/$(ROOTFS_RV_DIR)/root/.cargo" \
-	GLIBC_HOST_TARGET="$(RV_GLIBC_HOST_TARGET)" \
-	GLIBC_HOST_LINKER="$(RV_GLIBC_HOST_LINKER)" \
 		bash scripts/prepare-rootfs-rv-cargo-offline.sh
 	@touch "$@"
 
