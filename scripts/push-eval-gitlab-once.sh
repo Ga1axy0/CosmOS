@@ -142,13 +142,11 @@ EXCLUDED_FILES=(
     "CosmOS-rootfs/third-party/libclang-riscv64-noble/libllvm18_18.1.3-1ubuntu1_riscv64.deb"
 )
 
-# These paths are nested submodules in the source repository.  They are
-# removed only from the temporary flattened export; the source gitlink,
-# .gitmodules entry, local checkout, and local submodule Git repository stay
-# intact.
-EXCLUDED_SUBMODULES=(
-    "CosmOS-rootfs/rootfs/root/tgoskits"
-)
+# Nested submodules are expanded by archive_local_repository() into the
+# temporary export.  Keep TGOSKits in the submission because the rootfs build
+# uses its Cargo.toml/Cargo.lock to prepare the offline cache; it is still
+# excluded from disk.img/rootfs variants by WITH_TGOSKITS=0.
+EXCLUDED_SUBMODULES=()
 
 for path in "${EXCLUDED_FILES[@]}"; do
     rm -f -- "$TEMP_REPO/$path"
