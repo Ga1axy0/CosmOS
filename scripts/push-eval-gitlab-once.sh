@@ -139,7 +139,34 @@ rm -f -- "$SOURCE_MODULES_FILE" "$SOURCE_ENTRIES_FILE"
 EXCLUDED_FILES=(
     "CosmOS-rootfs/third-party/gcc-11.2.0.tar.xz"
     "CosmOS-rootfs/third-party/gcc-13.2.0.tar.xz"
-    "CosmOS-rootfs/third-party/libclang-riscv64-noble/libllvm18_18.1.3-1ubuntu1_riscv64.deb"
+    "CosmOS-rootfs/third-party/gmp-6.1.0.tar.bz2"
+    "CosmOS-rootfs/third-party/gmp-6.2.1.tar.bz2"
+    "CosmOS-rootfs/third-party/mpc-1.0.3.tar.gz"
+    "CosmOS-rootfs/third-party/mpc-1.2.1.tar.gz"
+    "CosmOS-rootfs/third-party/mpfr-3.1.6.tar.xz"
+    "CosmOS-rootfs/third-party/mpfr-4.1.0.tar.bz2"
+    "CosmOS-rootfs/third-party/pkgconf-3.0.3.tar.gz"
+    "CosmOS-rootfs/third-party/zlib-1.3.2.tar.gz"
+    "CosmOS-rootfs/third-party/libudev-zero-1.0.4.tar.gz"
+)
+
+EXCLUDED_DIRECTORIES=(
+    "CosmOS-rootfs/third-party/libclang-riscv64-noble"
+)
+
+# Keep the TGOSKits workspace manifests and source needed by the host-side
+# `cargo fetch --locked`, but omit material which is not read by Cargo during
+# dependency preparation.  These paths are removed only from TEMP_REPO; the
+# checked-out tgoskits submodule remains complete locally.
+TGOSKITS_ROOT="CosmOS-rootfs/rootfs/root/tgoskits"
+EXCLUDED_TGOSKITS_DIRS=(
+    "$TGOSKITS_ROOT/.claude"
+    "$TGOSKITS_ROOT/.devcontainer"
+    "$TGOSKITS_ROOT/.github"
+    "$TGOSKITS_ROOT/book"
+    "$TGOSKITS_ROOT/container"
+    "$TGOSKITS_ROOT/docs"
+    "$TGOSKITS_ROOT/test-suit/starryos"
 )
 
 # Nested submodules are expanded by archive_local_repository() into the
@@ -151,8 +178,56 @@ EXCLUDED_SUBMODULES=()
 for path in "${EXCLUDED_FILES[@]}"; do
     rm -f -- "$TEMP_REPO/$path"
 done
+for path in "${EXCLUDED_DIRECTORIES[@]}"; do
+    rm -rf -- "$TEMP_REPO/$path"
+done
 for path in "${EXCLUDED_SUBMODULES[@]}"; do
     rm -rf -- "$TEMP_REPO/$path"
+done
+for path in "${EXCLUDED_TGOSKITS_DIRS[@]}"; do
+    rm -rf -- "$TEMP_REPO/$path"
+done
+
+# Most of apps/starry is a collection of non-workspace demos and test assets.
+# The root workspace only names these two Starry app trees as Cargo members;
+# keep them and discard the other app trees from the upload.
+STARRY_APPS_ROOT="$TEMP_REPO/$TGOSKITS_ROOT/apps/starry"
+if [[ -d "$STARRY_APPS_ROOT" ]]; then
+    for path in "$STARRY_APPS_ROOT"/*; do
+        [[ -d "$path" ]] || continue
+        case "${path##*/}" in
+            orangepi-5-plus-uvc|qemu)
+                ;;
+            *)
+                rm -rf -- "$path"
+                ;;
+        esac
+    done
+fi
+
+# Remove checked-in runtime assets and prebuilt libraries.  Cargo's resolver
+# does not read any of these files, while they account for much of TGOSKits'
+# apparent size (models, images, PDFs, wheels, and architecture-specific
+# libraries).  Keep source/configuration formats such as .dts and .dtb.
+while IFS= read -r -d '' path; do
+    rm -f -- "$path"
+done < <(
+    find "$TEMP_REPO/$TGOSKITS_ROOT" -type f \( \
+        -name '*.a' -o -name '*.so' -o -name '*.whl' -o \
+        -name '*.jar' -o -name '*.rknn' -o -name '*.cvimodel' -o \
+        -name '*.pdf' -o -name '*.png' -o -name '*.jpg' -o \
+        -name '*.jpeg' -o -name '*.gif' -o -name '*.ppm' -o \
+        -name '*.svg' \
+    \) -print0
+)
+
+for path in \
+    "$TEMP_REPO/$TGOSKITS_ROOT/Cargo.toml" \
+    "$TEMP_REPO/$TGOSKITS_ROOT/Cargo.lock"; do
+    if [[ ! -f "$path" ]]; then
+        echo "[ERROR] Cargo workspace file missing after TGOSKits pruning: $path" >&2
+        exit 1
+    fi
 done
 
 # Remove all submodule metadata from the remote snapshot.  The source tree is
@@ -165,9 +240,21 @@ for path in "${EXCLUDED_FILES[@]}"; do
         exit 1
     fi
 done
+for path in "${EXCLUDED_DIRECTORIES[@]}"; do
+    if [[ -e "$TEMP_REPO/$path" ]]; then
+        echo "[ERROR] Excluded directory is still present in the export: $path" >&2
+        exit 1
+    fi
+done
 for path in "${EXCLUDED_SUBMODULES[@]}"; do
     if [[ -e "$TEMP_REPO/$path" ]]; then
         echo "[ERROR] Excluded submodule is still present in the export: $path" >&2
+        exit 1
+    fi
+done
+for path in "${EXCLUDED_TGOSKITS_DIRS[@]}"; do
+    if [[ -e "$TEMP_REPO/$path" ]]; then
+        echo "[ERROR] Excluded TGOSKits directory is still present in the export: $path" >&2
         exit 1
     fi
 done
@@ -190,6 +277,12 @@ git -C "$TEMP_REPO" add -A --force
 for path in "${EXCLUDED_FILES[@]}"; do
     if git -C "$TEMP_REPO" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
         echo "[ERROR] Excluded file is still tracked in the export: $path" >&2
+        exit 1
+    fi
+done
+for path in "${EXCLUDED_DIRECTORIES[@]}"; do
+    if git -C "$TEMP_REPO" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+        echo "[ERROR] Excluded directory still has tracked files in the export: $path" >&2
         exit 1
     fi
 done
