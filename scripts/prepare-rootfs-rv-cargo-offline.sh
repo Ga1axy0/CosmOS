@@ -23,7 +23,13 @@ GUEST_CARGO_HOME="${GUEST_CARGO_HOME_OVERRIDE:-$GUEST_CARGO_HOME}"
 PREFETCH_STARRY_TOOLS=0
 
 HOST_CARGO="${HOST_CARGO:-cargo}"
-HOST_CARGO_HOME="${HOST_CARGO_HOME:-$HOME/.cargo}"
+# Do not reuse the build host's ~/.cargo.  Course build hosts may configure a
+# registry mirror there; copying that mirror's cache and then writing a plain
+# crates.io guest config leaves Cargo with packages but no matching offline
+# index.  Keep a persistent, project-owned cache with an explicit source.
+HOST_CARGO_HOME="${HOST_CARGO_HOME:-$(dirname "$ROOTFS_DIR")/build/cargo-host-cache}"
+HOST_CRATES_IO_INDEX="${HOST_CRATES_IO_INDEX:-sparse+https://index.crates.io/}"
+HOST_CRATES_IO_PROTOCOL="${HOST_CRATES_IO_PROTOCOL:-sparse}"
 # ksym 0.6 uses the unstable `let_chains` feature.  The host's default
 # nightly may be older than the guest toolchain, so select the matching
 # nightly explicitly.  Set HOST_RUST_TOOLCHAIN= to use HOST_CARGO directly.
@@ -35,6 +41,14 @@ if [[ -n "$HOST_RUST_TOOLCHAIN" ]]; then
     HOST_CARGO_ARGS+=("+$HOST_RUST_TOOLCHAIN")
 fi
 
+run_host_cargo() {
+    CARGO_HOME="$HOST_CARGO_HOME" \
+    CARGO_NET_OFFLINE=false \
+    CARGO_REGISTRIES_CRATES_IO_INDEX="$HOST_CRATES_IO_INDEX" \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL="$HOST_CRATES_IO_PROTOCOL" \
+        "$HOST_CARGO" "${HOST_CARGO_ARGS[@]}" "$@"
+}
+
 die() {
     echo "[ERROR] $*" >&2
     exit 1
@@ -44,20 +58,21 @@ command -v "$HOST_CARGO" >/dev/null 2>&1 || die "host cargo not found: $HOST_CAR
 [ -f "$WORKSPACE_DIR/Cargo.toml" ] || die "TGOSKits workspace not found: $WORKSPACE_DIR"
 [ -f "$WORKSPACE_DIR/Cargo.lock" ] || die "Cargo.lock not found: $WORKSPACE_DIR/Cargo.lock"
 
-host_cargo_version="$($HOST_CARGO "${HOST_CARGO_ARGS[@]}" --version)" || \
+host_cargo_version="$(run_host_cargo --version)" || \
     die "cannot run host Cargo with toolchain ${HOST_RUST_TOOLCHAIN:-<direct>}; set HOST_RUST_TOOLCHAIN= or install the requested toolchain"
 
 mkdir -p "$HOST_CARGO_HOME" "$GUEST_CARGO_HOME"
 
 echo "[INFO] host Cargo: $host_cargo_version"
 echo "[INFO] host CARGO_HOME: $HOST_CARGO_HOME"
+echo "[INFO] host crates.io index: $HOST_CRATES_IO_INDEX ($HOST_CRATES_IO_PROTOCOL)"
 echo "[INFO] guest workspace: $WORKSPACE_DIR"
 
 # Fetch the complete locked workspace.  Do not pass --target here: the
 # workspace lockfile contains architecture-specific packages which must also
 # be available to an offline Cargo resolver.
 echo "[INFO] fetching TGOSKits dependencies on the host..."
-CARGO_HOME="$HOST_CARGO_HOME" "$HOST_CARGO" "${HOST_CARGO_ARGS[@]}" fetch \
+run_host_cargo fetch \
     --locked \
     --manifest-path "$WORKSPACE_DIR/Cargo.toml"
 
@@ -73,11 +88,11 @@ if [[ "$PREFETCH_STARRY_TOOLS" != "0" ]]; then
     trap cleanup EXIT
 
     echo "[INFO] fetching cargo-binutils dependencies on the host..."
-    CARGO_HOME="$HOST_CARGO_HOME" "$HOST_CARGO" "${HOST_CARGO_ARGS[@]}" install \
+    run_host_cargo install \
         --root "$tool_stage" cargo-binutils
 
     echo "[INFO] fetching ksym dependencies on the host..."
-    CARGO_HOME="$HOST_CARGO_HOME" "$HOST_CARGO" "${HOST_CARGO_ARGS[@]}" install \
+    run_host_cargo install \
         --root "$tool_stage" ksym
 fi
 
@@ -111,6 +126,22 @@ cat > "$guest_config" <<'CONFIG_EOF'
 offline = true
 git-fetch-with-cli = true
 CONFIG_EOF
+
+# Resolve the complete workspace using exactly the cache and configuration
+# that will be packed into the guest.  This catches a missing sparse-index
+# entry (even when the corresponding .crate archive exists) during image
+# construction instead of producing a zero-second BuildStorm failure.
+echo "[INFO] validating guest Cargo cache in offline mode..."
+CARGO_HOME="$GUEST_CARGO_HOME" \
+CARGO_NET_OFFLINE=true \
+CARGO_REGISTRIES_CRATES_IO_INDEX="$HOST_CRATES_IO_INDEX" \
+CARGO_REGISTRIES_CRATES_IO_PROTOCOL="$HOST_CRATES_IO_PROTOCOL" \
+    "$HOST_CARGO" "${HOST_CARGO_ARGS[@]}" metadata \
+        --locked \
+        --offline \
+        --format-version 1 \
+        --manifest-path "$WORKSPACE_DIR/Cargo.toml" \
+        >/dev/null || die "guest Cargo cache failed offline workspace resolution"
 
 # Keep this marker about the cache only.  The guest-side helper must still run
 # its mounted-disk linker setup even when this marker already exists.
