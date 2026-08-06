@@ -32,7 +32,7 @@ compile_error!("Enable one of the cargo features: ext4 | easyfs | fat32");
 
 /// inode in memory
 pub struct OSInode {
-    path: String,
+    path: SpinNoIrqLock<String>,
     inode: Arc<Inode>,
 }
 
@@ -40,7 +40,10 @@ impl OSInode {
     /// create a new inode in memory
     pub fn new(inode: Arc<Inode>, path: String) -> Self {
         trace!("kernel: OSInode::new");
-        Self { path, inode }
+        Self {
+            path: SpinNoIrqLock::new(path),
+            inode,
+        }
     }
 
     /// Add `pid` to this inode when it is a cgroup v2 directory.
@@ -327,6 +330,40 @@ fn split_for_mount(abs_path: &str) -> (&str, &str) {
     }
 }
 
+#[inline]
+fn path_is_below(path: &str, parent: &str) -> bool {
+    path.len() > parent.len()
+        && path.starts_with(parent)
+        && (parent == "/" || path.as_bytes().get(parent.len()) == Some(&b'/'))
+}
+
+fn append_absolute_path(prefix: &str, path: &str) -> String {
+    if path == "/" {
+        return String::from(prefix);
+    }
+    if prefix == "/" {
+        return String::from(path);
+    }
+    alloc::format!("{}{}", prefix, path)
+}
+
+fn move_rebased_path(path: &str, source: &str, target: &str) -> Option<String> {
+    if path == source {
+        return Some(String::from(target));
+    }
+    path_is_below(path, source).then(|| alloc::format!("{}{}", target, &path[source.len()..]))
+}
+
+fn pivot_rebased_path(path: &str, new_root: &str, put_old_after: &str) -> String {
+    if path == new_root {
+        return String::from("/");
+    }
+    if path_is_below(path, new_root) {
+        return String::from(&path[new_root.len()..]);
+    }
+    append_absolute_path(put_old_after, path)
+}
+
 /// Ensure a virtual directory exists at `abs_path`, creating intermediate
 /// virtual directories as needed.
 ///
@@ -488,6 +525,10 @@ pub fn do_move_mount(source_path: &str, target_path: &str) -> Result<(), ERRNO> 
         return Err(ERRNO::EINVAL);
     }
 
+    if MOUNT_TABLE.lock().contains_key(dst_abs.as_str()) {
+        return Err(ERRNO::EBUSY);
+    }
+
     let src_wrapper = {
         let map = VIRT_DIRS.lock();
         map.get(src_abs.as_str()).cloned().ok_or(ERRNO::EINVAL)?
@@ -513,13 +554,167 @@ pub fn do_move_mount(source_path: &str, target_path: &str) -> Result<(), ERRNO> 
 
     {
         let mut map = VIRT_DIRS.lock();
-        map.remove(src_abs.as_str());
+        let old_paths: Vec<String> = map
+            .keys()
+            .filter(|path| *path == &src_abs || path_is_below(path, src_abs.as_str()))
+            .cloned()
+            .collect();
+        let mut moved = Vec::with_capacity(old_paths.len());
+        for old_path in old_paths {
+            if let Some(node) = map.remove(old_path.as_str()) {
+                let new_path =
+                    move_rebased_path(old_path.as_str(), src_abs.as_str(), dst_abs.as_str())
+                        .expect("selected move-mount path must be rebased");
+                moved.push((new_path, node));
+            }
+        }
+        for (new_path, node) in moved {
+            map.insert(new_path, node);
+        }
         map.insert(dst_abs.clone(), Arc::clone(&src_wrapper));
+    }
+
+    // Keep /proc/mounts coherent for the moved mount and every child mount.
+    {
+        let mut table = MOUNT_TABLE.lock();
+        let old_targets: Vec<String> = table
+            .keys()
+            .filter(|path| *path == &src_abs || path_is_below(path, src_abs.as_str()))
+            .cloned()
+            .collect();
+        let mut moved = Vec::with_capacity(old_targets.len());
+        for old_target in old_targets {
+            if let Some(mut record) = table.remove(old_target.as_str()) {
+                let new_target =
+                    move_rebased_path(old_target.as_str(), src_abs.as_str(), dst_abs.as_str())
+                        .expect("selected mount-table path must be rebased");
+                record.target = new_target.clone();
+                moved.push((new_target, record));
+            }
+        }
+        for (new_target, record) in moved {
+            table.insert(new_target, record);
+        }
     }
 
     prune_unused_virtual_dirs(src_parent_path);
     info!("[kernel] moved mount {} -> {}", src_abs, dst_abs);
     Ok(())
+}
+
+/// Promote a mounted filesystem to `/` and attach the previous root below it.
+///
+/// This kernel currently has one global mount namespace.  The stable
+/// `VIRT_ROOT` object therefore remains in place while its complete namespace
+/// view is exchanged with the mounted `new_root` wrapper.  Mount registry
+/// paths and `/proc/mounts` records are rebased to describe the new topology.
+/// Process-local path strings are updated by the syscall layer after this
+/// operation succeeds.
+pub fn do_pivot_root(new_root: &str, put_old: &str) -> Result<(String, String), ERRNO> {
+    let new_abs = canonicalize("/", new_root);
+    let put_old_abs = canonicalize("/", put_old);
+
+    if new_abs == "/" || put_old_abs == new_abs || !path_is_below(&put_old_abs, &new_abs) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let new_inode = lookup_inode_follow("/", new_abs.as_str(), true)?;
+    let put_old_inode = lookup_inode_follow("/", put_old_abs.as_str(), true)?;
+    if !new_inode.is_dir() || !put_old_inode.is_dir() {
+        return Err(ERRNO::ENOTDIR);
+    }
+
+    let put_old_after = String::from(&put_old_abs[new_abs.len()..]);
+    if put_old_after == "/" || put_old_after.is_empty() {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let new_wrapper = {
+        let map = VIRT_DIRS.lock();
+        map.get(new_abs.as_str()).cloned().ok_or(ERRNO::EINVAL)?
+    };
+
+    // new_root must be an actual mount point. put_old must remain on that
+    // filesystem rather than crossing into one of its child mounts.
+    {
+        let table = MOUNT_TABLE.lock();
+        if !table.contains_key(new_abs.as_str()) {
+            return Err(ERRNO::EINVAL);
+        }
+        if table.keys().any(|target| {
+            target != &new_abs
+                && (target == &put_old_abs
+                    || (path_is_below(target, new_abs.as_str())
+                        && (put_old_abs == *target
+                            || path_is_below(put_old_abs.as_str(), target.as_str()))))
+        }) {
+            return Err(ERRNO::EBUSY);
+        }
+    }
+
+    // Build the future mount table before changing the namespace, so all
+    // fallible validation has completed when the first topology mutation is
+    // made.
+    let rebased_mounts = {
+        let table = MOUNT_TABLE.lock();
+        let mut rebased = BTreeMap::new();
+        for (target, record) in table.iter() {
+            let new_target =
+                pivot_rebased_path(target.as_str(), new_abs.as_str(), put_old_after.as_str());
+            let mut new_record = record.clone();
+            new_record.target = new_target.clone();
+            if rebased.insert(new_target, new_record).is_some() {
+                return Err(ERRNO::EBUSY);
+            }
+        }
+        rebased
+    };
+
+    let (src_parent_path, src_name) = split_for_mount(new_abs.as_str());
+    let src_parent = if src_parent_path == "/" {
+        Arc::clone(&VIRT_ROOT)
+    } else {
+        VIRT_DIRS
+            .lock()
+            .get(src_parent_path)
+            .cloned()
+            .ok_or(ERRNO::EINVAL)?
+    };
+    if !src_parent.unbind(src_name) {
+        return Err(ERRNO::EINVAL);
+    }
+
+    let old_root = VIRT_ROOT.take_over_root_from(&new_wrapper);
+
+    // Rebase every virtual mount wrapper. Entries below new_root become
+    // top-level paths; all other entries move below put_old.
+    {
+        let mut map = VIRT_DIRS.lock();
+        let previous = core::mem::take(&mut *map);
+        for (path, node) in previous {
+            if path == new_abs {
+                continue;
+            }
+            let new_path =
+                pivot_rebased_path(path.as_str(), new_abs.as_str(), put_old_after.as_str());
+            map.insert(new_path, node);
+        }
+    }
+
+    // Mount the complete old namespace at put_old. The directory was resolved
+    // above while it was still visible through new_root.
+    let (put_parent_path, put_name) = split_for_mount(put_old_after.as_str());
+    let put_parent = ensure_virtual_dir(put_parent_path)?;
+    put_parent.bind(put_name, Arc::clone(&old_root) as Arc<dyn VfsNode>);
+    VIRT_DIRS.lock().insert(put_old_after.clone(), old_root);
+
+    *MOUNT_TABLE.lock() = rebased_mounts;
+    prune_unused_virtual_dirs(src_parent_path);
+    info!(
+        "[kernel] pivot_root {} -> /, old root -> {}",
+        new_abs, put_old_after
+    );
+    Ok((new_abs, put_old_after))
 }
 
 /// Unmount the filesystem mounted at `path`.
@@ -528,10 +723,19 @@ pub fn do_move_mount(source_path: &str, target_path: &str) -> Result<(), ERRNO> 
 /// intermediate directory created by [`do_mount`]), it is also removed from
 /// the internal registry.  Sub-mounts must be unmounted first; this function
 /// does **not** cascade.
-pub fn do_umount(path: &str) -> Result<(), ERRNO> {
+pub fn do_umount(path: &str, detach: bool) -> Result<(), ERRNO> {
     let abs = canonicalize("/", path);
     if abs == "/" {
         // Unmounting the root overlay is not supported (use pivot_root instead).
+        return Err(ERRNO::EBUSY);
+    }
+
+    if !detach
+        && MOUNT_TABLE
+            .lock()
+            .keys()
+            .any(|target| path_is_below(target.as_str(), abs.as_str()))
+    {
         return Err(ERRNO::EBUSY);
     }
 
@@ -551,14 +755,26 @@ pub fn do_umount(path: &str) -> Result<(), ERRNO> {
         return Err(ERRNO::EINVAL);
     }
 
-    remove_mount_record(&abs);
-
-    // Clean up the registry entry (no-op if `abs` was a real-FS mount, not
-    // a VirtualDirNode we created).
-    VIRT_DIRS.lock().remove(&abs);
+    if detach {
+        MOUNT_TABLE
+            .lock()
+            .retain(|target, _| target != &abs && !path_is_below(target.as_str(), abs.as_str()));
+        VIRT_DIRS
+            .lock()
+            .retain(|target, _| target != &abs && !path_is_below(target.as_str(), abs.as_str()));
+    } else {
+        remove_mount_record(&abs);
+        // Clean up the registry entry (no-op if `abs` was a real-FS mount,
+        // not a VirtualDirNode we created).
+        VIRT_DIRS.lock().remove(&abs);
+    }
     prune_unused_virtual_dirs(parent_path);
 
-    info!("[kernel] unmounted {}", abs);
+    info!(
+        "[kernel] unmounted {}{}",
+        abs,
+        if detach { " (detach)" } else { "" }
+    );
     Ok(())
 }
 
@@ -1398,7 +1614,19 @@ impl File for OSInode {
     }
 
     fn path(&self) -> Option<String> {
-        Some(self.path.clone())
+        Some(self.path.lock().clone())
+    }
+
+    fn rebase_path_after_pivot(&self, new_root: &str, put_old: &str) {
+        let mut path = self.path.lock();
+        let rebased = if path.as_str() == new_root {
+            String::from("/")
+        } else if path_is_below(path.as_str(), new_root) {
+            String::from(&path[new_root.len()..])
+        } else {
+            append_absolute_path(put_old, path.as_str())
+        };
+        *path = rebased;
     }
 
     fn chmod(&self, mode: u32) -> Result<(), fs::errno::FS_ERRNO> {

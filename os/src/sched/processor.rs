@@ -227,7 +227,10 @@ pub(crate) fn run_tasks() {
             // Scan only from the idle path, where no local task can make
             // progress anyway; the scanner is internally rate-limited and
             // re-enqueues every orphan it finds.
-            super::warn_lost_runnable_tasks("idle_no_task");
+            // Disabled while investigating an SMP lockup: this diagnostic
+            // scanner acquires process/task locks from the idle path and can
+            // contend with the scheduler's blocking path.
+            // super::warn_lost_runnable_tasks("idle_no_task");
 
             crate::trap::set_kernel_trap_entry();
 

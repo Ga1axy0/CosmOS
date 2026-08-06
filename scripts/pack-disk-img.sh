@@ -12,6 +12,7 @@ LOOP_FAT32_ENABLE="${LOOP_FAT32_ENABLE:-1}"
 LOOP_FAT32_SIZE_MIB="${LOOP_FAT32_SIZE_MIB:-1}"
 LOOP_FAT32_GUEST_PATH="${LOOP_FAT32_GUEST_PATH:-root/loop-fat32.img}"
 LOOP_FAT32_MNT_DIR="${LOOP_FAT32_MNT_DIR:-root/loop-fat32-mnt}"
+PACK_USER_APPS="${PACK_USER_APPS:-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 USER_APP_SRC_DIR="${USER_APP_SRC_DIR:-$PROJECT_ROOT/user/src/bin}"
@@ -30,21 +31,22 @@ require_tool truncate
 require_tool mktemp
 require_tool cp
 require_tool rm
-require_tool cargo
 
 if [ ! -d "$ROOTFS_DIR" ]; then
     echo "rootfs directory not found: $ROOTFS_DIR" >&2
     exit 1
 fi
 
-if [ ! -d "$USER_BIN_DIR" ]; then
-    echo "user binary directory not found: $USER_BIN_DIR" >&2
-    exit 1
-fi
+if [ "$PACK_USER_APPS" != "0" ]; then
+    if [ ! -d "$USER_BIN_DIR" ]; then
+        echo "user binary directory not found: $USER_BIN_DIR" >&2
+        exit 1
+    fi
 
-if [ ! -d "$USER_APP_SRC_DIR" ]; then
-    echo "user app source directory not found: $USER_APP_SRC_DIR" >&2
-    exit 1
+    if [ ! -d "$USER_APP_SRC_DIR" ]; then
+        echo "user app source directory not found: $USER_APP_SRC_DIR" >&2
+        exit 1
+    fi
 fi
 
 STAGE_DIR="$(mktemp -d /tmp/pack-disk-img.XXXXXX)"
@@ -60,22 +62,24 @@ if [ ! -d "$STAGE_DIR/root" ]; then
     exit 1
 fi
 
-for app_src in "$USER_APP_SRC_DIR"/*.rs; do
-    [ -f "$app_src" ] || continue
+if [ "$PACK_USER_APPS" != "0" ]; then
+    for app_src in "$USER_APP_SRC_DIR"/*.rs; do
+        [ -f "$app_src" ] || continue
 
-    name="$(basename "$app_src" .rs)"
-    host_path="$USER_BIN_DIR/$name"
-    if [ ! -f "$host_path" ]; then
-        echo "user app binary not found: $host_path" >&2
-        exit 1
-    fi
-    if [ ! -x "$host_path" ]; then
-        echo "user app binary is not executable: $host_path" >&2
-        exit 1
-    fi
+        name="$(basename "$app_src" .rs)"
+        host_path="$USER_BIN_DIR/$name"
+        if [ ! -f "$host_path" ]; then
+            echo "user app binary not found: $host_path" >&2
+            exit 1
+        fi
+        if [ ! -x "$host_path" ]; then
+            echo "user app binary is not executable: $host_path" >&2
+            exit 1
+        fi
 
-    cp -f "$host_path" "$STAGE_DIR/root/$name"
-done
+        cp -f "$host_path" "$STAGE_DIR/root/$name"
+    done
+fi
 
 
 if [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$STAGE_DIR/lib/ld-musl-$MUSL_ARCH.so.1" ]; then
@@ -87,6 +91,7 @@ if [ "$MUSL_ARCH" = "riscv64" ] && [ -e "$STAGE_DIR/lib/libc.so" ] && [ ! -e "$S
 fi
 
 if [ "$LOOP_FAT32_ENABLE" != "0" ]; then
+    require_tool cargo
     LOOP_FAT32_HOST_PATH="$STAGE_DIR/$LOOP_FAT32_GUEST_PATH"
     LOOP_FAT32_HOST_DIR="$(dirname "$LOOP_FAT32_HOST_PATH")"
     LOOP_FAT32_SEED_DIR="$STAGE_DIR/.loop-fat32-seed"
@@ -111,4 +116,8 @@ rm -f "$OUT_IMG"
 truncate -s "${size_mib}M" "$OUT_IMG"
 mkfs.ext4 -q -F -d "$STAGE_DIR" -L "$LABEL" "$OUT_IMG"
 
-echo "packed $OUT_IMG from staged $ROOTFS_DIR with user binaries in /root (${size_mib} MiB)"
+if [ "$PACK_USER_APPS" != "0" ]; then
+    echo "packed $OUT_IMG from staged $ROOTFS_DIR with user binaries in /root (${size_mib} MiB)"
+else
+    echo "packed $OUT_IMG from staged $ROOTFS_DIR as bootstrap image (${size_mib} MiB)"
+fi

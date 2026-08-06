@@ -36,7 +36,7 @@ pub use block_dev::{BlockDevice, BlockRead, BlockWrite};
 pub use easyfs::efs::EasyFileSystem;
 pub use fat32::Fat32FileSystem;
 pub use ext4::Ext4FileSystem;
-pub use dentry_cache::{dentry_cache_stats, DentryCacheStats, remove_dentry};
+pub use dentry_cache::{dentry_cache_stats, DentryCacheStats, remove_dentry, remove_parent_dentries};
 pub use inode_cache::{inode_cache_stats, InodeCacheStats};
 pub use vfs::{Inode, VfsStatFs, STATFS_MAGIC_EASYFS, STATFS_MAGIC_EXT4, STATFS_MAGIC_MSDOS,
 	STATFS_MAGIC_PIPEFS, STATFS_MAGIC_PROC, STATFS_MAGIC_TMPFS, STATFS_NAMELEN_DEFAULT,

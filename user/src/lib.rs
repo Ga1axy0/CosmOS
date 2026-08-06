@@ -1030,6 +1030,12 @@ pub fn chdir(path: &str) -> isize {
     sys_chdir(to_cstring(path).as_str())
 }
 
+pub fn pivot_root(new_root: &str, put_old: &str) -> isize {
+    let new_root = to_cstring(new_root);
+    let put_old = to_cstring(put_old);
+    sys_pivot_root(new_root.as_str(), put_old.as_str())
+}
+
 pub fn getdents64(fd: usize, buffer: &mut [u8]) -> isize {
     sys_getdents64(fd, buffer)
 }

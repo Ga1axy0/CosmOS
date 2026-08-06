@@ -44,6 +44,8 @@ pub const SYSCALL_LINKAT: usize = 37;
 pub const SYSCALL_UMOUNT: usize = 39;
 /// mount syscall
 pub const SYSCALL_MOUNT: usize = 40;
+/// pivot_root syscall
+pub const SYSCALL_PIVOT_ROOT: usize = 41;
 /// statfs64 syscall
 pub const SYSCALL_STATFS64: usize = 43;
 /// fstatfs64 syscall
@@ -618,6 +620,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
             args[4] as *const u8,
         ),
+        SYSCALL_PIVOT_ROOT => sys_pivot_root(args[0] as *const u8, args[1] as *const u8),
         SYSCALL_STATFS64 => sys_statfs64(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_FSTATFS64 => sys_fstatfs64(args[0] as u32, args[1] as *mut u8),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),

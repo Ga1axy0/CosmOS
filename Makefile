@@ -80,6 +80,14 @@ ROOTFS_CARGO_CACHE_HELPER := $(ROOTFS_BASE_DIR)/root/prepare-cargo-cache
 ROOTFS_CAGENT_WRAPPER := $(ROOTFS_BASE_DIR)/root/cagent-run-glibc
 ROOTFS_BUILDSTORM_WRAPPER := $(ROOTFS_BASE_DIR)/root/buildstorm-run-glibc
 ROOTFS_FINAL_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/final_auto_run
+ROOTFS_PIVOT_EVAL_HELPER := $(ROOTFS_BASE_DIR)/sbin/pivot-eval-root
+# The final evaluator always supplies a self-contained public filesystem as
+# the first disk. Promote it to `/` by default; use PIVOT_EVAL_ROOT=0 to keep
+# the bootstrap filesystem as the runtime root and restore the legacy Cargo
+# cache preparation path.
+PIVOT_EVAL_ROOT ?= 1
+PIVOT_EVAL_ROOT_ENABLED := $(if $(filter 1 yes true on,$(PIVOT_EVAL_ROOT)),1,0)
+PIVOT_EVAL_ROOT_KEY := $(if $(filter 1,$(PIVOT_EVAL_ROOT_ENABLED)),ON,OFF)
 # Keep the canonical base rootfs intact, but optionally omit TGOSKits from the
 # generated architecture variants.  The RV Cargo cache is controlled by the
 # same switch because it is prepared solely for root/tgoskits.
@@ -88,15 +96,39 @@ WITH_TGOSKITS_ENABLED := $(if $(filter 1 yes true on,$(WITH_TGOSKITS)),1,0)
 WITH_TGOSKITS_KEY := $(if $(filter 1,$(WITH_TGOSKITS_ENABLED)),ON,OFF)
 ROOTFS_RV_VARIANT_CONFIG_STAMP := $(ROOTFS_RV_STAMP_DIR)/.variant-config.stamp
 ROOTFS_LA_VARIANT_CONFIG_STAMP := $(ROOTFS_LA_STAMP_DIR)/.variant-config.stamp
-# Cargo's registry/index is useful even when the source tree itself is omitted
-# from the generated image.  Prepare it on the host for every RISC-V rootfs.
+# In pivot mode the evaluation filesystem is the complete userspace, including
+# its Cargo home and registry. The bootstrap image therefore does not depend
+# on TGOSKits/Cargo.lock or host-side Cargo preparation.
+ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
+ROOTFS_RV_READY_STAMP := $(ROOTFS_RV_INIT_STAMP)
+else
 ROOTFS_RV_READY_STAMP := $(ROOTFS_RV_CARGO_STAMP)
+endif
 # The RV guest uses the Rust toolchain carried by sdcard-rv-pub.img at /mnt.
 # Set WITH_RUST=1 to restore the optional toolchain in the generated rootfs.
 WITH_RUST ?= 0
 WITH_LIBCLANG ?= $(WITH_RUST)
 ROOTFS_SCRIPT_FILES := $(shell find $(ROOTFS_REPO)/scripts -type f | sort)
+ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
+# The bootstrap image only needs the files used before pivot_root.  Avoid
+# making every package recipe (and the nested TGOSKits checkout) a dependency
+# of the generated image in this mode.
+ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_REPO)/Makefile \
+	$(ROOTFS_REPO)/scripts/build-busybox.sh \
+	$(ROOTFS_REPO)/scripts/common-musl-env.sh \
+	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
+	$(ROOTFS_FINAL_AUTO_RUN)
+else
+ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_SCRIPT_FILES) \
+	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
+	$(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) \
+	$(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
+endif
+ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
+LA_ROOTFS_ARCH_FILES := bin/busybox
+else
 LA_ROOTFS_ARCH_FILES := bin/busybox usr/bin/bash lib/libc.so
+endif
 DISK_RV_IMG := disk.img
 DISK_LA_IMG := disk-la.img
 QEMU_LA_BLK_ARGS = -drive file=$(RUN_TEST_FS_LA),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0,id=x0
@@ -128,8 +160,25 @@ OPTIONAL_RUNTIME_FILES := $(wildcard lib/musl/ar lib/glibc/ar)
 ALL_ARCH_REQUEST := $(BUILD_ARCH)
 ALL_ARCH := $(shell printf '%s' "$(ALL_ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 
+ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
+ALL_TARGETS_RV := kernel-rv $(DISK_RV_IMG)
+ALL_TARGETS_LA := kernel-la $(DISK_LA_IMG)
+ROOTFS_RV_USER_DEPS :=
+ROOTFS_LA_USER_DEPS :=
+PACK_USER_APPS := 0
+PACK_LOOP_FAT32_ENABLE := 0
+PACK_EXTRA_MIB := 16
+PACK_MIN_SIZE_MIB := 64
+else
 ALL_TARGETS_RV := user-apps kernel-rv $(DISK_RV_IMG)
 ALL_TARGETS_LA := user-apps-la kernel-la $(DISK_LA_IMG)
+ROOTFS_RV_USER_DEPS := $(USER_BUILD_STAMP_RV)
+ROOTFS_LA_USER_DEPS := $(USER_BUILD_STAMP_LA)
+PACK_USER_APPS := 1
+PACK_LOOP_FAT32_ENABLE := 1
+PACK_EXTRA_MIB := 512
+PACK_MIN_SIZE_MIB := 1024
+endif
 
 ifneq ($(filter $(ALL_ARCH),all both),)
 ALL_BUILD_TARGETS := $(ALL_TARGETS_RV) $(ALL_TARGETS_LA)
@@ -172,7 +221,11 @@ clean-eval-sdcard:
 # 拉取所有子模块，确保后续构建依赖完整。
 submodules:
 	@if [ -f .gitmodules ]; then \
-		git submodule update --init --recursive; \
+		if [ "$(PIVOT_EVAL_ROOT_ENABLED)" = 1 ]; then \
+			git submodule update --init fs/src/ext4_rs CosmOS-rootfs; \
+		else \
+			git submodule update --init --recursive; \
+		fi; \
 	else \
 		echo "No .gitmodules found; assuming dependencies are already vendored."; \
 	fi
@@ -270,21 +323,21 @@ rootfs-la: $(ROOTFS_LA_INIT_STAMP)
 
 $(ROOTFS_RV_VARIANT_CONFIG_STAMP): force
 	@mkdir -p "$(ROOTFS_RV_STAMP_DIR)"
-	@key='TGOSKITS=$(WITH_TGOSKITS_KEY)'; \
+	@key='TGOSKITS=$(WITH_TGOSKITS_KEY) PIVOT_EVAL_ROOT=$(PIVOT_EVAL_ROOT_KEY) BOOTSTRAP_ONLY=$(PIVOT_EVAL_ROOT_KEY)'; \
 	if [ ! -f "$@" ] || [ "$$(cat "$@")" != "$$key" ]; then \
 		printf '%s\n' "$$key" > "$@"; \
 	fi
 
 $(ROOTFS_LA_VARIANT_CONFIG_STAMP): force
 	@mkdir -p "$(ROOTFS_LA_STAMP_DIR)"
-	@key='TGOSKITS=$(WITH_TGOSKITS_KEY)'; \
+	@key='TGOSKITS=$(WITH_TGOSKITS_KEY) PIVOT_EVAL_ROOT=$(PIVOT_EVAL_ROOT_KEY) BOOTSTRAP_ONLY=$(PIVOT_EVAL_ROOT_KEY)'; \
 	if [ ! -f "$@" ] || [ "$$(cat "$@")" != "$$key" ]; then \
 		printf '%s\n' "$$key" > "$@"; \
 	fi
 
 # Keep both spellings in sync: older RISC-V init files invoke the
 # hyphenated path, while the canonical source uses an underscore.
-$(ROOTFS_RV_INIT_STAMP): Makefile $(ROOTFS_SCRIPT_FILES) $(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_RV_VARIANT_CONFIG_STAMP) $(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) $(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
+$(ROOTFS_RV_INIT_STAMP): $(ROOTFS_VARIANT_DEPS) $(ROOTFS_RV_VARIANT_CONFIG_STAMP)
 	@test -d "$(ROOTFS_BASE_DIR)" || { \
 		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' first" >&2; \
 		exit 1; \
@@ -293,6 +346,19 @@ $(ROOTFS_RV_INIT_STAMP): Makefile $(ROOTFS_SCRIPT_FILES) $(ROOTFS_BASE_DIR)/sbin
 		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
 		exit 1; \
 	}
+ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
+	@echo "[ROOTFS] creating minimal RISC-V pivot bootstrap"
+	@rm -rf "$(ROOTFS_RV_DIR)"
+	@mkdir -p "$(ROOTFS_RV_DIR)/root" "$(ROOTFS_RV_DIR)/sbin" "$(ROOTFS_RV_DIR)/etc"
+	@rm -f "$(ROOTFS_RV_STAMP_DIR)/build-busybox.stamp"
+	@cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/init"
+	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
+	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final_auto_run"
+	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final-auto-run"
+	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root" \
+		"$(ROOTFS_RV_DIR)/root/final_auto_run" "$(ROOTFS_RV_DIR)/root/final-auto-run"
+	@touch "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"
+else
 	@if [ ! -d "$(ROOTFS_RV_DIR)" ]; then \
 		if [ "$(WITH_TGOSKITS_ENABLED)" = 1 ]; then \
 			cp -a "$(ROOTFS_BASE_DIR)" "$(ROOTFS_RV_DIR)"; \
@@ -328,6 +394,15 @@ endif
 		cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/init"; \
 		chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init"; \
 	fi
+	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
+	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
+	@mkdir -p "$(ROOTFS_RV_DIR)/etc"
+	@if [ "$(PIVOT_EVAL_ROOT_ENABLED)" = 1 ]; then \
+		touch "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"; \
+	else \
+		rm -f "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"; \
+	fi
+endif
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_RV_DIR)" \
 		BUILD_ROOT="$(CURDIR)/$(ROOTFS_RV_BUILD_DIR)" \
@@ -344,6 +419,7 @@ endif
 		MUSL_ARCH=$(RV_MUSL_ARCH) \
 		WITH_RUST=$(WITH_RUST) \
 		WITH_LIBCLANG=$(WITH_LIBCLANG) \
+		BOOTSTRAP_ONLY=$(PIVOT_EVAL_ROOT_ENABLED) \
 		MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)"
 	@touch "$@"
 
@@ -356,7 +432,7 @@ $(ROOTFS_RV_CARGO_STAMP): $(ROOTFS_RV_INIT_STAMP) \
 		bash scripts/prepare-rootfs-rv-cargo-offline.sh
 	@touch "$@"
 
-$(ROOTFS_LA_INIT_STAMP): Makefile $(ROOTFS_SCRIPT_FILES) $(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_LA_VARIANT_CONFIG_STAMP) $(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) $(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
+$(ROOTFS_LA_INIT_STAMP): $(ROOTFS_VARIANT_DEPS) $(ROOTFS_LA_VARIANT_CONFIG_STAMP)
 	@test -d "$(ROOTFS_BASE_DIR)" || { \
 		echo "missing base rootfs directory $(ROOTFS_BASE_DIR); run 'make rootfs' first" >&2; \
 		exit 1; \
@@ -365,6 +441,19 @@ $(ROOTFS_LA_INIT_STAMP): Makefile $(ROOTFS_SCRIPT_FILES) $(ROOTFS_BASE_DIR)/sbin
 		echo "base rootfs is incomplete under $(ROOTFS_BASE_DIR)" >&2; \
 		exit 1; \
 	}
+ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
+	@echo "[ROOTFS] creating minimal LoongArch pivot bootstrap"
+	@rm -rf "$(ROOTFS_LA_DIR)"
+	@mkdir -p "$(ROOTFS_LA_DIR)/root" "$(ROOTFS_LA_DIR)/sbin" "$(ROOTFS_LA_DIR)/etc"
+	@rm -f "$(ROOTFS_LA_STAMP_DIR)/build-busybox.stamp"
+	@cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/init"
+	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
+	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final_auto_run"
+	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final-auto-run"
+	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root" \
+		"$(ROOTFS_LA_DIR)/root/final_auto_run" "$(ROOTFS_LA_DIR)/root/final-auto-run"
+	@touch "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"
+else
 	@if [ ! -d "$(ROOTFS_LA_DIR)" ]; then \
 		if [ "$(WITH_TGOSKITS_ENABLED)" = 1 ]; then \
 			cp -a "$(ROOTFS_BASE_DIR)" "$(ROOTFS_LA_DIR)"; \
@@ -396,6 +485,19 @@ endif
 		cp -f "$(ROOTFS_BUILDSTORM_WRAPPER)" "$(ROOTFS_LA_DIR)/root/buildstorm-run-glibc"; \
 		chmod 0755 "$(ROOTFS_LA_DIR)/root/buildstorm-run-glibc"; \
 	fi
+	@if [ -f "$(ROOTFS_BASE_DIR)/sbin/init" ]; then \
+		cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/init"; \
+		chmod 0755 "$(ROOTFS_LA_DIR)/sbin/init"; \
+	fi
+	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
+	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
+	@mkdir -p "$(ROOTFS_LA_DIR)/etc"
+	@if [ "$(PIVOT_EVAL_ROOT_ENABLED)" = 1 ]; then \
+		touch "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"; \
+	else \
+		rm -f "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"; \
+	fi
+endif
 	$(MAKE) -C $(ROOTFS_REPO) rootfs-init \
 		ROOTFS_DIR="$(CURDIR)/$(ROOTFS_LA_DIR)" \
 		BUILD_ROOT="$(CURDIR)/$(ROOTFS_LA_BUILD_DIR)" \
@@ -407,6 +509,7 @@ endif
 		MUSL_LIB=$(LA_MUSL_LIB) \
 		MUSL_ARCH=$(LA_MUSL_ARCH) \
 		WITH_RUST=0 \
+		BOOTSTRAP_ONLY=$(PIVOT_EVAL_ROOT_ENABLED) \
 		MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)"
 	@touch "$@"
 
@@ -509,18 +612,24 @@ check-rootfs-la-arch: force
 		fi; \
 	fi
 
-$(DISK_RV_IMG): $(USER_BUILD_STAMP_RV) $(ROOTFS_RV_READY_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh
-	MUSL_ARCH=$(RV_MUSL_ARCH) MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR_RV) $@
+$(DISK_RV_IMG): $(ROOTFS_RV_USER_DEPS) $(ROOTFS_RV_READY_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh
+	PACK_USER_APPS=$(PACK_USER_APPS) LOOP_FAT32_ENABLE=$(PACK_LOOP_FAT32_ENABLE) \
+	EXTRA_MIB=$(PACK_EXTRA_MIB) MIN_SIZE_MIB=$(PACK_MIN_SIZE_MIB) \
+	MUSL_ARCH=$(RV_MUSL_ARCH) MUSL_LOADER_ALIASES="$(RV_MUSL_LOADER_ALIASES)" \
+	./scripts/pack-disk-img.sh $(ROOTFS_RV_DIR) $(USER_BIN_DIR_RV) $@
 
 
-$(DISK_LA_IMG): $(USER_BUILD_STAMP_LA) $(ROOTFS_LA_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh | check-rootfs-la-arch
+$(DISK_LA_IMG): $(ROOTFS_LA_USER_DEPS) $(ROOTFS_LA_INIT_STAMP) $(OPTIONAL_RUNTIME_FILES) scripts/pack-disk-img.sh | check-rootfs-la-arch
 	@for path in $(LA_ROOTFS_ARCH_FILES); do \
 		file -L "$(ROOTFS_LA_DIR)/$$path" | grep -q 'LoongArch' || { \
 			echo "LA rootfs architecture check failed: $(ROOTFS_LA_DIR)/$$path" >&2; \
 			exit 1; \
 		}; \
 	done
-	MUSL_ARCH=$(LA_MUSL_ARCH) MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)" ./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR_LA) $@
+	PACK_USER_APPS=$(PACK_USER_APPS) LOOP_FAT32_ENABLE=$(PACK_LOOP_FAT32_ENABLE) \
+	EXTRA_MIB=$(PACK_EXTRA_MIB) MIN_SIZE_MIB=$(PACK_MIN_SIZE_MIB) \
+	MUSL_ARCH=$(LA_MUSL_ARCH) MUSL_LOADER_ALIASES="$(LA_MUSL_LOADER_ALIASES)" \
+	./scripts/pack-disk-img.sh $(ROOTFS_LA_DIR) $(USER_BIN_DIR_LA) $@
 
 force:
 

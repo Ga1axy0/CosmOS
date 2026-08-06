@@ -37,8 +37,8 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fs::errno::FS_ERRNO;
-use fs::remove_dentry;
 use fs::vfs::{InodeTime, VfsFileType, VfsNode, VfsStatFs};
+use fs::{remove_dentry, remove_parent_dentries};
 use lazy_static::*;
 
 use crate::sync::SpinNoIrqLock;
@@ -89,12 +89,24 @@ unsafe impl Send for VirtualDirNode {}
 unsafe impl Sync for VirtualDirNode {}
 
 impl VirtualDirNode {
-    /// Create a new, empty virtual directory.
-    pub fn new() -> Arc<Self> {
-        let inner = SpinNoIrqLock::new(VirtDirInner {
+    fn empty_inner() -> VirtDirInner {
+        VirtDirInner {
             overlay: None,
             mounts: BTreeMap::new(),
-        });
+        }
+    }
+
+    fn from_inner(inner: VirtDirInner) -> Arc<Self> {
+        Arc::new(Self {
+            ino: alloc_virt_ino(),
+            inner: SpinNoIrqLock::new(inner),
+            keep_bound_without_children: AtomicBool::new(true),
+        })
+    }
+
+    /// Create a new, empty virtual directory.
+    pub fn new() -> Arc<Self> {
+        let inner = SpinNoIrqLock::new(Self::empty_inner());
         Arc::new(Self {
             ino: alloc_virt_ino(),
             inner,
@@ -203,6 +215,29 @@ impl VirtualDirNode {
 
     pub(crate) fn keep_bound_without_children(&self) -> bool {
         self.keep_bound_without_children.load(Ordering::Relaxed)
+    }
+
+    /// Replace this node's complete namespace view with `new_root` and return
+    /// the previous view as a standalone virtual root.
+    ///
+    /// `VIRT_ROOT` has stable identity for the lifetime of the kernel, so a
+    /// root pivot cannot swap the `Arc` itself. Keep the mounted `new_root`
+    /// node intact and use it as the root overlay. This also preserves
+    /// directory file descriptions opened on that mount point before pivot.
+    pub(crate) fn take_over_root_from(&self, new_root: &Arc<Self>) -> Arc<Self> {
+        let new_inner = VirtDirInner {
+            overlay: Some(Arc::clone(new_root) as Arc<dyn VfsNode>),
+            mounts: BTreeMap::new(),
+        };
+        let old_inner = {
+            let mut inner = self.inner.lock();
+            core::mem::replace(&mut *inner, new_inner)
+        };
+
+        // Child dentries cached against this stable virtual inode refer to the
+        // previous overlay and must not survive the namespace replacement.
+        remove_parent_dentries(u64::MAX, self.ino);
+        Self::from_inner(old_inner)
     }
 
     fn overlay_node(&self) -> Option<Arc<dyn VfsNode>> {

@@ -3,14 +3,14 @@ use crate::fs::epoll::{EpollEvent, EpollFile, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOL
 use crate::fs::EventFdFile;
 use crate::fs::Pipe;
 use crate::fs::{
-    canonicalize, do_bind_mount, do_move_mount, do_umount, inode_stat, linkat_with_flags,
-    lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, make_pipe,
-    mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
-    open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path, rename_at,
-    symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all, truncate_inode,
-    unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime,
-    OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode,
-    AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    canonicalize, do_bind_mount, do_move_mount, do_pivot_root, do_umount, inode_stat,
+    linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
+    make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
+    mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
+    rename_at, symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all,
+    truncate_inode, unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags,
+    InodeTime, OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64,
+    StatMode, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use crate::mm::{translated_byte_buffer, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
@@ -33,7 +33,7 @@ use crate::timer::{
     add_current_timer_ns_preflagged, add_timer_with_poll_tag, get_realtime_ns, get_time_ns,
     get_time_us,
 };
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -104,6 +104,7 @@ const MS_RDONLY: usize = 1;
 const MS_REMOUNT: usize = 32;
 const MS_BIND: usize = 4096;
 const MS_MOVE: usize = 8192;
+const MNT_DETACH: usize = 2;
 const MS_REC: usize = 16384;
 const MS_SHARED: usize = 1 << 20;
 const MS_SLAVE: usize = 1 << 19;
@@ -4884,6 +4885,121 @@ pub fn sys_mount(
     })
 }
 
+#[inline]
+fn syscall_path_is_below(path: &str, parent: &str) -> bool {
+    path.len() > parent.len()
+        && path.starts_with(parent)
+        && (parent == "/" || path.as_bytes().get(parent.len()) == Some(&b'/'))
+}
+
+fn rebase_process_path_after_pivot(path: &str, new_root: &str, put_old: &str) -> String {
+    // Linux chroot_fs_refs() replaces references that point exactly at the
+    // previous root with the new root. Other locations on the old root move
+    // below put_old, while locations inside new_root lose that prefix.
+    if path == "/" || path == new_root {
+        return String::from("/");
+    }
+    if syscall_path_is_below(path, new_root) {
+        return String::from(&path[new_root.len()..]);
+    }
+    alloc::format!("{}{}", put_old, path)
+}
+
+fn rebase_open_path_after_pivot(path: &str, new_root: &str, put_old: &str) -> String {
+    if path == new_root {
+        return String::from("/");
+    }
+    if syscall_path_is_below(path, new_root) {
+        return String::from(&path[new_root.len()..]);
+    }
+    if path == "/" {
+        return String::from(put_old);
+    }
+    alloc::format!("{}{}", put_old, path)
+}
+
+/// pivot_root(2) – promote a mounted directory to the global root and move
+/// the previous root to `put_old` below it.
+pub fn sys_pivot_root(new_root: *const u8, put_old: *const u8) -> isize {
+    trace!(
+        "kernel:pid[{}] sys_pivot_root",
+        current_task().unwrap().process.upgrade().unwrap().getpid()
+    );
+    syscall_body!({
+        let new_root = read_cstring_from_user(new_root, PATH_MAX)?;
+        let put_old = read_cstring_from_user(put_old, PATH_MAX)?;
+        if new_root.is_empty() || put_old.is_empty() {
+            return Err(ERRNO::ENOENT);
+        }
+        if new_root
+            .split('/')
+            .chain(put_old.split('/'))
+            .any(|component| component.len() > NAME_MAX)
+        {
+            return Err(ERRNO::ENAMETOOLONG);
+        }
+
+        let process = current_process();
+        if process.geteuid() != 0 {
+            return Err(ERRNO::EPERM);
+        }
+        let (cwd, process_root) = {
+            let inner = process.inner_exclusive_access();
+            (inner.cwd.clone(), inner.root.clone())
+        };
+        // This global-namespace implementation requires the caller to see the
+        // actual mount root, matching Linux's rejection of a chrooted caller.
+        if process_root != "/" {
+            return Err(ERRNO::EINVAL);
+        }
+
+        let new_abs = canonicalize(cwd.as_str(), new_root.as_str());
+        let put_old_abs = canonicalize(cwd.as_str(), put_old.as_str());
+        let (new_abs, put_old_after) = do_pivot_root(&new_abs, &put_old_abs)?;
+
+        // Path-bearing process and file-description state must follow the
+        // moved mount nodes because this VFS stores canonical strings rather
+        // than Linux path objects.
+        let mut descriptions = Vec::new();
+        for pid in crate::sched::list_pids() {
+            let Some(process) = crate::sched::pid2process(pid) else {
+                continue;
+            };
+            let mut inner = process.inner_exclusive_access();
+            inner.cwd = rebase_process_path_after_pivot(
+                inner.cwd.as_str(),
+                new_abs.as_str(),
+                put_old_after.as_str(),
+            );
+            inner.root = rebase_process_path_after_pivot(
+                inner.root.as_str(),
+                new_abs.as_str(),
+                put_old_after.as_str(),
+            );
+            inner.exec_path = rebase_open_path_after_pivot(
+                inner.exec_path.as_str(),
+                new_abs.as_str(),
+                put_old_after.as_str(),
+            );
+            descriptions.extend(
+                inner
+                    .fd_table
+                    .iter()
+                    .filter_map(|entry| entry.as_ref().map(|entry| Arc::clone(&entry.desc))),
+            );
+        }
+
+        let mut seen = BTreeSet::new();
+        for description in descriptions {
+            if seen.insert(description.identity()) {
+                description.rebase_path_after_pivot(new_abs.as_str(), put_old_after.as_str());
+            }
+        }
+
+        Ok(0)
+    })
+}
+
 pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_umount",
@@ -4893,7 +5009,7 @@ pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
         let name = read_cstring_from_user(name, PATH_MAX)?;
         let cwd = current_process().inner_exclusive_access().cwd.clone();
         let abs = canonicalize(&cwd, &name);
-        do_umount(&abs)?;
+        do_umount(&abs, (_flags & MNT_DETACH) != 0)?;
         Ok(0)
     })
 }

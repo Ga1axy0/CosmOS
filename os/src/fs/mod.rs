@@ -1119,6 +1119,14 @@ impl FileDescription {
         self.file.path()
     }
 
+    /// Rebase a stored canonical path after the global mount namespace is
+    /// pivoted. Open file descriptions keep referring to the same inode, but
+    /// directory operations such as `fchdir` also need their textual path to
+    /// follow that inode's new location.
+    pub fn rebase_path_after_pivot(&self, new_root: &str, put_old: &str) {
+        self.file.rebase_path_after_pivot(new_root, put_old)
+    }
+
     /// 返回该打开文件描述关联的 inode；非 inode 类型文件返回 `None`。
     pub fn as_inode(&self) -> Option<Arc<Inode>> {
         self.file.as_inode()
@@ -1499,6 +1507,9 @@ pub trait File: Send + Sync + Any {
     fn path(&self) -> Option<String> {
         None
     }
+    /// Update a canonical path retained by this file object after
+    /// `pivot_root(2)`. Objects without a path need no action.
+    fn rebase_path_after_pivot(&self, _new_root: &str, _put_old: &str) {}
     /// 返回该文件对象关联的 inode；非 inode 类型文件返回 `None`。
     fn as_inode(&self) -> Option<Arc<Inode>> {
         None
@@ -1614,9 +1625,9 @@ bitflags! {
 }
 
 pub use inode::{
-    canonicalize, do_bind_mount, do_mount, do_move_mount, do_umount, init_dev, init_procfs,
-    init_rootfs, init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps, lookup_inode,
-    lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, mkdir_at,
+    canonicalize, do_bind_mount, do_mount, do_move_mount, do_pivot_root, do_umount, init_dev,
+    init_procfs, init_rootfs, init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps,
+    lookup_inode, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from, mkdir_at,
     mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs, mount_tmpfs,
     open_file, open_file_at, open_file_at_with_status, remount_path, rename_at, symlinkat,
     unlink_child, unlinkat, OSInode, OpenFlags, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR,

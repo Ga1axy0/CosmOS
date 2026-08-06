@@ -1043,6 +1043,12 @@ impl File for TtyFile {
     }
 
     fn write_at(&self, _offset: usize, buf: UserBuffer) -> usize {
+        // A non-interactive shell script may start writing before it performs
+        // any tty ioctl (the evaluation runner does exactly that during its
+        // countdown).  Establish the controlling session from the first
+        // userspace write so VINTR/Ctrl-C has a foreground process group to
+        // signal instead of being echoed and silently discarded.
+        self.core.adopt_controlling_if_unset();
         // 以单次 `write` 为粒度串行化终端输出，尽量贴近 Linux tty 的整块写语义。
         let _tx_guard = self.core.tx_lock.lock();
         let mut n = 0usize;
@@ -1057,6 +1063,7 @@ impl File for TtyFile {
     }
 
     fn write_bytes_at(&self, _offset: usize, buf: &[u8]) -> Result<usize, ERRNO> {
+        self.core.adopt_controlling_if_unset();
         let _tx_guard = self.core.tx_lock.lock();
         for &ch in buf {
             self.core.write_byte(ch);

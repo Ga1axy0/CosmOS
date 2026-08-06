@@ -425,6 +425,23 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         ExitReason::Exit(code) => code,
         ExitReason::Signal(signum) => -(signum as i32),
     };
+    // Initproc is the lifetime owner of the guest. Keep it as the current
+    // task while flushing storage: `shutdown_with_code()` calls
+    // `sync_storage_all()`, and filesystem sleep locks may block through a
+    // WaitQueue. Taking the task out of Processor first leaves
+    // `current_task()` empty and makes that otherwise valid shutdown path
+    // panic in WaitQueue::prepare_to_wait().
+    let current_pid = current_task()
+        .as_ref()
+        .and_then(|task| task.process.upgrade())
+        .map(|process| process.getpid());
+    if current_pid == Some(IDLE_PID) {
+        println!(
+            "[kernel] Initproc process exit with exit_code {} ...",
+            task_exit_code
+        );
+        crate::sbi::shutdown_with_code(task_exit_code);
+    }
     trace!(
         "kernel: pid[{}] exit_current_and_run_next",
         current_task().unwrap().process.upgrade().unwrap().getpid()
@@ -432,6 +449,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // take from Processor
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
+    let pid = process.getpid();
     process.pause_cpu_accounting(get_time());
     let mut task_inner = task.inner_exclusive_access();
     let (tid, thread_id) = match task_inner.res.as_ref() {
@@ -521,14 +539,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         // A vfork parent must also be released when the child exits before
         // reaching execve, for example when execve itself fails.
         process.release_vfork_parent();
-        let pid = process.getpid();
-        if pid == IDLE_PID {
-            println!(
-                "[kernel] Initproc process exit with exit_code {} ...",
-                task_exit_code
-            );
-            crate::sbi::shutdown_with_code(task_exit_code);
-        }
         let mut process_inner = process.inner_exclusive_access();
         if process_inner.is_zombie {
             drop(process_inner);

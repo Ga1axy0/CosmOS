@@ -161,6 +161,25 @@ impl DentryCache {
         }
     }
 
+    /// Remove every cached child of one directory.
+    ///
+    /// Namespace operations such as `pivot_root(2)` can replace the backing
+    /// directory represented by a synthetic VFS inode without knowing which
+    /// child names have previously been looked up.  Invalidating the complete
+    /// parent is required in that case so positive and negative entries from
+    /// the old namespace cannot leak into the new one.
+    fn remove_parent(&mut self, fs_id: u64, parent_ino: u64) {
+        let mut removed_negative = 0usize;
+        self.table.retain(|key, entry| {
+            let remove = key.fs_id == fs_id && key.parent_ino == parent_ino;
+            if remove && entry.child.is_none() {
+                removed_negative += 1;
+            }
+            !remove
+        });
+        self.negative_entries = self.negative_entries.saturating_sub(removed_negative);
+    }
+
     // ------------------------------------------------------------------
     // CLOCK eviction
     // ------------------------------------------------------------------
@@ -239,6 +258,11 @@ pub fn insert_negative_dentry(fs_id: u64, parent_ino: u64, name: &str) {
 /// Explicitly invalidate a dentry (unlink / rmdir / rename).
 pub fn remove_dentry(fs_id: u64, parent_ino: u64, name: &str) {
     DENTRY_CACHE.lock().remove(fs_id, parent_ino, name)
+}
+
+/// Explicitly invalidate every cached child of one directory.
+pub fn remove_parent_dentries(fs_id: u64, parent_ino: u64) {
+    DENTRY_CACHE.lock().remove_parent(fs_id, parent_ino)
 }
 
 /// Return the current global dentry-cache footprint and queue depths.

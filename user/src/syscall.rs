@@ -9,6 +9,7 @@ pub const SYSCALL_MKDIRAT: usize = 34;
 pub const SYSCALL_UNLINKAT: usize = 35;
 pub const SYSCALL_SYMLINKAT: usize = 36;
 pub const SYSCALL_LINKAT: usize = 37;
+pub const SYSCALL_PIVOT_ROOT: usize = 41;
 pub const SYSCALL_STATFS64: usize = 43;
 pub const SYSCALL_FSTATFS64: usize = 44;
 pub const SYSCALL_TRUNCATE: usize = 45;
@@ -843,6 +844,13 @@ pub fn sys_chdir(path: &str) -> isize {
 
 pub fn sys_fchdir(fd: usize) -> isize {
     syscall(SYSCALL_FCHDIR, [fd, 0, 0])
+}
+
+pub fn sys_pivot_root(new_root: &str, put_old: &str) -> isize {
+    syscall(
+        SYSCALL_PIVOT_ROOT,
+        [new_root.as_ptr() as usize, put_old.as_ptr() as usize, 0],
+    )
 }
 
 pub fn sys_copy_file_range(
