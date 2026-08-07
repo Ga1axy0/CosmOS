@@ -2,6 +2,7 @@
 //!
 //! Provides:
 //! - `/proc/meminfo` — standard memory statistics.
+//! - `/proc/uptime` — seconds since boot and aggregate idle time.
 //! - `/proc/cosmos_meminfo` — xxOS memory and performance counters.
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
@@ -46,7 +47,7 @@ use crate::signal::{MAX_SIG, SIG_IGN};
 #[cfg(feature = "cosmos-meminfo")]
 use crate::task::{cached_kstack_count, process_lifecycle_stats};
 use crate::task::{current_process, TaskStatus};
-use crate::timer::{get_time, time_to_ticks};
+use crate::timer::{get_time, get_time_ns, time_to_ticks};
 #[cfg(feature = "cosmos-meminfo")]
 use core::sync::atomic::Ordering;
 
@@ -76,6 +77,23 @@ fn build_meminfo() -> String {
     let _ = writeln!(&mut out, "MemAvailable:   {} kB", mem_available);
     let _ = writeln!(&mut out, "Cached:         {} kB", cached);
     out
+}
+
+/// Build the contents of `/proc/uptime`.
+///
+/// The first field is the kernel's monotonic time since boot.  The current
+/// scheduler does not maintain Linux-style per-hart idle accounting, so the
+/// second field is reported as zero for now.  The BuildStorm evaluator only
+/// consumes the first field, but keeping the normal two-field format makes
+/// this file usable by standard shell tooling as well.
+fn build_uptime() -> String {
+    const NSEC_PER_SEC: u64 = 1_000_000_000;
+    const HUNDREDTH_NS: u64 = 10_000_000;
+
+    let uptime_ns = get_time_ns();
+    let seconds = uptime_ns / NSEC_PER_SEC;
+    let hundredths = (uptime_ns % NSEC_PER_SEC) / HUNDREDTH_NS;
+    alloc::format!("{}.{:02} 0.00\n", seconds, hundredths)
 }
 
 #[cfg(feature = "cosmos-meminfo")]
@@ -902,6 +920,7 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("cpuinfo"), VfsFileType::Regular));
         entries.push((String::from("filesystems"), VfsFileType::Regular));
         entries.push((String::from("meminfo"), VfsFileType::Regular));
+        entries.push((String::from("uptime"), VfsFileType::Regular));
         #[cfg(feature = "cosmos-meminfo")]
         entries.push((String::from("cosmos_meminfo"), VfsFileType::Regular));
         entries.push((String::from("mounts"), VfsFileType::Regular));
@@ -930,6 +949,7 @@ impl VfsNode for ProcRootNode {
             "cpuinfo" => Some(Arc::new(ProcCpuinfoNode::new()) as Arc<dyn VfsNode>),
             "filesystems" => Some(Arc::new(ProcFilesystemsNode::new()) as Arc<dyn VfsNode>),
             "meminfo" => Some(Arc::new(ProcMeminfoNode::new()) as Arc<dyn VfsNode>),
+            "uptime" => Some(Arc::new(ProcUptimeNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "cosmos-meminfo")]
             "cosmos_meminfo" => Some(Arc::new(ProcCosmosMeminfoNode::new()) as Arc<dyn VfsNode>),
             "mounts" => Some(Arc::new(ProcMountsNode::new()) as Arc<dyn VfsNode>),
@@ -1751,6 +1771,66 @@ impl VfsNode for ProcMeminfoNode {
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         read_string_at(build_meminfo(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
+        0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/uptime` node.
+#[derive(Default, Debug)]
+pub struct ProcUptimeNode;
+
+impl ProcUptimeNode {
+    /// Create a new uptime node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcUptimeNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        build_uptime().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {}
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(build_uptime(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {

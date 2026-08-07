@@ -81,6 +81,8 @@ ROOTFS_CAGENT_WRAPPER := $(ROOTFS_BASE_DIR)/root/cagent-run-glibc
 ROOTFS_BUILDSTORM_WRAPPER := $(ROOTFS_BASE_DIR)/root/buildstorm-run-glibc
 ROOTFS_FINAL_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/final_auto_run
 ROOTFS_PIVOT_EVAL_HELPER := $(ROOTFS_BASE_DIR)/sbin/pivot-eval-root
+ROOTFS_PIVOT_CAGENT_RUNNER_SRC := $(ROOTFS_REPO)/scripts/pivot-cagent-runner.sh
+ROOTFS_PIVOT_CAGENT_RETRY_SRC := $(ROOTFS_REPO)/scripts/pivot-cagent-retry.sh
 # The final evaluator always supplies a self-contained public filesystem as
 # the first disk. Promote it to `/` by default; use PIVOT_EVAL_ROOT=0 to keep
 # the bootstrap filesystem as the runtime root and restore the legacy Cargo
@@ -117,10 +119,12 @@ ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_REPO)/Makefile \
 	$(ROOTFS_REPO)/scripts/build-busybox.sh \
 	$(ROOTFS_REPO)/scripts/common-musl-env.sh \
 	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
+	$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC) $(ROOTFS_PIVOT_CAGENT_RETRY_SRC) \
 	$(ROOTFS_FINAL_AUTO_RUN)
 else
 ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_SCRIPT_FILES) \
 	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
+	$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC) $(ROOTFS_PIVOT_CAGENT_RETRY_SRC) \
 	$(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) \
 	$(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
 endif
@@ -353,9 +357,12 @@ ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 	@rm -f "$(ROOTFS_RV_STAMP_DIR)/build-busybox.stamp"
 	@cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/init"
 	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner"
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final_auto_run"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final-auto-run"
 	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root" \
+		"$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry" \
 		"$(ROOTFS_RV_DIR)/root/final_auto_run" "$(ROOTFS_RV_DIR)/root/final-auto-run"
 	@touch "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"
 else
@@ -448,9 +455,12 @@ ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 	@rm -f "$(ROOTFS_LA_STAMP_DIR)/build-busybox.stamp"
 	@cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/init"
 	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner"
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final_auto_run"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final-auto-run"
 	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root" \
+		"$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry" \
 		"$(ROOTFS_LA_DIR)/root/final_auto_run" "$(ROOTFS_LA_DIR)/root/final-auto-run"
 	@touch "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"
 else

@@ -12,7 +12,7 @@ pub const USER_STACK_BASE: usize = 0x0800_0000;
 pub const INTERP_BASE: usize = 0x2_0000_0000;
 
 /// Clock frequency.
-pub const CLOCK_FREQ: usize = 12_500_000;
+pub const CLOCK_FREQ: usize = 10_000_000;
 
 /// MMIO windows exposed by the machine.
 pub const MMIO: &[(usize, usize)] = &[
