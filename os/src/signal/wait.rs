@@ -279,6 +279,21 @@ pub(crate) fn has_pending_signal_in_set(signal_set: SignalBit) -> bool {
     !((task_inner.pending_signals | process_inner.pending_signals) & signal_set).is_empty()
 }
 
+/// Return whether the current task has a pending signal that belongs to a
+/// signalfd mask and is blocked by the current task.
+///
+/// A signalfd is normally paired with `sigprocmask(SIG_BLOCK, ...)`.  Keeping
+/// the blocked-mask check here prevents an unblocked signal from being stolen
+/// from the ordinary signal-delivery path by a signalfd read.
+pub(crate) fn has_signalfd_pending_in_set(signal_set: SignalBit) -> bool {
+    let task = crate::task::current_task().unwrap();
+    let process = current_process();
+    let process_inner = process.inner_exclusive_access();
+    let task_inner = task.inner_exclusive_access();
+    let blocked = signal_set & task_inner.signal_mask.without_unblockable();
+    !((task_inner.pending_signals | process_inner.pending_signals) & blocked).is_empty()
+}
+
 pub(crate) fn has_unmasked_pending_signal() -> bool {
     let task = crate::task::current_task().unwrap();
     if !task.signal_work_pending() {
@@ -299,6 +314,57 @@ pub(crate) fn take_pending_signal_in_set(signal_set: SignalBit) -> Option<(i32, 
     let mut task_inner = task.inner_exclusive_access();
     let thread_pending = task_inner.pending_signals & signal_set;
     let process_pending = process_inner.pending_signals & signal_set;
+    let mut remaining = thread_pending | process_pending;
+    while !remaining.is_empty() {
+        let signum = remaining.bits().trailing_zeros() as usize + 1;
+        let flag = SignalBit::from_signum(signum as u32).unwrap();
+        remaining &= !flag;
+        if thread_pending.contains(flag) {
+            let siginfo = task_inner.pending_siginfo[signum];
+            task_inner.pending_signals &= !flag;
+            task.set_signal_work_pending(crate::signal::signal_work_needed(
+                task_inner.pending_signals,
+                process_inner.pending_signals,
+                task_inner.signal_mask,
+                task_inner.signal_mask_backup.is_some(),
+            ));
+            return Some((signum as i32, siginfo));
+        }
+        if process_pending.contains(flag) {
+            let siginfo = process_inner.pending_siginfo[signum];
+            process_inner.pending_signals &= !flag;
+            task.set_signal_work_pending(crate::signal::signal_work_needed(
+                task_inner.pending_signals,
+                process_inner.pending_signals,
+                task_inner.signal_mask,
+                task_inner.signal_mask_backup.is_some(),
+            ));
+            return Some((signum as i32, siginfo));
+        }
+    }
+    task.set_signal_work_pending(crate::signal::signal_work_needed(
+        task_inner.pending_signals,
+        process_inner.pending_signals,
+        task_inner.signal_mask,
+        task_inner.signal_mask_backup.is_some(),
+    ));
+    None
+}
+
+/// Consume one pending signal for a signalfd read.
+///
+/// Thread-directed pending signals take precedence over process-directed
+/// pending signals, matching the ordering used by `sigtimedwait`.  Only
+/// signals that are both in the fd mask and blocked by the current task are
+/// eligible.
+pub(crate) fn take_signalfd_signal_in_set(signal_set: SignalBit) -> Option<(i32, SigInfo)> {
+    let task = crate::task::current_task().unwrap();
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    let mut task_inner = task.inner_exclusive_access();
+    let blocked = signal_set & task_inner.signal_mask.without_unblockable();
+    let thread_pending = task_inner.pending_signals & blocked;
+    let process_pending = process_inner.pending_signals & blocked;
     let mut remaining = thread_pending | process_pending;
     while !remaining.is_empty() {
         let signum = remaining.bits().trailing_zeros() as usize + 1;

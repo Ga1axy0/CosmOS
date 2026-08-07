@@ -930,6 +930,7 @@ pub fn add_signal_to_process_with_siginfo(
     };
 
     crate::signal::notify_signal_wait_pid(pid, signal.bits());
+    crate::fs::signalfd::notify_signal_fd(signal.bits());
 
     let deliverable_tasks = tasks
         .into_iter()
@@ -986,6 +987,7 @@ pub fn add_signal_to_task_with_siginfo(
     };
 
     crate::signal::notify_signal_wait_task(task, signal.bits());
+    crate::fs::signalfd::notify_signal_fd(signal.bits());
 
     if !newly_unmasked.is_empty() {
         crate::poll::notify_poll_signal_pid(pid);

@@ -2,6 +2,7 @@ use crate::fs::devfs::BlockDevNode;
 use crate::fs::epoll::{EpollEvent, EpollFile, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
 use crate::fs::EventFdFile;
 use crate::fs::Pipe;
+use crate::fs::signalfd::SignalFdFile;
 use crate::fs::{
     canonicalize, do_bind_mount, do_move_mount, do_pivot_root, do_umount, inode_stat,
     linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
@@ -513,6 +514,29 @@ fn alloc_eventfd(
             status_flags.contains(FileStatusFlags::NONBLOCK),
         )),
         AccessMode::ReadWrite,
+        status_flags,
+        0,
+    ));
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = inner.alloc_fd()?;
+    let mut entry = FdEntry::new(desc);
+    if cloexec {
+        entry.flags |= FdFlags::CLOEXEC;
+    }
+    inner.fd_table[fd] = Some(entry);
+    Ok(fd as isize)
+}
+
+fn alloc_signalfd(
+    signal_mask: SignalBit,
+    status_flags: FileStatusFlags,
+    cloexec: bool,
+) -> Result<isize, ERRNO> {
+    let desc = Arc::new(FileDescription::new(
+        SignalFdFile::new(signal_mask),
+        AccessMode::ReadOnly,
         status_flags,
         0,
     ));
@@ -1184,7 +1208,6 @@ fn write_back_pollfds(ufds: *mut PollFd, pollfds: &[PollFd]) -> Result<(), ERRNO
 /// 扫描 fd 集，更新每个 `pollfd.revents` 并返回已就绪计数。
 fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
     let process = current_process();
-    let inner = process.inner_exclusive_access();
     let mut ready_cnt = 0usize;
 
     for pfd in pollfds.iter_mut() {
@@ -1193,17 +1216,25 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
             continue;
         }
         let fd = pfd.fd as usize;
-        let Some(file) = inner.fd_table.get(fd).and_then(|f| f.as_ref()) else {
-            pfd.revents = POLLNVAL as i16;
-            ready_cnt += 1;
-            continue;
+        // Keep the process lock only while looking up and cloning the
+        // description.  File::poll() may inspect process state itself (for
+        // example signalfd checks the pending signal set), so calling it
+        // while holding process.inner would self-deadlock on a single CPU.
+        let desc = {
+            let inner = process.inner_exclusive_access();
+            let Some(file) = inner.fd_table.get(fd).and_then(|f| f.as_ref()) else {
+                pfd.revents = POLLNVAL as i16;
+                ready_cnt += 1;
+                continue;
+            };
+            Arc::clone(&file.desc)
         };
 
-        let mut revents = file.desc.poll(pfd.events as u16);
-        if !file.desc.readable() && (pfd.events as u16 & POLLIN) != 0 {
+        let mut revents = desc.poll(pfd.events as u16);
+        if !desc.readable() && (pfd.events as u16 & POLLIN) != 0 {
             revents |= POLLERR;
         }
-        if !file.desc.writable() && (pfd.events as u16 & POLLOUT) != 0 {
+        if !desc.writable() && (pfd.events as u16 & POLLOUT) != 0 {
             revents |= POLLERR;
         }
         // pipe 实现可能设置 POLLHUP；普通文件默认走 POLLIN/POLLOUT。
@@ -1216,7 +1247,6 @@ fn scan_pollfds(pollfds: &mut [PollFd]) -> usize {
         }
     }
 
-    drop(inner);
     poll::record_scan(pollfds.len(), ready_cnt);
     ready_cnt
 }
@@ -3581,16 +3611,33 @@ pub fn sys_inotify_init1(flags: i32) -> isize {
     })
 }
 
-pub fn sys_signalfd4(fd: i32, sigmask: *const u8, _sigsetsize: usize, flags: i32) -> isize {
+pub fn sys_signalfd4(fd: i32, sigmask: *const u8, sigsetsize: usize, flags: i32) -> isize {
     syscall_body!({
-        if fd != -1 {
-            return Err(ERRNO::EINVAL);
+        if fd < -1 {
+            return Err(ERRNO::EBADF);
         }
         if sigmask.is_null() {
             return Err(ERRNO::EFAULT);
         }
+        if sigsetsize != size_of::<u64>() {
+            return Err(ERRNO::EINVAL);
+        }
+        let signal_mask = SignalBit::from_user_bits(read_pod_from_user(sigmask as *const u64)?);
         let (status_flags, cloexec) = parse_anon_fd_flags(flags, O_NONBLOCK | O_CLOEXEC)?;
-        alloc_anonymous_fd(status_flags, cloexec)
+        if fd == -1 {
+            return alloc_signalfd(signal_mask, status_flags, cloexec);
+        }
+
+        if cloexec {
+            return Err(ERRNO::EINVAL);
+        }
+        let desc = get_file_description(fd as usize)?;
+        let signalfd = desc
+            .as_any()
+            .downcast_ref::<SignalFdFile>()
+            .ok_or(ERRNO::EINVAL)?;
+        signalfd.set_mask(signal_mask);
+        Ok(fd as isize)
     })
 }
 

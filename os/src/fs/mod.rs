@@ -9,6 +9,7 @@ mod page_cache;
 mod pipe;
 pub mod procfs;
 pub mod rootfs;
+pub(crate) mod signalfd;
 mod stdio;
 pub mod sysfs;
 /// In-memory tmpfs backend that can be mounted into the virtual namespace.
@@ -946,6 +947,12 @@ impl FileDescription {
         // status snapshot instead of its creation-time default.
         if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
             return eventfd.read_with_nonblock(
+                buf,
+                self.status_flags().contains(FileStatusFlags::NONBLOCK),
+            );
+        }
+        if let Some(signalfd) = self.file.as_any().downcast_ref::<signalfd::SignalFdFile>() {
+            return signalfd.read_with_nonblock(
                 buf,
                 self.status_flags().contains(FileStatusFlags::NONBLOCK),
             );

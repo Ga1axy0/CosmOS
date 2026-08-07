@@ -18,9 +18,10 @@ pub use action::{SigInfo, SigSetT, SignalAbi, SignalAction, SignalActions, Stack
 pub use signals::{SignalBit, SignalNum, FIRST_RT_SIG, LAST_RT_SIG, MAX_SIG};
 pub(crate) use wait::{
     cleanup_signal_wait, cleanup_signal_wait_for_task, handle_signal_wait_timeout,
-    has_pending_signal_in_set, has_unmasked_pending_signal, notify_signal_wait_pid,
-    notify_signal_wait_task, register_signal_wait, signal_wait_should_skip, signal_wait_state,
-    take_pending_signal_in_set, SignalTimerTag, SignalWaitHandle, SignalWakeState,
+    has_pending_signal_in_set, has_signalfd_pending_in_set, has_unmasked_pending_signal,
+    notify_signal_wait_pid, notify_signal_wait_task, register_signal_wait, signal_wait_should_skip,
+    signal_wait_state, take_pending_signal_in_set, take_signalfd_signal_in_set, SignalTimerTag,
+    SignalWaitHandle, SignalWakeState,
 };
 
 bitflags! {
