@@ -131,8 +131,9 @@ impl Drop for PageTableRootFrame {
 /// The guard intentionally pins only the root frame.  While a hart is idle it
 /// executes solely through permanent kernel mappings: Sv39 process roots share
 /// the kernel-half directory frames with `KERNEL_SPACE`, and LoongArch kernel
-/// execution uses DMW mappings.  User page-table descendants may therefore be
-/// reclaimed after exit/exec while the old root remains borrowed by idle.
+/// execution uses DMW mappings plus the shared kernel-heap root entry. User
+/// page-table descendants may therefore be reclaimed after exit/exec while the
+/// old root remains borrowed by idle.
 #[derive(Clone)]
 pub struct AddressSpaceRoot {
     token: AddressSpaceToken,
@@ -190,6 +191,28 @@ impl PageTable {
                 pte.bits |= PTEFlags::G.bits() as usize;
             }
         }
+    }
+
+    /// Share the low-address kernel heap subtree with a LoongArch user root.
+    ///
+    /// LoongArch kernel text, data and stacks use DMW mappings, but the
+    /// growable kernel heap lives in a low virtual-address window and is
+    /// backed by the kernel page table. Keep that one root entry shared so
+    /// the kernel can retain the current process PGDL across user traps.
+    #[cfg(target_arch = "loongarch64")]
+    pub fn share_kernel_heap_from(&mut self, kernel: &PageTable) {
+        let heap_vpn = VirtAddr::from(crate::config::KERNEL_HEAP_BASE).floor();
+        let root_index = crate::hal::vpn_index(heap_vpn.0, 0);
+        let kernel_entry = kernel.root_ppn.get_pte_array()[root_index];
+        debug_assert!(
+            kernel_entry.is_valid(),
+            "kernel heap root entry must be initialized before user roots"
+        );
+        debug_assert!(
+            !self.root_ppn.get_pte_array()[root_index].is_valid(),
+            "user root unexpectedly owns the kernel heap root entry"
+        );
+        self.root_ppn.get_pte_array()[root_index] = kernel_entry;
     }
 
     /// Temporarily used to get arguments from user space.

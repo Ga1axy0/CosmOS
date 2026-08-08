@@ -8,6 +8,8 @@ use super::{AddressSpaceRoot, PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
+#[cfg(target_arch = "loongarch64")]
+use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE};
 use crate::config::{
     MAX_HARTS, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
     USER_VDSO_BASE,
@@ -261,6 +263,12 @@ fn align_up_to_page(value: usize) -> usize {
 
 fn align_down_to_page(value: usize) -> usize {
     value & !(PAGE_SIZE - 1)
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn overlaps_kernel_heap_range(start: usize, end: usize) -> bool {
+    start < KERNEL_HEAP_BASE.saturating_add(MAX_KERNEL_HEAP_SIZE) && end > KERNEL_HEAP_BASE
 }
 
 fn map_kernel_ram_fragment(memory_set: &mut MemorySet, start: usize, end: usize) {
@@ -564,6 +572,10 @@ impl MemorySet {
         memory_set
             .page_table
             .share_kernel_half_from(&KERNEL_SPACE.lock().page_table);
+        #[cfg(target_arch = "loongarch64")]
+        memory_set
+            .page_table
+            .share_kernel_heap_from(&KERNEL_SPACE.lock().page_table);
         Ok(memory_set)
     }
     /// Get he page table token
@@ -793,6 +805,15 @@ impl MemorySet {
         if vma.is_user_accessible() && VirtAddr::from(vma.end_vpn()).0 > USER_SPACE_END {
             return Err(MmError::PermissionDenied);
         }
+        #[cfg(target_arch = "loongarch64")]
+        if vma.is_user_accessible()
+            && overlaps_kernel_heap_range(
+                usize::from(VirtAddr::from(vma.start_vpn())),
+                usize::from(VirtAddr::from(vma.end_vpn())),
+            )
+        {
+            return Err(MmError::PermissionDenied);
+        }
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
             return Err(MmError::Conflict);
         }
@@ -807,6 +828,15 @@ impl MemorySet {
     }
     /// Like `insert_vma` but always eagerly maps the pages regardless of `should_eager_map`.
     pub fn insert_vma_eager(&mut self, mut vma: Vma) -> Result<(), MmError> {
+        #[cfg(target_arch = "loongarch64")]
+        if vma.is_user_accessible()
+            && overlaps_kernel_heap_range(
+                usize::from(VirtAddr::from(vma.start_vpn())),
+                usize::from(VirtAddr::from(vma.end_vpn())),
+            )
+        {
+            return Err(MmError::PermissionDenied);
+        }
         if self.overlaps_vma_range(vma.start_vpn(), vma.end_vpn()) {
             return Err(MmError::Conflict);
         }
@@ -949,6 +979,14 @@ impl MemorySet {
             let candidate_end = candidate.checked_add(len)?;
             if candidate_end > upper {
                 return None;
+            }
+            #[cfg(target_arch = "loongarch64")]
+            if overlaps_kernel_heap_range(candidate, candidate_end) {
+                candidate = align_up(
+                    KERNEL_HEAP_BASE.saturating_add(MAX_KERNEL_HEAP_SIZE),
+                    PAGE_SIZE,
+                )?;
+                continue;
             }
             let candidate_vpn = VirtAddr::from(candidate).floor();
             if let Some((_, prev)) = self.vmas.range(..=candidate_vpn).next_back() {

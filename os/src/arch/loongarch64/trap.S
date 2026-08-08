@@ -88,20 +88,24 @@ __alltraps:
     st.d    $t0, $sp, 70*8
 
     ld.d    $tp, $sp, 34*8
-    ld.d    $t0, $sp, 35*8
     ld.d    $t1, $sp, 37*8
     ld.d    $sp, $sp, 36*8
-    # LoongArch keeps separate kernel and user PGDL roots.  User MemorySets
-    # do not share the kernel half, so enter Rust with the kernel root active.
-    csrwr   $t0, 0x19
-    invtlb  0x00, $zero, $zero
+    # Kernel text/data, stacks and the kernel heap are reachable from every
+    # process root (DMW mappings plus the shared heap subtree). Keep the
+    # current process PGDL active across the privilege transition.
     jr      $t1
 
 __restore:
     csrwr   $a0, CSR_SAVE
     csrrd   $a0, CSR_SAVE
+    # A syscall normally returns to the same process root. Only a real task
+    # or address-space switch needs to install a different PGDL and flush the
+    # local TLB.
+    csrrd   $t0, 0x19
+    beq     $t0, $a1, 1f
     csrwr   $a1, 0x19
     invtlb  0x00, $zero, $zero
+1:
     move    $sp, $a0
     ld.d    $t0, $sp, 32*8
     ld.d    $t1, $sp, 33*8
