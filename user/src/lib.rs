@@ -143,6 +143,8 @@ pub const IPC_EXCL: i32 = 0o2000;
 pub const IPC_RMID: i32 = 0;
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
+/// Discard resident pages while preserving an anonymous mapping.
+pub const MADV_DONTNEED: i32 = 4;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -781,6 +783,10 @@ pub fn mmap_full(
 
 pub fn munmap(start: usize, len: usize) -> isize {
     sys_munmap(start, len)
+}
+
+pub fn madvise(start: usize, len: usize, advice: i32) -> isize {
+    sys_madvise(start, len, advice)
 }
 
 pub fn shmget(key: i32, size: usize, flags: i32) -> isize {

@@ -2034,6 +2034,90 @@ impl MemorySet {
         Some(batch)
     }
 
+    /// Discard resident pages in a private anonymous user range while keeping
+    /// the VMA itself intact.
+    ///
+    /// `MADV_DONTNEED` is deliberately separate from `munmap_deferred`: the
+    /// address range must remain a valid mapping, and a later access must be
+    /// able to fault in a fresh zero-filled anonymous page. The returned
+    /// private-page references must only be dropped after the caller has
+    /// completed the remote TLB shootdown.
+    pub(crate) fn madvise_dontneed_deferred(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> Result<UserReleaseBatch, MmError> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn {
+            return Err(MmError::InvalidRange);
+        }
+
+        // Validate the complete range before changing any PTE or VMA-owned
+        // page state. The first implementation intentionally covers only
+        // private anonymous VMAs, which is the mapping type used by jemalloc.
+        // Shared anonymous and file-backed mappings need different discard
+        // and dirty-page semantics and must not be reported as successful.
+        let mut cursor = start_vpn;
+        while cursor < end_vpn {
+            let Some((_, area)) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.contains_vpn(cursor))
+            else {
+                return Err(MmError::NoMapping);
+            };
+            if !area.supports_lazy_user_fault() {
+                return Err(MmError::Unsupported);
+            }
+            cursor = area.end_vpn().min(end_vpn);
+        }
+
+        let mut batch = UserReleaseBatch::new();
+        cursor = start_vpn;
+        while cursor < end_vpn {
+            let area_start = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, area)| area.contains_vpn(cursor))
+                .map(|(start, _)| *start)
+                .ok_or(MmError::NoMapping)?;
+            let area_end = self
+                .vmas
+                .get(&area_start)
+                .map(|area| area.end_vpn())
+                .ok_or(MmError::NoMapping)?;
+            let overlap_end = area_end.min(end_vpn);
+
+            // Only resident anonymous pages have entries in data_frames.
+            // Collect the keys first so that removing pages does not mutate a
+            // BTreeMap iterator while it is being traversed.
+            let resident_vpns = self
+                .vmas
+                .get(&area_start)
+                .ok_or(MmError::NoMapping)?
+                .data_frames
+                .range(cursor..overlap_end)
+                .map(|(&vpn, _)| vpn)
+                .collect::<Vec<_>>();
+            let area = self.vmas.get_mut(&area_start).ok_or(MmError::NoMapping)?;
+            for vpn in resident_vpns {
+                area.unmap_present_one_deferred(&mut self.page_table, vpn, &mut batch);
+            }
+            cursor = overlap_end;
+        }
+
+        if !batch.is_empty() {
+            // The current hart may have cached the translations that were
+            // just cleared. Remote harts are handled by DeferredUserReclaim
+            // after the process lock is released.
+            self.finish_deferred_page_table_edit();
+        }
+        Ok(batch)
+    }
+
     /// 为 file-backed 缺页生成锁外慢路径所需的最小计划。
     pub fn prepare_file_page_fault(
         &self,

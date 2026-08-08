@@ -99,6 +99,8 @@ const MREMAP_DONTUNMAP: usize = 4;
 const MS_ASYNC: i32 = 1;
 const MS_INVALIDATE: i32 = 2;
 const MS_SYNC: i32 = 4;
+/// Discard resident pages while preserving the mapping for future faults.
+const MADV_DONTNEED: i32 = 4;
 
 /// Translate user-visible `PROT_*` bits into internal page permissions.
 ///
@@ -660,7 +662,6 @@ pub fn sys_madvise(start: usize, len: usize, advice: i32) -> isize {
         "kernel:pid[{}] sys_madvise",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    // TODO take madvice
     syscall_body!({
         if start & ((1 << PAGE_SIZE_BITS) - 1) != 0 {
             return Err(ERRNO::EINVAL); // start not page-aligned
@@ -668,13 +669,18 @@ pub fn sys_madvise(start: usize, len: usize, advice: i32) -> isize {
         if len == 0 {
             return Ok(0); // POSIX/Linux: zero-length madvise is a successful no-op
         }
-        warn!(
-            "madvise(pid={} addr={:#x} len={} advice={}) is not implemented",
-            current_task().unwrap().process.upgrade().unwrap().getpid(),
-            start,
-            len,
-            advice
-        );
+        if advice != MADV_DONTNEED {
+            return Err(ERRNO::EINVAL);
+        }
+        if start >= USER_SPACE_END {
+            return Err(ERRNO::EINVAL);
+        }
+        let end = start.checked_add(len).ok_or(ERRNO::EOVERFLOW)?;
+        let end = end.checked_add(PAGE_SIZE - 1).ok_or(ERRNO::EOVERFLOW)? & !(PAGE_SIZE - 1);
+        if end > USER_SPACE_END {
+            return Err(ERRNO::EINVAL);
+        }
+        current_process().madvise_dontneed(VirtAddr::from(start), VirtAddr::from(end))?;
         Ok(0)
     })
 }

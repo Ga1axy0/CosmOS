@@ -27,6 +27,9 @@ pub enum MmError {
     InvalidRange,
     /// The requested mapping conflicts with an existing VMA or PTE state.
     Conflict,
+    /// The requested memory-management operation is not supported for the
+    /// selected mapping type.
+    Unsupported,
     /// The requested address range is not available for an in-place mapping.
     AddressUnavailable,
     /// No matching mapping or page-table entry exists.

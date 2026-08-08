@@ -87,6 +87,7 @@ pub const SYSCALL_COPY_FILE_RANGE: usize = 285;
 pub const SYSCALL_BRK: usize = 214;
 pub const SYSCALL_MUNMAP: usize = 215;
 pub const SYSCALL_MMAP: usize = 222;
+pub const SYSCALL_MADVISE: usize = 233;
 pub const SYSCALL_SPAWN: usize = 400;
 pub const SYSCALL_MAIL_READ: usize = 401;
 pub const SYSCALL_MAIL_WRITE: usize = 402;
@@ -694,6 +695,10 @@ pub fn sys_mmap_full(
 
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     syscall(SYSCALL_MUNMAP, [start, len, 0])
+}
+
+pub fn sys_madvise(start: usize, len: usize, advice: i32) -> isize {
+    syscall(SYSCALL_MADVISE, [start, len, advice as usize])
 }
 
 pub fn sys_spawn(path: &str) -> isize {

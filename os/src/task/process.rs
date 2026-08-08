@@ -68,6 +68,7 @@ fn mm_error_to_errno(err: MmError) -> ERRNO {
         MmError::OutOfMemory => ERRNO::ENOMEM,
         MmError::InvalidRange => ERRNO::EINVAL,
         MmError::Conflict => ERRNO::EACCES,
+        MmError::Unsupported => ERRNO::EOPNOTSUPP,
         MmError::AddressUnavailable => ERRNO::ENOMEM,
         MmError::NoMapping => ERRNO::EFAULT,
         MmError::PermissionDenied => ERRNO::EFAULT,
@@ -2076,6 +2077,28 @@ impl ProcessControlBlock {
         };
         reclaim.flush_then_release();
         true
+    }
+
+    /// Discard resident pages from a private anonymous range without removing
+    /// the range's VMA. Pages are released only after all active harts have
+    /// invalidated their old translations.
+    pub fn madvise_dontneed(&self, start: VirtAddr, end: VirtAddr) -> Result<(), ERRNO> {
+        let reclaim = {
+            let mut inner = self.inner.lock();
+            let token = inner.memory_set.token();
+            let batch = inner
+                .memory_set
+                .madvise_dontneed_deferred(start, end)
+                .map_err(mm_error_to_errno)?;
+            let mask = if batch.is_empty() {
+                0
+            } else {
+                inner.memory_set.record_local_tlb_change()
+            };
+            DeferredUserReclaim::new_range(token, mask, start.0, end.0, batch)
+        };
+        reclaim.flush_then_release();
+        Ok(())
     }
 
     /// Resize or relocate one mmap-style user mapping.

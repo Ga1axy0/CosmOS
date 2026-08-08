@@ -10,8 +10,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
-    close, exit, fork, get_time, getpid, mmap_full, munmap, open, read, unlink, waitpid, write,
-    MMapFlags, MMapProt, OpenFlags, SIGBUS,
+    close, exit, fork, get_time, getpid, madvise, mmap_full, munmap, open, read, unlink, waitpid,
+    write, MMapFlags, MMapProt, OpenFlags, MADV_DONTNEED, SIGBUS,
 };
 
 const PAGE_SIZE: usize = 4096;
@@ -361,6 +361,44 @@ fn case_mmap_private_first_write() {
     assert_eq!(unlink(name.as_str()), 0);
 }
 
+/// 测试 `MADV_DONTNEED` 保留 VMA、丢弃驻留匿名页并在再次访问时返回零页。
+fn case_madvise_dontneed_anon() {
+    println!("[suite] case_madvise_dontneed_anon");
+    let pages = 3;
+    let len = pages * PAGE_SIZE;
+    let addr = mmap_full(
+        0,
+        len,
+        MMapProt::PROT_READ | MMapProt::PROT_WRITE,
+        MMapFlags::MAP_PRIVATE | MMapFlags::MAP_ANONYMOUS,
+        0,
+        0,
+    );
+    assert!(addr > 0, "anonymous mmap failed: {}", addr);
+
+    // Materialize every page and put non-zero data in both ends of it.
+    for page in 0..pages {
+        unsafe {
+            let ptr = (addr as usize + page * PAGE_SIZE) as *mut u8;
+            core::ptr::write_volatile(ptr, 0xa5);
+            core::ptr::write_volatile(ptr.add(PAGE_SIZE - 1), 0x5a);
+        }
+    }
+
+    assert_eq!(madvise(addr as usize, len, MADV_DONTNEED), 0);
+
+    // The VMA must remain usable, while each next read faults in a fresh
+    // zero-filled private page.
+    for page in 0..pages {
+        unsafe {
+            let ptr = (addr as usize + page * PAGE_SIZE) as *const u8;
+            assert_eq!(core::ptr::read_volatile(ptr), 0);
+            assert_eq!(core::ptr::read_volatile(ptr.add(PAGE_SIZE - 1)), 0);
+        }
+    }
+    assert_eq!(munmap(addr as usize, len), 0);
+}
+
 /// 测试匿名页在 `fork` 后的写时复制。
 fn case_fork_cow_anon() {
     println!("[suite] case_fork_cow_anon");
@@ -595,6 +633,7 @@ pub fn main(argc: usize, argv: &[&str]) -> i32 {
     case_mmap_shared_basic();
     case_mmap_private_basic();
     case_mmap_private_first_write();
+    case_madvise_dontneed_anon();
     case_fork_cow_anon();
     case_fork_mmap_private();
     case_fork_mmap_shared();
