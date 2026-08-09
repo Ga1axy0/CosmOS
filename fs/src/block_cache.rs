@@ -399,6 +399,13 @@ impl BlockCacheManager {
             }
         }
 
+        // A page-cache read frequently finds every backing block resident.
+        // Avoid allocating an empty request vector and crossing into the
+        // instrumented device path for that common all-hit case.
+        if pending_meta.is_empty() {
+            return;
+        }
+
         let mut pending = Vec::with_capacity(pending_meta.len());
         for &(range_idx, miss_start, miss_end) in &pending_meta {
             // The metadata pass has ended. Miss intervals are disjoint, so

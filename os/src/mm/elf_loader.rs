@@ -63,7 +63,7 @@ impl<'a> ElfLoader<'a> {
             let elf_data = file.read_all();
             return self.load_bytes(&elf_data);
         }
-        self.load_file_at(file, None)
+        self.load_parsed_file_at(file, &elf, None)
     }
 
     /// Load one in-memory ELF image into the target address space.
@@ -200,6 +200,20 @@ impl<'a> ElfLoader<'a> {
     ) -> Result<LoadedElf, MmError> {
         let metadata = read_elf_metadata(file)?;
         let elf = xmas_elf::ElfFile::new(&metadata).map_err(|_| MmError::InvalidElf)?;
+        self.load_parsed_file_at(file, &elf, forced_load_bias)
+    }
+
+    /// Map a file after its ELF metadata has already been read and validated.
+    ///
+    /// Keeping this separate from [`Self::load_file_at`] lets the main-image
+    /// path reuse the metadata it read while selecting the eager or streaming
+    /// loader, instead of reading and parsing the same header table twice.
+    fn load_parsed_file_at(
+        &mut self,
+        file: &Arc<OSInode>,
+        elf: &xmas_elf::ElfFile<'_>,
+        forced_load_bias: Option<usize>,
+    ) -> Result<LoadedElf, MmError> {
         let elf_type = elf.header.pt2.type_().as_type();
         let load_bias =
             forced_load_bias.unwrap_or(if elf_type == xmas_elf::header::Type::SharedObject {

@@ -45,6 +45,7 @@ pub use page_cache::{
     sync_fs as sync_page_cache_fs, sync_inode as sync_page_cache_inode, sync_inode_range,
     truncate_inode, CachePage, PageCacheStats, PAGE_CACHE_MANAGER,
 };
+pub(crate) use page_cache::record_fault_around_commit;
 
 /// Flush all modified entries in the lower-level block cache.
 pub fn sync_block_cache_all() -> Result<(), ERRNO> {

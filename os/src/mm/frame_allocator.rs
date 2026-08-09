@@ -2,8 +2,9 @@
 
 use super::{virt_to_phys, PhysPageNum};
 use crate::bootinfo::{self, PhysMemoryRegion};
-use crate::config::PAGE_SIZE;
+use crate::config::{MAX_HARTS, PAGE_SIZE};
 use crate::fs::PAGE_CACHE_MANAGER;
+use crate::hal::hartid;
 #[cfg(feature = "cosmos-meminfo")]
 use crate::hal::traits::Timer as _;
 #[cfg(feature = "cosmos-meminfo")]
@@ -11,17 +12,24 @@ use crate::hal::Plat;
 use crate::sync::SpinNoIrqLock;
 use core::cmp::{max, min};
 use core::fmt::{self, Debug, Formatter};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::*;
 
 const MAX_ORDER: usize = 32;
 const INVALID_PPN: usize = usize::MAX;
 const MAX_MANAGED_REGIONS: usize = 16;
+const PER_CPU_FRAME_CACHE_CAPACITY: usize = 32;
+const PER_CPU_FRAME_CACHE_FLUSH: usize = PER_CPU_FRAME_CACHE_CAPACITY / 2;
+const PER_CPU_FRAME_CACHE_REFILL_ORDER: usize = 3;
+const PER_CPU_FRAME_CACHE_REFILL_PAGES: usize = 1 << PER_CPU_FRAME_CACHE_REFILL_ORDER;
+const PER_CPU_FRAME_CACHE_DEFAULT_ENABLED: bool = true;
 // The fallback platform memory window is 4 GiB, or 1M 4 KiB pages. The
 // bitmap uses at most roughly two bits per page across all buddy orders.
 const MAX_BITMAP_PAGES: usize = crate::config::MEMORY_END / PAGE_SIZE;
 const MAX_BITMAP_WORDS: usize = (2 * MAX_BITMAP_PAGES + MAX_ORDER + 63) / 64;
 static FRAME_ALLOC_OOM_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FRAME_PER_CPU_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+static FRAME_PER_CPU_CACHED_PAGES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "cosmos-meminfo")]
 static FRAME_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "cosmos-meminfo")]
@@ -41,13 +49,49 @@ static FRAME_ZEROED_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Cumulative platform timer ticks spent clearing physical pages.
 #[cfg(feature = "cosmos-meminfo")]
 static FRAME_ZERO_TIME_TICKS: AtomicUsize = AtomicUsize::new(0);
-/// Per-CPU frame-cache counters.  The cache is not enabled yet; keeping the
-/// counters here makes the no-cache baseline explicit before a local cache is
-/// added.
+/// Per-CPU frame-cache counters.
 #[cfg(feature = "cosmos-meminfo")]
 static FRAME_PER_CPU_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "cosmos-meminfo")]
 static FRAME_PER_CPU_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+
+struct PerCpuFrameCache {
+    pages: [usize; PER_CPU_FRAME_CACHE_CAPACITY],
+    len: usize,
+}
+
+impl PerCpuFrameCache {
+    const fn new() -> Self {
+        Self {
+            pages: [INVALID_PPN; PER_CPU_FRAME_CACHE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, ppn: PhysPageNum) -> bool {
+        if self.len == self.pages.len() {
+            return false;
+        }
+        self.pages[self.len] = ppn.0;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<PhysPageNum> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        let ppn = self.pages[self.len];
+        self.pages[self.len] = INVALID_PPN;
+        Some(PhysPageNum(ppn))
+    }
+
+    fn clear(&mut self) {
+        self.pages.fill(INVALID_PPN);
+        self.len = 0;
+    }
+}
 
 /// tracker for physical page frame allocation and deallocation
 pub struct FrameTracker {
@@ -643,18 +687,21 @@ pub struct FrameAllocatorStats {
     #[cfg(feature = "cosmos-meminfo")]
     pub per_cpu_cache_hits: usize,
     /// Number of allocations that fell through a per-CPU frame cache.
-    /// The cache is currently disabled, so this is the single-frame
-    /// allocation baseline and every such request is counted as a miss.
     #[cfg(feature = "cosmos-meminfo")]
     pub per_cpu_cache_misses: usize,
     /// Whether a per-CPU frame cache is currently enabled.
     #[cfg(feature = "cosmos-meminfo")]
     pub per_cpu_cache_enabled: bool,
+    /// Number of free pages currently held outside the global buddy lists.
+    #[cfg(feature = "cosmos-meminfo")]
+    pub per_cpu_cached_pages: usize,
 }
 
 lazy_static! {
     pub static ref FRAME_ALLOCATOR: SpinNoIrqLock<FrameAllocatorImpl> =
         SpinNoIrqLock::new(FrameAllocatorImpl::new());
+    static ref PER_CPU_FRAME_CACHES: [SpinNoIrqLock<PerCpuFrameCache>; MAX_HARTS] =
+        core::array::from_fn(|_| SpinNoIrqLock::new(PerCpuFrameCache::new()));
 }
 
 pub fn init_frame_allocator() {
@@ -664,9 +711,15 @@ pub fn init_frame_allocator() {
     }
     let kernel_start = PhysPageNum(phys_addr_floor_ppn(virt_to_phys(skernel as usize)));
     let kernel_end = PhysPageNum(phys_addr_ceil_ppn(virt_to_phys(ekernel as usize)));
+    FRAME_PER_CPU_CACHE_ENABLED.store(false, Ordering::Release);
     FRAME_ALLOCATOR
         .lock()
         .init_from_bootinfo(kernel_start, kernel_end);
+    for cache in PER_CPU_FRAME_CACHES.iter() {
+        cache.lock().clear();
+    }
+    FRAME_PER_CPU_CACHED_PAGES.store(0, Ordering::Release);
+    FRAME_PER_CPU_CACHE_ENABLED.store(PER_CPU_FRAME_CACHE_DEFAULT_ENABLED, Ordering::Release);
     FRAME_ALLOC_OOM_COUNT.store(0, Ordering::Release);
     #[cfg(feature = "cosmos-meminfo")]
     {
@@ -686,8 +739,11 @@ pub fn init_frame_allocator() {
 /// Return runtime statistics of the frame allocator.
 pub fn frame_allocator_stats() -> FrameAllocatorStats {
     let allocator = FRAME_ALLOCATOR.lock();
-    let free_pages = allocator.free_pages;
-    let allocated_pages = allocator.allocated_pages;
+    let per_cpu_cached_pages = FRAME_PER_CPU_CACHED_PAGES.load(Ordering::Acquire);
+    let free_pages = allocator.free_pages.saturating_add(per_cpu_cached_pages);
+    let allocated_pages = allocator
+        .allocated_pages
+        .saturating_sub(per_cpu_cached_pages);
     FrameAllocatorStats {
         free_pages,
         allocated_pages,
@@ -728,7 +784,9 @@ pub fn frame_allocator_stats() -> FrameAllocatorStats {
         #[cfg(feature = "cosmos-meminfo")]
         per_cpu_cache_misses: FRAME_PER_CPU_CACHE_MISSES.load(Ordering::Acquire),
         #[cfg(feature = "cosmos-meminfo")]
-        per_cpu_cache_enabled: false,
+        per_cpu_cache_enabled: FRAME_PER_CPU_CACHE_ENABLED.load(Ordering::Acquire),
+        #[cfg(feature = "cosmos-meminfo")]
+        per_cpu_cached_pages,
     }
 }
 
@@ -745,15 +803,125 @@ fn record_frame_allocator_lock_wait(start: usize) {
         .fetch_add(Plat::read_time().wrapping_sub(start), Ordering::Relaxed);
 }
 
+#[inline]
+fn local_frame_cache_index() -> usize {
+    hartid() % MAX_HARTS
+}
+
+fn try_pop_local_frame() -> Option<PhysPageNum> {
+    if !FRAME_PER_CPU_CACHE_ENABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    let ppn = PER_CPU_FRAME_CACHES[local_frame_cache_index()]
+        .lock()
+        .pop()?;
+    FRAME_PER_CPU_CACHED_PAGES.fetch_sub(1, Ordering::AcqRel);
+    #[cfg(feature = "cosmos-meminfo")]
+    FRAME_PER_CPU_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(ppn)
+}
+
+fn try_steal_cached_frame() -> Option<PhysPageNum> {
+    if !FRAME_PER_CPU_CACHE_ENABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    let local = local_frame_cache_index();
+    for offset in 1..=MAX_HARTS {
+        let index = (local + offset) % MAX_HARTS;
+        if let Some(ppn) = PER_CPU_FRAME_CACHES[index].lock().pop() {
+            FRAME_PER_CPU_CACHED_PAGES.fetch_sub(1, Ordering::AcqRel);
+            #[cfg(feature = "cosmos-meminfo")]
+            FRAME_PER_CPU_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(ppn);
+        }
+    }
+    None
+}
+
+/// Keep recently released order-0 frames local.  When one cache fills, return
+/// half of it to the buddy allocator in a single global-lock acquisition so
+/// contiguous allocations and remote harts still make forward progress.
+fn try_push_local_frame(ppn: PhysPageNum) -> bool {
+    if !FRAME_PER_CPU_CACHE_ENABLED.load(Ordering::Acquire) {
+        return false;
+    }
+
+    let mut flushed = [INVALID_PPN; PER_CPU_FRAME_CACHE_FLUSH];
+    let flushed_count = {
+        let mut cache = PER_CPU_FRAME_CACHES[local_frame_cache_index()].lock();
+        let mut count = 0;
+        if cache.len == PER_CPU_FRAME_CACHE_CAPACITY {
+            while count < flushed.len() {
+                flushed[count] = cache
+                    .pop()
+                    .expect("full per-CPU frame cache became empty")
+                    .0;
+                count += 1;
+            }
+        }
+        assert!(cache.push(ppn), "per-CPU frame cache push must fit");
+        count
+    };
+
+    FRAME_PER_CPU_CACHED_PAGES.fetch_add(1, Ordering::AcqRel);
+    if flushed_count != 0 {
+        FRAME_PER_CPU_CACHED_PAGES.fetch_sub(flushed_count, Ordering::AcqRel);
+        #[cfg(feature = "cosmos-meminfo")]
+        let lock_start = frame_allocator_lock_start();
+        let mut allocator = FRAME_ALLOCATOR.lock();
+        #[cfg(feature = "cosmos-meminfo")]
+        record_frame_allocator_lock_wait(lock_start);
+        for raw_ppn in &flushed[..flushed_count] {
+            allocator.dealloc(PhysPageNum(*raw_ppn));
+        }
+    }
+    true
+}
+
+/// Return cached order-0 pages to the buddy lists before reporting that a
+/// larger contiguous allocation cannot be satisfied.
+fn drain_per_cpu_frame_caches() -> usize {
+    if !FRAME_PER_CPU_CACHE_ENABLED.load(Ordering::Acquire) {
+        return 0;
+    }
+    let mut total = 0usize;
+    for cache in PER_CPU_FRAME_CACHES.iter() {
+        let mut drained = [INVALID_PPN; PER_CPU_FRAME_CACHE_CAPACITY];
+        let count = {
+            let mut cache = cache.lock();
+            let mut count = 0;
+            while let Some(ppn) = cache.pop() {
+                drained[count] = ppn.0;
+                count += 1;
+            }
+            count
+        };
+        if count == 0 {
+            continue;
+        }
+        FRAME_PER_CPU_CACHED_PAGES.fetch_sub(count, Ordering::AcqRel);
+        #[cfg(feature = "cosmos-meminfo")]
+        let lock_start = frame_allocator_lock_start();
+        let mut allocator = FRAME_ALLOCATOR.lock();
+        #[cfg(feature = "cosmos-meminfo")]
+        record_frame_allocator_lock_wait(lock_start);
+        for raw_ppn in &drained[..count] {
+            allocator.dealloc(PhysPageNum(*raw_ppn));
+        }
+        total += count;
+    }
+    total
+}
+
 /// Allocate a physical page frame in FrameTracker style
 pub fn frame_alloc() -> Option<FrameTracker> {
     #[cfg(feature = "cosmos-meminfo")]
     {
         FRAME_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
-    // There is deliberately no per-CPU frame cache yet.  Count this as a
-    // miss so the first run provides a directly comparable baseline for the
-    // cache implementation that may be added later.
+    if let Some(ppn) = try_pop_local_frame() {
+        return Some(FrameTracker::new(ppn));
+    }
     #[cfg(feature = "cosmos-meminfo")]
     {
         FRAME_PER_CPU_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -765,34 +933,74 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     {
         record_frame_allocator_lock_wait(lock_start);
     }
-    let ppn = { allocator.alloc() };
+    let mut refill_start = None;
+    let ppn = if FRAME_PER_CPU_CACHE_ENABLED.load(Ordering::Acquire) {
+        match allocator.alloc_order(PER_CPU_FRAME_CACHE_REFILL_ORDER) {
+            Some(start) => {
+                refill_start = Some(start);
+                Some(start)
+            }
+            None => allocator.alloc(),
+        }
+    } else {
+        allocator.alloc()
+    };
     drop(allocator);
-    ppn.map(FrameTracker::new).or_else(|| {
-        FRAME_ALLOC_OOM_COUNT.fetch_add(1, Ordering::AcqRel);
-        let frame_allocator_stats = frame_allocator_stats();
-        // Keep the page-cache guard's lifetime bounded to this block.  Using
-        // PAGE_CACHE_MANAGER.lock() once per format argument keeps the first
-        // SpinNoIrqLockGuard alive until the end of the error! statement;
-        // the second call then spins forever on the same lock (especially
-        // because interrupts are disabled while acquiring it).
-        let (cached_pages, low_watermark, high_watermark) = {
-            let manager = PAGE_CACHE_MANAGER.lock();
-            (
-                manager.cached_pages,
-                manager.low_watermark,
-                manager.high_watermark,
-            )
-        };
-        error!(
-            "frame_alloc: out of memory (free={} cached={} low={} high={} total={})",
-            frame_allocator_stats.free_pages,
-            cached_pages,
-            low_watermark,
-            high_watermark,
-            frame_allocator_stats.total_pages,
-        );
-        None
-    })
+    if let Some(start) = refill_start {
+        let mut cached = 0usize;
+        let mut overflow = [INVALID_PPN; PER_CPU_FRAME_CACHE_REFILL_PAGES - 1];
+        let mut overflow_count = 0usize;
+        {
+            let mut cache = PER_CPU_FRAME_CACHES[local_frame_cache_index()].lock();
+            for raw_ppn in start.0 + 1..start.0 + PER_CPU_FRAME_CACHE_REFILL_PAGES {
+                if cache.push(PhysPageNum(raw_ppn)) {
+                    cached += 1;
+                } else {
+                    overflow[overflow_count] = raw_ppn;
+                    overflow_count += 1;
+                }
+            }
+        }
+        FRAME_PER_CPU_CACHED_PAGES.fetch_add(cached, Ordering::AcqRel);
+        if overflow_count != 0 {
+            #[cfg(feature = "cosmos-meminfo")]
+            let lock_start = frame_allocator_lock_start();
+            let mut allocator = FRAME_ALLOCATOR.lock();
+            #[cfg(feature = "cosmos-meminfo")]
+            record_frame_allocator_lock_wait(lock_start);
+            for raw_ppn in &overflow[..overflow_count] {
+                allocator.dealloc(PhysPageNum(*raw_ppn));
+            }
+        }
+    }
+    ppn.or_else(try_steal_cached_frame)
+        .map(FrameTracker::new)
+        .or_else(|| {
+            FRAME_ALLOC_OOM_COUNT.fetch_add(1, Ordering::AcqRel);
+            let frame_allocator_stats = frame_allocator_stats();
+            // Keep the page-cache guard's lifetime bounded to this block.  Using
+            // PAGE_CACHE_MANAGER.lock() once per format argument keeps the first
+            // SpinNoIrqLockGuard alive until the end of the error! statement;
+            // the second call then spins forever on the same lock (especially
+            // because interrupts are disabled while acquiring it).
+            let (cached_pages, low_watermark, high_watermark) = {
+                let manager = PAGE_CACHE_MANAGER.lock();
+                (
+                    manager.cached_pages,
+                    manager.low_watermark,
+                    manager.high_watermark,
+                )
+            };
+            error!(
+                "frame_alloc: out of memory (free={} cached={} low={} high={} total={})",
+                frame_allocator_stats.free_pages,
+                cached_pages,
+                low_watermark,
+                high_watermark,
+                frame_allocator_stats.total_pages,
+            );
+            None
+        })
 }
 
 /// Allocate a physical page frame, triggering page-cache reclamation on first
@@ -811,6 +1019,9 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
     #[cfg(feature = "cosmos-meminfo")]
     {
         FRAME_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    if try_push_local_frame(ppn) {
+        return;
     }
     #[cfg(feature = "cosmos-meminfo")]
     let lock_start = frame_allocator_lock_start();
@@ -834,7 +1045,7 @@ pub fn frame_alloc_contiguous(pages: usize, align_pages: usize) -> Option<Contig
         return None;
     }
     let order = pages.trailing_zeros() as usize;
-    let start = {
+    let allocate_order = || {
         #[cfg(feature = "cosmos-meminfo")]
         let lock_start = frame_allocator_lock_start();
         let mut allocator = FRAME_ALLOCATOR.lock();
@@ -842,13 +1053,17 @@ pub fn frame_alloc_contiguous(pages: usize, align_pages: usize) -> Option<Contig
         {
             record_frame_allocator_lock_wait(lock_start);
         }
-        let start = allocator.alloc_order(order)?;
-        if start.0 & (align_pages - 1) != 0 {
-            allocator.dealloc_order(start, order);
-            return None;
-        }
-        start
+        allocator.alloc_order(order)
     };
+    let start = allocate_order().or_else(|| {
+        (drain_per_cpu_frame_caches() != 0)
+            .then(allocate_order)
+            .flatten()
+    })?;
+    if start.0 & (align_pages - 1) != 0 {
+        FRAME_ALLOCATOR.lock().dealloc_order(start, order);
+        return None;
+    }
     Some(ContiguousFrames::new(start, pages))
 }
 

@@ -75,6 +75,26 @@ static READAHEAD_DROPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static READAHEAD_WORKER_JOBS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static READAHEAD_WORKER_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_WINDOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_WINDOW_REQUESTED_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_WINDOW_READY_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_WINDOW_LOADING_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_WINDOW_COLD_MISSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_SCAN_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_SCANNED_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_READY_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_MAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_LEAF_PREFLIGHTS: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
 /// Bound speculative work independently of the normal page-cache watermarks.
@@ -310,7 +330,7 @@ impl PageMappingHandle {
     ) -> Vec<(u64, Arc<SpinNoIrqLock<CachePage>>)> {
         let mapping = self.inner.lock();
         let end_page = first_page.saturating_add(count as u64);
-        mapping
+        let pages: Vec<_> = mapping
             .pages
             .range(first_page..end_page)
             .filter_map(|(&page_idx, page)| {
@@ -321,7 +341,14 @@ impl PageMappingHandle {
                 };
                 ready.then(|| (page_idx, Arc::clone(page)))
             })
-            .collect()
+            .collect();
+        #[cfg(feature = "io_perf_counters")]
+        {
+            FAULT_AROUND_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+            FAULT_AROUND_SCANNED_PAGES.fetch_add(count, Ordering::Relaxed);
+            FAULT_AROUND_READY_PAGES.fetch_add(pages.len(), Ordering::Relaxed);
+        }
+        pages
     }
 
     /// 获取文件映射缺页所需的页面，并在顺序访问时一起预读取一个有限窗口。
@@ -349,19 +376,31 @@ impl PageMappingHandle {
         page_idx: u64,
         count: usize,
     ) -> Result<Arc<SpinNoIrqLock<CachePage>>, MmError> {
-        let demand_is_ready = self
-            .inner
-            .lock()
-            .pages
-            .get(&page_idx)
-            .cloned()
-            .is_some_and(|page| {
-                let page = page.lock();
-                page.state.contains(CachePageState::UPTODATE)
-                    && !page.state.contains(CachePageState::EVICTING)
-            });
-        if demand_is_ready {
-            return get_or_load_page(&self.inner, page_idx);
+        #[cfg(feature = "io_perf_counters")]
+        {
+            FAULT_WINDOW_CALLS.fetch_add(1, Ordering::Relaxed);
+            FAULT_WINDOW_REQUESTED_PAGES.fetch_add(count, Ordering::Relaxed);
+        }
+        let demand_page = self.inner.lock().pages.get(&page_idx).cloned();
+        let demand_state = demand_page.as_ref().map(|page| {
+            let mut page = page.lock();
+            let ready = page.state.contains(CachePageState::UPTODATE)
+                && !page.state.contains(CachePageState::EVICTING);
+            if ready {
+                page.ref_bit = true;
+            }
+            (ready, page.state.contains(CachePageState::LOADING))
+        });
+        if demand_state.is_some_and(|(ready, _)| ready) {
+            #[cfg(feature = "io_perf_counters")]
+            FAULT_WINDOW_READY_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(demand_page.expect("ready page must remain referenced"));
+        }
+        #[cfg(feature = "io_perf_counters")]
+        if demand_state.is_some_and(|(_, loading)| loading) {
+            FAULT_WINDOW_LOADING_HITS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FAULT_WINDOW_COLD_MISSES.fetch_add(1, Ordering::Relaxed);
         }
         let foreground_pages = count.min(FAULT_READAHEAD_DEMAND_PAGES).max(1);
         if foreground_pages > 1 {
@@ -988,6 +1027,16 @@ pub fn reset_perf_counters() {
     READAHEAD_DROPPED_PAGES.store(0, Ordering::Relaxed);
     READAHEAD_WORKER_JOBS.store(0, Ordering::Relaxed);
     READAHEAD_WORKER_PAGES.store(0, Ordering::Relaxed);
+    FAULT_WINDOW_CALLS.store(0, Ordering::Relaxed);
+    FAULT_WINDOW_REQUESTED_PAGES.store(0, Ordering::Relaxed);
+    FAULT_WINDOW_READY_HITS.store(0, Ordering::Relaxed);
+    FAULT_WINDOW_LOADING_HITS.store(0, Ordering::Relaxed);
+    FAULT_WINDOW_COLD_MISSES.store(0, Ordering::Relaxed);
+    FAULT_AROUND_SCAN_CALLS.store(0, Ordering::Relaxed);
+    FAULT_AROUND_SCANNED_PAGES.store(0, Ordering::Relaxed);
+    FAULT_AROUND_READY_PAGES.store(0, Ordering::Relaxed);
+    FAULT_AROUND_MAPPED_PAGES.store(0, Ordering::Relaxed);
+    FAULT_AROUND_LEAF_PREFLIGHTS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
@@ -1096,6 +1145,56 @@ pub fn render_perf_counters() -> String {
     );
     let _ = writeln!(
         &mut out,
+        "  fault_window_calls {}",
+        perf_load(&FAULT_WINDOW_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_window_requested_pages {}",
+        perf_load(&FAULT_WINDOW_REQUESTED_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_window_ready_hits {}",
+        perf_load(&FAULT_WINDOW_READY_HITS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_window_loading_hits {}",
+        perf_load(&FAULT_WINDOW_LOADING_HITS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_window_cold_misses {}",
+        perf_load(&FAULT_WINDOW_COLD_MISSES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_around_scan_calls {}",
+        perf_load(&FAULT_AROUND_SCAN_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_around_scanned_pages {}",
+        perf_load(&FAULT_AROUND_SCANNED_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_around_ready_pages {}",
+        perf_load(&FAULT_AROUND_READY_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_around_mapped_pages {}",
+        perf_load(&FAULT_AROUND_MAPPED_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_around_leaf_preflights {}",
+        perf_load(&FAULT_AROUND_LEAF_PREFLIGHTS)
+    );
+    let _ = writeln!(
+        &mut out,
         "  direct_read_runs {}",
         perf_load(&DIRECT_READ_RUNS)
     );
@@ -1178,17 +1277,31 @@ pub fn get_cached_page(inode: &Arc<Inode>, page_idx: u64) -> Option<Arc<SpinNoIr
     mapping_for_inode(inode).and_then(|mapping| mapping.try_get_page(page_idx).ok())
 }
 
-/// 增加某个缓存页的共享映射计数，防止其在仍被用户页表引用时被回收。
-pub fn retain_mapped_page(page: &Arc<SpinNoIrqLock<CachePage>>) {
+/// 增加某个缓存页的共享映射计数，防止其在仍被用户页表引用时被回收，
+/// 并在同一次页锁临界区内返回其物理页号。
+pub fn retain_mapped_page(page: &Arc<SpinNoIrqLock<CachePage>>) -> PhysPageNum {
     let mut page_guard = page.lock();
     page_guard.ref_bit = true;
     page_guard.map_count += 1;
+    page_guard.ppn()
 }
 
 /// 减少某个缓存页的共享映射计数。
 pub fn release_mapped_page(page: &Arc<SpinNoIrqLock<CachePage>>) {
     let mut page_guard = page.lock();
     page_guard.map_count = page_guard.map_count.saturating_sub(1);
+}
+
+/// Account pages committed by one file-fault-around batch and the number of
+/// page-table leaf preflights needed to make that batch failure-atomic.
+pub(crate) fn record_fault_around_commit(mapped_pages: usize, leaf_preflights: usize) {
+    #[cfg(feature = "io_perf_counters")]
+    {
+        FAULT_AROUND_MAPPED_PAGES.fetch_add(mapped_pages, Ordering::Relaxed);
+        FAULT_AROUND_LEAF_PREFLIGHTS.fetch_add(leaf_preflights, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "io_perf_counters"))]
+    let _ = (mapped_pages, leaf_preflights);
 }
 
 /// 将一个已经通过共享映射暴露给用户态的缓存页标记为脏页。

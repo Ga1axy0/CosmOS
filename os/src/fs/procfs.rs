@@ -184,6 +184,11 @@ fn build_cosmos_meminfo() -> String {
         "FramePerCpuCacheMisses: {}",
         stats.per_cpu_cache_misses
     );
+    let _ = writeln!(
+        &mut out,
+        "FramePerCpuCachedPages: {}",
+        stats.per_cpu_cached_pages
+    );
     let _ = writeln!(&mut out, "PageTableAllocCalls: {}", page_table.alloc_calls);
     let _ = writeln!(&mut out, "PageTableFreeCalls: {}", page_table.free_calls);
     let _ = writeln!(

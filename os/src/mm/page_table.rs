@@ -307,6 +307,22 @@ impl PageTable {
             .ok_or(MmError::NoMapping)
             .map(|_| ())
     }
+    /// Map one leaf whose intermediate page-table levels were preallocated by
+    /// [`Self::ensure_leaf`].  Batch mapping paths use this after completing
+    /// all fallible allocation work, avoiding a second create-mode walk.
+    pub fn map_preallocated_leaf(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+    ) -> Result<(), MmError> {
+        let pte = self.find_pte(vpn).ok_or(MmError::NoMapping)?;
+        if pte.is_valid() {
+            return Err(MmError::Conflict);
+        }
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        Ok(())
+    }
     /// Map a permanent kernel page without recording page-table frames in `frames`.
     pub fn map_kernel_untracked(
         &mut self,

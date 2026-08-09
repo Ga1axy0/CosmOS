@@ -15,8 +15,8 @@ use crate::config::{
     USER_VDSO_BASE,
 };
 use crate::fs::{
-    mark_cached_page_dirty, release_mapped_page, retain_mapped_page, sync_inode_range, CachePage,
-    FileDescription, OSInode,
+    mark_cached_page_dirty, record_fault_around_commit, release_mapped_page, retain_mapped_page,
+    sync_inode_range, CachePage, FileDescription, OSInode,
 };
 use crate::hal::traits::{AddressSpaceToken, TrapMachine};
 use crate::hal::ArchTrapMachine;
@@ -889,9 +889,9 @@ impl MemorySet {
         let Some(area) = self.find_vma_containing_mut(vpn) else {
             return Err(MmError::NoMapping);
         };
-        retain_mapped_page(&page);
+        let ppn = retain_mapped_page(&page);
         area.direct_cache_pages.insert(vpn, Arc::clone(&page));
-        self.page_table.map(vpn, page.lock().ppn(), flags)?;
+        self.page_table.map(vpn, ppn, flags)?;
         // debug!(
         //     "[cow] install inherited direct cache page: vpn={:#x} ppn={:#x} writable={}",
         //     vpn.0,
@@ -2366,14 +2366,13 @@ impl MemorySet {
         {
             pte_flags.remove(PTEFlags::W);
         }
-        let ppn = page.lock().ppn();
         if plan.shared
             && plan.map_perm.contains(MapPermission::W)
             && plan.access == PageFaultAccess::Write
         {
             mark_cached_page_dirty(&page);
         }
-        retain_mapped_page(&page);
+        let ppn = retain_mapped_page(&page);
         let area = self
             .find_vma_containing_mut(plan.vpn)
             .expect("validated file fault VMA disappeared");
@@ -2411,15 +2410,34 @@ impl MemorySet {
             return Ok(PageFaultHandled::NotHandled);
         }
 
+        // Classify each candidate once while the process lock excludes other
+        // page-table writers.  The old path translated every page again in
+        // the commit loop after this preflight.
+        let mut mapped_fault_page = false;
+        let mut pending_pages = Vec::with_capacity(pages.len());
+        for (vpn, page) in pages {
+            if vpn < plan.vma_start || vpn >= plan.vma_end {
+                continue;
+            }
+            if self.page_table.translate(vpn).is_some() {
+                mapped_fault_page |= vpn == plan.vpn;
+            } else {
+                pending_pages.push((vpn, page));
+            }
+        }
+
         // Allocate every required intermediate page-table page before taking
-        // cache-page mapping references.  Once this succeeds, the commit loop
-        // cannot leave a half-installed batch due to page-table OOM.
-        for (vpn, _) in &pages {
-            if *vpn >= plan.vma_start
-                && *vpn < plan.vma_end
-                && self.page_table.translate(*vpn).is_none()
-            {
+        // cache-page mapping references.  One leaf table covers many adjacent
+        // PTEs, so preflight it once rather than once per candidate page.
+        let leaf_vpn_span = 1usize << crate::hal::page_table_index_bits();
+        let mut leaf_preflights = 0usize;
+        let mut previous_leaf_base = None;
+        for (vpn, _) in &pending_pages {
+            let leaf_base = vpn.0 & !(leaf_vpn_span - 1);
+            if previous_leaf_base != Some(leaf_base) {
                 self.page_table.ensure_leaf(*vpn)?;
+                leaf_preflights += 1;
+                previous_leaf_base = Some(leaf_base);
             }
         }
 
@@ -2433,32 +2451,31 @@ impl MemorySet {
             pte_flags.remove(PTEFlags::D);
         }
 
-        let mut mapped_fault_page = self.page_table.translate(plan.vpn).is_some();
         let mut mapped_any = false;
+        let mut mapped_pages = 0usize;
         let mut mapped_start = usize::MAX;
         let mut mapped_end = 0usize;
-        for (vpn, page) in pages {
-            if vpn < plan.vma_start
-                || vpn >= plan.vma_end
-                || self.page_table.translate(vpn).is_some()
-            {
-                continue;
-            }
-            let ppn = page.lock().ppn();
-            retain_mapped_page(&page);
+        if !pending_pages.is_empty() {
             let area = self
-                .find_vma_containing_mut(vpn)
+                .vmas
+                .get_mut(&plan.vma_start)
                 .expect("validated fault-around VMA disappeared");
-            if let Some(old_page) = area.direct_cache_pages.insert(vpn, Arc::clone(&page)) {
-                release_mapped_page(&old_page);
+            for (vpn, page) in pending_pages {
+                let ppn = retain_mapped_page(&page);
+                self.page_table
+                    .map_preallocated_leaf(vpn, ppn, pte_flags)?;
+                if let Some(old_page) = area.direct_cache_pages.insert(vpn, Arc::clone(&page)) {
+                    release_mapped_page(&old_page);
+                }
+                mapped_any = true;
+                mapped_pages += 1;
+                mapped_fault_page |= vpn == plan.vpn;
+                let page_start = VirtAddr::from(vpn).0;
+                mapped_start = mapped_start.min(page_start);
+                mapped_end = mapped_end.max(page_start + PAGE_SIZE);
             }
-            self.page_table.map(vpn, ppn, pte_flags)?;
-            mapped_any = true;
-            mapped_fault_page |= vpn == plan.vpn;
-            let page_start = VirtAddr::from(vpn).0;
-            mapped_start = mapped_start.min(page_start);
-            mapped_end = mapped_end.max(page_start + PAGE_SIZE);
         }
+        record_fault_around_commit(mapped_pages, leaf_preflights);
         if mapped_any {
             self.flush_local_tlb_range_asid(mapped_start, mapped_end);
         } else if mapped_fault_page {
@@ -2545,8 +2562,7 @@ impl MemorySet {
         let mut pte_flags = Self::map_perm_to_pte_flags(plan.map_perm);
         pte_flags.remove(PTEFlags::W);
         pte_flags.remove(PTEFlags::D);
-        let ppn = page.lock().ppn();
-        retain_mapped_page(&page);
+        let ppn = retain_mapped_page(&page);
         let area = self
             .find_vma_containing_mut(plan.vpn)
             .expect("validated private file fault VMA disappeared");

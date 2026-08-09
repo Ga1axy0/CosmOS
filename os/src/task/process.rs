@@ -2193,6 +2193,7 @@ impl ProcessControlBlock {
 
     /// 处理当前进程的私有页写时复制缺页。
     pub fn handle_private_cow_fault(&self, fault_addr: usize) -> Result<PageFaultHandled, MmError> {
+        let _probe = crate::probe_scope!("mmap.handle_private_cow_fault");
         let (handled, reclaim) = {
             let mut inner = self.inner.lock();
             let token = inner.memory_set.token();
@@ -2218,6 +2219,7 @@ impl ProcessControlBlock {
         fault_addr: usize,
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
+        let _probe = crate::probe_scope!("mmap.handle_lazy_user_fault");
         let (handled, token, mask) = {
             let mut inner = self.inner.lock();
             let handled = inner
@@ -2247,6 +2249,17 @@ impl ProcessControlBlock {
         access: PageFaultAccess,
     ) -> Result<PageFaultHandled, MmError> {
         let _probe = crate::probe_scope!("mmap.handle_file_page_fault");
+        match access {
+            PageFaultAccess::Read => {
+                let _access_probe = crate::probe_scope!("mmap.file_fault.access.read");
+            }
+            PageFaultAccess::Write => {
+                let _access_probe = crate::probe_scope!("mmap.file_fault.access.write");
+            }
+            PageFaultAccess::Exec => {
+                let _access_probe = crate::probe_scope!("mmap.file_fault.access.exec");
+            }
+        }
         trace!(
             "[mmap] page fault enter: pid={} addr={:#x} access={:?}",
             self.getpid(),
@@ -2254,7 +2267,7 @@ impl ProcessControlBlock {
             access
         );
         if access == PageFaultAccess::Write {
-            let (notified, token, mask) = {
+            let (notified, token, mask) = crate::probe!({
                 let mut inner = self.inner.lock();
                 let notified = inner
                     .memory_set
@@ -2266,14 +2279,16 @@ impl ProcessControlBlock {
                     0
                 };
                 (notified, token, mask)
-            };
+            }, "mmap.file_fault.write_notify");
             if notified {
                 if mask != 0 {
-                    shootdown_page(
-                        mask,
-                        crate::hal::address_space_id_from_token(token),
-                        fault_addr,
-                    );
+                    crate::probe!({
+                        shootdown_page(
+                            mask,
+                            crate::hal::address_space_id_from_token(token),
+                            fault_addr,
+                        );
+                    }, "mmap.file_fault.shootdown");
                 }
                 trace!(
                     "[mmap] page fault resolved by shared write-notify: pid={} addr={:#x}",
@@ -2283,7 +2298,7 @@ impl ProcessControlBlock {
                 return Ok(PageFaultHandled::Handled);
             }
         }
-        let (prepared, token, mask) = {
+        let (prepared, token, mask) = crate::probe!({
             let inner = self.inner.lock();
             let prepared = inner
                 .memory_set
@@ -2295,15 +2310,17 @@ impl ProcessControlBlock {
                 0
             };
             (prepared, token, mask)
-        };
+        }, "mmap.file_fault.prepare");
         let plan = match prepared {
             FilePageFaultPrepare::Resolved => {
                 if mask != 0 {
-                    shootdown_page(
-                        mask,
-                        crate::hal::address_space_id_from_token(token),
-                        fault_addr,
-                    );
+                    crate::probe!({
+                        shootdown_page(
+                            mask,
+                            crate::hal::address_space_id_from_token(token),
+                            fault_addr,
+                        );
+                    }, "mmap.file_fault.shootdown");
                 }
                 trace!(
                     "[mmap] page fault resolved by present PTE: pid={} addr={:#x} access={:?}",
@@ -2324,12 +2341,15 @@ impl ProcessControlBlock {
                 return Ok(PageFaultHandled::NotHandled);
             }
         };
-        let Some(inode) = plan.file.backing_inode() else {
-            return Ok(PageFaultHandled::NotHandled);
-        };
-        let Some(mapping) = mapping_for_inode(&inode) else {
-            return Ok(PageFaultHandled::NotHandled);
-        };
+        let mapping = crate::probe!({
+            let Some(inode) = plan.file.backing_inode() else {
+                return Ok(PageFaultHandled::NotHandled);
+            };
+            let Some(mapping) = mapping_for_inode(&inode) else {
+                return Ok(PageFaultHandled::NotHandled);
+            };
+            mapping
+        }, "mmap.file_fault.lookup_mapping");
         let page_start = plan.page_idx as usize * PAGE_SIZE;
         let file_size = mapping.size();
         if page_start >= file_size {
@@ -2351,17 +2371,19 @@ impl ProcessControlBlock {
             plan.shared,
             plan.file.path()
         );
-        let page = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
-            // Keep the conservative 64 KiB demand prefix synchronous, then
-            // let the page-cache worker fill any confirmed sequential tail.
-            mapping.try_get_page_with_fault_window(plan.page_idx, plan.read_ahead_pages)?
-        } else {
-            mapping.try_get_page(plan.page_idx)?
-        };
-        let fault_around_pages =
-            (matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
-                && (plan.shared || !plan.map_perm.contains(MapPermission::W)))
-            .then(|| {
+        let page = crate::probe!({
+            if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
+                // Keep the conservative 64 KiB demand prefix synchronous, then
+                // let the page-cache worker fill any confirmed sequential tail.
+                mapping.try_get_page_with_fault_window(plan.page_idx, plan.read_ahead_pages)?
+            } else {
+                mapping.try_get_page(plan.page_idx)?
+            }
+        }, "mmap.file_fault.page_cache");
+        let fault_around_pages = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
+            && (plan.shared || !plan.map_perm.contains(MapPermission::W))
+        {
+            Some(crate::probe!({
                 let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
                 let first_vpn = aligned_start.max(plan.vma_start.0);
                 let end_vpn = aligned_start
@@ -2389,7 +2411,10 @@ impl ProcessControlBlock {
                     pages.push((plan.vpn, Arc::clone(&page)));
                 }
                 pages
-            });
+            }, "mmap.file_fault.collect_around"))
+        } else {
+            None
+        };
         let fault_flush_range = fault_around_pages.as_ref().and_then(|pages| {
             let first_vpn = pages.iter().map(|(vpn, _)| *vpn).min()?;
             let last_vpn = pages.iter().map(|(vpn, _)| *vpn).max()?;
@@ -2403,11 +2428,17 @@ impl ProcessControlBlock {
             // TODO：这里目前只靠二次匹配校验 VMA 是否仍然有效；
             // 后续补齐更严格的 `mm_seq` 代际校验。
             let committed = if let Some(pages) = fault_around_pages {
-                inner.memory_set.map_file_cache_pages_around(&plan, pages)
+                crate::probe!({
+                    inner.memory_set.map_file_cache_pages_around(&plan, pages)
+                }, "mmap.file_fault.commit.around")
             } else if plan.shared {
-                inner.memory_set.map_shared_file_page(&plan, page)
+                crate::probe!({
+                    inner.memory_set.map_shared_file_page(&plan, page)
+                }, "mmap.file_fault.commit.shared")
             } else {
-                inner.memory_set.map_private_file_page(&plan, page)
+                crate::probe!({
+                    inner.memory_set.map_private_file_page(&plan, page)
+                }, "mmap.file_fault.commit.private")
             }?;
             let token = inner.memory_set.token();
             let mask = if committed == PageFaultHandled::Handled {
@@ -2423,11 +2454,13 @@ impl ProcessControlBlock {
         // it to continue with a cached invalid or restrictive translation.
         if mask != 0 {
             let asid = crate::hal::address_space_id_from_token(token);
-            if let Some((start, end)) = fault_flush_range {
-                shootdown_range(mask, asid, start, end);
-            } else {
-                shootdown_page(mask, asid, fault_addr);
-            }
+            crate::probe!({
+                if let Some((start, end)) = fault_flush_range {
+                    shootdown_range(mask, asid, start, end);
+                } else {
+                    shootdown_page(mask, asid, fault_addr);
+                }
+            }, "mmap.file_fault.shootdown");
         }
         trace!(
             "[mmap] page fault commit result: pid={} vpn={:#x} shared={} committed={}",
