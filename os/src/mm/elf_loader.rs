@@ -52,16 +52,18 @@ impl<'a> ElfLoader<'a> {
     ///
     /// Static PIE keeps the existing full-image path because relocation
     /// processing currently needs the dynamic relocation bytes as one slice.
-    /// Other images use the bounded streaming path.
+    /// A directly executed runtime linker is also `ET_DYN` without
+    /// `PT_INTERP`, so it uses the same eager mapping path, but it does not
+    /// carry `DF_1_PIE` and must be allowed to perform its own bootstrap
+    /// relocations. Other images use the bounded streaming path.
     pub(crate) fn load_file(&mut self, file: &Arc<OSInode>) -> Result<LoadedElf, MmError> {
         let metadata = read_elf_metadata(file)?;
         let elf = xmas_elf::ElfFile::new(&metadata).map_err(|_| MmError::InvalidElf)?;
-        if is_static_pie(&elf)? {
+        if is_et_dyn_without_interp(&elf)? {
             let elf_data = file.read_all();
-            self.load_bytes(&elf_data)
-        } else {
-            self.load_file_at(file, None)
+            return self.load_bytes(&elf_data);
         }
+        self.load_file_at(file, None)
     }
 
     /// Load one in-memory ELF image into the target address space.
@@ -164,7 +166,7 @@ impl<'a> ElfLoader<'a> {
                 self.memory_set.insert_vma(vma, Some(seg_data))?;
             }
         }
-        if elf_type == xmas_elf::header::Type::SharedObject && interp_path.is_none() {
+        if needs_kernel_static_pie_relocations(&elf)? {
             apply_static_pie_relocations(self.memory_set, &elf, load_bias)?;
         }
         let max_end_va: VirtAddr = max_end_vpn.into();
@@ -391,7 +393,7 @@ impl<'a> ElfLoader<'a> {
     }
 }
 
-fn is_static_pie(elf: &xmas_elf::ElfFile<'_>) -> Result<bool, MmError> {
+fn is_et_dyn_without_interp(elf: &xmas_elf::ElfFile<'_>) -> Result<bool, MmError> {
     if elf.header.pt2.type_().as_type() != xmas_elf::header::Type::SharedObject {
         return Ok(false);
     }
@@ -402,6 +404,50 @@ fn is_static_pie(elf: &xmas_elf::ElfFile<'_>) -> Result<bool, MmError> {
         Ok::<bool, MmError>(found || is_interp)
     })?;
     Ok(!has_interp)
+}
+
+/// Return whether this image uses CosmOS's legacy kernel-relocated static PIE
+/// ABI. `ET_DYN` alone is not sufficient: a runtime linker such as glibc's
+/// `ld.so` has no `PT_INTERP` either, but its entry code deliberately runs
+/// before relocations and relocates the image itself. GNU linkers mark actual
+/// PIE executables with `DF_1_PIE`, while runtime linkers/shared objects leave
+/// that bit clear.
+fn needs_kernel_static_pie_relocations(elf: &xmas_elf::ElfFile<'_>) -> Result<bool, MmError> {
+    const ELF64_DYN_SIZE: usize = 16;
+    const DT_NULL: u64 = 0;
+    const DT_FLAGS_1: u64 = 0x6fff_fffb;
+
+    if !is_et_dyn_without_interp(elf)? {
+        return Ok(false);
+    }
+
+    for index in 0..elf.header.pt2.ph_count() {
+        let ph = elf.program_header(index).map_err(|_| MmError::InvalidElf)?;
+        if ph.get_type().map_err(|_| MmError::InvalidElf)? != xmas_elf::program::Type::Dynamic {
+            continue;
+        }
+
+        let offset = usize::try_from(ph.offset()).map_err(|_| MmError::InvalidElf)?;
+        let size = usize::try_from(ph.file_size()).map_err(|_| MmError::InvalidElf)?;
+        let end = offset.checked_add(size).ok_or(MmError::InvalidElf)?;
+        let bytes = elf.input.get(offset..end).ok_or(MmError::InvalidElf)?;
+        if bytes.len() % ELF64_DYN_SIZE != 0 {
+            return Err(MmError::InvalidElf);
+        }
+
+        for entry in bytes.chunks_exact(ELF64_DYN_SIZE) {
+            let tag = u64::from_le_bytes(entry[..8].try_into().map_err(|_| MmError::InvalidElf)?);
+            if tag == DT_NULL {
+                break;
+            }
+            if tag == DT_FLAGS_1 {
+                let flags =
+                    u64::from_le_bytes(entry[8..].try_into().map_err(|_| MmError::InvalidElf)?);
+                return Ok(flags & xmas_elf::dynamic::FLAG_1_PIE != 0);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn add_load_bias(addr: usize, load_bias: usize) -> Result<usize, MmError> {

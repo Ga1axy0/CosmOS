@@ -182,7 +182,23 @@ enum Auxv {
     Pagesz = 6,  // system page size
     Base = 7,    // base address of interpreter
     Entry = 9,   // entry point of program
+    Hwcap = 16,  // architecture-specific CPU capabilities
     Random = 25, // address of 16 random bytes
+}
+
+/// LoongArch Linux `AT_HWCAP` bits enabled by the current CosmOS user runtime.
+/// LASX is intentionally omitted: the current trap frame preserves LSX state,
+/// but CosmOS does not yet enable or save the 256-bit LASX registers.
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_HWCAP: usize = (1 << 0) // CPUCFG
+    | (1 << 1) // LAM
+    | (1 << 2) // UAL
+    | (1 << 3) // FPU
+    | (1 << 4); // LSX
+
+fn add_arch_auxv(auxv: &mut Vec<(Auxv, usize)>) {
+    #[cfg(target_arch = "loongarch64")]
+    auxv.push((Auxv::Hwcap, LOONGARCH_HWCAP));
 }
 
 /// Process Control Block
@@ -657,7 +673,9 @@ fn resolve_init_image(
 
 fn init_user_stack(token: usize, stack_top: usize, args: &[&str]) -> usize {
     let args: Vec<String> = args.iter().map(|arg| String::from(*arg)).collect();
-    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[], &[])
+    let mut auxv_extra = Vec::new();
+    add_arch_auxv(&mut auxv_extra);
+    init_user_stack_from_strings(token, stack_top, args.as_slice(), &[], &auxv_extra)
 }
 
 fn load_process_image(
@@ -697,14 +715,16 @@ fn load_process_image(
             app_load_info.phdr_vaddr, app_load_info.phnum
         );
 
-        let auxv_extra = vec![
+        let mut auxv_extra = Vec::new();
+        add_arch_auxv(&mut auxv_extra);
+        auxv_extra.extend([
             (Auxv::Phdr, app_load_info.phdr_vaddr),
             (Auxv::Phent, app_load_info.phent_size),
             (Auxv::Phnum, app_load_info.phnum),
             (Auxv::Pagesz, crate::config::PAGE_SIZE),
             (Auxv::Base, interp_base),
             (Auxv::Entry, app_load_info.entry_point),
-        ];
+        ]);
 
         (relocated_entry, auxv_extra)
     } else {
@@ -713,13 +733,15 @@ fn load_process_image(
             "App PHDR vaddr: {:#x}, phnum: {}",
             app_load_info.phdr_vaddr, app_load_info.phnum
         );
-        let auxv_extra = vec![
+        let mut auxv_extra = Vec::new();
+        add_arch_auxv(&mut auxv_extra);
+        auxv_extra.extend([
             (Auxv::Phdr, app_load_info.phdr_vaddr),
             (Auxv::Phent, app_load_info.phent_size),
             (Auxv::Phnum, app_load_info.phnum),
             (Auxv::Pagesz, crate::config::PAGE_SIZE),
             (Auxv::Entry, app_load_info.entry_point),
-        ];
+        ]);
         (app_load_info.entry_point, auxv_extra)
     };
 

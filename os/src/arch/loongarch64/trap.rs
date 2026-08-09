@@ -7,8 +7,9 @@ use crate::hal::traits::{
     CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
     TrapMachine,
 };
+use crate::mm::PageFaultAccess;
 use crate::signal::{SigSetT, SignalAbi, SignalAction, SignalBit, StackT};
-use crate::syscall::Pod;
+use crate::syscall::{translated_byte_buffer_with_access, Pod};
 use crate::trap::TrapContext;
 
 global_asm!(include_str!("trap.S"));
@@ -61,6 +62,212 @@ const ESUBCODE_ADEF: usize = 0;
 /// Address error for data-memory access. The subcode does not distinguish
 /// between a load and a store, so keep that ambiguity in the common cause.
 const ESUBCODE_ADEM: usize = 1;
+
+const LDH_OP: u32 = 0xa1;
+const LDHU_OP: u32 = 0xa9;
+const LDW_OP: u32 = 0xa2;
+const LDWU_OP: u32 = 0xaa;
+const LDD_OP: u32 = 0xa3;
+const STH_OP: u32 = 0xa5;
+const STW_OP: u32 = 0xa6;
+const STD_OP: u32 = 0xa7;
+
+const LDPTRW_OP: u32 = 0x24;
+const LDPTRD_OP: u32 = 0x26;
+const STPTRW_OP: u32 = 0x25;
+const STPTRD_OP: u32 = 0x27;
+
+const LDXH_OP: u32 = 0x7048;
+const LDXHU_OP: u32 = 0x7008;
+const LDXW_OP: u32 = 0x7010;
+const LDXWU_OP: u32 = 0x7050;
+const LDXD_OP: u32 = 0x7018;
+const STXH_OP: u32 = 0x7028;
+const STXW_OP: u32 = 0x7030;
+const STXD_OP: u32 = 0x7038;
+
+const FLDS_OP: u32 = 0xac;
+const FLDD_OP: u32 = 0xae;
+const FSTS_OP: u32 = 0xad;
+const FSTD_OP: u32 = 0xaf;
+
+const FSTXS_OP: u32 = 0x7070;
+const FSTXD_OP: u32 = 0x7078;
+const FLDXS_OP: u32 = 0x7060;
+const FLDXD_OP: u32 = 0x7068;
+
+/// Failure while decoding or servicing a user-mode unaligned instruction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UnalignedError {
+    /// The faulting instruction is not one of the supported scalar accesses.
+    UnsupportedInstruction(u32),
+    /// The user address is not readable/writable as required by the access.
+    InvalidUserMemory,
+}
+
+fn read_user_value(addr: usize, size: usize) -> Result<u64, UnalignedError> {
+    let buffers = translated_byte_buffer_with_access(
+        addr as *const u8,
+        size,
+        PageFaultAccess::Read,
+    )
+    .map_err(|_| UnalignedError::InvalidUserMemory)?;
+    let mut value = 0u64;
+    let mut offset = 0usize;
+    for buffer in buffers {
+        for byte in buffer.iter() {
+            value |= (*byte as u64) << (offset * 8);
+            offset += 1;
+        }
+    }
+    (offset == size)
+        .then_some(value)
+        .ok_or(UnalignedError::InvalidUserMemory)
+}
+
+fn write_user_value(addr: usize, value: u64, size: usize) -> Result<(), UnalignedError> {
+    let mut buffers = translated_byte_buffer_with_access(
+        addr as *const u8,
+        size,
+        PageFaultAccess::Write,
+    )
+    .map_err(|_| UnalignedError::InvalidUserMemory)?;
+    let mut offset = 0usize;
+    for buffer in buffers.iter_mut() {
+        for byte in buffer.iter_mut() {
+            *byte = (value >> (offset * 8)) as u8;
+            offset += 1;
+        }
+    }
+    if offset == size {
+        Ok(())
+    } else {
+        Err(UnalignedError::InvalidUserMemory)
+    }
+}
+
+fn sign_extend(value: u64, bits: usize) -> usize {
+    let shift = 64 - bits;
+    ((value << shift) as i64 >> shift) as usize
+}
+
+fn faulting_user_instruction(cx: &TrapContext) -> Result<u32, UnalignedError> {
+    let badi = read_badi() as u32;
+    if badi != 0 {
+        return Ok(badi);
+    }
+
+    let buffers = translated_byte_buffer_with_access(
+        cx.user_pc() as *const u8,
+        core::mem::size_of::<u32>(),
+        PageFaultAccess::Exec,
+    )
+    .map_err(|_| UnalignedError::InvalidUserMemory)?;
+    let mut bytes = [0u8; 4];
+    let mut offset = 0usize;
+    for buffer in buffers {
+        for byte in buffer.iter() {
+            bytes[offset] = *byte;
+            offset += 1;
+        }
+    }
+    if offset == bytes.len() {
+        Ok(u32::from_le_bytes(bytes))
+    } else {
+        Err(UnalignedError::InvalidUserMemory)
+    }
+}
+
+/// Emulate a LoongArch scalar unaligned user access.
+///
+/// LoongArch raises `ADEM` for these accesses when the underlying CPU does
+/// not provide hardware UAL. The instruction is decoded from `BADI` and the
+/// user bytes are accessed through the current process page table, so a
+/// cross-page access cannot recursively fault the kernel.
+pub fn emulate_user_unaligned(
+    cx: &mut TrapContext,
+    fault_addr: usize,
+) -> Result<(), UnalignedError> {
+    let instruction = faulting_user_instruction(cx)?;
+    let rd = (instruction & 0x1f) as usize;
+    let op22 = instruction >> 22;
+    let op24 = instruction >> 24;
+    let op15 = instruction >> 15;
+
+    let integer_load = if op22 == LDD_OP || op24 == LDPTRD_OP || op15 == LDXD_OP {
+        Some((8, false))
+    } else if op22 == LDW_OP || op24 == LDPTRW_OP || op15 == LDXW_OP {
+        Some((4, true))
+    } else if op22 == LDWU_OP || op15 == LDXWU_OP {
+        Some((4, false))
+    } else if op22 == LDH_OP || op15 == LDXH_OP {
+        Some((2, true))
+    } else if op22 == LDHU_OP || op15 == LDXHU_OP {
+        Some((2, false))
+    } else {
+        None
+    };
+
+    if let Some((size, signed)) = integer_load {
+        let value = read_user_value(fault_addr, size)?;
+        let value = if signed {
+            sign_extend(value, size * 8)
+        } else {
+            value as usize
+        };
+        if rd != 0 {
+            cx.arch.r[rd] = value;
+        }
+        cx.advance_user_pc(4);
+        return Ok(());
+    }
+
+    let integer_store = if op22 == STD_OP || op24 == STPTRD_OP || op15 == STXD_OP {
+        Some(8)
+    } else if op22 == STW_OP || op24 == STPTRW_OP || op15 == STXW_OP {
+        Some(4)
+    } else if op22 == STH_OP || op15 == STXH_OP {
+        Some(2)
+    } else {
+        None
+    };
+
+    if let Some(size) = integer_store {
+        write_user_value(fault_addr, cx.arch.r[rd] as u64, size)?;
+        cx.advance_user_pc(4);
+        return Ok(());
+    }
+
+    let fp_load = if op22 == FLDD_OP || op15 == FLDXD_OP {
+        Some(8)
+    } else if op22 == FLDS_OP || op15 == FLDXS_OP {
+        Some(4)
+    } else {
+        None
+    };
+
+    if let Some(size) = fp_load {
+        cx.arch.f[rd] = read_user_value(fault_addr, size)?;
+        cx.advance_user_pc(4);
+        return Ok(());
+    }
+
+    let fp_store = if op22 == FSTD_OP || op15 == FSTXD_OP {
+        Some(8)
+    } else if op22 == FSTS_OP || op15 == FSTXS_OP {
+        Some(4)
+    } else {
+        None
+    };
+
+    if let Some(size) = fp_store {
+        write_user_value(fault_addr, cx.arch.f[rd], size)?;
+        cx.advance_user_pc(4);
+        return Ok(());
+    }
+
+    Err(UnalignedError::UnsupportedInstruction(instruction))
+}
 
 /// LoongArch64 implementation of [`InterruptControl`](crate::hal::traits::InterruptControl).
 pub struct LoongArchInterruptControl;

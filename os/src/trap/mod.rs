@@ -635,10 +635,38 @@ pub fn trap_handler() -> ! {
                 }
             }
         }
-        TrapCause::StoreFault
-        | TrapCause::InstructionFault
-        | TrapCause::LoadFault
-        | TrapCause::DataAddressFault => {
+        TrapCause::DataAddressFault => {
+            #[cfg(target_arch = "loongarch64")]
+            {
+                match crate::arch::loongarch64::trap::emulate_user_unaligned(
+                    current_trap_cx(),
+                    trap_info.fault_addr,
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(
+                            "loongarch64 user unaligned emulation failed: ip={:#x}, fault_addr={:#x}, err={:?}",
+                            current_trap_cx().user_pc(),
+                            trap_info.fault_addr,
+                            err,
+                        );
+                        log_user_fault(
+                            "unaligned access",
+                            "unknown",
+                            trap_info.fault_addr,
+                            "SIGBUS",
+                        );
+                        current_add_signal(SignalBit::SIGBUS);
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                log_user_fault("access fault", "unknown", trap_info.fault_addr, "SIGSEGV");
+                current_add_signal(SignalBit::SIGSEGV);
+            }
+        }
+        TrapCause::StoreFault | TrapCause::InstructionFault | TrapCause::LoadFault => {
             log_user_fault("access fault", "unknown", trap_info.fault_addr, "SIGSEGV");
             current_add_signal(SignalBit::SIGSEGV);
         }
