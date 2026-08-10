@@ -102,10 +102,10 @@ pub const SYSCALL_PWRITEV: usize = 70;
 pub const SYSCALL_SENDFILE64: usize = 71;
 /// splice syscall
 pub const SYSCALL_SPLICE: usize = 76;
-/// pselect6_time32 syscall
-pub const SYSCALL_PSELECT6_TIME32: usize = 72;
-/// ppoll_time32 syscall
-pub const SYSCALL_PPOLL_TIME32: usize = 73;
+/// pselect6 syscall (LP64 timespec ABI)
+pub const SYSCALL_PSELECT6: usize = 72;
+/// ppoll syscall (LP64 timespec ABI)
+pub const SYSCALL_PPOLL: usize = 73;
 /// signalfd4 syscall
 pub const SYSCALL_SIGNALFD4: usize = 74;
 /// readlinkat syscall
@@ -192,8 +192,8 @@ pub const SYSCALL_SIGACTION: usize = 134;
 pub const SYSCALL_SIGPROCMASK: usize = 135;
 /// rt_sigpending syscall
 pub const SYSCALL_RT_SIGPENDING: usize = 136;
-/// rt_sigtimedwait_time32 syscall
-pub const SYSCALL_RT_SIGTIMEDWAIT_TIME32: usize = 137;
+/// rt_sigtimedwait syscall (LP64 timespec ABI)
+pub const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 /// sigreturn syscall
 pub const SYSCALL_SIGRETURN: usize = 139;
 /// set priority syscall
@@ -742,18 +742,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as i32,
         ),
         SYSCALL_ACCT => sys_acct(args[0] as *const u8),
-        SYSCALL_PSELECT6_TIME32 => sys_pselect6_time32(
+        SYSCALL_PSELECT6 => sys_pselect6(
             args[0] as i32,
             args[1] as *mut usize,
             args[2] as *mut usize,
             args[3] as *mut usize,
-            args[4] as *const OldTimespec32,
+            args[4] as *const Timespec,
             args[5] as *const u8,
         ),
-        SYSCALL_PPOLL_TIME32 => sys_ppoll_time32(
+        SYSCALL_PPOLL => sys_ppoll(
             args[0] as *mut PollFd,
             args[1] as u32,
-            args[2] as *const OldTimespec32,
+            args[2] as *const Timespec,
             args[3] as *const u8,
             args[4],
         ),
@@ -1042,10 +1042,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_RT_SIGPENDING => sys_rt_sigpending(args[0] as *mut u64, args[1]),
         SYSCALL_SIGSUSPEND => sys_sigsuspend(args[0] as *const u64, args[1]),
-        SYSCALL_RT_SIGTIMEDWAIT_TIME32 => sys_rt_sigtimedwait_time32(
+        SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u64,
             args[1] as *mut crate::task::SigInfo,
-            args[2] as *const OldTimespec32,
+            args[2] as *const Timespec,
             args[3],
         ),
         SYSCALL_SIGRETURN => sys_sigreturn(),

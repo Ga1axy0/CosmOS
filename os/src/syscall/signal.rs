@@ -1,5 +1,6 @@
 use crate::hal::ArchSignalAbi;
 use crate::signal::{register_signal_wait, SigInfo, SignalAbi, SignalWaitHandle, SignalWakeState};
+use crate::syscall::times::{timespec_to_ns, Timespec};
 use crate::syscall::{read_pod_from_user, write_pod_to_user, Pod, ERRNO};
 use crate::timer::{add_timer_with_signal_tag, get_time_ns};
 use crate::{
@@ -10,8 +11,6 @@ use crate::{
         TaskStatus, WaitReason,
     },
 };
-
-use crate::syscall::OldTimespec32;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
@@ -93,21 +92,12 @@ fn write_user_sigset(
     }
 }
 
-fn parse_sigtimedwait_timeout_ns(uts: *const OldTimespec32) -> Result<Option<u64>, ERRNO> {
+fn parse_sigtimedwait_timeout_ns(uts: *const Timespec) -> Result<Option<u64>, ERRNO> {
     if uts.is_null() {
         return Ok(None);
     }
     let timeout = read_pod_from_user(uts)?;
-    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
-        return Err(ERRNO::EINVAL);
-    }
-    let sec_ns = (timeout.tv_sec as u64)
-        .checked_mul(1_000_000_000)
-        .ok_or(ERRNO::EINVAL)?;
-    let timeout_ns = sec_ns
-        .checked_add(timeout.tv_nsec as u64)
-        .ok_or(ERRNO::EINVAL)?;
-    Ok(Some(timeout_ns))
+    timespec_to_ns(&timeout).map(Some)
 }
 
 fn timeout_ns_to_deadline_ns(timeout_ns: Option<u64>) -> Result<Option<u64>, ERRNO> {
@@ -511,17 +501,17 @@ pub fn sys_sigsuspend(mask: *const u64, sigsetsize: usize) -> isize {
     })
 }
 
-/// `rt_sigtimedwait_time32(2)`：等待并同步消费指定信号集合中的 pending signal。
+/// `rt_sigtimedwait(2)`：等待并同步消费指定信号集合中的 pending signal。
 ///
 /// 当前内核使用 64 位 `SignalBit`，并保留 4 字节 sigsetsize 的兼容读取。
-pub fn sys_rt_sigtimedwait_time32(
+pub fn sys_rt_sigtimedwait(
     uthese: *const u64,
     uinfo: *mut SigInfo,
-    uts: *const OldTimespec32,
+    uts: *const Timespec,
     sigsetsize: usize,
 ) -> isize {
     debug!(
-        "kernel:pid[{}] sys_rt_sigtimedwait_time32 uthese={:#x} uinfo={:#x} uts={:#x} sigsetsize={}",
+        "kernel:pid[{}] sys_rt_sigtimedwait uthese={:#x} uinfo={:#x} uts={:#x} sigsetsize={}",
         current_task().unwrap().process.upgrade().unwrap().getpid(),
         uthese as usize,
         uinfo as usize,

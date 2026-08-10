@@ -155,6 +155,12 @@ pub struct Timespec {
 
 impl Pod for Timespec {}
 
+// Both supported userspace ABIs are LP64 and use `__kernel_timespec`, whose
+// fields are signed 64-bit values. Negative inputs are represented as large
+// `usize` values here and rejected by `timespec_to_ns` below.
+const _: () = assert!(core::mem::size_of::<Timespec>() == 16);
+const _: () = assert!(core::mem::align_of::<Timespec>() == 8);
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ItimerSpec {
@@ -210,16 +216,6 @@ pub struct Timex {
 }
 
 impl Pod for Timex {}
-
-/// 32-bit timespec used by legacy *_time32 syscalls (tv_sec/tv_nsec are signed 32-bit)
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct OldTimespec32 {
-    pub tv_sec: i32,
-    pub tv_nsec: i32,
-}
-
-impl Pod for OldTimespec32 {}
 
 #[repr(C)]
 pub struct Tms {
@@ -317,7 +313,7 @@ fn timeval_to_ns(tv: &TimeVal) -> Result<u64, ERRNO> {
 }
 
 /// 将 `timespec` 转为纳秒时间长度。
-fn timespec_to_ns(ts: &Timespec) -> Result<u64, ERRNO> {
+pub(crate) fn timespec_to_ns(ts: &Timespec) -> Result<u64, ERRNO> {
     if ts.tv_sec > i64::MAX as usize || ts.tv_nsec >= 1_000_000_000 {
         return Err(ERRNO::EINVAL);
     }

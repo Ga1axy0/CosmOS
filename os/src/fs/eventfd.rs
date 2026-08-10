@@ -48,7 +48,9 @@ impl EventFdFile {
     }
 
     fn copy_value_from_user(buf: UserBuffer) -> Result<u64, ERRNO> {
-        if buf.len() != core::mem::size_of::<u64>() {
+        // Linux accepts eventfd reads and writes with any count of at least
+        // eight bytes, while consuming exactly one u64 value.
+        if buf.len() < core::mem::size_of::<u64>() {
             return Err(ERRNO::EINVAL);
         }
         let mut bytes = [0u8; core::mem::size_of::<u64>()];
@@ -59,7 +61,7 @@ impl EventFdFile {
     }
 
     fn copy_value_to_user(buf: UserBuffer, value: u64) -> Result<usize, ERRNO> {
-        if buf.len() != core::mem::size_of::<u64>() {
+        if buf.len() < core::mem::size_of::<u64>() {
             return Err(ERRNO::EINVAL);
         }
         let bytes = value.to_ne_bytes();
@@ -78,7 +80,7 @@ impl EventFdFile {
         buf: UserBuffer,
         nonblock: bool,
     ) -> Result<usize, ERRNO> {
-        if buf.len() != core::mem::size_of::<u64>() {
+        if buf.len() < core::mem::size_of::<u64>() {
             return Err(ERRNO::EINVAL);
         }
 

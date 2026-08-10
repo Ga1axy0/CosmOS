@@ -19,8 +19,7 @@ use crate::poll::{self, PollWakeState};
 use crate::sched::block_current_and_run_next;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::{OrErrno, ERRNO};
-use crate::syscall::times::Timespec;
-use crate::syscall::OldTimespec32;
+use crate::syscall::times::{timespec_to_ns, Timespec};
 use crate::syscall::{
     read_bytes_from_user, read_cstring_from_user, read_pod_from_user,
     translated_byte_buffer_with_access, write_bytes_to_user, write_pod_to_user, Pod,
@@ -1299,20 +1298,12 @@ fn has_unmasked_pending_signal() -> bool {
     false
 }
 
-fn parse_timeout_ns(tmo_p: *const OldTimespec32) -> Result<Option<u64>, ERRNO> {
+fn parse_timeout_ns(tmo_p: *const Timespec) -> Result<Option<u64>, ERRNO> {
     if tmo_p.is_null() {
         return Ok(None);
     }
     let tmo = read_pod_from_user(tmo_p)?;
-    if tmo.tv_sec < 0 || tmo.tv_nsec < 0 || tmo.tv_nsec >= 1_000_000_000 {
-        return Err(ERRNO::EINVAL);
-    }
-    let sec_ns = (tmo.tv_sec as u64)
-        .checked_mul(1_000_000_000)
-        .ok_or(ERRNO::EINVAL)?;
-    let nsec = tmo.tv_nsec as u64;
-    let timeout_ns = sec_ns.checked_add(nsec).ok_or(ERRNO::EINVAL)?;
-    Ok(Some(timeout_ns))
+    timespec_to_ns(&tmo).map(Some)
 }
 
 fn timeout_ns_to_deadline_ns(timeout_ns: Option<u64>) -> Result<Option<u64>, ERRNO> {
@@ -5061,17 +5052,17 @@ pub fn sys_umount(name: *const u8, _flags: usize) -> isize {
     })
 }
 
-/// `ppoll_time32(2)`：在 fd 集上等待事件，支持 32 位 timespec 与临时信号掩码。
+/// `ppoll(2)`：在 fd 集上等待事件，支持 LP64 timespec 与临时信号掩码。
 /// sigmask 按 Linux sigset_t 处理，内核内部统一保存为 64 位 SignalBit。
-pub fn sys_ppoll_time32(
+pub fn sys_ppoll(
     ufds: *mut PollFd,
-    nfds: u32,                   // length of ufds
-    tmo_p: *const OldTimespec32, // timeout, NULL for infinite
+    nfds: u32,                // length of ufds
+    tmo_p: *const Timespec,   // timeout, NULL for infinite
     sigmask: *const u8,
     sigsetsize: usize, // length of sigmasks
 ) -> isize {
     trace!(
-        "kernel:pid[{}] sys_ppoll_time32",
+        "kernel:pid[{}] sys_ppoll",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
@@ -5081,7 +5072,7 @@ pub fn sys_ppoll_time32(
         let deadline_ns = timeout_ns_to_deadline_ns(timeout_ns)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
 
-        let old_mask = apply_temp_signal_mask(sigmask, sigsetsize, "sys_ppoll_time32")?;
+        let old_mask = apply_temp_signal_mask(sigmask, sigsetsize, "sys_ppoll")?;
         let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline_ns, |polled| {
             write_back_pollfds(ufds, polled)
         });
@@ -5090,20 +5081,20 @@ pub fn sys_ppoll_time32(
     })
 }
 
-/// `pselect6_time32(2)`：在 `fd_set` 上等待事件，支持 32 位 timespec 与临时信号掩码。
+/// `pselect6(2)`：在 `fd_set` 上等待事件，支持 LP64 timespec 与临时信号掩码。
 ///
 /// 第 6 个参数遵循 Linux `pselect6` 约定：
 /// `struct { const sigset_t *ss; size_t ss_len; }`。
-pub fn sys_pselect6_time32(
+pub fn sys_pselect6(
     nfds: i32,
     readfds: *mut usize,
     writefds: *mut usize,
     exceptfds: *mut usize,
-    tmo_p: *const OldTimespec32,
+    tmo_p: *const Timespec,
     sigmask: *const u8,
 ) -> isize {
     trace!(
-        "kernel:pid[{}] sys_pselect6_time32",
+        "kernel:pid[{}] sys_pselect6",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     let token = current_user_token();
@@ -5136,13 +5127,13 @@ pub fn sys_pselect6_time32(
 
         let timeout_ns = parse_timeout_ns(tmo_p)?;
         // debug!(
-        //     "sys_pselect6_time32: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
+        //     "sys_pselect6: nfds={}, read_set={:?}, write_set={:?}, except_set={:?}, timeout_ms={:?}, sigmask={:p}",
         //     nfds, read_set, write_set, except_set, timeout_ms, sigmask
         // );
         let deadline_ns = timeout_ns_to_deadline_ns(timeout_ns)?;
         let pid = current_task().unwrap().process.upgrade().unwrap().getpid();
         let (sigmask_ptr, sigsetsize) = parse_pselect_sigmask_arg(sigmask)?;
-        let old_mask = apply_temp_signal_mask(sigmask_ptr, sigsetsize, "sys_pselect6_time32")?;
+        let old_mask = apply_temp_signal_mask(sigmask_ptr, sigsetsize, "sys_pselect6")?;
 
         let ret = poll_wait_loop_with_writeback(pid, &mut pollfds, deadline_ns, |polled| {
             write_back_pselect_fdsets(readfds, writefds, exceptfds, nfds, polled, &metas)
