@@ -2380,9 +2380,7 @@ impl ProcessControlBlock {
                 mapping.try_get_page(plan.page_idx)?
             }
         }, "mmap.file_fault.page_cache");
-        let fault_around_pages = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
-            && (plan.shared || !plan.map_perm.contains(MapPermission::W))
-        {
+        let fault_around_pages = if matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec) {
             Some(crate::probe!({
                 let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
                 let first_vpn = aligned_start.max(plan.vma_start.0);

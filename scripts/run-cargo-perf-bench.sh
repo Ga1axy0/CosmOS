@@ -7,11 +7,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LABEL="${1:-run}"
 SMP_COUNT="${SMP_COUNT:-8}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-180}"
+PERF_PROBE_VALUE="${PERF_PROBE_VALUE:-1}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/.make/cargo-perf}"
 LOG_PATH="$OUT_DIR/$LABEL.log"
 BUILD_LOG_PATH="$OUT_DIR/$LABEL-build.log"
 ROOTFS_RV="$PROJECT_ROOT/CosmOS-rootfs/rootfs-rv"
-GUEST_RUNNER="$SCRIPT_DIR/cargo-perf-guest.sh"
+GUEST_RUNNER="${GUEST_RUNNER:-$SCRIPT_DIR/cargo-perf-guest.sh}"
 LOG_PARSER="$SCRIPT_DIR/parse-cargo-perf-log.py"
 OVERLAY_DIR=""
 BENCH_ROOTFS=""
@@ -50,8 +51,12 @@ BOOTSTRAP_BASE="$OVERLAY_DIR/bootstrap.img"
 SDCARD_OVERLAY="$OVERLAY_DIR/sdcard.qcow2"
 BOOTSTRAP_OVERLAY="$OVERLAY_DIR/bootstrap.qcow2"
 
-echo "[cargo-perf-host] building instrumented RISC-V kernel"
-if ! make -C "$PROJECT_ROOT" kernel-rv PERF_PROBE=1 >"$BUILD_LOG_PATH" 2>&1; then
+if [[ "$PERF_PROBE_VALUE" == 1 ]]; then
+    echo "[cargo-perf-host] building instrumented RISC-V kernel"
+else
+    echo "[cargo-perf-host] building production RISC-V kernel"
+fi
+if ! make -C "$PROJECT_ROOT" kernel-rv PERF_PROBE="$PERF_PROBE_VALUE" >"$BUILD_LOG_PATH" 2>&1; then
     echo "[cargo-perf-host] kernel build failed: $BUILD_LOG_PATH" >&2
     tail -n 100 "$BUILD_LOG_PATH" >&2
     exit 1
@@ -79,7 +84,7 @@ qemu-img create -q -f qcow2 -F raw -b "$BOOTSTRAP_BASE" "$BOOTSTRAP_OVERLAY"
 sdcard_args="-drive file=$SDCARD_OVERLAY,if=none,format=qcow2,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
 bootstrap_args="-drive file=$BOOTSTRAP_OVERLAY,if=none,format=qcow2,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1"
 
-echo "[cargo-perf-host] running label=$LABEL smp=$SMP_COUNT timeout=${RUN_TIMEOUT}s"
+echo "[cargo-perf-host] running label=$LABEL smp=$SMP_COUNT perf_probe=$PERF_PROBE_VALUE timeout=${RUN_TIMEOUT}s"
 run_prefix=()
 if [[ -n "${QEMU_CPUSET:-}" ]]; then
     run_prefix=(taskset --cpu-list "$QEMU_CPUSET")
@@ -90,7 +95,7 @@ set +e
 # --foreground, timeout can stop it on a terminal read before any guest output
 # reaches the log.
 "${run_prefix[@]}" timeout --foreground "$RUN_TIMEOUT" \
-    make -C "$PROJECT_ROOT" fast-run FINAL=1 PERF_PROBE=1 SMP="$SMP_COUNT" \
+    make -C "$PROJECT_ROOT" fast-run FINAL=1 PERF_PROBE="$PERF_PROBE_VALUE" SMP="$SMP_COUNT" \
     FAST_RUN_MODE_ARGS= \
     FAST_RUN_QEMU_BLK_ARGS="$sdcard_args" \
     QEMU_COMP_EXTRA_BLK_ARGS="$bootstrap_args" \
@@ -107,7 +112,11 @@ fi
 
 echo "[cargo-perf-host] completed (qemu rc=$qemu_status): $LOG_PATH"
 if [[ -x "$LOG_PARSER" ]]; then
-    "$LOG_PARSER" "$LOG_PATH"
+    if rg -q '\[cargo-perf\] cargo_(new|run_release)' "$LOG_PATH"; then
+        "$LOG_PARSER" "$LOG_PATH"
+    else
+        rg '\[(process-perf|cargo-perf)\] (phase|cargo_|CARGO_|PROCESS_)' "$LOG_PATH" || true
+    fi
 else
     rg '\[cargo-perf\] cargo_(new|run_release)' "$LOG_PATH" || true
 fi

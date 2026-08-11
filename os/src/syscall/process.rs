@@ -1679,27 +1679,29 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                 child_tid,
                 child_pid
             );
-            let child_ppid = {
-                let child_inner = new_process.inner_exclusive_access();
-                child_inner
-                    .parent
-                    .as_ref()
-                    .and_then(|parent| parent.upgrade())
-                    .map(|parent| parent.getpid())
-                    .unwrap_or(0)
-            };
-            let child_thread_count = new_process.thread_count();
-            warn!(
-                "[clone-diag] process child parent_pid={} parent_caller_tid={} child_pid={} child_ppid={} child_thread_count={} flags={:#x} clone_parent={} vfork={}",
-                caller_pid,
-                caller_tid,
-                child_pid,
-                child_ppid,
-                child_thread_count,
-                clone_flags_arg,
-                flags.contains(CloneFlags::CLONE_PARENT),
-                vfork_clone
-            );
+            if log::log_enabled!(log::Level::Warn) {
+                let child_ppid = {
+                    let child_inner = new_process.inner_exclusive_access();
+                    child_inner
+                        .parent
+                        .as_ref()
+                        .and_then(|parent| parent.upgrade())
+                        .map(|parent| parent.getpid())
+                        .unwrap_or(0)
+                };
+                let child_thread_count = new_process.thread_count();
+                warn!(
+                    "[clone-diag] process child parent_pid={} parent_caller_tid={} child_pid={} child_ppid={} child_thread_count={} flags={:#x} clone_parent={} vfork={}",
+                    caller_pid,
+                    caller_tid,
+                    child_pid,
+                    child_ppid,
+                    child_thread_count,
+                    clone_flags_arg,
+                    flags.contains(CloneFlags::CLONE_PARENT),
+                    vfork_clone
+                );
+            }
             if vfork_clone {
                 // A vfork parent is released by the child's successful
                 // execve (or by _exit), not only after the child becomes a
@@ -1970,14 +1972,16 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
     trace!("kernel: sys_wait4");
     let process = current_process();
     let caller_pid = process.getpid();
-    let children_snapshot = snapshot_wait_children(&process)
-        .into_iter()
-        .map(|(_, child)| (child.pid, child.ppid, child.is_zombie))
-        .collect::<Vec<_>>();
-    warn!(
-        "[wait4-diag] enter caller_pid={} target_pid={} options={:#x} children={:?}",
-        caller_pid, pid, options, children_snapshot
-    );
+    if log::log_enabled!(log::Level::Warn) {
+        let children_snapshot = snapshot_wait_children(&process)
+            .into_iter()
+            .map(|(_, child)| (child.pid, child.ppid, child.is_zombie))
+            .collect::<Vec<_>>();
+        warn!(
+            "[wait4-diag] enter caller_pid={} target_pid={} options={:#x} children={:?}",
+            caller_pid, pid, options, children_snapshot
+        );
+    }
 
     let result = syscall_body!({
         // 只在低 32 位上校验选项，避免符号扩展把 `__WCLONE`(0x80000000) 误判为非法位。

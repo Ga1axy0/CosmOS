@@ -19,17 +19,27 @@ say() {
 snapshot_meminfo() {
     label=$1
     echo "===== CARGO_PERF_${label}_MEMINFO_BEGIN ====="
-    cat /proc/cosmos_meminfo
+    if [ -r /proc/cosmos_meminfo ]; then
+        cat /proc/cosmos_meminfo
+    elif [ -r /proc/meminfo ]; then
+        # Keep the same phase markers for the Linux comparison runner.  The
+        # host parser simply leaves CosmOS-only frame counters at zero.
+        cat /proc/meminfo
+    fi
     echo "===== CARGO_PERF_${label}_MEMINFO_END ====="
 }
 
 reset_phase_counters() {
     # Disable first so shell setup and counter reset do not leak into the
     # measured interval. /proc/io_perf resets all FS and block-I/O counters.
-    echo 0 > /proc/perf_probe_enable
-    echo 1 > /proc/perf_probe
-    echo 1 > /proc/io_perf
-    echo 1 > /proc/perf_probe_enable
+    if [ -w /proc/perf_probe_enable ]; then
+        echo 0 > /proc/perf_probe_enable
+        echo 1 > /proc/perf_probe
+        if [ -w /proc/io_perf ]; then
+            echo 1 > /proc/io_perf
+        fi
+        echo 1 > /proc/perf_probe_enable
+    fi
 }
 
 uptime_now() {
@@ -44,12 +54,18 @@ dump_phase_counters() {
     phase=$1
     # Stop timing before spawning cat. io_perf may include the tiny cost of
     # opening procfs, but no later workload can perturb the timing probes.
-    echo 0 > /proc/perf_probe_enable
+    if [ -w /proc/perf_probe_enable ]; then
+        echo 0 > /proc/perf_probe_enable
+    fi
     echo "===== CARGO_PERF_${phase}_IO_BEGIN ====="
-    cat /proc/io_perf
+    if [ -r /proc/io_perf ]; then
+        cat /proc/io_perf
+    fi
     echo "===== CARGO_PERF_${phase}_IO_END ====="
     echo "===== CARGO_PERF_${phase}_PROBE_BEGIN ====="
-    cat /proc/perf_probe
+    if [ -r /proc/perf_probe ]; then
+        cat /proc/perf_probe
+    fi
     echo "===== CARGO_PERF_${phase}_PROBE_END ====="
 }
 
@@ -60,7 +76,10 @@ finish() {
     # The benchmark runner is PID 1. Prefer an explicit shutdown, but exiting
     # still lets the kernel terminate the guest if the userspace command is
     # unavailable in a future public image.
-    poweroff -f 2>/dev/null || reboot -f 2>/dev/null || exit "$status"
+    poweroff -f 2>/dev/null \
+        || /bin/busybox poweroff -f 2>/dev/null \
+        || reboot -f 2>/dev/null \
+        || exit "$status"
 }
 
 say "CARGO_PERF_BEGIN"

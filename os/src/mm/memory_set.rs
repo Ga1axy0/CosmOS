@@ -2401,9 +2401,7 @@ impl MemorySet {
         plan: &FilePageFaultPlan,
         pages: Vec<(VirtPageNum, Arc<SpinNoIrqLock<CachePage>>)>,
     ) -> Result<PageFaultHandled, MmError> {
-        if !matches!(plan.access, PageFaultAccess::Read | PageFaultAccess::Exec)
-            || (!plan.shared && plan.map_perm.contains(MapPermission::W))
-        {
+        if !matches!(plan.access, PageFaultAccess::Read | PageFaultAccess::Exec) {
             return Ok(PageFaultHandled::NotHandled);
         }
         if !self.can_commit_file_page_fault(plan) {
@@ -2779,13 +2777,12 @@ impl MemorySet {
         if !self.can_commit_file_page_fault(plan) {
             return Ok(PageFaultHandled::NotHandled);
         }
-        if plan.access != PageFaultAccess::Write && !plan.map_perm.contains(MapPermission::W) {
-            // 只读/可执行的 MAP_PRIVATE 文件页仍可直接共享 page cache。
-            //
-            // 对于带 W 权限的数据段，若先接入只读 page cache、再等首次写入走 COW，
-            // 一些动态链接程序会在 very-early init 阶段立即修改页内指针表。
-            // 这里改为首次 fault 就直接物化私有页，避免同一页先读后写时跨越
-            // "direct-cache -> private" 两套状态机。
+        if plan.access != PageFaultAccess::Write {
+            // A read/execute fault can share the page-cache frame even when
+            // the VMA is writable.  Keep the PTE read-only and let the first
+            // store take the existing file-cache COW path.  This avoids
+            // allocating and copying writable ELF/data pages which are never
+            // modified by the process.
             return self.map_private_file_cache_page(plan, page);
         }
         self.map_private_page_in_vma(plan.vpn)?;
