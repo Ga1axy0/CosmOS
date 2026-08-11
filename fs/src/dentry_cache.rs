@@ -7,6 +7,15 @@ use spin::Mutex;
 
 use crate::vfs::Inode;
 
+// Cargo freshness checks keep directory entries for workspace sources,
+// registry crates, fingerprints, dep-info and build outputs live at the same
+// time.  A 4K cache cycles several times during one no-op `cargo build`, which
+// sends an otherwise hot metadata workload back through ext4.  Keep enough
+// entries for that working set while retaining a lower watermark for bounded
+// CLOCK reclaim once larger workloads exceed it.
+const DENTRY_CACHE_HIGH_WATERMARK: usize = 16 * 1024;
+const DENTRY_CACHE_LOW_WATERMARK: usize = 12 * 1024;
+
 /// Key for the dentry cache: `(fs_id, parent_inode_number, child_name)`.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct DentryKey {
@@ -55,8 +64,8 @@ impl DentryCache {
         Self {
             table: BTreeMap::new(),
             inactive: VecDeque::new(),
-            high_watermark: 4096,
-            low_watermark: 2304,
+            high_watermark: DENTRY_CACHE_HIGH_WATERMARK,
+            low_watermark: DENTRY_CACHE_LOW_WATERMARK,
             negative_entries: 0,
         }
     }

@@ -6,6 +6,13 @@ use spin::Mutex;
 
 use crate::vfs::{Inode, VfsNode};
 
+// Positive dentries hold strong inode references.  Keep the inode cache at
+// the same watermarks as the dentry cache so a metadata-heavy workload does
+// not repeatedly invoke a reclaim scan while every candidate is still pinned
+// by a hot dentry.
+const INODE_CACHE_HIGH_WATERMARK: usize = 16 * 1024;
+const INODE_CACHE_LOW_WATERMARK: usize = 12 * 1024;
+
 /// 稳定内存 inode 的缓存键。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct InodeCacheKey {
@@ -41,8 +48,8 @@ impl InodeCacheManager {
         Self {
             table: BTreeMap::new(),
             inactive: VecDeque::new(),
-            high_watermark: 2048,
-            low_watermark: 1536,
+            high_watermark: INODE_CACHE_HIGH_WATERMARK,
+            low_watermark: INODE_CACHE_LOW_WATERMARK,
         }
     }
 }
