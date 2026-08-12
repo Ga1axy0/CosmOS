@@ -1210,7 +1210,6 @@ impl ProcessControlBlock {
             let old_token = old_memory_set.token();
             inner.vm_layout = vm_layout;
             inner.exec_path = exec_path;
-            inner.environment = envs.clone();
             // POSIX: on exec, reset all user-defined signal handlers to SIG_DFL.
             // SIG_IGN dispositions are preserved across exec.
             for action in inner.signal_actions.table.iter_mut() {
@@ -1328,6 +1327,11 @@ impl ProcessControlBlock {
             envs.as_slice(),
             auxv_extra.as_slice(),
         );
+        // The user stack no longer borrows the kernel-side strings, so publish
+        // the new environment by moving it into the PCB.  Cloning it during
+        // every exec is particularly expensive for compiler processes with a
+        // large inherited environment.
+        self.inner_exclusive_access().environment = envs;
 
         // initialize trap_cx
         trace!(
@@ -2191,7 +2195,8 @@ impl ProcessControlBlock {
         inner.memory_set.msync_range(start, end)
     }
 
-    /// 处理当前进程的私有页写时复制缺页。
+    /// Handle a private COW fault for user-copy helpers which already
+    /// distinguish COW from lazy allocation.
     pub fn handle_private_cow_fault(&self, fault_addr: usize) -> Result<PageFaultHandled, MmError> {
         let _probe = crate::probe_scope!("mmap.handle_private_cow_fault");
         let (handled, reclaim) = {
@@ -2210,6 +2215,43 @@ impl ProcessControlBlock {
         };
         if let Some(reclaim) = reclaim {
             reclaim.flush_then_release();
+        }
+        Ok(handled)
+    }
+
+    /// Handle a user store fault, combining the private-COW and lazy
+    /// anonymous paths under one PCB lock.
+    pub fn handle_user_store_fault(&self, fault_addr: usize) -> Result<PageFaultHandled, MmError> {
+        let _probe = crate::probe_scope!("mmap.handle_user_store_fault");
+        let (handled, reclaim, token, mask) = {
+            let mut inner = self.inner.lock();
+            let token = inner.memory_set.token();
+            let (handled, batch) = inner
+                .memory_set
+                .handle_user_store_fault(VirtAddr::from(fault_addr))?;
+            let (reclaim, mask) = if let Some(batch) = batch {
+                (
+                    Some({
+                        let mask = inner.memory_set.record_local_tlb_change();
+                        DeferredUserReclaim::new_page(token, mask, fault_addr, batch)
+                    }),
+                    0,
+                )
+            } else if handled == PageFaultHandled::Handled {
+                (None, inner.memory_set.record_local_tlb_change())
+            } else {
+                (None, 0)
+            };
+            (handled, reclaim, token, mask)
+        };
+        if let Some(reclaim) = reclaim {
+            reclaim.flush_then_release();
+        } else if mask != 0 {
+            shootdown_page(
+                mask,
+                crate::hal::address_space_id_from_token(token),
+                fault_addr,
+            );
         }
         Ok(handled)
     }

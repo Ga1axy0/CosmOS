@@ -54,8 +54,13 @@ mkfifo "$INPUT_FIFO"
 exec 3<>"$INPUT_FIFO"
 
 echo "[linux-cargo-perf-host] running label=$LABEL smp=$SMP_COUNT timeout=${RUN_TIMEOUT}s"
+run_prefix=()
+if [[ -n "${QEMU_CPUSET:-}" ]]; then
+    run_prefix=(taskset --cpu-list "$QEMU_CPUSET")
+    echo "[linux-cargo-perf-host] pinning QEMU process tree to cpus=$QEMU_CPUSET"
+fi
 set +e
-timeout --foreground "$RUN_TIMEOUT" \
+"${run_prefix[@]}" timeout --foreground "$RUN_TIMEOUT" \
     qemu-system-riscv64 \
     -machine virt \
     -kernel "$LINUX_IMAGE" \
@@ -78,7 +83,7 @@ printf '%s\n' \
     'mount -t proc proc /proc' \
     'mkdir -p /host' \
     'mount -t 9p -o trans=virtio,version=9p2000.L host0 /host' \
-    "/bin/sh /host/$guest_runner_relative; /bin/busybox poweroff -f" \
+    "LMBENCH_GROUPS=${LMBENCH_GROUPS:-all} LMBENCH_CASES=${LMBENCH_CASES:-} LMBENCH_CASE_TIMEOUT=${LMBENCH_CASE_TIMEOUT:-45} /bin/sh /host/$guest_runner_relative; /bin/busybox poweroff -f" \
     >&3
 
 wait "$qemu_pid"

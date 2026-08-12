@@ -3887,6 +3887,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
 /// sync syscall
 pub fn sys_sync() -> isize {
     syscall_body!({
+        warn!("sync");
         sync_storage_all()?;
         Ok(0)
     })
@@ -3895,6 +3896,7 @@ pub fn sys_sync() -> isize {
 /// fsync syscall
 pub fn sys_fsync(fd: u32) -> isize {
     syscall_body!({
+        warn!("fsync: fd={}", fd);
         let file = get_any_file(fd as usize)?;
         file.sync()?;
         Ok(0)
@@ -3904,6 +3906,7 @@ pub fn sys_fsync(fd: u32) -> isize {
 /// fdatasync syscall
 pub fn sys_fdatasync(fd: u32) -> isize {
     syscall_body!({
+        warn!("fdatasync: fd={}", fd);
         let file = get_any_file(fd as usize)?;
         file.sync()?;
         Ok(0)
@@ -3913,6 +3916,7 @@ pub fn sys_fdatasync(fd: u32) -> isize {
 /// syncfs syscall
 pub fn sys_syncfs(fd: u32) -> isize {
     syscall_body!({
+        warn!("syncfs: fd={}", fd);
         let file = get_any_file(fd as usize)?;
         let inode = file.backing_inode().ok_or(ERRNO::EINVAL)?;
         sync_page_cache_fs(inode.fs_id())?;

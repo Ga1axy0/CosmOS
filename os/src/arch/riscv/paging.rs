@@ -7,7 +7,10 @@ const SATP_ASID_SHIFT: usize = 44;
 const SATP_ASID_BITS: usize = 16;
 const SATP_ASID_MASK: usize = ((1usize << SATP_ASID_BITS) - 1) << SATP_ASID_SHIFT;
 const PAGE_SIZE: usize = 4096;
-const TLB_RANGE_PAGE_LIMIT: usize = 32;
+// QEMU 10.1.x lowers every SFENCE.VMA operand form to the same full local TLB
+// flush. Keep a precise fence for a single page, but avoid repeating that full
+// flush for every page in a range. The current RISC-V platform is QEMU virt.
+const TLB_RANGE_PAGE_LIMIT: usize = 1;
 
 /// RISC-V Sv39 three-level paging implementation.
 pub struct Sv39Paging;

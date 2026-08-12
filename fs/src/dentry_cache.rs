@@ -24,6 +24,15 @@ struct DentryKey {
     name: String,
 }
 
+/// Directory-local bucket key.  Keeping the owned `String` one level below
+/// this key lets lookup/remove query it with `&str` instead of allocating a
+/// temporary `String` for every dentry-cache hit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DentryParentKey {
+    fs_id: u64,
+    parent_ino: u64,
+}
+
 /// A single dentry cache entry.
 struct DentryEntry {
     /// Strong reference to the child inode so hot dentries stay reusable even if
@@ -48,7 +57,11 @@ pub enum DentryLookup {
 
 /// Global dentry cache manager.
 struct DentryCache {
-    table: BTreeMap<DentryKey, DentryEntry>,
+    /// Parent directory to its cached child names.  `String: Borrow<str>`
+    /// makes the overwhelmingly common hit path allocation-free.
+    table: BTreeMap<DentryParentKey, BTreeMap<String, DentryEntry>>,
+    /// Total entries across all parent buckets.
+    entries: usize,
     /// CLOCK queue; the same key may appear more than once.
     inactive: VecDeque<DentryKey>,
     /// Start eviction when the table exceeds this size.
@@ -63,6 +76,7 @@ impl DentryCache {
     fn new() -> Self {
         Self {
             table: BTreeMap::new(),
+            entries: 0,
             inactive: VecDeque::new(),
             high_watermark: DENTRY_CACHE_HIGH_WATERMARK,
             low_watermark: DENTRY_CACHE_LOW_WATERMARK,
@@ -72,12 +86,12 @@ impl DentryCache {
 
     /// Look up a dentry by `(fs_id, parent_ino, name)`.
     fn lookup(&mut self, fs_id: u64, parent_ino: u64, name: &str) -> DentryLookup {
-        let key = DentryKey {
-            fs_id,
-            parent_ino,
-            name: String::from(name),
-        };
-        if let Some(entry) = self.table.get_mut(&key) {
+        let parent = DentryParentKey { fs_id, parent_ino };
+        if let Some(entry) = self
+            .table
+            .get_mut(&parent)
+            .and_then(|children| children.get_mut(name))
+        {
             entry.ref_bit = true;
             return match entry.child.as_ref() {
                 Some(child) => DentryLookup::Positive(Arc::clone(child)),
@@ -89,81 +103,83 @@ impl DentryCache {
 
     /// Insert or replace a positive `(parent, name) → child` mapping.
     fn insert(&mut self, fs_id: u64, parent_ino: u64, name: &str, child: &Arc<Inode>) {
-        let key = DentryKey {
-            fs_id,
-            parent_ino,
-            name: String::from(name),
-        };
-        if self.table.contains_key(&key) {
-            let was_negative = self
-                .table
-                .get(&key)
-                .map(|entry| entry.child.is_none())
-                .unwrap_or(false);
-            if was_negative {
+        let parent = DentryParentKey { fs_id, parent_ino };
+        if let Some(entry) = self
+            .table
+            .get_mut(&parent)
+            .and_then(|children| children.get_mut(name))
+        {
+            if entry.child.is_none() {
                 self.negative_entries = self.negative_entries.saturating_sub(1);
             }
-            let Some(entry) = self.table.get_mut(&key) else {
-                return;
-            };
             entry.child = Some(Arc::clone(child));
             entry.ref_bit = true;
             return;
         }
-        self.table.insert(
-            key.clone(),
+        let name = String::from(name);
+        self.table.entry(parent).or_default().insert(
+            name.clone(),
             DentryEntry {
                 child: Some(Arc::clone(child)),
                 ref_bit: true,
             },
         );
-        self.inactive.push_back(key);
+        self.entries += 1;
+        self.inactive.push_back(DentryKey {
+            fs_id,
+            parent_ino,
+            name,
+        });
         self.reclaim_if_needed();
     }
 
     /// Insert or replace a negative `(parent, name) → ENOENT` mapping.
     fn insert_negative(&mut self, fs_id: u64, parent_ino: u64, name: &str) {
-        let key = DentryKey {
-            fs_id,
-            parent_ino,
-            name: String::from(name),
-        };
-        if self.table.contains_key(&key) {
-            let was_positive = self
-                .table
-                .get(&key)
-                .map(|entry| entry.child.is_some())
-                .unwrap_or(false);
-            if was_positive {
+        let parent = DentryParentKey { fs_id, parent_ino };
+        if let Some(entry) = self
+            .table
+            .get_mut(&parent)
+            .and_then(|children| children.get_mut(name))
+        {
+            if entry.child.is_some() {
                 self.negative_entries += 1;
             }
-            let Some(entry) = self.table.get_mut(&key) else {
-                return;
-            };
             entry.child = None;
             entry.ref_bit = true;
             return;
         }
-        self.table.insert(
-            key.clone(),
+        let name = String::from(name);
+        self.table.entry(parent).or_default().insert(
+            name.clone(),
             DentryEntry {
                 child: None,
                 ref_bit: true,
             },
         );
-        self.inactive.push_back(key);
+        self.entries += 1;
+        self.inactive.push_back(DentryKey {
+            fs_id,
+            parent_ino,
+            name,
+        });
         self.negative_entries += 1;
         self.reclaim_if_needed();
     }
 
     /// Remove a single dentry (called on unlink / rmdir / rename).
     fn remove(&mut self, fs_id: u64, parent_ino: u64, name: &str) {
-        let key = DentryKey {
-            fs_id,
-            parent_ino,
-            name: String::from(name),
-        };
-        if let Some(entry) = self.table.remove(&key) {
+        let parent = DentryParentKey { fs_id, parent_ino };
+        let mut remove_parent = false;
+        let removed = self.table.get_mut(&parent).and_then(|children| {
+            let removed = children.remove(name);
+            remove_parent = children.is_empty();
+            removed
+        });
+        if remove_parent {
+            self.table.remove(&parent);
+        }
+        if let Some(entry) = removed {
+            self.entries = self.entries.saturating_sub(1);
             if entry.child.is_none() {
                 self.negative_entries = self.negative_entries.saturating_sub(1);
             }
@@ -178,14 +194,16 @@ impl DentryCache {
     /// parent is required in that case so positive and negative entries from
     /// the old namespace cannot leak into the new one.
     fn remove_parent(&mut self, fs_id: u64, parent_ino: u64) {
-        let mut removed_negative = 0usize;
-        self.table.retain(|key, entry| {
-            let remove = key.fs_id == fs_id && key.parent_ino == parent_ino;
-            if remove && entry.child.is_none() {
-                removed_negative += 1;
-            }
-            !remove
-        });
+        let parent = DentryParentKey { fs_id, parent_ino };
+        let Some(children) = self.table.remove(&parent) else {
+            return;
+        };
+        let removed_entries = children.len();
+        let removed_negative = children
+            .values()
+            .filter(|entry| entry.child.is_none())
+            .count();
+        self.entries = self.entries.saturating_sub(removed_entries);
         self.negative_entries = self.negative_entries.saturating_sub(removed_negative);
     }
 
@@ -194,7 +212,7 @@ impl DentryCache {
     // ------------------------------------------------------------------
 
     fn reclaim_if_needed(&mut self) {
-        while self.table.len() > self.high_watermark {
+        while self.entries > self.high_watermark {
             if !self.reclaim_one() {
                 break;
             }
@@ -202,13 +220,21 @@ impl DentryCache {
     }
 
     fn reclaim_one(&mut self) -> bool {
-        if self.table.len() <= self.low_watermark {
+        if self.entries <= self.low_watermark {
             return false;
         }
         let Some(key) = self.inactive.pop_front() else {
             return false;
         };
-        let Some(entry) = self.table.get_mut(&key) else {
+        let parent = DentryParentKey {
+            fs_id: key.fs_id,
+            parent_ino: key.parent_ino,
+        };
+        let Some(entry) = self
+            .table
+            .get_mut(&parent)
+            .and_then(|children| children.get_mut(key.name.as_str()))
+        else {
             // Already removed (e.g. via explicit remove()).
             return true;
         };
@@ -217,7 +243,17 @@ impl DentryCache {
             self.inactive.push_back(key);
             return true;
         }
-        if let Some(entry) = self.table.remove(&key) {
+        let mut remove_parent = false;
+        let removed = self.table.get_mut(&parent).and_then(|children| {
+            let removed = children.remove(key.name.as_str());
+            remove_parent = children.is_empty();
+            removed
+        });
+        if remove_parent {
+            self.table.remove(&parent);
+        }
+        if let Some(entry) = removed {
+            self.entries = self.entries.saturating_sub(1);
             if entry.child.is_none() {
                 self.negative_entries = self.negative_entries.saturating_sub(1);
             }
@@ -278,7 +314,7 @@ pub fn remove_parent_dentries(fs_id: u64, parent_ino: u64) {
 pub fn dentry_cache_stats() -> DentryCacheStats {
     let cache = DENTRY_CACHE.lock();
     DentryCacheStats {
-        entries: cache.table.len(),
+        entries: cache.entries,
         negative_entries: cache.negative_entries,
         inactive_entries: cache.inactive.len(),
         high_watermark: cache.high_watermark,

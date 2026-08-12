@@ -2327,6 +2327,32 @@ impl MemorySet {
             }
             return Ok(PageFaultHandled::NotHandled);
         }
+        self.handle_missing_lazy_user_fault(fault_va, access)
+    }
+
+    /// Handle the common store-fault case without looking up an absent PTE
+    /// once in the COW path and again in the lazy-anonymous path.
+    pub(crate) fn handle_user_store_fault(
+        &mut self,
+        fault_va: VirtAddr,
+    ) -> Result<(PageFaultHandled, Option<UserReleaseBatch>), MmError> {
+        if let Some(pte) = self.page_table.translate(fault_va.floor()) {
+            return self.handle_private_cow_fault_with_pte(fault_va, pte);
+        }
+        Ok((
+            self.handle_missing_lazy_user_fault(fault_va, PageFaultAccess::Write)?,
+            None,
+        ))
+    }
+
+    /// Materialize a lazy anonymous page after the caller established that
+    /// the faulting VPN has no present PTE.
+    fn handle_missing_lazy_user_fault(
+        &mut self,
+        fault_va: VirtAddr,
+        access: PageFaultAccess,
+    ) -> Result<PageFaultHandled, MmError> {
+        let vpn = fault_va.floor();
         let Some(area) = self.find_vma_containing(vpn) else {
             return Ok(PageFaultHandled::NotHandled);
         };
@@ -2473,7 +2499,12 @@ impl MemorySet {
                 mapped_end = mapped_end.max(page_start + PAGE_SIZE);
             }
         }
-        record_fault_around_commit(mapped_pages, leaf_preflights);
+        let flush_pages = if mapped_any {
+            (mapped_end - mapped_start) / PAGE_SIZE
+        } else {
+            0
+        };
+        record_fault_around_commit(mapped_pages, leaf_preflights, flush_pages);
         if mapped_any {
             self.flush_local_tlb_range_asid(mapped_start, mapped_end);
         } else if mapped_fault_page {
@@ -2629,11 +2660,21 @@ impl MemorySet {
         &mut self,
         fault_va: VirtAddr,
     ) -> Result<(PageFaultHandled, Option<UserReleaseBatch>), MmError> {
-        let mut batch = UserReleaseBatch::new();
         let vpn = fault_va.floor();
         let Some(pte) = self.page_table.translate(vpn) else {
             return Ok((PageFaultHandled::NotHandled, None));
         };
+        self.handle_private_cow_fault_with_pte(fault_va, pte)
+    }
+
+    /// Continue private-COW handling with the caller's already translated PTE.
+    fn handle_private_cow_fault_with_pte(
+        &mut self,
+        fault_va: VirtAddr,
+        pte: PageTableEntry,
+    ) -> Result<(PageFaultHandled, Option<UserReleaseBatch>), MmError> {
+        let mut batch = UserReleaseBatch::new();
+        let vpn = fault_va.floor();
         if pte.writable() {
             // 可能是其他 hart 已经把该页从 COW 只读状态放宽为可写，
             // 当前 hart 仍命中了陈旧的只读 TLB。刷新本地后让用户态重试。

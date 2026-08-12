@@ -22,6 +22,8 @@ use crate::mm::{
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::task::{current_task, SchedAttr, TaskControlBlock, WaitQueue, WaitReason};
+#[cfg(feature = "io_perf_counters")]
+use crate::timer::get_time_us;
 
 #[cfg(feature = "io_perf_counters")]
 static READ_PAGE_LOADS: AtomicUsize = AtomicUsize::new(0);
@@ -43,6 +45,14 @@ static WRITEBACK_BYTES: AtomicUsize = AtomicUsize::new(0);
 static WRITEBACK_BATCHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static WRITEBACK_BATCH_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Cumulative wall-clock time spent in page-cache writeback operations.
+///
+/// This measures the interval after a writeback owner has captured its page
+/// data and before writeback completion state is published.  It includes the
+/// lower filesystem/block-device write and completion bookkeeping, and covers
+/// both explicit sync and reclaim-triggered writeback.
+#[cfg(feature = "io_perf_counters")]
+static WRITEBACK_TIME_US: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static READAHEAD_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -95,6 +105,10 @@ static FAULT_AROUND_READY_PAGES: AtomicUsize = AtomicUsize::new(0);
 static FAULT_AROUND_MAPPED_PAGES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static FAULT_AROUND_LEAF_PREFLIGHTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_FLUSH_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static FAULT_AROUND_FLUSH_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_WRITEBACK_BATCH_PAGES: usize = 32;
 /// Bound speculative work independently of the normal page-cache watermarks.
@@ -1011,6 +1025,7 @@ pub fn reset_perf_counters() {
     WRITEBACK_BYTES.store(0, Ordering::Relaxed);
     WRITEBACK_BATCHES.store(0, Ordering::Relaxed);
     WRITEBACK_BATCH_PAGES.store(0, Ordering::Relaxed);
+    WRITEBACK_TIME_US.store(0, Ordering::Relaxed);
     READAHEAD_CALLS.store(0, Ordering::Relaxed);
     READAHEAD_PAGES.store(0, Ordering::Relaxed);
     READAHEAD_BYTES.store(0, Ordering::Relaxed);
@@ -1037,6 +1052,8 @@ pub fn reset_perf_counters() {
     FAULT_AROUND_READY_PAGES.store(0, Ordering::Relaxed);
     FAULT_AROUND_MAPPED_PAGES.store(0, Ordering::Relaxed);
     FAULT_AROUND_LEAF_PREFLIGHTS.store(0, Ordering::Relaxed);
+    FAULT_AROUND_FLUSH_CALLS.store(0, Ordering::Relaxed);
+    FAULT_AROUND_FLUSH_PAGES.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
@@ -1092,6 +1109,11 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  writeback_batch_pages {}",
         perf_load(&WRITEBACK_BATCH_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  writeback_time_us {}",
+        perf_load(&WRITEBACK_TIME_US)
     );
     let _ = writeln!(
         &mut out,
@@ -1195,6 +1217,16 @@ pub fn render_perf_counters() -> String {
     );
     let _ = writeln!(
         &mut out,
+        "  fault_around_flush_calls {}",
+        perf_load(&FAULT_AROUND_FLUSH_CALLS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  fault_around_flush_pages {}",
+        perf_load(&FAULT_AROUND_FLUSH_PAGES)
+    );
+    let _ = writeln!(
+        &mut out,
         "  direct_read_runs {}",
         perf_load(&DIRECT_READ_RUNS)
     );
@@ -1292,16 +1324,24 @@ pub fn release_mapped_page(page: &Arc<SpinNoIrqLock<CachePage>>) {
     page_guard.map_count = page_guard.map_count.saturating_sub(1);
 }
 
-/// Account pages committed by one file-fault-around batch and the number of
-/// page-table leaf preflights needed to make that batch failure-atomic.
-pub(crate) fn record_fault_around_commit(mapped_pages: usize, leaf_preflights: usize) {
+/// Account one file-fault-around commit, including the VA span invalidated
+/// after installing the PTEs. `flush_pages` is zero when no range was flushed.
+pub(crate) fn record_fault_around_commit(
+    mapped_pages: usize,
+    leaf_preflights: usize,
+    flush_pages: usize,
+) {
     #[cfg(feature = "io_perf_counters")]
     {
         FAULT_AROUND_MAPPED_PAGES.fetch_add(mapped_pages, Ordering::Relaxed);
         FAULT_AROUND_LEAF_PREFLIGHTS.fetch_add(leaf_preflights, Ordering::Relaxed);
+        if flush_pages != 0 {
+            FAULT_AROUND_FLUSH_CALLS.fetch_add(1, Ordering::Relaxed);
+            FAULT_AROUND_FLUSH_PAGES.fetch_add(flush_pages, Ordering::Relaxed);
+        }
     }
     #[cfg(not(feature = "io_perf_counters"))]
-    let _ = (mapped_pages, leaf_preflights);
+    let _ = (mapped_pages, leaf_preflights, flush_pages);
 }
 
 /// 将一个已经通过共享映射暴露给用户态的缓存页标记为脏页。
@@ -2340,6 +2380,8 @@ fn flush_writeback_batch(
         expected
     );
 
+    #[cfg(feature = "io_perf_counters")]
+    let writeback_start_us = get_time_us();
     match batch
         .owner_inode
         .write_at_result(page_start(start_page_idx), &batch.data)
@@ -2364,6 +2406,11 @@ fn flush_writeback_batch(
     for info in batch.pages {
         finish_page_writeback(mapping, info.page_idx, &info.page, write_ok);
     }
+    #[cfg(feature = "io_perf_counters")]
+    WRITEBACK_TIME_US.fetch_add(
+        get_time_us().saturating_sub(writeback_start_us),
+        Ordering::Relaxed,
+    );
 
     if write_ok {
         Ok(())
@@ -2456,6 +2503,8 @@ fn flush_page(
         let (page_idx, valid_bytes, ppn, owner_inode) =
             writeback_info.expect("writeback owner must provide page data");
         let mut write_ok = true;
+        #[cfg(feature = "io_perf_counters")]
+        let writeback_start_us = get_time_us();
         if valid_bytes != 0 {
             let bytes = ppn.get_bytes_array();
             #[cfg(feature = "io_perf_counters")]
@@ -2487,6 +2536,11 @@ fn flush_page(
         }
 
         finish_page_writeback(mapping, page_idx, page, write_ok);
+        #[cfg(feature = "io_perf_counters")]
+        WRITEBACK_TIME_US.fetch_add(
+            get_time_us().saturating_sub(writeback_start_us),
+            Ordering::Relaxed,
+        );
         if write_ok {
             return Ok(());
         }

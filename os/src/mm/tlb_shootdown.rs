@@ -1,7 +1,7 @@
 //! TLB shootdown state and deferred recycle helpers.
 
 use super::FrameTracker;
-use crate::config::MAX_HARTS;
+use crate::config::{MAX_HARTS, PAGE_SIZE};
 use crate::hal::hartid;
 use crate::hal::traits::AddressSpaceToken;
 #[cfg(feature = "cosmos-meminfo")]
@@ -247,6 +247,14 @@ static TLB_SHOOTDOWN_IPI_TARGETS: AtomicUsize = AtomicUsize::new(0);
 static TLB_SHOOTDOWN_ACK_WAITS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "cosmos-meminfo")]
 static TLB_SHOOTDOWN_ACK_WAIT_TICKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static LOCAL_TLB_RANGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static LOCAL_TLB_RANGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static LOCAL_TLB_RANGE_MULTI_PAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "cosmos-meminfo")]
+static LOCAL_TLB_RANGE_FLUSH_TICKS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "cosmos-meminfo")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -260,6 +268,14 @@ pub struct TlbShootdownStats {
     pub ack_waits: usize,
     /// Cumulative platform timer ticks spent waiting for remote acks.
     pub ack_wait_ticks: usize,
+    /// Number of local VA-range flush operations, including remote acknowledgements.
+    pub local_range_calls: usize,
+    /// Total number of virtual pages covered by local VA-range flush operations.
+    pub local_range_pages: usize,
+    /// Number of local VA-range flush operations spanning more than one page.
+    pub local_range_multi_page_calls: usize,
+    /// Cumulative platform timer ticks spent executing local VA-range flushes.
+    pub local_range_flush_ticks: usize,
 }
 
 /// Reset TLB shootdown counters after early memory-management setup.
@@ -269,6 +285,10 @@ pub fn reset_tlb_shootdown_stats() {
     TLB_SHOOTDOWN_IPI_TARGETS.store(0, Ordering::Release);
     TLB_SHOOTDOWN_ACK_WAITS.store(0, Ordering::Release);
     TLB_SHOOTDOWN_ACK_WAIT_TICKS.store(0, Ordering::Release);
+    LOCAL_TLB_RANGE_CALLS.store(0, Ordering::Release);
+    LOCAL_TLB_RANGE_PAGES.store(0, Ordering::Release);
+    LOCAL_TLB_RANGE_MULTI_PAGE_CALLS.store(0, Ordering::Release);
+    LOCAL_TLB_RANGE_FLUSH_TICKS.store(0, Ordering::Release);
 }
 
 /// Return cumulative TLB shootdown counters.
@@ -279,6 +299,10 @@ pub fn tlb_shootdown_stats() -> TlbShootdownStats {
         ipi_targets: TLB_SHOOTDOWN_IPI_TARGETS.load(Ordering::Acquire),
         ack_waits: TLB_SHOOTDOWN_ACK_WAITS.load(Ordering::Acquire),
         ack_wait_ticks: TLB_SHOOTDOWN_ACK_WAIT_TICKS.load(Ordering::Acquire),
+        local_range_calls: LOCAL_TLB_RANGE_CALLS.load(Ordering::Acquire),
+        local_range_pages: LOCAL_TLB_RANGE_PAGES.load(Ordering::Acquire),
+        local_range_multi_page_calls: LOCAL_TLB_RANGE_MULTI_PAGE_CALLS.load(Ordering::Acquire),
+        local_range_flush_ticks: LOCAL_TLB_RANGE_FLUSH_TICKS.load(Ordering::Acquire),
     }
 }
 
@@ -724,5 +748,25 @@ fn local_sfence_vma_page_asid(vaddr: usize, asid: usize) {
 
 /// 在当前 hart 上刷新一个 VA 范围；大范围自动退化为 ASID-wide fence。
 pub(super) fn local_sfence_vma_range_asid(start: usize, end: usize, asid: usize) {
+    if start >= end {
+        return;
+    }
+    #[cfg(feature = "cosmos-meminfo")]
+    let flush_start = {
+        let first_page = start & !(PAGE_SIZE - 1);
+        let last_page = end.saturating_sub(1) & !(PAGE_SIZE - 1);
+        let pages = (last_page - first_page) / PAGE_SIZE + 1;
+        LOCAL_TLB_RANGE_CALLS.fetch_add(1, Ordering::Relaxed);
+        LOCAL_TLB_RANGE_PAGES.fetch_add(pages, Ordering::Relaxed);
+        if pages > 1 {
+            LOCAL_TLB_RANGE_MULTI_PAGE_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        Plat::read_time()
+    };
     unsafe { crate::hal::flush_tlb_range_asid(start, end, asid) }
+    #[cfg(feature = "cosmos-meminfo")]
+    LOCAL_TLB_RANGE_FLUSH_TICKS.fetch_add(
+        Plat::read_time().wrapping_sub(flush_start),
+        Ordering::Relaxed,
+    );
 }

@@ -120,7 +120,10 @@ def main(argv: list[str]) -> int:
         "file_fault_s",
         "fault ready/calls",
         "around map/pre",
+        "around flush c/p",
         "commit_ms",
+        "TLB range c/p",
+        "TLB range ms",
         "lookup_s",
         "frame cache h/m",
         "alloc lock kticks",
@@ -148,7 +151,12 @@ def main(argv: list[str]) -> int:
                 f"{value(data, 'page_cache.fault_window_calls')}",
                 f"{value(data, 'page_cache.fault_around_mapped_pages')}/"
                 f"{value(data, 'page_cache.fault_around_leaf_preflights')}",
+                f"{value(data, 'page_cache.fault_around_flush_calls')}/"
+                f"{value(data, 'page_cache.fault_around_flush_pages')}",
                 f"{probe(data, 'mmap.file_fault.commit.around', 1) / 1e6:.1f}",
+                f"{mem_delta(data, 'LocalTlbRangeCalls')}/"
+                f"{mem_delta(data, 'LocalTlbRangePages')}",
+                f"{mem_delta(data, 'LocalTlbRangeFlushTicks') / 1e4:.1f}",
                 f"{lookup_us / 1e6:.3f}",
                 f"{mem_delta(data, 'FramePerCpuCacheHits')}/"
                 f"{mem_delta(data, 'FramePerCpuCacheMisses')}",

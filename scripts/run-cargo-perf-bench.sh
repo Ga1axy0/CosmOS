@@ -13,6 +13,10 @@ LOG_PATH="$OUT_DIR/$LABEL.log"
 BUILD_LOG_PATH="$OUT_DIR/$LABEL-build.log"
 ROOTFS_RV="$PROJECT_ROOT/CosmOS-rootfs/rootfs-rv"
 GUEST_RUNNER="${GUEST_RUNNER:-$SCRIPT_DIR/cargo-perf-guest.sh}"
+GUEST_PAYLOAD="${GUEST_PAYLOAD:-}"
+GUEST_PAYLOAD_DEST="${GUEST_PAYLOAD_DEST:-/root/guest-payload}"
+GUEST_GROUPS="${GUEST_GROUPS:-}"
+GUEST_CASES="${GUEST_CASES:-}"
 LOG_PARSER="$SCRIPT_DIR/parse-cargo-perf-log.py"
 OVERLAY_DIR=""
 BENCH_ROOTFS=""
@@ -67,6 +71,24 @@ cp -a "$ROOTFS_RV" "$BENCH_ROOTFS"
 echo "[cargo-perf-host] staging no-countdown runner in temporary rootfs"
 install -m 0755 "$GUEST_RUNNER" "$BENCH_ROOTFS/root/final_auto_run"
 install -m 0755 "$GUEST_RUNNER" "$BENCH_ROOTFS/root/final-auto-run"
+if [[ -n "$GUEST_PAYLOAD" ]]; then
+    if [[ ! -f "$GUEST_PAYLOAD" ]]; then
+        echo "guest payload does not exist: $GUEST_PAYLOAD" >&2
+        exit 2
+    fi
+    payload_path="$BENCH_ROOTFS$GUEST_PAYLOAD_DEST"
+    mkdir -p "$(dirname "$payload_path")"
+    install -m 0755 "$GUEST_PAYLOAD" "$payload_path"
+    echo "[cargo-perf-host] staged guest payload at $GUEST_PAYLOAD_DEST"
+fi
+if [[ -n "$GUEST_GROUPS" ]]; then
+    printf '%s\n' "$GUEST_GROUPS" > "$BENCH_ROOTFS/root/lmbench-groups"
+    echo "[cargo-perf-host] staged guest groups=$GUEST_GROUPS"
+fi
+if [[ -n "$GUEST_CASES" ]]; then
+    printf '%s\n' "$GUEST_CASES" > "$BENCH_ROOTFS/root/lmbench-cases"
+    echo "[cargo-perf-host] staged guest cases=$GUEST_CASES"
+fi
 
 echo "[cargo-perf-host] repacking temporary bootstrap disk"
 PACK_USER_APPS=0 LOOP_FAT32_ENABLE=0 EXTRA_MIB=16 MIN_SIZE_MIB=64 \

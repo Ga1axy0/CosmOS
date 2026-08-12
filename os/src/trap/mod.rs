@@ -462,23 +462,13 @@ pub fn trap_handler() -> ! {
             );
             let process = current_process();
             let mut handled = false;
-            match process.handle_private_cow_fault(trap_info.fault_addr) {
+            match process.handle_user_store_fault(trap_info.fault_addr) {
                 Ok(PageFaultHandled::Handled) => handled = true,
                 Ok(PageFaultHandled::NotHandled) => {}
                 Err(MmError::OutOfMemory) => {
-                    handle_user_oom("private_cow", "write", trap_info.fault_addr);
+                    handle_user_oom("user_store", "write", trap_info.fault_addr);
                 }
                 Err(_) => {}
-            }
-            if !handled {
-                match process.handle_lazy_user_fault(trap_info.fault_addr, PageFaultAccess::Write) {
-                    Ok(PageFaultHandled::Handled) => handled = true,
-                    Ok(PageFaultHandled::NotHandled) => {}
-                    Err(MmError::OutOfMemory) => {
-                        handle_user_oom("lazy_user", "write", trap_info.fault_addr);
-                    }
-                    Err(_) => {}
-                }
             }
             if !handled {
                 match current_process()
@@ -516,7 +506,9 @@ pub fn trap_handler() -> ! {
                         current_add_signal(SignalBit::SIGSEGV);
                     }
                 }
-            } else if process.exec_path().ends_with("entry-static.exe") {
+            } else if log::log_enabled!(log::Level::Debug)
+                && process.exec_path().ends_with("entry-static.exe")
+            {
                 let start_brk = {
                     let inner = process.inner_exclusive_access();
                     inner.vm_layout.start_brk

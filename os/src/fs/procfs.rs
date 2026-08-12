@@ -200,6 +200,18 @@ fn build_cosmos_meminfo() -> String {
     let _ = writeln!(&mut out, "TlbShootdownIpiTargets: {}", tlb.ipi_targets);
     let _ = writeln!(&mut out, "TlbShootdownAckWaits: {}", tlb.ack_waits);
     let _ = writeln!(&mut out, "TlbShootdownAckWaitTicks: {}", tlb.ack_wait_ticks);
+    let _ = writeln!(&mut out, "LocalTlbRangeCalls: {}", tlb.local_range_calls);
+    let _ = writeln!(&mut out, "LocalTlbRangePages: {}", tlb.local_range_pages);
+    let _ = writeln!(
+        &mut out,
+        "LocalTlbRangeMultiPageCalls: {}",
+        tlb.local_range_multi_page_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "LocalTlbRangeFlushTicks: {}",
+        tlb.local_range_flush_ticks
+    );
     let _ = writeln!(&mut out, "ProcessCreateCalls: {}", process.create_calls);
     let _ = writeln!(&mut out, "ProcessExecCalls: {}", process.exec_calls);
     let _ = writeln!(&mut out, "ProcessExitCalls: {}", process.exit_calls);
