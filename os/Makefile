@@ -58,7 +58,28 @@ APPS := ../user/src/bin/*
 OFFLINE :=
 
 # BOARD
-BOARD := qemu
+# Keep QEMU as the default while allowing a compile-time LoongArch board
+# backend to be selected with `BOARD=ls2k1000-nebula`.
+BOARD ?= qemu
+ifeq ($(ARCH),loongarch64)
+	# Use the architecture's portable aligned-access baseline for every board.
+	# UAL is a code-generation contract, so it cannot safely be enabled or
+	# disabled after CPUCFG1 is read at runtime.
+	TARGET_RUSTFLAGS_ENV := CARGO_TARGET_LOONGARCH64_UNKNOWN_NONE_RUSTFLAGS='-Ctarget-feature=-ual'
+else
+	TARGET_RUSTFLAGS_ENV :=
+endif
+ifeq ($(BOARD),qemu)
+	PLATFORM_FEATURE := platform-qemu-virt
+else ifeq ($(BOARD),ls2k1000-nebula)
+	ifeq ($(ARCH),loongarch64)
+		PLATFORM_FEATURE := platform-ls2k1000-nebula
+	else
+$(error BOARD=ls2k1000-nebula requires ARCH=loongarch64)
+	endif
+else
+$(error Unsupported BOARD '$(BOARD)'. Use qemu or ls2k1000-nebula)
+endif
 SBI ?= rustsbi
 QEMU_VERSION := $(shell $(QEMU) --version 2>/dev/null | head -n1 | sed -E 's/.*version ([0-9.]+).*/\1/')
 QEMU_MAJOR := $(shell echo "$(QEMU_VERSION)" | cut -d. -f1)
@@ -164,9 +185,9 @@ fs-img:
 kernel:
 	@echo Platform: $(BOARD)
 ifeq ($(QEMU7_CFG),--cfg qemu7)
-	@LOG=$(LOG) cargo rustc $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) $(EXTRA_FEATURES) -- --cfg qemu7
+	@$(TARGET_RUSTFLAGS_ENV) LOG=$(LOG) cargo rustc $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) --features $(PLATFORM_FEATURE) $(EXTRA_FEATURES) -- --cfg qemu7
 else
-	@LOG=$(LOG) cargo build $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) $(EXTRA_FEATURES)
+	@$(TARGET_RUSTFLAGS_ENV) LOG=$(LOG) cargo build $(MODE_ARG) --target $(TARGET) --no-default-features --features $(MAIN_FS) --features $(PLATFORM_FEATURE) $(EXTRA_FEATURES)
 endif
 
 clean:

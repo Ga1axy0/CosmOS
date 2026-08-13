@@ -812,7 +812,10 @@ impl TtyCore {
 
     /// 向底层终端写入一个字节。
     pub fn write_byte(&self, ch: u8) {
-        // TODO: 后续在这里接入输出后处理（OPOST/ONLCR 等）。
+        let oflag = self.state.lock().termios.oflag;
+        if ch == b'\n' && oflag & OFLAG_OPOST != 0 && oflag & OFLAG_ONLCR != 0 {
+            self.driver.write(b'\r');
+        }
         self.driver.write(ch);
     }
 
@@ -1048,7 +1051,7 @@ impl File for TtyFile {
         let mut n = 0usize;
         for slice in buf.buffers.iter() {
             for &ch in slice.iter() {
-                // 逐字节透传到底层驱动，先保持与旧 stdio 行为一致。
+                // 返回值按用户提供的字节计数；ONLCR 额外生成的 CR 不计入。
                 self.core.write_byte(ch);
                 n += 1;
             }

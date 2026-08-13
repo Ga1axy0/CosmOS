@@ -2,7 +2,13 @@
 
 mod virtio_blk;
 
+#[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
+mod ahci;
+
 pub use virtio_blk::VirtIOBlock;
+
+#[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
+pub(crate) use ahci::probe_ahci;
 
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ReschedReason, SchedAttr, TaskControlBlock, TaskStatus, WaitQueue, WaitReason};

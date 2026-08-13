@@ -574,6 +574,15 @@ pub fn init_rootfs() -> Result<(), ERRNO> {
         let primary_path = alloc::format!("/dev/{}", primary_name);
         let secondary_path = alloc::format!("/dev/{}", secondary_name);
         let map = BLOCK_DEVICES.lock();
+        #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
+        if let Some((partition_name, partition)) = (1..=128).find_map(|index| {
+            let name = alloc::format!("{}{}", primary_name, index);
+            map.get(&name).cloned().map(|device| (name, device))
+        }) {
+            let partition_path = alloc::format!("/dev/{}", partition_name);
+            println!("[ahci] using {} as root filesystem", partition_path);
+            return init_rootfs_from_device(partition_path, partition, None);
+        }
         if let Some(dev) = map.get(&secondary_name).cloned() {
             let extra_dev = map
                 .get(&primary_name)
@@ -589,6 +598,14 @@ pub fn init_rootfs() -> Result<(), ERRNO> {
         }
     };
 
+    init_rootfs_from_device(root_dev_name, root_dev, extra_dev)
+}
+
+fn init_rootfs_from_device(
+    root_dev_name: String,
+    root_dev: Arc<dyn fs::BlockDevice>,
+    extra_dev: Option<(String, Arc<dyn fs::BlockDevice>)>,
+) -> Result<(), ERRNO> {
     #[cfg(feature = "fat32")]
     {
         use fs::Fat32FileSystem;

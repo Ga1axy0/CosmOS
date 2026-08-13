@@ -103,7 +103,10 @@ pub fn init() {
     #[cfg(feature = "cosmos-meminfo")]
     reset_anonymous_page_stats();
     heap_allocator::init_heap();
-    KERNEL_SPACE.lock().activate();
+    let kernel_space = &*KERNEL_SPACE;
+    let kernel_space_guard = kernel_space.lock();
+    kernel_space_guard.activate();
+    drop(kernel_space_guard);
     asid::init();
     heap_allocator::init_kernel_heap_mapping();
     heap_allocator::init_heap_virtual_window();

@@ -273,12 +273,16 @@ fn wait_for_bootstrap() {
 
 /// bootstrap hart 的主入口
 fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
+    platform::early_runtime_diagnostics();
     clear_bss();
     BOOT_BSS_READY.store(0, Ordering::Release);
     bootinfo::init(fdt_ptr);
     // Install TLB refill handler and page-walker CSRs before activating page tables.
     trap::init();
     mm::init();
+    if !platform::continue_full_boot() {
+        platform::halt_early_bringup();
+    }
     // mm::remap_test();
     klog::init();
     let hart_count = detect_hart_count();
@@ -288,9 +292,12 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     info!("hart {} elected as bootstrap hart", hart_id);
     drivers::init();
     platform::init();
-    print_boot_stage("devices", "virtio buses enumerated");
+    print_boot_stage("devices", "firmware-described buses enumerated");
     net::init();
-    print_boot_stage("network", "smoltcp stack synchronized");
+    print_boot_stage("network", "smoltcp stack initialized");
+    if !platform::continue_storage_boot() {
+        panic!("[kernel] firmware exposed no supported block device");
+    }
     if let Err(err) = fs::init() {
         panic!("[kernel] filesystem init failed: {:?}", err);
     }

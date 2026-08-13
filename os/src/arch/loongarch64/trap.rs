@@ -2,7 +2,6 @@
 
 use core::arch::{asm, global_asm};
 
-use crate::config::TRAMPOLINE;
 use crate::hal::traits::{
     CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
     TrapMachine,
@@ -28,6 +27,8 @@ const CSR_TLBREHI: usize = 0x8e;
 const CSR_PWCL: usize = 0x1c;
 const CSR_PWCH: usize = 0x1d;
 const CSR_STLBPS: usize = 0x1e;
+const CSR_IMPCTL1: usize = 0x80;
+const IMPCTL1_STFILL: usize = 1 << 8;
 
 const CRMD_IE: usize = 1 << 2;
 const EUEN_FPEN: usize = 1 << 0;
@@ -45,6 +46,7 @@ const ECODE_PIS: usize = 0x2;
 const ECODE_PIF: usize = 0x3;
 const ECODE_PME: usize = 0x4;
 const ECODE_ADE: usize = 0x8;
+const ECODE_ALE: usize = 0x9;
 const ECODE_SYS: usize = 0xb;
 const ECODE_INE: usize = 0xd;
 const ECODE_FPD: usize = 0xf;
@@ -238,19 +240,32 @@ impl InterruptControl for LoongArchInterruptControl {
             fn __trap_from_kernel();
             fn __tlb_refill();
         }
-        // PWCL: PTbase=12, PTwidth=9, Dir1base=21, Dir1width=9, Dir2base=30, Dir2width=9
-        // PWCH: Dir3=unused (3-level paging: root=Dir2, middle=Dir1, leaf=PT)
-        const PWCL: usize = 12 | (9 << 5) | (21 << 10) | (9 << 15) | (30 << 20) | (9 << 25);
-        const PWCH: usize = 0;
+        // Match Linux's LoongArch64 three-level walker layout:
+        // PT[20:12], Dir1[29:21], Dir2 unused, Dir3/PGD[38:30].
+        const PWCL: usize = 12 | (9 << 5) | (21 << 10) | (9 << 15);
+        const PWCH: usize = 30 | (9 << 6);
         asm!(
+            // Use one common general-exception entry. Firmware may leave
+            // ECFG.VS nonzero, which would add an ecode-dependent offset.
+            "li.d   $t2, {ecfg_vs_mask}",
+            "csrxchg $zero, $t2, {ecfg_csr}",
+            // Linux clears the implementation-specific STFILL bit for 4 KiB
+            // pages. Preserve all other firmware/CPU tuning bits.
+            "csrrd $t0, {impctl1_csr}",
+            "li.d   $t1, {stfill_mask}",
+            "andn   $t0, $t0, $t1",
+            "csrwr  $t0, {impctl1_csr}",
             "csrwr {eentry}, {eentry_csr}",
             "csrwr {tlbr}, {tlbr_csr}",
             "csrwr {pwcl}, {pwcl_csr}",
             "csrwr {pwch}, {pwch_csr}",
             // STLBPS / TLBREHI.PS: page size = 12 (4KB) for software-managed
             // refill entries as well as the shared TLB configuration.
+            // CSRWR replaces its source register with the old CSR value, so
+            // reload 12 before each write.
             "ori   $t0, $zero, 12",
             "csrwr $t0, {stlbps_csr}",
+            "ori   $t0, $zero, 12",
             "csrwr $t0, {tlbrehi_csr}",
             eentry     = in(reg) (__trap_from_kernel as usize),
             eentry_csr = const CSR_EENTRY,
@@ -262,16 +277,23 @@ impl InterruptControl for LoongArchInterruptControl {
             pwch_csr   = const CSR_PWCH,
             stlbps_csr = const CSR_STLBPS,
             tlbrehi_csr = const CSR_TLBREHI,
+            impctl1_csr = const CSR_IMPCTL1,
+            stfill_mask = const IMPCTL1_STFILL,
+            ecfg_csr = const CSR_ECFG,
+            ecfg_vs_mask = const (0b111 << 16),
             out("$t0") _,
+            out("$t1") _,
+            out("$t2") _,
         );
     }
 
     unsafe fn set_user_trap_entry() {
         extern "C" {
             fn __alltraps();
-            fn strampoline();
         }
-        let trap_entry = __alltraps as usize - strampoline as usize + TRAMPOLINE;
+        // PLV0 keeps the cached DMW active while a user PGDL is installed, so
+        // the linked kernel entry is reachable without a trampoline TLB hit.
+        let trap_entry = __alltraps as usize;
         asm!(
             "csrwr {entry}, {eentry}",
             entry = in(reg) trap_entry,
@@ -297,14 +319,13 @@ impl TrapMachine for LoongArchTrapMachine {
             // enabled per hart, but decode these explicitly so a future
             // unsupported extension produces SIGILL instead of a kernel
             // panic.
-            ECODE_INE | ECODE_FPD | ECODE_LSXDIS | ECODE_LASXDIS => {
-                TrapCause::IllegalInstruction
-            }
+            ECODE_INE | ECODE_FPD | ECODE_LSXDIS | ECODE_LASXDIS => TrapCause::IllegalInstruction,
             ECODE_ADE => match esubcode {
                 ESUBCODE_ADEF => TrapCause::InstructionFault,
                 ESUBCODE_ADEM => TrapCause::DataAddressFault,
                 _ => TrapCause::Unknown,
             },
+            ECODE_ALE => TrapCause::DataAddressFault,
             ECODE_INT => decode_interrupt_cause(estat, ecfg),
             _ => TrapCause::Unknown,
         };
@@ -332,9 +353,8 @@ impl TrapMachine for LoongArchTrapMachine {
     unsafe fn return_to_user(trap_cx_user_va: usize, user_token: usize) -> ! {
         extern "C" {
             fn __restore();
-            fn strampoline();
         }
-        let restore_va = __restore as usize - strampoline as usize + TRAMPOLINE;
+        let restore_va = __restore as usize;
         asm!(
             "ibar 0",
             "jirl $zero, {restore}, 0",

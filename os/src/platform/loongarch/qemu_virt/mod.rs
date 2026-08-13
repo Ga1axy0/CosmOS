@@ -12,7 +12,6 @@ pub use board::{
 pub use irq::{
     console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
 };
-pub use pci::probe_platform_devices;
 
 use crate::drivers::chardev::CharDevice;
 use crate::hal::traits::{HartCtrl, Timer};
@@ -36,10 +35,21 @@ pub const fn continue_full_boot() -> bool {
     true
 }
 
-/// Continue to the root filesystem only when the FDT exposes the supported
-/// QEMU PCI/interrupt topology. LS2K storage remains a separate driver task.
+/// Continue to the root filesystem only after a block device was registered.
 pub fn continue_storage_boot() -> bool {
-    is_qemu_virt()
+    !crate::drivers::block::BLOCK_DEVICES.lock().is_empty()
+}
+
+/// Probe the storage/network transports exposed by the selected FDT.
+pub fn probe_platform_devices() {
+    #[cfg(feature = "platform-ls2k1000-nebula")]
+    {
+        if crate::bootinfo::get().ahci().is_some() {
+            crate::drivers::block::probe_ahci();
+            return;
+        }
+    }
+    pci::probe_platform_devices();
 }
 
 /// Stop after the common early bring-up stages when requested by a backend.

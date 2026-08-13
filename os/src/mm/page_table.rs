@@ -155,15 +155,34 @@ pub struct PageTable {
 }
 
 impl PageTable {
+    /// Construct a page table directly in its final early-boot destination.
+    ///
+    /// This avoids passing a `PageTable` aggregate by value before the normal
+    /// kernel address space and allocator environment are fully established.
+    pub(crate) unsafe fn init_new_at(output: *mut Self) -> Result<(), MmError> {
+        let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
+        #[cfg(feature = "cosmos-meminfo")]
+        account_tracked_page_table_alloc();
+        let root_ppn = frame.ppn;
+
+        let root_frame = Arc::new(PageTableRootFrame { _frame: frame });
+
+        core::ptr::addr_of_mut!((*output).root_ppn).write(root_ppn);
+        core::ptr::addr_of_mut!((*output).root_frame).write(Some(root_frame));
+        core::ptr::addr_of_mut!((*output).frames).write(Vec::new());
+        Ok(())
+    }
+
     /// Create a new page table
     pub fn new() -> Result<Self, MmError> {
         let frame = frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?;
         #[cfg(feature = "cosmos-meminfo")]
         account_tracked_page_table_alloc();
         let root_ppn = frame.ppn;
+        let root_frame = Arc::new(PageTableRootFrame { _frame: frame });
         Ok(PageTable {
             root_ppn,
-            root_frame: Some(Arc::new(PageTableRootFrame { _frame: frame })),
+            root_frame: Some(root_frame),
             frames: Vec::new(),
         })
     }
