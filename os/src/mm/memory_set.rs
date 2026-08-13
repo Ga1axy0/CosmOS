@@ -9,7 +9,7 @@ use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
 use crate::bootinfo;
 use crate::config::{
-    MAX_HARTS, MMIO, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
+    MAX_HARTS, PAGE_SIZE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, USER_STACK_SIZE,
     USER_VDSO_BASE,
 };
 use crate::fs::{
@@ -27,6 +27,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use fs::Inode;
 use lazy_static::*;
@@ -542,16 +543,35 @@ impl MemorySet {
         self.flush_local_tlb_asid();
     }
 
+    /// Initialize a bare address space directly at `output`.
+    ///
+    /// Keeping the destination explicit avoids relying on the large-aggregate
+    /// return buffer while the LoongArch board boot path is being diagnosed.
+    #[inline(never)]
+    unsafe fn init_bare_at(output: *mut Self, asid: usize) -> Result<(), MmError> {
+        PageTable::init_new_at(core::ptr::addr_of_mut!((*output).page_table))?;
+        let vmas = BTreeMap::new();
+        // Give every hart an initial value different from the first live
+        // generation.  Besides expressing "never synchronized" directly,
+        // distinct sentinels avoid an early-boot bulk memset for this atomic
+        // array on LoongArch.
+        let seen_tlb_generation =
+            core::array::from_fn(|hart| AtomicUsize::new(usize::MAX - hart));
+
+        core::ptr::addr_of_mut!((*output).vmas).write(vmas);
+        core::ptr::addr_of_mut!((*output).asid).write(asid);
+        core::ptr::addr_of_mut!((*output).active_user_harts).write(AtomicUsize::new(0));
+        core::ptr::addr_of_mut!((*output).tlb_generation).write(AtomicUsize::new(1));
+        core::ptr::addr_of_mut!((*output).seen_tlb_generation).write(seen_tlb_generation);
+        Ok(())
+    }
+
     fn new_bare_with_asid(asid: usize) -> Result<Self, MmError> {
-        Ok(Self {
-            page_table: PageTable::new()?,
-            vmas: BTreeMap::new(),
-            asid,
-            active_user_harts: AtomicUsize::new(0),
-            // Generation zero means "never synchronized" for a new hart.
-            tlb_generation: AtomicUsize::new(1),
-            seen_tlb_generation: [const { AtomicUsize::new(0) }; MAX_HARTS],
-        })
+        let mut output = MaybeUninit::<Self>::uninit();
+        unsafe {
+            Self::init_bare_at(output.as_mut_ptr(), asid)?;
+            Ok(output.assume_init())
+        }
     }
     /// Create a new empty user `MemorySet` with a boot-unique ASID when
     /// supported by the current architecture.
@@ -990,8 +1010,10 @@ impl MemorySet {
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
-        let mut memory_set = Self::new_bare_with_asid(super::asid::KERNEL_ASID)
+        let mut output = MaybeUninit::<Self>::uninit();
+        unsafe { Self::init_bare_at(output.as_mut_ptr(), super::asid::KERNEL_ASID) }
             .expect("failed to allocate boot-time kernel root page table");
+        let mut memory_set = unsafe { output.assume_init() };
         // map trampoline
         memory_set
             .map_trampoline()
@@ -1071,12 +1093,13 @@ impl MemorySet {
                 map_kernel_ram_fragment(&mut memory_set, kernel_end.max(start), end);
             });
             info!("mapping memory-mapped registers");
-            for pair in MMIO {
+            for region in bootinfo::get().mmio_regions() {
+                let start = crate::platform::mmio_phys_to_virt(region.start);
                 memory_set
                     .insert_vma(
                         Vma::new(
-                            (*pair).0.into(),
-                            ((*pair).0 + (*pair).1).into(),
+                            start.into(),
+                            (start + region.end - region.start).into(),
                             MapType::Direct,
                             MapPermission::R | MapPermission::W,
                             VmaKind::Kernel,

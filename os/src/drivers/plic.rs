@@ -9,24 +9,22 @@ use crate::hal::hartid;
 use crate::sync::SpinNoIrqLock;
 use lazy_static::*;
 
-/// QEMU virt PLIC physical base.
-const PLIC_PHYS_BASE: usize = 0x0C00_0000;
-
 #[inline(always)]
 fn plic_base() -> usize {
-    crate::platform::mmio_phys_to_virt(PLIC_PHYS_BASE)
+    let resource = crate::bootinfo::get()
+        .plic()
+        .expect("FDT has no enabled RISC-V PLIC");
+    crate::platform::mmio_phys_to_virt(resource.start)
 }
 
-/// QEMU virt UART0 interrupt source id.
-const UART0_IRQ: u32 = 10;
-
-// QEMU virt exposes VirtIO MMIO interrupts as sources starting from 1.
-// Each virtio-mmio slot corresponds to one interrupt source.
-
-const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
-
-const VIRTIO_MMIO_IRQ_COUNT: u32 = 8;
 const MAX_IRQ_ID: usize = 32;
+
+fn uart_irq() -> u32 {
+    crate::bootinfo::get()
+        .uart()
+        .and_then(|resource| resource.irq)
+        .expect("FDT console UART has no interrupt")
+}
 
 #[inline(always)]
 fn priority_ptr(irq: u32) -> *mut u32 {
@@ -117,9 +115,14 @@ fn set_irq_affinity_internal(irq: u32, hart_id: usize) {
 pub fn init() {
     debug!("[kernel] Initializing PLIC...");
     let housekeeping_hart = bootstrap_hart_id();
-    set_irq_affinity_internal(UART0_IRQ, housekeeping_hart);
-    set_priority(UART0_IRQ, 1);
-    for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
+    let uart_irq = uart_irq();
+    set_irq_affinity_internal(uart_irq, housekeeping_hart);
+    set_priority(uart_irq, 1);
+    for irq in crate::bootinfo::get()
+        .virtio_mmio_devices()
+        .iter()
+        .filter_map(|resource| resource.irq)
+    {
         set_irq_affinity_internal(irq, housekeeping_hart);
         set_priority(irq, 1);
     }
@@ -131,12 +134,17 @@ pub fn init() {
 /// 每个 hart 都需要各自执行一次，使能本地 context 的 IRQ 位图并设置 threshold。
 pub fn init_hart(hart_id: usize) {
     let context = supervisor_context(hart_id);
-    if affinity_target(UART0_IRQ) == hart_id {
-        enable_irq(context, UART0_IRQ);
+    let uart_irq = uart_irq();
+    if affinity_target(uart_irq) == hart_id {
+        enable_irq(context, uart_irq);
     } else {
-        disable_irq(context, UART0_IRQ);
+        disable_irq(context, uart_irq);
     }
-    for irq in VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT) {
+    for irq in crate::bootinfo::get()
+        .virtio_mmio_devices()
+        .iter()
+        .filter_map(|resource| resource.irq)
+    {
         if affinity_target(irq) == hart_id {
             enable_irq(context, irq);
         } else {
@@ -156,25 +164,18 @@ pub fn handle_supervisor_external() {
 pub fn handle_supervisor_external_hart(hart_id: usize) {
     let context = supervisor_context(hart_id);
     let irq = claim(context);
-    match irq {
-        UART0_IRQ => {
-            UART.handle_irq();
-            // 把刚到达的输入立刻喂入控制台行规程：这样即便当前没有进程在 read，
-            // Ctrl+C 等信号字符也能在到达瞬间生成信号投递给前台进程组。
-            crate::fs::console_receive();
-        }
-        irq if (VIRTIO_MMIO_IRQ_BASE..(VIRTIO_MMIO_IRQ_BASE + VIRTIO_MMIO_IRQ_COUNT))
-            .contains(&irq) =>
-        {
-            crate::drivers::block::handle_irq(irq);
-            crate::drivers::net::handle_irq(irq);
-        }
-        0 => {
-            // spurious
-        }
-        _ => {
-            // ignore other IRQs for now
-        }
+    if irq == uart_irq() {
+        UART.handle_irq();
+        // 把刚到达的输入立刻喂入控制台行规程：这样即便当前没有进程在 read，
+        // Ctrl+C 等信号字符也能在到达瞬间生成信号投递给前台进程组。
+        crate::fs::console_receive();
+    } else if crate::bootinfo::get()
+        .virtio_mmio_devices()
+        .iter()
+        .any(|resource| resource.irq == Some(irq))
+    {
+        crate::drivers::block::handle_irq(irq);
+        crate::drivers::net::handle_irq(irq);
     }
     if irq != 0 {
         complete(context, irq);

@@ -17,7 +17,7 @@ pub mod loongarch;
 pub use riscv::qemu_virt::rtc;
 
 #[cfg(target_arch = "loongarch64")]
-pub use loongarch::qemu_virt::rtc;
+pub use loongarch::rtc;
 
 #[cfg(target_arch = "riscv64")]
 pub use riscv::qemu_virt::{
@@ -26,25 +26,47 @@ pub use riscv::qemu_virt::{
     init_external_irq, init_external_irq_hart, kernel_heap_virtual_window_supported, machine_name,
     mmio_phys_to_virt, platform_name, probe_platform_devices, rtc_is_supported, shutdown,
     start_secondary_harts, translate_direct_mapped_kernel_va, use_early_console, BlockDeviceImpl,
-    CharDeviceImpl, QEMUExit, SbiPlatform as PlatformImpl, CLOCK_FREQ, INTERP_BASE,
-    KERNEL_ADDR_OFFSET, KERNEL_HEAP_BASE, MMIO, QEMU_EXIT_HANDLE, TRAMPOLINE, USER_MMAP_BASE,
-    USER_STACK_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
-    VIRT_RTC, VIRT_UART,
+    CharDeviceImpl, QEMUExit, SbiPlatform as PlatformImpl, INTERP_BASE, KERNEL_ADDR_OFFSET,
+    KERNEL_HEAP_BASE, QEMU_EXIT_HANDLE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE,
 };
 
 #[cfg(target_arch = "loongarch64")]
-pub use loongarch::qemu_virt::{
-    clear_ipi_vector, console_getchar, console_putchar, console_rx_irq_ready,
-    direct_map_phys_to_virt, direct_map_virt_to_phys, early_console_write, handle_external_irq,
+pub use loongarch::{
+    boot_fdt_ptr, clear_ipi_vector, console_getchar, console_putchar, console_rx_irq_ready,
+    continue_full_boot, continue_storage_boot, direct_map_phys_to_virt, direct_map_virt_to_phys,
+    early_console_write, early_runtime_diagnostics, halt_early_bringup, handle_external_irq,
     heap_debug_enabled, init_external_irq, init_external_irq_hart, init_ipi_hart,
     kernel_heap_virtual_window_supported, machine_name, mmio_phys_to_virt, platform_name,
     probe_platform_devices, rtc_is_supported, shutdown, start_secondary_harts,
     translate_direct_mapped_kernel_va, use_early_console, BlockDeviceImpl, CharDeviceImpl,
-    LoongArchPlatform as PlatformImpl, QEMUExit, CLOCK_FREQ, INTERP_BASE, IO_ADDR_OFFSET,
-    KERNEL_ADDR_OFFSET, KERNEL_HEAP_BASE, MMIO, QEMU_EXIT_HANDLE, TRAMPOLINE, USER_MMAP_BASE,
-    USER_STACK_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
-    VIRT_RTC, VIRT_UART,
+    LoongArchPlatform as PlatformImpl, QEMUExit, INTERP_BASE, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET,
+    KERNEL_HEAP_BASE, QEMU_EXIT_HANDLE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE, VIRT_UART,
 };
+
+#[cfg(target_arch = "riscv64")]
+pub const fn boot_fdt_ptr(raw: usize) -> usize {
+    raw
+}
+
+#[cfg(target_arch = "riscv64")]
+pub const fn continue_full_boot() -> bool {
+    true
+}
+
+#[cfg(target_arch = "riscv64")]
+pub const fn continue_storage_boot() -> bool {
+    true
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn halt_early_bringup() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn early_runtime_diagnostics() {}
 
 /// Initialize platform-owned devices and interrupt routing.
 pub fn init() {

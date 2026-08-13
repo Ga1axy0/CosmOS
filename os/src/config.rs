@@ -10,8 +10,6 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 32;
 pub const MAX_KERNEL_HEAP_SIZE: usize = 0x4000_0000;
 /// max harts reserved by the kernel SMP bootstrap path
 pub const MAX_HARTS: usize = 12;
-/// Fallback physical memory end used only when firmware memory discovery fails.
-pub const MEMORY_END: usize = 0x180000000;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12
@@ -21,7 +19,7 @@ pub const USER_PIE_BASE: usize = 0x0020_0000;
 
 /// qemu board info
 pub use crate::platform::{
-    CLOCK_FREQ, INTERP_BASE, KERNEL_HEAP_BASE, MMIO, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE,
+    INTERP_BASE, KERNEL_HEAP_BASE, TRAMPOLINE, USER_MMAP_BASE, USER_STACK_BASE,
 };
 
 /// the virtual addr of trap context

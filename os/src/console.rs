@@ -7,24 +7,43 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// 串行化所有 hart 的控制台输出，避免多个 hart 同时逐字符写 UART 时互相穿插。
 static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
 
-struct Stdout;
+struct Stdout {
+    last_was_cr: bool,
+}
 
 impl Write for Stdout {
     /// write str to console
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.chars() {
-            UART.write(c as u8);
-            // console_putchar(c as usize);
+        for byte in s.bytes() {
+            if byte == b'\n' && !self.last_was_cr {
+                UART.write(b'\r');
+            }
+            UART.write(byte);
+            self.last_was_cr = byte == b'\r';
         }
         Ok(())
     }
 }
 
-struct EarlyStdout;
+struct EarlyStdout {
+    last_was_cr: bool,
+}
 
 impl Write for EarlyStdout {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        crate::platform::early_console_write(s);
+        let mut pending_start = 0;
+        for (index, ch) in s.char_indices() {
+            if ch == '\n' {
+                crate::platform::early_console_write(&s[pending_start..index]);
+                if !self.last_was_cr {
+                    crate::platform::early_console_write("\r");
+                }
+                crate::platform::early_console_write("\n");
+                pending_start = index + ch.len_utf8();
+            }
+            self.last_was_cr = ch == '\r';
+        }
+        crate::platform::early_console_write(&s[pending_start..]);
         Ok(())
     }
 }
@@ -66,10 +85,10 @@ impl Drop for ConsoleGuard {
 pub fn print(args: fmt::Arguments) {
     let _guard = ConsoleGuard::lock();
     if crate::platform::use_early_console() {
-        EarlyStdout.write_fmt(args).unwrap();
+        EarlyStdout { last_was_cr: false }.write_fmt(args).unwrap();
         return;
     }
-    Stdout.write_fmt(args).unwrap();
+    Stdout { last_was_cr: false }.write_fmt(args).unwrap();
 }
 
 /// Print! macro to the host console using the format string and arguments.

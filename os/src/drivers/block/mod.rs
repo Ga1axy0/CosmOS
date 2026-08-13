@@ -4,9 +4,6 @@ mod virtio_blk;
 
 pub use virtio_blk::VirtIOBlock;
 
-use crate::platform::{
-    VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE,
-};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ReschedReason, SchedAttr, TaskControlBlock, TaskStatus, WaitQueue, WaitReason};
 use alloc::collections::BTreeMap;
@@ -136,8 +133,12 @@ pub fn probe_block_devices() {
     let mut map = BLOCK_DEVICES.lock();
     let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut idx = 0usize;
-    for slot in 0..VIRTIO_MMIO_SLOTS {
-        let addr = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
+    for (slot, resource) in crate::bootinfo::get()
+        .virtio_mmio_devices()
+        .iter()
+        .enumerate()
+    {
+        let addr = crate::platform::mmio_phys_to_virt(resource.start);
 
         let Some(header) = NonNull::new(addr as *mut VirtIOHeader) else {
             continue;
@@ -150,7 +151,7 @@ pub fn probe_block_devices() {
             continue;
         }
 
-        let transport = match unsafe { MmioTransport::new(header, VIRTIO_MMIO_STRIDE) } {
+        let transport = match unsafe { MmioTransport::new(header, resource.size) } {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -160,7 +161,10 @@ pub fn probe_block_devices() {
             let name = block_device_name(idx);
             debug!("[kernel] block device {} idx {} at {:#x}", name, idx, addr);
             map.insert(name, dev.clone());
-            irq_map.insert(VIRTIO_MMIO_IRQ_BASE + slot as u32, dev);
+            let irq = resource
+                .irq
+                .expect("FDT VirtIO-MMIO block transport has no interrupt");
+            irq_map.insert(irq, dev);
             idx += 1;
         }
     }

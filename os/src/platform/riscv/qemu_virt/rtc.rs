@@ -5,8 +5,6 @@ use lazy_static::lazy_static;
 
 use crate::sync::SpinNoIrqLock;
 
-use super::VIRT_RTC;
-
 #[inline(always)]
 fn mmio_read32(addr: usize) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
@@ -46,7 +44,14 @@ impl Rtc {
 }
 
 lazy_static! {
-    static ref RTC: Arc<SpinNoIrqLock<Rtc>> = Arc::new(SpinNoIrqLock::new(Rtc::new(VIRT_RTC)));
+    static ref RTC: Arc<SpinNoIrqLock<Rtc>> = {
+        let resource = crate::bootinfo::get()
+            .rtc()
+            .expect("FDT has no RTC resource");
+        Arc::new(SpinNoIrqLock::new(Rtc::new(
+            crate::platform::mmio_phys_to_virt(resource.start),
+        )))
+    };
 }
 
 static RTC_READY: AtomicBool = AtomicBool::new(false);

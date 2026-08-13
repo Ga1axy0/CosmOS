@@ -13,19 +13,37 @@ use crate::drivers::chardev::{CharDevice, UART};
 
 static UART_IRQ_READY: AtomicBool = AtomicBool::new(false);
 
-const PCH_PIC_BASE: usize = super::IO_ADDR_OFFSET | 0x1000_0000;
 const PCH_PIC_INT_MASK: usize = 0x20;
 const PCH_PIC_HTMSI_VEC: usize = 0x200;
 const PCH_PIC_IRQS: u32 = 32;
 
-const EXTIOI_BASE: usize = 0x1400;
 const EXTIOI_IPMAP_START: usize = 0x0c0;
 const EXTIOI_ENABLE_START: usize = 0x200;
 const EXTIOI_COREISR_START: usize = 0x400;
 const EXTIOI_COREMAP_START: usize = 0x800;
 
-const UART0_PCH_IRQ: u32 = 2;
 const EXTIOI_ROUTE_IP3: u32 = 0x0808_0808;
+
+fn pch_pic_base() -> usize {
+    let resource = crate::bootinfo::get()
+        .pch_pic()
+        .expect("FDT has no Loongson PCH PIC");
+    crate::platform::mmio_phys_to_virt(resource.start)
+}
+
+fn extioi_base() -> usize {
+    crate::bootinfo::get()
+        .eiointc()
+        .expect("FDT has no Loongson EIOINTC")
+        .start
+}
+
+fn uart_irq() -> u32 {
+    crate::bootinfo::get()
+        .uart()
+        .and_then(|resource| resource.irq)
+        .expect("FDT console UART has no interrupt")
+}
 
 #[inline]
 fn mmio_read64(addr: usize) -> u64 {
@@ -63,15 +81,16 @@ fn iocsr_write32(addr: usize, value: u32) {
 
 fn enable_pch_pic_irq(irq: u32) {
     let irq = irq as usize;
-    let vec_reg = PCH_PIC_BASE + PCH_PIC_HTMSI_VEC + (irq & !7);
+    let base = pch_pic_base();
+    let vec_reg = base + PCH_PIC_HTMSI_VEC + (irq & !7);
     let vec_shift = (irq & 7) * 8;
     let mut vectors = mmio_read64(vec_reg);
     vectors &= !(0xffu64 << vec_shift);
     vectors |= (irq as u64) << vec_shift;
     mmio_write64(vec_reg, vectors);
 
-    let mask = mmio_read64(PCH_PIC_BASE + PCH_PIC_INT_MASK);
-    mmio_write64(PCH_PIC_BASE + PCH_PIC_INT_MASK, mask & !(1u64 << irq));
+    let mask = mmio_read64(base + PCH_PIC_INT_MASK);
+    mmio_write64(base + PCH_PIC_INT_MASK, mask & !(1u64 << irq));
 }
 
 fn init_extioi_routing() {
@@ -79,12 +98,15 @@ fn init_extioi_routing() {
     let cpu_bit = 1u32 << target_hart;
 
     for reg in 0..2 {
-        iocsr_write32(EXTIOI_BASE + EXTIOI_IPMAP_START + reg * 4, EXTIOI_ROUTE_IP3);
+        iocsr_write32(
+            extioi_base() + EXTIOI_IPMAP_START + reg * 4,
+            EXTIOI_ROUTE_IP3,
+        );
     }
 
     let coremap_word = cpu_bit | (cpu_bit << 8) | (cpu_bit << 16) | (cpu_bit << 24);
     for reg in 0..64 {
-        iocsr_write32(EXTIOI_BASE + EXTIOI_COREMAP_START + reg * 4, coremap_word);
+        iocsr_write32(extioi_base() + EXTIOI_COREMAP_START + reg * 4, coremap_word);
     }
 }
 
@@ -96,17 +118,23 @@ pub(crate) fn enable_pch_irq(irq: u32) -> bool {
 
     let word = (irq / 32) as usize;
     let bit = 1u32 << (irq % 32);
-    iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, bit);
-    let enable = iocsr_read32(EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4);
-    iocsr_write32(EXTIOI_BASE + EXTIOI_ENABLE_START + word * 4, enable | bit);
+    iocsr_write32(extioi_base() + EXTIOI_COREISR_START + word * 4, bit);
+    let enable = iocsr_read32(extioi_base() + EXTIOI_ENABLE_START + word * 4);
+    iocsr_write32(extioi_base() + EXTIOI_ENABLE_START + word * 4, enable | bit);
     enable_pch_pic_irq(irq);
     true
 }
 
 /// Initialize platform external interrupt routing on the bootstrap hart.
 pub fn init_external_irq() {
+    if crate::bootinfo::get().pch_pic().is_none()
+        || crate::bootinfo::get().eiointc().is_none()
+        || crate::bootinfo::get().uart().and_then(|uart| uart.irq).is_none()
+    {
+        return;
+    }
     init_extioi_routing();
-    enable_pch_irq(UART0_PCH_IRQ);
+    enable_pch_irq(uart_irq());
     UART_IRQ_READY.store(true, Ordering::Release);
     info!(
         "[irq] loongarch uart IRQ enabled on hart {}",
@@ -129,7 +157,7 @@ pub fn handle_external_irq() {
     }
 
     for word in 0..((PCH_PIC_IRQS as usize + 31) / 32) {
-        let mut pending = iocsr_read32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4);
+        let mut pending = iocsr_read32(extioi_base() + EXTIOI_COREISR_START + word * 4);
 
         while pending != 0 {
             let bit_idx = pending.trailing_zeros();
@@ -144,11 +172,11 @@ pub fn handle_external_irq() {
             // the block worker asleep in BLOCK_WORKER_WAIT for good. Clearing
             // first means any re-assertion during the handler sets a fresh bit
             // that survives and re-triggers after `ertn`.
-            iocsr_write32(EXTIOI_BASE + EXTIOI_COREISR_START + word * 4, bit);
+            iocsr_write32(extioi_base() + EXTIOI_COREISR_START + word * 4, bit);
 
             let mut handled = false;
 
-            if irq == UART0_PCH_IRQ {
+            if irq == uart_irq() {
                 UART.handle_irq();
                 crate::fs::console_receive();
                 handled = true;

@@ -18,30 +18,29 @@ use crate::drivers::{
     net::{self, VirtIONetDevice},
 };
 
-const PCI_ECAM_BASE: usize = 0x2000_0000;
-const PCI_ECAM_SIZE: usize = 0x1000_0000;
-const PCI_RANGE_BASE: usize = 0x4000_0000;
-const PCI_RANGE_SIZE: usize = 0x4000_0000;
-const PCI_BUS_END: u8 = 0x7f;
 const PCI_INTERRUPT_LINE_PIN_OFFSET: usize = 0x3c;
-const GPEX_INTX_IRQ_BASE: u32 = 16;
-const GPEX_INTX_IRQ_COUNT: u32 = 4;
 
 /// Probe the LA64 PCIe ECAM bus and register VirtIO PCI devices.
 pub fn probe_platform_devices() {
-    let ecam_vaddr = PCI_ECAM_BASE | super::IO_ADDR_OFFSET;
-    let ecam_end = ecam_vaddr + PCI_ECAM_SIZE;
+    let Some(host) = crate::bootinfo::get().pci_host() else {
+        return;
+    };
+    if host.memory_size == 0 {
+        panic!("FDT PCI host has no non-prefetchable memory aperture");
+    }
+    let ecam_vaddr = crate::platform::mmio_phys_to_virt(host.ecam.start);
+    let ecam_end = ecam_vaddr + host.ecam.size;
     if ecam_end < ecam_vaddr {
         panic!("PCI ECAM window overflow");
     }
 
     let mut root = unsafe { PciRoot::new(MmioCam::new(ecam_vaddr as *mut u8, Cam::Ecam)) };
-    let mut allocator = PciRangeAllocator::new(PCI_RANGE_BASE as u64, PCI_RANGE_SIZE as u64);
+    let mut allocator = PciRangeAllocator::new(host.memory_start as u64, host.memory_size as u64);
     let mut map = BLOCK_DEVICES.lock();
     let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut block_idx = 0usize;
 
-    for bus in 0..=PCI_BUS_END {
+    for bus in host.bus_start..=host.bus_end {
         for (bdf, dev_info) in root.enumerate_bus(bus) {
             if dev_info.header_type != HeaderType::Standard {
                 continue;
@@ -67,7 +66,7 @@ pub fn probe_platform_devices() {
                     };
                     let dev = Arc::new(dev);
                     let name = block_device_name(block_idx);
-                    let irq = gpex_intx_irq(bdf);
+                    let irq = gpex_intx_irq(host, bdf);
                     info!("[pci] virtio-blk {} at {} irq {:?}", name, bdf, irq);
                     map.insert(name, dev.clone());
                     if let Some(irq) = irq {
@@ -78,7 +77,7 @@ pub fn probe_platform_devices() {
                     block_idx += 1;
                 }
                 DeviceType::Network => {
-                    let Some(irq) = gpex_intx_irq(bdf) else {
+                    let Some(irq) = gpex_intx_irq(host, bdf) else {
                         warn!("[pci] virtio-net at {} has no INTx pin", bdf);
                         continue;
                     };
@@ -187,9 +186,13 @@ fn configure_pci_device(
     Ok(())
 }
 
-fn pci_config_read_word(bdf: DeviceFunction, offset: usize) -> u32 {
+fn pci_config_read_word(
+    host: crate::bootinfo::PciHostResource,
+    bdf: DeviceFunction,
+    offset: usize,
+) -> u32 {
     debug_assert!(offset % core::mem::size_of::<u32>() == 0);
-    let addr = (PCI_ECAM_BASE | super::IO_ADDR_OFFSET)
+    let addr = crate::platform::mmio_phys_to_virt(host.ecam.start)
         + ((bdf.bus as usize) << 20)
         + ((bdf.device as usize) << 15)
         + ((bdf.function as usize) << 12)
@@ -197,18 +200,14 @@ fn pci_config_read_word(bdf: DeviceFunction, offset: usize) -> u32 {
     unsafe { read_volatile(addr as *const u32) }
 }
 
-fn gpex_intx_irq(bdf: DeviceFunction) -> Option<u32> {
-    let line_pin = pci_config_read_word(bdf, PCI_INTERRUPT_LINE_PIN_OFFSET);
+fn gpex_intx_irq(host: crate::bootinfo::PciHostResource, bdf: DeviceFunction) -> Option<u32> {
+    let line_pin = pci_config_read_word(host, bdf, PCI_INTERRUPT_LINE_PIN_OFFSET);
     let interrupt_pin = ((line_pin >> 8) & 0xff) as u8;
     if interrupt_pin == 0 {
         return None;
     }
 
-    // QEMU GPEX maps INTx as `(slot + zero_based_pin) % 4` and the
-    // LoongArch virt machine wires those four outputs to PCH IRQs 16..19.
-    let zero_based_pin = u32::from(interrupt_pin - 1);
-    let intx = (u32::from(bdf.device) + zero_based_pin) % GPEX_INTX_IRQ_COUNT;
-    Some(GPEX_INTX_IRQ_BASE + intx)
+    host.intx_irq(bdf.device, interrupt_pin)
 }
 
 fn probe_virtio_pci_device(

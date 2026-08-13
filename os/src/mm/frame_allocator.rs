@@ -12,15 +12,18 @@ use crate::sync::SpinNoIrqLock;
 use core::cmp::{max, min};
 use core::fmt::{self, Debug, Formatter};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use lazy_static::*;
 
 const MAX_ORDER: usize = 32;
 const INVALID_PPN: usize = usize::MAX;
 const MAX_MANAGED_REGIONS: usize = 16;
-// The fallback platform memory window is 4 GiB, or 1M 4 KiB pages. The
-// bitmap uses at most roughly two bits per page across all buddy orders.
-const MAX_BITMAP_PAGES: usize = crate::config::MEMORY_END / PAGE_SIZE;
-const MAX_BITMAP_WORDS: usize = (2 * MAX_BITMAP_PAGES + MAX_ORDER + 63) / 64;
+// Optional O(1) buddy-membership acceleration for RAM spans up to one million
+// pages. Larger firmware-described spans remain correct via free-list scans.
+const MAX_BITMAP_PAGES: usize = 1024 * 1024;
+// Each buddy order is stored in a separate word-aligned slice. Besides the
+// geometric sum of at most two bits per page, reserve one rounding word per
+// order; rounding only once for the whole bitmap is too small at the 4 GiB
+// boundary.
+const MAX_BITMAP_WORDS: usize = (2 * MAX_BITMAP_PAGES + 63) / 64 + MAX_ORDER;
 static FRAME_ALLOC_OOM_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "cosmos-meminfo")]
 static FRAME_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -128,9 +131,9 @@ impl FreeBlockBitmap {
     }
 
     fn reset(&mut self, base: usize, end: usize) {
-        self.bits = [0; MAX_BITMAP_WORDS];
-        self.offsets = [0; MAX_ORDER];
-        self.words = [0; MAX_ORDER];
+        self.bits.fill(0);
+        self.offsets.fill(0);
+        self.words.fill(0);
         self.base = base;
         self.span_pages = end.saturating_sub(base);
         self.enabled = base < end && self.span_pages <= MAX_BITMAP_PAGES;
@@ -235,6 +238,31 @@ impl PpnRegion {
 }
 
 impl BuddyFrameAllocator {
+    const fn empty() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            regions: [PpnRegion::empty(); MAX_MANAGED_REGIONS],
+            region_count: 0,
+            free_list: [None; MAX_ORDER],
+            free_bitmap: FreeBlockBitmap::empty(),
+            free_pages: 0,
+            allocated_pages: 0,
+            #[cfg(feature = "cosmos-meminfo")]
+            free_scan_steps: 0,
+            #[cfg(feature = "cosmos-meminfo")]
+            split_ops: 0,
+            #[cfg(feature = "cosmos-meminfo")]
+            merge_ops: 0,
+            #[cfg(feature = "cosmos-meminfo")]
+            buddy_search_calls: 0,
+            #[cfg(feature = "cosmos-meminfo")]
+            buddy_search_hits: 0,
+            #[cfg(feature = "cosmos-meminfo")]
+            buddy_search_misses: 0,
+        }
+    }
+
     pub fn init_from_bootinfo(&mut self, kernel_start: PhysPageNum, kernel_end: PhysPageNum) {
         self.reset();
         bootinfo::for_each_usable_memory_region(|region| {
@@ -253,7 +281,6 @@ impl BuddyFrameAllocator {
         self.regions = [PpnRegion::empty(); MAX_MANAGED_REGIONS];
         self.region_count = 0;
         self.free_list = [None; MAX_ORDER];
-        self.free_bitmap = FreeBlockBitmap::empty();
         self.free_pages = 0;
         self.allocated_pages = 0;
         #[cfg(feature = "cosmos-meminfo")]
@@ -541,28 +568,7 @@ impl BuddyFrameAllocator {
 
 impl FrameAllocator for BuddyFrameAllocator {
     fn new() -> Self {
-        Self {
-            start: 0,
-            end: 0,
-            regions: [PpnRegion::empty(); MAX_MANAGED_REGIONS],
-            region_count: 0,
-            free_list: [None; MAX_ORDER],
-            free_bitmap: FreeBlockBitmap::empty(),
-            free_pages: 0,
-            allocated_pages: 0,
-            #[cfg(feature = "cosmos-meminfo")]
-            free_scan_steps: 0,
-            #[cfg(feature = "cosmos-meminfo")]
-            split_ops: 0,
-            #[cfg(feature = "cosmos-meminfo")]
-            merge_ops: 0,
-            #[cfg(feature = "cosmos-meminfo")]
-            buddy_search_calls: 0,
-            #[cfg(feature = "cosmos-meminfo")]
-            buddy_search_hits: 0,
-            #[cfg(feature = "cosmos-meminfo")]
-            buddy_search_misses: 0,
-        }
+        Self::empty()
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
         // trace!(
@@ -652,10 +658,8 @@ pub struct FrameAllocatorStats {
     pub per_cpu_cache_enabled: bool,
 }
 
-lazy_static! {
-    pub static ref FRAME_ALLOCATOR: SpinNoIrqLock<FrameAllocatorImpl> =
-        SpinNoIrqLock::new(FrameAllocatorImpl::new());
-}
+static FRAME_ALLOCATOR: SpinNoIrqLock<FrameAllocatorImpl> =
+    SpinNoIrqLock::new(FrameAllocatorImpl::empty());
 
 pub fn init_frame_allocator() {
     extern "C" {
@@ -664,9 +668,9 @@ pub fn init_frame_allocator() {
     }
     let kernel_start = PhysPageNum(phys_addr_floor_ppn(virt_to_phys(skernel as usize)));
     let kernel_end = PhysPageNum(phys_addr_ceil_ppn(virt_to_phys(ekernel as usize)));
-    FRAME_ALLOCATOR
-        .lock()
-        .init_from_bootinfo(kernel_start, kernel_end);
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    allocator.init_from_bootinfo(kernel_start, kernel_end);
+    drop(allocator);
     FRAME_ALLOC_OOM_COUNT.store(0, Ordering::Release);
     #[cfg(feature = "cosmos-meminfo")]
     {
