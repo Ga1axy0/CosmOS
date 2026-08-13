@@ -39,6 +39,8 @@ case_enabled() {
 find_binary() {
     if [ -x /.cosmos-old-root/root/lmbench_all ]; then
         echo /.cosmos-old-root/root/lmbench_all
+    elif [ -x /root/lmbench_all ]; then
+        echo /root/lmbench_all
     elif [ -x /host/.make/lmbench-old/lmbench_all ]; then
         echo /host/.make/lmbench-old/lmbench_all
     else

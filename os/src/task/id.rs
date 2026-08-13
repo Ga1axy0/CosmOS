@@ -511,6 +511,12 @@ impl TaskUserRes {
     fn dealloc_user_res(&self) {
         // dealloc tid
         let process = self.process.upgrade().unwrap();
+        if process.is_vfork_shared() {
+            // The child task reuses the parent's stack/trap mappings while a
+            // shared-MM vfork is active.  Removing them here would corrupt
+            // the parent before the child execs or exits.
+            return;
+        }
         let reclaim = {
             let mut process_inner = process.inner_exclusive_access();
             let token = process_inner.memory_set.token();

@@ -1,9 +1,10 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use lazy_static::lazy_static;
-use spin::Mutex;
+use spin::RwLock;
 
 use crate::vfs::Inode;
 
@@ -41,7 +42,7 @@ struct DentryEntry {
     /// exist in this parent directory.
     child: Option<Arc<Inode>>,
     /// CLOCK second-chance bit.
-    ref_bit: bool,
+    ref_bit: AtomicBool,
 }
 
 /// Result of a dentry-cache lookup.
@@ -85,14 +86,14 @@ impl DentryCache {
     }
 
     /// Look up a dentry by `(fs_id, parent_ino, name)`.
-    fn lookup(&mut self, fs_id: u64, parent_ino: u64, name: &str) -> DentryLookup {
+    fn lookup(&self, fs_id: u64, parent_ino: u64, name: &str) -> DentryLookup {
         let parent = DentryParentKey { fs_id, parent_ino };
         if let Some(entry) = self
             .table
-            .get_mut(&parent)
-            .and_then(|children| children.get_mut(name))
+            .get(&parent)
+            .and_then(|children| children.get(name))
         {
-            entry.ref_bit = true;
+            entry.ref_bit.store(true, Ordering::Release);
             return match entry.child.as_ref() {
                 Some(child) => DentryLookup::Positive(Arc::clone(child)),
                 None => DentryLookup::Negative,
@@ -113,7 +114,7 @@ impl DentryCache {
                 self.negative_entries = self.negative_entries.saturating_sub(1);
             }
             entry.child = Some(Arc::clone(child));
-            entry.ref_bit = true;
+            entry.ref_bit.store(true, Ordering::Release);
             return;
         }
         let name = String::from(name);
@@ -121,7 +122,7 @@ impl DentryCache {
             name.clone(),
             DentryEntry {
                 child: Some(Arc::clone(child)),
-                ref_bit: true,
+                ref_bit: AtomicBool::new(true),
             },
         );
         self.entries += 1;
@@ -145,7 +146,7 @@ impl DentryCache {
                 self.negative_entries += 1;
             }
             entry.child = None;
-            entry.ref_bit = true;
+            entry.ref_bit.store(true, Ordering::Release);
             return;
         }
         let name = String::from(name);
@@ -153,7 +154,7 @@ impl DentryCache {
             name.clone(),
             DentryEntry {
                 child: None,
-                ref_bit: true,
+                ref_bit: AtomicBool::new(true),
             },
         );
         self.entries += 1;
@@ -238,8 +239,7 @@ impl DentryCache {
             // Already removed (e.g. via explicit remove()).
             return true;
         };
-        if entry.ref_bit {
-            entry.ref_bit = false;
+        if entry.ref_bit.swap(false, Ordering::Acquire) {
             self.inactive.push_back(key);
             return true;
         }
@@ -278,7 +278,7 @@ pub struct DentryCacheStats {
 }
 
 lazy_static! {
-    static ref DENTRY_CACHE: Mutex<DentryCache> = Mutex::new(DentryCache::new());
+    static ref DENTRY_CACHE: RwLock<DentryCache> = RwLock::new(DentryCache::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -287,32 +287,34 @@ lazy_static! {
 
 /// Try to resolve `(fs_id, parent_ino, name)` from the dentry cache.
 pub fn lookup_dentry(fs_id: u64, parent_ino: u64, name: &str) -> DentryLookup {
-    DENTRY_CACHE.lock().lookup(fs_id, parent_ino, name)
+    DENTRY_CACHE.read().lookup(fs_id, parent_ino, name)
 }
 
 /// Store `(fs_id, parent_ino, name) → child` in the dentry cache.
 pub fn insert_dentry(fs_id: u64, parent_ino: u64, name: &str, child: &Arc<Inode>) {
-    DENTRY_CACHE.lock().insert(fs_id, parent_ino, name, child)
+    DENTRY_CACHE
+        .write()
+        .insert(fs_id, parent_ino, name, child)
 }
 
 /// Store a negative `(fs_id, parent_ino, name) -> ENOENT` mapping.
 pub fn insert_negative_dentry(fs_id: u64, parent_ino: u64, name: &str) {
-    DENTRY_CACHE.lock().insert_negative(fs_id, parent_ino, name)
+    DENTRY_CACHE.write().insert_negative(fs_id, parent_ino, name)
 }
 
 /// Explicitly invalidate a dentry (unlink / rmdir / rename).
 pub fn remove_dentry(fs_id: u64, parent_ino: u64, name: &str) {
-    DENTRY_CACHE.lock().remove(fs_id, parent_ino, name)
+    DENTRY_CACHE.write().remove(fs_id, parent_ino, name)
 }
 
 /// Explicitly invalidate every cached child of one directory.
 pub fn remove_parent_dentries(fs_id: u64, parent_ino: u64) {
-    DENTRY_CACHE.lock().remove_parent(fs_id, parent_ino)
+    DENTRY_CACHE.write().remove_parent(fs_id, parent_ino)
 }
 
 /// Return the current global dentry-cache footprint and queue depths.
 pub fn dentry_cache_stats() -> DentryCacheStats {
-    let cache = DENTRY_CACHE.lock();
+    let cache = DENTRY_CACHE.read();
     DentryCacheStats {
         entries: cache.entries,
         negative_entries: cache.negative_entries,

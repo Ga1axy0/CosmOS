@@ -323,6 +323,11 @@ pub struct MemorySet {
     tlb_generation: AtomicUsize,
     /// Last generation synchronized locally by each hart.
     seen_tlb_generation: [AtomicUsize; MAX_HARTS],
+    /// Whether this `MemorySet` is a temporary shared-MM vfork view.
+    ///
+    /// Such a view borrows the parent's page-table root and must transfer its
+    /// VMA/page-table-descendant ownership back before being dropped.
+    shared_vfork_view: bool,
 }
 
 /// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
@@ -340,6 +345,12 @@ pub struct UserSpaceLayout {
 /// 用户页表 shootdown 完成后才能释放的旧页对象集合。
 pub(crate) struct UserReleaseBatch {
     pages: Vec<DeferredUserPage>,
+}
+
+/// Ownership extracted from a shared-MM vfork view when it execs or exits.
+pub(crate) struct SharedMemorySetState {
+    pub(crate) vmas: Vec<Vma>,
+    pub(crate) page_table_frames: Vec<FrameTracker>,
 }
 
 /// 用户页表中已经摘除、但仍需等 TLB shootdown 后才能释放的页对象。
@@ -559,6 +570,7 @@ impl MemorySet {
             // Generation zero means "never synchronized" for a new hart.
             tlb_generation: AtomicUsize::new(1),
             seen_tlb_generation: [const { AtomicUsize::new(0) }; MAX_HARTS],
+            shared_vfork_view: false,
         })
     }
     /// Create a new empty user `MemorySet` with a boot-unique ASID when
@@ -877,6 +889,40 @@ impl MemorySet {
         //     flags.contains(PTEFlags::W),
         //     page.is_cow()
         // );
+        Ok(())
+    }
+
+    /// Install a consecutive run of already resident private pages in one
+    /// page-table batch.  The VMA metadata is updated only after all leaf PTE
+    /// writes have succeeded.
+    pub(crate) fn map_existing_private_pages_batch(
+        &mut self,
+        pages: &[(VirtPageNum, Arc<PrivatePage>, PTEFlags)],
+    ) -> Result<(), MmError> {
+        let Some((start_vpn, _, _)) = pages.first() else {
+            return Ok(());
+        };
+        for (index, (vpn, _, _)) in pages.iter().enumerate() {
+            if vpn.0 != start_vpn.0 + index {
+                return Err(MmError::InvalidRange);
+            }
+        }
+        let end_vpn = VirtPageNum(start_vpn.0 + pages.len());
+        let area_start = self
+            .find_vma_containing(*start_vpn)
+            .filter(|area| end_vpn <= area.end_vpn())
+            .map(Vma::start_vpn)
+            .ok_or(MmError::NoMapping)?;
+        let entries: Vec<_> = pages
+            .iter()
+            .map(|(_, page, flags)| (page.ppn(), *flags))
+            .collect();
+        self.page_table
+            .map_preallocated_range(*start_vpn, entries.as_slice())?;
+        let area = self.vmas.get_mut(&area_start).ok_or(MmError::NoMapping)?;
+        for (vpn, page, _) in pages {
+            area.data_frames.insert(*vpn, Arc::clone(page));
+        }
         Ok(())
     }
     /// 把一张已有的 page cache 页直接接入指定虚拟页，供 `fork` 继承只读文件私有映射。
@@ -1238,53 +1284,89 @@ impl MemorySet {
                 .map(|(&vpn, page)| (vpn, Arc::clone(page)))
                 .collect();
             let inherit_direct_cache_pages = area.file.is_some();
-            for (vpn, page) in private_pages {
-                if area.shared_anon {
-                    shared_anon_pages += 1;
+            if area.shared_anon || share_private_pages {
+                // First prepare the child entries and parent write-protection,
+                // then install adjacent entries in leaf-table-sized batches.
+                let mut shared_pages = Vec::with_capacity(private_pages.len());
+                let mut parent_updates = Vec::new();
+                for (vpn, page) in private_pages {
                     let mut child_flags = user_space.translate(vpn).unwrap().flags();
-                    child_flags.remove(PTEFlags::D);
-                    memory_set.map_existing_private_page(vpn, page, child_flags)?;
-                    continue;
-                }
-                if share_private_pages {
-                    shared_private_pages += 1;
-                    let mut child_flags = user_space.translate(vpn).unwrap().flags();
-                    if area.is_shared_anonymous() {
-                        memory_set.map_existing_private_page(vpn, page, child_flags)?;
-                        continue;
+                    if area.shared_anon {
+                        shared_anon_pages += 1;
+                        child_flags.remove(PTEFlags::D);
+                    } else {
+                        shared_private_pages += 1;
+                        if area.is_shared_anonymous() {
+                            shared_pages.push((vpn, page, child_flags));
+                            continue;
+                        }
+                        child_flags.remove(PTEFlags::D);
+                        if map_perm.contains(MapPermission::W) {
+                            // 将父子双方都降为只读，后续写入通过缺页走 COW。
+                            page.set_cow(true);
+                            child_flags.remove(PTEFlags::W);
+                            parent_updates.push((vpn, child_flags));
+                            parent_tlb_needs_flush = true;
+                        }
                     }
-                    child_flags.remove(PTEFlags::D);
-                    if map_perm.contains(MapPermission::W) {
-                        // 将父子双方都降为只读，后续写入通过缺页走 COW。
-                        page.set_cow(true);
-                        child_flags.remove(PTEFlags::W);
-                        let _ = user_space.page_table.update_flags(vpn, child_flags);
-                        parent_tlb_needs_flush = true;
+                    shared_pages.push((vpn, page, child_flags));
+                }
+
+                let mut run_start = 0usize;
+                while run_start < shared_pages.len() {
+                    let mut run_end = run_start + 1;
+                    while run_end < shared_pages.len()
+                        && shared_pages[run_end].0.0
+                            == shared_pages[run_end - 1].0.0 + 1
+                    {
+                        run_end += 1;
                     }
-                    // debug!(
-                    //     "[cow] fork share private page: vpn={:#x} ppn={:#x} writable={} child_writable={} cow={}",
-                    //     vpn.0,
-                    //     page.ppn().0,
-                    //     map_perm.contains(MapPermission::W),
-                    //     child_flags.contains(PTEFlags::W),
-                    //     page.is_cow()
-                    // );
-                    memory_set.map_existing_private_page(vpn, page, child_flags)?;
-                    continue;
+                    memory_set
+                        .map_existing_private_pages_batch(&shared_pages[run_start..run_end])?;
+                    run_start = run_end;
                 }
-                if memory_set.translate(vpn).is_none() {
-                    memory_set.map_private_page_in_vma(vpn)?;
+
+                // Parent PTEs normally have identical flags across a run, so
+                // collapse the write-protection edits too.  Fall back to a
+                // single-page update when hardware flags differ.
+                let mut update_start = 0usize;
+                while update_start < parent_updates.len() {
+                    let (start_vpn, flags) = parent_updates[update_start];
+                    let mut update_end = update_start + 1;
+                    while update_end < parent_updates.len()
+                        && parent_updates[update_end].0.0
+                            == parent_updates[update_end - 1].0.0 + 1
+                        && parent_updates[update_end].1 == flags
+                    {
+                        update_end += 1;
+                    }
+                    if update_end - update_start > 1 {
+                        let _ = user_space.page_table.update_flags_range(
+                            start_vpn,
+                            update_end - update_start,
+                            flags,
+                        );
+                    } else {
+                        let _ = user_space.page_table.update_flags(start_vpn, flags);
+                    }
+                    update_start = update_end;
                 }
-                copied_private_pages += 1;
-                let src_ppn = user_space.translate(vpn).unwrap().ppn();
-                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
-                dst_ppn
-                    .get_bytes_array()
-                    .copy_from_slice(src_ppn.get_bytes_array());
-                debug!(
-                    "[cow] fork copy private page directly: vpn={:#x} src_ppn={:#x} dst_ppn={:#x}",
-                    vpn.0, src_ppn.0, dst_ppn.0
-                );
+            } else {
+                for (vpn, _) in private_pages {
+                    if memory_set.translate(vpn).is_none() {
+                        memory_set.map_private_page_in_vma(vpn)?;
+                    }
+                    copied_private_pages += 1;
+                    let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                    let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                    dst_ppn
+                        .get_bytes_array()
+                        .copy_from_slice(src_ppn.get_bytes_array());
+                    debug!(
+                        "[cow] fork copy private page directly: vpn={:#x} src_ppn={:#x} dst_ppn={:#x}",
+                        vpn.0, src_ppn.0, dst_ppn.0
+                    );
+                }
             }
             // 对于已经直接映到 page cache 的文件页，子进程也直接继承当前映射。
             // `MAP_PRIVATE` 仍然保持只读，`MAP_SHARED` 在 sticky dirty 语义下保留父进程当前 `W` 状态。
@@ -1330,6 +1412,120 @@ impl MemorySet {
             );
         }
         Ok((memory_set, parent_tlb_needs_flush))
+    }
+
+    /// Make a parent writable again before creating a shared-MM vfork view.
+    ///
+    /// A previous ordinary fork may have left this address space holding a
+    /// read-only COW mapping. The vfork child must see the parent's writes
+    /// directly, so detach those pages once and then share the resulting
+    /// writable mapping with the child.
+    pub(crate) fn prepare_shared_vfork(&mut self) -> Result<bool, MmError> {
+        let area_starts: Vec<_> = self.vmas.keys().copied().collect();
+        let mut changed = false;
+        for area_start in area_starts {
+            let Some(area) = self.vmas.get(&area_start) else {
+                continue;
+            };
+            if !area.supports_private_page_sharing()
+                || !area.map_perm.contains(MapPermission::W)
+            {
+                continue;
+            }
+            let private_pages: Vec<_> = area
+                .data_frames
+                .iter()
+                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                .collect();
+            for (vpn, page) in private_pages {
+                let pte = self.translate(vpn).ok_or(MmError::NoMapping)?;
+                if !page.is_cow() || pte.flags().contains(PTEFlags::W) {
+                    continue;
+                }
+                if Arc::strong_count(&page) <= 2 {
+                    // Only this VMA and the local snapshot retain the page;
+                    // clear the stale fork-COW state in place instead of
+                    // copying a page that is already exclusive again.
+                    page.set_cow(false);
+                    let mut writable_flags = pte.flags();
+                    writable_flags.insert(PTEFlags::W);
+                    writable_flags.remove(PTEFlags::D);
+                    if !self.page_table.update_flags(vpn, writable_flags) {
+                        return Err(MmError::NoMapping);
+                    }
+                    changed = true;
+                    continue;
+                }
+                let writable_page = Arc::new(PrivatePage::new(
+                    frame_alloc_with_reclaim().ok_or(MmError::OutOfMemory)?,
+                ));
+                writable_page
+                    .ppn()
+                    .get_bytes_array()
+                    .copy_from_slice(page.ppn().get_bytes_array());
+                let mut writable_flags = pte.flags();
+                writable_flags.insert(PTEFlags::W);
+                writable_flags.remove(PTEFlags::D);
+                if !self
+                    .page_table
+                    .replace(vpn, writable_page.ppn(), writable_flags)
+                {
+                    return Err(MmError::NoMapping);
+                }
+                self.vmas
+                    .get_mut(&area_start)
+                    .ok_or(MmError::NoMapping)?
+                    .data_frames
+                    .insert(vpn, writable_page);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Build a temporary `MemorySet` that uses the parent's root and ASID.
+    /// No root frame or page-table descendants are allocated on this path.
+    pub(crate) fn from_shared_vfork_view(user_space: &Self) -> Result<Self, MmError> {
+        let mut vmas = BTreeMap::new();
+        for (&start_vpn, area) in &user_space.vmas {
+            vmas.insert(start_vpn, area.clone_shared_view());
+        }
+        Ok(Self {
+            page_table: PageTable::borrowed_from(&user_space.page_table),
+            vmas,
+            asid: user_space.asid,
+            active_user_harts: AtomicUsize::new(0),
+            tlb_generation: AtomicUsize::new(1),
+            seen_tlb_generation: [const { AtomicUsize::new(0) }; MAX_HARTS],
+            shared_vfork_view: true,
+        })
+    }
+
+    /// Extract the metadata and page-table descendants owned by a shared
+    /// vfork view before its borrowed root is dropped.
+    pub(crate) fn take_shared_vfork_state(&mut self) -> Option<SharedMemorySetState> {
+        if !self.shared_vfork_view {
+            return None;
+        }
+        Some(SharedMemorySetState {
+            vmas: core::mem::take(&mut self.vmas).into_values().collect(),
+            page_table_frames: self.page_table.take_owned_frames(),
+        })
+    }
+
+    /// Adopt the child's shared-view metadata and any page-table descendants
+    /// allocated while the parent was blocked in vfork.
+    pub(crate) fn adopt_shared_vfork_state(&mut self, state: SharedMemorySetState) {
+        debug_assert!(!self.shared_vfork_view);
+        self.vmas.clear();
+        for area in state.vmas {
+            self.vmas.insert(area.start_vpn(), area);
+        }
+        self.page_table.append_owned_frames(state.page_table_frames);
+    }
+
+    pub(crate) fn is_shared_vfork_view(&self) -> bool {
+        self.shared_vfork_view
     }
 
     /// Create a vfork-compatible address space for a process-style
@@ -1467,6 +1663,13 @@ impl MemorySet {
         // shared file mappings here as well so mmap writers do not lose their
         // output merely because the process exits or replaces its image.
         let _ = self.msync_range(VirtAddr::from(0), VirtAddr::from(USER_SPACE_END));
+        if self.shared_vfork_view {
+            // The root and all resident mappings belong to the parent.  The
+            // vfork owner extracts VMA/page-table state explicitly before
+            // this teardown path runs.
+            self.vmas.clear();
+            return UserReleaseBatch::new();
+        }
         let mut batch = UserReleaseBatch::new();
         for area in self.vmas.values_mut() {
             area.teardown_user_deferred(&mut self.page_table, &mut batch);
@@ -1478,6 +1681,10 @@ impl MemorySet {
 
     /// Remove all VMAs
     pub fn recycle_data_pages(&mut self) {
+        if self.shared_vfork_view {
+            self.vmas.clear();
+            return;
+        }
         for area in self.vmas.values_mut() {
             let _ = area.teardown_deferred(&mut self.page_table);
         }
@@ -3255,6 +3462,30 @@ impl Vma {
             file: self.file.clone(),
             shared_anon: self.shared_anon,
             direct_cache_pages: BTreeMap::new(),
+        }
+    }
+
+    /// Clone a VMA for a shared-MM vfork view, retaining the resident page
+    /// references without changing page-cache mapping counters.  The view is
+    /// temporary and its metadata is adopted by the parent when it finishes.
+    fn clone_shared_view(&self) -> Self {
+        Self {
+            vpn_range: VPNRange::new(self.start_vpn(), self.end_vpn()),
+            data_frames: self
+                .data_frames
+                .iter()
+                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                .collect(),
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+            kind: self.kind.clone(),
+            file: self.file.clone(),
+            shared_anon: self.shared_anon,
+            direct_cache_pages: self
+                .direct_cache_pages
+                .iter()
+                .map(|(&vpn, page)| (vpn, Arc::clone(page)))
+                .collect(),
         }
     }
     /// 返回该区域覆盖的起始虚拟页号，便于统一做区间级操作。

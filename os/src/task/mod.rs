@@ -570,12 +570,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // If this is the main thread or exit_group was requested, the process
     // should terminate at once.
     if tid == Some(0) || force_process_exit {
-        // A vfork parent must also be released when the child exits before
-        // reaching execve, for example when execve itself fails.
-        process.release_vfork_parent();
         let mut process_inner = process.inner_exclusive_access();
         if process_inner.is_zombie {
             drop(process_inner);
+            process.release_vfork_parent();
             let mut process_inner = process.inner_exclusive_access();
             if let Some(tid) = tid {
                 process_inner.mutex_detector.clear_thread(tid);
@@ -597,6 +595,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         // other's on_cpu handoff and could recycle the same address space.
         if process.exec_in_progress() {
             drop(process_inner);
+            process.release_vfork_parent();
             let mut process_inner = process.inner_exclusive_access();
             if let Some(tid) = tid {
                 process_inner.mutex_detector.clear_thread(tid);
@@ -773,13 +772,29 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
         recycle_res.clear();
 
+        // Drop the child's task resources while the shared-view marker is
+        // still set, then hand the shared address space back to the parent
+        // before waking a blocked vfork caller.
+        let shared_state = {
+            let mut process_inner = process.inner_exclusive_access();
+            process_inner.memory_set.take_shared_vfork_state()
+        };
+        process.finish_vfork_shared_mm(shared_state);
+        // A vfork parent must also be released when the child exits before
+        // reaching execve, for example when execve itself fails.
+        process.release_vfork_parent();
+
         let exit_signal = process.clone_exit_signal;
         let (closed_fds, reclaim, shm_attachments, keyrings_to_release) = {
             let mut process_inner = process.inner_exclusive_access();
             // deallocate other data in user space i.e. program code/data section
             let token = process_inner.memory_set.token();
             let release_batch = process_inner.memory_set.recycle_data_pages_deferred();
-            let mask = process_inner.memory_set.record_local_tlb_change();
+            let mask = if process_inner.memory_set.is_shared_vfork_view() {
+                0
+            } else {
+                process_inner.memory_set.record_local_tlb_change()
+            };
             // warn_heap_state_lockfree("exit_after_vmas_clear", pid);
             let reclaim = DeferredUserReclaim::new(token, mask, release_batch);
             // 关键点：先把 fd 表项整体移出，避免在持有进程自旋锁时触发文件同步或块设备等待。

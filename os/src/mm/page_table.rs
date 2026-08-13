@@ -169,6 +169,21 @@ impl PageTable {
         })
     }
 
+    /// Create a view of an existing owned root without allocating another
+    /// hardware page-table root.  The root guard keeps the parent root alive
+    /// while the view is installed on a hart.
+    pub(crate) fn borrowed_from(other: &PageTable) -> Self {
+        debug_assert!(
+            other.root_frame.is_some(),
+            "a borrowed page table must originate from an owned root"
+        );
+        Self {
+            root_ppn: other.root_ppn,
+            root_frame: other.root_frame.as_ref().map(Arc::clone),
+            frames: Vec::new(),
+        }
+    }
+
     /// Share the complete Sv39 kernel half from the permanent kernel page
     /// table. Only this root frame is process-owned; the referenced kernel
     /// directory frames live for the lifetime of `KERNEL_SPACE`.
@@ -285,6 +300,22 @@ impl PageTable {
         }
         None
     }
+
+    /// Return the leaf table covering `vpn`, assuming all intermediate levels
+    /// have already been created.
+    fn find_leaf_table(&self, vpn: VirtPageNum) -> Option<PhysPageNum> {
+        let levels = crate::hal::page_table_levels();
+        let mut ppn = self.root_ppn;
+        for level in 0..levels.saturating_sub(1) {
+            let idx = crate::hal::vpn_index(vpn.0, level);
+            let pte = &ppn.get_pte_array()[idx];
+            if !pte.is_valid() {
+                return None;
+            }
+            ppn = pte.ppn();
+        }
+        Some(ppn)
+    }
     /// set the map between virtual page number and physical page number
     #[allow(unused)]
     pub fn map(
@@ -322,6 +353,112 @@ impl PageTable {
         }
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         Ok(())
+    }
+
+    /// Map a consecutive run of already allocated physical pages.
+    ///
+    /// Intermediate page-table pages are allocated once per leaf table, then
+    /// the leaf PTEs are written directly.  This is the hot path used by
+    /// fork's COW inheritance, where a VMA commonly contains many adjacent
+    /// resident pages.
+    pub(crate) fn map_preallocated_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        entries: &[(PhysPageNum, PTEFlags)],
+    ) -> Result<(), MmError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let end = start_vpn
+            .0
+            .checked_add(entries.len())
+            .ok_or(MmError::InvalidRange)?;
+        let leaf_span = 1usize << crate::hal::page_table_index_bits();
+
+        // Complete all fallible intermediate allocations before touching leaf
+        // PTEs.  A leaf table covers `leaf_span` consecutive virtual pages.
+        let mut previous_leaf_base = None;
+        for vpn_index in 0..entries.len() {
+            let vpn = VirtPageNum(start_vpn.0 + vpn_index);
+            let leaf_base = vpn.0 & !(leaf_span - 1);
+            if previous_leaf_base != Some(leaf_base) {
+                self.ensure_leaf(vpn)?;
+                previous_leaf_base = Some(leaf_base);
+            }
+        }
+
+        let mut offset = 0usize;
+        while offset < entries.len() {
+            let vpn = VirtPageNum(start_vpn.0 + offset);
+            let leaf_ppn = self.find_leaf_table(vpn).ok_or(MmError::NoMapping)?;
+            let leaf_index = crate::hal::vpn_index(
+                vpn.0,
+                crate::hal::page_table_levels().saturating_sub(1),
+            );
+            let chunk_len = core::cmp::min(entries.len() - offset, leaf_span - leaf_index);
+            let leaf_entries = &mut leaf_ppn.get_pte_array()[leaf_index..leaf_index + chunk_len];
+            for (pte, (ppn, flags)) in leaf_entries
+                .iter_mut()
+                .zip(entries[offset..offset + chunk_len].iter())
+            {
+                if pte.is_valid() {
+                    return Err(MmError::Conflict);
+                }
+                *pte = PageTableEntry::new(*ppn, *flags | PTEFlags::V);
+            }
+            offset += chunk_len;
+        }
+        let _ = end;
+        Ok(())
+    }
+
+    /// Update flags for a consecutive run without repeating a full page-table
+    /// walk for every page.
+    pub(crate) fn update_flags_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        len: usize,
+        flags: PTEFlags,
+    ) -> Result<(), MmError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let _end = start_vpn
+            .0
+            .checked_add(len)
+            .ok_or(MmError::InvalidRange)?;
+        let leaf_span = 1usize << crate::hal::page_table_index_bits();
+        let mut offset = 0usize;
+        while offset < len {
+            let vpn = VirtPageNum(start_vpn.0 + offset);
+            let leaf_ppn = self.find_leaf_table(vpn).ok_or(MmError::NoMapping)?;
+            let leaf_index = crate::hal::vpn_index(
+                vpn.0,
+                crate::hal::page_table_levels().saturating_sub(1),
+            );
+            let chunk_len = core::cmp::min(len - offset, leaf_span - leaf_index);
+            let leaf_entries = &mut leaf_ppn.get_pte_array()[leaf_index..leaf_index + chunk_len];
+            for pte in leaf_entries.iter_mut() {
+                if !pte.is_valid() {
+                    return Err(MmError::NoMapping);
+                }
+                let ppn = pte.ppn();
+                *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+            }
+            offset += chunk_len;
+        }
+        Ok(())
+    }
+
+    /// Move descendants allocated by a borrowed view back to its owning
+    /// address space before the view is dropped.
+    pub(crate) fn take_owned_frames(&mut self) -> Vec<FrameTracker> {
+        core::mem::take(&mut self.frames)
+    }
+
+    /// Adopt page-table descendants transferred from a shared view.
+    pub(crate) fn append_owned_frames(&mut self, mut frames: Vec<FrameTracker>) {
+        self.frames.append(&mut frames);
     }
     /// Map a permanent kernel page without recording page-table frames in `frames`.
     pub fn map_kernel_untracked(

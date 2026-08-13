@@ -16,7 +16,8 @@ use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, shootdown_page, shootdown_range, translated_refmut,
     DeferredUserReclaim, FilePageFaultPrepare, InodeKey, MapPermission, MemorySet, MmError,
-    PageFaultAccess, PageFaultHandled, ShootdownKind, UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
+    PageFaultAccess, PageFaultHandled, SharedMemorySetState, ShootdownKind, UserSpaceLayout,
+    VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sched::insert_into_pid2process;
 use crate::sched::{add_task, current_task};
@@ -202,6 +203,15 @@ fn add_arch_auxv(auxv: &mut Vec<(Auxv, usize)>) {
 }
 
 /// Process Control Block
+struct VforkSharedState {
+    /// Strongly keep the parent root and its owned page-table descendants alive
+    /// while the child executes against the borrowed shared-MM view.
+    parent: Arc<ProcessControlBlock>,
+    /// The parent task whose trap context must be restored before wakeup.
+    parent_task: Arc<TaskControlBlock>,
+    parent_trap_cx: TrapContext,
+}
+
 pub struct ProcessControlBlock {
     /// immutable
     pub pid: PidHandle,
@@ -235,6 +245,8 @@ pub struct ProcessControlBlock {
     vfork_released: AtomicBool,
     /// Whether this process is currently replacing its image with `execve`.
     exec_in_progress: AtomicBool,
+    /// Parent/root ownership state for a shared-MM `vfork` child.
+    vfork_shared_state: SpinNoIrqLock<Option<VforkSharedState>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1112,6 +1124,7 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(true),
             exec_in_progress: AtomicBool::new(false),
+            vfork_shared_state: SpinNoIrqLock::new(None),
         });
         // create a main thread, we should allocate ustack and trap_cx here
         let task = process
@@ -1253,8 +1266,14 @@ impl ProcessControlBlock {
         // scheduler reads the authoritative token from the PCB.
         crate::sched::activate_current_address_space(new_address_space);
         debug!("[mmap] exec teardown old memory_set before installing new user context");
+        let shared_state = old_memory_set.take_shared_vfork_state();
+        self.finish_vfork_shared_mm(shared_state);
         let old_batch = old_memory_set.recycle_data_pages_deferred();
-        let old_mask = old_memory_set.record_local_tlb_change();
+        let old_mask = if old_memory_set.is_shared_vfork_view() {
+            0
+        } else {
+            old_memory_set.record_local_tlb_change()
+        };
         DeferredUserReclaim::new(old_token, old_mask, old_batch).flush_then_release();
         for entry in &cloexec_entries {
             entry.desc.release_posix_locks_for_owner(owner_pid);
@@ -1398,6 +1417,7 @@ impl ProcessControlBlock {
         vfork_clone: bool,
     ) -> Result<Arc<Self>, ERRNO> {
         trace!("kernel: clone_process");
+        let _clone_probe = crate::probe_scope!("process.clone_process");
         let clone_start_ns = get_time_ns();
         // warn_heap_state("fork_begin", self.getpid());
         // Snapshot the calling task before taking the parent PCB lock.  The
@@ -1444,9 +1464,26 @@ impl ProcessControlBlock {
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let addr_space_start_ns = get_time_ns();
-        let (memory_set, parent_token, parent_mask) = if shared_resources
-            .contains(CloneResourceFlags::VM)
-        {
+        let shared_mm_vfork =
+            vfork_clone && shared_resources.contains(CloneResourceFlags::VM);
+        let (memory_set, parent_token, parent_mask) = if shared_mm_vfork {
+            let _vfork_probe = crate::probe_scope!("mm.clone_shared_vfork");
+            let parent_tlb_needs_flush = parent
+                .memory_set
+                .prepare_shared_vfork()
+                .map_err(mm_error_to_errno)?;
+            let memory_set = MemorySet::from_shared_vfork_view(&parent.memory_set)
+                .map_err(mm_error_to_errno)?;
+            let parent_token = parent.memory_set.token();
+            let parent_mask = if parent_tlb_needs_flush {
+                parent
+                    .memory_set
+                    .record_tlb_change_with_local_fence()
+            } else {
+                0
+            };
+            (memory_set, parent_token, parent_mask)
+        } else if shared_resources.contains(CloneResourceFlags::VM) {
             let (memory_set, parent_tlb_needs_flush) =
                 MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
                     .map_err(mm_error_to_errno)?;
@@ -1512,6 +1549,15 @@ impl ProcessControlBlock {
             }
         }
         let fd_copy_ns = get_time_ns() - fd_copy_start_ns;
+        let vfork_shared_state = if shared_mm_vfork {
+            Some(VforkSharedState {
+                parent: Arc::clone(self),
+                parent_task: Arc::clone(&parent_task),
+                parent_trap_cx,
+            })
+        } else {
+            None
+        };
         // create child process pcb
         let child_pcb_start_ns = get_time_ns();
         let child = Arc::new(Self {
@@ -1575,6 +1621,7 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(!vfork_clone),
             exec_in_progress: AtomicBool::new(false),
+            vfork_shared_state: SpinNoIrqLock::new(vfork_shared_state),
         });
         let child_pcb_ns = get_time_ns() - child_pcb_start_ns;
         // warn_heap_state("fork_after_pcb_create", self.getpid());
@@ -1861,6 +1908,7 @@ impl ProcessControlBlock {
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(true),
             exec_in_progress: AtomicBool::new(false),
+            vfork_shared_state: SpinNoIrqLock::new(None),
         });
         parent.children.push(Arc::clone(&child));
         drop(parent);
@@ -1942,6 +1990,50 @@ impl ProcessControlBlock {
     /// Return whether a process-wide `execve` transition is in progress.
     pub(crate) fn exec_in_progress(&self) -> bool {
         self.exec_in_progress.load(Ordering::Acquire)
+    }
+
+    /// Whether this process is still executing in a parent's shared-MM
+    /// vfork view.  Task-resource teardown uses this to avoid removing the
+    /// parent's stack/trap VMAs from the shared page table.
+    pub(crate) fn is_vfork_shared(&self) -> bool {
+        self.vfork_shared_state.lock().is_some()
+    }
+
+    /// Finish a shared-MM vfork transition before waking its parent.
+    ///
+    /// The child may have faulted pages or changed VMAs while the parent was
+    /// suspended.  Adopt that metadata and any newly allocated page-table
+    /// descendants, restore the parent's saved trap frame, then invalidate
+    /// stale parent translations.
+    pub(crate) fn finish_vfork_shared_mm(
+        &self,
+        shared_state: Option<SharedMemorySetState>,
+    ) {
+        let Some(state) = self.vfork_shared_state.lock().take() else {
+            return;
+        };
+        if let Some(shared_state) = shared_state {
+            let (token, mask) = {
+                let mut parent_inner = state.parent.inner_exclusive_access();
+                parent_inner
+                    .memory_set
+                    .adopt_shared_vfork_state(shared_state);
+                let token = parent_inner.memory_set.token();
+                let mask = parent_inner
+                    .memory_set
+                    .record_tlb_change_with_local_fence();
+                (token, mask)
+            };
+            if mask != 0 {
+                shootdown(mask, ShootdownKind::AddressSpace { token });
+            }
+        }
+        *state.parent_task.inner_exclusive_access().get_trap_cx() = state.parent_trap_cx;
+        // The exec path may still fail while constructing the new user stack
+        // after the old shared view has already been detached.  Wake here as
+        // well as at the syscall wrapper so that such a failure cannot leave
+        // the parent blocked forever.
+        self.release_vfork_parent();
     }
 
     /// Release a parent blocked by `CLONE_VFORK`.
