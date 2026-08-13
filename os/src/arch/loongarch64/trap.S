@@ -31,7 +31,10 @@
 __tlb_refill:
     csrwr   $t0, 0x8b          # save t0 to TLBRSAVE
     csrrd   $t0, 0x1b          # t0 = effective PGD selected by hardware
-    lddir   $t0, $t0, 2        # walk root → mid (Dir2 → Dir1)
+    # Linux's LoongArch64 three-level layout uses Dir3 for the root index and
+    # Dir1 for the middle index (Dir2 is unused).  QEMU also accepts a Dir2
+    # root, but real 2K1000 hardware requires the architectural Dir3 walk.
+    lddir   $t0, $t0, 3        # walk root → mid (Dir3 → Dir1)
     beqz    $t0, 1f
     lddir   $t0, $t0, 1        # walk mid → leaf PT
     beqz    $t0, 1f
@@ -48,7 +51,9 @@ __tlb_refill:
 
     .globl __alltraps
     .globl __restore
-    .align 3
+    # EENTRY stores only bits [GRLEN-1:12]. Keep the general exception entry
+    # on its own 4 KiB boundary instead of sharing the TLB-refill page.
+    .balign 4096
 __alltraps:
     # Swap user sp with the per-task trap context pointer kept in CSR_SAVE.
     # This preserves every user GPR, including t0/r12.
@@ -79,11 +84,18 @@ __alltraps:
     STORE_FP %n
     .set    n, n + 1
     .endr
+    # This code is executed through the trampoline alias, so it must not use
+    # PC-relative references to ordinary kernel globals.  EUEN is hart-local
+    # and directly tells us whether LSX instructions are safe to execute.
+    csrrd   $t0, 0x2
+    andi    $t0, $t0, 0x2
+    beqz    $t0, 10f
     .set    n, 0
     .rept   32
     STORE_FP_HIGH %n
     .set    n, n + 1
     .endr
+10:
     movfcsr2gr $t0, $fcsr0
     st.d    $t0, $sp, 70*8
 
@@ -120,11 +132,15 @@ __restore:
     LOAD_FP %n
     .set    n, n + 1
     .endr
+    csrrd   $t0, 0x2
+    andi    $t0, $t0, 0x2
+    beqz    $t0, 11f
     .set    n, 0
     .rept   32
     LOAD_FP_HIGH %n
     .set    n, n + 1
     .endr
+11:
     ld.d    $ra, $sp, 1*8
     ld.d    $tp, $sp, 2*8
     .set    n, 4
@@ -137,7 +153,8 @@ __restore:
 
     .section .text
     .globl __trap_from_kernel
-    .align 3
+    # This is also installed directly in EENTRY while Rust handles a trap.
+    .balign 4096
 __trap_from_kernel:
     # Save all caller-saved GPRs (LoongArch ELF ABI: ra, a0-a7, t0-t8).
     # The Rust trap_from_kernel and its callees freely clobber these

@@ -15,6 +15,7 @@ log = { version = "0.4", features = ["release_max_level_warn"] }
 bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
+simple-ahci = { version = "0.1.1-preview.1", optional = true }
 # fs = { path = "../fs" }
 fs = { path = "../fs", default-features = false, features = ["io_perf_counters", "kernel_sleep_mutex"] }
 hashbrown = "0.12.3"
@@ -36,7 +37,7 @@ fat32 = []
 easyfs = []
 ext4 = []
 platform-qemu-virt = []
-platform-ls2k1000-nebula = []
+platform-ls2k1000-nebula = ["dep:simple-ahci"]
 io_perf_counters = []
 net_perf_counters = []
 mm_perf_counters = []

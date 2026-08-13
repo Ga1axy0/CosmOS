@@ -124,6 +124,7 @@ pub struct BootInfo {
     pch_pic: Option<DeviceResource>,
     eiointc: Option<DeviceResource>,
     pci_host: Option<PciHostResource>,
+    ahci: Option<DeviceResource>,
     virtio_mmio: [DeviceResource; MAX_VIRTIO_MMIO_DEVICES],
     virtio_mmio_count: usize,
     mmio_regions: [PhysMemoryRegion; MAX_MMIO_REGIONS],
@@ -150,6 +151,7 @@ impl BootInfo {
             pch_pic: None,
             eiointc: None,
             pci_host: None,
+            ahci: None,
             virtio_mmio: [DeviceResource::empty(); MAX_VIRTIO_MMIO_DEVICES],
             virtio_mmio_count: 0,
             mmio_regions: [PhysMemoryRegion::empty(); MAX_MMIO_REGIONS],
@@ -307,6 +309,11 @@ impl BootInfo {
     /// Return the PCI host bridge description.
     pub fn pci_host(&self) -> Option<PciHostResource> {
         self.pci_host
+    }
+
+    /// Return the firmware-described AHCI controller resource.
+    pub fn ahci(&self) -> Option<DeviceResource> {
+        self.ahci
     }
 
     /// Return all enabled VirtIO-MMIO transports.
@@ -787,6 +794,7 @@ struct NodeState {
     is_pch_pic: bool,
     is_eiointc: bool,
     is_pci_host: bool,
+    is_ahci: bool,
     address_cells: usize,
     size_cells: usize,
     child_address_cells: usize,
@@ -826,6 +834,7 @@ impl NodeState {
             is_pch_pic: false,
             is_eiointc: false,
             is_pci_host: false,
+            is_ahci: false,
             address_cells: parent.child_address_cells.max(1),
             size_cells: parent.child_size_cells.max(1),
             child_address_cells: 2,
@@ -860,13 +869,22 @@ impl NodeState {
                 self.is_uart = compatible_contains(value, b"ns16550a")
                     || compatible_contains(value, b"ns16550");
                 self.is_rtc = compatible_contains(value, b"google,goldfish-rtc")
-                    || compatible_contains(value, b"loongson,ls7a-rtc");
+                    || compatible_contains(value, b"loongson,ls7a-rtc")
+                    || compatible_contains(value, b"loongson,ls2k-rtc")
+                    || compatible_contains(value, b"loongson,ls2k1000-rtc")
+                    || compatible_contains(value, b"loongson,ls-rtc");
                 self.is_plic = compatible_contains(value, b"riscv,plic0")
                     || compatible_contains(value, b"sifive,plic-1.0.0");
                 self.is_virtio_mmio = compatible_contains(value, b"virtio,mmio");
                 self.is_pch_pic = compatible_contains(value, b"loongson,pch-pic-1.0");
                 self.is_eiointc = compatible_contains(value, b"loongson,ls2k2000-eiointc");
                 self.is_pci_host = compatible_contains(value, b"pci-host-ecam-generic");
+                self.is_ahci = compatible_contains(value, b"snps,spear-ahci")
+                    || compatible_contains(value, b"loongson,ls-ahci")
+                    || compatible_contains(value, b"loongson,ls2k1000-ahci")
+                    || compatible_contains(value, b"loongson,2k1000-ahci")
+                    || compatible_contains(value, b"generic-ahci")
+                    || compatible_contains(value, b"snps,dwc-ahci");
             }
             b"timebase-frequency" => {
                 self.timebase_frequency = read_cells_usize(value, 1).unwrap_or(0)
@@ -964,6 +982,9 @@ impl NodeState {
             self.parse_pci_ranges(&mut host);
             self.parse_pci_interrupt_map(&mut host);
             info.pci_host = Some(host);
+            info.push_mmio_region(resource);
+        } else if self.is_ahci && info.ahci.is_none() {
+            info.ahci = Some(resource);
             info.push_mmio_region(resource);
         }
     }

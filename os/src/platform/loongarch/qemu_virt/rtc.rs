@@ -11,6 +11,11 @@ const TOY_WRITE1: usize = 0x28;
 const TOY_READ0: usize = 0x2c;
 const TOY_READ1: usize = 0x30;
 const RTC_CTRL: usize = 0x40;
+const RTC_TRIM: usize = 0x60;
+
+const RTC_ENABLE: u32 = 1 << 13;
+const TOY_ENABLE: u32 = 1 << 11;
+const OSC_ENABLE: u32 = 1 << 8;
 
 #[inline(always)]
 fn mmio_read32(addr: usize) -> u32 {
@@ -33,8 +38,12 @@ impl Rtc {
 
     fn init(&self) {
         mmio_write32(self.base + TOY_TRIM, 0);
+        mmio_write32(self.base + RTC_TRIM, 0);
         let ctrl = mmio_read32(self.base + RTC_CTRL);
-        mmio_write32(self.base + RTC_CTRL, ctrl | (1 << 11) | (1 << 8));
+        mmio_write32(
+            self.base + RTC_CTRL,
+            ctrl | RTC_ENABLE | TOY_ENABLE | OSC_ENABLE,
+        );
     }
 
     fn read_time_ns(&self) -> u64 {
