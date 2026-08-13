@@ -841,11 +841,16 @@ fn dequeue_task(hart: usize) -> Option<Arc<TaskControlBlock>> {
         }?;
         let mut task_inner = task.inner_exclusive_access();
         task_inner.sched.on_rq = false;
-        if matches!(task_inner.task_status, TaskStatus::Runnable) {
+        if task_inner.exit_code.is_none()
+            && matches!(task_inner.task_status, TaskStatus::Runnable)
+        {
             task.on_cpu.store(true, Ordering::Relaxed);
             task_inner.sched.last_cpu = hart;
             drop(task_inner);
             return Some(task);
+        }
+        if task_inner.exit_code.is_some() {
+            task_inner.task_status = TaskStatus::Zombie;
         }
     }
 }
@@ -873,7 +878,12 @@ fn steal_cfs_task(target_hart: usize) -> Option<Arc<TaskControlBlock>> {
                 .min_vruntime_ns;
             let mut task_inner = task.inner_exclusive_access();
             task_inner.sched.on_rq = false;
-            if !matches!(task_inner.task_status, TaskStatus::Runnable) {
+            if task_inner.exit_code.is_some()
+                || !matches!(task_inner.task_status, TaskStatus::Runnable)
+            {
+                if task_inner.exit_code.is_some() {
+                    task_inner.task_status = TaskStatus::Zombie;
+                }
                 continue;
             }
             task.on_cpu.store(true, Ordering::Relaxed);
@@ -1091,7 +1101,14 @@ pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
 /// task's kernel stack is guaranteed unused.
 pub fn clear_stopping_task() {
     let hart = hartid();
-    RUN_QUEUES[hart].lock().stop_task = None;
+    let task = RUN_QUEUES[hart].lock().stop_task.take();
+    if let Some(task) = task {
+        // Process teardown and exec wait with Acquire before reclaiming this
+        // task's trap frame/address-space resources. Keep it on-CPU until the
+        // architectural context switch has made its kernel stack unreachable.
+        task.on_cpu.store(false, Ordering::Release);
+        drop(task);
+    }
 }
 
 /// Get process by pid.

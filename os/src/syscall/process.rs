@@ -82,7 +82,7 @@ fn snapshot_wait_children(
                 pid: child.getpid(),
                 ppid,
                 pgid: child_inner.cred.pgid,
-                is_zombie: child_inner.is_zombie,
+                is_zombie: child_inner.is_zombie && child.cpu_accounting_finalized(),
             };
             drop(child_inner);
             (child, snapshot)
@@ -1605,7 +1605,12 @@ fn sys_clone_request(req: CloneRequest) -> isize {
                     write_pod_to_user(ptr as *mut i32, &new_tid)?;
                 }
             }
-            current_process.attach_task(Arc::clone(&new_task));
+            if current_process.attach_task(Arc::clone(&new_task)).is_err() {
+                // Process teardown won the race. Dropping this unpublished
+                // task releases its trap-frame allocation without exposing it
+                // to the scheduler or global TID map.
+                return Err(ERRNO::EAGAIN);
+            }
             add_task(new_task);
             let process_thread_count = current_process.thread_count();
             debug!(
@@ -2032,14 +2037,17 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                 // Read the child's exit data only after releasing the parent
                 // lock. Revalidate the snapshot in case of a concurrent race.
                 let child_data = {
+                    let accounting_finalized = child.cpu_accounting_finalized();
+                    // Pair with finalization before reading relaxed totals.
+                    let (child_user_time, child_kernel_time) = child.committed_cpu_times();
                     let child_inner = child.inner_exclusive_access();
                     let child_snapshot = WaitChildSnapshot {
                         pid: found_pid,
                         ppid: 0,
                         pgid: child_inner.cred.pgid,
-                        is_zombie: child_inner.is_zombie,
+                        is_zombie: child_inner.is_zombie && accounting_finalized,
                     };
-                    if !child_inner.is_zombie
+                    if !child_snapshot.is_zombie
                         || !wait_child_matches(pid, current_pgid, child_snapshot)
                     {
                         None
@@ -2062,9 +2070,9 @@ pub fn sys_wait4(pid: isize, exit_status_ptr: *mut i32, options: isize) -> isize
                         };
                         Some((
                             exit_status,
-                            child_inner.user_time,
+                            child_user_time,
                             child_inner.child_user_time,
-                            child_inner.kernel_time,
+                            child_kernel_time,
                             child_inner.child_kernel_time,
                         ))
                     }

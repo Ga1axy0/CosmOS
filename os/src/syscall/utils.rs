@@ -273,17 +273,33 @@ pub fn read_cstring_from_user(ptr: *const u8, max_len: usize) -> Result<String, 
     if ptr.is_null() {
         return Err(ERRNO::EFAULT);
     }
+    if max_len == 0 {
+        return Err(ERRNO::ENAMETOOLONG);
+    }
     let mut out = String::new();
-    for offset in 0..max_len {
-        let ch = translated_byte_buffer_with_access(
-            unsafe { ptr.add(offset) },
-            1,
-            PageFaultAccess::Read,
-        )?[0][0];
-        if ch == 0 {
+    let mut offset = 0usize;
+    while offset < max_len {
+        // Translate one page-sized run at a time instead of one byte at a
+        // time.  The old per-byte loop performed a full page-table walk and a
+        // fresh `Vec` allocation for every character, which dominated path
+        // string copyin for `open`/`stat`-style syscalls.
+        let cur = unsafe { ptr.add(offset) };
+        let page_remain = PAGE_SIZE - ((cur as usize) & (PAGE_SIZE - 1));
+        let chunk_len = (max_len - offset).min(page_remain);
+        let buffers = translated_byte_buffer_with_access(cur, chunk_len, PageFaultAccess::Read)?;
+        let mut nul_found = false;
+        for chunk in buffers {
+            if let Some(nul_idx) = chunk.iter().position(|&byte| byte == 0) {
+                out.extend(chunk[..nul_idx].iter().copied().map(|byte| byte as char));
+                nul_found = true;
+                break;
+            }
+            out.extend(chunk.iter().copied().map(|byte| byte as char));
+        }
+        if nul_found {
             return Ok(out);
         }
-        out.push(ch as char);
+        offset += chunk_len;
     }
     Err(ERRNO::ENAMETOOLONG)
 }

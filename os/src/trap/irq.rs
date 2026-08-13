@@ -91,3 +91,28 @@ impl Drop for KernelIrqEnableGuard {
         }
     }
 }
+
+/// Enable interrupts for a syscall entered directly from user mode.
+///
+/// The user trap entry always arrives with local interrupts disabled, before
+/// any hardirq or irq-off lock nesting can exist.  Keeping this narrower guard
+/// separate makes that invariant explicit and avoids consulting the per-hart
+/// nesting counters on every syscall.
+pub(super) struct UserSyscallIrqGuard;
+
+impl UserSyscallIrqGuard {
+    #[inline]
+    pub(super) fn new() -> Self {
+        debug_assert!(!crate::hal::local_irqs_enabled());
+        debug_assert!(can_sleep());
+        unsafe { crate::hal::enable_local_irqs() };
+        Self
+    }
+}
+
+impl Drop for UserSyscallIrqGuard {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { crate::hal::disable_local_irqs() };
+    }
+}

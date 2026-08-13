@@ -320,8 +320,9 @@ impl InterruptControl for RiscvInterruptControl {
 }
 
 impl TrapMachine for RiscvTrapMachine {
-    fn read_trap_info() -> TrapInfo {
-        let cause = match scause::read().cause() {
+    #[inline]
+    fn read_trap_cause() -> TrapCause {
+        match scause::read().cause() {
             Trap::Exception(Exception::UserEnvCall) => TrapCause::UserSyscall,
             Trap::Exception(Exception::StorePageFault) => TrapCause::StorePageFault,
             Trap::Exception(Exception::LoadPageFault) => TrapCause::LoadPageFault,
@@ -334,9 +335,12 @@ impl TrapMachine for RiscvTrapMachine {
             Trap::Interrupt(Interrupt::SupervisorSoft) => TrapCause::SoftwareInterrupt,
             Trap::Interrupt(Interrupt::SupervisorExternal) => TrapCause::ExternalInterrupt,
             _ => TrapCause::Unknown,
-        };
+        }
+    }
+
+    fn read_trap_info() -> TrapInfo {
         TrapInfo {
-            cause,
+            cause: Self::read_trap_cause(),
             fault_addr: stval::read(),
         }
     }
@@ -455,6 +459,12 @@ impl TrapContextAbi for RiscvTrapContextAbi {
     ) -> Self::Frame {
         let mut status = sstatus::read();
         status.set_spp(SPP::User);
+        // A frame may be created by exec while the syscall path has SIE set.
+        // `sret` derives the userspace interrupt-enable bit from SPIE; never
+        // copy the live kernel SIE bit into a frame that is restored while the
+        // trampoline still uses the TrapContext as its stack pointer.
+        status.set_sie(false);
+        status.set_spie(true);
         // Keep FP disabled until the task executes its first F/D instruction.
         // This lets the trampoline skip all FP loads/stores for integer-only
         // workloads while still preserving the existing per-task backing area.
@@ -584,6 +594,9 @@ impl TrapContextAbi for RiscvTrapContextAbi {
         // A signal frame explicitly supplying FP state makes that state valid,
         // even if the interrupted task had not previously used the FPU.
         frame.sstatus.set_fs(FS::Clean);
+        // The frame no longer matches the registers currently resident on the
+        // hart.  Force this return through the full assembly restore path.
+        unsafe { sstatus::set_fs(FS::Dirty) };
     }
 
     fn fault_dump_summary(frame: &Self::Frame) -> [NamedReg; 7] {

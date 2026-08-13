@@ -95,6 +95,13 @@ pub trait SyscallAbi {
 
 /// Arch-specific trap/syscall machine operations used by common code.
 pub trait TrapMachine {
+    /// Read only the current trap cause. Architectures may override this to
+    /// avoid touching a fault-value CSR on paths (notably syscalls) that do
+    /// not consume it.
+    #[inline]
+    fn read_trap_cause() -> TrapCause {
+        Self::read_trap_info().cause
+    }
     /// Read the current trap cause and associated fault address.
     fn read_trap_info() -> TrapInfo;
     /// Return to user mode using the given trap-context VA and address-space token.

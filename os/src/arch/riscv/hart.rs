@@ -25,7 +25,11 @@ impl HartId for RiscvHartId {
 
     #[inline]
     unsafe fn enable_fp() {
-        sstatus::set_fs(FS::Initial);
+        // Do not erase Dirty: trap return uses the live FS state to decide
+        // whether userspace FP registers can be reused without reloading them.
+        if sstatus::read().fs() == FS::Off {
+            sstatus::set_fs(FS::Initial);
+        }
     }
 
     #[inline]

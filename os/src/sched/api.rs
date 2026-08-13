@@ -1,7 +1,7 @@
 //! Scheduling control-flow entry points.
 
 use super::{
-    boost_process_cfs_tasks, cfs_should_preempt, current_process, current_task,
+    boost_process_cfs_tasks, cfs_should_preempt, current_task,
     defer_task_release_after_switch, has_runnable_task_at_or_above, restore_current_task, schedule,
     take_current_task, TaskContext,
 };
@@ -17,7 +17,6 @@ fn suspend_current_and_run_next_inner(
     reset_slice: bool,
     rt_enqueue_head: Option<bool>,
 ) {
-    current_process().pause_cpu_accounting(get_time());
     // IRQ-atomic transition window — see `block_current_and_run_next` for the
     // rationale. `take_current_task()` clears `processor.current` while
     // `on_cpu` is only dropped later by `finish_pending_task_release()` after
@@ -28,10 +27,22 @@ fn suspend_current_and_run_next_inner(
     // for consistency and to guard against future regressions.)
     let _irq = crate::hal::LocalIrqSave::new();
     let task = take_current_task().unwrap();
+    let process = task
+        .process
+        .upgrade()
+        .expect("suspend without a current process");
+    // Publish the inactive accounting state only after interrupts are masked.
+    // Otherwise a kernel timer tick can land between this transition and
+    // `take_current_task()`, mistake INACTIVE for an open kernel slice, and
+    // restart accounting while the task is off-CPU.
+    process.pause_cpu_accounting(task.as_ref(), get_time());
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.account_cfs_runtime(get_time_ns());
-        if matches!(task_inner.task_status, TaskStatus::Zombie) {
+        if task_inner.exit_code.is_some()
+            || matches!(task_inner.task_status, TaskStatus::Zombie)
+        {
+            task_inner.task_status = TaskStatus::Zombie;
             task_inner.sched.on_rq = false;
             task_inner.wait_reason = None;
         } else {
@@ -96,7 +107,18 @@ pub fn block_current_and_run_next(reason: WaitReason) {
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.account_cfs_runtime(get_time_ns());
-        let task_cx_ptr = if matches!(task_inner.task_status, TaskStatus::Runnable) {
+        let task_cx_ptr = if task_inner.exit_code.is_some()
+            || matches!(task_inner.task_status, TaskStatus::Zombie)
+        {
+            // Remote exec/exit makes exit_code irreversible. A wait helper
+            // may have overwritten Zombie immediately before this final
+            // transition; restore it and switch away instead of cancelling
+            // the block or publishing another runnable task.
+            task_inner.task_status = TaskStatus::Zombie;
+            task_inner.sched.on_rq = false;
+            task_inner.wait_reason = None;
+            Some(&mut task_inner.task_cx as *mut TaskContext)
+        } else if matches!(task_inner.task_status, TaskStatus::Runnable) {
             task_inner.task_status = TaskStatus::Running;
             task_inner.wait_reason = None;
             task.on_cpu.store(true, Ordering::Relaxed);
@@ -138,7 +160,7 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         };
         boost_process_cfs_tasks(hartid(), boost_candidates.as_slice());
     }
-    process.pause_cpu_accounting(get_time());
+    process.pause_cpu_accounting(task.as_ref(), get_time());
     defer_task_release_after_switch(task);
     schedule(task_cx_ptr.unwrap());
 }

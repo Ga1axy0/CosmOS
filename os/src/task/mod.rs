@@ -79,56 +79,59 @@ pub(crate) fn terminate_other_threads_for_exec(
     for sibling in siblings {
         let state = {
             let mut task_inner = sibling.inner_exclusive_access();
-            if task_inner.exit_code.is_some() {
-                None
-            } else {
-                let tid = task_inner.res.as_ref().map(|res| res.tid);
-                let thread_id = task_inner.res.as_ref().map(|res| res.thread_id());
-                let clear_child_tid = task_inner.clear_child_tid;
-                let wait_handle = task_inner.current_wq_handle.take();
-                let was_on_cpu = sibling.on_cpu.load(Ordering::Acquire);
-                let last_cpu = task_inner.sched.last_cpu;
+            let already_exiting = task_inner.exit_code.is_some();
+            let tid = task_inner.res.as_ref().map(|res| res.tid);
+            let thread_id = task_inner.res.as_ref().map(|res| res.thread_id());
+            let clear_child_tid = task_inner.clear_child_tid;
+            let wait_handle = task_inner.current_wq_handle.take();
+            let was_on_cpu = sibling.on_cpu.load(Ordering::Acquire);
+            let last_cpu = task_inner.sched.last_cpu;
+            if !already_exiting {
                 task_inner.exit_code = Some(0);
-                task_inner.task_status = TaskStatus::Zombie;
-                task_inner.wait_reason = None;
-                sibling.set_resched_reason_locked(
-                    &mut task_inner,
-                    Some(crate::sched::ReschedReason::HigherRtPriority),
-                );
-                task_inner.clear_child_tid = 0;
-                Some((
-                    tid,
-                    thread_id,
-                    clear_child_tid,
-                    wait_handle,
-                    was_on_cpu,
-                    last_cpu,
-                ))
             }
+            task_inner.task_status = TaskStatus::Zombie;
+            task_inner.wait_reason = None;
+            sibling.set_resched_reason_locked(
+                &mut task_inner,
+                Some(crate::sched::ReschedReason::HigherRtPriority),
+            );
+            task_inner.clear_child_tid = 0;
+            (
+                tid,
+                thread_id,
+                clear_child_tid,
+                wait_handle,
+                was_on_cpu,
+                last_cpu,
+                already_exiting,
+            )
         };
-        let Some((tid, thread_id, clear_child_tid, wait_handle, was_on_cpu, last_cpu)) = state
-        else {
-            continue;
-        };
+        let (tid, thread_id, clear_child_tid, wait_handle, was_on_cpu, last_cpu, already_exiting) =
+            state;
 
-        if let Some(wait_handle) = wait_handle {
-            wait_handle.remove_waiter(&sibling);
-        }
-        cleanup_signal_wait_for_task(&sibling);
-        cleanup_futex_wait_for_task(&sibling);
-        if should_remove_non_futex_timers_on_exit(&sibling) {
-            remove_timer(Arc::clone(&sibling));
-        }
-        if let Some(thread_id) = thread_id {
-            remove_from_tid2task(thread_id);
-        }
-        if let Some(tid) = tid {
-            let mut process_inner = process.inner_exclusive_access();
-            process_inner.mutex_detector.clear_thread(tid);
-            process_inner.semaphore_detector.clear_thread(tid);
+        // A sibling may already be part-way through its own exit path.  It
+        // still belongs to the old image and must be waited/reclaimed here,
+        // but its one-shot waiter/timer/futex cleanup must not be repeated.
+        if !already_exiting {
+            if let Some(wait_handle) = wait_handle {
+                wait_handle.remove_waiter(&sibling);
+            }
+            cleanup_signal_wait_for_task(&sibling);
+            cleanup_futex_wait_for_task(&sibling);
+            if should_remove_non_futex_timers_on_exit(&sibling) {
+                remove_timer(Arc::clone(&sibling));
+            }
+            if let Some(thread_id) = thread_id {
+                remove_from_tid2task(thread_id);
+            }
+            if let Some(tid) = tid {
+                let mut process_inner = process.inner_exclusive_access();
+                process_inner.mutex_detector.clear_thread(tid);
+                process_inner.semaphore_detector.clear_thread(tid);
+            }
         }
 
-        if clear_child_tid != 0 {
+        if !already_exiting && clear_child_tid != 0 {
             if let Err(err) = write_pod_to_process_user(
                 process,
                 clear_child_tid as *mut i32,
@@ -160,8 +163,11 @@ pub(crate) fn terminate_other_threads_for_exec(
         if was_on_cpu {
             resched_hart(last_cpu);
             running_siblings.push((sibling, last_cpu));
-        } else if let Some(res) = sibling.inner_exclusive_access().res.take() {
-            recycle_res.push(res);
+        } else {
+            quiesce_stopped_task(&sibling);
+            if let Some(res) = sibling.inner_exclusive_access().res.take() {
+                recycle_res.push(res);
+            }
         }
     }
 
@@ -176,6 +182,7 @@ pub(crate) fn terminate_other_threads_for_exec(
         core::hint::spin_loop();
     }
     for (sibling, _) in running_siblings {
+        quiesce_stopped_task(&sibling);
         if let Some(res) = sibling.inner_exclusive_access().res.take() {
             recycle_res.push(res);
         }
@@ -210,6 +217,37 @@ use lazy_static::*;
 
 fn should_remove_non_futex_timers_on_exit(task: &Arc<TaskControlBlock>) -> bool {
     task.inner_exclusive_access().may_have_non_futex_timer
+}
+
+/// Finalize wait state after a stopped task has published on_cpu=false.
+///
+/// This second, idempotent sweep closes the window where a syscall installs a
+/// waiter after a remote exec/exit owner took its first snapshot. No new wait
+/// can be published after the context-switch handoff.
+fn quiesce_stopped_task(task: &Arc<TaskControlBlock>) {
+    let (wait_handle, remove_non_futex_timers) = {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.task_status = TaskStatus::Zombie;
+        task_inner.wait_reason = None;
+        task_inner.sched.on_rq = false;
+        task.set_resched_reason_locked(&mut task_inner, None);
+        (
+            task_inner.current_wq_handle.take(),
+            task_inner.may_have_non_futex_timer,
+        )
+    };
+    // Zombie is now irreversible, so a concurrent waker can no longer add a
+    // fresh runqueue node after this removal pass.
+    remove_task(Arc::clone(task));
+    if let Some(wait_handle) = wait_handle {
+        wait_handle.remove_waiter(task);
+    }
+    crate::poll::cleanup_poll_wait_for_task(task);
+    cleanup_signal_wait_for_task(task);
+    cleanup_futex_wait_for_task(task);
+    if remove_non_futex_timers {
+        remove_timer(Arc::clone(task));
+    }
 }
 
 static DEBUG_DUMP_PGRP: AtomicUsize = AtomicUsize::new(0);
@@ -319,12 +357,16 @@ fn reap_zombie_child_from_parent(
     // The child must be inspected after releasing the parent PCB lock. The
     // exit path can hold a child PCB lock while notifying/reparenting it.
     let child_data = {
+        let accounting_finalized = removed_child.cpu_accounting_finalized();
+        // The Acquire finalized observation must precede the relaxed total
+        // loads so the exit owner's Release publishes every final increment.
+        let (user_time, kernel_time) = removed_child.committed_cpu_times();
         let child_inner = removed_child.inner_exclusive_access();
-        if child_inner.is_zombie {
+        if child_inner.is_zombie && accounting_finalized {
             Some((
-                child_inner.user_time,
+                user_time,
                 child_inner.child_user_time,
-                child_inner.kernel_time,
+                kernel_time,
                 child_inner.child_kernel_time,
             ))
         } else {
@@ -450,7 +492,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     let task = take_current_task().unwrap();
     let process = task.process.upgrade().unwrap();
     let pid = process.getpid();
-    process.pause_cpu_accounting(get_time());
+    process.pause_cpu_accounting(task.as_ref(), get_time());
     let mut task_inner = task.inner_exclusive_access();
     let (tid, thread_id) = match task_inner.res.as_ref() {
         Some(res) => (Some(res.tid), Some(res.thread_id())),
@@ -466,7 +508,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     // record exit code
     task_inner.exit_code = Some(task_exit_code);
     task_inner.task_status = TaskStatus::Zombie;
-    task.on_cpu.store(false, Ordering::Relaxed);
     task_inner.sched.on_rq = false;
     task.set_resched_reason_locked(&mut task_inner, None);
     task_inner.clear_child_tid = 0;
@@ -525,14 +566,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         remove_from_tid2task(thread_id);
     }
 
-    let exiting_task = Arc::clone(&task);
-    // Move the task to stop-wait status when it owns process teardown, to avoid
-    // freeing the kernel stack while still switching away on it.
-    if tid == Some(0) || force_process_exit {
-        add_stopping_task(task);
-    } else {
-        drop(task);
-    }
+    let exiting_task = task;
     // If this is the main thread or exit_group was requested, the process
     // should terminate at once.
     if tid == Some(0) || force_process_exit {
@@ -548,6 +582,28 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 process_inner.semaphore_detector.clear_thread(tid);
             }
             drop(process_inner);
+            // Publish on_cpu=false only after this hart has switched off the
+            // task's kernel stack; a concurrent exit_group/exec owner waits on
+            // that handoff before reclaiming this task's user resources.
+            add_stopping_task(exiting_task);
+            drop(process);
+            let mut _unused = TaskContext::zero_init();
+            schedule(&mut _unused as *mut _);
+            return;
+        }
+        // A successful exec claim linearizes before this exit_group request.
+        // Let that sole owner reap this sibling; becoming a second process-
+        // wide teardown owner here would make exec and exit wait on each
+        // other's on_cpu handoff and could recycle the same address space.
+        if process.exec_in_progress() {
+            drop(process_inner);
+            let mut process_inner = process.inner_exclusive_access();
+            if let Some(tid) = tid {
+                process_inner.mutex_detector.clear_thread(tid);
+                process_inner.semaphore_detector.clear_thread(tid);
+            }
+            drop(process_inner);
+            add_stopping_task(exiting_task);
             drop(process);
             let mut _unused = TaskContext::zero_init();
             schedule(&mut _unused as *mut _);
@@ -558,7 +614,18 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         account_process_exit();
         process_inner.is_zombie = true;
         #[cfg(feature = "return_work_cache")]
-        process.mark_zombie_work_pending();
+        {
+            // Publish the process-wide hint before the per-task return bit.
+            // Observing a task bit with Acquire must never lead the slow path
+            // to observe an older false process hint.
+            process.mark_zombie_work_pending();
+            // Publish exit work to every thread while process-inner keeps the
+            // task table stable. Their common trap-exit path can then decide
+            // whether to enter the slow path with one TCB bitmap load.
+            for task in process_inner.tasks.iter().flatten() {
+                task.mark_zombie_work_pending();
+            }
+        }
         // record process exit reason for wait4/waitpid
         process_inner.exit_reason = exit_reason;
         let clone_shared_resources = process_inner.clone_shared_resources;
@@ -578,23 +645,29 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         // with wait4/child-exit notification and otherwise create a cycle.
         drop(process_inner);
 
-        let reparented_zombies = children_to_reparent
-            .iter()
-            .filter_map(|child| {
+        for child in &children_to_reparent {
                 let mut child_inner = child.inner_exclusive_access();
                 child_inner.parent = Some(Arc::downgrade(&INITPROC));
                 #[cfg(feature = "process_identity_cache")]
                 child.set_ppid_cached(INITPROC.getpid());
-                child_inner.is_zombie.then(|| Arc::clone(child))
-            })
-            .collect::<Vec<_>>();
+        }
         {
             let mut initproc_inner = INITPROC.inner_exclusive_access();
-            for child in children_to_reparent {
-                initproc_inner.children.push(child);
+            for child in &children_to_reparent {
+                initproc_inner.children.push(Arc::clone(child));
             }
         }
-        for child in reparented_zombies {
+        // Recheck only after every child is visible in INITPROC.children. A
+        // child can finalize between parent reassignment and insertion; its
+        // own wake would then be early, so this post-insert check closes the
+        // lost-wakeup window. Duplicate notifications are harmless because
+        // reap_zombie_child_from_parent revalidates membership.
+        for child in children_to_reparent {
+            let finalized = child.cpu_accounting_finalized();
+            let zombie = child.inner_exclusive_access().is_zombie;
+            if !zombie || !finalized {
+                continue;
+            }
             let autoreap = notify_parent_child_exit(&INITPROC, child.clone_exit_signal);
             if autoreap {
                 reap_zombie_child_from_parent(&INITPROC, &child);
@@ -614,8 +687,6 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 }
             }
         }
-        write_process_accounting_on_exit(&process, exit_reason);
-
         // deallocate user res (including tid/trap_cx/ustack) of all threads
         // it has to be done before we dealloc the whole memory_set
         // otherwise they will be deallocated twice
@@ -670,9 +741,8 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             // are limited in a single process. Therefore, the blocked tasks are
             // removed when the PCB is deallocated.
             trace!("kernel: exit_current_and_run_next .. remove_inactive_task");
-            remove_inactive_task(Arc::clone(&task));
+            quiesce_stopped_task(&task);
             let mut task_inner = task.inner_exclusive_access();
-            task.on_cpu.store(false, Ordering::Relaxed);
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
@@ -686,21 +756,25 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         {
             core::hint::spin_loop();
         }
+        // Every running sibling has now crossed its scheduler/exit accounting
+        // transition, so the atomic process totals form a complete exit
+        // snapshot for BSD accounting and later wait/reap aggregation.
+        write_process_accounting_on_exit(&process, exit_reason);
         // Do not reacquire process-inner while extracting resources.  The
         // TaskUserRes destructor needs that same PCB lock when the vector is
         // dropped below.
         for task in running_tasks {
+            quiesce_stopped_task(&task);
             let mut task_inner = task.inner_exclusive_access();
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
-            task.on_cpu.store(false, Ordering::Relaxed);
             task_inner.sched.on_rq = false;
         }
         recycle_res.clear();
 
         let exit_signal = process.clone_exit_signal;
-        let (closed_fds, parent_weak, reclaim, shm_attachments, keyrings_to_release) = {
+        let (closed_fds, reclaim, shm_attachments, keyrings_to_release) = {
             let mut process_inner = process.inner_exclusive_access();
             // deallocate other data in user space i.e. program code/data section
             let token = process_inner.memory_set.token();
@@ -716,12 +790,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             process_inner.tasks.clear();
             // warn_heap_state_lockfree("exit_after_tasks_clear", pid);
 
-            let parent_weak = process_inner.parent.clone();
             let shm_attachments = core::mem::take(&mut process_inner.shm_attachments);
             let keyrings_to_release = core::mem::take(&mut process_inner.keyrings);
             (
                 closed_fds,
-                parent_weak,
                 reclaim,
                 shm_attachments,
                 keyrings_to_release,
@@ -739,6 +811,15 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             ipc::detach_segment(attachment.shmid);
         }
 
+        // `is_zombie` was set early to stop sibling tasks. Publish the second
+        // phase only after their CPU slices and process teardown are complete;
+        // wait4/WNOHANG must not reap the PCB before this point.
+        process.finalize_cpu_accounting();
+        // Re-read the parent only after finalization. If reparenting happened
+        // earlier, the old parent saw an unfinished zombie and deliberately
+        // skipped notification; using a pre-teardown snapshot here would then
+        // notify the wrong process and leave init's wait queue asleep.
+        let parent_weak = process.inner_exclusive_access().parent.clone();
         if let Some(parent) = parent_weak.and_then(|pw| pw.upgrade()) {
             let autoreap = notify_parent_child_exit(&parent, exit_signal);
             if autoreap {
@@ -757,9 +838,8 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             }
         }
     }
-    // Move the exiting task reference off the stack into stop_task so that
-    // the idle loop's `finish_pending_task_release` can drop it once the
-    // kernel stack is no longer in use (after __switch completes).
+    // Move the exiting task reference off the stack. The idle loop publishes
+    // on_cpu=false with Release and drops it only after __switch completes.
     add_stopping_task(exiting_task);
     drop(process);
     // we do not have to save task context

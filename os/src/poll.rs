@@ -466,6 +466,27 @@ pub(crate) fn cleanup_poll_wait(handle: PollWaitHandle) {
     lock_poll_registry!().cleanup_key(handle);
 }
 
+/// Remove every transient poll registration owned by `task`.
+///
+/// A remote exec/exit owner can stop a thread between poll-key registration
+/// and the normal syscall cleanup. After its on_cpu handoff no new key can be
+/// published, so this sweep prevents a dead task identity from leaking in the
+/// registry.
+pub(crate) fn cleanup_poll_wait_for_task(task: &Arc<TaskControlBlock>) {
+    let task_ptr = Arc::as_ptr(task) as usize;
+    let mut registry = lock_poll_registry!();
+    for key_idx in 0..MAX_POLL_KEYS {
+        let slot = registry.key_slots[key_idx];
+        if slot.task_ptr != task_ptr || matches!(slot.state, PollKeyState::Free) {
+            continue;
+        }
+        registry.cleanup_key(PollWaitHandle {
+            key_idx: key_idx as u8,
+            key_generation: slot.generation,
+        });
+    }
+}
+
 /// Check whether wait should be skipped because key has already been triggered.
 pub(crate) fn poll_wait_should_skip(handle: PollWaitHandle) -> bool {
     let registry = lock_poll_registry!();

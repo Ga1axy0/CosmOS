@@ -9,7 +9,9 @@ edition = "2021"
 [dependencies]
 riscv = { path = "../vendor/riscv", features = ["inline-asm"] }
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
-log = "0.4"
+# Keep release hot paths free of disabled trace/debug/info formatting while
+# retaining warnings and errors for production diagnostics.
+log = { version = "0.4", features = ["release_max_level_warn"] }
 bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 virtio-drivers = "0.12.0"
@@ -72,6 +74,10 @@ trap_stvec_probe = ["getpid_path_probe"]
 # Diagnostic-only bound for the two active-user-hart mask updates nested in
 # process accounting. Safe only when the benchmark does not edit page tables.
 trap_active_harts_probe = ["trap_context_cache"]
+# Diagnostic-only forced kernel fcsr clobber before syscall return. Used by
+# fp_context_probe to prove that a full restore also writes an authoritative
+# zero fcsr value; never enable in production.
+trap_fp_fcsr_clobber_probe = ["trap_context_cache"]
 legacy-vdb-names = []
 sched_invariant_checks = []
 kernel_trap_diagnostics = []

@@ -8,7 +8,11 @@ set -u
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-CASE_TIMEOUT=${LMBENCH_CASE_TIMEOUT:-45}
+# Calibration-heavy cases can legitimately exceed 45 seconds when the host is
+# power-throttled.  Keep a per-case watchdog, but leave enough room for the
+# benchmark to finish so a host power-state change is not misclassified as a
+# kernel regression.
+CASE_TIMEOUT=${LMBENCH_CASE_TIMEOUT:-120}
 GROUPS=${LMBENCH_GROUPS:-}
 CASES=${LMBENCH_CASES:-}
 DATA_FILE=/tmp/lmbench-data

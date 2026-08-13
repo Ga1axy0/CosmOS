@@ -866,7 +866,8 @@ pub fn gettid() -> isize {
 pub fn waittid(tid: usize) -> isize {
     loop {
         match sys_waittid(tid) {
-            -2 => {
+            // EAGAIN: the target exists but has not exited yet.
+            -11 => {
                 yield_();
             }
             exit_code => return exit_code,

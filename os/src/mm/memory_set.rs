@@ -602,6 +602,9 @@ impl MemorySet {
             self.seen_tlb_generation[hart_id].store(generation, Ordering::Release);
         }
         let bit = 1usize << hart_id;
+        if self.active_user_harts.load(Ordering::Acquire) & bit != 0 {
+            return;
+        }
         let mask = self.active_user_harts.fetch_or(bit, Ordering::AcqRel) | bit;
         trace!(
             "[tlb] user ASID active on hart {} token={:#x} asid={} generation={} mask={:#b}",

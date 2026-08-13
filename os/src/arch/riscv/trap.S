@@ -62,19 +62,24 @@ __alltraps:
     sd t0, 32*8(sp)
 1:
 
-    # The trap frame above keeps the userspace FS state (Off/Initial/Clean),
-    # but this kernel is built for the hard-float ABI and may execute FP
-    # instructions in ordinary Rust code.  Enable FP only in the live kernel
-    # CSR; the saved userspace sstatus remains unchanged.
-    csrr t0, sstatus
+    # Keep the live userspace FP register image reusable across an integer-only
+    # kernel path.  Clearing fcsr dirties FS, so mark the live state Clean only
+    # after that write.  FS=Off must first be enabled before touching fcsr.
     li t1, ~(3 << 13)
+    beqz t2, 2f
+    and t0, t0, t1
+    li t1, (2 << 13)
+    or t0, t0, t1
+    csrwi fcsr, 0
+    csrw sstatus, t0
+    j 3f
+2:
     and t0, t0, t1
     li t1, (1 << 13)
     or t0, t0, t1
     csrw sstatus, t0
-    # Do not let a userspace rounding mode or accrued exception flags affect
-    # hard-float kernel code.  User fcsr is restored from the trap frame later.
     csrwi fcsr, 0
+3:
 
     # read user stack from sscratch and save it in TrapContext
     csrr t2, sscratch
@@ -152,28 +157,46 @@ __restore:
     csrw sscratch, a0
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it
-    # restore sstatus/sepc
     ld t0, 32*8(sp)
     ld t1, 33*8(sp)
-    csrw sstatus, t0
     csrw sepc, t1
 
-    # Restore FP state only after the task has crossed the lazy first-use path.
-    # Loading FP registers dirties the live FS bits, so write the saved status
-    # once more afterwards to retain the frame's Initial/Clean state.
+    # A Clean frame can reuse the live FP register image when the kernel left it
+    # Clean too.  Scheduling and any kernel FP instruction make live FS Dirty,
+    # which conservatively falls back to a full restore.  Initial must also be
+    # restored in full so a task never observes another context's registers.
     srli t2, t0, 13
     andi t2, t2, 3
-    beqz t2, 1f
-    ld t0, 70*8(a0)
-    fscsr t0
+    beqz t2, 4f
+    li t1, 2
+    bne t2, t1, 5f
+    csrr t3, sstatus
+    srli t3, t3, 13
+    andi t3, t3, 3
+    beq t3, t1, 6f
+5:
     .set n, 0
     .rept 32
         LOAD_FP %n
         .set n, n + 1
     .endr
-    ld t0, 32*8(sp)
+    # A full restore cannot assume the live fcsr is still the zero installed
+    # on this trap's entry: the syscall may have used kernel FP, blocked, or
+    # migrated.  Restore even an authoritative zero value so frm/fflags never
+    # leak across contexts.
+    ld t3, 70*8(a0)
+    fscsr t3
+    j 4f
+6:
+    # The Clean/Clean reuse path did clear live fcsr at entry and performed no
+    # later FP operation, so only a nonzero saved value needs a CSR write.
+    ld t3, 70*8(a0)
+    beqz t3, 4f
+    fscsr t3
+4:
+    # FP loads/fscsr dirty the live state; restore the authoritative user bits
+    # once, after the optional fast/full FP path.
     csrw sstatus, t0
-1:
 
     # restore general purpose registers except x0/sp
     ld x1, 1*8(sp)

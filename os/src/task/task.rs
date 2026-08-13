@@ -12,9 +12,29 @@ use crate::sync::{SpinNoIrqLock, SpinNoIrqLockGuard};
 use crate::timer::get_time_ns;
 use crate::trap::TrapContext;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 const TASK_CONTROL_BLOCK_NEW_TIMING_WARN_THRESHOLD_NS: u64 = 1_000_000;
+const RETURN_WORK_SIGNAL: u32 = 1 << 0;
+#[cfg(feature = "return_work_cache")]
+const RETURN_WORK_RESCHED: u32 = 1 << 1;
+#[cfg(feature = "return_work_cache")]
+const RETURN_WORK_ZOMBIE: u32 = 1 << 2;
+
+// Keep the accounting mode and its raw-counter timestamp in one atomic word.
+// The timer counter is reduced modulo 2^(usize::BITS - 2); subtraction below
+// uses the same modulus, so a counter wrap is handled correctly as long as a
+// single running slice is shorter than that (hundreds of years at GHz rates).
+const CPU_ACCOUNTING_MODE_SHIFT: u32 = usize::BITS - 2;
+const CPU_ACCOUNTING_TIMESTAMP_MASK: usize = (1usize << CPU_ACCOUNTING_MODE_SHIFT) - 1;
+const CPU_ACCOUNTING_INACTIVE: usize = 0;
+const CPU_ACCOUNTING_USER: usize = 1;
+const CPU_ACCOUNTING_KERNEL: usize = 2;
+
+#[inline(always)]
+const fn pack_cpu_accounting(mode: usize, timestamp: usize) -> usize {
+    (mode << CPU_ACCOUNTING_MODE_SHIFT) | (timestamp & CPU_ACCOUNTING_TIMESTAMP_MASK)
+}
 
 /// Return a mask containing all online harts supported by the kernel.
 pub const fn all_cpu_affinity_mask() -> usize {
@@ -148,16 +168,18 @@ pub struct TaskControlBlock {
     /// registers are saved; a remote waker spins on it with `Acquire`. All other
     /// accesses are under the inner lock and use `Relaxed`.
     pub on_cpu: AtomicBool,
-    /// Lock-free hint for the user-return signal slow path.
+    /// Per-task CPU accounting state: mode in the top two bits and the raw
+    /// timer timestamp of the last transition in the remaining bits.
     ///
-    /// `true` means that this task may have an unmasked thread/process signal,
-    /// or deferred signal-mask restoration work.  It is deliberately a hint:
-    /// stale true values are cleared by the locked slow path, while producers
-    /// publish true after making pending state visible.
-    signal_work_pending: AtomicBool,
-    /// Lock-free hint for the deferred-reschedule slow path.
-    #[cfg(feature = "return_work_cache")]
-    resched_work_pending: AtomicBool,
+    /// Only the hart currently owning this task writes the stamp. Keeping it
+    /// task-local makes simultaneous threads of one process independent.
+    cpu_accounting_stamp: AtomicUsize,
+    /// Lock-free bitmap for work that must run before returning to userspace.
+    ///
+    /// Bits are conservative hints for signal delivery, rescheduling and
+    /// process exit. The trap exit fast path needs only one acquire load;
+    /// authoritative state remains protected by the existing locks.
+    return_work: AtomicU32,
     /// Physical trap-frame page, userspace VA and address-space token cached
     /// for the lifetime of the current exec image.
     #[cfg(feature = "trap_context_cache")]
@@ -172,6 +194,106 @@ impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
     pub fn inner_exclusive_access(&self) -> SpinNoIrqLockGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
+    }
+
+    /// Whether this scheduler entity owns a userspace trap frame/address
+    /// space. Kernel threads deliberately keep the cached PPN at zero.
+    #[inline(always)]
+    pub fn has_user_context(&self) -> bool {
+        #[cfg(feature = "trap_context_cache")]
+        {
+            return self.trap_cx_ppn_cache.load(Ordering::Relaxed) != 0;
+        }
+        #[cfg(not(feature = "trap_context_cache"))]
+        self.inner.lock().res.is_some()
+    }
+
+    /// Commit the previous running slice and publish a new accounting mode.
+    ///
+    /// The task's `on_cpu` ownership invariant gives this stamp one writer at
+    /// a time. PCB totals are intentionally relaxed counters: ordering CPU
+    /// time against unrelated process state is unnecessary, while each atomic
+    /// counter remains monotonic and race-free across harts.
+    #[inline(always)]
+    fn transition_cpu_accounting(
+        &self,
+        process: &ProcessControlBlock,
+        new_mode: usize,
+        now: usize,
+    ) {
+        let old = self.cpu_accounting_stamp.swap(
+            pack_cpu_accounting(new_mode, now),
+            Ordering::AcqRel,
+        );
+        let old_mode = old >> CPU_ACCOUNTING_MODE_SHIFT;
+        if old_mode == CPU_ACCOUNTING_INACTIVE {
+            return;
+        }
+        let old_timestamp = old & CPU_ACCOUNTING_TIMESTAMP_MASK;
+        let now_timestamp = now & CPU_ACCOUNTING_TIMESTAMP_MASK;
+        let delta = now_timestamp
+            .wrapping_sub(old_timestamp)
+            & CPU_ACCOUNTING_TIMESTAMP_MASK;
+        match old_mode {
+            CPU_ACCOUNTING_USER => process.commit_user_cpu_time(delta),
+            CPU_ACCOUNTING_KERNEL => process.commit_kernel_cpu_time(delta),
+            _ => debug_assert!(false, "invalid packed CPU accounting mode"),
+        }
+    }
+
+    /// Account a user slice ending at `now` and begin a kernel slice.
+    #[inline(always)]
+    pub fn enter_kernel(&self, process: &ProcessControlBlock, now: usize) {
+        self.transition_cpu_accounting(process, CPU_ACCOUNTING_KERNEL, now);
+    }
+
+    /// Account a kernel slice ending at `now` and begin a user slice.
+    #[inline(always)]
+    pub fn enter_user(&self, process: &ProcessControlBlock, now: usize) {
+        self.transition_cpu_accounting(process, CPU_ACCOUNTING_USER, now);
+    }
+
+    /// Start accounting a task selected by the scheduler in kernel mode.
+    #[inline(always)]
+    pub fn resume_in_kernel(&self, process: &ProcessControlBlock, now: usize) {
+        self.transition_cpu_accounting(process, CPU_ACCOUNTING_KERNEL, now);
+    }
+
+    /// Commit the current slice when this task leaves its hart.
+    #[inline(always)]
+    pub fn pause_cpu_accounting(&self, process: &ProcessControlBlock, now: usize) {
+        self.transition_cpu_accounting(process, CPU_ACCOUNTING_INACTIVE, now);
+    }
+
+    /// Roll an open kernel slice forward at a periodic kernel-mode tick.
+    ///
+    /// Unlike `enter_kernel`, this must not resurrect an INACTIVE task: exit
+    /// cleanup and the post-switch handoff can remain interruptible after the
+    /// task has stopped owning CPU-accounting time.
+    pub fn flush_kernel_cpu_accounting(&self, process: &ProcessControlBlock, now: usize) {
+        let new = pack_cpu_accounting(CPU_ACCOUNTING_KERNEL, now);
+        let mut old = self.cpu_accounting_stamp.load(Ordering::Relaxed);
+        loop {
+            if old >> CPU_ACCOUNTING_MODE_SHIFT != CPU_ACCOUNTING_KERNEL {
+                return;
+            }
+            match self.cpu_accounting_stamp.compare_exchange_weak(
+                old,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let old_timestamp = old & CPU_ACCOUNTING_TIMESTAMP_MASK;
+                    let delta = (now & CPU_ACCOUNTING_TIMESTAMP_MASK)
+                        .wrapping_sub(old_timestamp)
+                        & CPU_ACCOUNTING_TIMESTAMP_MASK;
+                    process.commit_kernel_cpu_time(delta);
+                    return;
+                }
+                Err(observed) => old = observed,
+            }
+        }
     }
     /// Get the current user address-space token for this task.
     #[cfg(not(feature = "trap_context_cache"))]
@@ -201,6 +323,33 @@ impl TaskControlBlock {
         self.trap_cx_user_va_cache
     }
 
+    /// Get this task's current user trap frame. Exec may replace the cached
+    /// frame, so callers must reacquire it after a syscall that can exec.
+    #[inline]
+    pub fn trap_cx(&self) -> &'static mut TrapContext {
+        #[cfg(feature = "trap_context_cache")]
+        {
+            return self.cached_trap_cx();
+        }
+        #[cfg(not(feature = "trap_context_cache"))]
+        self.inner_exclusive_access().get_trap_cx()
+    }
+
+    /// Get the userspace virtual address of this task's trap frame.
+    #[inline]
+    pub fn trap_cx_user_va(&self) -> usize {
+        #[cfg(feature = "trap_context_cache")]
+        {
+            return self.cached_trap_cx_user_va();
+        }
+        #[cfg(not(feature = "trap_context_cache"))]
+        self.inner_exclusive_access()
+            .res
+            .as_ref()
+            .unwrap()
+            .trap_cx_user_va()
+    }
+
     /// Publish trap metadata after exec has installed the replacement image.
     #[cfg(feature = "trap_context_cache")]
     pub(crate) fn update_trap_context_cache(
@@ -216,26 +365,47 @@ impl TaskControlBlock {
     /// Return whether user-return signal handling needs the locked slow path.
     #[inline]
     pub fn signal_work_pending(&self) -> bool {
-        self.signal_work_pending.load(Ordering::Acquire)
+        self.return_work.load(Ordering::Acquire) & RETURN_WORK_SIGNAL != 0
     }
 
     /// Publish that signal delivery or mask-restoration work may be pending.
     #[inline]
     pub(crate) fn mark_signal_work_pending(&self) {
-        self.signal_work_pending.store(true, Ordering::Release);
+        self.return_work
+            .fetch_or(RETURN_WORK_SIGNAL, Ordering::Release);
     }
 
     /// Refresh the signal-work hint from state protected by signal locks.
     #[inline]
     pub(crate) fn set_signal_work_pending(&self, pending: bool) {
-        self.signal_work_pending.store(pending, Ordering::Release);
+        if pending {
+            self.mark_signal_work_pending();
+        } else {
+            self.return_work
+                .fetch_and(!RETURN_WORK_SIGNAL, Ordering::AcqRel);
+        }
+    }
+
+    /// Return whether any deferred work may be required before user return.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub fn return_work_pending(&self) -> bool {
+        self.return_work.load(Ordering::Acquire) != 0
+    }
+
+    /// Publish that process teardown requires this task to leave userspace.
+    #[cfg(feature = "return_work_cache")]
+    #[inline]
+    pub(crate) fn mark_zombie_work_pending(&self) {
+        self.return_work
+            .fetch_or(RETURN_WORK_ZOMBIE, Ordering::Release);
     }
 
     /// Return whether trap exit needs to inspect the locked reschedule reason.
     #[cfg(feature = "return_work_cache")]
     #[inline]
     pub fn resched_work_pending(&self) -> bool {
-        self.resched_work_pending.load(Ordering::Acquire)
+        self.return_work.load(Ordering::Acquire) & RETURN_WORK_RESCHED != 0
     }
 
     /// Update the authoritative reschedule reason and its lock-free hint.
@@ -251,8 +421,13 @@ impl TaskControlBlock {
     ) {
         task_inner.sched.resched_reason = reason;
         #[cfg(feature = "return_work_cache")]
-        self.resched_work_pending
-            .store(reason.is_some(), Ordering::Release);
+        if reason.is_some() {
+            self.return_work
+                .fetch_or(RETURN_WORK_RESCHED, Ordering::Release);
+        } else {
+            self.return_work
+                .fetch_and(!RETURN_WORK_RESCHED, Ordering::AcqRel);
+        }
     }
 }
 
@@ -399,9 +574,11 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             on_cpu: AtomicBool::new(false),
-            signal_work_pending: AtomicBool::new(false),
-            #[cfg(feature = "return_work_cache")]
-            resched_work_pending: AtomicBool::new(false),
+            cpu_accounting_stamp: AtomicUsize::new(pack_cpu_accounting(
+                CPU_ACCOUNTING_INACTIVE,
+                0,
+            )),
+            return_work: AtomicU32::new(0),
             #[cfg(feature = "trap_context_cache")]
             trap_cx_ppn_cache: AtomicUsize::new(trap_cx_ppn.0),
             #[cfg(feature = "trap_context_cache")]
@@ -456,9 +633,11 @@ impl TaskControlBlock {
             process: Arc::downgrade(&process),
             kstack,
             on_cpu: AtomicBool::new(false),
-            signal_work_pending: AtomicBool::new(false),
-            #[cfg(feature = "return_work_cache")]
-            resched_work_pending: AtomicBool::new(false),
+            cpu_accounting_stamp: AtomicUsize::new(pack_cpu_accounting(
+                CPU_ACCOUNTING_INACTIVE,
+                0,
+            )),
+            return_work: AtomicU32::new(0),
             #[cfg(feature = "trap_context_cache")]
             trap_cx_ppn_cache: AtomicUsize::new(0),
             #[cfg(feature = "trap_context_cache")]

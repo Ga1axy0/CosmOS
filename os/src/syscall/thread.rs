@@ -63,7 +63,9 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     );
     new_task_trap_cx.set_user_arg(0, arg);
     drop(new_task_inner);
-    process.attach_task(Arc::clone(&new_task));
+    if process.attach_task(Arc::clone(&new_task)).is_err() {
+        return -(ERRNO::EAGAIN as isize);
+    }
     add_task(new_task);
     new_task_tid as isize
 }
@@ -103,32 +105,39 @@ pub fn sys_waittid(tid: usize) -> i32 {
     );
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    // a thread cannot wait for itself
-    let current_tid = {
-        let task_inner = task.inner_exclusive_access();
-        let Some(res) = task_inner.res.as_ref() else {
-            return -(ERRNO::ESRCH as i32);
-        };
-        res.tid
-    };
-    if current_tid == tid {
-        return -(ERRNO::EINVAL as i32);
-    }
-    // Take only an Arc snapshot under process-inner.  Reading the target task
-    // while holding that lock would invert the task -> process order used by
-    // the caller and by the scheduler's exit path.
-    let waited_task = {
+    // thread_create() and gettid() expose the globally allocated Linux thread
+    // id, while ProcessControlBlock::tasks is indexed by a process-local slot.
+    // Snapshot the table, then inspect each task without holding process-inner
+    // so that task -> process lock ordering cannot be inverted.
+    let tasks = {
         let process_inner = process.inner_exclusive_access();
         process_inner
             .tasks
-            .get(tid)
-            .and_then(|slot| slot.as_ref().cloned())
+            .iter()
+            .filter_map(|slot| slot.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
     };
+    let waited_task = tasks.into_iter().find(|candidate| {
+        candidate
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .is_some_and(|res| res.thread_id() == tid)
+    });
     let Some(waited_task) = waited_task else {
         return -(ERRNO::ESRCH as i32);
     };
-    let exit_code = waited_task.inner_exclusive_access().exit_code;
-    let Some(code) = exit_code else {
+    if Arc::ptr_eq(&task, &waited_task) {
+        return -(ERRNO::EINVAL as i32);
+    }
+    let (local_tid, exit_code) = {
+        let waited_inner = waited_task.inner_exclusive_access();
+        (
+            waited_inner.res.as_ref().map(|res| res.tid),
+            waited_inner.exit_code,
+        )
+    };
+    let (Some(local_tid), Some(code)) = (local_tid, exit_code) else {
         return -(ERRNO::EAGAIN as i32);
     };
 
@@ -139,11 +148,11 @@ pub fn sys_waittid(tid: usize) -> i32 {
         let mut process_inner = process.inner_exclusive_access();
         let slot_matches = process_inner
             .tasks
-            .get(tid)
+            .get(local_tid)
             .and_then(|slot| slot.as_ref())
             .is_some_and(|registered| Arc::ptr_eq(registered, &waited_task));
         if slot_matches {
-            process_inner.tasks[tid].take()
+            process_inner.tasks[local_tid].take()
         } else {
             None
         }

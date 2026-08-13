@@ -276,11 +276,12 @@ pub fn write_process_accounting_on_exit(process: &Arc<ProcessControlBlock>, reas
     };
 
     let now_realtime_ns = get_realtime_ns();
+    let (user_time, kernel_time) = process.committed_cpu_times();
     let record = {
         let inner = process.inner_exclusive_access();
         let elapsed_ns = now_realtime_ns.saturating_sub(inner.accounting_start_time_ns);
-        let utime_ticks = crate::timer::time_to_ticks(inner.user_time);
-        let stime_ticks = crate::timer::time_to_ticks(inner.kernel_time);
+        let utime_ticks = crate::timer::time_to_ticks(user_time);
+        let stime_ticks = crate::timer::time_to_ticks(kernel_time);
         let btime = (inner.accounting_start_time_ns / 1_000_000_000).min(u32::MAX as u64) as u32;
         let ppid = inner
             .parent
@@ -4054,17 +4055,8 @@ pub fn sys_fstat(fd: u32, st: *mut Stat) -> isize {
         let fd = fd as usize;
         let desc = get_file_description(fd)?;
         let stat = desc.stat();
-        let path = desc.path();
-        debug!(
-            "sys_fstat: fd={} size={} blksize={} blocks={} mode={:#o} path={:?}",
-            fd,
-            stat.size,
-            stat.blksize,
-            stat.blocks,
-            stat.mode.bits(),
-            path
-        );
         if stat.blksize >= SUSPICIOUS_STAT_BLKSIZE {
+            let path = desc.path();
             warn!(
                 "sys_fstat: suspicious st_blksize fd={} blksize={} size={} path={:?}",
                 fd, stat.blksize, stat.size, path

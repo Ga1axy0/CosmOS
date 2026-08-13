@@ -168,39 +168,62 @@ pub(crate) fn run_tasks() {
             //     hartid(),
             //     task.process.upgrade().unwrap().getpid()
             // );
+            // dequeue_task() publishes on_cpu=true while holding task-inner,
+            // but a remote exec/exit owner may mark the task Zombie before we
+            // get here.  Commit the Runnable -> Running transition under the
+            // same lock and refuse to resurrect a stopped task.  Releasing
+            // on_cpu after this check is also the handoff that lets teardown
+            // reclaim a task which was selected but never switched to.
+            let next_task_cx_ptr = {
+                let mut task_inner = task.inner_exclusive_access();
+                if task_inner.exit_code.is_some()
+                    || !matches!(task_inner.task_status, TaskStatus::Runnable)
+                {
+                    if task_inner.exit_code.is_some() {
+                        task_inner.task_status = TaskStatus::Zombie;
+                    }
+                    task_inner.sched.on_rq = false;
+                    task.on_cpu.store(false, Ordering::Release);
+                    continue;
+                }
+                task_inner.task_status = TaskStatus::Running;
+                task_inner.wait_reason = None;
+                task_inner.sched.last_cpu = hartid();
+                task_inner.sched.on_rq = false;
+                task.set_resched_reason_locked(&mut task_inner, None);
+                if matches!(task_inner.sched.policy, SchedPolicy::Other) {
+                    let now_ns = crate::timer::get_time_ns();
+                    task_inner.sched.exec_start_ns = now_ns;
+                    task_inner.sched.cfs_slice_start_ns = now_ns;
+                }
+                &task_inner.task_cx as *const TaskContext
+            };
+
             let process = task.process.upgrade().unwrap();
             // Read the PCB's authoritative token instead of the task's cached
             // trap metadata. During exec the MemorySet is replaced before the
             // new trap frame/cache is fully constructed, and this task may be
             // preempted inside that interval.
-            let next_address_space = process
-                .inner_exclusive_access()
-                .memory_set
-                .address_space_root();
+            let has_user_context = task.has_user_context();
+            let next_address_space = {
+                let process_inner = process.inner_exclusive_access();
+                // The address space remains in the active mask across normal
+                // traps. Activate it once when a task is installed on this
+                // hart; the matching scheduler pause clears it.
+                #[cfg(not(feature = "trap_active_harts_probe"))]
+                if has_user_context {
+                    process_inner.memory_set.mark_user_active(hartid());
+                }
+                process_inner.memory_set.address_space_root()
+            };
             let mut processor = current_processor().lock();
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
 
-            let mut task_inner = task.inner_exclusive_access();
-            let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
-            task_inner.task_status = TaskStatus::Running;
-            task_inner.wait_reason = None;
-            task_inner.sched.last_cpu = hartid();
-            task.on_cpu.store(true, Ordering::Relaxed);
-            task_inner.sched.on_rq = false;
-            task.set_resched_reason_locked(&mut task_inner, None);
-            if matches!(task_inner.sched.policy, SchedPolicy::Other) {
-                let now_ns = crate::timer::get_time_ns();
-                task_inner.sched.exec_start_ns = now_ns;
-                task_inner.sched.cfs_slice_start_ns = now_ns;
-            }
-            drop(task_inner);
-
+            process.resume_in_kernel(task.as_ref(), get_time());
             processor.current = Some(task);
             #[cfg(feature = "current_task_cache")]
             publish_current_task(processor.current.as_ref());
             drop(processor);
-            process.resume_in_kernel(get_time());
-
             // Switch directly from the previously borrowed process root to the
             // next one. Same-address-space scheduling performs no CSR write.
             activate_current_address_space(next_address_space);
@@ -328,31 +351,12 @@ pub fn current_user_token() -> AddressSpaceToken {
 
 /// Get the mutable reference to trap context of current task
 pub fn current_trap_cx() -> &'static mut TrapContext {
-    #[cfg(feature = "trap_context_cache")]
-    {
-        return current_task().unwrap().cached_trap_cx();
-    }
-    #[cfg(not(feature = "trap_context_cache"))]
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .get_trap_cx()
+    current_task().unwrap().trap_cx()
 }
 
 /// get the user virtual address of trap context
 pub fn current_trap_cx_user_va() -> usize {
-    #[cfg(feature = "trap_context_cache")]
-    {
-        return current_task().unwrap().cached_trap_cx_user_va();
-    }
-    #[cfg(not(feature = "trap_context_cache"))]
-    current_task()
-        .unwrap()
-        .inner_exclusive_access()
-        .res
-        .as_ref()
-        .unwrap()
-        .trap_cx_user_va()
+    current_task().unwrap().trap_cx_user_va()
 }
 
 /// get the top addr of kernel stack

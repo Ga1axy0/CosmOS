@@ -29,10 +29,11 @@ use crate::syscall::{syscall, syscall_supports_sa_restart};
 use crate::task::{
     check_fatal_signals_of_current, check_itimers_of_all_processes, current_add_signal,
     current_process, current_process_is_zombie, current_task, current_trap_cx,
-    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
-    exit_group_current_and_run_next, ExitReason,
+    exit_current_and_run_next, exit_group_current_and_run_next, ExitReason, ProcessControlBlock,
+    TaskControlBlock,
 };
 use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+use alloc::sync::Arc;
 
 /// Diagnostic-only lmbench-null/getppid path.
 ///
@@ -42,8 +43,8 @@ use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
 /// how much of `lat_syscall null` is outside the architectural trap entry/exit
 /// plus one snapshot of the current task/process state.
 #[cfg(all(feature = "getpid_path_probe", target_arch = "riscv64"))]
-fn try_getpid_path_probe(trap_info: &crate::hal::traits::TrapInfo) {
-    if !matches!(trap_info.cause, TrapCause::UserSyscall) {
+fn try_getpid_path_probe(trap_cause: TrapCause) {
+    if !matches!(trap_cause, TrapCause::UserSyscall) {
         return;
     }
 
@@ -82,6 +83,34 @@ fn try_getpid_path_probe(trap_info: &crate::hal::traits::TrapInfo) {
     #[cfg(not(feature = "trap_stvec_probe"))]
     set_user_trap_entry();
     unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
+}
+
+/// Owned view used only while preparing a user syscall with interrupts off.
+///
+/// Release these references before dispatch: a syscall may block, migrate,
+/// replace its trap frame with exec, or diverge through exit.
+struct CurrentUserEntrySnapshot {
+    task: Arc<TaskControlBlock>,
+    process: Arc<ProcessControlBlock>,
+}
+
+impl CurrentUserEntrySnapshot {
+    #[inline]
+    fn capture() -> Self {
+        let task = current_task().expect("user trap without a current task");
+        let process = task
+            .process
+            .upgrade()
+            .expect("user trap without a current process");
+        Self { task, process }
+    }
+
+    #[inline]
+    fn release(self) {
+        let Self { task, process } = self;
+        drop(process);
+        drop(task);
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -397,61 +426,110 @@ fn handle_reschedule_ipi() {
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
-    #[cfg(not(all(target_arch = "riscv64", feature = "trap_stvec_probe")))]
-    set_kernel_trap_entry();
     #[cfg(all(target_arch = "riscv64", feature = "trap_stvec_probe"))]
-    {
-        let trap_info = ArchTrapMachine::read_trap_info();
-        try_getpid_path_probe(&trap_info);
+    let trap_cause = {
+        let trap_cause = ArchTrapMachine::read_trap_cause();
+        try_getpid_path_probe(trap_cause);
         // Non-getppid traps continue through the normal kernel path.
         set_kernel_trap_entry();
-    }
-    #[cfg(all(
-        feature = "getpid_path_probe",
-        not(feature = "trap_stvec_probe"),
-        target_arch = "riscv64"
-    ))]
-    {
-        let trap_info = ArchTrapMachine::read_trap_info();
-        try_getpid_path_probe(&trap_info);
-    }
+        trap_cause
+    };
+    #[cfg(not(all(target_arch = "riscv64", feature = "trap_stvec_probe")))]
+    let trap_cause = {
+        set_kernel_trap_entry();
+        let trap_cause = ArchTrapMachine::read_trap_cause();
+        #[cfg(all(feature = "getpid_path_probe", target_arch = "riscv64"))]
+        try_getpid_path_probe(trap_cause);
+        trap_cause
+    };
     // The trampoline has entered kernel mode without changing the process page
     // table. Ack an older shootdown snapshot before taking locks or relying on
     // interrupt delivery.
     #[cfg(not(feature = "trap_tlb_poll_probe"))]
     crate::mm::poll_pending_shootdown();
+    if matches!(trap_cause, TrapCause::UserSyscall) {
+        handle_user_syscall();
+    }
+    handle_user_trap_slow(trap_cause);
+}
+
+/// Dedicated syscall path. It owns one stable task/process snapshot across a
+/// potentially blocking syscall and reacquires the trap frame after dispatch
+/// so a successful exec is handled correctly.
+#[inline(never)]
+fn handle_user_syscall() -> ! {
+    let snapshot = CurrentUserEntrySnapshot::capture();
     #[cfg(not(feature = "trap_accounting_probe"))]
-    current_process().enter_kernel(get_time());
+    snapshot
+        .process
+        .enter_kernel(snapshot.task.as_ref(), get_time());
+    let (syscall_id, syscall_args) = {
+        let cx = snapshot.task.trap_cx();
+        cx.in_syscall = false;
+        cx.restartable_syscall = false;
+        let syscall_id = cx.syscall_nr();
+        let syscall_args = cx.syscall_args();
+        cx.save_syscall_arg0_for_restart();
+        cx.restartable_syscall = syscall_supports_sa_restart(syscall_id);
+        cx.advance_user_pc(ArchTrapMachine::syscall_instruction_len());
+        (syscall_id, syscall_args)
+    };
+
+    // Do not keep an owned reference on the task's own kernel stack while the
+    // dispatcher may block or exit. Reacquire the (possibly exec-replaced)
+    // current trap frame after dispatch.
+    snapshot.release();
+    #[cfg(not(feature = "trap_irq_guard_probe"))]
+    let result = {
+        let _kernel_irq = irq::UserSyscallIrqGuard::new();
+        syscall(syscall_id, syscall_args)
+    };
+    #[cfg(feature = "trap_irq_guard_probe")]
+    let result = syscall(syscall_id, syscall_args);
+
+    // A successful exec replaces the trap frame cache, so never retain the
+    // pre-dispatch reference across the syscall call.
+    let cx = current_trap_cx();
+    #[cfg(all(
+        target_arch = "riscv64",
+        any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
+    ))]
+    if syscall_id == crate::syscall::SYSCALL_GETPPID && result >= 0 {
+        // x0 has no architectural restore action, so the probe build can cache
+        // ppid+1; zero remains the "not cached" marker.
+        cx.set_reg(0, result as usize + 1);
+    }
+    cx.set_syscall_ret(result as usize);
+    cx.in_syscall = true;
+    #[cfg(all(target_arch = "riscv64", feature = "trap_fp_fcsr_clobber_probe"))]
+    unsafe {
+        // Force the live kernel FP state away from the saved frame so the
+        // full-return path must restore even a zero user fcsr. This feature is
+        // diagnostic only and deliberately dirties FS.
+        core::arch::asm!("li t0, 0x51", "fscsr t0", out("t0") _);
+    }
+    finish_current_user_trap();
+}
+
+/// Non-syscall user traps retain the generic fault/interrupt path and only pay
+/// for reading the fault-value CSR here.
+#[inline(never)]
+fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
+    #[cfg(not(feature = "trap_accounting_probe"))]
+    {
+        let task = current_task().expect("user trap without a current task");
+        let process = task
+            .process
+            .upgrade()
+            .expect("user trap without a current process");
+        process.enter_kernel(task.as_ref(), get_time());
+    }
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
     let trap_info = ArchTrapMachine::read_trap_info();
+    debug_assert_eq!(trap_info.cause, expected_cause);
     match trap_info.cause {
-        TrapCause::UserSyscall => {
-            #[cfg(not(feature = "trap_irq_guard_probe"))]
-            let _kernel_irq = irq::KernelIrqEnableGuard::new();
-            // jump to next instruction anyway
-            let mut cx = current_trap_cx();
-            let syscall_id = cx.syscall_nr();
-            let syscall_args = cx.syscall_args();
-            cx.save_syscall_arg0_for_restart();
-            cx.restartable_syscall = syscall_supports_sa_restart(syscall_id);
-            cx.advance_user_pc(ArchTrapMachine::syscall_instruction_len());
-            // get system call return value
-            let result = syscall(syscall_id, syscall_args);
-            // cx is changed during sys_execve, so we have to call it again
-            cx = current_trap_cx();
-            #[cfg(all(
-                target_arch = "riscv64",
-                any(feature = "getpid_asm_probe", feature = "getpid_asm_satp_probe")
-            ))]
-            if syscall_id == crate::syscall::SYSCALL_GETPPID && result >= 0 {
-                // x0 has no architectural restore action, so the probe build
-                // can cache ppid+1; zero remains the "not cached" marker.
-                cx.set_reg(0, result as usize + 1);
-            }
-            cx.set_syscall_ret(result as usize);
-            cx.in_syscall = true;
-        }
+        TrapCause::UserSyscall => unreachable!("syscall escaped the dedicated trap path"),
         TrapCause::StorePageFault => {
             let _probe = crate::probe_scope!("trap.user_page_fault.store");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
@@ -706,59 +784,111 @@ pub fn trap_handler() -> ! {
             );
         }
     }
-    // check signals
-    if let Some((signum, msg)) = check_fatal_signals_of_current() {
-        let task = current_task();
-        let (tid, thread_id) = task
-            .as_ref()
-            .and_then(|task| {
-                let inner = task.inner_exclusive_access();
-                inner
-                    .res
-                    .as_ref()
-                    .map(|res| (Some(res.tid), Some(res.thread_id)))
-            })
-            .unwrap_or((None, None));
-        let cx = current_trap_cx();
-        warn!(
-            "[signal] fatal signum={} hart={} pid={} tid={:?} thread_id={:?} \
-             reason={} user_pc={:#x} user_sp={:#x}",
-            signum,
-            hartid(),
-            current_process().getpid(),
-            tid,
-            thread_id,
-            msg,
-            cx.user_pc(),
-            cx.user_sp(),
-        );
-        exit_current_and_run_next(ExitReason::Signal(signum as u32));
+    finish_current_user_trap();
+}
+
+/// Handle the uncommon work that must complete before returning to userspace.
+/// Keeping this out of `trap_handler` prevents signal/scheduler state and their
+/// large stack frames from inflating the ordinary syscall path.
+#[cold]
+#[inline(never)]
+fn exit_to_user_slow() -> ! {
+    loop {
+        // check signals
+        if let Some((signum, msg)) = check_fatal_signals_of_current() {
+            let task = current_task();
+            let (tid, thread_id) = task
+                .as_ref()
+                .and_then(|task| {
+                    let inner = task.inner_exclusive_access();
+                    inner
+                        .res
+                        .as_ref()
+                        .map(|res| (Some(res.tid), Some(res.thread_id)))
+                })
+                .unwrap_or((None, None));
+            let cx = current_trap_cx();
+            warn!(
+                "[signal] fatal signum={} hart={} pid={} tid={:?} thread_id={:?} \
+                 reason={} user_pc={:#x} user_sp={:#x}",
+                signum,
+                hartid(),
+                current_process().getpid(),
+                tid,
+                thread_id,
+                msg,
+                cx.user_pc(),
+                cx.user_sp(),
+            );
+            exit_current_and_run_next(ExitReason::Signal(signum as u32));
+        }
+        if current_process_is_zombie() {
+            trace!("[kernel] trap_handler: .. current process is zombie");
+            // 非主进程才会进入这个分支，此时退出的reason是不重要的。
+            exit_current_and_run_next(ExitReason::Exit(0));
+        }
+        #[cfg(feature = "return_work_cache")]
+        if current_task()
+            .map(|task| task.resched_work_pending())
+            .unwrap_or(false)
+        {
+            schedule_if_needed();
+            // The task may have slept and remote work may have arrived while
+            // it was off-CPU. Restart with fatal/process-exit checks.
+            continue;
+        }
+        #[cfg(not(feature = "return_work_cache"))]
+        schedule_if_needed();
+        // Handle user-installed signal handlers before returning to user space.
+        // If the kernel cannot build a signal frame (for example, because the user
+        // stack is already invalid), terminate the task instead of re-executing the
+        // same faulting instruction forever.
+        if let Some(signum) = handle_signals() {
+            exit_current_and_run_next(ExitReason::Signal(signum as u32));
+        }
+        // Deliver at most one signal frame per return, even when more signals
+        // remain pending. A nested loop here would stack every pending handler
+        // before userspace got a chance to run the first one.
+        trap_return_unchecked(CurrentUserEntrySnapshot::capture());
     }
-    if current_process_is_zombie() {
-        trace!("[kernel] trap_handler: .. current process is zombie");
-        // 非主进程才会进入这个分支，此时退出的reason是不重要的。
-        exit_current_and_run_next(ExitReason::Exit(0));
-    }
-    schedule_if_needed();
-    // Handle user-installed signal handlers before returning to user space.
-    // If the kernel cannot build a signal frame (for example, because the user
-    // stack is already invalid), terminate the task instead of re-executing the
-    // same faulting instruction forever.
-    if let Some(signum) = handle_signals() {
-        exit_current_and_run_next(ExitReason::Signal(signum as u32));
-    }
-    trap_return();
 }
 
 /// return to user space
 #[no_mangle]
 pub fn trap_return() -> ! {
+    finish_current_user_trap();
+}
+
+/// Complete the one-word return-work check for the current task.
+#[inline]
+fn finish_current_user_trap() -> ! {
+    #[cfg(not(feature = "return_work_cache"))]
+    exit_to_user_slow();
+    #[cfg(feature = "return_work_cache")]
+    {
+        let snapshot = CurrentUserEntrySnapshot::capture();
+        if snapshot.task.return_work_pending() {
+            snapshot.release();
+            exit_to_user_slow();
+        }
+        trap_return_unchecked(snapshot);
+    }
+}
+
+/// Return after the caller has completed the user-return work check.
+fn trap_return_unchecked(snapshot: CurrentUserEntrySnapshot) -> ! {
     set_user_trap_entry();
-    let trap_cx_user_va = current_trap_cx_user_va();
-    current_trap_cx().set_kernel_hartid(hartid());
-    let user_token = current_user_token();
+    let trap_cx_user_va = snapshot.task.trap_cx_user_va();
+    snapshot.task.trap_cx().set_kernel_hartid(hartid());
+    let user_token = snapshot.task.get_user_token();
     #[cfg(not(feature = "trap_accounting_probe"))]
-    current_process().enter_user(get_time());
+    snapshot
+        .process
+        .enter_user(snapshot.task.as_ref(), get_time());
+    // `return_to_user` never unwinds this Rust frame. Drop owned references
+    // explicitly before the architectural jump so every trap does not leak
+    // one TCB and PCB strong count.
+    snapshot.release();
     unsafe { ArchTrapMachine::return_to_user(trap_cx_user_va, user_token) }
 }
 
@@ -799,6 +929,15 @@ fn trap_from_kernel_impl(
                 crate::probe!(
                     {
                         let now_raw = get_time();
+                        // A task may spend multiple ticks inside a blocking or
+                        // compute-heavy syscall. Roll its open kernel slice
+                        // into the PCB atomic total before process CPU timers
+                        // inspect it, without changing accounting mode.
+                        if let Some(task) = current_task() {
+                            if let Some(process) = task.process.upgrade() {
+                                process.flush_kernel_cpu_accounting(task.as_ref(), now_raw);
+                            }
+                        }
                         check_itimers_of_all_processes(now_raw, get_realtime_ns());
                         crate::net::poll();
                         #[cfg(feature = "mm_perf_counters")]

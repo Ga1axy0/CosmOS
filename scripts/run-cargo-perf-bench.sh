@@ -8,6 +8,7 @@ LABEL="${1:-run}"
 SMP_COUNT="${SMP_COUNT:-8}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-180}"
 PERF_PROBE_VALUE="${PERF_PROBE_VALUE:-1}"
+SKIP_KERNEL_BUILD="${SKIP_KERNEL_BUILD:-0}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/.make/cargo-perf}"
 LOG_PATH="$OUT_DIR/$LABEL.log"
 BUILD_LOG_PATH="$OUT_DIR/$LABEL-build.log"
@@ -55,16 +56,24 @@ BOOTSTRAP_BASE="$OVERLAY_DIR/bootstrap.img"
 SDCARD_OVERLAY="$OVERLAY_DIR/sdcard.qcow2"
 BOOTSTRAP_OVERLAY="$OVERLAY_DIR/bootstrap.qcow2"
 
-if [[ "$PERF_PROBE_VALUE" == 1 ]]; then
+if [[ "$SKIP_KERNEL_BUILD" == 1 ]]; then
+    if [[ ! -f "$PROJECT_ROOT/kernel-rv" ]]; then
+        echo "missing prebuilt $PROJECT_ROOT/kernel-rv" >&2
+        exit 2
+    fi
+    echo "[cargo-perf-host] using prebuilt RISC-V kernel"
+elif [[ "$PERF_PROBE_VALUE" == 1 ]]; then
     echo "[cargo-perf-host] building instrumented RISC-V kernel"
 else
     echo "[cargo-perf-host] building production RISC-V kernel"
 fi
-if ! make -C "$PROJECT_ROOT" kernel-rv PERF_PROBE="$PERF_PROBE_VALUE" >"$BUILD_LOG_PATH" 2>&1; then
+if [[ "$SKIP_KERNEL_BUILD" != 1 ]] && ! make -C "$PROJECT_ROOT" kernel-rv PERF_PROBE="$PERF_PROBE_VALUE" >"$BUILD_LOG_PATH" 2>&1; then
     echo "[cargo-perf-host] kernel build failed: $BUILD_LOG_PATH" >&2
     tail -n 100 "$BUILD_LOG_PATH" >&2
     exit 1
 fi
+KERNEL_SHA256="$(sha256sum "$PROJECT_ROOT/kernel-rv" | awk '{print $1}')"
+echo "[cargo-perf-host] kernel_sha256=$KERNEL_SHA256"
 
 echo "[cargo-perf-host] cloning bootstrap rootfs for this run"
 cp -a "$ROOTFS_RV" "$BENCH_ROOTFS"
@@ -116,8 +125,16 @@ set +e
 # QEMU's stdio chardev needs to stay in the foreground process group.  Without
 # --foreground, timeout can stop it on a terminal read before any guest output
 # reaches the log.
+make_args=(-C "$PROJECT_ROOT")
+if [[ "$SKIP_KERNEL_BUILD" == 1 ]]; then
+    # `fast-run` normally depends on `kernel-rv`.  Merely skipping the explicit
+    # build above is insufficient when a source file is newer than a frozen
+    # A/B kernel copied into place: make would silently rebuild it here.  Treat
+    # this target as an old file so its recipe is suppressed for this run.
+    make_args+=(-o kernel-rv)
+fi
 "${run_prefix[@]}" timeout --foreground "$RUN_TIMEOUT" \
-    make -C "$PROJECT_ROOT" fast-run FINAL=1 PERF_PROBE="$PERF_PROBE_VALUE" SMP="$SMP_COUNT" \
+    make "${make_args[@]}" fast-run FINAL=1 PERF_PROBE="$PERF_PROBE_VALUE" SMP="$SMP_COUNT" \
     FAST_RUN_MODE_ARGS= \
     FAST_RUN_QEMU_BLK_ARGS="$sdcard_args" \
     QEMU_COMP_EXTRA_BLK_ARGS="$bootstrap_args" \

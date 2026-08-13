@@ -211,6 +211,15 @@ pub struct ProcessControlBlock {
     /// Lock-free hint for another thread observing process exit on trap return.
     #[cfg(feature = "return_work_cache")]
     zombie_work_pending: AtomicBool,
+    /// User and kernel CPU time already committed by this process's tasks.
+    /// Active-slice ownership lives in each TCB, so threads running on
+    /// different harts can add to these totals independently.
+    committed_user_time: AtomicUsize,
+    committed_kernel_time: AtomicUsize,
+    /// Becomes true after every running thread has committed its final slice.
+    /// `is_zombie` is published earlier to stop sibling tasks, so wait/reap
+    /// must use this second phase before consuming process CPU totals.
+    cpu_accounting_finalized: AtomicBool,
     /// Signal delivered to the parent when this process exits.
     pub clone_exit_signal: u32,
     /// mutable
@@ -336,18 +345,10 @@ pub struct ProcessControlBlockInner {
     pub cred: Credentials,
     /// lazily created special keyrings visible through `add_key/keyctl`
     pub keyrings: ProcessKeyrings,
-    /// CPU time spent in user mode for this process (raw timer counter units)
-    pub user_time: usize,
-    /// CPU time spent in kernel mode for this process (raw timer counter units)
-    pub kernel_time: usize,
     /// waited-for children's aggregated user time (raw timer counter units)
     pub child_user_time: usize,
     /// waited-for children's aggregated kernel time (raw timer counter units)
     pub child_kernel_time: usize,
-    /// Current CPU accounting mode for this process on the single core.
-    pub accounting_state: CpuAccountingState,
-    /// Timestamp of the last accounting state transition.
-    pub accounting_timestamp: usize,
     /// Process birth time on the realtime clock, used for BSD process accounting.
     pub accounting_start_time_ns: u64,
     /// Effective CLOCK_MONOTONIC offset inherited from a parent time namespace.
@@ -388,13 +389,6 @@ pub struct ShmAttachment {
 pub struct RobustList {
     pub head: usize,
     pub len: usize,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub enum CpuAccountingState {
-    Inactive,
-    User,
-    Kernel,
 }
 
 /// 进程级 interval timer 状态。
@@ -1008,7 +1002,7 @@ impl ProcessControlBlock {
     }
 
     /// Attach a created task to this process's task table without scheduling it.
-    pub fn attach_task(self: &Arc<Self>, task: Arc<TaskControlBlock>) {
+    pub fn attach_task(self: &Arc<Self>, task: Arc<TaskControlBlock>) -> Result<(), ()> {
         let task_inner = task.inner_exclusive_access();
         let res = task_inner.res.as_ref().unwrap();
         let tid = res.tid;
@@ -1018,6 +1012,13 @@ impl ProcessControlBlock {
         let restore_mask = task_inner.signal_mask_backup.is_some();
         drop(task_inner);
         let mut inner = self.inner_exclusive_access();
+        // Serialize publication of a new thread with process teardown. A
+        // clone may finish allocating its private resources after exit_group
+        // has begun; publishing it here would let a task escape the exit
+        // snapshot and run against a recycled address space.
+        if inner.is_zombie || self.exec_in_progress() || self.cpu_accounting_finalized() {
+            return Err(());
+        }
         if crate::signal::signal_work_needed(
             thread_pending,
             inner.pending_signals,
@@ -1032,6 +1033,7 @@ impl ProcessControlBlock {
         inner.tasks[tid] = Some(Arc::clone(&task));
         drop(inner);
         insert_into_tid2task(thread_id, &task);
+        Ok(())
     }
 
     /// new process from elf file
@@ -1059,6 +1061,9 @@ impl ProcessControlBlock {
             parent_pid: AtomicUsize::new(0),
             #[cfg(feature = "return_work_cache")]
             zombie_work_pending: AtomicBool::new(false),
+            committed_user_time: AtomicUsize::new(0),
+            committed_kernel_time: AtomicUsize::new(0),
+            cpu_accounting_finalized: AtomicBool::new(false),
             clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1089,12 +1094,8 @@ impl ProcessControlBlock {
                 oom_score_adj: 0,
                 cred,
                 keyrings: ProcessKeyrings::default(),
-                user_time: 0,
-                kernel_time: 0,
                 child_user_time: 0,
                 child_kernel_time: 0,
-                accounting_state: CpuAccountingState::Inactive,
-                accounting_timestamp: 0,
                 accounting_start_time_ns: get_realtime_ns(),
                 timens_monotonic_offset_ns: 0,
                 timens_child_monotonic_offset_ns: 0,
@@ -1137,7 +1138,9 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
         // add main thread to the process
-        process.attach_task(Arc::clone(&task));
+        process
+            .attach_task(Arc::clone(&task))
+            .expect("new process became zombie before initial task attach");
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // publish main thread to scheduler only after the process/task state is fully initialized
         add_task(task);
@@ -1176,23 +1179,36 @@ impl ProcessControlBlock {
             );
             return Err(ERRNO::EINVAL);
         }
-        if self
-            .exec_in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            warn!("kernel: concurrent exec rejected: pid={}", self.getpid());
-            return Err(ERRNO::EAGAIN);
-        }
-        let _exec_guard = ExecInProgressGuard {
-            flag: &self.exec_in_progress,
-        };
         let owner_pid = self.getpid();
 
         trace!("kernel: exec .. load process image");
         let cwd = self.inner_exclusive_access().cwd.clone();
         let (memory_set, user_layout, final_entry, auxv_extra) =
             load_process_image(elf_file, cwd.as_str())?;
+
+        // Loading has no process-wide side effects, so claim teardown only
+        // after it succeeds.  The claim and is_zombie check share the PCB
+        // lock with exit_group, giving exec and exit one linearization point.
+        // Threads cloned while the image was loading are harmless: the
+        // sibling snapshot below includes every task published before this
+        // claim, while attach_task rejects publication afterwards.
+        {
+            let inner = self.inner_exclusive_access();
+            if inner.is_zombie {
+                return Err(ERRNO::ESRCH);
+            }
+            if self
+                .exec_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                warn!("kernel: concurrent exec rejected: pid={}", self.getpid());
+                return Err(ERRNO::EAGAIN);
+            }
+        }
+        let _exec_guard = ExecInProgressGuard {
+            flag: &self.exec_in_progress,
+        };
 
         let ustack_base = user_layout.ustack_base;
         let new_token = memory_set.token();
@@ -1296,11 +1312,18 @@ impl ProcessControlBlock {
                     None,
                 )
                 .map_err(mm_error_to_errno)?;
-            process_inner
+            let trap_cx_ppn = process_inner
                 .memory_set
                 .translate(VirtAddr::from(trap_cx_bottom).into())
                 .unwrap()
-                .ppn()
+                .ppn();
+            // Exec replaces MemorySet without a scheduler switch. Publish the
+            // new mm as active on this hart once its return mappings exist.
+            #[cfg(not(feature = "trap_active_harts_probe"))]
+            process_inner
+                .memory_set
+                .mark_user_active(crate::hal::hartid());
+            trap_cx_ppn
         };
 
         {
@@ -1497,6 +1520,9 @@ impl ProcessControlBlock {
             parent_pid: AtomicUsize::new(child_parent_pid),
             #[cfg(feature = "return_work_cache")]
             zombie_work_pending: AtomicBool::new(false),
+            committed_user_time: AtomicUsize::new(0),
+            committed_kernel_time: AtomicUsize::new(0),
+            cpu_accounting_finalized: AtomicBool::new(false),
             clone_exit_signal: exit_signal,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1527,12 +1553,8 @@ impl ProcessControlBlock {
                 oom_score_adj: parent.oom_score_adj,
                 cred,
                 keyrings: parent_keyrings,
-                user_time: 0,
-                kernel_time: 0,
                 child_user_time: 0,
                 child_kernel_time: 0,
-                accounting_state: CpuAccountingState::Inactive,
-                accounting_timestamp: 0,
                 accounting_start_time_ns: get_realtime_ns(),
                 timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
                 timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
@@ -1621,7 +1643,9 @@ impl ProcessControlBlock {
             task_inner.signal_mask = parent_signal_mask;
         }
         // attach task to child process before publishing it
-        child.attach_task(Arc::clone(&task));
+        child
+            .attach_task(Arc::clone(&task))
+            .expect("new child became zombie before initial task attach");
         // Finalize the child's trap context before publishing it to the scheduler.
         // Otherwise, on SMP the child may run on another hart before `sys_fork`
         // patches the inherited return register, breaking fork semantics.
@@ -1786,6 +1810,9 @@ impl ProcessControlBlock {
             parent_pid: AtomicUsize::new(self.getpid()),
             #[cfg(feature = "return_work_cache")]
             zombie_work_pending: AtomicBool::new(false),
+            committed_user_time: AtomicUsize::new(0),
+            committed_kernel_time: AtomicUsize::new(0),
+            cpu_accounting_finalized: AtomicBool::new(false),
             clone_exit_signal: 17,
             inner: SpinNoIrqLock::new(ProcessControlBlockInner {
                 is_zombie: false,
@@ -1816,12 +1843,8 @@ impl ProcessControlBlock {
                 oom_score_adj: parent.oom_score_adj,
                 cred,
                 keyrings: parent_keyrings,
-                user_time: 0,
-                kernel_time: 0,
                 child_user_time: 0,
                 child_kernel_time: 0,
-                accounting_state: CpuAccountingState::Inactive,
-                accounting_timestamp: 0,
                 accounting_start_time_ns: get_realtime_ns(),
                 timens_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
                 timens_child_monotonic_offset_ns: parent.timens_child_monotonic_offset_ns,
@@ -1873,7 +1896,9 @@ impl ProcessControlBlock {
             trap_handler as usize,
         );
 
-        child.attach_task(Arc::clone(&task));
+        child
+            .attach_task(Arc::clone(&task))
+            .expect("spawn child became zombie before initial task attach");
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         add_task(task);
         #[cfg(feature = "cosmos-meminfo")]
@@ -2638,86 +2663,90 @@ impl ProcessControlBlock {
         result_brk
     }
 
-    /// Mark this process as running in kernel mode from `now`.
-    pub fn resume_in_kernel(&self, now: usize) {
-        let mut inner = self.inner.lock();
-        inner.accounting_state = CpuAccountingState::Kernel;
-        inner.accounting_timestamp = now;
+    /// Add one task's completed user slice to the process-wide total.
+    #[inline(always)]
+    pub(crate) fn commit_user_cpu_time(&self, delta: usize) {
+        self.committed_user_time.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Add one task's completed kernel slice to the process-wide total.
+    #[inline(always)]
+    pub(crate) fn commit_kernel_cpu_time(&self, delta: usize) {
+        self.committed_kernel_time
+            .fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Read process CPU time committed by all threads so far.
+    ///
+    /// A concurrently running thread may have at most its current open slice
+    /// missing from this snapshot. The calling thread has already committed
+    /// its user slice at trap entry, and periodic timer traps bound the lag of
+    /// remote threads without taking their locks.
+    #[inline]
+    pub fn committed_cpu_times(&self) -> (usize, usize) {
+        (
+            self.committed_user_time.load(Ordering::Relaxed),
+            self.committed_kernel_time.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Publish that no task can add another CPU slice to this process.
+    #[inline]
+    pub(crate) fn finalize_cpu_accounting(&self) {
+        self.cpu_accounting_finalized.store(true, Ordering::Release);
+    }
+
+    /// Return whether wait/reap may consume this zombie's final CPU totals.
+    #[inline]
+    pub(crate) fn cpu_accounting_finalized(&self) -> bool {
+        self.cpu_accounting_finalized.load(Ordering::Acquire)
+    }
+
+    /// Mark `task` as running in kernel mode from `now`.
+    #[inline(always)]
+    pub fn resume_in_kernel(&self, task: &TaskControlBlock, now: usize) {
+        if task.has_user_context() {
+            task.resume_in_kernel(self, now);
+        }
     }
 
     /// Account the user-mode slice that ended at `now`, then switch to kernel mode.
-    pub fn enter_kernel(&self, now: usize) {
-        let mut inner = self.inner.lock();
-        // The process page table remains active in kernel mode. Kernel
-        // user-memory helpers walk it explicitly, while generation tracking
-        // guarantees an ASID fence before returning to an edited user mapping.
-        #[cfg(not(feature = "trap_active_harts_probe"))]
-        inner.memory_set.mark_user_inactive(crate::hal::hartid());
-        match inner.accounting_state {
-            CpuAccountingState::User => {
-                inner.user_time = inner
-                    .user_time
-                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
-            }
-            CpuAccountingState::Kernel | CpuAccountingState::Inactive => {}
-        }
-        inner.accounting_state = CpuAccountingState::Kernel;
-        inner.accounting_timestamp = now;
+    #[inline(always)]
+    pub fn enter_kernel(&self, task: &TaskControlBlock, now: usize) {
+        task.enter_kernel(self, now);
+    }
+
+    /// Flush an open kernel slice without changing an inactive task's mode.
+    #[inline]
+    pub fn flush_kernel_cpu_accounting(&self, task: &TaskControlBlock, now: usize) {
+        task.flush_kernel_cpu_accounting(self, now);
     }
 
     /// Account the kernel-mode slice that ended at `now`, then switch to user mode.
-    pub fn enter_user(&self, now: usize) {
-        let mut inner = self.inner.lock();
-        match inner.accounting_state {
-            CpuAccountingState::Kernel => {
-                inner.kernel_time = inner
-                    .kernel_time
-                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
-            }
-            CpuAccountingState::User | CpuAccountingState::Inactive => {}
-        }
-        inner.accounting_state = CpuAccountingState::User;
-        inner.accounting_timestamp = now;
+    #[inline(always)]
+    pub fn enter_user(&self, task: &TaskControlBlock, now: usize) {
+        task.enter_user(self, now);
         // 即将跳回用户态，后续其他 hart 修改该 mm 时需要把当前 hart 作为 shootdown 目标。
-        #[cfg(not(feature = "trap_active_harts_probe"))]
-        inner.memory_set.mark_user_active(crate::hal::hartid());
     }
 
     /// Flush the current running slice into the corresponding accumulator.
-    pub fn pause_cpu_accounting(&self, now: usize) {
-        let mut inner = self.inner.lock();
-        match inner.accounting_state {
-            CpuAccountingState::User => {
-                inner.user_time = inner
-                    .user_time
-                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
-            }
-            CpuAccountingState::Kernel => {
-                inner.kernel_time = inner
-                    .kernel_time
-                    .saturating_add(now.saturating_sub(inner.accounting_timestamp));
-            }
-            CpuAccountingState::Inactive => {}
+    pub fn pause_cpu_accounting(&self, task: &TaskControlBlock, now: usize) {
+        if !task.has_user_context() {
+            return;
         }
-        inner.accounting_state = CpuAccountingState::Inactive;
-        inner.accounting_timestamp = now;
+        task.pause_cpu_accounting(self, now);
+        let inner = self.inner.lock();
+        // Keep this address space in the shootdown mask across ordinary
+        // syscalls.  Only clear it when the task really leaves this hart; a
+        // later return fences against any generation missed while inactive.
+        #[cfg(not(feature = "trap_active_harts_probe"))]
+        inner.memory_set.mark_user_inactive(crate::hal::hartid());
     }
 
     /// Snapshot process times as raw counters: (utime, stime, cutime, cstime).
-    pub fn times_snapshot(&self, now: usize) -> (usize, usize, usize, usize) {
+    pub fn times_snapshot(&self, _now: usize) -> (usize, usize, usize, usize) {
+        let (user_time, kernel_time) = self.committed_cpu_times();
         let inner = self.inner.lock();
-        let active_delta = now.saturating_sub(inner.accounting_timestamp);
-        let (user_time, kernel_time) = match inner.accounting_state {
-            CpuAccountingState::User => (
-                inner.user_time.saturating_add(active_delta),
-                inner.kernel_time,
-            ),
-            CpuAccountingState::Kernel => (
-                inner.user_time,
-                inner.kernel_time.saturating_add(active_delta),
-            ),
-            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
-        };
         (
             user_time,
             kernel_time,
@@ -2735,19 +2764,8 @@ impl ProcessControlBlock {
         now_raw: usize,
         _now_realtime_ns: u64,
     ) -> Result<(u64, u64), ERRNO> {
+        let (user_raw, kernel_raw) = self.committed_cpu_times();
         let inner = self.inner.lock();
-        let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
-        let (user_raw, kernel_raw) = match inner.accounting_state {
-            CpuAccountingState::User => (
-                inner.user_time.saturating_add(active_delta),
-                inner.kernel_time,
-            ),
-            CpuAccountingState::Kernel => (
-                inner.user_time,
-                inner.kernel_time.saturating_add(active_delta),
-            ),
-            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
-        };
         let monotonic_ns = raw_counter_to_ns(now_raw);
         let user_ns = raw_counter_to_ns(user_raw);
         let kernel_ns = raw_counter_to_ns(kernel_raw);
@@ -2776,19 +2794,8 @@ impl ProcessControlBlock {
         _now_realtime_ns: u64,
         new_value: Option<(u64, u64)>,
     ) -> Result<(u64, u64), ERRNO> {
+        let (user_raw, kernel_raw) = self.committed_cpu_times();
         let mut inner = self.inner.lock();
-        let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
-        let (user_raw, kernel_raw) = match inner.accounting_state {
-            CpuAccountingState::User => (
-                inner.user_time.saturating_add(active_delta),
-                inner.kernel_time,
-            ),
-            CpuAccountingState::Kernel => (
-                inner.user_time,
-                inner.kernel_time.saturating_add(active_delta),
-            ),
-            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
-        };
         let monotonic_ns = raw_counter_to_ns(now_raw);
         let user_ns = raw_counter_to_ns(user_raw);
         let kernel_ns = raw_counter_to_ns(kernel_raw);
@@ -2825,19 +2832,8 @@ impl ProcessControlBlock {
 
     /// 在一个时钟 tick 上推进进程级 interval timers，并返回本次应投递的信号集合。
     pub fn consume_expired_itimers(&self, now_raw: usize, _now_realtime_ns: u64) -> SignalBit {
+        let (user_raw, kernel_raw) = self.committed_cpu_times();
         let mut inner = self.inner.lock();
-        let active_delta = now_raw.saturating_sub(inner.accounting_timestamp);
-        let (user_raw, kernel_raw) = match inner.accounting_state {
-            CpuAccountingState::User => (
-                inner.user_time.saturating_add(active_delta),
-                inner.kernel_time,
-            ),
-            CpuAccountingState::Kernel => (
-                inner.user_time,
-                inner.kernel_time.saturating_add(active_delta),
-            ),
-            CpuAccountingState::Inactive => (inner.user_time, inner.kernel_time),
-        };
         let monotonic_ns = raw_counter_to_ns(now_raw);
         let user_ns = raw_counter_to_ns(user_raw);
         let prof_ns = user_ns.saturating_add(raw_counter_to_ns(kernel_raw));
