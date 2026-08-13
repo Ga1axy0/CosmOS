@@ -8,7 +8,7 @@ use alloc::string::String;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::config::{CLOCK_FREQ, MAX_HARTS};
+use crate::config::MAX_HARTS;
 use crate::hal::hartid;
 
 /// Generic spin-lock acquisitions that do not have a more specific class.
@@ -326,7 +326,11 @@ pub(crate) fn render() -> String {
         }
     }
 
-    let _ = writeln!(&mut out, "# timer_ticks_per_second {}", CLOCK_FREQ);
+    let _ = writeln!(
+        &mut out,
+        "# timer_ticks_per_second {}",
+        crate::bootinfo::timer_frequency()
+    );
     let _ = writeln!(
         &mut out,
         "# lock_class acquires contended wait_events wait_spins wait_ticks max_wait_spins hold_ticks max_hold_ticks"

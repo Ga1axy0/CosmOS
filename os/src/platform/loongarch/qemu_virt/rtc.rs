@@ -5,8 +5,6 @@ use lazy_static::lazy_static;
 
 use crate::sync::SpinNoIrqLock;
 
-use super::VIRT_RTC;
-
 const TOY_TRIM: usize = 0x20;
 const TOY_WRITE0: usize = 0x24;
 const TOY_WRITE1: usize = 0x28;
@@ -121,7 +119,14 @@ fn secs_to_calendar(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 }
 
 lazy_static! {
-    static ref RTC: Arc<SpinNoIrqLock<Rtc>> = Arc::new(SpinNoIrqLock::new(Rtc::new(VIRT_RTC)));
+    static ref RTC: Arc<SpinNoIrqLock<Rtc>> = {
+        let resource = crate::bootinfo::get()
+            .rtc()
+            .expect("FDT has no RTC resource");
+        Arc::new(SpinNoIrqLock::new(Rtc::new(
+            crate::platform::mmio_phys_to_virt(resource.start),
+        )))
+    };
 }
 
 static RTC_READY: AtomicBool = AtomicBool::new(false);

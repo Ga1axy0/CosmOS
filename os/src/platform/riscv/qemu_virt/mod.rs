@@ -5,9 +5,8 @@ pub mod rtc;
 pub mod sbi;
 
 pub use board::{
-    BlockDeviceImpl, CharDeviceImpl, QEMUExit, CLOCK_FREQ, INTERP_BASE, MMIO, QEMU_EXIT_HANDLE,
-    USER_MMAP_BASE, USER_STACK_BASE, VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS,
-    VIRTIO_MMIO_STRIDE, VIRT_RTC, VIRT_UART,
+    BlockDeviceImpl, CharDeviceImpl, QEMUExit, INTERP_BASE, QEMU_EXIT_HANDLE, USER_MMAP_BASE,
+    USER_STACK_BASE,
 };
 pub use sbi::SbiPlatform;
 
@@ -184,7 +183,7 @@ pub fn mmio_phys_to_virt(paddr: usize) -> usize {
 
 /// Whether the Goldfish RTC is supported on this platform.
 pub fn rtc_is_supported() -> bool {
-    true
+    crate::bootinfo::get().rtc().is_some()
 }
 
 /// Whether the kernel heap may grow inside its dedicated virtual window.

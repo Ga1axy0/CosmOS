@@ -25,7 +25,6 @@ use alloc::string::String;
 
 use lazy_static::lazy_static;
 
-use crate::config::CLOCK_FREQ;
 use crate::fs::{
     dentry_perf_counters, getdents_perf_counters, inode_perf_counters, page_cache_stats,
 };
@@ -215,7 +214,7 @@ pub fn render() -> String {
         let _ = writeln!(
             &mut out,
             "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            s.tick / CLOCK_FREQ,
+            s.tick / crate::bootinfo::timer_frequency(),
             s.heap_total_bytes,
             s.heap_used_bytes,
             s.heap_slack_bytes,

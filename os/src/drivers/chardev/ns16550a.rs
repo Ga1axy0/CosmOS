@@ -135,7 +135,7 @@ struct WriteEnd {
 }
 
 /// NS16550a char device.
-pub struct NS16550a<const BASE_ADDR: usize> {
+pub struct NS16550a {
     pub(crate) inner: SpinNoIrqLock<NS16550aInner>,
     #[allow(dead_code)]
     pub(crate) rx_wait_queue: WaitQueue,
@@ -186,11 +186,11 @@ impl NS16550aRaw {
     }
 }
 
-impl<const BASE_ADDR: usize> NS16550a<BASE_ADDR> {
+impl NS16550a {
     /// new device
-    pub fn new() -> Self {
+    pub fn new(base_addr: usize) -> Self {
         let mut inner = NS16550aInner {
-            ns16550a: NS16550aRaw::new(BASE_ADDR),
+            ns16550a: NS16550aRaw::new(base_addr),
             read_buffer: VecDeque::new(),
         };
         inner.ns16550a.init();
@@ -216,7 +216,7 @@ impl NS16550aRaw {
     }
 }
 
-impl<const BASE_ADDR: usize> CharDevice for NS16550a<BASE_ADDR> {
+impl CharDevice for NS16550a {
     fn write(&self, ch: u8) {
         let mut inner = self.inner.lock();
         inner.ns16550a.write(ch);

@@ -3,7 +3,6 @@
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
-use crate::config::CLOCK_FREQ;
 use crate::config::MAX_HARTS;
 use crate::hal::hartid;
 use crate::hal::traits::Timer as _;
@@ -28,7 +27,13 @@ const MICRO_PER_SEC: usize = 1_000_000;
 /// 每秒对应的纳秒数。
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// Periodic scheduler/accounting tick interval expressed in raw timer ticks.
-const PERIODIC_TICK_INTERVAL: u64 = (CLOCK_FREQ / TICKS_PER_SEC) as u64;
+fn clock_freq() -> usize {
+    Plat::clock_freq()
+}
+
+fn periodic_tick_interval() -> u64 {
+    (clock_freq() / TICKS_PER_SEC).max(1) as u64
+}
 
 /// `CLOCK_REALTIME` 相对单调时钟的偏移，单位为纳秒。
 /// 全局唯一
@@ -41,20 +46,21 @@ pub fn get_time() -> usize {
 
 /// Get the current time in milliseconds
 pub fn get_time_ms() -> usize {
-    get_time() * MSEC_PER_SEC / CLOCK_FREQ
+    get_time() * MSEC_PER_SEC / clock_freq()
 }
 
 /// get current time in microseconds
 pub fn get_time_us() -> usize {
-    get_time() * MICRO_PER_SEC / CLOCK_FREQ
+    get_time() * MICRO_PER_SEC / clock_freq()
 }
 
 /// Convert a raw platform timer counter value to nanoseconds.
 pub fn raw_time_to_ns(raw_time: usize) -> u64 {
-    if NSEC_PER_SEC as usize % CLOCK_FREQ == 0 {
-        (raw_time as u64).saturating_mul((NSEC_PER_SEC as usize / CLOCK_FREQ) as u64)
+    let frequency = clock_freq();
+    if NSEC_PER_SEC as usize % frequency == 0 {
+        (raw_time as u64).saturating_mul((NSEC_PER_SEC as usize / frequency) as u64)
     } else {
-        ((raw_time as u128) * (NSEC_PER_SEC as u128) / (CLOCK_FREQ as u128)) as u64
+        ((raw_time as u128) * (NSEC_PER_SEC as u128) / (frequency as u128)) as u64
     }
 }
 
@@ -96,12 +102,12 @@ pub fn init_realtime_offset_from_rtc() {
 
 /// Get current time in clock ticks used by times(2).
 pub fn get_time_ticks() -> usize {
-    get_time() * TICKS_PER_SEC / CLOCK_FREQ
+    get_time() * TICKS_PER_SEC / clock_freq()
 }
 
 /// Convert a raw timer counter delta into clock ticks used by times(2).
 pub fn time_to_ticks(time: usize) -> usize {
-    time.saturating_mul(TICKS_PER_SEC) / CLOCK_FREQ
+    time.saturating_mul(TICKS_PER_SEC) / clock_freq()
 }
 
 /// Set the next timer interrupt
@@ -117,7 +123,7 @@ pub fn init_hart() {
     crate::trap::enable_timer_interrupt();
     let hart = normalize_hart(hartid());
     let now = get_time() as u64;
-    *PER_CPU_NEXT_PERIODIC_TICK[hart].lock() = now.saturating_add(PERIODIC_TICK_INTERVAL.max(1));
+    *PER_CPU_NEXT_PERIODIC_TICK[hart].lock() = now.saturating_add(periodic_tick_interval());
     set_next_trigger();
     info!("hart {} timer init done", hartid());
 }
@@ -372,7 +378,7 @@ fn ns_to_raw_ticks_ceil(ns: u64) -> u64 {
         return 0;
     }
     ((ns as u128)
-        .saturating_mul(CLOCK_FREQ as u128)
+        .saturating_mul(clock_freq() as u128)
         .saturating_add((NSEC_PER_SEC - 1) as u128)
         / (NSEC_PER_SEC as u128)) as u64
 }
@@ -469,7 +475,7 @@ pub fn handle_timer_interrupt() -> bool {
         if now_raw < *next_periodic {
             false
         } else {
-            let interval = PERIODIC_TICK_INTERVAL.max(1);
+            let interval = periodic_tick_interval();
             while now_raw >= *next_periodic {
                 *next_periodic = next_periodic.saturating_add(interval);
             }
@@ -493,7 +499,7 @@ pub fn handle_timer_interrupt() -> bool {
         // `run_tasks`), where contention is low. The block-worker orphan has
         // its own cheap single-task self-heal in `block::warn_if_stalled`.
     }
- 
+
     program_next_trigger_for_hart(hart, now_raw as usize);
     periodic_fired
 }

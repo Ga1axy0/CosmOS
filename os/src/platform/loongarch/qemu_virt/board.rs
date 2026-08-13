@@ -14,33 +14,13 @@ pub const IO_ADDR_OFFSET: usize = 0x8000_0000_0000_0000;
 /// Direct-mapped cached kernel-address offset used during early bring-up.
 pub const KERNEL_ADDR_OFFSET: usize = 0x9000_0000_0000_0000;
 
-/// QEMU loongarch64 `virt` clock frequency.
-pub const CLOCK_FREQ: usize = 100_000_000;
-
-/// MMIO windows used by the kernel on QEMU loongarch64 `virt` (uncached DMW0 window).
-pub const MMIO: &[(usize, usize)] = &[
-    (IO_ADDR_OFFSET | 0x1000_0000, 0x100000), // LS7A bridge (RTC at 0x100d0100, GED at 0x100e001c)
-    (IO_ADDR_OFFSET | 0x1fe0_0000, 0x10000),  // covers all 1fe0_xxxx MMIO
-    (IO_ADDR_OFFSET | 0x1fe2_0000, 0x8000),   // VirtIO
-];
-
-/// UART MMIO virtual address (uncached DMW0 window).
+/// UART used only before the firmware FDT has selected the runtime console.
 pub const VIRT_UART: usize = IO_ADDR_OFFSET | 0x1fe0_01e0;
-/// LS7A RTC MMIO virtual address (uncached DMW0 window).
-pub const VIRT_RTC: usize = IO_ADDR_OFFSET | 0x100d_0100;
-/// VirtIO MMIO window base address.
-pub const VIRTIO_MMIO_BASE: usize = IO_ADDR_OFFSET | 0x1fe2_0000;
-/// Size of each VirtIO MMIO slot.
-pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-/// Number of VirtIO MMIO slots exposed by the machine.
-pub const VIRTIO_MMIO_SLOTS: usize = 8;
-/// First IRQ line assigned to VirtIO MMIO devices.
-pub const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
 
 /// Block device implementation for QEMU `virt`.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 /// Char device implementation for QEMU `virt`.
-pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
+pub type CharDeviceImpl = crate::drivers::chardev::NS16550a;
 
 use core::arch::asm;
 

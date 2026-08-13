@@ -1,4 +1,4 @@
-//! QEMU `virt` platform for LoongArch64.
+//! FDT-selected LoongArch64 platform support.
 
 mod board;
 mod irq;
@@ -6,9 +6,8 @@ mod pci;
 pub mod rtc;
 
 pub use board::{
-    BlockDeviceImpl, CharDeviceImpl, QEMUExit, CLOCK_FREQ, INTERP_BASE, IO_ADDR_OFFSET,
-    KERNEL_ADDR_OFFSET, MMIO, QEMU_EXIT_HANDLE, USER_MMAP_BASE, USER_STACK_BASE, VIRTIO_MMIO_BASE,
-    VIRTIO_MMIO_IRQ_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE, VIRT_RTC, VIRT_UART,
+    BlockDeviceImpl, CharDeviceImpl, QEMUExit, INTERP_BASE, IO_ADDR_OFFSET, KERNEL_ADDR_OFFSET,
+    QEMU_EXIT_HANDLE, USER_MMAP_BASE, USER_STACK_BASE, VIRT_UART,
 };
 pub use irq::{
     console_rx_irq_ready, handle_external_irq, init_external_irq, init_external_irq_hart,
@@ -20,6 +19,35 @@ use crate::hal::traits::{HartCtrl, Timer};
 
 pub const KERNEL_HEAP_BASE: usize = 0x0000_0038_0000_0000;
 pub const TRAMPOLINE: usize = 0x0000_003f_ffff_f000;
+
+/// QEMU's direct loader passes the generated FDT address as argument 1.
+pub const fn boot_fdt_ptr(raw: usize) -> usize {
+    raw
+}
+
+fn is_qemu_virt() -> bool {
+    crate::bootinfo::try_get().is_some_and(|info| {
+        info.pci_host().is_some() && info.pch_pic().is_some() && info.eiointc().is_some()
+    })
+}
+
+/// The common early initialization path is supported on every described board.
+pub const fn continue_full_boot() -> bool {
+    true
+}
+
+/// Continue to the root filesystem only when the FDT exposes the supported
+/// QEMU PCI/interrupt topology. LS2K storage remains a separate driver task.
+pub fn continue_storage_boot() -> bool {
+    is_qemu_virt()
+}
+
+/// Stop after the common early bring-up stages when requested by a backend.
+pub fn halt_early_bringup() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 /// LoongArch64 platform implementation used by the generic HAL facade.
 pub struct LoongArchPlatform;
@@ -34,7 +62,7 @@ impl Timer for LoongArchPlatform {
     }
 
     fn clock_freq() -> usize {
-        crate::config::CLOCK_FREQ
+        crate::bootinfo::timer_frequency()
     }
 }
 
@@ -124,11 +152,26 @@ pub fn use_early_console() -> bool {
 
 /// Write one string through the earliest available console path.
 pub fn early_console_write(s: &str) {
+    let uart = crate::bootinfo::try_get()
+        .and_then(|info| info.uart())
+        .map(|resource| crate::platform::mmio_phys_to_virt(resource.start))
+        .unwrap_or(VIRT_UART);
     for b in s.bytes() {
         unsafe {
-            while core::ptr::read_volatile((VIRT_UART + 5) as *const u8) & 0x20 == 0 {}
-            core::ptr::write_volatile(VIRT_UART as *mut u8, b);
+            while core::ptr::read_volatile((uart + 5) as *const u8) & 0x20 == 0 {}
+            core::ptr::write_volatile(uart as *mut u8, b);
         }
+    }
+}
+
+/// Verify the portable compiler baseline against the CPU before Rust proceeds.
+pub fn early_runtime_diagnostics() {
+    const CPUCFG1_UAL: usize = 1 << 20;
+    const COMPILER_UAL: bool = cfg!(target_feature = "ual");
+    let state = crate::arch::loongarch64::boot_execution_state();
+    if COMPILER_UAL && state.cpucfg1 & CPUCFG1_UAL == 0 {
+        early_console_write("[loongarch] compiler requires UAL but CPU lacks it\r\n");
+        halt_early_bringup();
     }
 }
 
@@ -154,21 +197,28 @@ pub fn machine_name() -> &'static str {
 
 /// Return the platform name for display purposes.
 pub fn platform_name() -> &'static str {
-    "qemu virt"
+    if is_qemu_virt() {
+        "qemu virt"
+    } else {
+        "firmware-described LoongArch board"
+    }
 }
 
 /// Start all secondary harts via IOCSR mailbox + IPI.
 pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     extern "C" {
-        fn _start();
+        fn _start_high();
     }
 
-    // Under direct boot, CPU0 reaches the kernel through our tiny bootloader,
-    // which jumps to the high-half DMW alias of `_start`. QEMU's secondary
-    // slave stub simply `jirl`s to the mailbox value, so feeding it the raw
-    // physical address would drop APs outside the cached DMW window right
-    // after wakeup.
-    let entry = _start as usize;
+    if !is_qemu_virt() {
+        return;
+    }
+
+    // CPU0 uses the ELF's physical `_start`, but QEMU's secondary slave stub
+    // already runs with the DMW environment inherited from firmware and
+    // simply `jirl`s to the mailbox value. Start APs at the internal cached
+    // continuation rather than reusing the firmware-facing ELF entry.
+    let entry = _start_high as usize;
     let boot_info = crate::bootinfo::get();
     let hart_count = if boot_info.fdt_blob().is_some() {
         boot_info.hart_count()
@@ -226,7 +276,7 @@ pub fn mmio_phys_to_virt(paddr: usize) -> usize {
 
 /// Whether the RTC is supported on this platform.
 pub fn rtc_is_supported() -> bool {
-    true
+    crate::bootinfo::get().rtc().is_some()
 }
 
 /// Whether the kernel heap may grow inside its dedicated virtual window.

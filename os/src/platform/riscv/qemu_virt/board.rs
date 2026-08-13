@@ -11,34 +11,10 @@ pub const USER_STACK_BASE: usize = 0x0800_0000;
 /// base address for loading dynamic linker (interpreter)
 pub const INTERP_BASE: usize = 0x2_0000_0000;
 
-/// Clock frequency.
-pub const CLOCK_FREQ: usize = 10_000_000;
-
-/// MMIO windows exposed by the machine.
-pub const MMIO: &[(usize, usize)] = &[
-    (KERNEL_MMIO_OFFSET + 0x0C00_0000, 0x400000),  // PLIC
-    (KERNEL_MMIO_OFFSET + 0x0010_0000, 0x00_2000), // VIRT_TEST/RTC
-    (KERNEL_MMIO_OFFSET + 0x1000_0000, 0x100),     // UART0 (NS16550a)
-    (KERNEL_MMIO_OFFSET + 0x1000_1000, 0x8000),    // VirtIO MMIO devices
-];
-
-/// UART0 MMIO base address.
-pub const VIRT_UART: usize = KERNEL_MMIO_OFFSET + 0x1000_0000;
-/// Goldfish RTC MMIO base address.
-pub const VIRT_RTC: usize = KERNEL_MMIO_OFFSET + 0x0010_1000;
-/// VirtIO MMIO window base address.
-pub const VIRTIO_MMIO_BASE: usize = KERNEL_MMIO_OFFSET + 0x1000_1000;
-/// Size of each VirtIO MMIO slot.
-pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-/// Number of VirtIO MMIO slots exposed by the machine.
-pub const VIRTIO_MMIO_SLOTS: usize = 8;
-/// First IRQ line assigned to VirtIO MMIO devices.
-pub const VIRTIO_MMIO_IRQ_BASE: u32 = 1;
-
 /// Block device implementation for QEMU `virt`.
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 /// Char device implementation for QEMU `virt`.
-pub type CharDeviceImpl = crate::drivers::chardev::NS16550a<VIRT_UART>;
+pub type CharDeviceImpl = crate::drivers::chardev::NS16550a;
 
 use core::arch::asm;
 
