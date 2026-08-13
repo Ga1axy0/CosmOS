@@ -1436,7 +1436,6 @@ fn sys_clone_request(req: CloneRequest) -> isize {
             tls,
             child_tid,
         } = req;
-        warn!("Clone");
         let clone_flags_arg = flags | exit_signal;
         let caller_task = current_task().ok_or(ERRNO::ESRCH)?;
         let caller_pid = caller_task

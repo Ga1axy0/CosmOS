@@ -1464,8 +1464,19 @@ impl ProcessControlBlock {
         );
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
         let addr_space_start_ns = get_time_ns();
-        let shared_mm_vfork =
-            vfork_clone && shared_resources.contains(CloneResourceFlags::VM);
+        // A shared-MM vfork child borrows the parent's page-table root but
+        // keeps its own VMA/TLB bookkeeping. This is safe only while the
+        // caller is the process's sole thread; sibling threads may otherwise
+        // continue changing the shared address space during the vfork.
+        let shared_vm = shared_resources.contains(CloneResourceFlags::VM);
+        let shared_mm_vfork = vfork_clone && shared_vm && parent_thread_count == 1;
+        if vfork_clone && shared_vm && parent_thread_count != 1 {
+            debug!(
+                "[vfork] multithreaded parent falls back to independent VM clone: pid={} threads={}",
+                self.getpid(),
+                parent_thread_count
+            );
+        }
         let (memory_set, parent_token, parent_mask) = if shared_mm_vfork {
             let _vfork_probe = crate::probe_scope!("mm.clone_shared_vfork");
             let parent_tlb_needs_flush = parent
@@ -1483,7 +1494,7 @@ impl ProcessControlBlock {
                 0
             };
             (memory_set, parent_token, parent_mask)
-        } else if shared_resources.contains(CloneResourceFlags::VM) {
+        } else if shared_vm {
             let (memory_set, parent_tlb_needs_flush) =
                 MemorySet::from_existed_user_shared_vm(&mut parent.memory_set)
                     .map_err(mm_error_to_errno)?;
