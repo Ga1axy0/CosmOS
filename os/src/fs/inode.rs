@@ -16,6 +16,7 @@ use crate::mm::UserBuffer;
 use crate::sync::SpinNoIrqLock;
 use crate::syscall::errno::ERRNO;
 use crate::timer::{get_realtime_ns, get_time_us};
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -913,6 +914,22 @@ pub fn canonicalize(cwd: &str, path: &str) -> String {
     }
 }
 
+/// Return whether `path` is already a canonical absolute path.
+///
+/// These paths can be walked as borrowed components.  Paths containing
+/// repeated separators or `.`/`..` still go through `canonicalize`, while
+/// symlink handling remains part of the normal lookup walk below.
+fn is_simple_absolute_path(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    path.starts_with('/')
+        && path
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 /// Walk the virtual filesystem from the root to the node at `abs_path`.
 /// Returns `None` if any component along the path is not found.
 pub fn lookup_inode(abs_path: &str) -> Option<Arc<Inode>> {
@@ -999,7 +1016,11 @@ fn lookup_inode_follow_impl(
     return_path: bool,
 ) -> Result<(Arc<Inode>, Option<String>), ERRNO> {
     let start_us = get_time_us();
-    let mut abs = canonicalize(cwd, path);
+    let mut abs = if is_simple_absolute_path(path) {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(canonicalize(cwd, path))
+    };
     let mut depth = 0usize;
     let mut restarts = 0usize;
     let mut components_walked = 0usize;
@@ -1053,9 +1074,9 @@ fn lookup_inode_follow_impl(
         }
 
         if let Some(next_abs) = restart {
-            abs = next_abs;
+            abs = Cow::Owned(next_abs);
         } else {
-            break 'walk Ok((cur, return_path.then_some(abs)));
+            break 'walk Ok((cur, return_path.then(|| abs.into_owned())));
         }
     };
     super::record_lookup_inode_follow_perf(
