@@ -7,11 +7,12 @@ use crate::fs::{
     canonicalize, do_bind_mount, do_move_mount, do_pivot_root, do_umount, inode_stat,
     linkat_with_flags, lookup_inode_follow, lookup_inode_follow_with_path, lookup_inode_from,
     make_pipe, mkdir_at_with_inode, mount_cgroup2, mount_device, mount_is_readonly, mount_sysfs,
-    mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf, remount_path,
-    rename_at, symlinkat, sync_block_cache_all, sync_page_cache_fs, sync_storage_all,
-    truncate_inode, unlink_child, unlinkat, AccessMode, File, FileDescription, FileStatusFlags,
-    InodeTime, OpenFlags, PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64,
-    StatMode, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    mount_tmpfs, open_file_at, open_file_at_with_status, record_newfstatat_perf,
+    record_statx_perf, remount_path, rename_at, statx_perf_enabled, symlinkat,
+    sync_block_cache_all, sync_page_cache_fs, sync_storage_all, truncate_inode, unlink_child,
+    unlinkat, AccessMode, File, FileDescription, FileStatusFlags, InodeTime, OpenFlags,
+    PosixLockConflict, PosixLockRange, PosixLockType, Stat, StatFs64, StatMode, AT_EMPTY_PATH,
+    AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use crate::mm::{translated_byte_buffer, PageFaultAccess, UserBuffer};
 use crate::net::UnixSocketPairEnd;
@@ -4201,6 +4202,8 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, mask: u32, stx: *mut
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     syscall_body!({
+        let timing_enabled = statx_perf_enabled();
+        let total_start_us = if timing_enabled { get_time_us() } else { 0 };
         let flags = flags as u32;
         let supported_flags =
             AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
@@ -4208,6 +4211,7 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, mask: u32, stx: *mut
             return Err(ERRNO::EINVAL);
         }
         let mask = StatxMask::from_bits(mask).ok_or(ERRNO::EINVAL)?;
+        let copyin_start_us = if timing_enabled { get_time_us() } else { 0 };
         let path = if path.is_null() {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(ERRNO::EFAULT);
@@ -4216,24 +4220,86 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: i32, mask: u32, stx: *mut
         } else {
             read_cstring_from_user(path, PATH_MAX)?
         };
+        let copyin_us = if timing_enabled {
+            get_time_us().saturating_sub(copyin_start_us)
+        } else {
+            0
+        };
 
-        let stat = if path.is_empty() {
+        let (stat, resolve_us, lookup_us, inode_stat_us) = if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(ERRNO::ENOENT);
             }
-            match resolve_at_target(dirfd, "", flags as i32)? {
+            let resolve_start_us = if timing_enabled { get_time_us() } else { 0 };
+            let target = resolve_at_target(dirfd, "", flags as i32)?;
+            let resolve_us = if timing_enabled {
+                get_time_us().saturating_sub(resolve_start_us)
+            } else {
+                0
+            };
+            let inode_stat_start_us = if timing_enabled { get_time_us() } else { 0 };
+            let stat = match target {
                 ResolvedAtTarget::Inode(inode) => inode_stat(&inode),
                 ResolvedAtTarget::FileDesc(desc) => desc.stat(),
-            }
+            };
+            let inode_stat_us = if timing_enabled {
+                get_time_us().saturating_sub(inode_stat_start_us)
+            } else {
+                0
+            };
+            (stat, resolve_us, 0, inode_stat_us)
         } else {
+            let resolve_start_us = if timing_enabled { get_time_us() } else { 0 };
             let base = resolve_dirfd_lookup_base(dirfd, path.as_str())?;
+            let resolve_us = if timing_enabled {
+                get_time_us().saturating_sub(resolve_start_us)
+            } else {
+                0
+            };
+            let lookup_start_us = if timing_enabled { get_time_us() } else { 0 };
             let inode =
                 lookup_inode_from_base(&base, path.as_str(), flags & AT_SYMLINK_NOFOLLOW == 0)?;
-            inode_stat(&inode)
+            let lookup_us = if timing_enabled {
+                get_time_us().saturating_sub(lookup_start_us)
+            } else {
+                0
+            };
+            let inode_stat_start_us = if timing_enabled { get_time_us() } else { 0 };
+            let stat = inode_stat(&inode);
+            let inode_stat_us = if timing_enabled {
+                get_time_us().saturating_sub(inode_stat_start_us)
+            } else {
+                0
+            };
+            (stat, resolve_us, lookup_us, inode_stat_us)
         };
 
-        let statx = stat_to_statx(&stat, mask);
-        write_pod_to_user(stx, &statx)?;
+        let convert_start_us = if timing_enabled { get_time_us() } else { 0 };
+        let statx_value = stat_to_statx(&stat, mask);
+        let convert_us = if timing_enabled {
+            get_time_us().saturating_sub(convert_start_us)
+        } else {
+            0
+        };
+        let copyout_start_us = if timing_enabled { get_time_us() } else { 0 };
+        write_pod_to_user(stx, &statx_value)?;
+        let copyout_us = if timing_enabled {
+            get_time_us().saturating_sub(copyout_start_us)
+        } else {
+            0
+        };
+        if timing_enabled {
+            record_statx_perf(
+                path.is_empty(),
+                copyin_us,
+                resolve_us,
+                lookup_us,
+                inode_stat_us,
+                convert_us,
+                copyout_us,
+                get_time_us().saturating_sub(total_start_us),
+            );
+        }
         Ok(0)
     })
 }

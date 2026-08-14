@@ -16,6 +16,7 @@ ROOTFS_RV="$PROJECT_ROOT/CosmOS-rootfs/rootfs-rv"
 GUEST_RUNNER="${GUEST_RUNNER:-$SCRIPT_DIR/cargo-perf-guest.sh}"
 GUEST_PAYLOAD="${GUEST_PAYLOAD:-}"
 GUEST_PAYLOAD_DEST="${GUEST_PAYLOAD_DEST:-/root/guest-payload}"
+GUEST_PAYLOAD_ARGS="${GUEST_PAYLOAD_ARGS:-}"
 GUEST_GROUPS="${GUEST_GROUPS:-}"
 GUEST_CASES="${GUEST_CASES:-}"
 LOG_PARSER="$SCRIPT_DIR/parse-cargo-perf-log.py"
@@ -89,6 +90,10 @@ if [[ -n "$GUEST_PAYLOAD" ]]; then
     mkdir -p "$(dirname "$payload_path")"
     install -m 0755 "$GUEST_PAYLOAD" "$payload_path"
     echo "[cargo-perf-host] staged guest payload at $GUEST_PAYLOAD_DEST"
+fi
+if [[ -n "$GUEST_PAYLOAD_ARGS" ]]; then
+    printf '%s\n' "$GUEST_PAYLOAD_ARGS" > "$BENCH_ROOTFS/root/guest-payload-args"
+    echo "[cargo-perf-host] staged guest payload arguments"
 fi
 if [[ -n "$GUEST_GROUPS" ]]; then
     printf '%s\n' "$GUEST_GROUPS" > "$BENCH_ROOTFS/root/lmbench-groups"

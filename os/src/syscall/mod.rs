@@ -465,6 +465,8 @@ mod sync;
 mod thread;
 mod times;
 mod utils;
+#[cfg(feature = "syscalls_count")]
+pub(crate) mod syscalls_count;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
@@ -570,6 +572,9 @@ fn errno_name(errno: isize) -> &'static str {
 
 /// 系统调用分发入口：根据 `syscall_id` 将参数路由到具体 `sys_*` 实现。
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
+    #[cfg(feature = "syscalls_count")]
+    syscalls_count::record(syscall_id);
+
     let result = match syscall_id {
         SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as i32),
         SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0] as i32),

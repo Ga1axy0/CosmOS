@@ -31,6 +31,8 @@ use core::any::Any;
 #[cfg(feature = "io_perf_counters")]
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "io_perf_counters")]
+use core::sync::atomic::AtomicBool;
 pub use fs::vfs::{InodeTime, VfsDirEntry, VfsFileType};
 use fs::{
     dentry_cache_stats, errno::FS_ERRNO, inode_cache_stats, DentryCacheStats, Inode,
@@ -112,6 +114,26 @@ static NEWFSTATAT_LOOKUP_US: AtomicUsize = AtomicUsize::new(0);
 static NEWFSTATAT_INODE_STAT_US: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static NEWFSTATAT_COPYOUT_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "io_perf_counters")]
+static STATX_TIMED_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_EMPTY_PATH_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_TOTAL_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_COPYIN_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_RESOLVE_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_LOOKUP_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_INODE_STAT_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_CONVERT_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static STATX_COPYOUT_US: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 fn record_getdents_perf(bytes: usize, elapsed_us: usize) {
@@ -222,6 +244,61 @@ pub(crate) fn record_newfstatat_perf(
 }
 
 #[cfg(feature = "io_perf_counters")]
+pub(crate) fn statx_perf_enabled() -> bool {
+    STATX_TIMING_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+pub(crate) fn statx_perf_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn set_statx_perf_enabled(enabled: bool) {
+    STATX_TIMING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+pub(crate) fn set_statx_perf_enabled(_enabled: bool) {}
+
+#[cfg(feature = "io_perf_counters")]
+pub(crate) fn record_statx_perf(
+    empty_path: bool,
+    copyin_us: usize,
+    resolve_us: usize,
+    lookup_us: usize,
+    inode_stat_us: usize,
+    convert_us: usize,
+    copyout_us: usize,
+    total_us: usize,
+) {
+    STATX_TIMED_CALLS.fetch_add(1, Ordering::Relaxed);
+    if empty_path {
+        STATX_EMPTY_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    STATX_COPYIN_US.fetch_add(copyin_us, Ordering::Relaxed);
+    STATX_RESOLVE_US.fetch_add(resolve_us, Ordering::Relaxed);
+    STATX_LOOKUP_US.fetch_add(lookup_us, Ordering::Relaxed);
+    STATX_INODE_STAT_US.fetch_add(inode_stat_us, Ordering::Relaxed);
+    STATX_CONVERT_US.fetch_add(convert_us, Ordering::Relaxed);
+    STATX_COPYOUT_US.fetch_add(copyout_us, Ordering::Relaxed);
+    STATX_TOTAL_US.fetch_add(total_us, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "io_perf_counters"))]
+pub(crate) fn record_statx_perf(
+    _empty_path: bool,
+    _copyin_us: usize,
+    _resolve_us: usize,
+    _lookup_us: usize,
+    _inode_stat_us: usize,
+    _convert_us: usize,
+    _copyout_us: usize,
+    _total_us: usize,
+) {
+}
+
+#[cfg(feature = "io_perf_counters")]
 /// Reset filesystem metadata counters exported through `/proc/io_perf`.
 pub fn reset_perf_counters() {
     GETDENTS_CALLS.store(0, Ordering::Relaxed);
@@ -245,6 +322,15 @@ pub fn reset_perf_counters() {
     NEWFSTATAT_LOOKUP_US.store(0, Ordering::Relaxed);
     NEWFSTATAT_INODE_STAT_US.store(0, Ordering::Relaxed);
     NEWFSTATAT_COPYOUT_US.store(0, Ordering::Relaxed);
+    STATX_TIMED_CALLS.store(0, Ordering::Relaxed);
+    STATX_EMPTY_PATH_CALLS.store(0, Ordering::Relaxed);
+    STATX_TOTAL_US.store(0, Ordering::Relaxed);
+    STATX_COPYIN_US.store(0, Ordering::Relaxed);
+    STATX_RESOLVE_US.store(0, Ordering::Relaxed);
+    STATX_LOOKUP_US.store(0, Ordering::Relaxed);
+    STATX_INODE_STAT_US.store(0, Ordering::Relaxed);
+    STATX_CONVERT_US.store(0, Ordering::Relaxed);
+    STATX_COPYOUT_US.store(0, Ordering::Relaxed);
 }
 
 #[cfg(feature = "io_perf_counters")]
@@ -255,6 +341,7 @@ pub fn render_perf_counters() -> String {
     let lookup_calls = perf_load(&LOOKUP_INODE_FOLLOW_CALLS);
     let inode_stat_calls = perf_load(&INODE_STAT_CALLS);
     let newfstatat_calls = perf_load(&NEWFSTATAT_CALLS);
+    let statx_calls = perf_load(&STATX_TIMED_CALLS);
     let _ = writeln!(&mut out, "fs_meta:");
     let _ = writeln!(&mut out, "  getdents_calls {}", getdents_calls);
     let _ = writeln!(&mut out, "  getdents_bytes {}", perf_load(&GETDENTS_BYTES));
@@ -366,6 +453,37 @@ pub fn render_perf_counters() -> String {
             0
         } else {
             perf_load(&NEWFSTATAT_TOTAL_US).saturating_mul(100) / newfstatat_calls
+        }
+    );
+    let _ = writeln!(
+        &mut out,
+        "  statx_timing_enabled {}",
+        statx_perf_enabled() as usize
+    );
+    let _ = writeln!(&mut out, "  statx_timed_calls {}", statx_calls);
+    let _ = writeln!(
+        &mut out,
+        "  statx_empty_path_calls {}",
+        perf_load(&STATX_EMPTY_PATH_CALLS)
+    );
+    let _ = writeln!(&mut out, "  statx_total_us {}", perf_load(&STATX_TOTAL_US));
+    let _ = writeln!(&mut out, "  statx_copyin_us {}", perf_load(&STATX_COPYIN_US));
+    let _ = writeln!(&mut out, "  statx_resolve_us {}", perf_load(&STATX_RESOLVE_US));
+    let _ = writeln!(&mut out, "  statx_lookup_us {}", perf_load(&STATX_LOOKUP_US));
+    let _ = writeln!(
+        &mut out,
+        "  statx_inode_stat_us {}",
+        perf_load(&STATX_INODE_STAT_US)
+    );
+    let _ = writeln!(&mut out, "  statx_convert_us {}", perf_load(&STATX_CONVERT_US));
+    let _ = writeln!(&mut out, "  statx_copyout_us {}", perf_load(&STATX_COPYOUT_US));
+    let _ = writeln!(
+        &mut out,
+        "  avg_statx_us_x100 {}",
+        if statx_calls == 0 {
+            0
+        } else {
+            perf_load(&STATX_TOTAL_US).saturating_mul(100) / statx_calls
         }
     );
     out

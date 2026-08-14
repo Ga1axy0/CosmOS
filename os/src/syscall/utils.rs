@@ -58,10 +58,20 @@ fn translated_byte_buffer_fast(
     len: usize,
     access: PageFaultAccess,
 ) -> Option<Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+
     let start = ptr as usize;
     let end = checked_user_buffer_end(ptr, len)?;
     let page_table = PageTable::from_token(token);
     let mut page_start = start & !(PAGE_SIZE - 1);
+    let span = end - page_start;
+    let page_count = span / PAGE_SIZE + usize::from(span % PAGE_SIZE != 0);
+    // Avoid turning a large user-supplied length into an equally large eager
+    // kernel allocation.  Common small buffers still get their capacity
+    // reserved up front; larger ranges grow only as mapped pages are found.
+    let mut buffers = Vec::with_capacity(page_count.min(16));
 
     while page_start < end {
         let vpn = VirtAddr::from(page_start).floor();
@@ -69,10 +79,53 @@ fn translated_byte_buffer_fast(
         if !pte_allows_user_access(pte, access) {
             return None;
         }
-        page_start = page_start.checked_add(PAGE_SIZE)?;
+
+        let page_end = page_start.checked_add(PAGE_SIZE)?;
+        let chunk_start = start.max(page_start);
+        let chunk_end = end.min(page_end);
+        let page_offset = chunk_start - page_start;
+        let chunk_len = chunk_end - chunk_start;
+        let page = pte.ppn().get_bytes_array();
+        buffers.push(&mut page[page_offset..page_offset + chunk_len]);
+        page_start = page_end;
     }
 
-    translated_byte_buffer(token, ptr, len)
+    Some(buffers)
+}
+
+/// Translate a user buffer that is entirely contained in one page.
+///
+/// Most syscall metadata buffers are small and single-page, so keep this
+/// common case to one page-table lookup and one slice construction.  Missing
+/// mappings, insufficient permissions, and cross-page buffers deliberately
+/// fall back to the existing fault-in/retry path.
+fn translated_single_page_fast(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: PageFaultAccess,
+) -> Option<&'static mut [u8]> {
+    if len == 0 {
+        return None;
+    }
+
+    checked_user_buffer_end(ptr, len)?;
+    let start = ptr as usize;
+    let page_offset = start & (PAGE_SIZE - 1);
+    if page_offset.checked_add(len)? > PAGE_SIZE {
+        return None;
+    }
+
+    let page_table = PageTable::from_token(token);
+    let vpn = VirtAddr::from(start & !(PAGE_SIZE - 1)).floor();
+    let pte = page_table.translate(vpn)?;
+    if !pte_allows_user_access(pte, access) {
+        return None;
+    }
+
+    let ppn = pte.ppn();
+    let page = ppn.get_bytes_array();
+    Some(&mut page[page_offset..page_offset + len])
 }
 
 /// 尝试为一段用户虚拟地址触发并完成缺页装入，使后续字节翻译可成功。
@@ -193,6 +246,19 @@ pub fn translated_process_byte_buffer_with_access(
 
 /// 将一段字节序列写回到用户地址空间。
 pub fn write_bytes_to_user(ptr: *mut u8, src: &[u8]) -> Result<(), ERRNO> {
+    if !src.is_empty() {
+        let token = current_user_token();
+        if let Some(buffer) = translated_single_page_fast(
+            token,
+            ptr as *const u8,
+            src.len(),
+            PageFaultAccess::Write,
+        ) {
+            buffer.copy_from_slice(src);
+            return Ok(());
+        }
+    }
+
     let mut buffers =
         translated_byte_buffer_with_access(ptr as *const u8, src.len(), PageFaultAccess::Write)?;
     let mut copied = 0usize;
@@ -277,6 +343,7 @@ pub fn read_cstring_from_user(ptr: *const u8, max_len: usize) -> Result<String, 
         return Err(ERRNO::ENAMETOOLONG);
     }
     let mut out = String::new();
+    let token = current_user_token();
     let mut offset = 0usize;
     while offset < max_len {
         // Translate one page-sized run at a time instead of one byte at a
@@ -286,18 +353,29 @@ pub fn read_cstring_from_user(ptr: *const u8, max_len: usize) -> Result<String, 
         let cur = unsafe { ptr.add(offset) };
         let page_remain = PAGE_SIZE - ((cur as usize) & (PAGE_SIZE - 1));
         let chunk_len = (max_len - offset).min(page_remain);
-        let buffers = translated_byte_buffer_with_access(cur, chunk_len, PageFaultAccess::Read)?;
-        let mut nul_found = false;
-        for chunk in buffers {
+        if let Some(chunk) =
+            translated_single_page_fast(token, cur, chunk_len, PageFaultAccess::Read)
+        {
             if let Some(nul_idx) = chunk.iter().position(|&byte| byte == 0) {
                 out.extend(chunk[..nul_idx].iter().copied().map(|byte| byte as char));
-                nul_found = true;
-                break;
+                return Ok(out);
             }
             out.extend(chunk.iter().copied().map(|byte| byte as char));
-        }
-        if nul_found {
-            return Ok(out);
+        } else {
+            let buffers =
+                translated_byte_buffer_with_access(cur, chunk_len, PageFaultAccess::Read)?;
+            let mut nul_found = false;
+            for chunk in buffers {
+                if let Some(nul_idx) = chunk.iter().position(|&byte| byte == 0) {
+                    out.extend(chunk[..nul_idx].iter().copied().map(|byte| byte as char));
+                    nul_found = true;
+                    break;
+                }
+                out.extend(chunk.iter().copied().map(|byte| byte as char));
+            }
+            if nul_found {
+                return Ok(out);
+            }
         }
         offset += chunk_len;
     }
@@ -306,10 +384,24 @@ pub fn read_cstring_from_user(ptr: *const u8, max_len: usize) -> Result<String, 
 
 /// 从用户地址空间读取一个 POD 结构，允许结构体跨越多个用户页。
 pub fn read_pod_from_user<T: Pod>(ptr: *const T) -> Result<T, ERRNO> {
-    let bytes = read_bytes_from_user(ptr as *const u8, size_of::<T>())?;
     let mut value = MaybeUninit::<T>::uninit();
     let value_bytes =
         unsafe { slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
+
+    if size_of::<T>() != 0 {
+        let token = current_user_token();
+        if let Some(bytes) = translated_single_page_fast(
+            token,
+            ptr as *const u8,
+            size_of::<T>(),
+            PageFaultAccess::Read,
+        ) {
+            value_bytes.copy_from_slice(bytes);
+            return Ok(unsafe { value.assume_init() });
+        }
+    }
+
+    let bytes = read_bytes_from_user(ptr as *const u8, size_of::<T>())?;
     value_bytes.copy_from_slice(&bytes);
     Ok(unsafe { value.assume_init() })
 }

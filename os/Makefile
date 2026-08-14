@@ -13,6 +13,12 @@ endif
 ifeq ($(COSMOS_MEMINFO),1)
 EXTRA_FEATURES += --features cosmos-meminfo
 endif
+ifeq ($(SYSCALLS_COUNT),1)
+EXTRA_FEATURES += --features syscalls_count
+endif
+ifeq ($(IO_PERF_COUNTERS),1)
+EXTRA_FEATURES += --features io_perf_counters
+endif
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 

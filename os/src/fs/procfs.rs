@@ -4,6 +4,8 @@
 //! - `/proc/meminfo` — standard memory statistics.
 //! - `/proc/uptime` — seconds since boot and aggregate idle time.
 //! - `/proc/cosmos_meminfo` — xxOS memory and performance counters.
+//! - `/proc/statx_perf_enable` — toggles low-overhead `statx(2)` phase timing.
+//! - `/proc/syscalls_count` — per-system-call invocation counters.
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.
@@ -38,6 +40,8 @@ use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
 use crate::net;
 #[cfg(feature = "perf_probe")]
 use crate::perf_probe;
+#[cfg(feature = "syscalls_count")]
+use crate::syscall::syscalls_count;
 #[cfg(feature = "mm_perf_counters")]
 use crate::perf_sampler;
 #[cfg(feature = "io_perf_counters")]
@@ -944,6 +948,10 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("partitions"), VfsFileType::Regular));
         #[cfg(feature = "io_perf_counters")]
         entries.push((String::from("io_perf"), VfsFileType::Regular));
+        #[cfg(feature = "io_perf_counters")]
+        entries.push((String::from("statx_perf_enable"), VfsFileType::Regular));
+        #[cfg(feature = "syscalls_count")]
+        entries.push((String::from("syscalls_count"), VfsFileType::Regular));
         #[cfg(feature = "net_perf_counters")]
         entries.push((String::from("net_perf"), VfsFileType::Regular));
         #[cfg(feature = "perf_probe")]
@@ -973,6 +981,12 @@ impl VfsNode for ProcRootNode {
             "partitions" => Some(Arc::new(ProcPartitionsNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "io_perf_counters")]
             "io_perf" => Some(Arc::new(ProcIoPerfNode::new()) as Arc<dyn VfsNode>),
+            #[cfg(feature = "io_perf_counters")]
+            "statx_perf_enable" => {
+                Some(Arc::new(ProcStatxPerfEnableNode::new()) as Arc<dyn VfsNode>)
+            }
+            #[cfg(feature = "syscalls_count")]
+            "syscalls_count" => Some(Arc::new(ProcSyscallsCountNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "net_perf_counters")]
             "net_perf" => Some(Arc::new(ProcNetPerfNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "perf_probe")]
@@ -2105,6 +2119,163 @@ impl VfsNode for ProcIoPerfNode {
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
         reset_io_perf();
+        buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/statx_perf_enable` node.
+///
+/// The phase timers are intentionally dynamic.  Keeping them disabled during
+/// latency runs avoids adding several timer reads to every `statx` call; a
+/// profiling run can enable them immediately before its measured workload.
+#[derive(Default, Debug)]
+#[cfg(feature = "io_perf_counters")]
+pub struct ProcStatxPerfEnableNode;
+
+#[cfg(feature = "io_perf_counters")]
+impl ProcStatxPerfEnableNode {
+    /// Create a new `/proc/statx_perf_enable` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "io_perf_counters")]
+impl VfsNode for ProcStatxPerfEnableNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        2
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        crate::fs::set_statx_perf_enabled(false);
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let value = if crate::fs::statx_perf_enabled() {
+            "1\n"
+        } else {
+            "0\n"
+        };
+        read_string_at(String::from(value), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let Ok(text) = core::str::from_utf8(buf) else {
+            return buf.len();
+        };
+        match text.trim() {
+            "0" => crate::fs::set_statx_perf_enabled(false),
+            "1" => crate::fs::set_statx_perf_enabled(true),
+            _ => {}
+        }
+        buf.len()
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/syscalls_count` node.
+#[derive(Default, Debug)]
+#[cfg(feature = "syscalls_count")]
+pub struct ProcSyscallsCountNode;
+
+#[cfg(feature = "syscalls_count")]
+impl ProcSyscallsCountNode {
+    /// Create a new `/proc/syscalls_count` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "syscalls_count")]
+impl VfsNode for ProcSyscallsCountNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        syscalls_count::render().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        syscalls_count::reset();
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        syscalls_count::reset();
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(syscalls_count::render(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        syscalls_count::reset();
         buf.len()
     }
 
