@@ -44,6 +44,11 @@ pub fn continue_storage_boot() -> bool {
 pub fn probe_platform_devices() {
     #[cfg(feature = "platform-ls2k1000-nebula")]
     {
+        if let Some(irq) = crate::drivers::net::probe_loongson_gmac() {
+            if !irq::enable_device_irq(irq) {
+                warn!("[kernel] LS2K1000 GMAC IRQ {} could not be routed", irq);
+            }
+        }
         if crate::bootinfo::get().ahci().is_some() {
             crate::drivers::block::probe_ahci();
             return;

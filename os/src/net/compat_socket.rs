@@ -21,8 +21,12 @@ const ARPOP_REQUEST: u16 = 1;
 const ARPOP_REPLY: u16 = 2;
 const AF_PACKET_FAMILY: u16 = 17;
 const PACKET_HOST: u8 = 0;
+const SIOCGIFCONF: usize = 0x8912;
 const SIOCGIFFLAGS: usize = 0x8913;
 const SIOCSIFFLAGS: usize = 0x8914;
+const SIOCGIFADDR: usize = 0x8915;
+const SIOCGIFBRDADDR: usize = 0x8919;
+const SIOCGIFNETMASK: usize = 0x891b;
 const SIOCGIFNAME: usize = 0x8910;
 const SIOCGIFINDEX: usize = 0x8933;
 const SIOCGIFMTU: usize = 0x8921;
@@ -52,6 +56,7 @@ const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
 const VETH_INFO_PEER: u16 = 1;
 const AF_INET: u8 = 2;
+const AF_INET_NATIVE: u16 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -458,10 +463,69 @@ fn build_arp_ipv4_reply(
     out
 }
 
+fn write_ifreq_sockaddr_ipv4(ifreq: &mut [u8], address: [u8; 4]) {
+    ifreq[IFNAMSIZ..].fill(0);
+    ifreq[IFNAMSIZ..IFNAMSIZ + 2].copy_from_slice(&AF_INET_NATIVE.to_ne_bytes());
+    // `struct sockaddr_in`: family(2), port(2), address(4).
+    ifreq[IFNAMSIZ + 4..IFNAMSIZ + 8].copy_from_slice(&address);
+}
+
+fn prefix_netmask(prefix: u8) -> [u8; 4] {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix.min(32))
+    };
+    mask.to_be_bytes()
+}
+
+fn compat_ifconf(arg: usize) -> Result<isize, ERRNO> {
+    const IFCONF_SIZE: usize = 16;
+    let raw = copy_user_bytes(arg as *const u8, IFCONF_SIZE)?;
+    let mut len_raw = [0u8; 4];
+    len_raw.copy_from_slice(&raw[..4]);
+    let capacity = i32::from_ne_bytes(len_raw).max(0) as usize;
+    let mut ptr_raw = [0u8; size_of::<usize>()];
+    ptr_raw.copy_from_slice(&raw[8..8 + size_of::<usize>()]);
+    let request_ptr = usize::from_ne_bytes(ptr_raw);
+
+    let ifaces = compat::list_ifaces();
+    let required = ifaces.len().saturating_mul(IFREQ_SIZE);
+    let copied = if request_ptr == 0 {
+        0
+    } else {
+        let count = ifaces.len().min(capacity / IFREQ_SIZE);
+        let mut records = Vec::with_capacity(count * IFREQ_SIZE);
+        for iface in ifaces.into_iter().take(count) {
+            let mut ifreq = [0u8; IFREQ_SIZE];
+            let name_len = iface
+                .name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(IFNAMSIZ)
+                .min(IFNAMSIZ);
+            ifreq[..name_len].copy_from_slice(&iface.name[..name_len]);
+            write_ifreq_sockaddr_ipv4(&mut ifreq, iface.ipv4);
+            records.extend_from_slice(&ifreq);
+        }
+        crate::syscall::write_bytes_to_user(request_ptr as *mut u8, &records)?;
+        records.len()
+    };
+
+    let reported = if request_ptr == 0 { required } else { copied };
+    let mut updated = raw;
+    updated[..4].copy_from_slice(&(reported.min(i32::MAX as usize) as i32).to_ne_bytes());
+    crate::syscall::write_bytes_to_user(arg as *mut u8, &updated)?;
+    Ok(0)
+}
+
 pub(crate) fn compat_ifreq_ioctl(req: usize, arg: usize) -> Result<isize, ERRNO> {
     let ptr = arg as *mut u8;
     if ptr.is_null() {
         return Err(ERRNO::EFAULT);
+    }
+    if req == SIOCGIFCONF {
+        return compat_ifconf(arg);
     }
     let mut ifreq = copy_user_bytes(ptr as *const u8, IFREQ_SIZE)?;
     match req {
@@ -485,6 +549,29 @@ pub(crate) fn compat_ifreq_ioctl(req: usize, arg: usize) -> Result<isize, ERRNO>
             let iface = compat::get_iface_info(name).ok_or(ERRNO::ENODEV)?;
             let flags = if iface.up != 0 { IFF_UP as u16 } else { 0 };
             ifreq[IFNAMSIZ..IFNAMSIZ + 2].copy_from_slice(&flags.to_ne_bytes());
+        }
+        SIOCGIFADDR => {
+            let name = c_name(&ifreq[..IFNAMSIZ]);
+            let iface = compat::get_iface_info(name).ok_or(ERRNO::ENODEV)?;
+            if iface.has_ipv4 == 0 {
+                return Err(ERRNO::EADDRNOTAVAIL);
+            }
+            write_ifreq_sockaddr_ipv4(&mut ifreq, iface.ipv4);
+        }
+        SIOCGIFBRDADDR => {
+            let name = c_name(&ifreq[..IFNAMSIZ]);
+            let iface = compat::get_iface_info(name).ok_or(ERRNO::ENODEV)?;
+            if iface.has_ipv4 == 0 {
+                return Err(ERRNO::EADDRNOTAVAIL);
+            }
+            let mask = prefix_netmask(iface.prefix);
+            let broadcast = core::array::from_fn(|index| iface.ipv4[index] | !mask[index]);
+            write_ifreq_sockaddr_ipv4(&mut ifreq, broadcast);
+        }
+        SIOCGIFNETMASK => {
+            let name = c_name(&ifreq[..IFNAMSIZ]);
+            let iface = compat::get_iface_info(name).ok_or(ERRNO::ENODEV)?;
+            write_ifreq_sockaddr_ipv4(&mut ifreq, prefix_netmask(iface.prefix));
         }
         SIOCSIFFLAGS => {
             let name = c_name(&ifreq[..IFNAMSIZ]).to_string();

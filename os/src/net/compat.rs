@@ -120,6 +120,14 @@ pub(crate) fn set_eth0_mac(mac: [u8; 6]) {
     }
 }
 
+pub(crate) fn set_eth0_ipv4(ipv4: Option<([u8; 4], u8)>) {
+    let mut state = COMPAT_NET_STATE.lock();
+    if let Some(iface) = state.ifaces.iter_mut().find(|iface| iface.name == "eth0") {
+        iface.ipv4 = ipv4.map(|(address, _)| address);
+        iface.prefix = ipv4.map(|(_, prefix)| prefix).unwrap_or(0);
+    }
+}
+
 pub(crate) fn list_ifaces() -> Vec<CompatNetIfInfo> {
     COMPAT_NET_STATE
         .lock()

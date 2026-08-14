@@ -36,8 +36,12 @@ const ECFG_SIP: usize = 1 << 1;
 const ECFG_HWI0: usize = 1 << 2;
 const ECFG_TIMER: usize = 1 << 11;
 const ECFG_IPI: usize = 1 << 12;
+// LS2K1000's LIOINTC cascades through CPU INT0/HWI0 by default.
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const ECFG_EXTERNAL: usize = ECFG_HWI0;
 // QEMU `virt` routes EXTIOI sources to CPU IP3, which is exposed in
 // ESTAT/ECFG as HWI3 (interrupt number 5, bit 5).
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const ECFG_EXTERNAL: usize = ECFG_HWI0 << 3;
 
 const ECODE_INT: usize = 0x0;

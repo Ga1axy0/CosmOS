@@ -70,7 +70,7 @@ pub fn probe_platform_devices() {
                     info!("[pci] virtio-blk {} at {} irq {:?}", name, bdf, irq);
                     map.insert(name, dev.clone());
                     if let Some(irq) = irq {
-                        if super::irq::enable_pch_irq(irq) {
+                        if super::irq::enable_device_irq(irq) {
                             irq_map.insert(irq, dev);
                         }
                     }
@@ -98,8 +98,8 @@ pub fn probe_platform_devices() {
                         mac[4],
                         mac[5]
                     );
-                    super::irq::enable_pch_irq(irq);
-                    net::register_device(Arc::new(dev));
+                    super::irq::enable_device_irq(irq);
+                    net::register_device(dev);
                 }
                 other => {
                     warn!(

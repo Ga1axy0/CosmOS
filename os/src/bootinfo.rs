@@ -40,6 +40,25 @@ pub struct DeviceResource {
     pub irq: Option<u32>,
 }
 
+/// One firmware-described DesignWare GMAC controller.
+#[derive(Clone, Copy, Debug)]
+pub struct GmacResource {
+    device: DeviceResource,
+    mac_address: Option<[u8; 6]>,
+}
+
+impl GmacResource {
+    /// Return the controller register and interrupt resource.
+    pub fn device(self) -> DeviceResource {
+        self.device
+    }
+
+    /// Return the firmware-provided station address, when valid.
+    pub fn mac_address(self) -> Option<[u8; 6]> {
+        self.mac_address
+    }
+}
+
 impl DeviceResource {
     const fn empty() -> Self {
         Self {
@@ -125,6 +144,7 @@ pub struct BootInfo {
     eiointc: Option<DeviceResource>,
     pci_host: Option<PciHostResource>,
     ahci: Option<DeviceResource>,
+    gmac: Option<GmacResource>,
     virtio_mmio: [DeviceResource; MAX_VIRTIO_MMIO_DEVICES],
     virtio_mmio_count: usize,
     mmio_regions: [PhysMemoryRegion; MAX_MMIO_REGIONS],
@@ -152,6 +172,7 @@ impl BootInfo {
             eiointc: None,
             pci_host: None,
             ahci: None,
+            gmac: None,
             virtio_mmio: [DeviceResource::empty(); MAX_VIRTIO_MMIO_DEVICES],
             virtio_mmio_count: 0,
             mmio_regions: [PhysMemoryRegion::empty(); MAX_MMIO_REGIONS],
@@ -314,6 +335,11 @@ impl BootInfo {
     /// Return the firmware-described AHCI controller resource.
     pub fn ahci(&self) -> Option<DeviceResource> {
         self.ahci
+    }
+
+    /// Return the first enabled DesignWare GMAC controller.
+    pub fn gmac(&self) -> Option<GmacResource> {
+        self.gmac
     }
 
     /// Return all enabled VirtIO-MMIO transports.
@@ -582,9 +608,8 @@ fn uboot_bootelf_fdt_source() -> Option<FdtSource> {
 
     let argv = early_loongarch_addr(args.arg1)?;
     for index in 0..args.arg0 {
-        let argument = unsafe {
-            ptr::read_volatile((argv + index * size_of::<usize>()) as *const usize)
-        };
+        let argument =
+            unsafe { ptr::read_volatile((argv + index * size_of::<usize>()) as *const usize) };
         let Some(argument) = early_loongarch_addr(argument) else {
             continue;
         };
@@ -795,6 +820,7 @@ struct NodeState {
     is_eiointc: bool,
     is_pci_host: bool,
     is_ahci: bool,
+    is_gmac: bool,
     address_cells: usize,
     size_cells: usize,
     child_address_cells: usize,
@@ -805,6 +831,8 @@ struct NodeState {
     phandle: u32,
     clock_phandle: u32,
     irq: Option<u32>,
+    mac_address: [u8; 6],
+    has_mac_address: bool,
     bus_start: u8,
     bus_end: u8,
     ranges_ptr: usize,
@@ -835,6 +863,7 @@ impl NodeState {
             is_eiointc: false,
             is_pci_host: false,
             is_ahci: false,
+            is_gmac: false,
             address_cells: parent.child_address_cells.max(1),
             size_cells: parent.child_size_cells.max(1),
             child_address_cells: 2,
@@ -845,6 +874,8 @@ impl NodeState {
             phandle: 0,
             clock_phandle: 0,
             irq: None,
+            mac_address: [0; 6],
+            has_mac_address: false,
             bus_start: 0,
             bus_end: 0,
             ranges_ptr: 0,
@@ -885,6 +916,9 @@ impl NodeState {
                     || compatible_contains(value, b"loongson,2k1000-ahci")
                     || compatible_contains(value, b"generic-ahci")
                     || compatible_contains(value, b"snps,dwc-ahci");
+                self.is_gmac = compatible_contains(value, b"snps,dwmac-3.70a")
+                    || compatible_contains(value, b"snps,arc-dwmac-3.70a")
+                    || compatible_contains(value, b"ls,ls-gmac");
             }
             b"timebase-frequency" => {
                 self.timebase_frequency = read_cells_usize(value, 1).unwrap_or(0)
@@ -897,6 +931,14 @@ impl NodeState {
                 self.clock_phandle = read_be_u32(&value[..4]).unwrap_or(0)
             }
             b"interrupts" if value.len() >= 4 => self.irq = read_be_u32(&value[..4]),
+            b"local-mac-address" | b"mac-address" if value.len() >= 6 => {
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(&value[..6]);
+                if valid_unicast_mac(mac) {
+                    self.mac_address = mac;
+                    self.has_mac_address = true;
+                }
+            }
             b"bus-range" if value.len() >= 8 => {
                 self.bus_start = read_be_u32(&value[..4]).unwrap_or(0) as u8;
                 self.bus_end = read_be_u32(&value[4..8]).unwrap_or(0) as u8;
@@ -986,6 +1028,12 @@ impl NodeState {
         } else if self.is_ahci && info.ahci.is_none() {
             info.ahci = Some(resource);
             info.push_mmio_region(resource);
+        } else if self.is_gmac && info.gmac.is_none() {
+            info.gmac = Some(GmacResource {
+                device: resource,
+                mac_address: self.has_mac_address.then_some(self.mac_address),
+            });
+            info.push_mmio_region(resource);
         }
     }
 
@@ -1048,6 +1096,10 @@ impl NodeState {
             value = &value[ROW_BYTES..];
         }
     }
+}
+
+fn valid_unicast_mac(mac: [u8; 6]) -> bool {
+    mac != [0; 6] && mac != [0xff; 6] && mac[0] & 1 == 0
 }
 
 fn compatible_contains(mut value: &[u8], needle: &[u8]) -> bool {

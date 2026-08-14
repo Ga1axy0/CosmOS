@@ -27,7 +27,7 @@ use lazy_static::lazy_static;
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken},
-    socket::{tcp as tcp_socket, udp as udp_socket},
+    socket::{dhcpv4 as dhcp_socket, tcp as tcp_socket, udp as udp_socket},
     time::Instant,
     wire::{
         EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
@@ -98,6 +98,27 @@ const IPV6_LOOPBACK_SOLICITED_NODE: [u8; 16] = [
 // Kernel UDP echo feature (for quick network stack testing).
 const ENABLE_KERNEL_UDP_ECHO: bool = true;
 const KERNEL_UDP_ECHO_PORT: u16 = 5555;
+
+#[derive(Clone, Copy)]
+struct ExternalIpv4Config {
+    address: Ipv4Address,
+    prefix: u8,
+    gateway: Option<Ipv4Address>,
+}
+
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
+fn external_ipv4_config() -> Option<ExternalIpv4Config> {
+    Some(ExternalIpv4Config {
+        address: Ipv4Address::new(10, 0, 2, 15),
+        prefix: 24,
+        gateway: Some(Ipv4Address::new(10, 0, 2, 2)),
+    })
+}
+
+#[cfg(feature = "platform-ls2k1000-nebula")]
+fn external_ipv4_config() -> Option<ExternalIpv4Config> {
+    None
+}
 
 lazy_static! {
     /// Global network stack instance.
@@ -514,11 +535,13 @@ pub struct SockAddrIn {
     pub sin_zero: [u8; 8],
 }
 
-/// Initialize the network stack if a VirtIO network device is present.
+/// Initialize the network stack if a physical network device is present.
 pub fn init() {
     let dev = drivers::net::with_device(Arc::clone);
     let Some(dev) = dev else {
-        info!("[kernel] net: no virtio-net device, skip stack init");
+        #[cfg(feature = "platform-ls2k1000-nebula")]
+        println!("[net] no physical Ethernet device; smoltcp disabled");
+        info!("[kernel] net: no Ethernet device, skip stack init");
         return;
     };
 
@@ -591,13 +614,16 @@ pub(crate) struct NetStack {
     pub(crate) udp_states: Vec<Arc<UdpSocketState>>,
     pub(crate) tcp_states: Vec<Arc<TcpSocketState>>,
     pub(crate) echo_udp: Option<smoltcp::iface::SocketHandle>,
+    dhcp: Option<smoltcp::iface::SocketHandle>,
     next_ephemeral_port: u16,
 }
 
 impl NetStack {
-    fn new(dev: Arc<drivers::net::VirtIONetDevice>) -> Self {
+    fn new(dev: Arc<drivers::net::NetworkDevice>) -> Self {
         let mac = dev.mac_address();
         compat::set_eth0_mac(mac);
+        let external = external_ipv4_config();
+        compat::set_eth0_ipv4(external.map(|config| (config.address.octets(), config.prefix)));
         let eth = EthernetAddress(mac);
 
         let mut device = MultiDevice::new(dev);
@@ -611,13 +637,14 @@ impl NetStack {
         iface.update_ip_addrs(|addrs| {
             addrs.clear();
 
-            // External network (QEMU user networking)
-            addrs
-                .push(IpCidr::new(
-                    IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)),
-                    24,
-                ))
-                .expect("failed to configure external IPv4 address");
+            if let Some(external) = external {
+                addrs
+                    .push(IpCidr::new(
+                        IpAddress::Ipv4(external.address),
+                        external.prefix,
+                    ))
+                    .expect("failed to configure external IPv4 address");
+            }
 
             // IPv4 loopback
             addrs
@@ -632,9 +659,9 @@ impl NetStack {
                 .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128))
                 .expect("failed to configure IPv6 loopback address");
         });
-        let _ = iface
-            .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+        if let Some(gateway) = external.and_then(|config| config.gateway) {
+            let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+        }
         info!("[kernel] net: iface addresses = {:?}", iface.ip_addrs());
 
         let storage_vec: Vec<smoltcp::iface::SocketStorage<'static>> = (0..MAX_SOCKETS)
@@ -642,6 +669,14 @@ impl NetStack {
             .collect();
         let storage = Box::leak(storage_vec.into_boxed_slice());
         let sockets = SocketSet::new(storage);
+        #[cfg(feature = "platform-ls2k1000-nebula")]
+        let (sockets, dhcp) = {
+            let mut sockets = sockets;
+            let dhcp = sockets.add(dhcp_socket::Socket::new());
+            (sockets, Some(dhcp))
+        };
+        #[cfg(not(feature = "platform-ls2k1000-nebula"))]
+        let dhcp = None;
 
         let mut stack = Self {
             device,
@@ -650,8 +685,12 @@ impl NetStack {
             udp_states: Vec::new(),
             tcp_states: Vec::new(),
             echo_udp: None,
+            dhcp,
             next_ephemeral_port: EPHEMERAL_PORT_START,
         };
+
+        #[cfg(feature = "platform-ls2k1000-nebula")]
+        println!("[net] DHCPv4 client enabled on LS2K1000 GMAC");
 
         // Optionally create a kernel UDP echo socket bound to the configured port.
         if ENABLE_KERNEL_UDP_ECHO {
@@ -775,6 +814,8 @@ impl NetStack {
             self.device.loopback.queue.len()
         );
 
+        self.poll_dhcp();
+
         for st in self.udp_states.iter() {
             let mut ready = 0u16;
             {
@@ -886,6 +927,67 @@ impl NetStack {
         }
 
         self.refresh_poll_deadline(ts);
+    }
+
+    fn poll_dhcp(&mut self) {
+        let Some(handle) = self.dhcp else {
+            return;
+        };
+
+        let update = {
+            let socket = self.sockets.get_mut::<dhcp_socket::Socket>(handle);
+            match socket.poll() {
+                None => None,
+                Some(dhcp_socket::Event::Configured(config)) => {
+                    Some((Some(config.address), config.router))
+                }
+                Some(dhcp_socket::Event::Deconfigured) => Some((None, None)),
+            }
+        };
+        let Some((address, gateway)) = update else {
+            return;
+        };
+
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            if let Some(address) = address {
+                addrs
+                    .push(IpCidr::Ipv4(address))
+                    .expect("failed to configure DHCP IPv4 address");
+            }
+            addrs
+                .push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+                    8,
+                ))
+                .expect("failed to configure IPv4 loopback address");
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128))
+                .expect("failed to configure IPv6 loopback address");
+        });
+
+        match gateway {
+            Some(gateway) => {
+                let _ = self.iface.routes_mut().add_default_ipv4_route(gateway);
+            }
+            None => {
+                self.iface.routes_mut().remove_default_ipv4_route();
+            }
+        }
+
+        match address {
+            Some(address) => {
+                compat::set_eth0_ipv4(Some((address.address().octets(), address.prefix_len())));
+                info!(
+                    "[kernel] net: DHCP configured address={} gateway={:?}",
+                    address, gateway
+                );
+            }
+            None => {
+                compat::set_eth0_ipv4(None);
+                warn!("[kernel] net: DHCP lease lost; IPv4 configuration removed");
+            }
+        }
     }
 
     fn refresh_poll_deadline(&mut self, ts: Instant) {
@@ -1061,7 +1163,7 @@ struct MultiDevice {
 }
 
 impl MultiDevice {
-    fn new(virtio_dev: Arc<drivers::net::VirtIONetDevice>) -> Self {
+    fn new(virtio_dev: Arc<drivers::net::NetworkDevice>) -> Self {
         Self {
             virtio: VirtioSmoltcpDevice::new(virtio_dev),
             loopback: loopback::Loopback::new(Medium::Ethernet),
@@ -1229,19 +1331,13 @@ impl<'a> TxToken for MultiTxToken<'a> {
             );
         } else {
             // Send to VirtIO using the standard path
-            match self.virtio.dev.try_send(&buf) {
-                Ok(true) => {
-                    #[cfg(feature = "net_perf_counters")]
-                    perf_inc(&PERF_VIRTIO_TX_FRAMES);
-                    #[cfg(feature = "net_perf_counters")]
-                    perf_add(&PERF_VIRTIO_TX_BYTES, len);
-                }
-                Ok(false) => {
-                    trace!("net: tx queue busy, drop one frame");
-                }
-                Err(e) => {
-                    warn!("net: try_send failed: {:?}", e);
-                }
+            if self.virtio.dev.try_send(&buf) {
+                #[cfg(feature = "net_perf_counters")]
+                perf_inc(&PERF_VIRTIO_TX_FRAMES);
+                #[cfg(feature = "net_perf_counters")]
+                perf_add(&PERF_VIRTIO_TX_BYTES, len);
+            } else {
+                trace!("net: tx queue busy, drop one frame");
             }
         }
 
@@ -1251,13 +1347,13 @@ impl<'a> TxToken for MultiTxToken<'a> {
 }
 
 struct VirtioSmoltcpDevice {
-    dev: Arc<drivers::net::VirtIONetDevice>,
+    dev: Arc<drivers::net::NetworkDevice>,
     caps: DeviceCapabilities,
     mac: [u8; 6],
 }
 
 impl VirtioSmoltcpDevice {
-    fn new(dev: Arc<drivers::net::VirtIONetDevice>) -> Self {
+    fn new(dev: Arc<drivers::net::NetworkDevice>) -> Self {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1500;
@@ -1320,7 +1416,7 @@ impl RxToken for VirtioRxToken {
 }
 
 struct VirtioTxToken {
-    dev: Arc<drivers::net::VirtIONetDevice>,
+    dev: Arc<drivers::net::NetworkDevice>,
 }
 
 impl TxToken for VirtioTxToken {
@@ -1331,19 +1427,13 @@ impl TxToken for VirtioTxToken {
         let mut buf = vec![0u8; len];
         let ret = f(&mut buf);
 
-        match self.dev.try_send(&buf) {
-            Ok(true) => {
-                #[cfg(feature = "net_perf_counters")]
-                perf_inc(&PERF_VIRTIO_TX_FRAMES);
-                #[cfg(feature = "net_perf_counters")]
-                perf_add(&PERF_VIRTIO_TX_BYTES, len);
-            }
-            Ok(false) => {
-                trace!("net: tx queue busy, drop one frame");
-            }
-            Err(e) => {
-                warn!("net: try_send failed: {:?}", e);
-            }
+        if self.dev.try_send(&buf) {
+            #[cfg(feature = "net_perf_counters")]
+            perf_inc(&PERF_VIRTIO_TX_FRAMES);
+            #[cfg(feature = "net_perf_counters")]
+            perf_add(&PERF_VIRTIO_TX_BYTES, len);
+        } else {
+            trace!("net: tx queue busy, drop one frame");
         }
         NEED_POLL.store(true, Ordering::Release);
         ret
