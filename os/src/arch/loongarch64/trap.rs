@@ -4,7 +4,7 @@ use core::arch::{asm, global_asm};
 
 use crate::hal::traits::{
     CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
-    TrapMachine,
+    TrapMachine, UnalignedEmulationOutcome,
 };
 use crate::mm::PageFaultAccess;
 use crate::signal::{SigSetT, SignalAbi, SignalAction, SignalBit, StackT};
@@ -536,7 +536,7 @@ impl TrapMachine for LoongArchTrapMachine {
                 ESUBCODE_ADEM => TrapCause::DataAddressFault,
                 _ => TrapCause::Unknown,
             },
-            ECODE_ALE => TrapCause::DataAddressFault,
+            ECODE_ALE => TrapCause::AddressAlignmentFault,
             ECODE_INT => decode_interrupt_cause(estat, ecfg),
             _ => TrapCause::Unknown,
         };
@@ -559,6 +559,10 @@ impl TrapMachine for LoongArchTrapMachine {
             cause,
             fault_addr: badv,
         }
+    }
+
+    fn emulate_user_unaligned(fault_addr: usize) -> UnalignedEmulationOutcome {
+        super::unaligned::emulate_current_user_ale(fault_addr)
     }
 
     unsafe fn return_to_user(trap_cx_user_va: usize, user_token: usize) -> ! {

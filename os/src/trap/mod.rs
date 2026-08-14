@@ -16,7 +16,7 @@ mod irq;
 
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
-use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine};
+use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine, UnalignedEmulationOutcome};
 use crate::hal::{ArchInterrupt, ArchTrapMachine};
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
 use crate::sched::{
@@ -705,38 +705,62 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
                 }
             }
         }
-        TrapCause::DataAddressFault => {
-            #[cfg(target_arch = "loongarch64")]
-            {
-                match crate::arch::loongarch64::trap::emulate_user_unaligned(
-                    current_trap_cx(),
-                    trap_info.fault_addr,
-                ) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        warn!(
-                            "loongarch64 user unaligned emulation failed: ip={:#x}, fault_addr={:#x}, err={:?}",
-                            current_trap_cx().user_pc(),
-                            trap_info.fault_addr,
-                            err,
-                        );
-                        log_user_fault(
-                            "unaligned access",
-                            "unknown",
-                            trap_info.fault_addr,
-                            "SIGBUS",
-                        );
-                        current_add_signal(SignalBit::SIGBUS);
-                    }
+        TrapCause::AddressAlignmentFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
+            let fault_pc = current_trap_cx().user_pc();
+            match ArchTrapMachine::emulate_user_unaligned(trap_info.fault_addr) {
+                UnalignedEmulationOutcome::Handled {
+                    instruction,
+                    access,
+                    size,
+                } => {
+                    trace!(
+                        "[trap] emulated unaligned access: pc={:#x} addr={:#x} instruction={:#010x} fetched={} access={} size={}",
+                        fault_pc,
+                        trap_info.fault_addr,
+                        instruction.unwrap_or(0),
+                        instruction.is_some(),
+                        access.as_str(),
+                        size,
+                    );
+                }
+                UnalignedEmulationOutcome::Unsupported {
+                    instruction,
+                    reason,
+                } => {
+                    warn!(
+                        "[trap] {}: pc={:#x} addr={:#x} instruction={:#010x} fetched={}",
+                        reason,
+                        fault_pc,
+                        trap_info.fault_addr,
+                        instruction.unwrap_or(0),
+                        instruction.is_some(),
+                    );
+                    log_user_fault(reason, "unknown", trap_info.fault_addr, "SIGBUS");
+                    current_add_signal(SignalBit::SIGBUS);
+                }
+                UnalignedEmulationOutcome::Fault {
+                    instruction,
+                    access,
+                    reason,
+                } => {
+                    warn!(
+                        "[trap] {}: pc={:#x} addr={:#x} instruction={:#010x} fetched={}",
+                        reason,
+                        fault_pc,
+                        trap_info.fault_addr,
+                        instruction.unwrap_or(0),
+                        instruction.is_some(),
+                    );
+                    log_user_fault(reason, access.as_str(), trap_info.fault_addr, "SIGSEGV");
+                    current_add_signal(SignalBit::SIGSEGV);
                 }
             }
-            #[cfg(not(target_arch = "loongarch64"))]
-            {
-                log_user_fault("access fault", "unknown", trap_info.fault_addr, "SIGSEGV");
-                current_add_signal(SignalBit::SIGSEGV);
-            }
         }
-        TrapCause::StoreFault | TrapCause::InstructionFault | TrapCause::LoadFault => {
+        TrapCause::StoreFault
+        | TrapCause::InstructionFault
+        | TrapCause::LoadFault
+        | TrapCause::DataAddressFault => {
             log_user_fault("access fault", "unknown", trap_info.fault_addr, "SIGSEGV");
             current_add_signal(SignalBit::SIGSEGV);
         }

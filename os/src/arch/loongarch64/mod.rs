@@ -6,6 +6,7 @@ pub mod hart;
 pub mod paging;
 mod switch;
 pub mod trap;
+pub(crate) mod unaligned;
 
 pub use entry::{
     boot_execution_state, firmware_boot_args, BootExecutionState, FirmwareBootArgs,
