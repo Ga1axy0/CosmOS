@@ -38,6 +38,9 @@ kernel; use `SKIP_KERNEL_BUILD=1` only when `kernel-rv` already contains the
 desired configuration. `SYSCALLS_COUNT=1` includes `/proc/syscalls_count` in
 the CosmOS log during a rebuild.
 
-The `/proc/syscalls_count` values are a kernel-side cross-check. They include
-small process-startup and counter-dump overhead around the measured program,
-so the exact per-workload values are the fields in `MPF_RESULT`.
+The `/proc/syscalls_count` values are a kernel-side cross-check. Each row now
+contains `count total_ns avg_ns`; the timing covers syscall dispatch and the
+syscall implementation, in nanoseconds, but not architecture trap entry or
+return. They include small process-startup and counter-dump overhead around
+the measured program, so the exact per-workload call count is the field in
+`MPF_RESULT`.

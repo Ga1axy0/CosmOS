@@ -5,7 +5,7 @@
 //! - `/proc/uptime` — seconds since boot and aggregate idle time.
 //! - `/proc/cosmos_meminfo` — xxOS memory and performance counters.
 //! - `/proc/statx_perf_enable` — toggles low-overhead `statx(2)` phase timing.
-//! - `/proc/syscalls_count` — per-system-call invocation counters.
+//! - `/proc/syscalls_count` — per-system-call invocation and dispatch-time counters.
 //! - `/proc/mounts`  — current mount table.
 //! - `/proc/self`    — symlink to current process directory.
 //! - `/proc/<pid>/exe` — symlink to process executable path.

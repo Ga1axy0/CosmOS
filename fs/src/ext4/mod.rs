@@ -53,6 +53,30 @@ static PAGE_CACHE_READ_PLAN_BLOCKS: AtomicUsize = AtomicUsize::new(0);
 static PAGE_CACHE_READ_PLAN_US: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static PAGE_CACHE_READ_IO_US: AtomicUsize = AtomicUsize::new(0);
+// Wall time waiting for, and holding, the per-inode mapping lock.  Hold time
+// intentionally includes the data I/O: it is the same-inode serialization
+// window that a range-lock implementation could potentially expose.
+#[cfg(feature = "io_perf_counters")]
+static READ_MAPPING_LOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READ_MAPPING_LOCK_WAIT_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static READ_MAPPING_LOCK_HOLD_US: AtomicUsize = AtomicUsize::new(0);
+// Mapping time is measured after acquiring the global ext4 mutex and around
+// prepare_aligned_read_at.  It therefore isolates inode/extent lookup and
+// physical-offset vector construction from global ext4-mutex wait time.
+#[cfg(feature = "io_perf_counters")]
+static EXTENT_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EXTENT_MAP_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EXTENT_MAP_RUNS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EXTENT_MAP_US: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EXTENT_MAP_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "io_perf_counters")]
+static EXTENT_MAP_ERRORS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static DIR_LOOKUP_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -310,6 +334,18 @@ fn perf_elapsed_us(start_us: Option<usize>) -> usize {
 }
 
 #[cfg(feature = "io_perf_counters")]
+fn count_physical_runs(physical_offsets: &[usize]) -> usize {
+    if physical_offsets.is_empty() {
+        return 0;
+    }
+
+    1 + physical_offsets
+        .windows(2)
+        .filter(|pair| pair[1] != pair[0].saturating_add(BLOCK_SIZE))
+        .count()
+}
+
+#[cfg(feature = "io_perf_counters")]
 pub fn set_perf_time_source(now_us: fn() -> usize) {
     PERF_TIME_NOW_US.store(now_us as usize, Ordering::Relaxed);
 }
@@ -327,6 +363,15 @@ pub fn reset_perf_counters() {
     PAGE_CACHE_READ_PLAN_BLOCKS.store(0, Ordering::Relaxed);
     PAGE_CACHE_READ_PLAN_US.store(0, Ordering::Relaxed);
     PAGE_CACHE_READ_IO_US.store(0, Ordering::Relaxed);
+    READ_MAPPING_LOCK_CALLS.store(0, Ordering::Relaxed);
+    READ_MAPPING_LOCK_WAIT_US.store(0, Ordering::Relaxed);
+    READ_MAPPING_LOCK_HOLD_US.store(0, Ordering::Relaxed);
+    EXTENT_MAP_CALLS.store(0, Ordering::Relaxed);
+    EXTENT_MAP_BLOCKS.store(0, Ordering::Relaxed);
+    EXTENT_MAP_RUNS.store(0, Ordering::Relaxed);
+    EXTENT_MAP_US.store(0, Ordering::Relaxed);
+    EXTENT_MAP_FALLBACKS.store(0, Ordering::Relaxed);
+    EXTENT_MAP_ERRORS.store(0, Ordering::Relaxed);
     DIR_LOOKUP_CALLS.store(0, Ordering::Relaxed);
     DIR_LOOKUP_HITS.store(0, Ordering::Relaxed);
     DIR_LOOKUP_MISSES.store(0, Ordering::Relaxed);
@@ -350,6 +395,8 @@ pub fn render_perf_counters() -> String {
     let getdents_calls = perf_load(&GETDENTS_CALLS);
     let getdents_prime_calls = perf_load(&GETDENTS_PRIME_CALLS);
     let ls_calls = perf_load(&LS_CALLS);
+    let read_mapping_lock_calls = perf_load(&READ_MAPPING_LOCK_CALLS);
+    let extent_map_calls = perf_load(&EXTENT_MAP_CALLS);
     let _ = writeln!(&mut out, "ext4:");
     let _ = writeln!(
         &mut out,
@@ -405,6 +452,90 @@ pub fn render_perf_counters() -> String {
         &mut out,
         "  page_cache_read_io_us {}",
         perf_load(&PAGE_CACHE_READ_IO_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  read_mapping_lock_calls {}",
+        read_mapping_lock_calls
+    );
+    let _ = writeln!(
+        &mut out,
+        "  read_mapping_lock_wait_us {}",
+        perf_load(&READ_MAPPING_LOCK_WAIT_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  read_mapping_lock_hold_us {}",
+        perf_load(&READ_MAPPING_LOCK_HOLD_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_read_mapping_lock_wait_us_x100 {}",
+        if read_mapping_lock_calls == 0 {
+            0
+        } else {
+            perf_load(&READ_MAPPING_LOCK_WAIT_US).saturating_mul(100)
+                / read_mapping_lock_calls
+        }
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_read_mapping_lock_hold_us_x100 {}",
+        if read_mapping_lock_calls == 0 {
+            0
+        } else {
+            perf_load(&READ_MAPPING_LOCK_HOLD_US).saturating_mul(100)
+                / read_mapping_lock_calls
+        }
+    );
+    let _ = writeln!(&mut out, "  extent_map_calls {}", extent_map_calls);
+    let _ = writeln!(
+        &mut out,
+        "  extent_map_us {}",
+        perf_load(&EXTENT_MAP_US)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  extent_map_blocks {}",
+        perf_load(&EXTENT_MAP_BLOCKS)
+    );
+    let _ = writeln!(&mut out, "  extent_map_runs {}", perf_load(&EXTENT_MAP_RUNS));
+    let _ = writeln!(
+        &mut out,
+        "  extent_map_fallbacks {}",
+        perf_load(&EXTENT_MAP_FALLBACKS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  extent_map_errors {}",
+        perf_load(&EXTENT_MAP_ERRORS)
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_extent_map_us_x100 {}",
+        if extent_map_calls == 0 {
+            0
+        } else {
+            perf_load(&EXTENT_MAP_US).saturating_mul(100) / extent_map_calls
+        }
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_extent_map_blocks_x100 {}",
+        if extent_map_calls == 0 {
+            0
+        } else {
+            perf_load(&EXTENT_MAP_BLOCKS).saturating_mul(100) / extent_map_calls
+        }
+    );
+    let _ = writeln!(
+        &mut out,
+        "  avg_extent_map_runs_x100 {}",
+        if extent_map_calls == 0 {
+            0
+        } else {
+            perf_load(&EXTENT_MAP_RUNS).saturating_mul(100) / extent_map_calls
+        }
     );
     let _ = writeln!(&mut out, "  getdents_calls {}", getdents_calls);
     let _ = writeln!(
@@ -1059,48 +1190,99 @@ impl VfsNode for Ext4Inode {
         // global ext4 metadata lock is released.  This first implementation
         // serializes reads of one inode, but no longer serializes unrelated
         // inode and directory operations behind data-device latency.
-        let _mapping_guard = self.mapping_lock.lock();
         #[cfg(feature = "io_perf_counters")]
-        PAGE_CACHE_READ_PLAN_CALLS.fetch_add(1, Ordering::Relaxed);
+        let mapping_lock_wait_start_us = perf_now_us();
+        let mapping_guard = self.mapping_lock.lock();
         #[cfg(feature = "io_perf_counters")]
-        let plan_start_us = perf_now_us();
-        let prepared = {
-            let ext4 = self.fs.ext4.lock();
-            match ext4.prepare_aligned_read_at(self.inode_num, offset, buf.len()) {
-                Ok(Some((read_len, physical_offsets))) => Some((
-                    Arc::clone(&ext4.block_device),
-                    read_len,
-                    physical_offsets,
-                )),
-                Ok(None) => None,
-                Err(_) => return 0,
-            }
-        };
-        #[cfg(feature = "io_perf_counters")]
-        PAGE_CACHE_READ_PLAN_US.fetch_add(perf_elapsed_us(plan_start_us), Ordering::Relaxed);
-
-        if let Some((block_device, read_len, physical_offsets)) = prepared {
-            #[cfg(feature = "io_perf_counters")]
-            {
-                PAGE_CACHE_READ_PLAN_HITS.fetch_add(1, Ordering::Relaxed);
-                PAGE_CACHE_READ_PLAN_BLOCKS
-                    .fetch_add(physical_offsets.len(), Ordering::Relaxed);
-            }
-            #[cfg(feature = "io_perf_counters")]
-            let io_start_us = perf_now_us();
-            block_device.read_offsets_uncached(
-                &physical_offsets,
-                &mut buf[..read_len],
+        {
+            READ_MAPPING_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+            READ_MAPPING_LOCK_WAIT_US.fetch_add(
+                perf_elapsed_us(mapping_lock_wait_start_us),
+                Ordering::Relaxed,
             );
-            #[cfg(feature = "io_perf_counters")]
-            PAGE_CACHE_READ_IO_US.fetch_add(perf_elapsed_us(io_start_us), Ordering::Relaxed);
-            return read_len;
         }
-
         #[cfg(feature = "io_perf_counters")]
-        PAGE_CACHE_READ_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        let ext4 = self.fs.ext4.lock();
-        ext4.read_at_uncached(self.inode_num, offset, buf).unwrap_or(0)
+        let mapping_lock_hold_start_us = perf_now_us();
+        let result = (|| {
+            #[cfg(feature = "io_perf_counters")]
+            PAGE_CACHE_READ_PLAN_CALLS.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "io_perf_counters")]
+            let plan_start_us = perf_now_us();
+            let prepared = {
+                let ext4 = self.fs.ext4.lock();
+                #[cfg(feature = "io_perf_counters")]
+                let extent_map_start_us = perf_now_us();
+                let extent_map_result =
+                    ext4.prepare_aligned_read_at(self.inode_num, offset, buf.len());
+                #[cfg(feature = "io_perf_counters")]
+                {
+                    EXTENT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+                    EXTENT_MAP_US.fetch_add(
+                        perf_elapsed_us(extent_map_start_us),
+                        Ordering::Relaxed,
+                    );
+                }
+                match extent_map_result {
+                    Ok(Some((read_len, physical_offsets))) => Some((
+                        Arc::clone(&ext4.block_device),
+                        read_len,
+                        {
+                            #[cfg(feature = "io_perf_counters")]
+                            {
+                                EXTENT_MAP_BLOCKS.fetch_add(
+                                    physical_offsets.len(),
+                                    Ordering::Relaxed,
+                                );
+                                EXTENT_MAP_RUNS.fetch_add(
+                                    count_physical_runs(&physical_offsets),
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            physical_offsets
+                        },
+                    )),
+                    Ok(None) => {
+                        #[cfg(feature = "io_perf_counters")]
+                        EXTENT_MAP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    Err(_) => {
+                        #[cfg(feature = "io_perf_counters")]
+                        EXTENT_MAP_ERRORS.fetch_add(1, Ordering::Relaxed);
+                        return 0;
+                    }
+                }
+            };
+            #[cfg(feature = "io_perf_counters")]
+            PAGE_CACHE_READ_PLAN_US.fetch_add(perf_elapsed_us(plan_start_us), Ordering::Relaxed);
+
+            if let Some((block_device, read_len, physical_offsets)) = prepared {
+                #[cfg(feature = "io_perf_counters")]
+                {
+                    PAGE_CACHE_READ_PLAN_HITS.fetch_add(1, Ordering::Relaxed);
+                    PAGE_CACHE_READ_PLAN_BLOCKS
+                        .fetch_add(physical_offsets.len(), Ordering::Relaxed);
+                }
+                #[cfg(feature = "io_perf_counters")]
+                let io_start_us = perf_now_us();
+                block_device.read_offsets_uncached(&physical_offsets, &mut buf[..read_len]);
+                #[cfg(feature = "io_perf_counters")]
+                PAGE_CACHE_READ_IO_US.fetch_add(perf_elapsed_us(io_start_us), Ordering::Relaxed);
+                return read_len;
+            }
+
+            #[cfg(feature = "io_perf_counters")]
+            PAGE_CACHE_READ_PLAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            let ext4 = self.fs.ext4.lock();
+            ext4.read_at_uncached(self.inode_num, offset, buf).unwrap_or(0)
+        })();
+        drop(mapping_guard);
+        #[cfg(feature = "io_perf_counters")]
+        READ_MAPPING_LOCK_HOLD_US.fetch_add(
+            perf_elapsed_us(mapping_lock_hold_start_us),
+            Ordering::Relaxed,
+        );
+        result
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> usize {

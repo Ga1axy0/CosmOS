@@ -84,14 +84,21 @@ ROOTFS_CARGO_CACHE_HELPER := $(ROOTFS_BASE_DIR)/root/prepare-cargo-cache
 ROOTFS_CAGENT_WRAPPER := $(ROOTFS_BASE_DIR)/root/cagent-run-glibc
 ROOTFS_BUILDSTORM_WRAPPER := $(ROOTFS_BASE_DIR)/root/buildstorm-run-glibc
 ROOTFS_FINAL_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/final_auto_run
+ROOTFS_LTP_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/ltp-auto-run
+ROOTFS_LTP_RUN_FILES := $(addprefix $(ROOTFS_BASE_DIR)/root/, \
+	ltp-run-musl ltp-run-glibc \
+	netperf-run-musl netperf-run-glibc \
+	iperf-run-musl iperf-run-glibc \
+	basic-run-musl basic-run-glibc)
+ROOTFS_BOOTSTRAP_LTP_FILES := $(ROOTFS_LTP_AUTO_RUN) $(ROOTFS_LTP_RUN_FILES)
 ROOTFS_PIVOT_EVAL_HELPER := $(ROOTFS_BASE_DIR)/sbin/pivot-eval-root
 ROOTFS_PIVOT_CAGENT_RUNNER_SRC := $(ROOTFS_REPO)/scripts/pivot-cagent-runner.sh
 ROOTFS_PIVOT_CAGENT_RETRY_SRC := $(ROOTFS_REPO)/scripts/pivot-cagent-retry.sh
 # The final evaluator always supplies a self-contained public filesystem as
 # the first disk. Promote it to `/` by default; use PIVOT_EVAL_ROOT=0 to keep
-# the bootstrap filesystem as the runtime root and restore the legacy Cargo
-# cache preparation path.
-PIVOT_EVAL_ROOT ?= 1
+# the full bootstrap filesystem as the runtime root.  Its optional guest Cargo
+# cache is controlled separately by PREPARE_ROOTFS_CARGO_OFFLINE.
+PIVOT_EVAL_ROOT ?= 0
 PIVOT_EVAL_ROOT_ENABLED := $(if $(filter 1 yes true on,$(PIVOT_EVAL_ROOT)),1,0)
 PIVOT_EVAL_ROOT_KEY := $(if $(filter 1,$(PIVOT_EVAL_ROOT_ENABLED)),ON,OFF)
 # Keep the canonical base rootfs intact, but optionally omit TGOSKits from the
@@ -100,6 +107,13 @@ PIVOT_EVAL_ROOT_KEY := $(if $(filter 1,$(PIVOT_EVAL_ROOT_ENABLED)),ON,OFF)
 WITH_TGOSKITS ?= 0
 WITH_TGOSKITS_ENABLED := $(if $(filter 1 yes true on,$(WITH_TGOSKITS)),1,0)
 WITH_TGOSKITS_KEY := $(if $(filter 1,$(WITH_TGOSKITS_ENABLED)),ON,OFF)
+# The guest Cargo registry is only needed when the bootstrap rootfs itself
+# will build TGOSKits projects.  Keep the legacy preparation enabled by
+# default, but allow full-rootfs builds to omit the large cache when the
+# mounted evaluation image supplies the complete userspace.
+PREPARE_ROOTFS_CARGO_OFFLINE ?= 1
+PREPARE_ROOTFS_CARGO_OFFLINE_ENABLED := $(if $(filter 1 yes true on,$(PREPARE_ROOTFS_CARGO_OFFLINE)),1,0)
+PREPARE_ROOTFS_CARGO_OFFLINE_KEY := $(if $(filter 1,$(PREPARE_ROOTFS_CARGO_OFFLINE_ENABLED)),ON,OFF)
 ROOTFS_RV_VARIANT_CONFIG_STAMP := $(ROOTFS_RV_STAMP_DIR)/.variant-config.stamp
 ROOTFS_LA_VARIANT_CONFIG_STAMP := $(ROOTFS_LA_STAMP_DIR)/.variant-config.stamp
 # In pivot mode the evaluation filesystem is the complete userspace, including
@@ -107,8 +121,10 @@ ROOTFS_LA_VARIANT_CONFIG_STAMP := $(ROOTFS_LA_STAMP_DIR)/.variant-config.stamp
 # on TGOSKits/Cargo.lock or host-side Cargo preparation.
 ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 ROOTFS_RV_READY_STAMP := $(ROOTFS_RV_INIT_STAMP)
-else
+else ifeq ($(PREPARE_ROOTFS_CARGO_OFFLINE_ENABLED),1)
 ROOTFS_RV_READY_STAMP := $(ROOTFS_RV_CARGO_STAMP)
+else
+ROOTFS_RV_READY_STAMP := $(ROOTFS_RV_INIT_STAMP)
 endif
 # The RV guest uses the Rust toolchain carried by sdcard-rv-pub.img at /mnt.
 # Set WITH_RUST=1 to restore the optional toolchain in the generated rootfs.
@@ -116,15 +132,17 @@ WITH_RUST ?= 0
 WITH_LIBCLANG ?= $(WITH_RUST)
 ROOTFS_SCRIPT_FILES := $(shell find $(ROOTFS_REPO)/scripts -type f | sort)
 ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
-# The bootstrap image only needs the files used before pivot_root.  Avoid
-# making every package recipe (and the nested TGOSKits checkout) a dependency
-# of the generated image in this mode.
+# The bootstrap image only needs the files used before pivot_root, plus the
+# legacy preliminary-test runner used when the mounted disk is not standalone.
+# Avoid making every package recipe (and the nested TGOSKits checkout) a
+# dependency of the generated image in this mode.
 ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_REPO)/Makefile \
 	$(ROOTFS_REPO)/scripts/build-busybox.sh \
+	$(ROOTFS_REPO)/scripts/build-bash.sh \
 	$(ROOTFS_REPO)/scripts/common-musl-env.sh \
 	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
 	$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC) $(ROOTFS_PIVOT_CAGENT_RETRY_SRC) \
-	$(ROOTFS_FINAL_AUTO_RUN)
+	$(ROOTFS_FINAL_AUTO_RUN) $(ROOTFS_BOOTSTRAP_LTP_FILES)
 else
 ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_SCRIPT_FILES) \
 	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
@@ -331,7 +349,7 @@ rootfs-la: $(ROOTFS_LA_INIT_STAMP)
 
 $(ROOTFS_RV_VARIANT_CONFIG_STAMP): force
 	@mkdir -p "$(ROOTFS_RV_STAMP_DIR)"
-	@key='TGOSKITS=$(WITH_TGOSKITS_KEY) PIVOT_EVAL_ROOT=$(PIVOT_EVAL_ROOT_KEY) BOOTSTRAP_ONLY=$(PIVOT_EVAL_ROOT_KEY)'; \
+	@key='TGOSKITS=$(WITH_TGOSKITS_KEY) PIVOT_EVAL_ROOT=$(PIVOT_EVAL_ROOT_KEY) BOOTSTRAP_ONLY=$(PIVOT_EVAL_ROOT_KEY) PREPARE_ROOTFS_CARGO_OFFLINE=$(PREPARE_ROOTFS_CARGO_OFFLINE_KEY)'; \
 	if [ ! -f "$@" ] || [ "$$(cat "$@")" != "$$key" ]; then \
 		printf '%s\n' "$$key" > "$@"; \
 	fi
@@ -358,15 +376,17 @@ ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 	@echo "[ROOTFS] creating minimal RISC-V pivot bootstrap"
 	@rm -rf "$(ROOTFS_RV_DIR)"
 	@mkdir -p "$(ROOTFS_RV_DIR)/root" "$(ROOTFS_RV_DIR)/sbin" "$(ROOTFS_RV_DIR)/etc"
-	@rm -f "$(ROOTFS_RV_STAMP_DIR)/build-busybox.stamp"
+	@rm -f "$(ROOTFS_RV_STAMP_DIR)/build-busybox.stamp" "$(ROOTFS_RV_STAMP_DIR)/build-bash.stamp"
 	@cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/init"
 	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner"
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry"
+	@cp -f $(ROOTFS_BOOTSTRAP_LTP_FILES) "$(ROOTFS_RV_DIR)/root/"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final_auto_run"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final-auto-run"
 	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root" \
 		"$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry" \
+		$(addprefix $(ROOTFS_RV_DIR)/root/,ltp-auto-run $(notdir $(ROOTFS_LTP_RUN_FILES))) \
 		"$(ROOTFS_RV_DIR)/root/final_auto_run" "$(ROOTFS_RV_DIR)/root/final-auto-run"
 	@touch "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"
 else
@@ -456,15 +476,17 @@ ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 	@echo "[ROOTFS] creating minimal LoongArch pivot bootstrap"
 	@rm -rf "$(ROOTFS_LA_DIR)"
 	@mkdir -p "$(ROOTFS_LA_DIR)/root" "$(ROOTFS_LA_DIR)/sbin" "$(ROOTFS_LA_DIR)/etc"
-	@rm -f "$(ROOTFS_LA_STAMP_DIR)/build-busybox.stamp"
+	@rm -f "$(ROOTFS_LA_STAMP_DIR)/build-busybox.stamp" "$(ROOTFS_LA_STAMP_DIR)/build-bash.stamp"
 	@cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/init"
 	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner"
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry"
+	@cp -f $(ROOTFS_BOOTSTRAP_LTP_FILES) "$(ROOTFS_LA_DIR)/root/"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final_auto_run"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final-auto-run"
 	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root" \
 		"$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry" \
+		$(addprefix $(ROOTFS_LA_DIR)/root/,ltp-auto-run $(notdir $(ROOTFS_LTP_RUN_FILES))) \
 		"$(ROOTFS_LA_DIR)/root/final_auto_run" "$(ROOTFS_LA_DIR)/root/final-auto-run"
 	@touch "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"
 else

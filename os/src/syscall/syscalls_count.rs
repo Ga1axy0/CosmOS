@@ -1,14 +1,33 @@
-//! Optional per-system-call invocation counters.
+//! Optional per-system-call invocation and dispatch-time counters.
+//!
+//! The timing interval starts immediately after the entry count is recorded
+//! in [`super::syscall`] and ends immediately before it returns. It therefore
+//! measures syscall dispatch/implementation time, not architecture trap-entry
+//! or trap-return overhead. Durations are reported in nanoseconds.
 
 use alloc::string::String;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::timer::get_time_ns;
 
 // xxOS currently uses syscall numbers through 473. Keep a little headroom for
 // ABI additions while still using a fixed, allocation-free hot-path counter.
 const MAX_SYSCALL_NR: usize = 512;
 
 static COUNTS: [AtomicU64; MAX_SYSCALL_NR] = [const { AtomicU64::new(0) }; MAX_SYSCALL_NR];
+static TOTAL_NS: [AtomicU64; MAX_SYSCALL_NR] = [const { AtomicU64::new(0) }; MAX_SYSCALL_NR];
+
+// A reset can be issued from inside the syscall being measured (for example,
+// by writing to /proc/syscalls_count).  The generation lets the dispatcher
+// discard that syscall's in-flight timing sample after the reset.
+static RESET_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) struct SyscallStart {
+    start_ns: u64,
+    reset_generation: u64,
+}
 
 // Keep the names next to the counter implementation so /proc remains useful
 // without requiring userspace to duplicate xxOS's syscall-number table.
@@ -230,31 +249,66 @@ fn syscall_name(syscall_nr: usize) -> Option<&'static str> {
         .find_map(|(number, name)| (*number == syscall_nr).then_some(*name))
 }
 
-/// Increment the counter for one syscall entry.
+/// Record one syscall entry and start its dispatch-time measurement.
 #[inline]
-pub(crate) fn record(syscall_nr: usize) {
+pub(crate) fn begin(syscall_nr: usize) -> SyscallStart {
     if let Some(counter) = COUNTS.get(syscall_nr) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+    SyscallStart {
+        start_ns: get_time_ns(),
+        reset_generation: RESET_GENERATION.load(Ordering::Relaxed),
+    }
+}
+
+/// Record the elapsed time for one syscall dispatch.
+#[inline]
+pub(crate) fn finish(syscall_nr: usize, start: SyscallStart) {
+    // Do not add the tail of a syscall whose body reset the counters.  This is
+    // what keeps `echo 1 > /proc/syscalls_count` from leaving a timing-only
+    // sample behind after a reset.
+    if RESET_GENERATION.load(Ordering::Relaxed) != start.reset_generation {
+        return;
+    }
+    if let Some(total_ns) = TOTAL_NS.get(syscall_nr) {
+        total_ns.fetch_add(
+            get_time_ns().saturating_sub(start.start_ns),
+            Ordering::Relaxed,
+        );
     }
 }
 
 /// Clear all syscall counters.
 pub(crate) fn reset() {
+    RESET_GENERATION.fetch_add(1, Ordering::Relaxed);
     for counter in &COUNTS {
         counter.store(0, Ordering::Relaxed);
+    }
+    for total_ns in &TOTAL_NS {
+        total_ns.store(0, Ordering::Relaxed);
     }
 }
 
 /// Render the counters in a procfs-friendly table.
 pub(crate) fn render() -> String {
     let mut out = String::new();
-    let _ = writeln!(&mut out, "syscall_nr name count");
+    let _ = writeln!(&mut out, "syscall_nr name count total_ns avg_ns");
     for (syscall_nr, counter) in COUNTS.iter().enumerate() {
         let count = counter.load(Ordering::Relaxed);
+        let total_ns = TOTAL_NS[syscall_nr].load(Ordering::Relaxed);
+        let avg_ns = if count == 0 { 0 } else { total_ns / count };
         if let Some(name) = syscall_name(syscall_nr) {
-            let _ = writeln!(&mut out, "{} {} {}", syscall_nr, name, count);
+            let _ = writeln!(
+                &mut out,
+                "{} {} {} {} {}",
+                syscall_nr, name, count, total_ns, avg_ns
+            );
         } else if count != 0 {
-            let _ = writeln!(&mut out, "{} unknown {}", syscall_nr, count);
+            let _ = writeln!(
+                &mut out,
+                "{} unknown {} {} {}",
+                syscall_nr, count, total_ns, avg_ns
+            );
         }
     }
     out

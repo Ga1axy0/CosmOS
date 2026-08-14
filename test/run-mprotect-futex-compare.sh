@@ -195,10 +195,11 @@ metric() {
     ' "$file"
 }
 
-proc_metric() {
+proc_timing_metric() {
     local file="$1"
     local name="$2"
-    awk -v name="$name" '$2 == name { print $3; exit }' "$file"
+    local column="$3"
+    awk -v name="$name" -v column="$column" '$2 == name { print $column; exit }' "$file"
 }
 
 print_comparison() {
@@ -239,8 +240,14 @@ print_comparison() {
 
     echo
     echo "CosmOS kernel counter view (requires SYSCALLS_COUNT=1):"
-    printf '  mprotect: %s\n' "$(proc_metric "$cosmos_file" mprotect)"
-    printf '  futex:    %s\n' "$(proc_metric "$cosmos_file" futex)"
+    printf '  mprotect: calls=%s total_ns=%s avg_ns=%s\n' \
+        "$(proc_timing_metric "$cosmos_file" mprotect 3)" \
+        "$(proc_timing_metric "$cosmos_file" mprotect 4)" \
+        "$(proc_timing_metric "$cosmos_file" mprotect 5)"
+    printf '  futex:    calls=%s total_ns=%s avg_ns=%s\n' \
+        "$(proc_timing_metric "$cosmos_file" futex 3)" \
+        "$(proc_timing_metric "$cosmos_file" futex 4)" \
+        "$(proc_timing_metric "$cosmos_file" futex 5)"
 }
 
 host_binary=""

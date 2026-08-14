@@ -41,7 +41,8 @@ net_perf_counters = []
 mm_perf_counters = []
 oom_diagnostics = []
 perf_probe = []
-# Per-syscall invocation counters exposed through /proc/syscalls_count.
+# Per-syscall invocation and dispatch-time counters exposed through
+# /proc/syscalls_count.
 syscalls_count = []
 # Diagnostic-only getpid path used to bound generic trap/syscall overhead.
 # It is never enabled by the normal build.
