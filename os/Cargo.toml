@@ -27,6 +27,7 @@ smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
 	"proto-ipv4-fragmentation",
 	"socket-udp",
 	"socket-tcp",
+	"socket-dhcpv4",
 	"iface-max-addr-count-4",
 	"fragmentation-buffer-size-16384",
 ] }

@@ -4,26 +4,65 @@
 //! console UART into the LS7A PCH PIC, then forwards it through EXTIOI onto a
 //! CPU hardware interrupt line.
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
+#[cfg(feature = "platform-ls2k1000-nebula")]
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bootstrap_hart_id;
 use crate::drivers::chardev::{CharDevice, UART};
+#[cfg(feature = "platform-ls2k1000-nebula")]
+use crate::println;
 
 static UART_IRQ_READY: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "platform-ls2k1000-nebula")]
+static LIOINTC_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "platform-ls2k1000-nebula")]
+static LIOINTC_ENABLED: AtomicU32 = AtomicU32::new(0);
+
+// LS2K1000 LIOINTC defaults match the board HAL. Some U-Boot control FDTs do
+// not expose this internal interrupt controller, so the fixed SoC addresses
+// are deliberately used as the fallback platform description.
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_REG_PADDR: usize = 0x1fe0_1400;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_ISR_PADDR: usize = 0x1fe0_1040;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_INPUTS: u32 = 32;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_ROUTE_CPU0_INT0: u8 = 0x11;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_ENABLE: usize = 0x28;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_DISABLE: usize = 0x2c;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_POLARITY: usize = 0x30;
+#[cfg(feature = "platform-ls2k1000-nebula")]
+const LIOINTC_EDGE: usize = 0x34;
+
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const PCH_PIC_INT_MASK: usize = 0x20;
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const PCH_PIC_HTMSI_VEC: usize = 0x200;
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const PCH_PIC_IRQS: u32 = 32;
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const EXTIOI_IPMAP_START: usize = 0x0c0;
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const EXTIOI_ENABLE_START: usize = 0x200;
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const EXTIOI_COREISR_START: usize = 0x400;
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const EXTIOI_COREMAP_START: usize = 0x800;
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 const EXTIOI_ROUTE_IP3: u32 = 0x0808_0808;
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn pch_pic_base() -> usize {
     let resource = crate::bootinfo::get()
         .pch_pic()
@@ -31,6 +70,7 @@ fn pch_pic_base() -> usize {
     crate::platform::mmio_phys_to_virt(resource.start)
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn extioi_base() -> usize {
     crate::bootinfo::get()
         .eiointc()
@@ -38,6 +78,7 @@ fn extioi_base() -> usize {
         .start
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn uart_irq() -> u32 {
     crate::bootinfo::get()
         .uart()
@@ -45,16 +86,19 @@ fn uart_irq() -> u32 {
         .expect("FDT console UART has no interrupt")
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 #[inline]
 fn mmio_read64(addr: usize) -> u64 {
     unsafe { read_volatile(addr as *const u64) }
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 #[inline]
 fn mmio_write64(addr: usize, value: u64) {
     unsafe { write_volatile(addr as *mut u64, value) }
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 #[inline]
 fn iocsr_read32(addr: usize) -> u32 {
     let value: u32;
@@ -68,6 +112,7 @@ fn iocsr_read32(addr: usize) -> u32 {
     value
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 #[inline]
 fn iocsr_write32(addr: usize, value: u32) {
     unsafe {
@@ -79,6 +124,7 @@ fn iocsr_write32(addr: usize, value: u32) {
     }
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn enable_pch_pic_irq(irq: u32) {
     let irq = irq as usize;
     let base = pch_pic_base();
@@ -93,6 +139,7 @@ fn enable_pch_pic_irq(irq: u32) {
     mmio_write64(base + PCH_PIC_INT_MASK, mask & !(1u64 << irq));
 }
 
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn init_extioi_routing() {
     let target_hart = bootstrap_hart_id().min(3);
     let cpu_bit = 1u32 << target_hart;
@@ -110,7 +157,8 @@ fn init_extioi_routing() {
     }
 }
 
-pub(crate) fn enable_pch_irq(irq: u32) -> bool {
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
+pub(crate) fn enable_device_irq(irq: u32) -> bool {
     if irq >= PCH_PIC_IRQS {
         warn!("[irq] loongarch PCH IRQ {} out of range", irq);
         return false;
@@ -125,20 +173,85 @@ pub(crate) fn enable_pch_irq(irq: u32) -> bool {
     true
 }
 
+#[cfg(feature = "platform-ls2k1000-nebula")]
+#[inline]
+fn liointc_regs() -> usize {
+    crate::platform::mmio_phys_to_virt(LIOINTC_REG_PADDR)
+}
+
+#[cfg(feature = "platform-ls2k1000-nebula")]
+#[inline]
+fn liointc_isr() -> usize {
+    crate::platform::mmio_phys_to_virt(LIOINTC_ISR_PADDR)
+}
+
+#[cfg(feature = "platform-ls2k1000-nebula")]
+#[inline]
+fn liointc_write32(offset: usize, value: u32) {
+    unsafe { write_volatile((liointc_regs() + offset) as *mut u32, value) }
+}
+
+#[cfg(feature = "platform-ls2k1000-nebula")]
+#[inline]
+fn liointc_pending() -> u32 {
+    (unsafe { read_volatile(liointc_isr() as *const u32) })
+        & LIOINTC_ENABLED.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "platform-ls2k1000-nebula")]
+pub(crate) fn enable_device_irq(irq: u32) -> bool {
+    if irq >= LIOINTC_INPUTS {
+        warn!("[irq] LS2K1000 LIOINTC input {} out of range", irq);
+        return false;
+    }
+    if !LIOINTC_READY.load(Ordering::Acquire) {
+        warn!("[irq] LS2K1000 LIOINTC is not initialized");
+        return false;
+    }
+
+    let bit = 1u32 << irq;
+    LIOINTC_ENABLED.fetch_or(bit, Ordering::AcqRel);
+    liointc_write32(LIOINTC_ENABLE, bit);
+    println!("[irq] LS2K1000 LIOINTC input {} enabled", irq);
+    true
+}
+
 /// Initialize platform external interrupt routing on the bootstrap hart.
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 pub fn init_external_irq() {
     if crate::bootinfo::get().pch_pic().is_none()
         || crate::bootinfo::get().eiointc().is_none()
-        || crate::bootinfo::get().uart().and_then(|uart| uart.irq).is_none()
+        || crate::bootinfo::get()
+            .uart()
+            .and_then(|uart| uart.irq)
+            .is_none()
     {
         return;
     }
     init_extioi_routing();
-    enable_pch_irq(uart_irq());
+    enable_device_irq(uart_irq());
     UART_IRQ_READY.store(true, Ordering::Release);
     info!(
         "[irq] loongarch uart IRQ enabled on hart {}",
         bootstrap_hart_id().min(3)
+    );
+}
+
+/// Initialize the LS2K1000 ICU and route its inputs to CPU0 HWI0.
+#[cfg(feature = "platform-ls2k1000-nebula")]
+pub fn init_external_irq() {
+    let regs = liointc_regs();
+    for input in 0..LIOINTC_INPUTS as usize {
+        unsafe { write_volatile((regs + input) as *mut u8, LIOINTC_ROUTE_CPU0_INT0) };
+    }
+    liointc_write32(LIOINTC_DISABLE, u32::MAX);
+    liointc_write32(LIOINTC_EDGE, 0);
+    liointc_write32(LIOINTC_POLARITY, 0);
+    LIOINTC_ENABLED.store(0, Ordering::Release);
+    LIOINTC_READY.store(true, Ordering::Release);
+    println!(
+        "[irq] LS2K1000 LIOINTC initialized at {:#x}, ISR {:#x}, cascade HWI0",
+        LIOINTC_REG_PADDR, LIOINTC_ISR_PADDR
     );
 }
 
@@ -151,6 +264,7 @@ pub fn console_rx_irq_ready() -> bool {
 }
 
 /// Dispatch one platform external interrupt.
+#[cfg(not(feature = "platform-ls2k1000-nebula"))]
 pub fn handle_external_irq() {
     if !console_rx_irq_ready() {
         return;
@@ -190,5 +304,26 @@ pub fn handle_external_irq() {
 
             pending &= !bit;
         }
+    }
+}
+
+/// Dispatch LS2K1000 LIOINTC inputs. The controller is level-triggered, so
+/// the device handler clears the source and no controller EOI is required.
+#[cfg(feature = "platform-ls2k1000-nebula")]
+pub fn handle_external_irq() {
+    if !LIOINTC_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    let mut pending = liointc_pending();
+    while pending != 0 {
+        let irq = pending.trailing_zeros();
+        let bit = 1u32 << irq;
+        let mut handled = crate::drivers::block::handle_irq(irq);
+        handled |= crate::drivers::net::handle_irq(irq);
+        if !handled {
+            warn!("[irq] unexpected LS2K1000 LIOINTC input {}", irq);
+        }
+        pending &= !bit;
     }
 }
