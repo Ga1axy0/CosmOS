@@ -54,6 +54,8 @@ pub enum TrapCause {
     LoadFault,
     /// Data-memory address error whose direction (load/store) is not encoded.
     DataAddressFault,
+    /// Instruction or data access rejected because its address is not aligned.
+    AddressAlignmentFault,
     IllegalInstruction,
     TimerInterrupt,
     SoftwareInterrupt,
@@ -68,6 +70,49 @@ pub struct TrapInfo {
     pub cause: TrapCause,
     /// Fault address or trap-value register contents when applicable.
     pub fault_addr: usize,
+}
+
+/// Access direction reported by architecture-specific unaligned emulation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum UnalignedAccessKind {
+    Read,
+    Write,
+    Execute,
+    Unknown,
+}
+
+impl UnalignedAccessKind {
+    /// Stable label used by common fault diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Execute => "exec",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Architecture result for one user-mode unaligned-access exception.
+///
+/// Common trap handling owns signal policy: `Unsupported` becomes `SIGBUS`,
+/// while a real instruction or data access failure becomes `SIGSEGV`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum UnalignedEmulationOutcome {
+    Handled {
+        instruction: Option<u32>,
+        access: UnalignedAccessKind,
+        size: usize,
+    },
+    Unsupported {
+        instruction: Option<u32>,
+        reason: &'static str,
+    },
+    Fault {
+        instruction: Option<u32>,
+        access: UnalignedAccessKind,
+        reason: &'static str,
+    },
 }
 
 /// One architecture-labeled general-purpose register used in fault dumps.
@@ -97,6 +142,8 @@ pub trait SyscallAbi {
 pub trait TrapMachine {
     /// Read the current trap cause and associated fault address.
     fn read_trap_info() -> TrapInfo;
+    /// Attempt architecture-specific emulation of a user unaligned access.
+    fn emulate_user_unaligned(fault_addr: usize) -> UnalignedEmulationOutcome;
     /// Return to user mode using the given trap-context VA and address-space token.
     unsafe fn return_to_user(trap_cx_user_va: usize, user_token: usize) -> !;
     /// Size in bytes of the userspace syscall instruction.

@@ -16,7 +16,7 @@ mod irq;
 
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
-use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine};
+use crate::hal::traits::{InterruptControl, TrapCause, TrapMachine, UnalignedEmulationOutcome};
 use crate::hal::{ArchInterrupt, ArchTrapMachine};
 use crate::mm::{handle_ipi, MmError, PageFaultAccess, PageFaultHandled};
 use crate::sched::{
@@ -632,6 +632,58 @@ pub fn trap_handler() -> ! {
                         );
                         current_add_signal(SignalBit::SIGSEGV);
                     }
+                }
+            }
+        }
+        TrapCause::AddressAlignmentFault => {
+            let _kernel_irq = irq::KernelIrqEnableGuard::new();
+            let fault_pc = current_trap_cx().user_pc();
+            match ArchTrapMachine::emulate_user_unaligned(trap_info.fault_addr) {
+                UnalignedEmulationOutcome::Handled {
+                    instruction,
+                    access,
+                    size,
+                } => {
+                    trace!(
+                        "[trap] emulated unaligned access: pc={:#x} addr={:#x} instruction={:#010x} fetched={} access={} size={}",
+                        fault_pc,
+                        trap_info.fault_addr,
+                        instruction.unwrap_or(0),
+                        instruction.is_some(),
+                        access.as_str(),
+                        size,
+                    );
+                }
+                UnalignedEmulationOutcome::Unsupported {
+                    instruction,
+                    reason,
+                } => {
+                    warn!(
+                        "[trap] {}: pc={:#x} addr={:#x} instruction={:#010x} fetched={}",
+                        reason,
+                        fault_pc,
+                        trap_info.fault_addr,
+                        instruction.unwrap_or(0),
+                        instruction.is_some(),
+                    );
+                    log_user_fault(reason, "unknown", trap_info.fault_addr, "SIGBUS");
+                    current_add_signal(SignalBit::SIGBUS);
+                }
+                UnalignedEmulationOutcome::Fault {
+                    instruction,
+                    access,
+                    reason,
+                } => {
+                    warn!(
+                        "[trap] {}: pc={:#x} addr={:#x} instruction={:#010x} fetched={}",
+                        reason,
+                        fault_pc,
+                        trap_info.fault_addr,
+                        instruction.unwrap_or(0),
+                        instruction.is_some(),
+                    );
+                    log_user_fault(reason, access.as_str(), trap_info.fault_addr, "SIGSEGV");
+                    current_add_signal(SignalBit::SIGSEGV);
                 }
             }
         }

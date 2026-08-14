@@ -3,7 +3,7 @@
 use crate::config::TRAMPOLINE;
 use crate::hal::traits::{
     CloneArgs, InterruptControl, NamedReg, SyscallAbi, TrapCause, TrapContextAbi, TrapInfo,
-    TrapMachine,
+    TrapMachine, UnalignedEmulationOutcome,
 };
 use crate::signal::{SigSetT, SignalAbi, SignalAction, SignalBit, StackT};
 use crate::syscall::Pod;
@@ -329,6 +329,9 @@ impl TrapMachine for RiscvTrapMachine {
             Trap::Exception(Exception::StoreFault) => TrapCause::StoreFault,
             Trap::Exception(Exception::InstructionFault) => TrapCause::InstructionFault,
             Trap::Exception(Exception::LoadFault) => TrapCause::LoadFault,
+            Trap::Exception(Exception::InstructionMisaligned)
+            | Trap::Exception(Exception::LoadMisaligned)
+            | Trap::Exception(Exception::StoreMisaligned) => TrapCause::AddressAlignmentFault,
             Trap::Exception(Exception::IllegalInstruction) => TrapCause::IllegalInstruction,
             Trap::Interrupt(Interrupt::SupervisorTimer) => TrapCause::TimerInterrupt,
             Trap::Interrupt(Interrupt::SupervisorSoft) => TrapCause::SoftwareInterrupt,
@@ -338,6 +341,13 @@ impl TrapMachine for RiscvTrapMachine {
         TrapInfo {
             cause,
             fault_addr: stval::read(),
+        }
+    }
+
+    fn emulate_user_unaligned(_fault_addr: usize) -> UnalignedEmulationOutcome {
+        UnalignedEmulationOutcome::Unsupported {
+            instruction: None,
+            reason: "RISC-V unaligned emulation is not implemented",
         }
     }
 
