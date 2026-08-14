@@ -575,13 +575,26 @@ pub fn init_rootfs() -> Result<(), ERRNO> {
         let secondary_path = alloc::format!("/dev/{}", secondary_name);
         let map = BLOCK_DEVICES.lock();
         #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
-        if let Some((partition_name, partition)) = (1..=128).find_map(|index| {
-            let name = alloc::format!("{}{}", primary_name, index);
-            map.get(&name).cloned().map(|device| (name, device))
-        }) {
-            let partition_path = alloc::format!("/dev/{}", partition_name);
-            println!("[ahci] using {} as root filesystem", partition_path);
-            return init_rootfs_from_device(partition_path, partition, None);
+        {
+            let partitions: Vec<(String, Arc<dyn fs::BlockDevice>)> = (1..=128)
+                .filter_map(|index| {
+                    let name = alloc::format!("{}{}", primary_name, index);
+                    map.get(&name).cloned().map(|device| (name, device))
+                })
+                .collect();
+            if let Some((partition_name, partition)) = partitions.first().cloned() {
+                let partition_path = alloc::format!("/dev/{}", partition_name);
+                let extra_dev = partitions.get(1).cloned().map(|(name, device)| {
+                    let path = alloc::format!("/dev/{}", name);
+                    (path, device)
+                });
+                println!("[ahci] using {} as root filesystem", partition_path);
+                if let Some((extra_path, _)) = extra_dev.as_ref() {
+                    println!("[ahci] using {} as /mnt filesystem", extra_path);
+                }
+                drop(map);
+                return init_rootfs_from_device(partition_path, partition, extra_dev);
+            }
         }
         if let Some(dev) = map.get(&secondary_name).cloned() {
             let extra_dev = map
