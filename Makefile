@@ -111,7 +111,7 @@ WITH_TGOSKITS_KEY := $(if $(filter 1,$(WITH_TGOSKITS_ENABLED)),ON,OFF)
 # will build TGOSKits projects.  Keep the legacy preparation enabled by
 # default, but allow full-rootfs builds to omit the large cache when the
 # mounted evaluation image supplies the complete userspace.
-PREPARE_ROOTFS_CARGO_OFFLINE ?= 1
+PREPARE_ROOTFS_CARGO_OFFLINE ?= 0
 PREPARE_ROOTFS_CARGO_OFFLINE_ENABLED := $(if $(filter 1 yes true on,$(PREPARE_ROOTFS_CARGO_OFFLINE)),1,0)
 PREPARE_ROOTFS_CARGO_OFFLINE_KEY := $(if $(filter 1,$(PREPARE_ROOTFS_CARGO_OFFLINE_ENABLED)),ON,OFF)
 ROOTFS_RV_VARIANT_CONFIG_STAMP := $(ROOTFS_RV_STAMP_DIR)/.variant-config.stamp
