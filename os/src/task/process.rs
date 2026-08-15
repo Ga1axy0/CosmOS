@@ -15,9 +15,9 @@ use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
 use crate::mm::{
     register_file_mapping, shootdown, shootdown_page, shootdown_range, translated_refmut,
-    DeferredUserReclaim, FilePageFaultPrepare, InodeKey, MapPermission, MemorySet, MmError,
-    PageFaultAccess, PageFaultHandled, SharedMemorySetState, ShootdownKind, UserSpaceLayout,
-    VirtAddr, Vma, KERNEL_SPACE,
+    DeferredUserReclaim, FileMappingSyncPlan, FilePageFaultPrepare, InodeKey, MapPermission,
+    MemorySet, MmError, PageFaultAccess, PageFaultHandled, SharedMemorySetState, ShootdownKind,
+    UserSpaceLayout, VirtAddr, Vma, KERNEL_SPACE,
 };
 use crate::sched::insert_into_pid2process;
 use crate::sched::{add_task, current_task};
@@ -1268,6 +1268,9 @@ impl ProcessControlBlock {
         debug!("[mmap] exec teardown old memory_set before installing new user context");
         let shared_state = old_memory_set.take_shared_vfork_state();
         self.finish_vfork_shared_mm(shared_state);
+        let old_sync_plan: FileMappingSyncPlan = old_memory_set
+            .prepare_msync_range(VirtAddr::from(0), VirtAddr::from(crate::mm::USER_SPACE_END));
+        let _ = old_sync_plan.execute();
         let old_batch = old_memory_set.recycle_data_pages_deferred();
         let old_mask = if old_memory_set.is_shared_vfork_view() {
             0
@@ -2218,9 +2221,13 @@ impl ProcessControlBlock {
     }
     /// unmap an area. return true if success
     pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let sync_plan = {
+            let inner = self.inner.lock();
+            inner.memory_set.prepare_msync_range(start, end)
+        };
+        let _ = sync_plan.execute();
         let Some(reclaim) = ({
             let mut inner = self.inner.lock();
-            let _ = inner.memory_set.msync_range(start, end);
             let token = inner.memory_set.token();
             inner.memory_set.munmap_deferred(start, end).map(|batch| {
                 let mask = inner.memory_set.record_local_tlb_change();
@@ -2263,6 +2270,14 @@ impl ProcessControlBlock {
         new_start: VirtAddr,
         new_end: VirtAddr,
     ) -> Result<usize, ERRNO> {
+        // MREMAP_FIXED can replace a shared file mapping. Snapshot and flush
+        // that destination without retaining the process SpinNoIrqLock across
+        // potentially blocking page-cache writeback.
+        let sync_plan = {
+            let inner = self.inner.lock();
+            inner.memory_set.prepare_msync_range(new_start, new_end)
+        };
+        let _ = sync_plan.execute();
         let (result, token, mask, reclaim) = {
             let mut inner = self.inner.lock();
             let old_len = usize::from(old_end).saturating_sub(usize::from(old_start));
@@ -2319,8 +2334,11 @@ impl ProcessControlBlock {
 
     /// 对当前进程地址空间中的指定范围执行 `msync`。
     pub fn msync(&self, start: VirtAddr, end: VirtAddr) -> Result<(), ERRNO> {
-        let inner = self.inner.lock();
-        inner.memory_set.msync_range(start, end)
+        let sync_plan = {
+            let inner = self.inner.lock();
+            inner.memory_set.prepare_msync_range(start, end)
+        };
+        sync_plan.execute()
     }
 
     /// Handle a private COW fault for user-copy helpers which already

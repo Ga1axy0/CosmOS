@@ -420,6 +420,30 @@ pub fn exit_group_current_and_run_next(reason: ExitReason) {
     exit_current_and_run_next_inner(reason, true);
 }
 
+/// Commit the current task's terminal state immediately before switching off
+/// its kernel stack.
+///
+/// Process teardown can still perform blocking filesystem writeback. Until
+/// that work is complete the task must remain installed in Processor and must
+/// look Running to the wait-queue/scheduler path.
+fn finalize_current_task_exit(task: Arc<TaskControlBlock>, exit_code: i32) {
+    {
+        let mut task_inner = task.inner_exclusive_access();
+        task_inner.exit_code = Some(exit_code);
+        task_inner.task_status = TaskStatus::Zombie;
+        task_inner.wait_reason = None;
+        task_inner.sched.on_rq = false;
+        task.set_resched_reason_locked(&mut task_inner, None);
+    }
+    let processor_task = take_current_task().expect("exiting task is no longer current");
+    assert!(
+        Arc::ptr_eq(&task, &processor_task),
+        "processor current task changed during exit teardown"
+    );
+    drop(processor_task);
+    add_stopping_task(task);
+}
+
 fn reap_clear_child_tid_thread(
     process: &Arc<ProcessControlBlock>,
     task: &Arc<TaskControlBlock>,
@@ -488,8 +512,10 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         "kernel: pid[{}] exit_current_and_run_next",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    // take from Processor
-    let task = take_current_task().unwrap();
+    // Keep the task installed in Processor until all potentially blocking
+    // teardown work is complete. Page-cache writeback uses current_task() to
+    // sleep on block-device wait queues.
+    let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
     let pid = process.getpid();
     process.pause_cpu_accounting(task.as_ref(), get_time());
@@ -505,9 +531,15 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         }
     };
     let clear_child_tid = task_inner.clear_child_tid;
-    // record exit code
-    task_inner.exit_code = Some(task_exit_code);
-    task_inner.task_status = TaskStatus::Zombie;
+    let process_wide_exit = tid == Some(0) || force_process_exit;
+    // A thread-only exit has no blocking process teardown below. A process
+    // exit remains Running until its shared mappings and file table have been
+    // flushed, then finalize_current_task_exit() publishes Zombie atomically
+    // with removing it from Processor.
+    if !process_wide_exit {
+        task_inner.exit_code = Some(task_exit_code);
+        task_inner.task_status = TaskStatus::Zombie;
+    }
     task_inner.sched.on_rq = false;
     task.set_resched_reason_locked(&mut task_inner, None);
     task_inner.clear_child_tid = 0;
@@ -569,7 +601,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     let exiting_task = task;
     // If this is the main thread or exit_group was requested, the process
     // should terminate at once.
-    if tid == Some(0) || force_process_exit {
+    if process_wide_exit {
         let mut process_inner = process.inner_exclusive_access();
         if process_inner.is_zombie {
             drop(process_inner);
@@ -583,7 +615,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             // Publish on_cpu=false only after this hart has switched off the
             // task's kernel stack; a concurrent exit_group/exec owner waits on
             // that handoff before reclaiming this task's user resources.
-            add_stopping_task(exiting_task);
+            finalize_current_task_exit(exiting_task, task_exit_code);
             drop(process);
             let mut _unused = TaskContext::zero_init();
             schedule(&mut _unused as *mut _);
@@ -602,7 +634,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 process_inner.semaphore_detector.clear_thread(tid);
             }
             drop(process_inner);
-            add_stopping_task(exiting_task);
+            finalize_current_task_exit(exiting_task, task_exit_code);
             drop(process);
             let mut _unused = TaskContext::zero_init();
             schedule(&mut _unused as *mut _);
@@ -705,11 +737,14 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
                 .collect::<Vec<_>>()
         };
         for task in tasks {
+            let is_exiting_task = Arc::ptr_eq(&task, &exiting_task);
             let (thread_id, was_on_cpu, last_cpu, wait_handle) = {
                 let mut task_inner = task.inner_exclusive_access();
-                task_inner.exit_code.get_or_insert(task_exit_code);
-                task_inner.task_status = TaskStatus::Zombie;
-                task_inner.wait_reason = None;
+                if !is_exiting_task {
+                    task_inner.exit_code.get_or_insert(task_exit_code);
+                    task_inner.task_status = TaskStatus::Zombie;
+                    task_inner.wait_reason = None;
+                }
                 task_inner.sched.on_rq = false;
                 task.set_resched_reason_locked(
                     &mut task_inner,
@@ -728,9 +763,20 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
             if let Some(thread_id) = thread_id {
                 remove_from_tid2task(thread_id);
             }
-            if was_on_cpu && !Arc::ptr_eq(&task, &exiting_task) {
+            if was_on_cpu && !is_exiting_task {
                 running_harts.push(last_cpu);
                 running_tasks.push(Arc::clone(&task));
+                continue;
+            }
+            if is_exiting_task {
+                // Keep the exit owner schedulable until lock-free filesystem
+                // writeback below has finished. Its user resources can still
+                // be detached because a kernel context switch only needs the
+                // TCB-owned TaskContext and kernel stack.
+                let mut task_inner = task.inner_exclusive_access();
+                if let Some(res) = task_inner.res.take() {
+                    recycle_res.push(res);
+                }
                 continue;
             }
             // if other tasks are Runnable in TaskManager or waiting for a timer to be
@@ -785,6 +831,20 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
         process.release_vfork_parent();
 
         let exit_signal = process.clone_exit_signal;
+        // Mark resident writable MAP_SHARED pages while the VMA table is
+        // locked, then perform potentially blocking writeback without the PCB
+        // SpinNoIrqLock. The current task is deliberately still installed and
+        // Running here so WaitQueue can block it for device I/O.
+        let exit_sync_plan = {
+            let process_inner = process.inner_exclusive_access();
+            process_inner
+                .memory_set
+                .prepare_msync_range(
+                    VirtAddr::from(0),
+                    VirtAddr::from(crate::mm::USER_SPACE_END),
+                )
+        };
+        let _ = exit_sync_plan.execute();
         let (closed_fds, reclaim, shm_attachments, keyrings_to_release) = {
             let mut process_inner = process.inner_exclusive_access();
             // deallocate other data in user space i.e. program code/data section
@@ -855,7 +915,7 @@ fn exit_current_and_run_next_inner(reason: ExitReason, force_process_exit: bool)
     }
     // Move the exiting task reference off the stack. The idle loop publishes
     // on_cpu=false with Release and drops it only after __switch completes.
-    add_stopping_task(exiting_task);
+    finalize_current_task_exit(exiting_task, task_exit_code);
     drop(process);
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();

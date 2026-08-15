@@ -94,7 +94,14 @@ impl WaitQueue {
 
     /// Prepare the current task for sleeping on this queue.
     pub(crate) fn prepare_to_wait(&self, reason: WaitReason) -> Arc<TaskControlBlock> {
-        let task = current_task().unwrap();
+        let task = current_task().unwrap_or_else(|| {
+            panic!(
+                "WaitQueue::prepare_to_wait without a current task: hart={} reason={:?} irqs_enabled={}",
+                crate::hal::hartid(),
+                reason,
+                crate::hal::local_irqs_enabled(),
+            )
+        });
         let mut queue = self.queue.lock();
         {
             let mut task_inner = task.inner_exclusive_access();

@@ -330,6 +330,28 @@ pub struct MemorySet {
     shared_vfork_view: bool,
 }
 
+/// A snapshot of shared file ranges that may be flushed after releasing the
+/// process address-space lock.
+pub(crate) struct FileMappingSyncPlan {
+    ranges: Vec<FileMappingSyncRange>,
+}
+
+struct FileMappingSyncRange {
+    inode: Arc<Inode>,
+    file_offset: usize,
+    byte_len: usize,
+}
+
+impl FileMappingSyncPlan {
+    /// Execute the potentially blocking page-cache writeback outside PCB locks.
+    pub(crate) fn execute(self) -> Result<(), ERRNO> {
+        for range in self.ranges {
+            sync_inode_range(&range.inode, range.file_offset, range.byte_len)?;
+        }
+        Ok(())
+    }
+}
+
 /// 用户地址空间初始化后需要交给进程管理层保存的关键边界信息。
 pub struct UserSpaceLayout {
     /// 程序数据段末尾对齐后的初始 break。
@@ -1659,10 +1681,9 @@ impl MemorySet {
 
     /// 拆除全部用户 VMA，并把旧页对象放入延迟释放批次。
     pub(crate) fn recycle_data_pages_deferred(&mut self) -> UserReleaseBatch {
-        // Process exit and exec bypass the syscall-level munmap path.  Flush
-        // shared file mappings here as well so mmap writers do not lose their
-        // output merely because the process exits or replaces its image.
-        let _ = self.msync_range(VirtAddr::from(0), VirtAddr::from(USER_SPACE_END));
+        // Exit and exec must execute prepare_msync_range() before entering
+        // this non-blocking teardown phase. Performing writeback here would
+        // sleep while the caller holds the process SpinNoIrqLock.
         if self.shared_vfork_view {
             // The root and all resident mappings belong to the parent.  The
             // vfork owner extracts VMA/page-table state explicitly before
@@ -2146,7 +2167,6 @@ impl MemorySet {
         }
 
         if destination_occupied {
-            let _ = self.msync_range(new_start_va, new_end_va);
             let mut destination_batch = self
                 .munmap_deferred(new_start_va, new_end_va)
                 .ok_or(MmError::AddressUnavailable)?;
@@ -2729,15 +2749,23 @@ impl MemorySet {
         })
     }
 
-    /// 对当前地址空间内指定范围的 MAP_SHARED 文件映射执行同步。
-    pub fn msync_range(&self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), ERRNO> {
+    /// Snapshot MAP_SHARED file ranges and mark resident writable pages dirty.
+    ///
+    /// This phase is safe while the process address-space lock is held. The
+    /// returned plan must be executed only after that lock has been released,
+    /// because page-cache writeback may wait for block-device I/O.
+    pub(crate) fn prepare_msync_range(
+        &self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> FileMappingSyncPlan {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         if start_vpn >= end_vpn {
-            return Ok(());
+            return FileMappingSyncPlan { ranges: Vec::new() };
         }
 
-        let mut synced_any = false;
+        let mut ranges = Vec::new();
         for area in self.vmas.values() {
             let Some(file) = area.file.as_ref() else {
                 continue;
@@ -2753,7 +2781,6 @@ impl MemorySet {
             let Some(inode) = file.file.backing_inode() else {
                 continue;
             };
-            synced_any = true;
             let start_idx = overlap_start.0 - area.start_vpn().0;
             let page_count = overlap_end.0 - overlap_start.0;
             let file_offset = (file.pgoff + start_idx) * PAGE_SIZE;
@@ -2776,14 +2803,14 @@ impl MemorySet {
                     mark_cached_page_dirty(page);
                 }
             }
-            sync_inode_range(&inode, file_offset, byte_len)?;
+            ranges.push(FileMappingSyncRange {
+                inode,
+                file_offset,
+                byte_len,
+            });
         }
 
-        if synced_any {
-            Ok(0).map(|_| ())
-        } else {
-            Ok(())
-        }
+        FileMappingSyncPlan { ranges }
     }
 
     /// 将 file-backed `MAP_PRIVATE` 的缓存页以只读方式直接接入页表。

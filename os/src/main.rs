@@ -2,7 +2,7 @@
 //!
 //! Various facilities of the kernels are implemented as submodules. The most
 //! important ones are:
-//!
+//! 
 //! - [`trap`]: Handles all cases of switching from userspace to the kernel
 //! - [`task`]: Task management
 //! - [`syscall`]: System call handling and implementation

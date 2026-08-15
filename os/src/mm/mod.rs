@@ -79,7 +79,7 @@ pub use memory_set::{
     unregister_file_mappings_for_process, DeferredUserReclaim, FilePageFaultPrepare, InodeKey,
     MapPermission, MemorySet, PageFaultAccess, UserSpaceLayout, Vma, VmaKind, KERNEL_SPACE,
 };
-pub(crate) use memory_set::SharedMemorySetState;
+pub(crate) use memory_set::{FileMappingSyncPlan, SharedMemorySetState};
 pub use oom::{log_oom, warn_heap_state};
 #[cfg(feature = "cosmos-meminfo")]
 pub use page_table::{page_table_stats, reset_page_table_stats, PageTableStats};
