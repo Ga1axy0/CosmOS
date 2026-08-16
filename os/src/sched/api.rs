@@ -28,6 +28,7 @@ fn suspend_current_and_run_next_inner(
     // for consistency and to guard against future regressions.)
     let _irq = crate::hal::LocalIrqSave::new();
     let task = take_current_task().unwrap();
+    super::bais::on_task_stopping(&task, hartid());
     let task_cx_ptr = {
         let mut task_inner = task.inner_exclusive_access();
         task_inner.account_cfs_runtime(get_time_ns());
@@ -126,6 +127,7 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         restore_current_task(task);
         return;
     }
+    super::bais::on_task_stopping(&task, hartid());
     let process = task.process.upgrade().unwrap();
     if boost_same_process_cfs {
         let boost_candidates = {

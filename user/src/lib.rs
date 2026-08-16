@@ -538,6 +538,16 @@ pub fn getcpu() -> isize {
     }
 }
 
+pub const BAIS_HINT_REGISTER: usize = 1;
+pub const BAIS_HINT_PHASE_START: usize = 2;
+pub const BAIS_HINT_PROGRESS: usize = 3;
+pub const BAIS_HINT_ARRIVED: usize = 4;
+pub const BAIS_HINT_UNREGISTER: usize = 5;
+
+pub fn bais_hint(op: usize, value: usize) -> isize {
+    sys_bais_hint(op, value)
+}
+
 pub fn getitimer(which: i32, value: &mut Itimerval) -> isize {
     sys_getitimer(which, value as *mut _)
 }

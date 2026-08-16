@@ -38,6 +38,7 @@ use crate::{
     drivers,
     poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT},
     sync::SpinNoIrqLock,
+    task::{SchedAttr, TaskControlBlock, WaitQueue, WaitReason},
     timer::get_time_us,
 };
 
@@ -123,6 +124,9 @@ fn external_ipv4_config() -> Option<ExternalIpv4Config> {
 lazy_static! {
     /// Global network stack instance.
     pub(crate) static ref NET_STACK: SpinNoIrqLock<Option<NetStack>> = SpinNoIrqLock::new(None);
+    static ref NET_WORKER_WAIT: WaitQueue = WaitQueue::new();
+    static ref NET_WORKER_TASK: SpinNoIrqLock<Option<Arc<TaskControlBlock>>> =
+        SpinNoIrqLock::new(None);
 }
 
 /// Whether one immediate poll is needed due to IRQ or recent TX activity.
@@ -130,6 +134,9 @@ pub(crate) static NEED_POLL: AtomicBool = AtomicBool::new(false);
 /// Next soft deadline (us since boot) for calling into smoltcp.
 /// `u64::MAX` means no timer-driven deadline currently exists.
 pub(crate) static NEXT_POLL_DEADLINE_US: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_US);
+/// Set when IRQ or timer code has queued a network bottom-half run.
+static NET_WORK_PENDING: AtomicBool = AtomicBool::new(false);
+static NET_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "net_perf_counters")]
 static PERF_POLL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -554,8 +561,52 @@ pub fn init() {
 
 /// Notify the net stack that one NIC IRQ has arrived.
 pub fn notify_irq() {
+    crate::sched::note_bais_net_irq(crate::hal::hartid());
     NEED_POLL.store(true, Ordering::Release);
     NEXT_POLL_DEADLINE_US.store(0, Ordering::Release);
+    schedule_poll();
+}
+
+#[inline]
+fn net_worker_has_work() -> bool {
+    NET_WORK_PENDING.load(Ordering::Acquire) || NEED_POLL.load(Ordering::Acquire)
+}
+
+fn net_poll_worker_main() -> ! {
+    info!("[kernel] net: deferred poll worker started");
+    loop {
+        let requested = NET_WORK_PENDING.swap(false, Ordering::AcqRel);
+        if requested || NEED_POLL.load(Ordering::Acquire) {
+            let start_ns = crate::timer::get_time_ns();
+            drivers::net::service_deferred();
+            poll();
+            crate::sched::account_bais_net_deferred(
+                crate::hal::hartid(),
+                crate::timer::get_time_ns().saturating_sub(start_ns),
+            );
+            continue;
+        }
+        NET_WORKER_WAIT.wait_with_reason_or_skip(WaitReason::NetPoll, net_worker_has_work);
+    }
+}
+
+/// Start the scheduler-visible network bottom-half worker.
+pub fn start_worker() {
+    if NET_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let task = crate::task::spawn_kernel_thread(net_poll_worker_main, SchedAttr::other(0));
+    *NET_WORKER_TASK.lock() = Some(task);
+    schedule_poll();
+}
+
+/// Queue one network poll in task context. Safe to call from hardirq context.
+pub fn schedule_poll() {
+    NET_WORK_PENDING.store(true, Ordering::Release);
+    NET_WORKER_WAIT.wake_all();
 }
 
 /// Poll network stack once.
@@ -582,7 +633,7 @@ pub fn poll() {
     stack.poll();
 }
 
-/// Poll from the periodic timer path only when smoltcp has pending work.
+/// Ask the deferred worker to poll when smoltcp has pending or expired work.
 pub fn poll_timer_tick() {
     if !NEED_POLL.load(Ordering::Acquire) {
         let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
@@ -594,7 +645,7 @@ pub fn poll_timer_tick() {
         }
     }
 
-    poll();
+    schedule_poll();
 }
 
 /// Return `(tcp, udp)` live socket-state counts for diagnostics

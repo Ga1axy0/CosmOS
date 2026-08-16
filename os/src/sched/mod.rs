@@ -5,6 +5,7 @@
 
 mod api;
 mod autogroup;
+mod bais;
 mod context;
 mod policy;
 mod processor;
@@ -17,6 +18,17 @@ pub use api::{
     suspend_current_and_run_next_with_slice_reset, yield_current_and_run_next,
 };
 pub use autogroup::{autogroup_enabled, set_autogroup_enabled};
+pub use bais::{
+    account_ai_device_control as account_bais_ai_device_control,
+    account_ai_memory_control as account_bais_ai_memory_control,
+    account_ai_other_syscall as account_bais_ai_other_syscall,
+    account_ai_page_fault as account_bais_ai_page_fault,
+    account_block_deferred as account_bais_block_deferred, account_irq as account_bais_irq,
+    account_net_deferred as account_bais_net_deferred, apply_control as apply_bais_control,
+    enabled as bais_enabled,
+    hint_current as bais_hint_current, note_block_irq as note_bais_block_irq,
+    note_net_irq as note_bais_net_irq, render as render_bais,
+};
 pub use context::TaskContext;
 pub use policy::{
     clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, CFS_MIN_GRANULARITY_NS,

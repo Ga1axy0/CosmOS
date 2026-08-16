@@ -15,6 +15,7 @@ LOOP_FAT32_MNT_DIR="${LOOP_FAT32_MNT_DIR:-root/loop-fat32-mnt}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 USER_APP_SRC_DIR="${USER_APP_SRC_DIR:-$PROJECT_ROOT/user/src/bin}"
+EXTRA_ROOTFS_DIR="${EXTRA_ROOTFS_DIR:-}"
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -54,6 +55,14 @@ cleanup() {
 trap cleanup EXIT
 
 cp -a "$ROOTFS_DIR"/. "$STAGE_DIR"/
+
+if [ -n "$EXTRA_ROOTFS_DIR" ]; then
+    if [ ! -d "$EXTRA_ROOTFS_DIR" ]; then
+        echo "extra rootfs directory not found: $EXTRA_ROOTFS_DIR" >&2
+        exit 1
+    fi
+    cp -a "$EXTRA_ROOTFS_DIR"/. "$STAGE_DIR"/
+fi
 
 if [ ! -d "$STAGE_DIR/root" ]; then
     echo "rootfs must contain /root before packing" >&2

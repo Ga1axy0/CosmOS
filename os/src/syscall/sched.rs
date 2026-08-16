@@ -683,3 +683,12 @@ pub fn sys_sched_getaffinity(pid: isize, cpusetsize: usize, mask: *mut u8) -> is
         Ok(kernel_mask_size as isize)
     })
 }
+
+/// Pass fork-join phase information to the native BAIS scheduler.
+pub fn sys_bais_hint(op: usize, value: usize) -> isize {
+    if crate::sched::bais_hint_current(op, value) {
+        0
+    } else {
+        -(ERRNO::EINVAL as isize)
+    }
+}

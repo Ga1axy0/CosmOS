@@ -195,6 +195,8 @@ pub(crate) fn run_tasks() {
             }
             drop(task_inner);
 
+            super::bais::on_task_running(&task, hartid());
+
             processor.current = Some(task);
             #[cfg(feature = "current_task_cache")]
             publish_current_task(processor.current.as_ref());

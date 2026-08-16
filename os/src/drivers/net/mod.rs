@@ -56,6 +56,15 @@ impl NetworkDevice {
         }
     }
 
+    /// Run controller work that is intentionally excluded from hardirq context.
+    pub(crate) fn service_deferred(&self) {
+        match self {
+            Self::Virtio(dev) => dev.service_deferred(),
+            #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
+            Self::LoongsonGmac(_) => {}
+        }
+    }
+
     /// Return whether the transmit ring can accept one frame.
     pub(crate) fn can_send(&self) -> bool {
         match self {
@@ -207,4 +216,15 @@ pub fn handle_irq(irq: u32) -> bool {
 pub(crate) fn with_device<R>(f: impl FnOnce(&Arc<NetworkDevice>) -> R) -> Option<R> {
     let guard = NET_DEVICE.lock();
     guard.as_ref().map(f)
+}
+
+/// Service deferred NIC completions in scheduler task context.
+pub(crate) fn service_deferred() {
+    let dev = {
+        let guard = NET_DEVICE.lock();
+        guard.as_ref().cloned()
+    };
+    if let Some(dev) = dev {
+        dev.service_deferred();
+    }
 }

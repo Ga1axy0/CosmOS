@@ -242,6 +242,8 @@ pub const SYSCALL_UMASK: usize = 166;
 pub const SYSCALL_PRCTL: usize = 167;
 /// getcpu
 pub const SYSCALL_GETCPU: usize = 168;
+/// CosmOS-native BAIS phase/progress hint.
+pub const SYSCALL_BAIS_HINT: usize = 480;
 /// gettimeofday syscall
 pub const SYSCALL_GETTIMEOFDAY: usize = 169;
 /// settimeofday syscall
@@ -836,6 +838,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_SYNCFS => sys_syncfs(args[0] as u32),
         SYSCALL_GETCPU => sys_getcpu(args[0] as *mut u32, args[1] as *mut u32),
+        SYSCALL_BAIS_HINT => sys_bais_hint(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_SOCKET => sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
         SYSCALL_SOCKETPAIR => sys_socketpair(

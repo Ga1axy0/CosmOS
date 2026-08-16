@@ -525,6 +525,8 @@ pub enum WaitReason {
     Poll,
     /// Waiting for network device TX completion.
     NetDeviceTx,
+    /// Background network stack worker waiting for deferred poll work.
+    NetPoll,
     /// Waiting for socket data to become readable.
     SocketReadable,
     /// Waiting for socket buffer space / writable state.

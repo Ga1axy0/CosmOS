@@ -32,7 +32,14 @@ use crate::task::{
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
     exit_group_current_and_run_next, ExitReason,
 };
-use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+use crate::timer::{get_realtime_ns, get_time, get_time_ns, handle_timer_interrupt};
+
+#[inline]
+fn handle_external_interrupt() {
+    let start_ns = get_time_ns();
+    crate::platform::handle_external_irq();
+    crate::sched::account_bais_irq(hartid(), get_time_ns().saturating_sub(start_ns));
+}
 
 /// Diagnostic-only lmbench-null/getppid path.
 ///
@@ -394,6 +401,51 @@ fn handle_reschedule_ipi() {
     request_current_task_resched(ReschedReason::HigherRtPriority);
 }
 
+#[derive(Clone, Copy)]
+enum BaisTrapService {
+    None,
+    PageFault,
+    MemoryControl,
+    DeviceControl,
+    OtherSyscall,
+}
+
+fn classify_bais_syscall(syscall_id: usize) -> BaisTrapService {
+    use crate::syscall::*;
+    if syscall_id == SYSCALL_BAIS_HINT {
+        return BaisTrapService::None;
+    }
+    if matches!(
+        syscall_id,
+        SYSCALL_BRK
+            | SYSCALL_MMAP
+            | SYSCALL_MUNMAP
+            | SYSCALL_MREMAP
+            | SYSCALL_MPROTECT
+            | SYSCALL_MSYNC
+            | SYSCALL_MADVISE
+    ) {
+        return BaisTrapService::MemoryControl;
+    }
+    if matches!(
+        syscall_id,
+        SYSCALL_IOCTL
+            | SYSCALL_READ
+            | SYSCALL_WRITE
+            | SYSCALL_READV
+            | SYSCALL_WRITEV
+            | SYSCALL_PREAD64
+            | SYSCALL_PWRITE64
+            | SYSCALL_PREADV
+            | SYSCALL_PWRITEV
+            | SYSCALL_FSYNC
+            | SYSCALL_FDATASYNC
+    ) {
+        return BaisTrapService::DeviceControl;
+    }
+    BaisTrapService::OtherSyscall
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -425,6 +477,8 @@ pub fn trap_handler() -> ! {
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
     let trap_info = ArchTrapMachine::read_trap_info();
+    let bais_service_start_ns = get_time_ns();
+    let mut bais_service = BaisTrapService::None;
     match trap_info.cause {
         TrapCause::UserSyscall => {
             #[cfg(not(feature = "trap_irq_guard_probe"))]
@@ -432,6 +486,7 @@ pub fn trap_handler() -> ! {
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
             let syscall_id = cx.syscall_nr();
+            bais_service = classify_bais_syscall(syscall_id);
             let syscall_args = cx.syscall_args();
             cx.save_syscall_arg0_for_restart();
             cx.restartable_syscall = syscall_supports_sa_restart(syscall_id);
@@ -453,6 +508,7 @@ pub fn trap_handler() -> ! {
             cx.in_syscall = true;
         }
         TrapCause::StorePageFault => {
+            bais_service = BaisTrapService::PageFault;
             let _probe = crate::probe_scope!("trap.user_page_fault.store");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             trace!(
@@ -532,6 +588,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::LoadPageFault => {
+            bais_service = BaisTrapService::PageFault;
             let _probe = crate::probe_scope!("trap.user_page_fault.load");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // debug!(
@@ -579,6 +636,7 @@ pub fn trap_handler() -> ! {
             }
         }
         TrapCause::InstructionPageFault => {
+            bais_service = BaisTrapService::PageFault;
             let _probe = crate::probe_scope!("trap.user_page_fault.exec");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             trace!(
@@ -713,7 +771,7 @@ pub fn trap_handler() -> ! {
                     {
                         let now_raw = get_time();
                         check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                        crate::net::poll();
+                        crate::net::poll_timer_tick();
                         #[cfg(feature = "mm_perf_counters")]
                         crate::perf_sampler::on_tick(now_raw);
                         on_timer_tick();
@@ -728,14 +786,45 @@ pub fn trap_handler() -> ! {
         }
         TrapCause::ExternalInterrupt => {
             let _hardirq = irq::HardIrqGuard::enter();
-            crate::platform::handle_external_irq();
-            crate::net::poll();
+            handle_external_interrupt();
         }
         _ => {
             panic!(
                 "Unsupported trap {:?}, fault_addr = {:#x}!",
                 trap_info.cause, trap_info.fault_addr
             );
+        }
+    }
+    let bais_service_elapsed_ns = get_time_ns().saturating_sub(bais_service_start_ns);
+    match bais_service {
+        BaisTrapService::None => {}
+        BaisTrapService::PageFault => {
+            crate::sched::account_bais_ai_page_fault(
+                hartid(),
+                bais_service_start_ns,
+                bais_service_elapsed_ns,
+            )
+        }
+        BaisTrapService::MemoryControl => {
+            crate::sched::account_bais_ai_memory_control(
+                hartid(),
+                bais_service_start_ns,
+                bais_service_elapsed_ns,
+            )
+        }
+        BaisTrapService::DeviceControl => {
+            crate::sched::account_bais_ai_device_control(
+                hartid(),
+                bais_service_start_ns,
+                bais_service_elapsed_ns,
+            )
+        }
+        BaisTrapService::OtherSyscall => {
+            crate::sched::account_bais_ai_other_syscall(
+                hartid(),
+                bais_service_start_ns,
+                bais_service_elapsed_ns,
+            )
         }
     }
     // check signals
@@ -822,8 +911,7 @@ fn trap_from_kernel_impl(
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::ExternalInterrupt => {
-            crate::platform::handle_external_irq();
-            crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
+            handle_external_interrupt();
         }
         TrapCause::TimerInterrupt => {
             // trace!("hart {} timer tick", hartid());
@@ -832,7 +920,7 @@ fn trap_from_kernel_impl(
                     {
                         let now_raw = get_time();
                         check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                        crate::net::poll();
+                        crate::net::poll_timer_tick();
                         #[cfg(feature = "mm_perf_counters")]
                         crate::perf_sampler::on_tick(now_raw);
                         // Account CPU time spent while the current task executes in kernel

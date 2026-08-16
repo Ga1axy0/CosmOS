@@ -50,6 +50,7 @@ pub const SYSCALL_SCHED_GETPARAM: usize = 121;
 pub const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 pub const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 pub const SYSCALL_GETCPU: usize = 168;
+pub const SYSCALL_BAIS_HINT: usize = 480;
 pub const SYSCALL_SETPGID: usize = 154;
 pub const SYSCALL_GETPGID: usize = 155;
 pub const SYSCALL_GETSID: usize = 156;
@@ -463,6 +464,10 @@ pub fn sys_clock_gettime(clockid: i32, tp: *mut Timespec) -> isize {
 
 pub fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> isize {
     syscall(SYSCALL_GETCPU, [cpu as usize, node as usize, 0])
+}
+
+pub fn sys_bais_hint(op: usize, value: usize) -> isize {
+    syscall(SYSCALL_BAIS_HINT, [op, value, 0])
 }
 
 pub fn sys_getpid() -> isize {
