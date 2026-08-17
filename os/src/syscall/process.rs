@@ -19,10 +19,10 @@ use crate::{
     hal::hartid,
     ipc::{self, IPC_RMID},
     task::{
-        current_process, current_task, current_trap_cx,
-        exit_current_and_run_next, exit_group_current_and_run_next, reclaim_cached_kstacks,
-        thread_id2task, CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock,
-        ShmAttachment, SigInfo, SignalBit, TaskUserResAlloc, WaitReason,
+        current_process, current_task, current_trap_cx, exit_current_and_run_next,
+        exit_group_current_and_run_next, reclaim_cached_kstacks, thread_id2task,
+        CloneResourceFlags, ExitReason, FdEntry, ProcessControlBlock, ShmAttachment, SigInfo,
+        SignalBit, TaskUserResAlloc, WaitReason,
     },
 };
 
@@ -1438,11 +1438,7 @@ fn sys_clone_request(req: CloneRequest) -> isize {
         } = req;
         let clone_flags_arg = flags | exit_signal;
         let caller_task = current_task().ok_or(ERRNO::ESRCH)?;
-        let caller_pid = caller_task
-            .process
-            .upgrade()
-            .ok_or(ERRNO::ESRCH)?
-            .getpid();
+        let caller_pid = caller_task.process.upgrade().ok_or(ERRNO::ESRCH)?.getpid();
         let caller_tid = caller_task
             .inner_exclusive_access()
             .res

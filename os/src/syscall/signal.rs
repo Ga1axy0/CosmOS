@@ -225,7 +225,10 @@ pub fn sys_sigaction(
                 match translated_ref(token, word_ptr) {
                     Some(word) => trace!(
                         "sys_sigaction signum={} raw action[{}] addr={:#x} value={:#x}",
-                        signum, i, word_ptr as usize, *word
+                        signum,
+                        i,
+                        word_ptr as usize,
+                        *word
                     ),
                     None => warn!(
                         "sys_sigaction raw action[{}] addr={:#x} unreadable",
@@ -267,7 +270,9 @@ pub fn sys_sigaction(
             write_pod_to_user(old_action, &user_old)?;
             trace!(
                 "sys_sigaction: signum={}, returning old handler={:#x}, flags={:#x}",
-                signum, old.handler, old.sa_flags
+                signum,
+                old.handler,
+                old.sa_flags
             );
         }
 

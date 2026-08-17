@@ -8,8 +8,8 @@ use super::{pid_alloc, PidHandle};
 use super::{SigInfo, SignalAction, SignalActions, SignalBit, MAX_SIG, SIG_IGN};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{
-    canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription,
-    OSInode, OpenFlags,
+    canonicalize, mapping_for_inode, new_stdio_files, open_file_at, File, FileDescription, OSInode,
+    OpenFlags,
 };
 use crate::hal::traits::AddressSpaceToken;
 use crate::ipc;
@@ -619,7 +619,7 @@ fn resolve_init_image(
     }
 
     let abs_path = canonicalize(cwd, path);
-    let inode = open_file_at(cwd, path, OpenFlags::RDONLY).map_err(|_| ERRNO::ENOENT)?;
+    let inode = open_file_at(cwd, path, OpenFlags::RDONLY)?;
     if inode.is_dir() {
         return Err(ERRNO::EISDIR);
     }
@@ -2313,38 +2313,37 @@ impl ProcessControlBlock {
         } else {
             mapping.try_get_page(plan.page_idx)?
         };
-        let fault_around_pages =
-            (matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
-                && (plan.shared || !plan.map_perm.contains(MapPermission::W)))
-            .then(|| {
-                let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
-                let first_vpn = aligned_start.max(plan.vma_start.0);
-                let end_vpn = aligned_start
-                    .saturating_add(FILE_FAULT_AROUND_PAGES)
-                    .min(plan.vma_end.0);
-                let first_page_idx = plan
-                    .pgoff
-                    .saturating_add(first_vpn.saturating_sub(plan.vma_start.0))
-                    as u64;
-                let mut pages: Vec<_> = mapping
-                    .cached_uptodate_pages(first_page_idx, end_vpn.saturating_sub(first_vpn))
-                    .into_iter()
-                    .filter_map(|(page_idx, cached_page)| {
-                        let delta = page_idx.checked_sub(first_page_idx)? as usize;
-                        Some((
-                            crate::mm::VirtPageNum(first_vpn.saturating_add(delta)),
-                            cached_page,
-                        ))
-                    })
-                    .collect();
-                // Preserve the existing demand-fault guarantee even if a
-                // concurrent reclaim removed the page from the mapping
-                // between loading it above and scanning the resident range.
-                if !pages.iter().any(|(vpn, _)| *vpn == plan.vpn) {
-                    pages.push((plan.vpn, Arc::clone(&page)));
-                }
-                pages
-            });
+        let fault_around_pages = (matches!(access, PageFaultAccess::Read | PageFaultAccess::Exec)
+            && (plan.shared || !plan.map_perm.contains(MapPermission::W)))
+        .then(|| {
+            let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
+            let first_vpn = aligned_start.max(plan.vma_start.0);
+            let end_vpn = aligned_start
+                .saturating_add(FILE_FAULT_AROUND_PAGES)
+                .min(plan.vma_end.0);
+            let first_page_idx = plan
+                .pgoff
+                .saturating_add(first_vpn.saturating_sub(plan.vma_start.0))
+                as u64;
+            let mut pages: Vec<_> = mapping
+                .cached_uptodate_pages(first_page_idx, end_vpn.saturating_sub(first_vpn))
+                .into_iter()
+                .filter_map(|(page_idx, cached_page)| {
+                    let delta = page_idx.checked_sub(first_page_idx)? as usize;
+                    Some((
+                        crate::mm::VirtPageNum(first_vpn.saturating_add(delta)),
+                        cached_page,
+                    ))
+                })
+                .collect();
+            // Preserve the existing demand-fault guarantee even if a
+            // concurrent reclaim removed the page from the mapping
+            // between loading it above and scanning the resident range.
+            if !pages.iter().any(|(vpn, _)| *vpn == plan.vpn) {
+                pages.push((plan.vpn, Arc::clone(&page)));
+            }
+            pages
+        });
         let fault_flush_range = fault_around_pages.as_ref().and_then(|pages| {
             let first_vpn = pages.iter().map(|(vpn, _)| *vpn).min()?;
             let last_vpn = pages.iter().map(|(vpn, _)| *vpn).max()?;

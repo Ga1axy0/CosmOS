@@ -2,9 +2,7 @@ use super::cgroupfs::{new_cgroup2_root, CgroupDirNode};
 use super::devfs::{CpuDmaLatencyNode, NullDevNode, UrandomDevNode};
 use super::rootfs::{VirtualDirNode, VIRT_ROOT};
 use super::tmpfs::new_tmpfs_root;
-use super::{
-    discard_inode, page_cache, File, FileReadAheadPlan, Stat, StatFs64, StatMode,
-};
+use super::{discard_inode, page_cache, File, FileReadAheadPlan, Stat, StatFs64, StatMode};
 use crate::drivers::block::{block_device_name, BLOCK_DEVICES};
 use crate::fs::devfs::{
     ensure_ltp_scratch_device, BlockDevNode, DevRootNode, RtcDevNode, ZeroDevNode,
@@ -85,12 +83,7 @@ impl OSInode {
             }
         }
         if let (Some(mapping), Some(plan)) = (mapping.as_ref(), read_ahead) {
-            mapping.prefetch_for_sequential_read(
-                plan.start,
-                plan.len,
-                offset,
-                total_read_size,
-            );
+            mapping.prefetch_for_sequential_read(plan.start, plan.len, offset, total_read_size);
         }
         total_read_size
     }
