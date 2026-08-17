@@ -1,5 +1,7 @@
 //! VirtIO network device discovery and IRQ dispatch.
 
+#[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+mod jh7110_eqos;
 #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
 mod loongson_gmac;
 mod virtio_net;
@@ -15,9 +17,31 @@ use virtio_drivers::transport::{
 
 use crate::sync::SpinNoIrqLock;
 
+#[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+use jh7110_eqos::Jh7110EqosDevice;
 #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
 use loongson_gmac::LoongsonGmacDevice;
 pub use virtio_net::VirtIONetDevice;
+
+/// Read-only JH7110 EQoS hardware state used by the temporary net diagnostics.
+#[cfg(feature = "net_perf_counters")]
+pub(crate) struct NetHardwareDebug {
+    pub(crate) mmc_control: u32,
+    pub(crate) mmc_tx_frames_gb: u64,
+    pub(crate) mmc_tx_good_frames: u64,
+    pub(crate) mmc_tx_underflow: u64,
+    pub(crate) mmc_tx_late_collision: u64,
+    pub(crate) mmc_tx_carrier_error: u64,
+    pub(crate) mmc_rx_frames_gb: u64,
+    pub(crate) mmc_rx_crc_error: u64,
+    pub(crate) dma_status: u32,
+    pub(crate) dma_interrupt_enable: u32,
+    pub(crate) mtl_txq_debug: u32,
+    pub(crate) tx_tail: u32,
+    pub(crate) tx_next: usize,
+    pub(crate) tx_owned_by_dma: usize,
+    pub(crate) tx_error_summary: usize,
+}
 
 /// Runtime-selected Ethernet controller exposed to the kernel network stack.
 pub(crate) enum NetworkDevice {
@@ -26,6 +50,9 @@ pub(crate) enum NetworkDevice {
     /// The LS2K1000 integrated DesignWare GMAC.
     #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
     LoongsonGmac(LoongsonGmacDevice),
+    /// The JH7110 integrated Synopsys EQoS 5.20 controller.
+    #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+    Jh7110Eqos(Jh7110EqosDevice),
 }
 
 impl NetworkDevice {
@@ -35,6 +62,8 @@ impl NetworkDevice {
             Self::Virtio(dev) => dev.irq(),
             #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
             Self::LoongsonGmac(dev) => dev.irq(),
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.irq(),
         }
     }
 
@@ -44,6 +73,8 @@ impl NetworkDevice {
             Self::Virtio(dev) => dev.mac_address(),
             #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
             Self::LoongsonGmac(dev) => dev.mac_address(),
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.mac_address(),
         }
     }
 
@@ -53,6 +84,26 @@ impl NetworkDevice {
             Self::Virtio(dev) => dev.handle_irq(),
             #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
             Self::LoongsonGmac(dev) => dev.handle_irq(),
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.handle_irq(),
+        }
+    }
+
+    /// Complete one deferred network poll and re-arm device interrupts.
+    pub(crate) fn complete_poll(&self) -> bool {
+        match self {
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.complete_poll(),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "net_perf_counters")]
+    pub(crate) fn hardware_debug(&self) -> Option<NetHardwareDebug> {
+        match self {
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => Some(dev.hardware_debug()),
+            _ => None,
         }
     }
 
@@ -62,6 +113,8 @@ impl NetworkDevice {
             Self::Virtio(dev) => dev.can_send(),
             #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
             Self::LoongsonGmac(dev) => dev.can_send(),
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.can_send(),
         }
     }
 
@@ -77,6 +130,8 @@ impl NetworkDevice {
             },
             #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
             Self::LoongsonGmac(dev) => dev.try_send(frame),
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.try_send(frame),
         }
     }
 
@@ -86,6 +141,8 @@ impl NetworkDevice {
             Self::Virtio(dev) => dev.try_recv(out),
             #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
             Self::LoongsonGmac(dev) => dev.try_recv(out),
+            #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+            Self::Jh7110Eqos(dev) => dev.try_recv(out),
         }
     }
 }
@@ -138,6 +195,29 @@ pub fn probe_loongson_gmac() -> Option<u32> {
     let irq = dev.irq();
     *NET_DEVICE.lock() = Some(Arc::new(NetworkDevice::LoongsonGmac(dev)));
     println!("[net] LS2K1000 GMAC registered on IRQ {}", irq);
+    Some(irq)
+}
+
+/// Probe the JH7110 EQoS port used by the successful U-Boot TFTP path.
+#[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+pub fn probe_jh7110_eqos() -> Option<u32> {
+    let info = crate::bootinfo::get();
+    let preferred = info
+        .gmac_devices()
+        .find(|resource| resource.device().start == 0x1604_0000)
+        .or_else(|| info.gmac_devices().next());
+    let Some(resource) = preferred else {
+        println!("[jh7110-eqos] live FDT has no supported EQoS resource");
+        return None;
+    };
+    println!("[jh7110-eqos] probing resource {:?}", resource);
+    let Some(dev) = Jh7110EqosDevice::try_new(resource) else {
+        println!("[jh7110-eqos] native initialization failed");
+        return None;
+    };
+    let irq = dev.irq();
+    *NET_DEVICE.lock() = Some(Arc::new(NetworkDevice::Jh7110Eqos(dev)));
+    println!("[jh7110-eqos] registered interrupt-driven network device");
     Some(irq)
 }
 
@@ -207,4 +287,9 @@ pub fn handle_irq(irq: u32) -> bool {
 pub(crate) fn with_device<R>(f: impl FnOnce(&Arc<NetworkDevice>) -> R) -> Option<R> {
     let guard = NET_DEVICE.lock();
     guard.as_ref().map(f)
+}
+
+#[cfg(feature = "net_perf_counters")]
+pub(crate) fn hardware_debug() -> Option<NetHardwareDebug> {
+    with_device(|device| device.hardware_debug()).flatten()
 }

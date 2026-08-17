@@ -34,6 +34,8 @@ use smoltcp::{
     },
 };
 
+#[cfg(feature = "platform-visionfive2")]
+use crate::task::{SchedAttr, WaitQueue, WaitReason};
 use crate::{
     drivers,
     poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT},
@@ -106,7 +108,7 @@ struct ExternalIpv4Config {
     gateway: Option<Ipv4Address>,
 }
 
-#[cfg(not(feature = "platform-ls2k1000-nebula"))]
+#[cfg(not(any(feature = "platform-ls2k1000-nebula", feature = "platform-visionfive2")))]
 fn external_ipv4_config() -> Option<ExternalIpv4Config> {
     Some(ExternalIpv4Config {
         address: Ipv4Address::new(10, 0, 2, 15),
@@ -115,7 +117,7 @@ fn external_ipv4_config() -> Option<ExternalIpv4Config> {
     })
 }
 
-#[cfg(feature = "platform-ls2k1000-nebula")]
+#[cfg(any(feature = "platform-ls2k1000-nebula", feature = "platform-visionfive2"))]
 fn external_ipv4_config() -> Option<ExternalIpv4Config> {
     None
 }
@@ -125,14 +127,27 @@ lazy_static! {
     pub(crate) static ref NET_STACK: SpinNoIrqLock<Option<NetStack>> = SpinNoIrqLock::new(None);
 }
 
+#[cfg(feature = "platform-visionfive2")]
+lazy_static! {
+    static ref NET_WORKER_WAIT: WaitQueue = WaitQueue::new();
+}
+
 /// Whether one immediate poll is needed due to IRQ or recent TX activity.
 pub(crate) static NEED_POLL: AtomicBool = AtomicBool::new(false);
 /// Next soft deadline (us since boot) for calling into smoltcp.
 /// `u64::MAX` means no timer-driven deadline currently exists.
 pub(crate) static NEXT_POLL_DEADLINE_US: AtomicU64 = AtomicU64::new(NO_POLL_DEADLINE_US);
+#[cfg(feature = "platform-visionfive2")]
+static NET_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "net_perf_counters")]
 static PERF_POLL_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_IRQ_NOTIFIES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_WORKER_LOOPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "net_perf_counters")]
+static PERF_REARM_RACES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "net_perf_counters")]
 static PERF_POLL_SOCKET_WORK_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "net_perf_counters")]
@@ -270,6 +285,9 @@ pub(crate) fn perf_udp_user_recv(_bytes: usize) {}
 pub(crate) fn reset_perf_counters() {
     for counter in [
         &PERF_POLL_CALLS,
+        &PERF_IRQ_NOTIFIES,
+        &PERF_WORKER_LOOPS,
+        &PERF_REARM_RACES,
         &PERF_POLL_SOCKET_WORK_CALLS,
         &PERF_POLL_SOCKET_WORK_DEEP,
         &PERF_POLL_SOCKET_WORK_LIGHT,
@@ -309,6 +327,9 @@ pub(crate) fn render_perf_counters() -> String {
     let mut out = String::new();
     let _ = writeln!(&mut out, "net:");
     let _ = writeln!(&mut out, "  poll_calls {}", perf_load(&PERF_POLL_CALLS));
+    let _ = writeln!(&mut out, "  irq_notifies {}", perf_load(&PERF_IRQ_NOTIFIES));
+    let _ = writeln!(&mut out, "  worker_loops {}", perf_load(&PERF_WORKER_LOOPS));
+    let _ = writeln!(&mut out, "  rearm_races {}", perf_load(&PERF_REARM_RACES));
     let _ = writeln!(
         &mut out,
         "  poll_socket_work_calls {}",
@@ -393,6 +414,36 @@ pub(crate) fn render_perf_counters() -> String {
         perf_load(&PERF_VIRTIO_RX_FRAMES)
     );
     let _ = writeln!(&mut out, "  rx_bytes {}", perf_load(&PERF_VIRTIO_RX_BYTES));
+    if let Some(hw) = drivers::net::hardware_debug() {
+        let _ = writeln!(&mut out, "eqos_hw:");
+        let _ = writeln!(&mut out, "  mmc_control {:#010x}", hw.mmc_control);
+        let _ = writeln!(&mut out, "  mmc_tx_frames_gb {}", hw.mmc_tx_frames_gb);
+        let _ = writeln!(&mut out, "  mmc_tx_good_frames {}", hw.mmc_tx_good_frames);
+        let _ = writeln!(&mut out, "  mmc_tx_underflow {}", hw.mmc_tx_underflow);
+        let _ = writeln!(
+            &mut out,
+            "  mmc_tx_late_collision {}",
+            hw.mmc_tx_late_collision
+        );
+        let _ = writeln!(
+            &mut out,
+            "  mmc_tx_carrier_error {}",
+            hw.mmc_tx_carrier_error
+        );
+        let _ = writeln!(&mut out, "  mmc_rx_frames_gb {}", hw.mmc_rx_frames_gb);
+        let _ = writeln!(&mut out, "  mmc_rx_crc_error {}", hw.mmc_rx_crc_error);
+        let _ = writeln!(&mut out, "  dma_status {:#010x}", hw.dma_status);
+        let _ = writeln!(
+            &mut out,
+            "  dma_interrupt_enable {:#010x}",
+            hw.dma_interrupt_enable
+        );
+        let _ = writeln!(&mut out, "  mtl_txq_debug {:#010x}", hw.mtl_txq_debug);
+        let _ = writeln!(&mut out, "  tx_tail {:#010x}", hw.tx_tail);
+        let _ = writeln!(&mut out, "  tx_next {}", hw.tx_next);
+        let _ = writeln!(&mut out, "  tx_owned_by_dma {}", hw.tx_owned_by_dma);
+        let _ = writeln!(&mut out, "  tx_error_summary {}", hw.tx_error_summary);
+    }
     let _ = writeln!(&mut out, "udp:");
     let _ = writeln!(
         &mut out,
@@ -554,8 +605,19 @@ pub fn init() {
 
 /// Notify the net stack that one NIC IRQ has arrived.
 pub fn notify_irq() {
+    #[cfg(feature = "net_perf_counters")]
+    perf_inc(&PERF_IRQ_NOTIFIES);
     NEED_POLL.store(true, Ordering::Release);
     NEXT_POLL_DEADLINE_US.store(0, Ordering::Release);
+    #[cfg(feature = "platform-visionfive2")]
+    NET_WORKER_WAIT.wake_all();
+}
+
+/// Notify the deferred worker that protocol or socket TX work was queued.
+pub(crate) fn notify_tx() {
+    NEED_POLL.store(true, Ordering::Release);
+    #[cfg(feature = "platform-visionfive2")]
+    NET_WORKER_WAIT.wake_all();
 }
 
 /// Poll network stack once.
@@ -580,21 +642,77 @@ pub fn poll() {
     };
 
     stack.poll();
+    drop(guard);
+    #[cfg(feature = "platform-visionfive2")]
+    if drivers::net::with_device(|device| device.complete_poll()).unwrap_or(false) {
+        #[cfg(feature = "net_perf_counters")]
+        perf_inc(&PERF_REARM_RACES);
+        // A completion raced with interrupt re-arming. Keep the work token so
+        // the already-running worker loops immediately instead of sleeping.
+        NEED_POLL.store(true, Ordering::Release);
+    }
 }
 
 /// Poll from the periodic timer path only when smoltcp has pending work.
 pub fn poll_timer_tick() {
-    if !NEED_POLL.load(Ordering::Acquire) {
+    #[cfg(feature = "platform-visionfive2")]
+    {
         let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
-        if deadline_us == NO_POLL_DEADLINE_US {
-            return;
+        let deadline_due =
+            deadline_us != NO_POLL_DEADLINE_US && (get_time_us() as u64) >= deadline_us;
+        if NEED_POLL.load(Ordering::Acquire) || deadline_due {
+            // Turn a protocol deadline into one bounded work item per timer
+            // tick. Do not let an already-due smoltcp deadline make the
+            // deferred worker continuously self-wake and starve user tasks.
+            NEED_POLL.store(true, Ordering::Release);
+            NET_WORKER_WAIT.wake_all();
         }
-        if (get_time_us() as u64) < deadline_us {
-            return;
-        }
+        return;
     }
 
-    poll();
+    #[cfg(not(feature = "platform-visionfive2"))]
+    {
+        if !NEED_POLL.load(Ordering::Acquire) {
+            let deadline_us = NEXT_POLL_DEADLINE_US.load(Ordering::Acquire);
+            if deadline_us == NO_POLL_DEADLINE_US {
+                return;
+            }
+            if (get_time_us() as u64) < deadline_us {
+                return;
+            }
+        }
+
+        poll();
+    }
+}
+
+#[cfg(feature = "platform-visionfive2")]
+fn net_worker_has_work() -> bool {
+    NEED_POLL.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "platform-visionfive2")]
+fn net_worker_main() -> ! {
+    println!("[net] deferred poll worker started");
+    loop {
+        #[cfg(feature = "net_perf_counters")]
+        perf_inc(&PERF_WORKER_LOOPS);
+        poll();
+        NET_WORKER_WAIT.wait_with_reason_or_skip(WaitReason::NetDeviceTx, net_worker_has_work);
+    }
+}
+
+/// Start the deferred network poll worker used by interrupt-driven board NICs.
+pub fn start_worker() {
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        if NET_WORKER_STARTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = crate::task::spawn_kernel_thread(net_worker_main, SchedAttr::other(0));
+        }
+    }
 }
 
 /// Return `(tcp, udp)` live socket-state counts for diagnostics
@@ -669,13 +787,13 @@ impl NetStack {
             .collect();
         let storage = Box::leak(storage_vec.into_boxed_slice());
         let sockets = SocketSet::new(storage);
-        #[cfg(feature = "platform-ls2k1000-nebula")]
+        #[cfg(any(feature = "platform-ls2k1000-nebula", feature = "platform-visionfive2"))]
         let (sockets, dhcp) = {
             let mut sockets = sockets;
             let dhcp = sockets.add(dhcp_socket::Socket::new());
             (sockets, Some(dhcp))
         };
-        #[cfg(not(feature = "platform-ls2k1000-nebula"))]
+        #[cfg(not(any(feature = "platform-ls2k1000-nebula", feature = "platform-visionfive2")))]
         let dhcp = None;
 
         let mut stack = Self {
@@ -689,8 +807,8 @@ impl NetStack {
             next_ephemeral_port: EPHEMERAL_PORT_START,
         };
 
-        #[cfg(feature = "platform-ls2k1000-nebula")]
-        println!("[net] DHCPv4 client enabled on LS2K1000 GMAC");
+        #[cfg(any(feature = "platform-ls2k1000-nebula", feature = "platform-visionfive2"))]
+        println!("[net] DHCPv4 client enabled on physical Ethernet");
 
         // Optionally create a kernel UDP echo socket bound to the configured port.
         if ENABLE_KERNEL_UDP_ECHO {
@@ -834,8 +952,9 @@ impl NetStack {
                                 let mut rev = Vec::from(data);
                                 rev.reverse();
                                 if socket.can_send() {
-                                    let _ = socket.send_slice(&rev, meta.endpoint);
-                                    NEED_POLL.store(true, Ordering::Release);
+                                    if socket.send_slice(&rev, meta.endpoint).is_ok() {
+                                        NEED_POLL.store(true, Ordering::Release);
+                                    }
                                 }
                             } else {
                                 break;
@@ -978,6 +1097,7 @@ impl NetStack {
         match address {
             Some(address) => {
                 compat::set_eth0_ipv4(Some((address.address().octets(), address.prefix_len())));
+                self.announce_ipv4(address.address());
                 info!(
                     "[kernel] net: DHCP configured address={} gateway={:?}",
                     address, gateway
@@ -987,6 +1107,46 @@ impl NetStack {
                 compat::set_eth0_ipv4(None);
                 warn!("[kernel] net: DHCP lease lost; IPv4 configuration removed");
             }
+        }
+    }
+
+    /// Announce a freshly configured IPv4 lease at layer 2.
+    ///
+    /// Some switched networks answer unknown-host ARP through a proxy.  If the
+    /// host has not yet learned this station's MAC, that proxy reply can win
+    /// the race against our first normal ARP reply and direct all subsequent
+    /// traffic to the gateway.  A gratuitous ARP request publishes the DHCP
+    /// address before peers initiate traffic, matching normal DHCP-client
+    /// behaviour without embedding any host-specific address in the driver.
+    fn announce_ipv4(&self, address: Ipv4Address) {
+        const ETHERNET_ARP_LEN: usize = 42;
+        let mac = self.device.virtio.mac;
+        let ip = address.octets();
+        let mut frame = [0u8; ETHERNET_ARP_LEN];
+
+        frame[0..6].fill(0xff);
+        frame[6..12].copy_from_slice(&mac);
+        frame[12..14].copy_from_slice(&[0x08, 0x06]);
+        frame[14..16].copy_from_slice(&[0x00, 0x01]);
+        frame[16..18].copy_from_slice(&[0x08, 0x00]);
+        frame[18] = 6;
+        frame[19] = 4;
+        frame[20..22].copy_from_slice(&[0x00, 0x01]);
+        frame[22..28].copy_from_slice(&mac);
+        frame[28..32].copy_from_slice(&ip);
+        frame[32..38].fill(0x00);
+        frame[38..42].copy_from_slice(&ip);
+
+        if self.device.virtio.dev.try_send(&frame) {
+            info!(
+                "[kernel] net: announced DHCP address {} from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                address, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+        } else {
+            warn!(
+                "[kernel] net: transmit ring busy; failed to announce DHCP address {}",
+                address
+            );
         }
     }
 
@@ -1000,6 +1160,7 @@ impl NetStack {
 
         // Keep liveness for immediate work units (e.g. handshake progress)
         // even when there's no external IRQ.
+        #[cfg(not(feature = "platform-visionfive2"))]
         if next != NO_POLL_DEADLINE_US && (get_time_us() as u64) >= next {
             NEED_POLL.store(true, Ordering::Release);
         }
@@ -1331,7 +1492,8 @@ impl<'a> TxToken for MultiTxToken<'a> {
             );
         } else {
             // Send to VirtIO using the standard path
-            if self.virtio.dev.try_send(&buf) {
+            let queued = self.virtio.dev.try_send(&buf);
+            if queued {
                 #[cfg(feature = "net_perf_counters")]
                 perf_inc(&PERF_VIRTIO_TX_FRAMES);
                 #[cfg(feature = "net_perf_counters")]
