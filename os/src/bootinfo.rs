@@ -10,6 +10,8 @@ const MAX_MEMORY_REGIONS: usize = 8;
 const MAX_RESERVED_REGIONS: usize = 16;
 const MAX_MMIO_REGIONS: usize = 24;
 const MAX_VIRTIO_MMIO_DEVICES: usize = 16;
+const MAX_GMAC_DEVICES: usize = 4;
+const MAX_MMC_DEVICES: usize = 4;
 const MAX_CLOCK_RESOURCES: usize = 16;
 const PCI_INTX_ENTRIES: usize = 32 * 4;
 const MAX_FDT_SIZE: usize = 16 * 1024 * 1024;
@@ -45,6 +47,49 @@ pub struct DeviceResource {
 pub struct GmacResource {
     device: DeviceResource,
     mac_address: Option<[u8; 6]>,
+}
+
+/// One firmware-described JH7110 SD/MMC controller and slot policy.
+#[derive(Clone, Copy, Debug)]
+pub struct MmcResource {
+    device: DeviceResource,
+    bus_width: u32,
+    no_sd: bool,
+    no_mmc: bool,
+    non_removable: bool,
+    supports_1v8: bool,
+}
+
+impl MmcResource {
+    /// Return the controller register and interrupt resource.
+    pub fn device(self) -> DeviceResource {
+        self.device
+    }
+
+    /// Return the maximum firmware-advertised data-bus width.
+    pub fn bus_width(self) -> u32 {
+        self.bus_width
+    }
+
+    /// Return whether firmware forbids probing an SD card.
+    pub fn no_sd(self) -> bool {
+        self.no_sd
+    }
+
+    /// Return whether firmware forbids probing an MMC/eMMC card.
+    pub fn no_mmc(self) -> bool {
+        self.no_mmc
+    }
+
+    /// Return whether the slot is soldered-down rather than removable.
+    pub fn non_removable(self) -> bool {
+        self.non_removable
+    }
+
+    /// Return whether firmware advertises a 1.8 V timing mode.
+    pub fn supports_1v8(self) -> bool {
+        self.supports_1v8
+    }
 }
 
 impl GmacResource {
@@ -144,7 +189,11 @@ pub struct BootInfo {
     eiointc: Option<DeviceResource>,
     pci_host: Option<PciHostResource>,
     ahci: Option<DeviceResource>,
-    gmac: Option<GmacResource>,
+    syscrg: Option<DeviceResource>,
+    gmac: [Option<GmacResource>; MAX_GMAC_DEVICES],
+    gmac_count: usize,
+    mmc: [Option<MmcResource>; MAX_MMC_DEVICES],
+    mmc_count: usize,
     virtio_mmio: [DeviceResource; MAX_VIRTIO_MMIO_DEVICES],
     virtio_mmio_count: usize,
     mmio_regions: [PhysMemoryRegion; MAX_MMIO_REGIONS],
@@ -172,7 +221,11 @@ impl BootInfo {
             eiointc: None,
             pci_host: None,
             ahci: None,
-            gmac: None,
+            syscrg: None,
+            gmac: [None; MAX_GMAC_DEVICES],
+            gmac_count: 0,
+            mmc: [None; MAX_MMC_DEVICES],
+            mmc_count: 0,
             virtio_mmio: [DeviceResource::empty(); MAX_VIRTIO_MMIO_DEVICES],
             virtio_mmio_count: 0,
             mmio_regions: [PhysMemoryRegion::empty(); MAX_MMIO_REGIONS],
@@ -337,9 +390,24 @@ impl BootInfo {
         self.ahci
     }
 
+    /// Return the JH7110 system clock/reset register window.
+    pub fn syscrg(&self) -> Option<DeviceResource> {
+        self.syscrg
+    }
+
     /// Return the first enabled DesignWare GMAC controller.
     pub fn gmac(&self) -> Option<GmacResource> {
-        self.gmac
+        self.gmac_devices().next()
+    }
+
+    /// Return all enabled DesignWare GMAC controllers in firmware order.
+    pub fn gmac_devices(&self) -> impl Iterator<Item = GmacResource> + '_ {
+        self.gmac[..self.gmac_count].iter().flatten().copied()
+    }
+
+    /// Return all enabled JH7110 SD/MMC controllers in firmware order.
+    pub fn mmc_devices(&self) -> impl Iterator<Item = MmcResource> + '_ {
+        self.mmc[..self.mmc_count].iter().flatten().copied()
     }
 
     /// Return all enabled VirtIO-MMIO transports.
@@ -820,7 +888,10 @@ struct NodeState {
     is_eiointc: bool,
     is_pci_host: bool,
     is_ahci: bool,
+    is_syscrg: bool,
+    is_cache_controller: bool,
     is_gmac: bool,
+    is_mmc: bool,
     address_cells: usize,
     size_cells: usize,
     child_address_cells: usize,
@@ -833,6 +904,11 @@ struct NodeState {
     irq: Option<u32>,
     mac_address: [u8; 6],
     has_mac_address: bool,
+    bus_width: u32,
+    no_sd: bool,
+    no_mmc: bool,
+    non_removable: bool,
+    supports_1v8: bool,
     bus_start: u8,
     bus_end: u8,
     ranges_ptr: usize,
@@ -863,7 +939,10 @@ impl NodeState {
             is_eiointc: false,
             is_pci_host: false,
             is_ahci: false,
+            is_syscrg: false,
+            is_cache_controller: false,
             is_gmac: false,
+            is_mmc: false,
             address_cells: parent.child_address_cells.max(1),
             size_cells: parent.child_size_cells.max(1),
             child_address_cells: 2,
@@ -876,6 +955,11 @@ impl NodeState {
             irq: None,
             mac_address: [0; 6],
             has_mac_address: false,
+            bus_width: 1,
+            no_sd: false,
+            no_mmc: false,
+            non_removable: false,
+            supports_1v8: false,
             bus_start: 0,
             bus_end: 0,
             ranges_ptr: 0,
@@ -898,7 +982,9 @@ impl NodeState {
             b"device_type" if value == b"memory\0" => self.is_memory = true,
             b"compatible" => {
                 self.is_uart = compatible_contains(value, b"ns16550a")
-                    || compatible_contains(value, b"ns16550");
+                    || compatible_contains(value, b"ns16550")
+                    || compatible_contains(value, b"snps,dw-apb-uart")
+                    || compatible_contains(value, b"starfive,jh7110-uart");
                 self.is_rtc = compatible_contains(value, b"google,goldfish-rtc")
                     || compatible_contains(value, b"loongson,ls7a-rtc")
                     || compatible_contains(value, b"loongson,ls2k-rtc")
@@ -916,9 +1002,21 @@ impl NodeState {
                     || compatible_contains(value, b"loongson,2k1000-ahci")
                     || compatible_contains(value, b"generic-ahci")
                     || compatible_contains(value, b"snps,dwc-ahci");
+                self.is_syscrg = compatible_contains(value, b"starfive,jh7110-clkgen")
+                    || compatible_contains(value, b"starfive,jh7110-reset");
+                self.is_cache_controller = compatible_contains(value, b"starfive,jh7110-ccache")
+                    || compatible_contains(value, b"sifive,fu740-c000-ccache");
                 self.is_gmac = compatible_contains(value, b"snps,dwmac-3.70a")
                     || compatible_contains(value, b"snps,arc-dwmac-3.70a")
-                    || compatible_contains(value, b"ls,ls-gmac");
+                    || compatible_contains(value, b"ls,ls-gmac")
+                    || compatible_contains(value, b"starfive,jh7110-eqos-5.20")
+                    || compatible_contains(value, b"starfive,jh7110-dwmac")
+                    || compatible_contains(value, b"snps,dwmac-5.20");
+                // StarFive's SDK U-Boot control FDT describes both JH7110
+                // SDIO controllers with the generic DesignWare binding, while
+                // newer Linux device trees also carry the SoC-specific name.
+                self.is_mmc = compatible_contains(value, b"starfive,jh7110-mmc")
+                    || compatible_contains(value, b"snps,dw-mshc");
             }
             b"timebase-frequency" => {
                 self.timebase_frequency = read_cells_usize(value, 1).unwrap_or(0)
@@ -931,6 +1029,14 @@ impl NodeState {
                 self.clock_phandle = read_be_u32(&value[..4]).unwrap_or(0)
             }
             b"interrupts" if value.len() >= 4 => self.irq = read_be_u32(&value[..4]),
+            b"bus-width" => self.bus_width = read_cells_usize(value, 1).unwrap_or(1) as u32,
+            b"no-sd" => self.no_sd = true,
+            b"no-mmc" => self.no_mmc = true,
+            b"non-removable" => self.non_removable = true,
+            b"mmc-hs200-1_8v" | b"mmc-hs400-1_8v" | b"mmc-ddr-1_8v" | b"sd-uhs-sdr104"
+            | b"sd-uhs-sdr50" | b"sd-uhs-ddr50" | b"sd-uhs-sdr25" | b"sd-uhs-sdr12" => {
+                self.supports_1v8 = true
+            }
             b"local-mac-address" | b"mac-address" if value.len() >= 6 => {
                 let mut mac = [0u8; 6];
                 mac.copy_from_slice(&value[..6]);
@@ -1028,11 +1134,33 @@ impl NodeState {
         } else if self.is_ahci && info.ahci.is_none() {
             info.ahci = Some(resource);
             info.push_mmio_region(resource);
-        } else if self.is_gmac && info.gmac.is_none() {
-            info.gmac = Some(GmacResource {
+        } else if self.is_syscrg && info.syscrg.is_none() {
+            // The clock and reset provider nodes expose the same SYSCRG
+            // register window as their first `reg` tuple.
+            info.syscrg = Some(resource);
+            info.push_mmio_region(resource);
+        } else if self.is_cache_controller {
+            // JH7110 uses the SiFive-compatible CCACHE FLUSH64 register for
+            // non-coherent DMA maintenance, so its control window must be
+            // mapped before the GMAC driver starts.
+            info.push_mmio_region(resource);
+        } else if self.is_gmac && info.gmac_count < MAX_GMAC_DEVICES {
+            info.gmac[info.gmac_count] = Some(GmacResource {
                 device: resource,
                 mac_address: self.has_mac_address.then_some(self.mac_address),
             });
+            info.gmac_count += 1;
+            info.push_mmio_region(resource);
+        } else if self.is_mmc && info.mmc_count < MAX_MMC_DEVICES {
+            info.mmc[info.mmc_count] = Some(MmcResource {
+                device: resource,
+                bus_width: self.bus_width,
+                no_sd: self.no_sd,
+                no_mmc: self.no_mmc,
+                non_removable: self.non_removable,
+                supports_1v8: self.supports_1v8,
+            });
+            info.mmc_count += 1;
             info.push_mmio_region(resource);
         }
     }

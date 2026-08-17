@@ -5,10 +5,16 @@ mod virtio_blk;
 #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
 mod ahci;
 
+#[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+mod jh7110_mmc;
+
 pub use virtio_blk::VirtIOBlock;
 
 #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
 pub(crate) use ahci::probe_ahci;
+
+#[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
+pub(crate) use jh7110_mmc::probe_jh7110_mmc;
 
 use crate::sync::SpinNoIrqLock;
 use crate::task::{ReschedReason, SchedAttr, TaskControlBlock, TaskStatus, WaitQueue, WaitReason};
