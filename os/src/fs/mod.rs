@@ -18,10 +18,10 @@ mod tty;
 
 use crate::config::PAGE_SIZE;
 use crate::mm::UserBuffer;
-use crate::task::{WaitQueue, WaitReason};
 use crate::sync::{SleepMutex, SpinNoIrqLock};
 use crate::syscall::errno::ERRNO;
 use crate::syscall::Pod;
+use crate::task::{WaitQueue, WaitReason};
 use crate::timer::get_time_us;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -42,8 +42,7 @@ use lazy_static::*;
 pub use page_cache::{
     discard_inode, mapping_for_inode, mark_cached_page_dirty, page_cache_stats,
     reclaim_for_frame_allocation, reclaim_if_needed, release_mapped_page, retain_mapped_page,
-    start_workers as start_page_cache_workers,
-    sync_all as sync_page_cache_all,
+    start_workers as start_page_cache_workers, sync_all as sync_page_cache_all,
     sync_fs as sync_page_cache_fs, sync_inode as sync_page_cache_inode, sync_inode_range,
     truncate_inode, CachePage, PageCacheStats, PAGE_CACHE_MANAGER,
 };
@@ -1065,10 +1064,8 @@ impl FileDescription {
         // Route reads through the counter implementation with the current
         // status snapshot instead of its creation-time default.
         if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
-            return eventfd.read_with_nonblock(
-                buf,
-                self.status_flags().contains(FileStatusFlags::NONBLOCK),
-            );
+            return eventfd
+                .read_with_nonblock(buf, self.status_flags().contains(FileStatusFlags::NONBLOCK));
         }
         if let Some(signalfd) = self.file.as_any().downcast_ref::<signalfd::SignalFdFile>() {
             return signalfd.read_with_nonblock(
@@ -1114,10 +1111,8 @@ impl FileDescription {
     /// 顺序写入并推进共享文件偏移，同时保留底层 errno。
     pub fn write_result(&self, buf: UserBuffer) -> Result<usize, ERRNO> {
         if let Some(eventfd) = self.file.as_any().downcast_ref::<eventfd::EventFdFile>() {
-            return eventfd.write_with_nonblock(
-                buf,
-                self.status_flags().contains(FileStatusFlags::NONBLOCK),
-            );
+            return eventfd
+                .write_with_nonblock(buf, self.status_flags().contains(FileStatusFlags::NONBLOCK));
         }
         if self.file.is_seekable() {
             let mut inner = self.inner.lock();
@@ -1344,17 +1339,19 @@ impl FileDescription {
                     if crate::signal::has_interrupting_signal() {
                         return Err(ERRNO::EINTR);
                     }
-                    state.wait_queue.wait_with_reason_or_skip(WaitReason::FileLock, || {
-                        let entries = state.entries.lock();
-                        posix_lock_find_conflict(
-                            &entries,
-                            owner_pid,
-                            request_type,
-                            range.start,
-                            request_end,
-                        )
-                        .is_none()
-                    });
+                    state
+                        .wait_queue
+                        .wait_with_reason_or_skip(WaitReason::FileLock, || {
+                            let entries = state.entries.lock();
+                            posix_lock_find_conflict(
+                                &entries,
+                                owner_pid,
+                                request_type,
+                                range.start,
+                                request_end,
+                            )
+                            .is_none()
+                        });
                 }
             }
         }
@@ -1750,6 +1747,7 @@ bitflags! {
     }
 }
 
+pub(crate) use eventfd::EventFdFile;
 pub use inode::{
     canonicalize, do_bind_mount, do_mount, do_move_mount, do_pivot_root, do_umount, init_dev,
     init_procfs, init_rootfs, init_sysfs, inode_stat, linkat, linkat_with_flags, list_apps,
@@ -1760,7 +1758,6 @@ pub use inode::{
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 pub use pipe::{make_pipe, Pipe};
-pub(crate) use eventfd::EventFdFile;
 pub use stdio::new_stdio_files;
 pub use tty::{
     console_receive, console_tty, Termios, TtyCore, TtyDeviceKind, TtyDeviceNode, TtyFile, WinSize,

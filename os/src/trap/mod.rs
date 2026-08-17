@@ -783,7 +783,7 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
                     {
                         let now_raw = get_time();
                         check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                        crate::net::poll();
+                        crate::net::poll_timer_tick();
                         #[cfg(feature = "mm_perf_counters")]
                         crate::perf_sampler::on_tick(now_raw);
                         on_timer_tick();
@@ -799,6 +799,7 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
         TrapCause::ExternalInterrupt => {
             let _hardirq = irq::HardIrqGuard::enter();
             crate::platform::handle_external_irq();
+            #[cfg(not(feature = "platform-visionfive2"))]
             crate::net::poll();
         }
         _ => {
@@ -945,6 +946,7 @@ fn trap_from_kernel_impl(
     match trap_info.cause {
         TrapCause::ExternalInterrupt => {
             crate::platform::handle_external_irq();
+            #[cfg(not(feature = "platform-visionfive2"))]
             crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
         }
         TrapCause::TimerInterrupt => {
@@ -963,7 +965,7 @@ fn trap_from_kernel_impl(
                             }
                         }
                         check_itimers_of_all_processes(now_raw, get_realtime_ns());
-                        crate::net::poll();
+                        crate::net::poll_timer_tick();
                         #[cfg(feature = "mm_perf_counters")]
                         crate::perf_sampler::on_tick(now_raw);
                         // Account CPU time spent while the current task executes in kernel

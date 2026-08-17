@@ -1125,8 +1125,10 @@ impl File for TtyFile {
             TIOCSWINSZ => {
                 let winsize = *translated_ref(token, arg as *const WinSize).ok_or(ERRNO::EFAULT)?;
                 if self.core.set_winsize(winsize) {
-                    self.core
-                        .deliver_foreground_signal(SignalBit::SIGWINCH, SignalNum::SIGWINCH.number());
+                    self.core.deliver_foreground_signal(
+                        SignalBit::SIGWINCH,
+                        SignalNum::SIGWINCH.number(),
+                    );
                 }
                 Ok(0)
             }

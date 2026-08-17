@@ -596,8 +596,7 @@ impl MemorySet {
         // generation.  Besides expressing "never synchronized" directly,
         // distinct sentinels avoid an early-boot bulk memset for this atomic
         // array on LoongArch.
-        let seen_tlb_generation =
-            core::array::from_fn(|hart| AtomicUsize::new(usize::MAX - hart));
+        let seen_tlb_generation = core::array::from_fn(|hart| AtomicUsize::new(usize::MAX - hart));
 
         core::ptr::addr_of_mut!((*output).vmas).write(vmas);
         core::ptr::addr_of_mut!((*output).asid).write(asid);
@@ -3706,12 +3705,11 @@ impl Vma {
             let shared_file_mapping = self.file.as_ref().map(|file| file.shared).unwrap_or(false);
             trace!(
                 "[munmap] defer file cache mapping release: vpn={:#x} shared={}",
-                vpn.0, shared_file_mapping
+                vpn.0,
+                shared_file_mapping
             );
             if let Some(old_pte) = page_table.clear(vpn) {
-                if mark_shared_dirty
-                    && shared_file_mapping
-                    && old_pte.flags().contains(PTEFlags::D)
+                if mark_shared_dirty && shared_file_mapping && old_pte.flags().contains(PTEFlags::D)
                 {
                     mark_cached_page_dirty(&page);
                 }

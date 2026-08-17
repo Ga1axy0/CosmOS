@@ -35,7 +35,7 @@ use crate::mm::{
     anonymous_page_stats, deferred_frame_count, deferred_kstack_id_count, deferred_range_count,
     kernel_heap_allocator_stats, page_table_stats, tlb_shootdown_stats, KERNEL_HEAP_BYTES,
 };
-use crate::mm::{frame_allocator_stats, MapPermission, VmaKind};
+use crate::mm::{frame_allocator_stats, online_mask, MapPermission, VmaKind};
 #[cfg(feature = "net_perf_counters")]
 use crate::net;
 #[cfg(feature = "perf_probe")]
@@ -271,9 +271,17 @@ fn build_cosmos_meminfo() -> String {
 
 fn build_cpuinfo() -> String {
     let mut out = String::new();
-    for hart in 0..MAX_HARTS {
+    let online = online_mask();
+    for hart in 0..MAX_HARTS.min(usize::BITS as usize) {
+        if online & (1usize << hart) == 0 {
+            continue;
+        }
         let _ = writeln!(&mut out, "processor\t: {}", hart);
-        let _ = writeln!(&mut out, "model name\t: QEMU Virtual CPU");
+        let _ = writeln!(
+            &mut out,
+            "model name\t: {}",
+            crate::platform::platform_name()
+        );
         #[cfg(target_arch = "riscv64")]
         {
             let _ = writeln!(&mut out, "hart\t\t: {}", hart);
@@ -283,7 +291,11 @@ fn build_cpuinfo() -> String {
         #[cfg(target_arch = "loongarch64")]
         {
             let _ = writeln!(&mut out, "CPU Family\t: LoongArch");
-            let _ = writeln!(&mut out, "Model Name\t: CosmOS virtual CPU");
+            let _ = writeln!(
+                &mut out,
+                "Model Name\t: {}",
+                crate::platform::platform_name()
+            );
         }
         let _ = writeln!(&mut out);
     }
@@ -781,7 +793,7 @@ fn build_pid_status(pid: usize) -> Result<String, FS_ERRNO> {
             task_state_char(task_inner.task_status, is_zombie),
             task_inner.pending_signals.bits(),
             task_inner.signal_mask.bits(),
-            task_inner.sched.cpu_affinity_mask,
+            task_inner.sched.cpu_affinity_mask & online_mask(),
         )
     } else {
         (task_state_char(TaskStatus::Zombie, true), 0, 0, 0)

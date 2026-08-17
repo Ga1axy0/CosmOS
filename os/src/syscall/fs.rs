@@ -3357,12 +3357,7 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> isize {
         const EFD_SEMAPHORE: i32 = 0x1;
         let allowed = O_NONBLOCK | O_CLOEXEC | EFD_SEMAPHORE;
         let (status_flags, cloexec) = parse_anon_fd_flags(flags, allowed)?;
-        alloc_eventfd(
-            initval,
-            status_flags,
-            cloexec,
-            (flags & EFD_SEMAPHORE) != 0,
-        )
+        alloc_eventfd(initval, status_flags, cloexec, (flags & EFD_SEMAPHORE) != 0)
     })
 }
 

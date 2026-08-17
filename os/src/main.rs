@@ -304,6 +304,12 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     net::init();
     print_boot_stage("network", "smoltcp stack initialized");
     if !platform::continue_storage_boot() {
+        #[cfg(feature = "platform-visionfive2")]
+        if !drivers::block::BLOCK_DEVICES.lock().is_empty() {
+            panic!(
+                "[kernel] VisionFive 2 block-device read probe passed; rootfs mount remains disabled"
+            );
+        }
         panic!("[kernel] firmware exposed no supported block device");
     }
     if let Err(err) = fs::init() {

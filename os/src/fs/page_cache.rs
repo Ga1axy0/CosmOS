@@ -443,9 +443,8 @@ impl PageMappingHandle {
             None
         };
         let sequential = page_idx == 0
-            || previous_page.is_some_and(|page| {
-                page.lock().state.contains(CachePageState::UPTODATE)
-            });
+            || previous_page
+                .is_some_and(|page| page.lock().state.contains(CachePageState::UPTODATE));
         if !sequential {
             return 1;
         }
@@ -642,17 +641,10 @@ fn page_cache_readahead_worker_main() -> ! {
             // No real file page can have this index on the supported address
             // spaces.  Passing it as the demand marker accounts every page
             // actually loaded by this job as speculative readahead.
-            load_page_range_inner(
-                &mapping,
-                work.first_page,
-                work.page_count,
-                Some(u64::MAX),
-            );
+            load_page_range_inner(&mapping, work.first_page, work.page_count, Some(u64::MAX));
         }
-        PAGE_CACHE_READAHEAD_WAIT_QUEUE.wait_with_reason_or_skip(
-            WaitReason::PageCacheReadahead,
-            readahead_worker_has_work,
-        );
+        PAGE_CACHE_READAHEAD_WAIT_QUEUE
+            .wait_with_reason_or_skip(WaitReason::PageCacheReadahead, readahead_worker_has_work);
     }
 }
 
@@ -710,7 +702,8 @@ fn current_reclaim_owner_token() -> usize {
 
 fn try_acquire_page_cache_reclaim() -> PageCacheReclaimAcquire {
     let owner = current_reclaim_owner_token();
-    match PAGE_CACHE_RECLAIM_OWNER.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed) {
+    match PAGE_CACHE_RECLAIM_OWNER.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed)
+    {
         Ok(_) => PageCacheReclaimAcquire::Acquired(PageCacheReclaimGuard { owner }),
         Err(active_owner) if active_owner == owner => PageCacheReclaimAcquire::Reentrant,
         Err(_) => PageCacheReclaimAcquire::Busy,
@@ -1505,24 +1498,24 @@ fn read_mapping(mapping: &Arc<SpinNoIrqLock<PageMapping>>, offset: usize, buf: &
 
         let window_done = done.saturating_add(window_end.saturating_sub(file_off));
         while offset + done < end && done < window_done {
-        let file_off = offset + done;
-        let page_idx = file_page_index(file_off);
-        let page_off = file_page_offset(file_off);
-        let page =
-            get_or_load_page(mapping, page_idx).expect("page cache OOM in buffered read path");
+            let file_off = offset + done;
+            let page_idx = file_page_index(file_off);
+            let page_off = file_page_offset(file_off);
+            let page =
+                get_or_load_page(mapping, page_idx).expect("page cache OOM in buffered read path");
 
-        let page_guard = page.lock();
-        let readable = min(
-            page_guard.valid_bytes.saturating_sub(page_off),
-            end - file_off,
-        );
-        if readable == 0 {
-            break;
+            let page_guard = page.lock();
+            let readable = min(
+                page_guard.valid_bytes.saturating_sub(page_off),
+                end - file_off,
+            );
+            if readable == 0 {
+                break;
+            }
+            let bytes = page_guard.ppn().get_bytes_array();
+            buf[done..done + readable].copy_from_slice(&bytes[page_off..page_off + readable]);
+            done += readable;
         }
-        let bytes = page_guard.ppn().get_bytes_array();
-        buf[done..done + readable].copy_from_slice(&bytes[page_off..page_off + readable]);
-        done += readable;
-    }
     }
     done
 }
@@ -2428,10 +2421,7 @@ fn finish_page_writeback(
     let wait_queue = {
         let mut page_guard = page.lock();
         if page_guard.state.contains(CachePageState::DIRTY) {
-            if !write_ok
-                || page_guard.map_count > 0
-                || page_guard.redirtied_during_writeback
-            {
+            if !write_ok || page_guard.map_count > 0 || page_guard.redirtied_during_writeback {
                 // 共享映射仍然存在时先保守地维持脏状态，避免写回后后续写入无法再次通知内核。
                 // TODO：后续补齐反向映射后，可在写回前清 PTE 脏位并重新写保护，从而精确清脏。
                 let mut mapping_guard = mapping.lock();

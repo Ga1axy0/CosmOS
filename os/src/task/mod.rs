@@ -22,8 +22,8 @@ use crate::mm::{reclaim_kernel_heap_if_needed, unregister_file_mappings_for_proc
 use crate::mm::{DeferredUserReclaim, MapPermission, VirtAddr};
 use crate::poll::task_has_inflight_keyed_poll_wait;
 use crate::sched::{
-    add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, schedule,
-    resched_hart, take_current_task, TaskContext,
+    add_stopping_task, list_pids, pid2process, remove_from_pid2process, remove_task, resched_hart,
+    schedule, take_current_task, TaskContext,
 };
 pub use crate::sched::{
     block_current_and_run_next, current_process, current_task, current_trap_cx,
