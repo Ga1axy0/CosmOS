@@ -47,24 +47,35 @@ impl Rtc {
     }
 
     fn read_time_ns(&self) -> u64 {
-        let read0 = mmio_read32(self.base + TOY_READ0);
-        let raw_year = mmio_read32(self.base + TOY_READ1) as u64;
-        let year = if raw_year < 1900 {
-            raw_year + 1900
-        } else {
-            raw_year
-        };
+        let mut last_read0 = 0;
+        let mut last_raw_year = 0;
+        for _ in 0..3 {
+            // Keep the Linux driver order so TOY_READ0 latches a consistent
+            // snapshot before the year register is sampled.
+            let read0 = mmio_read32(self.base + TOY_READ0);
+            let raw_year = mmio_read32(self.base + TOY_READ1) as u64;
+            last_read0 = read0;
+            last_raw_year = raw_year;
+
+            let year = raw_year + 1900;
+            let mon = ((read0 >> 26) & 0x3f) as u64;
+            let day = ((read0 >> 21) & 0x1f) as u64;
+            let hour = ((read0 >> 16) & 0x1f) as u64;
+            let min = ((read0 >> 10) & 0x3f) as u64;
+            let sec = ((read0 >> 4) & 0x3f) as u64;
+            if hour < 24 && min < 60 && sec < 60 {
+                if let Some(days) = days_since_epoch(year, mon, day) {
+                    return (days * 86_400 + hour * 3_600 + min * 60 + sec) * 1_000_000_000;
+                }
+            }
+            core::hint::spin_loop();
+        }
+
         warn!(
-            "ls7a-rtc raw: TOY_READ0={:#010x} TOY_READ1={}",
-            read0, raw_year
+            "ls7a-rtc returned invalid TOY value: TOY_READ0={:#010x} TOY_READ1={}",
+            last_read0, last_raw_year
         );
-        let mon = ((read0 >> 26) & 0x3f) as u64;
-        let day = ((read0 >> 21) & 0x1f) as u64;
-        let hour = ((read0 >> 16) & 0x1f) as u64;
-        let min = ((read0 >> 10) & 0x3f) as u64;
-        let sec = ((read0 >> 4) & 0x3f) as u64;
-        let days = days_since_epoch(year, mon, day);
-        (days * 86_400 + hour * 3_600 + min * 60 + sec) * 1_000_000_000
+        0
     }
 
     fn write_time_ns(&self, time_ns: u64) {
@@ -81,17 +92,28 @@ impl Rtc {
     }
 }
 
-fn days_since_epoch(year: u64, mon: u64, day: u64) -> u64 {
+fn days_since_epoch(year: u64, mon: u64, day: u64) -> Option<u64> {
     const DAYS_BEFORE_MONTH: [u64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let month = mon.max(1);
-    let day = day.max(1);
+    if year < 1970 || !(1..=12).contains(&mon) {
+        return None;
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match mon {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
     let leap_days = (year / 4).saturating_sub(year / 100) + year / 400;
     let base = year * 365 + leap_days;
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let leap_adjust = if month > 2 && is_leap { 1 } else { 0 };
-    let year_days = base + DAYS_BEFORE_MONTH[month as usize] + leap_adjust + day - 1;
+    let leap_adjust = if mon > 2 && is_leap { 1 } else { 0 };
+    let year_days = base + DAYS_BEFORE_MONTH[mon as usize] + leap_adjust + day - 1;
     const EPOCH_DAYS: u64 = 1970 * 365 + (1970 / 4) - (1970 / 100) + (1970 / 400);
-    year_days.saturating_sub(EPOCH_DAYS)
+    Some(year_days.saturating_sub(EPOCH_DAYS))
 }
 
 fn secs_to_calendar(secs: u64) -> (u64, u64, u64, u64, u64, u64) {

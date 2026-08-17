@@ -89,11 +89,14 @@ const IOCSR_MBUF_SEND: usize = 0x1048;
 const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
 const IOCSR_MBUF_SEND_CPU_SHIFT: u64 = 16;
 const IOCSR_MBUF_SEND_DATA_SHIFT: u64 = 32;
+const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
+const IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
 
-// QEMU's LoongArch IPI model treats IOCSR_IPI_SEND[4:0] as a vector number,
-// and the per-core enable/clear registers as vector bitmasks.
+// IOCSR_IPI_SEND[4:0] selects a vector; the local enable/clear registers use
+// the corresponding bit. Vector 0 is the firmware boot action, while vector 1
+// is reserved for CosmOS wake/reschedule requests after a hart is online.
+const IPI_VECTOR_BOOT: u32 = 0;
 const IPI_VECTOR_WAKEUP: u32 = 1;
-const IPI_VECTOR_MASK: u32 = 1 << IPI_VECTOR_WAKEUP;
 
 #[inline]
 unsafe fn iocsr_write32(addr: usize, val: u32) {
@@ -106,12 +109,12 @@ unsafe fn iocsr_write64(addr: usize, val: u64) {
 }
 
 fn ipi_send(hart_id: usize, vector: u32) {
-    let val = vector | (hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT;
+    let val = IOCSR_IPI_SEND_BLOCKING | vector | (hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT;
     unsafe { iocsr_write32(IOCSR_IPI_SEND, val) };
 }
 
 fn enable_ipi() {
-    unsafe { iocsr_write32(IOCSR_IPI_EN, IPI_VECTOR_MASK) };
+    unsafe { iocsr_write32(IOCSR_IPI_EN, u32::MAX) };
 }
 
 fn clear_ipi(vector: u32) {
@@ -128,26 +131,26 @@ fn mailbox_word_slot(mailbox: u64, upper_half: bool) -> u64 {
 fn mail_send_word(word: u32, hart_id: usize, slot: u64) {
     let val = ((word as u64) << IOCSR_MBUF_SEND_DATA_SHIFT)
         | ((hart_id as u64) << IOCSR_MBUF_SEND_CPU_SHIFT)
-        | slot;
+        | slot
+        | IOCSR_MBUF_SEND_BLOCKING;
     unsafe { iocsr_write64(IOCSR_MBUF_SEND, val) };
 }
 
-// QEMU decodes MAIL_SEND as one 32-bit mailbox-slot write per request. To
-// publish a 64-bit entry address in MBUF0, we must write its low/high halves
-// into CORE_BUF_20 and CORE_BUF_24 separately.
+// MAIL_SEND publishes one 32-bit mailbox-slot word per request. Write the high
+// half first and the low half last, matching the LoongArch SMP boot protocol.
 fn mail_send(data: u64, hart_id: usize, mailbox: u64) {
-    mail_send_word(data as u32, hart_id, mailbox_word_slot(mailbox, false));
     mail_send_word(
         (data >> 32) as u32,
         hart_id,
         mailbox_word_slot(mailbox, true),
     );
+    mail_send_word(data as u32, hart_id, mailbox_word_slot(mailbox, false));
 }
 
 impl HartCtrl for LoongArchPlatform {
     fn start_hart(hart_id: usize, start_addr: usize, _opaque: usize) -> Result<(), ()> {
         mail_send(start_addr as u64, hart_id, 0);
-        ipi_send(hart_id, IPI_VECTOR_WAKEUP);
+        ipi_send(hart_id, IPI_VECTOR_BOOT);
         Ok(())
     }
 
@@ -222,18 +225,19 @@ pub fn platform_name() -> &'static str {
 /// Start all secondary harts via IOCSR mailbox + IPI.
 pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     extern "C" {
-        fn _start_high();
+        fn _start();
     }
 
-    if !is_qemu_virt() {
-        return;
-    }
-
-    // CPU0 uses the ELF's physical `_start`, but QEMU's secondary slave stub
-    // already runs with the DMW environment inherited from firmware and
-    // simply `jirl`s to the mailbox value. Start APs at the internal cached
-    // continuation rather than reusing the firmware-facing ELF entry.
-    let entry = _start_high as usize;
+    let qemu = is_qemu_virt();
+    // QEMU's slave loop runs before a cached DMW has been installed, so it must
+    // jump to the physical `_start`; that entry installs DMW1 and continues at
+    // `_start_high`. The LS2K1000 U-Boot slave loop is already executing from
+    // the cached DMW and jumps to the mailbox value exactly as written.
+    let entry = if qemu {
+        direct_map_virt_to_phys(_start as usize)
+    } else {
+        _start as usize
+    };
     let boot_info = crate::bootinfo::get();
     let hart_count = if boot_info.fdt_blob().is_some() {
         boot_info.hart_count()
@@ -245,7 +249,15 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
         if hart_id == bootstrap_hart_id {
             continue;
         }
-        let _ = <LoongArchPlatform as HartCtrl>::start_hart(hart_id, entry, 0);
+        if qemu {
+            // Discard a stale entry left by an earlier RAM boot before
+            // publishing the new one, matching Linux's CPU prepare phase.
+            mail_send(0, hart_id, 0);
+            let _ = <LoongArchPlatform as HartCtrl>::start_hart(hart_id, entry, 0);
+        } else {
+            #[cfg(feature = "platform-ls2k1000-nebula")]
+            super::ls2k1000_nebula::start_secondary_hart(hart_id, entry);
+        }
         warn!(
             "hart {} requested startup for hart {} at {:#x}",
             bootstrap_hart_id, hart_id, entry
@@ -255,6 +267,7 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
 
 /// Initialize per-hart IPI receive state.
 pub fn init_ipi_hart() {
+    unsafe { iocsr_write32(IOCSR_IPI_CLEAR, u32::MAX) };
     enable_ipi();
 }
 

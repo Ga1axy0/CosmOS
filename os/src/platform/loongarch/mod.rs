@@ -6,6 +6,8 @@
 //! hard-coded device backend. The feature may still select the firmware-facing
 //! ELF address representation required by the corresponding boot loader.
 
+#[cfg(feature = "platform-ls2k1000-nebula")]
+mod ls2k1000_nebula;
 mod qemu_virt;
 
 #[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-ls2k1000-nebula")))]
