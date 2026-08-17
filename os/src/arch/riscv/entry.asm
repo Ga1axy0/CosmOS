@@ -3,28 +3,38 @@
     .equ BOOT_STACK_SIZE, 1 << BOOT_STACK_SHIFT
     .equ BOOT_STACK_HARTS, 12
     .equ KERNEL_OFFSET, 0xffffffc000000000
-    .equ EARLY_RAM_GIGAPAGE_PTE, 0x200000ef
+    .equ EARLY_RAM_GIGAPAGE_PTE, 0x100000ef
+    .equ EARLY_MMIO_GIGAPAGE_PTE, 0x000000ef
     .equ NEXT_RAM_GIGAPAGE_PTE, 0x10000000
-    .equ EARLY_HIGH_RAM_ROOT_COUNT, 126
+    .equ EARLY_HIGH_RAM_ROOT_COUNT, 127
 
     .globl _start
 _start:
     /*
      * The kernel is loaded at 0x8020_0000 and initially executes without
-     * paging.  Root entry 2 provides the temporary identity map for the first
-     * RAM gigapage. Entries 258..383 cover the direct-RAM aperture beginning
-     * at 0xffff_ffc0_8000_0000, up to (but not including) the dedicated MMIO
-     * root. This keeps the firmware-provided FDT reachable for every supported
-     * QEMU memory size before the permanent page table is constructed.
+     * paging. Root entries 1 and 2 provide temporary identity mappings from
+     * PA 0x4000_0000 through 0xbfff_ffff. This covers both VisionFive 2 RAM
+     * (which begins at 0x4000_0000) and the QEMU kernel load address. Entries
+     * 257..383 cover the matching direct-RAM aperture, keeping a
+     * firmware-provided FDT reachable before the permanent page table exists.
      */
     la t3, boot_page_table
+    /* Temporarily expose PA 0..1 GiB at both its identity and MMIO aliases. */
+    li t0, EARLY_MMIO_GIGAPAGE_PTE
+    sd t0, 0*8(t3)
+    li t1, 384
+    slli t1, t1, 3
+    add t1, t3, t1
+    sd t0, 0(t1)
     li t0, EARLY_RAM_GIGAPAGE_PTE
-    sd t0, 2*8(t3)
-    li t1, 258
+    sd t0, 1*8(t3)
+    li t4, NEXT_RAM_GIGAPAGE_PTE
+    add t5, t0, t4
+    sd t5, 2*8(t3)
+    li t1, 257
     slli t1, t1, 3
     add t1, t3, t1
     li t2, EARLY_HIGH_RAM_ROOT_COUNT
-    li t4, NEXT_RAM_GIGAPAGE_PTE
 .Lmap_early_high_ram:
     sd t0, 0(t1)
     add t0, t0, t4

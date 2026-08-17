@@ -126,6 +126,17 @@ impl PagingArch for Sv39Paging {
         PTEFlags::from_bits_truncate(entry_bits as u16)
     }
 
+    fn normalize_leaf_flags(mut flags: PTEFlags) -> PTEFlags {
+        // Some physical RISC-V implementations trap instead of updating A/D
+        // in hardware. Seed them for resident leaves so the first fetch/load
+        // after switching SATP cannot recursively fault on the trap mapping.
+        flags.insert(PTEFlags::A);
+        if flags.contains(PTEFlags::W) {
+            flags.insert(PTEFlags::D);
+        }
+        flags
+    }
+
     fn normalize_virt_addr_input(bits: usize) -> usize {
         bits & ((1usize << Self::VA_BITS) - 1)
     }

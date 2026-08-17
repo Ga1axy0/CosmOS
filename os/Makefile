@@ -64,8 +64,8 @@ APPS := ../user/src/bin/*
 OFFLINE :=
 
 # BOARD
-# Keep QEMU as the default while allowing a compile-time LoongArch board
-# backend to be selected with `BOARD=ls2k1000-nebula`.
+# Keep QEMU as the default while allowing physical-board backends to be
+# selected explicitly.
 BOARD ?= qemu
 ifeq ($(ARCH),loongarch64)
 	# Use the architecture's portable aligned-access baseline for every board.
@@ -83,8 +83,14 @@ else ifeq ($(BOARD),ls2k1000-nebula)
 	else
 $(error BOARD=ls2k1000-nebula requires ARCH=loongarch64)
 	endif
+else ifeq ($(BOARD),visionfive2)
+	ifeq ($(ARCH),riscv64)
+		PLATFORM_FEATURE := platform-visionfive2
+	else
+$(error BOARD=visionfive2 requires ARCH=riscv64)
+	endif
 else
-$(error Unsupported BOARD '$(BOARD)'. Use qemu or ls2k1000-nebula)
+$(error Unsupported BOARD '$(BOARD)'. Use qemu, visionfive2, or ls2k1000-nebula)
 endif
 SBI ?= rustsbi
 QEMU_VERSION := $(shell $(QEMU) --version 2>/dev/null | head -n1 | sed -E 's/.*version ([0-9.]+).*/\1/')

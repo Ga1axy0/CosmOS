@@ -71,6 +71,11 @@ pub struct PageTableEntry {
 impl PageTableEntry {
     /// Create a new page table entry
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
+        let flags = if flags.intersects(PTEFlags::R | PTEFlags::W | PTEFlags::X) {
+            crate::hal::normalize_leaf_pte_flags(flags)
+        } else {
+            flags
+        };
         PageTableEntry {
             bits: crate::hal::make_pte(ppn.0, flags),
         }

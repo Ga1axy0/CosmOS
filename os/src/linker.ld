@@ -5,6 +5,20 @@ PHYS_BASE = 0x80200000;
 KERNEL_OFFSET = 0xffffffc000000000;
 VIRT_BASE = KERNEL_OFFSET + PHYS_BASE;
 
+/*
+ * StarFive's U-Boot 2021.10 bootelf loader walks every program header as if
+ * it were loadable.  Emit only PT_LOAD headers so it never tries to copy the
+ * RISC-V attributes segment to physical address zero.
+ */
+PHDRS
+{
+    boot   PT_LOAD FLAGS(7);
+    text   PT_LOAD FLAGS(5);
+    rodata PT_LOAD FLAGS(4);
+    data   PT_LOAD FLAGS(6);
+    bss    PT_LOAD FLAGS(6);
+}
+
 SECTIONS
 {
     /*
@@ -17,7 +31,7 @@ SECTIONS
         *(.text.entry)
         . = ALIGN(4K);
         *(.data.boot)
-    }
+    } :boot
     boot_physical_end = .;
 
     /*
@@ -35,7 +49,7 @@ SECTIONS
         *(.text.trampoline);
         . = ALIGN(4K);
         *(.text .text.*)
-    }
+    } :text
 
     . = ALIGN(4K);
     etext = .;
@@ -43,7 +57,7 @@ SECTIONS
     .rodata : AT(ADDR(.rodata) - KERNEL_OFFSET) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
-    }
+    } :rodata
 
     . = ALIGN(4K);
     erodata = .;
@@ -51,7 +65,7 @@ SECTIONS
     .data : AT(ADDR(.data) - KERNEL_OFFSET) {
         *(.data .data.*)
         *(.sdata .sdata.*)
-    }
+    } :data
     . = ALIGN(4K);
     edata = .;
     sbss_with_stack = .;
@@ -60,7 +74,7 @@ SECTIONS
         sbss = .;
         *(.bss .bss.*)
         *(.sbss .sbss.*)
-    }
+    } :bss
 
     . = ALIGN(4K);
     ebss = .;
@@ -68,5 +82,7 @@ SECTIONS
 
     /DISCARD/ : {
         *(.eh_frame)
+        *(.riscv.attributes)
+        *(.comment)
     }
 }
