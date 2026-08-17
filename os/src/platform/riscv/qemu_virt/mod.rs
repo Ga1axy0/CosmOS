@@ -47,8 +47,18 @@ pub fn console_rx_irq_ready() -> bool {
 
 /// Probe platform-specific devices after generic driver init.
 pub fn probe_platform_devices() {
-    crate::drivers::block::probe_block_devices();
-    crate::drivers::net::probe_net_devices();
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        crate::drivers::block::probe_jh7110_mmc();
+        if let Some(irq) = crate::drivers::net::probe_jh7110_eqos() {
+            crate::drivers::plic::register_irq(irq);
+        }
+    }
+    #[cfg(not(feature = "platform-visionfive2"))]
+    {
+        crate::drivers::block::probe_block_devices();
+        crate::drivers::net::probe_net_devices();
+    }
 }
 
 /// RISC-V always uses the normal UART path once the console layer is up.

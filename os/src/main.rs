@@ -317,6 +317,7 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     print_boot_stage("scheduler", "bootstrap hart entering run queue");
     task::add_initproc();
     drivers::block::start_workers();
+    net::start_worker();
     fs::start_page_cache_workers();
     BOOT_DONE.store(true, Ordering::Release);
     println!(

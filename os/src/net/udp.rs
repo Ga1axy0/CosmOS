@@ -14,7 +14,7 @@ use crate::mm::UserBuffer;
 use crate::net::{
     cleanup_socket_wait, compat_ifreq_ioctl, register_socket_wait, socket_wait_mark_ready,
     socket_wait_should_skip, socket_wait_state, timeout_ns_to_deadline_ns, SocketWakeState,
-    NEED_POLL, NET_STACK,
+    NET_STACK,
 };
 use crate::poll::{notify_poll_source, POLLHUP, POLLIN, POLLOUT};
 use crate::sync::SpinNoIrqLock;
@@ -305,7 +305,7 @@ impl UdpSocketFile {
                         );
 
                         stack.poll();
-                        NEED_POLL.store(true, Ordering::Release);
+                        crate::net::notify_tx();
                         if let Some(handle) = timeout_handle.take() {
                             socket_wait_mark_ready(handle);
                             cleanup_socket_wait(handle);

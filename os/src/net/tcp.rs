@@ -1575,9 +1575,7 @@ impl File for TcpSocketFile {
         let socket = stack.sockets.get_mut::<tcp_socket::Socket>(st.handle);
         let handshake_pending = matches!(
             socket.state(),
-            tcp_socket::State::Listen
-                | tcp_socket::State::SynSent
-                | tcp_socket::State::SynReceived
+            tcp_socket::State::Listen | tcp_socket::State::SynSent | tcp_socket::State::SynReceived
         );
 
         if (events & POLLIN) != 0 {
