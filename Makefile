@@ -156,7 +156,7 @@ else
 $(error unsupported RUN_ARCH=$(RUN_ARCH), expected rv or la)
 endif
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rv la disk-rv disk-la linux snapshot-fast-run snapshot-linux clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rootfs-la-strict rv la disk-rv disk-la linux snapshot-fast-run snapshot-linux clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
 
 all:
 	$(MAKE) submodules
@@ -270,6 +270,9 @@ sync-rootfs-variants:
 rootfs-rv: $(ROOTFS_RV_READY_STAMP)
 
 rootfs-la: $(ROOTFS_LA_INIT_STAMP)
+
+rootfs-la-strict:
+	bash scripts/build-rootfs-la-strict.sh
 
 $(ROOTFS_RV_VARIANT_CONFIG_STAMP): force
 	@mkdir -p "$(ROOTFS_RV_STAMP_DIR)"
