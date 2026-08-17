@@ -235,7 +235,6 @@ pub fn sys_openat(dirfd: usize, path: &str, flags: u32, mode: u32) -> isize {
         ],
     )
 }
-
 pub fn sys_close(fd: usize) -> isize {
     syscall(SYSCALL_CLOSE, [fd, 0, 0])
 }
@@ -718,7 +717,17 @@ pub fn sys_pipe(pipe: &mut [i32]) -> isize {
 }
 
 pub fn sys_ppoll_time32(fds: &mut [PollFd], timeout: Option<&OldTimespec32>) -> isize {
-    let timeout_ptr = timeout.map_or(core::ptr::null(), |value| value as *const _);
+    // The kernel's syscall 73 currently consumes the LP64 `Timespec` layout
+    // (two usize fields). Keep this compatibility wrapper's public 32-bit
+    // input, but expand it before issuing the ecall instead of passing an
+    // eight-byte object to a sixteen-byte kernel reader.
+    let timeout_value = timeout.map(|value| Timespec {
+        sec: value.tv_sec as usize,
+        nsec: value.tv_nsec as usize,
+    });
+    let timeout_ptr = timeout_value
+        .as_ref()
+        .map_or(core::ptr::null(), |value| value as *const _);
     syscall6(
         SYSCALL_PPOLL_TIME32,
         [

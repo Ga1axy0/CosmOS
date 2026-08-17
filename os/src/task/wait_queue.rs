@@ -50,6 +50,12 @@ impl NextKey for u16 {
     }
 }
 
+impl NextKey for u64 {
+    fn next(&self) -> Self {
+        self.wrapping_add(1)
+    }
+}
+
 impl NextKey for () {
     fn next(&self) -> Self {
         *self
