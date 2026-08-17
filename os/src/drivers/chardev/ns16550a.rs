@@ -73,11 +73,37 @@ impl Reg8 {
     }
 
     fn read(&self) -> u8 {
-        self.0.read()
+        #[cfg(feature = "platform-visionfive2")]
+        {
+            unsafe { core::ptr::read_volatile(self.0.addr as *const u32) as u8 }
+        }
+        #[cfg(not(feature = "platform-visionfive2"))]
+        {
+            self.0.read()
+        }
     }
 
     fn write(&self, value: u8) {
-        self.0.write(value)
+        #[cfg(feature = "platform-visionfive2")]
+        unsafe {
+            core::ptr::write_volatile(self.0.addr as *mut u32, value as u32)
+        }
+        #[cfg(not(feature = "platform-visionfive2"))]
+        {
+            self.0.write(value)
+        }
+    }
+}
+
+#[inline(always)]
+const fn register_offset(register: usize) -> usize {
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        register << 2
+    }
+    #[cfg(not(feature = "platform-visionfive2"))]
+    {
+        register
     }
 }
 
@@ -158,17 +184,17 @@ impl NS16550aRaw {
 
     fn read_end(&self) -> ReadEnd {
         ReadEnd {
-            rbr: Reg8::new(self.base_addr + REG_RBR_THR_DLL),
-            ier: IERReg::new(self.base_addr + REG_IER_DLM),
-            mcr: MCRReg::new(self.base_addr + REG_MCR),
-            lsr: LSRReg::new(self.base_addr + REG_LSR),
+            rbr: Reg8::new(self.base_addr + register_offset(REG_RBR_THR_DLL)),
+            ier: IERReg::new(self.base_addr + register_offset(REG_IER_DLM)),
+            mcr: MCRReg::new(self.base_addr + register_offset(REG_MCR)),
+            lsr: LSRReg::new(self.base_addr + register_offset(REG_LSR)),
         }
     }
 
     fn write_end(&self) -> WriteEnd {
         WriteEnd {
-            thr: Reg8::new(self.base_addr + REG_RBR_THR_DLL),
-            lsr: LSRReg::new(self.base_addr + REG_LSR),
+            thr: Reg8::new(self.base_addr + register_offset(REG_RBR_THR_DLL)),
+            lsr: LSRReg::new(self.base_addr + register_offset(REG_LSR)),
         }
     }
 

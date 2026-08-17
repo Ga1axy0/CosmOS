@@ -38,7 +38,11 @@ pub fn handle_external_irq() {
 
 /// Whether the console RX interrupt path is ready for blocking reads.
 pub fn console_rx_irq_ready() -> bool {
-    true
+    // The current JH7110 UART/PLIC path does not yet deliver RX promptly
+    // enough for terminal-generated signals while userspace is sleeping.
+    // Keep the scheduler and TTY on their cooperative polling path until the
+    // board-specific interrupt routing is fully validated.
+    !cfg!(feature = "platform-visionfive2")
 }
 
 /// Probe platform-specific devices after generic driver init.
@@ -49,18 +53,46 @@ pub fn probe_platform_devices() {
 
 /// RISC-V always uses the normal UART path once the console layer is up.
 pub fn use_early_console() -> bool {
-    false
+    cfg!(feature = "platform-visionfive2")
 }
 
 /// Write one string through the earliest available console path.
 pub fn early_console_write(s: &str) {
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        for byte in s.bytes() {
+            visionfive2_uart_putchar(byte);
+        }
+    }
+    #[cfg(not(feature = "platform-visionfive2"))]
     for byte in s.bytes() {
         sbi::console_putchar(byte as usize);
     }
 }
 
+#[cfg(feature = "platform-visionfive2")]
+fn visionfive2_uart_putchar(byte: u8) {
+    const UART0_PA: usize = 0x1000_0000;
+    const REG_SHIFT: usize = 2;
+    const THR: usize = 0;
+    const LSR: usize = 5;
+    const THR_EMPTY: u32 = 1 << 5;
+    let base = KERNEL_MMIO_OFFSET + UART0_PA;
+    unsafe {
+        while core::ptr::read_volatile((base + (LSR << REG_SHIFT)) as *const u32) & THR_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        core::ptr::write_volatile((base + (THR << REG_SHIFT)) as *mut u32, byte as u32);
+    }
+}
+
 /// Write one character to the platform console.
 pub fn console_putchar(c: usize) {
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        visionfive2_uart_putchar(c as u8);
+    }
+    #[cfg(not(feature = "platform-visionfive2"))]
     sbi::console_putchar(c);
 }
 
@@ -81,7 +113,14 @@ pub fn machine_name() -> &'static str {
 
 /// Return the platform name for display purposes.
 pub fn platform_name() -> &'static str {
-    "qemu virt"
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        "StarFive VisionFive 2"
+    }
+    #[cfg(not(feature = "platform-visionfive2"))]
+    {
+        "qemu virt"
+    }
 }
 
 /// Discover stopped harts via SBI HSM and start them on QEMU `virt`.
@@ -94,6 +133,14 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     info!("hart {} entering HSM probe/start loop", bootstrap_hart_id);
 
     for target_hart in 0..crate::config::MAX_HARTS {
+        #[cfg(feature = "platform-visionfive2")]
+        if target_hart == 0 {
+            // JH7110 hart0 is the E24 management core, not one of the U74
+            // application harts CosmOS runs on. Starting it at the U74 kernel
+            // entry makes OpenSBI trap before S-mode is reached.
+            info!("hart {} skips JH7110 E24 hart0", bootstrap_hart_id);
+            continue;
+        }
         let status = sbi::hart_get_status(target_hart);
         if status.error == SBI_ERR_INVALID_PARAM {
             info!(
@@ -166,6 +213,9 @@ pub fn translate_direct_mapped_kernel_va(va: usize) -> Option<usize> {
      * (root entry 258), so heap buffers must fall through to a page-table walk
      * when a device asks for their physical address.
      */
+    #[cfg(feature = "platform-visionfive2")]
+    let ram_alias_start = KERNEL_ADDR_OFFSET + 0x4000_0000;
+    #[cfg(not(feature = "platform-visionfive2"))]
     let ram_alias_start = KERNEL_ADDR_OFFSET + PHYSICAL_RAM_BASE;
     if (ram_alias_start..KERNEL_MMIO_OFFSET).contains(&va) {
         return Some(va - KERNEL_ADDR_OFFSET);

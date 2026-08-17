@@ -17,7 +17,7 @@ fn plic_base() -> usize {
     crate::platform::mmio_phys_to_virt(resource.start)
 }
 
-const MAX_IRQ_ID: usize = 32;
+const MAX_IRQ_ID: usize = 256;
 
 fn uart_irq() -> u32 {
     crate::bootinfo::get()
@@ -86,7 +86,16 @@ fn complete(context: usize, irq: u32) {
 
 #[inline(always)]
 fn supervisor_context(hart_id: usize) -> usize {
-    hart_id * 2 + 1
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        // JH7110 hart 0 is the E24 monitor core and has no S-mode context.
+        // U74 hart 1 therefore uses context 2, hart 2 context 4, and so on.
+        hart_id * 2
+    }
+    #[cfg(not(feature = "platform-visionfive2"))]
+    {
+        hart_id * 2 + 1
+    }
 }
 
 lazy_static! {
@@ -107,6 +116,19 @@ fn set_irq_affinity_internal(irq: u32, hart_id: usize) {
     if let Some(slot) = IRQ_AFFINITY.lock().get_mut(irq as usize) {
         *slot = target_hart;
     }
+}
+
+/// Register one platform device interrupt with the bootstrap housekeeping hart.
+///
+/// Platform devices such as the JH7110 EQoS controller are discovered after
+/// the PLIC global setup, but before per-hart contexts are enabled.
+pub fn register_irq(irq: u32) {
+    if irq == 0 || irq as usize >= MAX_IRQ_ID {
+        warn!("ignoring out-of-range PLIC IRQ {}", irq);
+        return;
+    }
+    set_irq_affinity_internal(irq, bootstrap_hart_id());
+    set_priority(irq, 1);
 }
 
 /// 初始化 PLIC 的全局优先级配置。
@@ -134,23 +156,18 @@ pub fn init() {
 /// 每个 hart 都需要各自执行一次，使能本地 context 的 IRQ 位图并设置 threshold。
 pub fn init_hart(hart_id: usize) {
     let context = supervisor_context(hart_id);
-    let uart_irq = uart_irq();
-    if affinity_target(uart_irq) == hart_id {
-        enable_irq(context, uart_irq);
-    } else {
-        disable_irq(context, uart_irq);
-    }
-    for irq in crate::bootinfo::get()
-        .virtio_mmio_devices()
-        .iter()
-        .filter_map(|resource| resource.irq)
-    {
-        if affinity_target(irq) == hart_id {
-            enable_irq(context, irq);
+    let affinity = IRQ_AFFINITY.lock();
+    for (irq, target_hart) in affinity.iter().copied().enumerate().skip(1) {
+        if target_hart == usize::MAX {
+            continue;
+        }
+        if target_hart == hart_id {
+            enable_irq(context, irq as u32);
         } else {
-            disable_irq(context, irq);
+            disable_irq(context, irq as u32);
         }
     }
+    drop(affinity);
     set_threshold(context, 0);
     debug!("hart {} plic init done", hart_id);
 }
@@ -169,13 +186,12 @@ pub fn handle_supervisor_external_hart(hart_id: usize) {
         // 把刚到达的输入立刻喂入控制台行规程：这样即便当前没有进程在 read，
         // Ctrl+C 等信号字符也能在到达瞬间生成信号投递给前台进程组。
         crate::fs::console_receive();
-    } else if crate::bootinfo::get()
-        .virtio_mmio_devices()
-        .iter()
-        .any(|resource| resource.irq == Some(irq))
-    {
-        crate::drivers::block::handle_irq(irq);
-        crate::drivers::net::handle_irq(irq);
+    } else if irq != 0 {
+        let block_handled = crate::drivers::block::handle_irq(irq);
+        let net_handled = crate::drivers::net::handle_irq(irq);
+        if !block_handled && !net_handled {
+            warn!("unhandled PLIC IRQ {}", irq);
+        }
     }
     if irq != 0 {
         complete(context, irq);

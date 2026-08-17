@@ -96,6 +96,8 @@ pub use tlb_shootdown::{reset_tlb_shootdown_stats, tlb_shootdown_stats, TlbShoot
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     frame_allocator::init_frame_allocator();
+    #[cfg(feature = "platform-visionfive2")]
+    crate::platform::early_console_write("[vf2] frame allocator online\r\n");
     #[cfg(feature = "cosmos-meminfo")]
     reset_page_table_stats();
     #[cfg(feature = "cosmos-meminfo")]
@@ -103,13 +105,23 @@ pub fn init() {
     #[cfg(feature = "cosmos-meminfo")]
     reset_anonymous_page_stats();
     heap_allocator::init_heap();
+    #[cfg(feature = "platform-visionfive2")]
+    crate::platform::early_console_write("[vf2] bootstrap heap online\r\n");
     let kernel_space = &*KERNEL_SPACE;
+    #[cfg(feature = "platform-visionfive2")]
+    crate::platform::early_console_write("[vf2] permanent kernel page table built\r\n");
     let kernel_space_guard = kernel_space.lock();
     kernel_space_guard.activate();
+    #[cfg(feature = "platform-visionfive2")]
+    crate::platform::early_console_write("[vf2] permanent kernel page table active\r\n");
     drop(kernel_space_guard);
     asid::init();
     heap_allocator::init_kernel_heap_mapping();
+    #[cfg(feature = "platform-visionfive2")]
+    crate::platform::early_console_write("[vf2] heap page-table subtree cached\r\n");
     heap_allocator::init_heap_virtual_window();
+    #[cfg(feature = "platform-visionfive2")]
+    crate::platform::early_console_write("[vf2] virtual heap online\r\n");
 }
 
 /// 在当前 hart 上激活内核地址空间（写入 satp + sfence.vma）。

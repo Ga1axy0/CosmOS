@@ -275,11 +275,19 @@ fn wait_for_bootstrap() {
 fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     platform::early_runtime_diagnostics();
     clear_bss();
+    #[cfg(feature = "platform-visionfive2")]
+    platform::early_console_write("[vf2] BSS cleared\r\n");
     BOOT_BSS_READY.store(0, Ordering::Release);
     bootinfo::init(fdt_ptr);
+    #[cfg(feature = "platform-visionfive2")]
+    platform::early_console_write("[vf2] firmware FDT parsed\r\n");
     // Install TLB refill handler and page-walker CSRs before activating page tables.
     trap::init();
+    #[cfg(feature = "platform-visionfive2")]
+    platform::early_console_write("[vf2] trap vector installed\r\n");
     mm::init();
+    #[cfg(feature = "platform-visionfive2")]
+    platform::early_console_write("[vf2] permanent MMU state online\r\n");
     if !platform::continue_full_boot() {
         platform::halt_early_bringup();
     }
@@ -330,6 +338,7 @@ fn secondary_hart_main(hart_id: usize) -> ! {
     mm::activate_kernel_space(); // 激活内核页表：但 satp 是 per-hart 寄存器
     info!("hart {} entered secondary_hart_main", hart_id);
     init_local_hart(hart_id);
+    println!("[smp] hart {} online", hart_id);
     debug!("hart {} entered scheduler", hart_id);
     sched::run_tasks();
     panic!("Unreachable in secondary_hart_main!");
@@ -341,6 +350,7 @@ fn secondary_hart_main(hart_id: usize) -> ! {
 /// 第一个进入该入口的 hart 会成为 bootstrap hart，负责一次性全局初始化
 /// 并进入调度器；其他 hart 等待 bootstrap 完成后只做本地初始化并进入 idle。
 pub fn rust_main(hart_id: usize, fdt_ptr: usize) -> ! {
+    let (hart_id, fdt_ptr) = platform::normalize_firmware_boot_args(hart_id, fdt_ptr);
     unsafe { crate::hal::init_with_hartid(hart_id) };
     if !try_claim_bootstrap_hart(hart_id) {
         secondary_hart_main(hart_id);
