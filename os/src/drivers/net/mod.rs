@@ -189,22 +189,46 @@ pub fn register_device(dev: VirtIONetDevice) {
     *NET_DEVICE.lock() = Some(Arc::new(NetworkDevice::Virtio(dev)));
 }
 
-/// Probe and register the LS2K1000 GMAC described by firmware.
+/// Probe and register the usable LS2K1000 GMAC described by firmware.
+///
+/// A legacy CosmOS network stack has one physical-Ethernet slot.  Probe every
+/// FDT-described port rather than binding an address constant; ports that
+/// declare a default pinctrl state are attempted first because they are the
+/// board-routed ports.  Once the stack grows multi-interface support this loop
+/// can register each successful device without changing FDT discovery again.
 #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
 pub fn probe_loongson_gmac() -> Option<u32> {
-    let Some(resource) = crate::bootinfo::get().gmac() else {
+    let info = crate::bootinfo::get();
+    if info.gmac_devices().next().is_none() {
         println!("[net] LS2K1000 FDT has no supported GMAC resource");
         return None;
-    };
-    println!("[net] probing LS2K1000 GMAC resource {:?}", resource);
-    let Some(dev) = LoongsonGmacDevice::try_new(resource) else {
-        println!("[net] LS2K1000 GMAC initialization failed");
-        return None;
-    };
-    let irq = dev.irq();
-    *NET_DEVICE.lock() = Some(Arc::new(NetworkDevice::LoongsonGmac(dev)));
-    println!("[net] LS2K1000 GMAC registered on IRQ {}", irq);
-    Some(irq)
+    }
+
+    for require_pinctrl in [true, false] {
+        for resource in info.gmac_devices() {
+            if resource.pinctrl_default().is_some() != require_pinctrl {
+                continue;
+            }
+            println!(
+                "[net] probing LS2K1000 GMAC resource {:?}, pinctrl_default={:?}, phy_mode={:?}, phy_handle={:?}, phy_addr={:?}",
+                resource,
+                resource.pinctrl_default(),
+                resource.phy_mode(),
+                resource.phy_handle(),
+                resource.phy_addr(),
+            );
+            let Some(dev) = LoongsonGmacDevice::try_new(resource) else {
+                println!("[net] LS2K1000 GMAC initialization failed for {:#x}", resource.device().start);
+                continue;
+            };
+            let irq = dev.irq();
+            *NET_DEVICE.lock() = Some(Arc::new(NetworkDevice::LoongsonGmac(dev)));
+            println!("[net] LS2K1000 GMAC registered on IRQ {}", irq);
+            return Some(irq);
+        }
+    }
+    println!("[net] no FDT-described LS2K1000 GMAC completed initialization");
+    None
 }
 
 /// Probe the JH7110 EQoS port used by the successful U-Boot TFTP path.
