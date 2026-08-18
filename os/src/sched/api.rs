@@ -27,6 +27,7 @@ fn suspend_current_and_run_next_inner(
     // for consistency and to guard against future regressions.)
     let _irq = crate::hal::LocalIrqSave::new();
     let task = take_current_task().unwrap();
+    super::bais::on_task_stopping(&task, hartid());
     let process = task
         .process
         .upgrade()
@@ -148,6 +149,7 @@ pub fn block_current_and_run_next(reason: WaitReason) {
         restore_current_task(task);
         return;
     }
+    super::bais::on_task_stopping(&task, hartid());
     let process = task.process.upgrade().unwrap();
     if boost_same_process_cfs {
         let boost_candidates = {

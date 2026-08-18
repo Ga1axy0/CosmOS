@@ -79,13 +79,17 @@ impl VirtIONetDevice {
         self.mac
     }
 
-    /// Acknowledge the device interrupt and wake a waiting TX token if any.
+    /// Acknowledge the device interrupt.
+    ///
+    /// Queue draining and waiter wakeups are deliberately deferred to the
+    /// scheduler-visible network worker so the hardirq path stays bounded.
     pub fn handle_irq(&self) {
         let mut inner = self.inner.lock();
-        if inner.ack_interrupt().is_empty() {
-            return;
-        }
-        drop(inner);
+        let _ = inner.ack_interrupt();
+    }
+
+    /// Drain TX completions from task context after an IRQ.
+    pub(crate) fn service_deferred(&self) {
         self.reclaim_tx_completions();
     }
 

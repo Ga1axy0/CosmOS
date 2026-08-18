@@ -113,6 +113,10 @@ static BLOCK_WORKER_LAST_PUMP_NS: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_WORKER_IN_PUMP: AtomicBool = AtomicBool::new(false);
 static BLOCK_WORKER_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IRQ_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Bound one scheduler-visible bottom-half run. If more completions remain,
+/// the worker requeues itself so BAIS can reconsider its target hart against
+/// the latest AI phase/progress state.
+const BLOCK_WORKER_COMPLETION_BUDGET: usize = 16;
 
 pub(super) struct BlockWorkerDebugSnapshot {
     task_ptr: usize,
@@ -188,6 +192,7 @@ pub fn probe_block_devices() {
 /// Handle one IRQ for a registered block device.
 pub fn handle_irq(irq: u32) -> bool {
     if let Some(dev) = BLOCK_DEVICES_BY_IRQ.lock().get(&irq).cloned() {
+        crate::sched::note_bais_block_irq(crate::hal::hartid());
         dev.handle_irq();
         true
     } else {
@@ -233,12 +238,26 @@ fn block_worker_has_completions() -> bool {
         .any(|dev| dev.has_used_completions())
 }
 
-fn block_worker_pump_once() -> bool {
-    let mut completed_any = false;
+struct BlockPumpResult {
+    completed: usize,
+    elapsed_ns: u64,
+}
+
+fn block_worker_pump_slice() -> BlockPumpResult {
+    let start_ns = crate::timer::get_time_ns();
+    let mut completed = 0usize;
     for dev in block_devices_snapshot() {
-        completed_any |= dev.pump_completions();
+        let remaining = BLOCK_WORKER_COMPLETION_BUDGET.saturating_sub(completed);
+        if remaining == 0 {
+            break;
+        }
+        completed = completed.saturating_add(dev.pump_completions_budget(remaining));
     }
-    completed_any
+    let elapsed_ns = crate::timer::get_time_ns().saturating_sub(start_ns);
+    BlockPumpResult {
+        completed,
+        elapsed_ns,
+    }
 }
 
 fn age_ms_since(now_ns: usize, then_ns: usize) -> Option<usize> {
@@ -333,12 +352,18 @@ fn block_io_worker_main() -> ! {
         BLOCK_WORKER_PUMP_CALLS.fetch_add(1, Ordering::Relaxed);
         BLOCK_WORKER_LAST_PUMP_NS.store(crate::timer::get_time_ns() as usize, Ordering::Release);
         BLOCK_WORKER_IN_PUMP.store(true, Ordering::Release);
-        let completed_any = block_worker_pump_once();
+        let pump = block_worker_pump_slice();
+        if pump.completed != 0 || had_completion_event {
+            crate::sched::account_bais_block_deferred(crate::hal::hartid(), pump.elapsed_ns);
+        }
         BLOCK_WORKER_IN_PUMP.store(false, Ordering::Release);
-        if completed_any {
+        if pump.completed != 0 {
             BLOCK_WORKER_PUMP_COMPLETED.fetch_add(1, Ordering::Relaxed);
         }
-        if completed_any || had_completion_event {
+        if block_worker_has_completions() {
+            // Bound each deferred run, then requeue through CFS. BAIS can
+            // choose a new hart from the latest AI-worker progress snapshot.
+            crate::sched::suspend_current_and_run_next();
             continue;
         }
         BLOCK_WORKER_SLEEPS.fetch_add(1, Ordering::Relaxed);

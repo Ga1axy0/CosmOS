@@ -220,6 +220,7 @@ pub(crate) fn run_tasks() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
 
             process.resume_in_kernel(task.as_ref(), get_time());
+            super::bais::on_task_running(&task, hartid());
             processor.current = Some(task);
             #[cfg(feature = "current_task_cache")]
             publish_current_task(processor.current.as_ref());

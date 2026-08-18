@@ -970,6 +970,7 @@ impl VfsNode for ProcRootNode {
         entries.push((String::from("perf_probe"), VfsFileType::Regular));
         #[cfg(feature = "perf_probe")]
         entries.push((String::from("perf_probe_enable"), VfsFileType::Regular));
+        entries.push((String::from("bais"), VfsFileType::Regular));
         #[cfg(feature = "mm_perf_counters")]
         entries.push((String::from("mm_perf"), VfsFileType::Regular));
         entries.push((String::from("key-users"), VfsFileType::Regular));
@@ -1007,6 +1008,7 @@ impl VfsNode for ProcRootNode {
             "perf_probe_enable" => {
                 Some(Arc::new(ProcPerfProbeEnableNode::new()) as Arc<dyn VfsNode>)
             }
+            "bais" => Some(Arc::new(ProcBaisNode::new()) as Arc<dyn VfsNode>),
             #[cfg(feature = "mm_perf_counters")]
             "mm_perf" => Some(Arc::new(ProcMmPerfNode::new()) as Arc<dyn VfsNode>),
             "key-users" => Some(Arc::new(ProcKeyUsersNode::new()) as Arc<dyn VfsNode>),
@@ -1040,6 +1042,80 @@ impl VfsNode for ProcRootNode {
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> usize {
         0
+    }
+
+    fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {
+        Ok(crate::fs::empty_statfs(
+            fs::STATFS_MAGIC_PROC,
+            crate::config::PAGE_SIZE as u64,
+            0x9fa0,
+            255,
+        ))
+    }
+}
+
+/// `/proc/bais` controls the native competition scheduler and exposes its
+/// per-hart interference snapshot.
+#[derive(Default, Debug)]
+pub struct ProcBaisNode;
+
+impl ProcBaisNode {
+    /// Create a new `/proc/bais` node.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VfsNode for ProcBaisNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn file_type(&self) -> VfsFileType {
+        VfsFileType::Regular
+    }
+
+    fn size(&self) -> usize {
+        crate::sched::render_bais().len()
+    }
+
+    fn ls(&self) -> Vec<(String, VfsFileType)> {
+        Vec::new()
+    }
+
+    fn find(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn create(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn mkdir(&self, _name: &str) -> Option<Arc<dyn VfsNode>> {
+        None
+    }
+
+    fn clear(&self) {
+        crate::sched::apply_bais_control("off");
+    }
+
+    fn truncate(&self, _new_size: usize) -> Result<(), FS_ERRNO> {
+        Ok(())
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        read_string_at(crate::sched::render_bais(), offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> usize {
+        let Ok(text) = core::str::from_utf8(buf) else {
+            return 0;
+        };
+        if crate::sched::apply_bais_control(text) {
+            buf.len()
+        } else {
+            0
+        }
     }
 
     fn statfs(&self) -> Result<fs::VfsStatFs, fs::errno::FS_ERRNO> {

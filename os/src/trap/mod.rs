@@ -32,8 +32,15 @@ use crate::task::{
     exit_current_and_run_next, exit_group_current_and_run_next, ExitReason, ProcessControlBlock,
     TaskControlBlock,
 };
-use crate::timer::{get_realtime_ns, get_time, handle_timer_interrupt};
+use crate::timer::{get_realtime_ns, get_time, get_time_ns, handle_timer_interrupt};
 use alloc::sync::Arc;
+
+#[inline]
+fn handle_external_interrupt() {
+    let start_ns = get_time_ns();
+    crate::platform::handle_external_irq();
+    crate::sched::account_bais_irq(hartid(), get_time_ns().saturating_sub(start_ns));
+}
 
 /// Diagnostic-only lmbench-null/getppid path.
 ///
@@ -423,6 +430,71 @@ fn handle_reschedule_ipi() {
     request_current_task_resched(ReschedReason::HigherRtPriority);
 }
 
+#[derive(Clone, Copy)]
+enum BaisTrapService {
+    None,
+    PageFault,
+    MemoryControl,
+    DeviceControl,
+    OtherSyscall,
+}
+
+fn classify_bais_syscall(syscall_id: usize) -> BaisTrapService {
+    use crate::syscall::*;
+    if syscall_id == SYSCALL_BAIS_HINT {
+        return BaisTrapService::None;
+    }
+    if matches!(
+        syscall_id,
+        SYSCALL_BRK
+            | SYSCALL_MMAP
+            | SYSCALL_MUNMAP
+            | SYSCALL_MREMAP
+            | SYSCALL_MPROTECT
+            | SYSCALL_MSYNC
+            | SYSCALL_MADVISE
+    ) {
+        return BaisTrapService::MemoryControl;
+    }
+    if matches!(
+        syscall_id,
+        SYSCALL_IOCTL
+            | SYSCALL_READ
+            | SYSCALL_WRITE
+            | SYSCALL_READV
+            | SYSCALL_WRITEV
+            | SYSCALL_PREAD64
+            | SYSCALL_PWRITE64
+            | SYSCALL_PREADV
+            | SYSCALL_PWRITEV
+            | SYSCALL_FSYNC
+            | SYSCALL_FDATASYNC
+    ) {
+        return BaisTrapService::DeviceControl;
+    }
+    BaisTrapService::OtherSyscall
+}
+
+#[inline]
+fn account_bais_service(service: BaisTrapService, start_ns: u64) {
+    let elapsed_ns = get_time_ns().saturating_sub(start_ns);
+    match service {
+        BaisTrapService::None => {}
+        BaisTrapService::PageFault => {
+            crate::sched::account_bais_ai_page_fault(hartid(), start_ns, elapsed_ns)
+        }
+        BaisTrapService::MemoryControl => {
+            crate::sched::account_bais_ai_memory_control(hartid(), start_ns, elapsed_ns)
+        }
+        BaisTrapService::DeviceControl => {
+            crate::sched::account_bais_ai_device_control(hartid(), start_ns, elapsed_ns)
+        }
+        BaisTrapService::OtherSyscall => {
+            crate::sched::account_bais_ai_other_syscall(hartid(), start_ns, elapsed_ns)
+        }
+    }
+}
+
 /// trap handler
 #[no_mangle]
 pub fn trap_handler() -> ! {
@@ -463,6 +535,7 @@ fn handle_user_syscall() -> ! {
     snapshot
         .process
         .enter_kernel(snapshot.task.as_ref(), get_time());
+    let bais_service_start_ns = get_time_ns();
     let (syscall_id, syscall_args) = {
         let cx = snapshot.task.trap_cx();
         cx.in_syscall = false;
@@ -474,6 +547,7 @@ fn handle_user_syscall() -> ! {
         cx.advance_user_pc(ArchTrapMachine::syscall_instruction_len());
         (syscall_id, syscall_args)
     };
+    let bais_service = classify_bais_syscall(syscall_id);
 
     // Do not keep an owned reference on the task's own kernel stack while the
     // dispatcher may block or exit. Reacquire the (possibly exec-replaced)
@@ -501,6 +575,7 @@ fn handle_user_syscall() -> ! {
     }
     cx.set_syscall_ret(result as usize);
     cx.in_syscall = true;
+    account_bais_service(bais_service, bais_service_start_ns);
     #[cfg(all(target_arch = "riscv64", feature = "trap_fp_fcsr_clobber_probe"))]
     unsafe {
         // Force the live kernel FP state away from the saved frame so the
@@ -527,10 +602,13 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
     current_trap_cx().in_syscall = false;
     current_trap_cx().restartable_syscall = false;
     let trap_info = ArchTrapMachine::read_trap_info();
+    let bais_service_start_ns = get_time_ns();
+    let mut bais_service = BaisTrapService::None;
     debug_assert_eq!(trap_info.cause, expected_cause);
     match trap_info.cause {
         TrapCause::UserSyscall => unreachable!("syscall escaped the dedicated trap path"),
         TrapCause::StorePageFault => {
+            bais_service = BaisTrapService::PageFault;
             let _probe = crate::probe_scope!("trap.user_page_fault.store");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             trace!(
@@ -602,6 +680,7 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
             }
         }
         TrapCause::LoadPageFault => {
+            bais_service = BaisTrapService::PageFault;
             let _probe = crate::probe_scope!("trap.user_page_fault.load");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             // debug!(
@@ -649,6 +728,7 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
             }
         }
         TrapCause::InstructionPageFault => {
+            bais_service = BaisTrapService::PageFault;
             let _probe = crate::probe_scope!("trap.user_page_fault.exec");
             let _kernel_irq = irq::KernelIrqEnableGuard::new();
             trace!(
@@ -798,9 +878,7 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
         }
         TrapCause::ExternalInterrupt => {
             let _hardirq = irq::HardIrqGuard::enter();
-            crate::platform::handle_external_irq();
-            #[cfg(not(feature = "platform-visionfive2"))]
-            crate::net::poll();
+            handle_external_interrupt();
         }
         _ => {
             panic!(
@@ -809,6 +887,7 @@ fn handle_user_trap_slow(expected_cause: TrapCause) -> ! {
             );
         }
     }
+    account_bais_service(bais_service, bais_service_start_ns);
     finish_current_user_trap();
 }
 
@@ -945,9 +1024,7 @@ fn trap_from_kernel_impl(
     let trap_info = ArchTrapMachine::read_trap_info();
     match trap_info.cause {
         TrapCause::ExternalInterrupt => {
-            crate::platform::handle_external_irq();
-            #[cfg(not(feature = "platform-visionfive2"))]
-            crate::net::poll(); // 处理完外部中断后立即poll，让smoltcp响应ARP等请求
+            handle_external_interrupt();
         }
         TrapCause::TimerInterrupt => {
             // trace!("hart {} timer tick", hartid());

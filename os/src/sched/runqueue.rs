@@ -346,7 +346,12 @@ fn effective_affinity_mask(affinity_mask: usize) -> usize {
     }
 }
 
-fn select_target_hart(preferred_hart: usize, affinity_mask: usize, policy: SchedPolicy) -> usize {
+fn select_target_hart(
+    task: &TaskControlBlock,
+    preferred_hart: usize,
+    affinity_mask: usize,
+    policy: SchedPolicy,
+) -> usize {
     let affinity_mask = effective_affinity_mask(affinity_mask);
     let preferred_hart = normalize_hart(preferred_hart);
     if policy.is_rt() {
@@ -354,6 +359,12 @@ fn select_target_hart(preferred_hart: usize, affinity_mask: usize, policy: Sched
             return preferred_hart;
         }
         return affinity_mask.trailing_zeros() as usize;
+    }
+
+    if let Some(selected) = super::bais::select_task_cpu(task, affinity_mask, policy) {
+        if selected < MAX_HARTS && affinity_mask & (1usize << selected) != 0 {
+            return selected;
+        }
     }
 
     if affinity_mask & (1usize << preferred_hart) != 0
@@ -672,7 +683,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         }
         (task_inner.sched.cpu_affinity_mask, task_inner.sched.policy)
     };
-    let target_hart = select_target_hart(hart, affinity_mask, policy);
+    let target_hart = select_target_hart(&task, hart, affinity_mask, policy);
     let current_vruntime_hint = running_cfs_vruntime_snapshot(target_hart);
     let incoming = {
         let mut rq = RUN_QUEUES[target_hart].lock();
@@ -867,7 +878,9 @@ fn steal_cfs_task(target_hart: usize) -> Option<Arc<TaskControlBlock>> {
                 .cfs_tasks
                 .iter()
                 .find(|(_, task)| {
-                    task.inner_exclusive_access().sched.cpu_affinity_mask & target_bit != 0
+                    let affinity_allows =
+                        { task.inner_exclusive_access().sched.cpu_affinity_mask & target_bit != 0 };
+                    affinity_allows && super::bais::allow_steal(task, target_hart)
                 })
                 .map(|(key, _)| *key);
             key.and_then(|key| source_rq.remove_cfs_by_key(key))
@@ -985,7 +998,7 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) -> bool {
         }
     };
     if let Some((preferred_hart, affinity_mask, policy)) = wake_target {
-        let target_hart = select_target_hart(preferred_hart, affinity_mask, policy);
+        let target_hart = select_target_hart(&task, preferred_hart, affinity_mask, policy);
         return enqueue_wakeup_task(task, target_hart);
     }
     true

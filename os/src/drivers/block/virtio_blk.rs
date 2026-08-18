@@ -1,4 +1,3 @@
-use crate::hal::hartid;
 use crate::sync::SpinNoIrqLock;
 use crate::task::{current_task, WaitQueue, WaitReason};
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
@@ -677,10 +676,9 @@ impl VirtIOBlock {
         inner.peek_used().is_some()
     }
 
-    /// Drain completed virtqueue entries and wake the corresponding waiters.
-    pub fn pump_completions(&self) -> bool {
-        let mut completed_any = false;
-        loop {
+    fn pump_completions_limited(&self, count_budget: usize) -> usize {
+        let mut completed = 0usize;
+        while completed < count_budget {
             let mut device = self.inner.lock();
             // See `handle_irq`: an I/O read fence is required before reading the
             // DMA-written used ring, otherwise a just-completed entry can be
@@ -741,13 +739,23 @@ impl VirtIOBlock {
             self.last_completion_ns.store(now_ns(), Ordering::Release);
             drop(data);
             drop(device);
-            completed_any = true;
+            completed += 1;
             request.wait_queue.wake_all();
         }
-        if completed_any {
+        if completed != 0 {
             self.wake_batch_waiters();
         }
-        completed_any
+        completed
+    }
+
+    /// Drain at most `budget` completed virtqueue entries and wake their waiters.
+    pub fn pump_completions_budget(&self, budget: usize) -> usize {
+        self.pump_completions_limited(budget)
+    }
+
+    /// Drain every completion currently visible in the virtqueue.
+    pub fn pump_completions(&self) -> bool {
+        self.pump_completions_budget(usize::MAX) != 0
     }
 
     fn wake_batch_waiters(&self) -> usize {
