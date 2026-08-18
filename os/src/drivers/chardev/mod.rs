@@ -42,7 +42,8 @@ pub trait CharDevice: Sync + Send {
 lazy_static! {
    /// Singleton of UART impl.
    pub static ref UART: Arc<CharDeviceImpl> = {
-       let uart = crate::bootinfo::get()
+       let uart = crate::boot::context::get()
+           .devices()
            .uart()
            .expect("FDT console UART disappeared after boot discovery");
        Arc::new(CharDeviceImpl::new(crate::platform::mmio_phys_to_virt(uart.start)))

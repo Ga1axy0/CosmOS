@@ -1384,7 +1384,7 @@ pub fn heap_test() {
 fn is_bootinfo_ram_va(va: usize) -> bool {
     let pa = crate::platform::direct_map_virt_to_phys(va);
     let mut found = false;
-    crate::bootinfo::for_each_usable_memory_region(|region| {
+    crate::boot::context::get().memblock().for_each_free_range(|region| {
         found |= pa >= region.start && pa < region.end;
     });
     found

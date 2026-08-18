@@ -12,7 +12,7 @@ mod soc;
 
 use core::{mem::size_of, ptr::addr_of_mut};
 
-use crate::{bootinfo::GmacResource, platform, sync::SpinNoIrqLock, timer::get_time_ns};
+use crate::{of::net::GmacResource, platform, sync::SpinNoIrqLock, timer::get_time_ns};
 
 use phy::PhyLink;
 use soc::SocControl;

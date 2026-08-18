@@ -243,7 +243,7 @@ pub fn mmio_phys_to_virt(paddr: usize) -> usize {
 
 /// Whether the Goldfish RTC is supported on this platform.
 pub fn rtc_is_supported() -> bool {
-    crate::bootinfo::get().rtc().is_some()
+    crate::boot::context::get().devices().rtc().is_some()
 }
 
 /// Whether the kernel heap may grow inside its dedicated virtual window.

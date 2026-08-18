@@ -5,7 +5,7 @@
 //! U-Boot's JH7110 EQoS and clock drivers at commit
 //! `c4c67bb66ae6f41c98537d18cf5c3abc8b97b8e4`.
 
-use crate::{bootinfo, platform};
+use crate::{boot::context, platform};
 
 const SYSCRG_PADDR: usize = 0x1302_0000;
 const RESET_ASSERT_BASE: usize = 0x2f8;
@@ -32,7 +32,7 @@ unsafe impl Sync for SocControl {}
 
 impl SocControl {
     pub(super) fn start_gmac1() -> Option<Self> {
-        let resource = bootinfo::get().syscrg()?;
+        let resource = context::get().devices().syscrg()?;
         if resource.start != SYSCRG_PADDR || resource.size < RESET_STATUS_BASE + 16 {
             println!(
                 "[jh7110-eqos] unsupported SYSCRG resource pa={:#x} size={:#x}",

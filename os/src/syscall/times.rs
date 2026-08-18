@@ -258,7 +258,7 @@ fn timespec_from_raw_ticks(raw_time: usize) -> Timespec {
 /// 将内核 CPU 账户的原始时间计数转换为 `timeval`。
 fn timeval_from_raw_time(raw_time: usize) -> TimeVal {
     let raw_time = raw_time as u128;
-    let freq = crate::bootinfo::timer_frequency() as u128;
+    let freq = crate::boot::context::timer_frequency() as u128;
     TimeVal {
         sec: (raw_time / freq) as usize,
         usec: ((raw_time % freq) * 1_000_000 / freq) as usize,

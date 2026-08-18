@@ -7,7 +7,7 @@ use super::{
 use super::{AddressSpaceRoot, PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum, USER_SPACE_END};
 use super::{StepByOne, VPNRange};
-use crate::bootinfo;
+use crate::boot::context;
 #[cfg(target_arch = "loongarch64")]
 use crate::config::{KERNEL_HEAP_BASE, MAX_KERNEL_HEAP_SIZE};
 use crate::config::{
@@ -1194,14 +1194,14 @@ impl MemorySet {
             info!("mapping physical memory");
             let kernel_start = crate::platform::direct_map_virt_to_phys(skernel as usize);
             let kernel_end = crate::platform::direct_map_virt_to_phys(ekernel as usize);
-            bootinfo::for_each_usable_memory_region(|region| {
+            context::get().memblock().for_each_free_range(|region| {
                 let start = align_up_to_page(region.start);
                 let end = align_down_to_page(region.end);
                 map_kernel_ram_fragment(&mut memory_set, start, kernel_start.min(end));
                 map_kernel_ram_fragment(&mut memory_set, kernel_end.max(start), end);
             });
             info!("mapping memory-mapped registers");
-            for region in bootinfo::get().mmio_regions() {
+            for region in context::get().devices().mmio_regions() {
                 let start = crate::platform::mmio_phys_to_virt(region.start);
                 memory_set
                     .insert_vma(

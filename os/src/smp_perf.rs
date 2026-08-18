@@ -329,7 +329,7 @@ pub(crate) fn render() -> String {
     let _ = writeln!(
         &mut out,
         "# timer_ticks_per_second {}",
-        crate::bootinfo::timer_frequency()
+        crate::boot::context::timer_frequency()
     );
     let _ = writeln!(
         &mut out,

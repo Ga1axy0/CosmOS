@@ -22,7 +22,7 @@ const PCI_INTERRUPT_LINE_PIN_OFFSET: usize = 0x3c;
 
 /// Probe the LA64 PCIe ECAM bus and register VirtIO PCI devices.
 pub fn probe_platform_devices() {
-    let Some(host) = crate::bootinfo::get().pci_host() else {
+    let Some(host) = crate::boot::context::get().devices().pci_host() else {
         return;
     };
     if host.memory_size == 0 {
@@ -187,7 +187,7 @@ fn configure_pci_device(
 }
 
 fn pci_config_read_word(
-    host: crate::bootinfo::PciHostResource,
+    host: crate::of::pci::PciHostResource,
     bdf: DeviceFunction,
     offset: usize,
 ) -> u32 {
@@ -200,7 +200,7 @@ fn pci_config_read_word(
     unsafe { read_volatile(addr as *const u32) }
 }
 
-fn gpex_intx_irq(host: crate::bootinfo::PciHostResource, bdf: DeviceFunction) -> Option<u32> {
+fn gpex_intx_irq(host: crate::of::pci::PciHostResource, bdf: DeviceFunction) -> Option<u32> {
     let line_pin = pci_config_read_word(host, bdf, PCI_INTERRUPT_LINE_PIN_OFFSET);
     let interrupt_pin = ((line_pin >> 8) & 0xff) as u8;
     if interrupt_pin == 0 {

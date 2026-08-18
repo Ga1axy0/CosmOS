@@ -11,7 +11,8 @@ use lazy_static::*;
 
 #[inline(always)]
 fn plic_base() -> usize {
-    let resource = crate::bootinfo::get()
+    let resource = crate::boot::context::get()
+        .devices()
         .plic()
         .expect("FDT has no enabled RISC-V PLIC");
     crate::platform::mmio_phys_to_virt(resource.start)
@@ -20,7 +21,8 @@ fn plic_base() -> usize {
 const MAX_IRQ_ID: usize = 256;
 
 fn uart_irq() -> u32 {
-    crate::bootinfo::get()
+    crate::boot::context::get()
+        .devices()
         .uart()
         .and_then(|resource| resource.irq)
         .expect("FDT console UART has no interrupt")
@@ -140,7 +142,8 @@ pub fn init() {
     let uart_irq = uart_irq();
     set_irq_affinity_internal(uart_irq, housekeeping_hart);
     set_priority(uart_irq, 1);
-    for irq in crate::bootinfo::get()
+    for irq in crate::boot::context::get()
+        .devices()
         .virtio_mmio_devices()
         .iter()
         .filter_map(|resource| resource.irq)

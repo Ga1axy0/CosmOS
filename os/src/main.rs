@@ -34,7 +34,8 @@ extern crate alloc;
 extern crate bitflags;
 
 pub mod arch;
-pub mod bootinfo;
+pub mod boot;
+pub mod of;
 pub mod hal;
 pub mod platform;
 
@@ -220,7 +221,7 @@ fn init_local_hart(hart_id: usize) {
 /// Probe the firmware-visible hart IDs and return the number of usable harts.
 #[cfg(target_arch = "riscv64")]
 fn detect_hart_count() -> usize {
-    let fdt_hart_count = bootinfo::hart_count();
+    let fdt_hart_count = boot::context::get().hart_count();
     if fdt_hart_count > 1 {
         return fdt_hart_count;
     }
@@ -244,7 +245,7 @@ fn detect_hart_count() -> usize {
 /// Probe the usable hart count on non-RISC-V platforms.
 #[cfg(target_arch = "loongarch64")]
 fn detect_hart_count() -> usize {
-    bootinfo::hart_count()
+    boot::context::get().hart_count()
 }
 
 /// 竞争并记录负责一次性全局初始化的 bootstrap hart。
@@ -278,7 +279,7 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     #[cfg(feature = "platform-visionfive2")]
     platform::early_console_write("[vf2] BSS cleared\r\n");
     BOOT_BSS_READY.store(0, Ordering::Release);
-    bootinfo::init(fdt_ptr);
+    boot::init::init(fdt_ptr);
     #[cfg(feature = "platform-visionfive2")]
     platform::early_console_write("[vf2] firmware FDT parsed\r\n");
     // Install TLB refill handler and page-walker CSRs before activating page tables.

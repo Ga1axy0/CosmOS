@@ -149,7 +149,8 @@ pub fn probe_block_devices() {
     let mut map = BLOCK_DEVICES.lock();
     let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut idx = 0usize;
-    for (slot, resource) in crate::bootinfo::get()
+    for (slot, resource) in crate::boot::context::get()
+        .devices()
         .virtio_mmio_devices()
         .iter()
         .enumerate()
