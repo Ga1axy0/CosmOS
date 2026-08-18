@@ -6,10 +6,13 @@
 
 use core::{mem::size_of, ptr::addr_of_mut};
 
-use crate::{bootinfo::GmacResource, platform, sync::SpinNoIrqLock};
+use crate::{
+    bootinfo::{GmacResource, PhyInterfaceMode},
+    platform,
+    sync::SpinNoIrqLock,
+};
 
-const DEVICE_NAME: &str = "ls2k1000-gmac0";
-const SUPPORTED_PADDR: usize = 0x4004_0000;
+const DEVICE_NAME: &str = "ls2k1000-gmac";
 const DEFAULT_MAC: [u8; 6] = [0x62, 0x19, 0x1a, 0x02, 0xa8, 0x91];
 
 const DMA_OFFSET: usize = 0x1000;
@@ -41,15 +44,36 @@ const GMII_BUSY: u32 = 1 << 0;
 const GMII_CSR_CLK4: u32 = 1 << 4;
 const GMII_REG_SHIFT: u32 = 6;
 const GMII_DEV_SHIFT: u32 = 11;
-const PHY_ADDR: u32 = 0;
+const PHY_ADDR_MAX: u8 = 31;
 
 const MAC_RX: u32 = 1 << 2;
 const MAC_TX: u32 = 1 << 3;
+const MAC_DEFERRAL_CHECK: u32 = 0x0000_0010;
+const MAC_BACKOFF_LIMIT: u32 = 0x0000_0060;
+const MAC_PAD_CRC_STRIP: u32 = 0x0000_0080;
+const MAC_RETRY: u32 = 0x0000_0200;
 const MAC_DUPLEX: u32 = 1 << 11;
+const MAC_LOOPBACK: u32 = 0x0000_1000;
+const MAC_RX_OWN: u32 = 0x0000_2000;
 const MAC_SPEED_100: u32 = 1 << 14;
 const MAC_PORT_SELECT: u32 = 1 << 15;
 const MAC_TX_CONFIG: u32 = 1 << 24;
+const MAC_JUMBO_FRAME: u32 = 0x0010_0000;
+const MAC_FRAME_BURST: u32 = 0x0020_0000;
+const MAC_JABBER: u32 = 0x0040_0000;
+const MAC_WATCHDOG: u32 = 0x0080_0000;
 const MAC_FILTER: u32 = 1 << 31;
+const MAC_PROMISCUOUS_MODE: u32 = 0x0000_0001;
+const MAC_UCAST_HASH_FILTER: u32 = 0x0000_0002;
+const MAC_MCAST_HASH_FILTER: u32 = 0x0000_0004;
+const MAC_DEST_ADDR_FILTER: u32 = 0x0000_0008;
+const MAC_MULTICAST_FILTER: u32 = 0x0000_0010;
+const MAC_BROADCAST: u32 = 0x0000_0020;
+const MAC_PASS_CONTROL: u32 = 0x0000_00c0;
+const MAC_SRC_ADDR_FILTER: u32 = 0x0000_0200;
+const MAC_TX_FLOW_CONTROL: u32 = 0x0000_0002;
+const MAC_RX_FLOW_CONTROL: u32 = 0x0000_0004;
+const MAC_PAUSE_TIME_MASK: u32 = 0xffff_0000;
 
 const LINK_DUPLEX: u32 = 1 << 0;
 const LINK_SPEED_100: u32 = 1 << 1;
@@ -63,6 +87,9 @@ const DMA_BURST_LENGTHX8: u32 = 0x0100_0000;
 const DMA_MIXED_BURST_ENABLE: u32 = 0x0400_0000;
 const DMA_RX_START: u32 = 1 << 1;
 const DMA_TX_SECOND_FRAME: u32 = 1 << 2;
+const DMA_EN_HW_FLOW_CTRL: u32 = 0x0000_0100;
+const DMA_RX_FLOW_CTRL_ACT: u32 = 0x0080_0600;
+const DMA_RX_FLOW_CTRL_DEACT: u32 = 0x0040_1800;
 const DMA_TX_START: u32 = 1 << 13;
 const DMA_STORE_AND_FORWARD: u32 = 0x0220_0000;
 
@@ -102,7 +129,8 @@ const DESC_FRAME_LENGTH_MASK: u32 = 0x3fff_0000;
 const DESC_FRAME_LENGTH_SHIFT: u32 = 16;
 const DESC_OWNED_BY_DMA: u32 = 1 << 31;
 
-const RING_SIZE: usize = 64;
+// Kept in sync with tgoskits' verified LS2K1000 GMAC implementation.
+const RING_SIZE: usize = 128;
 const BUFFER_SIZE: usize = 2048;
 const RESET_TIMEOUT: usize = 1_000_000;
 const MDIO_TIMEOUT: usize = 100_000;
@@ -200,27 +228,91 @@ impl Registers {
         false
     }
 
-    fn mdio_read(&self, register: u32) -> Option<u16> {
+    fn mdio_read(&self, phy_addr: u8, register: u32) -> Option<u16> {
         if !self.wait_mdio() {
             return None;
         }
         self.mac.write(
             MAC_GMII_ADDR,
-            (PHY_ADDR << GMII_DEV_SHIFT) | (register << GMII_REG_SHIFT) | GMII_CSR_CLK4 | GMII_BUSY,
+            ((phy_addr as u32) << GMII_DEV_SHIFT)
+                | (register << GMII_REG_SHIFT)
+                | GMII_CSR_CLK4
+                | GMII_BUSY,
         );
         self.wait_mdio()
             .then(|| self.mac.read(MAC_GMII_DATA) as u16)
     }
 
+    fn discover_phy(&self) -> Option<u8> {
+        for phy_addr in 0..=PHY_ADDR_MAX {
+            let Some(high) = self.mdio_read(phy_addr, 2) else {
+                continue;
+            };
+            let Some(low) = self.mdio_read(phy_addr, 3) else {
+                continue;
+            };
+            if high != 0 && high != u16::MAX && low != 0 && low != u16::MAX {
+                return Some(phy_addr);
+            }
+        }
+        None
+    }
+
     fn reset_dma(&self) -> bool {
+        let before = self.dma.read(DMA_BUS_MODE);
         self.dma.write(DMA_BUS_MODE, DMA_RESET);
+        let requested = self.dma.read(DMA_BUS_MODE);
+        println!(
+            "[net][gmac] DMA reset request: bus_mode={:#010x}->{:#010x}, \
+             dma_status={:#010x}, dma_control={:#010x}, mac_config={:#010x}, rgmii={:#010x}",
+            before,
+            requested,
+            self.dma.read(DMA_STATUS),
+            self.dma.read(DMA_CONTROL),
+            self.mac.read(MAC_CONFIG),
+            self.mac.read(MAC_RGSMII_STATUS),
+        );
         for _ in 0..RESET_TIMEOUT {
             if self.dma.read(DMA_BUS_MODE) & DMA_RESET == 0 {
+                println!(
+                    "[net][gmac] DMA reset complete: bus_mode={:#010x}, dma_status={:#010x}",
+                    self.dma.read(DMA_BUS_MODE),
+                    self.dma.read(DMA_STATUS),
+                );
                 return true;
             }
             core::hint::spin_loop();
         }
+        println!(
+            "[net][gmac] DMA reset TIMEOUT: bus_mode={:#010x}, dma_status={:#010x}, \
+             dma_control={:#010x}, mac_config={:#010x}, mac_intr={:#010x}, rgmii={:#010x}, \
+             gmii_addr={:#010x}, gmii_data={:#010x}",
+            self.dma.read(DMA_BUS_MODE),
+            self.dma.read(DMA_STATUS),
+            self.dma.read(DMA_CONTROL),
+            self.mac.read(MAC_CONFIG),
+            self.mac.read(MAC_INTERRUPT_STATUS),
+            self.mac.read(MAC_RGSMII_STATUS),
+            self.mac.read(MAC_GMII_ADDR),
+            self.mac.read(MAC_GMII_DATA),
+        );
         false
+    }
+
+    /// Configure the MAC side of the FDT-selected PHY interface before the
+    /// DesignWare DMA reset.  In particular, MII needs PORT_SELECT set for
+    /// the reset handshake to see the PHY clock; RGMII and RMII clear it.
+    fn select_phy_mode(&self, mode: PhyInterfaceMode) {
+        match mode {
+            PhyInterfaceMode::Mii => self.mac.set(MAC_CONFIG, MAC_PORT_SELECT),
+            PhyInterfaceMode::Rmii
+            | PhyInterfaceMode::Rgmii
+            | PhyInterfaceMode::RgmiiId
+            | PhyInterfaceMode::RgmiiRxId
+            | PhyInterfaceMode::RgmiiTxId => self.mac.clear(MAC_CONFIG, MAC_PORT_SELECT),
+            PhyInterfaceMode::Unknown => {}
+        }
+        println!("[net][gmac] FDT PHY mode: {:?}, mac_config={:#010x}", mode, self.mac.read(MAC_CONFIG));
     }
 
     fn station_address(&self) -> Option<[u8; 6]> {
@@ -265,6 +357,67 @@ impl Registers {
             _ => config |= MAC_PORT_SELECT,
         }
         self.mac.write(MAC_CONFIG, config);
+    }
+
+    /// Register sequence copied from tgoskits' verified LS2K1000 GMAC driver.
+    fn init_dma_regs(&self, tx_base: u32, rx_base: u32) {
+        self.dma.write(
+            DMA_BUS_MODE,
+            DMA_MIXED_BURST_ENABLE | DMA_BURST_LENGTHX8 | DMA_BURST_LENGTH32,
+        );
+        self.dma
+            .write(DMA_CONTROL, DMA_STORE_AND_FORWARD | DMA_TX_SECOND_FRAME);
+        self.dma.write(DMA_AXI_BUS_MODE, 0xff | (0x77 << 16));
+        self.dma.write(DMA_TX_BASE_ADDR, tx_base);
+        self.dma.write(DMA_RX_BASE_ADDR, rx_base);
+    }
+
+    /// Register sequence copied from tgoskits' verified LS2K1000 GMAC driver.
+    fn init_mac_regs(&self) {
+        self.mac.set(MAC_CONFIG, MAC_TX_CONFIG);
+        self.mac.clear(
+            MAC_CONFIG,
+            MAC_WATCHDOG
+                | MAC_JABBER
+                | MAC_FRAME_BURST
+                | MAC_JUMBO_FRAME
+                | MAC_RX_OWN
+                | MAC_LOOPBACK
+                | MAC_RETRY
+                | MAC_PAD_CRC_STRIP
+                | MAC_DEFERRAL_CHECK
+                | MAC_BACKOFF_LIMIT,
+        );
+        self.mac.set(MAC_CONFIG, MAC_DUPLEX);
+
+        self.mac.clear(
+            MAC_FRAME_FILTER,
+            MAC_SRC_ADDR_FILTER
+                | MAC_BROADCAST
+                | MAC_MULTICAST_FILTER
+                | MAC_DEST_ADDR_FILTER
+                | MAC_MCAST_HASH_FILTER
+                | MAC_UCAST_HASH_FILTER
+                | MAC_PROMISCUOUS_MODE
+                | MAC_PASS_CONTROL,
+        );
+        self.mac.set(MAC_FRAME_FILTER, MAC_FILTER);
+
+        let mut dma_control = self.dma.read(DMA_CONTROL);
+        dma_control &= !(DMA_RX_FLOW_CTRL_ACT | DMA_RX_FLOW_CTRL_DEACT | DMA_EN_HW_FLOW_CTRL);
+        self.dma.write(DMA_CONTROL, dma_control);
+
+        let mut flow_control = MAC_PAUSE_TIME_MASK;
+        flow_control &= !(MAC_RX_FLOW_CONTROL | MAC_TX_FLOW_CONTROL);
+        self.mac.write(MAC_FLOW_CONTROL, flow_control);
+    }
+
+    /// Clear all controller-side latched state before enabling interrupts.
+    fn clear_pending_irq(&self) {
+        self.mac.write(MAC_MMC_INTR_MASK_TX, u32::MAX);
+        self.mac.write(MAC_MMC_INTR_MASK_RX, u32::MAX);
+        self.mac.write(MAC_MMC_RX_IPC_INTR_MASK, u32::MAX);
+        self.dma.write(DMA_STATUS, self.dma.read(DMA_STATUS));
     }
 
     fn start(&self) {
@@ -324,14 +477,28 @@ pub(crate) struct LoongsonGmacDevice {
 impl LoongsonGmacDevice {
     pub(crate) fn try_new(resource: GmacResource) -> Option<Self> {
         let device = resource.device();
-        if device.start != SUPPORTED_PADDR || device.size < DMA_OFFSET + 0x100 {
+        println!(
+            "[net][gmac] begin: pa={:#x} size={:#x} irq={:?} fdt_mac={:?}",
+            device.start,
+            device.size,
+            device.irq,
+            resource.mac_address(),
+        );
+        if device.size < DMA_OFFSET + 0x100 {
+            println!(
+                "[net][gmac] reject resource: minimum_size={:#x}",
+                DMA_OFFSET + 0x100,
+            );
             warn!(
-                "{DEVICE_NAME}: unsupported resource base={:#x} size={:#x}",
+                "{DEVICE_NAME}: unsupported resource size at base={:#x}: {:#x}",
                 device.start, device.size
             );
             return None;
         }
-        let irq = device.irq?;
+        let Some(irq) = device.irq else {
+            println!("[net][gmac] reject resource: FDT supplied no IRQ");
+            return None;
+        };
         let regs = Registers::new(platform::mmio_phys_to_virt(device.start));
         let version = regs.mac.read(MAC_VERSION);
         let inherited_mac = regs.station_address();
@@ -340,15 +507,24 @@ impl LoongsonGmacDevice {
             .or(inherited_mac)
             .unwrap_or(DEFAULT_MAC);
 
+        let phy_addr = resource.phy_addr().or_else(|| {
+            println!("[net][gmac] FDT has no phy-handle; scanning MDIO addresses 0..31");
+            regs.discover_phy()
+        });
+        let Some(phy_addr) = phy_addr else {
+            println!("[net][gmac] no valid PHY found through FDT or MDIO scan");
+            return None;
+        };
         let phy_id = regs
-            .mdio_read(2)
-            .zip(regs.mdio_read(3))
+            .mdio_read(phy_addr, 2)
+            .zip(regs.mdio_read(phy_addr, 3))
             .map(|(high, low)| ((high as u32) << 16) | low as u32);
         let link = regs.link();
         println!(
-            "[kernel] {}: version={:#x} phy={:?} link={} {}Mbps {}",
+            "[kernel] {}: version={:#x} phy_addr={} phy={:?} link={} {}Mbps {}",
             DEVICE_NAME,
             version,
+            phy_addr,
             phy_id,
             if link.up { "up" } else { "down" },
             link.speed_mbps,
@@ -360,6 +536,7 @@ impl LoongsonGmacDevice {
         );
 
         regs.stop();
+        regs.select_phy_mode(resource.phy_mode());
         regs.dma.write(DMA_INTERRUPT, 0);
         if !regs.reset_dma() {
             error!("{DEVICE_NAME}: DMA reset timed out");
@@ -371,8 +548,22 @@ impl LoongsonGmacDevice {
         let tx_desc = unsafe { addr_of_mut!((*storage).tx_desc) }.cast::<DmaDesc>();
         let rx_desc = unsafe { addr_of_mut!((*storage).rx_desc) }.cast::<DmaDesc>();
         let rx_buf = unsafe { addr_of_mut!((*storage).rx_buf) }.cast::<u8>();
-        let tx_desc_pa = dma_addr32(tx_desc.cast())?;
-        let rx_desc_pa = dma_addr32(rx_desc.cast())?;
+        let Some(tx_desc_pa) = dma_addr32(tx_desc.cast()) else {
+            println!("[net][gmac] reject TX ring: VA {:#x} has no 32-bit DMA address", tx_desc as usize);
+            return None;
+        };
+        let Some(rx_desc_pa) = dma_addr32(rx_desc.cast()) else {
+            println!("[net][gmac] reject RX ring: VA {:#x} has no 32-bit DMA address", rx_desc as usize);
+            return None;
+        };
+        println!(
+            "[net][gmac] DMA memory: storage_va={:#x} tx_desc_pa={:#010x} \
+             rx_desc_pa={:#010x} rx_buf_va={:#x}",
+            storage as usize,
+            tx_desc_pa,
+            rx_desc_pa,
+            rx_buf as usize,
+        );
 
         for index in 0..RING_SIZE {
             let tx_end = if index + 1 == RING_SIZE {
@@ -393,30 +584,30 @@ impl LoongsonGmacDevice {
                 rx_desc.add(index).write_volatile(DmaDesc {
                     status: DESC_OWNED_BY_DMA,
                     length: BUFFER_SIZE as u32 | rx_end,
-                    buffer1: dma_addr32(rx_buf.add(index * BUFFER_SIZE))?,
+                    buffer1: match dma_addr32(rx_buf.add(index * BUFFER_SIZE)) {
+                        Some(address) => address,
+                        None => {
+                            println!(
+                                "[net][gmac] reject RX buffer {}: VA {:#x} has no 32-bit DMA address",
+                                index,
+                                rx_buf.add(index * BUFFER_SIZE) as usize,
+                            );
+                            return None;
+                        }
+                    },
                     buffer2: 0,
                 });
             }
         }
         dma_barrier();
 
-        regs.dma.write(
-            DMA_BUS_MODE,
-            DMA_MIXED_BURST_ENABLE | DMA_BURST_LENGTHX8 | DMA_BURST_LENGTH32,
-        );
-        regs.dma
-            .write(DMA_CONTROL, DMA_STORE_AND_FORWARD | DMA_TX_SECOND_FRAME);
-        regs.dma.write(DMA_AXI_BUS_MODE, 0xff | (0x77 << 16));
-        regs.dma.write(DMA_TX_BASE_ADDR, tx_desc_pa);
-        regs.dma.write(DMA_RX_BASE_ADDR, rx_desc_pa);
-        regs.mac.set(MAC_CONFIG, MAC_TX_CONFIG | MAC_DUPLEX);
-        regs.mac.write(MAC_FRAME_FILTER, MAC_FILTER);
-        regs.mac.write(MAC_FLOW_CONTROL, 0xffff_0000);
-        regs.mac.write(MAC_MMC_INTR_MASK_TX, u32::MAX);
-        regs.mac.write(MAC_MMC_INTR_MASK_RX, u32::MAX);
-        regs.mac.write(MAC_MMC_RX_IPC_INTR_MASK, u32::MAX);
+        // Keep the post-reset hardware sequence aligned with the verified
+        // tgoskits LS2K1000 implementation.  The surrounding state object is
+        // CosmOS-specific glue for its NetworkDevice interface.
+        regs.init_dma_regs(tx_desc_pa, rx_desc_pa);
+        regs.init_mac_regs();
         regs.configure_link(link);
-        regs.dma.write(DMA_STATUS, regs.dma.read(DMA_STATUS));
+        regs.clear_pending_irq();
         regs.dma.write(DMA_INTERRUPT, DMA_INT_ENABLE);
         regs.start();
 

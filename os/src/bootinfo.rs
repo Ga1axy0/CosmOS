@@ -11,6 +11,7 @@ const MAX_RESERVED_REGIONS: usize = 16;
 const MAX_MMIO_REGIONS: usize = 24;
 const MAX_VIRTIO_MMIO_DEVICES: usize = 16;
 const MAX_GMAC_DEVICES: usize = 4;
+const MAX_PHY_DEVICES: usize = 8;
 const MAX_MMC_DEVICES: usize = 4;
 const MAX_CLOCK_RESOURCES: usize = 16;
 const PCI_INTX_ENTRIES: usize = 32 * 4;
@@ -47,6 +48,43 @@ pub struct DeviceResource {
 pub struct GmacResource {
     device: DeviceResource,
     mac_address: Option<[u8; 6]>,
+    phy_mode: PhyInterfaceMode,
+    phy_handle: Option<u32>,
+    phy_addr: Option<u8>,
+    pinctrl_default: Option<u32>,
+}
+
+/// MAC-to-PHY electrical interface selected by firmware.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PhyInterfaceMode {
+    /// Firmware did not describe an interface mode.
+    #[default]
+    Unknown,
+    /// Media Independent Interface.
+    Mii,
+    /// Reduced Media Independent Interface.
+    Rmii,
+    /// Reduced Gigabit Media Independent Interface.
+    Rgmii,
+    /// RGMII with both internal RX and TX delays.
+    RgmiiId,
+    /// RGMII with an internal RX delay.
+    RgmiiRxId,
+    /// RGMII with an internal TX delay.
+    RgmiiTxId,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PhyResource {
+    phandle: u32,
+    address: u8,
+}
+
+impl PhyResource {
+    const EMPTY: Self = Self {
+        phandle: 0,
+        address: 0,
+    };
 }
 
 /// One firmware-described JH7110 SD/MMC controller and slot policy.
@@ -101,6 +139,26 @@ impl GmacResource {
     /// Return the firmware-provided station address, when valid.
     pub fn mac_address(self) -> Option<[u8; 6]> {
         self.mac_address
+    }
+
+    /// Return the FDT-selected MAC-to-PHY electrical interface.
+    pub fn phy_mode(self) -> PhyInterfaceMode {
+        self.phy_mode
+    }
+
+    /// Return the PHY address resolved through the `phy-handle`, when present.
+    pub fn phy_addr(self) -> Option<u8> {
+        self.phy_addr
+    }
+
+    /// Return the raw `phy-handle` phandle supplied by firmware.
+    pub fn phy_handle(self) -> Option<u32> {
+        self.phy_handle
+    }
+
+    /// Return the default pinctrl-state phandle, when firmware supplies one.
+    pub fn pinctrl_default(self) -> Option<u32> {
+        self.pinctrl_default
     }
 }
 
@@ -192,6 +250,8 @@ pub struct BootInfo {
     syscrg: Option<DeviceResource>,
     gmac: [Option<GmacResource>; MAX_GMAC_DEVICES],
     gmac_count: usize,
+    phys: [PhyResource; MAX_PHY_DEVICES],
+    phy_count: usize,
     mmc: [Option<MmcResource>; MAX_MMC_DEVICES],
     mmc_count: usize,
     virtio_mmio: [DeviceResource; MAX_VIRTIO_MMIO_DEVICES],
@@ -224,6 +284,8 @@ impl BootInfo {
             syscrg: None,
             gmac: [None; MAX_GMAC_DEVICES],
             gmac_count: 0,
+            phys: [PhyResource::EMPTY; MAX_PHY_DEVICES],
+            phy_count: 0,
             mmc: [None; MAX_MMC_DEVICES],
             mmc_count: 0,
             virtio_mmio: [DeviceResource::empty(); MAX_VIRTIO_MMIO_DEVICES],
@@ -308,6 +370,35 @@ impl BootInfo {
             frequency,
         };
         self.clock_count += 1;
+    }
+
+    fn push_phy(&mut self, phandle: u32, address: u8) {
+        if phandle == 0 || self.phy_count >= MAX_PHY_DEVICES {
+            return;
+        }
+        self.phys[self.phy_count] = PhyResource { phandle, address };
+        self.phy_count += 1;
+    }
+
+    fn phy_addr(&self, phandle: u32) -> Option<u8> {
+        self.phys[..self.phy_count]
+            .iter()
+            .find(|phy| phy.phandle == phandle)
+            .map(|phy| phy.address)
+    }
+
+    /// Resolve controller PHY references only after the entire tree was
+    /// walked.  A `phy-handle` is allowed to refer to a node that appears
+    /// later in the FDT, so resolving it while closing the MAC node is not
+    /// generally correct.
+    fn resolve_gmac_phys(&mut self) {
+        for index in 0..self.gmac_count {
+            let Some(mut resource) = self.gmac[index] else {
+                continue;
+            };
+            resource.phy_addr = resource.phy_handle.and_then(|handle| self.phy_addr(handle));
+            self.gmac[index] = Some(resource);
+        }
     }
 
     fn resolve_timer_frequency(&mut self) {
@@ -836,6 +927,7 @@ impl Fdt {
                 _ => break,
             }
         }
+        info.resolve_gmac_phys();
         info.resolve_timer_frequency();
     }
 
@@ -891,6 +983,8 @@ struct NodeState {
     is_syscrg: bool,
     is_cache_controller: bool,
     is_gmac: bool,
+    is_mdio: bool,
+    is_ethernet_phy: bool,
     is_mmc: bool,
     address_cells: usize,
     size_cells: usize,
@@ -901,6 +995,10 @@ struct NodeState {
     clock_frequency: usize,
     phandle: u32,
     clock_phandle: u32,
+    phy_handle: u32,
+    pinctrl_default: u32,
+    phy_mode: PhyInterfaceMode,
+    phy_reg: Option<u8>,
     irq: Option<u32>,
     mac_address: [u8; 6],
     has_mac_address: bool,
@@ -925,6 +1023,9 @@ impl NodeState {
         let is_cpu = parent.is_cpus && starts_with(name, b"cpu@");
         let is_memory = name == b"memory" || starts_with(name, b"memory@");
         let is_reserved_memory = parent.is_reserved_memory || name == b"reserved-memory";
+        let is_mdio = name == b"mdio" || starts_with(name, b"mdio@");
+        let is_ethernet_phy = parent.is_mdio
+            && (starts_with(name, b"ethernet-phy@") || starts_with(name, b"phy@"));
         Self {
             parent_is_cpus: parent.is_cpus,
             is_cpus,
@@ -942,6 +1043,8 @@ impl NodeState {
             is_syscrg: false,
             is_cache_controller: false,
             is_gmac: false,
+            is_mdio,
+            is_ethernet_phy,
             is_mmc: false,
             address_cells: parent.child_address_cells.max(1),
             size_cells: parent.child_size_cells.max(1),
@@ -952,6 +1055,10 @@ impl NodeState {
             clock_frequency: 0,
             phandle: 0,
             clock_phandle: 0,
+            phy_handle: 0,
+            pinctrl_default: 0,
+            phy_mode: PhyInterfaceMode::Unknown,
+            phy_reg: None,
             irq: None,
             mac_address: [0; 6],
             has_mac_address: false,
@@ -1012,6 +1119,10 @@ impl NodeState {
                     || compatible_contains(value, b"starfive,jh7110-eqos-5.20")
                     || compatible_contains(value, b"starfive,jh7110-dwmac")
                     || compatible_contains(value, b"snps,dwmac-5.20");
+                self.is_mdio |= compatible_contains(value, b"snps,dwmac-mdio");
+                self.is_ethernet_phy |= compatible_contains(value, b"ethernet-phy-ieee802.3-c22")
+                    || compatible_contains(value, b"ethernet-phy-ieee802.3-c45")
+                    || compatible_prefix(value, b"ethernet-phy-id");
                 // StarFive's SDK U-Boot control FDT describes both JH7110
                 // SDIO controllers with the generic DesignWare binding, while
                 // newer Linux device trees also carry the SoC-specific name.
@@ -1028,6 +1139,13 @@ impl NodeState {
             b"clocks" if value.len() >= 4 => {
                 self.clock_phandle = read_be_u32(&value[..4]).unwrap_or(0)
             }
+            b"phy-handle" if value.len() >= 4 => {
+                self.phy_handle = read_be_u32(&value[..4]).unwrap_or(0)
+            }
+            b"pinctrl-0" if value.len() >= 4 => {
+                self.pinctrl_default = read_be_u32(&value[..4]).unwrap_or(0)
+            }
+            b"phy-mode" => self.phy_mode = parse_phy_mode(value),
             b"interrupts" if value.len() >= 4 => self.irq = read_be_u32(&value[..4]),
             b"bus-width" => self.bus_width = read_cells_usize(value, 1).unwrap_or(1) as u32,
             b"no-sd" => self.no_sd = true,
@@ -1058,6 +1176,13 @@ impl NodeState {
                 self.interrupt_map_len = value.len();
             }
             b"reg" => {
+                // PHY nodes conventionally use a single-cell `reg`.  Record
+                // that first cell independently of property ordering: some
+                // firmware emits `reg` before `compatible`.
+                if self.phy_reg.is_none() {
+                    self.phy_reg =
+                        read_cells_usize(value, 1).and_then(|cell| u8::try_from(cell).ok());
+                }
                 parse_reg(value, self.address_cells, self.size_cells, |start, size| {
                     self.push_reg_region(start, size);
                 });
@@ -1081,6 +1206,11 @@ impl NodeState {
         }
         if self.phandle != 0 && (self.clock_phandle != 0 || self.clock_frequency != 0) {
             info.push_clock(self.phandle, self.clock_phandle, self.clock_frequency);
+        }
+        if self.is_ethernet_phy {
+            if let Some(address) = self.phy_reg {
+                info.push_phy(self.phandle, address);
+            }
         }
         for region in self.reg_regions[..self.reg_region_count].iter().copied() {
             if self.is_memory {
@@ -1148,6 +1278,10 @@ impl NodeState {
             info.gmac[info.gmac_count] = Some(GmacResource {
                 device: resource,
                 mac_address: self.has_mac_address.then_some(self.mac_address),
+                phy_mode: self.phy_mode,
+                phy_handle: (self.phy_handle != 0).then_some(self.phy_handle),
+                phy_addr: None,
+                pinctrl_default: (self.pinctrl_default != 0).then_some(self.pinctrl_default),
             });
             info.gmac_count += 1;
             info.push_mmio_region(resource);
@@ -1247,6 +1381,23 @@ fn compatible_contains(mut value: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+fn compatible_prefix(mut value: &[u8], prefix: &[u8]) -> bool {
+    while !value.is_empty() {
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        if starts_with(&value[..end], prefix) {
+            return true;
+        }
+        if end == value.len() {
+            break;
+        }
+        value = &value[end + 1..];
+    }
+    false
+}
+
 fn parse_reg(
     mut value: &[u8],
     address_cells: usize,
@@ -1307,6 +1458,18 @@ fn align4(value: usize) -> usize {
 
 fn starts_with(value: &[u8], prefix: &[u8]) -> bool {
     value.len() >= prefix.len() && &value[..prefix.len()] == prefix
+}
+
+fn parse_phy_mode(value: &[u8]) -> PhyInterfaceMode {
+    match value.strip_suffix(&[0]).unwrap_or(value) {
+        b"mii" => PhyInterfaceMode::Mii,
+        b"rmii" => PhyInterfaceMode::Rmii,
+        b"rgmii" => PhyInterfaceMode::Rgmii,
+        b"rgmii-id" => PhyInterfaceMode::RgmiiId,
+        b"rgmii-rxid" => PhyInterfaceMode::RgmiiRxId,
+        b"rgmii-txid" => PhyInterfaceMode::RgmiiTxId,
+        _ => PhyInterfaceMode::Unknown,
+    }
 }
 
 fn bytes_at(addr: usize, len: usize) -> Option<&'static [u8]> {
