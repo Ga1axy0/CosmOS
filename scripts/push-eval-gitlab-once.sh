@@ -5,8 +5,34 @@ set -euo pipefail
 # One-time evaluation export.
 #
 # The source repository is never flattened.  A temporary Git repository is
-# populated from local Git objects, flattened, committed, and pushed to GitLab.
-# No source or submodule repository is cloned from the network.
+# populated from local Git objects, flattened, committed, and optionally
+# pushed to GitLab.  No source or submodule repository is cloned from the
+# network.
+
+case "${1:-}" in
+    "")
+        OFFLINE_MODE=0
+        ;;
+    offline|--offline)
+        OFFLINE_MODE=1
+        ;;
+    -h|--help)
+        echo "Usage: $0 [offline|--offline]"
+        echo "  offline  build and keep a local flattened snapshot without pushing"
+        exit 0
+        ;;
+    *)
+        echo "[ERROR] Unknown option: $1" >&2
+        echo "Usage: $0 [offline|--offline]" >&2
+        exit 2
+        ;;
+esac
+
+if (($# > 1)); then
+    echo "[ERROR] Only one option is accepted: offline" >&2
+    echo "Usage: $0 [offline|--offline]" >&2
+    exit 2
+fi
 
 SOURCE_ROOT="$(git rev-parse --show-toplevel)"
 SOURCE_COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --verify HEAD)"
@@ -21,7 +47,11 @@ TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cosmos-gitlab-export.XXXXXX")"
 TEMP_REPO="$TEMP_ROOT/repo"
 
 cleanup() {
-    rm -rf -- "$TEMP_ROOT"
+    if ((OFFLINE_MODE)); then
+        echo "[INFO] Keeping offline export directory: $TEMP_ROOT" >&2
+    else
+        rm -rf -- "$TEMP_ROOT"
+    fi
 }
 trap cleanup EXIT
 
@@ -307,6 +337,7 @@ done < <(git -C "$TEMP_REPO" ls-files -z)
 # push only contains the newly added batch's objects.
 git -C "$TEMP_REPO" read-tree --empty
 STAGING_BRANCH="mirror-upload-${SOURCE_COMMIT:0:12}"
+OFFLINE_BRANCH="tmp-${SOURCE_COMMIT:0:12}"
 PREVIOUS_COMMIT=""
 BATCH_NUMBER=0
 BATCH_BYTES=0
@@ -366,14 +397,21 @@ push_current_batch() {
             -m "Mirror evaluation batch $BATCH_NUMBER"
     )"
 
-    echo "[INFO] Uploading batch $BATCH_NUMBER (${BATCH_BYTES} bytes)"
-    push_staging_commit "$mirror_commit"
+    if ((OFFLINE_MODE)); then
+        git -C "$TEMP_REPO" branch -f "$OFFLINE_BRANCH" "$mirror_commit"
+        echo "[INFO] Prepared offline batch $BATCH_NUMBER (${BATCH_BYTES} bytes)"
+    else
+        echo "[INFO] Uploading batch $BATCH_NUMBER (${BATCH_BYTES} bytes)"
+        push_staging_commit "$mirror_commit"
+    fi
     PREVIOUS_COMMIT="$mirror_commit"
     BATCH_PATHS=()
     BATCH_BYTES=0
 }
 
-prepare_credentials
+if ((OFFLINE_MODE == 0)); then
+    prepare_credentials
+fi
 
 while IFS=$'\t' read -r blob_size path; do
     [[ -n "$path" ]] || continue
@@ -395,13 +433,21 @@ if [[ -z "$PREVIOUS_COMMIT" ]]; then
     exit 1
 fi
 
-echo "[INFO] Publishing the final snapshot to GitLab branch $TARGET_BRANCH"
-git -C "$TEMP_REPO" -c credential.helper= push --force \
-    "$GITLAB_URL" "$PREVIOUS_COMMIT:refs/heads/$TARGET_BRANCH"
+if ((OFFLINE_MODE)); then
+    git -C "$TEMP_REPO" symbolic-ref HEAD "refs/heads/$OFFLINE_BRANCH"
+    echo "[OK] Offline evaluation snapshot prepared."
+    echo "[INFO] Temporary export directory: $TEMP_ROOT"
+    echo "[INFO] Local branch: $OFFLINE_BRANCH"
+    echo "[INFO] Final snapshot commit: $PREVIOUS_COMMIT"
+else
+    echo "[INFO] Publishing the final snapshot to GitLab branch $TARGET_BRANCH"
+    git -C "$TEMP_REPO" -c credential.helper= push --force \
+        "$GITLAB_URL" "$PREVIOUS_COMMIT:refs/heads/$TARGET_BRANCH"
 
-echo "[INFO] Removing temporary staging branch"
-git -C "$TEMP_REPO" -c credential.helper= push --force \
-    "$GITLAB_URL" ":refs/heads/$STAGING_BRANCH" || \
-    echo "[WARN] Could not remove staging branch $STAGING_BRANCH" >&2
+    echo "[INFO] Removing temporary staging branch"
+    git -C "$TEMP_REPO" -c credential.helper= push --force \
+        "$GITLAB_URL" ":refs/heads/$STAGING_BRANCH" || \
+        echo "[WARN] Could not remove staging branch $STAGING_BRANCH" >&2
 
-echo "[OK] Evaluation snapshot pushed to GitLab."
+    echo "[OK] Evaluation snapshot pushed to GitLab."
+fi
