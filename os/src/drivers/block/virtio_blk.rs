@@ -39,6 +39,10 @@ static TASK_WAIT_NS: AtomicUsize = AtomicUsize::new(0);
 static COMPLETE_RECHECK_MISSES: AtomicUsize = AtomicUsize::new(0);
 static COMPLETE_WRONG_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static IRQ_EMPTY_ISR_WITH_USED: AtomicUsize = AtomicUsize::new(0);
+static DIAG_BLOCK_SUBMITS: AtomicUsize = AtomicUsize::new(0);
+static DIAG_BLOCK_WAITS: AtomicUsize = AtomicUsize::new(0);
+static DIAG_BLOCK_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+static DIAG_BLOCK_IRQS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
 static READ_MANY_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "io_perf_counters")]
@@ -520,6 +524,17 @@ impl VirtIOBlock {
         data.submitted_ns = submitted_ns;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        let diag = DIAG_BLOCK_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        if diag < 64 {
+            println!(
+                "[diag][blk] submit self={:#x} op=read block={} len={} token={} pending={}",
+                self as *const Self as usize,
+                block_id,
+                len,
+                token,
+                self.pending_request_count(),
+            );
+        }
         self.submitted.fetch_add(1, Ordering::Relaxed);
         self.last_submit_ns.store(submitted_ns, Ordering::Release);
         super::wake_worker();
@@ -547,6 +562,17 @@ impl VirtIOBlock {
         data.submitted_ns = submitted_ns;
         drop(data);
         self.pending.lock().insert(token, Arc::clone(&request));
+        let diag = DIAG_BLOCK_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        if diag < 64 {
+            println!(
+                "[diag][blk] submit self={:#x} op=write block={} len={} token={} pending={}",
+                self as *const Self as usize,
+                block_id,
+                len,
+                token,
+                self.pending_request_count(),
+            );
+        }
         self.needs_flush.store(true, Ordering::Release);
         self.submitted.fetch_add(1, Ordering::Relaxed);
         self.last_submit_ns.store(submitted_ns, Ordering::Release);
@@ -571,6 +597,19 @@ impl VirtIOBlock {
                     continue;
                 }
                 super::wake_worker();
+                let diag = DIAG_BLOCK_WAITS.fetch_add(1, Ordering::Relaxed);
+                if diag < 64 {
+                    let data = request.inner.lock();
+                    println!(
+                        "[diag][blk] wait self={:#x} op={} block={} token={} pending={} waiters={}",
+                        self as *const Self as usize,
+                        data.kind.name(),
+                        data.block_id,
+                        data.token,
+                        self.pending_request_count(),
+                        request.wait_queue.debug_waiter_count(),
+                    );
+                }
                 let wait_start = now_ns();
                 request
                     .wait_queue
@@ -704,6 +743,18 @@ impl VirtIOBlock {
 
             let mut data = request.inner.lock();
             let kind = data.kind;
+            let block_id = data.block_id;
+            let diag = DIAG_BLOCK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+            if diag < 64 {
+                println!(
+                    "[diag][blk] complete self={:#x} op={} block={} token={} pending_before={}",
+                    self as *const Self as usize,
+                    kind.name(),
+                    block_id,
+                    token,
+                    self.pending_request_count(),
+                );
+            }
             let req = &data.req as *const BlkReq;
             let resp = &mut data.resp as *mut BlkResp;
             let result = unsafe {
@@ -782,6 +833,16 @@ impl VirtIOBlock {
         // the device already de-asserted, or a re-assertion racing the EOI), a
         // completion may still be sitting unread in the used ring.
         let has_used = inner.peek_used().is_some();
+        let diag = DIAG_BLOCK_IRQS.fetch_add(1, Ordering::Relaxed);
+        if diag < 64 {
+            println!(
+                "[diag][blk] irq self={:#x} isr={} used={} pending={}",
+                self as *const Self as usize,
+                isr_set,
+                has_used,
+                self.pending_request_count(),
+            );
+        }
         if !isr_set && !has_used {
             return;
         }

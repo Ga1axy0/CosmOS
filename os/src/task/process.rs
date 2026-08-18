@@ -1155,6 +1155,13 @@ impl ProcessControlBlock {
             .attach_task(Arc::clone(&task))
             .expect("new process became zombie before initial task attach");
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
+        println!(
+            "[diag][init] pid={} task={:#x} entry={:#x} user_sp={:#x}",
+            process.getpid(),
+            Arc::as_ptr(&task) as usize,
+            entry_point,
+            user_sp,
+        );
         // publish main thread to scheduler only after the process/task state is fully initialized
         add_task(task);
         #[cfg(feature = "cosmos-meminfo")]

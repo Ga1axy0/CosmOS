@@ -14,9 +14,12 @@ use virtio_drivers::transport::{
 };
 
 use crate::drivers::{
-    block::{block_device_name, VirtIOBlock, BLOCK_DEVICES, BLOCK_DEVICES_BY_IRQ},
+    block::{
+        block_device_name, VirtIOBlock, BLOCK_DEVICES, BLOCK_DEVICES_ALL, BLOCK_DEVICES_BY_IRQ,
+    },
     net::{self, VirtIONetDevice},
 };
+use crate::println;
 
 const PCI_INTERRUPT_LINE_PIN_OFFSET: usize = 0x3c;
 
@@ -37,6 +40,7 @@ pub fn probe_platform_devices() {
     let mut root = unsafe { PciRoot::new(MmioCam::new(ecam_vaddr as *mut u8, Cam::Ecam)) };
     let mut allocator = PciRangeAllocator::new(host.memory_start as u64, host.memory_size as u64);
     let mut map = BLOCK_DEVICES.lock();
+    let mut all_devices = BLOCK_DEVICES_ALL.lock();
     let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut block_idx = 0usize;
 
@@ -67,10 +71,22 @@ pub fn probe_platform_devices() {
                     let dev = Arc::new(dev);
                     let name = block_device_name(block_idx);
                     let irq = gpex_intx_irq(host, bdf);
+                    let irq_enabled = irq.is_some_and(|irq| super::irq::enable_device_irq(irq));
+                    if !irq_enabled {
+                        crate::drivers::block::mark_device_needs_polling();
+                    }
+                    println!(
+                        "[diag][pci] virtio-blk {} at {} irq={:?} enabled={}",
+                        name,
+                        bdf,
+                        irq,
+                        irq_enabled,
+                    );
                     info!("[pci] virtio-blk {} at {} irq {:?}", name, bdf, irq);
                     map.insert(name, dev.clone());
+                    all_devices.push(Arc::clone(&dev));
                     if let Some(irq) = irq {
-                        if super::irq::enable_device_irq(irq) {
+                        if irq_enabled {
                             irq_map.insert(irq, dev);
                         }
                     }

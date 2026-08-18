@@ -23,7 +23,11 @@ use core::ptr;
 #[cfg(feature = "current_task_cache")]
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
+use core::sync::atomic::AtomicUsize;
 use lazy_static::*;
+
+static DIAG_SCHED_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static DIAG_IDLE_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Processor management structure
 pub struct Processor {
@@ -163,6 +167,21 @@ pub(crate) fn run_tasks() {
         super::clear_stopping_task();
         crate::task::maybe_dump_pending_debug_pgrp_tasks();
         if let Some(task) = pick_next_task(hartid()) {
+            let event = DIAG_SCHED_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if event < 32 {
+                let pid = task
+                    .process
+                    .upgrade()
+                    .map(|process| process.getpid())
+                    .unwrap_or(usize::MAX);
+                println!(
+                    "[diag][sched] pick event={} hart={} task={:#x} pid={}",
+                    event,
+                    hartid(),
+                    Arc::as_ptr(&task) as usize,
+                    pid,
+                );
+            }
             // debug!(
             //     "kernel: hart {} run_tasks, pid[{}]",
             //     hartid(),
@@ -233,6 +252,10 @@ pub(crate) fn run_tasks() {
             }
             finish_pending_task_release();
         } else {
+            let event = DIAG_IDLE_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if event < 16 {
+                println!("[diag][sched] idle event={} hart={}", event, hartid());
+            }
             // idle: enable interrupts and wait for next interrupt (timer/UART/etc.)
             if INITPROC.inner_exclusive_access().is_zombie() {
                 info!("Goodbye!");

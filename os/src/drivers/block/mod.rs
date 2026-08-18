@@ -21,6 +21,7 @@ use crate::task::{ReschedReason, SchedAttr, TaskControlBlock, TaskStatus, WaitQu
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -92,7 +93,12 @@ lazy_static! {
     pub static ref BLOCK_DEVICES: SpinNoIrqLock<BTreeMap<String, Arc<dyn BlockDevice>>> =
         SpinNoIrqLock::new(BTreeMap::new());
 
-        /// VirtIO MMIO IRQ to block device mapping.
+        /// Every discovered VirtIO block device, including transports without
+        /// a routable legacy IRQ (for example modern virtio-pci on QEMU).
+        pub(crate) static ref BLOCK_DEVICES_ALL: SpinNoIrqLock<Vec<Arc<VirtIOBlock>>> =
+        SpinNoIrqLock::new(Vec::new());
+
+        /// VirtIO IRQ to block device mapping used by the hard IRQ path.
         pub static ref BLOCK_DEVICES_BY_IRQ: SpinNoIrqLock<BTreeMap<u32, Arc<VirtIOBlock>>> =
         SpinNoIrqLock::new(BTreeMap::new());
         static ref BLOCK_WORKER_WAIT: WaitQueue = WaitQueue::new();
@@ -113,6 +119,8 @@ static BLOCK_WORKER_LAST_PUMP_NS: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_WORKER_IN_PUMP: AtomicBool = AtomicBool::new(false);
 static BLOCK_WORKER_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BLOCK_IRQ_SELF_HEAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_DEVICES_NEED_POLLING: AtomicBool = AtomicBool::new(false);
+static DIAG_BLOCK_WORKER_LOOPS: AtomicUsize = AtomicUsize::new(0);
 /// Bound one scheduler-visible bottom-half run. If more completions remain,
 /// the worker requeues itself so BAIS can reconsider its target hart against
 /// the latest AI phase/progress state.
@@ -147,6 +155,7 @@ pub(super) struct BlockWorkerDebugSnapshot {
 /// Must be called **before** `fs::init_rootfs` and `fs::init_dev`.
 pub fn probe_block_devices() {
     let mut map = BLOCK_DEVICES.lock();
+    let mut all_devices = BLOCK_DEVICES_ALL.lock();
     let mut irq_map = BLOCK_DEVICES_BY_IRQ.lock();
     let mut idx = 0usize;
     for (slot, resource) in crate::boot::context::get()
@@ -178,6 +187,7 @@ pub fn probe_block_devices() {
             let name = block_device_name(idx);
             debug!("[kernel] block device {} idx {} at {:#x}", name, idx, addr);
             map.insert(name, dev.clone());
+            all_devices.push(Arc::clone(&dev));
             let irq = resource
                 .irq
                 .expect("FDT VirtIO-MMIO block transport has no interrupt");
@@ -202,7 +212,7 @@ pub fn handle_irq(irq: u32) -> bool {
 }
 
 fn block_devices_snapshot() -> alloc::vec::Vec<Arc<VirtIOBlock>> {
-    BLOCK_DEVICES_BY_IRQ.lock().values().cloned().collect()
+    BLOCK_DEVICES_ALL.lock().iter().cloned().collect()
 }
 
 /// Flush every discovered block device after filesystem and block-cache
@@ -237,6 +247,20 @@ fn block_worker_has_completions() -> bool {
     block_devices_snapshot()
         .into_iter()
         .any(|dev| dev.has_used_completions())
+}
+
+fn block_worker_has_unrouted_pending() -> bool {
+    BLOCK_DEVICES_NEED_POLLING.load(Ordering::Acquire)
+        && block_devices_snapshot()
+            .into_iter()
+            .any(|dev| dev.has_pending_requests())
+}
+
+/// Mark that at least one discovered transport has no IRQ route.  Such a
+/// device must be polled while requests are in flight because the generic
+/// virtio-pci transport used here does not configure MSI-X.
+pub(crate) fn mark_device_needs_polling() {
+    BLOCK_DEVICES_NEED_POLLING.store(true, Ordering::Release);
 }
 
 struct BlockPumpResult {
@@ -361,7 +385,24 @@ fn block_io_worker_main() -> ! {
         if pump.completed != 0 {
             BLOCK_WORKER_PUMP_COMPLETED.fetch_add(1, Ordering::Relaxed);
         }
-        if block_worker_has_completions() {
+        let diag = DIAG_BLOCK_WORKER_LOOPS.fetch_add(1, Ordering::Relaxed);
+        if diag < 64 {
+            let devices = block_devices_snapshot();
+            let pending = devices
+                .iter()
+                .map(|dev| dev.pending_request_count())
+                .sum::<usize>();
+            let used = devices.iter().filter(|dev| dev.has_used_completions()).count();
+            println!(
+                "[diag][blk-worker] loop={} event={} completed={} pending={} used={}",
+                diag,
+                had_completion_event,
+                pump.completed,
+                pending,
+                used,
+            );
+        }
+        if block_worker_has_completions() || block_worker_has_unrouted_pending() {
             // Bound each deferred run, then requeue through CFS. BAIS can
             // choose a new hart from the latest AI-worker progress snapshot.
             crate::sched::suspend_current_and_run_next();
