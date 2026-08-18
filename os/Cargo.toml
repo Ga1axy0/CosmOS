@@ -41,6 +41,10 @@ net_perf_counters = []
 mm_perf_counters = []
 oom_diagnostics = []
 perf_probe = []
+# Compile-time alternative for the regular-task scheduling class.  RT
+# FIFO/RR remains unchanged; when enabled, SCHED_OTHER uses EEVDF instead of
+# the default CFS ordering.
+sched_eevdf = []
 # Per-syscall invocation and dispatch-time counters exposed through
 # /proc/syscalls_count.
 syscalls_count = []

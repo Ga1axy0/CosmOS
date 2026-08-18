@@ -306,16 +306,19 @@ fn apply_sched_attr_to_task(
             SchedPolicy::Rr => {
                 task_inner.reset_time_slice();
                 task_inner.sched.cfs_rq_key = None;
+                task_inner.sched.eevdf_deadline_ns = 0;
                 task_inner.sched.rt_enqueue_head = enqueue_at_head;
             }
             SchedPolicy::Fifo => {
                 task_inner.sched.cfs_rq_key = None;
+                task_inner.sched.eevdf_deadline_ns = 0;
                 task_inner.sched.rt_enqueue_head = enqueue_at_head;
             }
             SchedPolicy::Other => {
                 task_inner.sched.cfs_initialized = false;
                 task_inner.sched.exec_start_ns = 0;
                 task_inner.sched.cfs_slice_start_ns = 0;
+                task_inner.sched.eevdf_deadline_ns = 0;
                 task_inner.sched.rt_enqueue_head = false;
             }
             SchedPolicy::Idle => unreachable!(),
@@ -399,6 +402,7 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
                     task_inner.sched.rt_priority = new_priority;
                     task_inner.reset_time_slice();
                     task_inner.sched.cfs_rq_key = None;
+                    task_inner.sched.eevdf_deadline_ns = 0;
                     task_inner.sched.rt_enqueue_head = enqueue_at_head;
                 }
                 SchedPolicy::Fifo => {
@@ -406,6 +410,7 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
                     task_inner.sched.linux_policy = SCHED_FIFO;
                     task_inner.sched.rt_priority = new_priority;
                     task_inner.sched.cfs_rq_key = None;
+                    task_inner.sched.eevdf_deadline_ns = 0;
                     task_inner.sched.rt_enqueue_head = enqueue_at_head;
                 }
                 SchedPolicy::Other => {
@@ -415,6 +420,7 @@ pub fn sys_sched_setscheduler(pid: isize, policy: i32, param: *const SchedParam)
                     task_inner.sched.cfs_initialized = false;
                     task_inner.sched.exec_start_ns = 0;
                     task_inner.sched.cfs_slice_start_ns = 0;
+                    task_inner.sched.eevdf_deadline_ns = 0;
                     task_inner.sched.rt_enqueue_head = false;
                 }
                 SchedPolicy::Idle => unreachable!(),

@@ -21,6 +21,47 @@ pub const CFS_WAKEUP_GRANULARITY_NS: u64 = 1_000_000;
 /// Penalty applied to SCHED_OTHER tasks that voluntarily yield.
 pub const CFS_YIELD_PENALTY_NS: u64 = CFS_MIN_GRANULARITY_NS;
 
+/// EEVDF's default request length for a regular task, in nanoseconds.
+///
+/// The current kernel exposes no userspace fair-class slice knob, so use the
+/// existing minimum granularity as the stable request size. Keeping this
+/// value equal to the CFS minimum makes A/B runs compare the same amount of
+/// work per regular scheduling decision.
+pub const EEVDF_DEFAULT_SLICE_NS: u64 = CFS_MIN_GRANULARITY_NS;
+/// EEVDF wakeup/deadline comparison slack, in nanoseconds.
+pub const EEVDF_WAKEUP_GRANULARITY_NS: u64 = CFS_WAKEUP_GRANULARITY_NS;
+/// Penalty applied to a regular task that voluntarily yields under either
+/// fair scheduler.
+pub const FAIR_YIELD_PENALTY_NS: u64 = CFS_YIELD_PENALTY_NS;
+
+/// Name of the compiled-in regular-task scheduler, useful for benchmark
+/// provenance in the guest boot log.
+#[cfg(feature = "sched_eevdf")]
+pub const FAIR_SCHEDULER_NAME: &str = "EEVDF";
+/// Name of the compiled-in regular-task scheduler, useful for benchmark
+/// provenance in the guest boot log.
+#[cfg(not(feature = "sched_eevdf"))]
+pub const FAIR_SCHEDULER_NAME: &str = "CFS";
+
+/// Calculate an EEVDF virtual deadline from a task's virtual runtime, weight,
+/// and requested fair-class slice.
+///
+/// EEVDF orders eligible entities by `virtual_deadline`, while the weighted
+/// virtual-runtime average decides eligibility. The calculation is kept in
+/// `u128` so a large runtime or a low-priority task cannot wrap the deadline.
+pub const fn eevdf_virtual_deadline(vruntime_ns: u64, weight: u64, slice_ns: u64) -> u64 {
+    let weight = if weight == 0 { 1 } else { weight };
+    let fair_slice = (slice_ns as u128)
+        .saturating_mul(NICE_0_LOAD as u128)
+        / (weight as u128);
+    let deadline = (vruntime_ns as u128).saturating_add(fair_slice);
+    if deadline > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        deadline as u64
+    }
+}
+
 /// Linux `prio_to_weight` table for nice -20..=19.
 pub const PRIO_TO_WEIGHT: [u64; 40] = [
     88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,

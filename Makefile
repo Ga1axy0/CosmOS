@@ -62,7 +62,9 @@ SYSCALLS_COUNT ?= 0
 SYSCALLS_COUNT_KEY := $(if $(filter 1,$(SYSCALLS_COUNT)),ON,OFF)
 IO_PERF_COUNTERS ?= 0
 IO_PERF_COUNTERS_KEY := $(if $(filter 1,$(IO_PERF_COUNTERS)),ON,OFF)
-KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY) KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS_KEY) COSMOS_MEMINFO=$(COSMOS_MEMINFO_KEY) SYSCALLS_COUNT=$(SYSCALLS_COUNT_KEY) IO_PERF_COUNTERS=$(IO_PERF_COUNTERS_KEY)
+SCHED_EEVDF ?= 0
+SCHED_EEVDF_KEY := $(if $(filter 1,$(SCHED_EEVDF)),ON,OFF)
+KERNEL_CONFIG_KEY := LOG=$(KERNEL_LOG_KEY) PERF_PROBE=$(KERNEL_PERF_PROBE_KEY) KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS_KEY) COSMOS_MEMINFO=$(COSMOS_MEMINFO_KEY) SYSCALLS_COUNT=$(SYSCALLS_COUNT_KEY) IO_PERF_COUNTERS=$(IO_PERF_COUNTERS_KEY) SCHED_EEVDF=$(SCHED_EEVDF_KEY)
 KERNEL_CONFIG_STAMP_RV := $(STAMP_DIR)/kernel-config-rv.stamp
 KERNEL_CONFIG_STAMP_LA := $(STAMP_DIR)/kernel-config-la.stamp
 USER_BUILD_DEPS := user/Makefile user/Cargo.toml $(shell find user/src -type f | sort)
@@ -84,6 +86,7 @@ ROOTFS_CARGO_CACHE_HELPER := $(ROOTFS_BASE_DIR)/root/prepare-cargo-cache
 ROOTFS_CAGENT_WRAPPER := $(ROOTFS_BASE_DIR)/root/cagent-run-glibc
 ROOTFS_BUILDSTORM_WRAPPER := $(ROOTFS_BASE_DIR)/root/buildstorm-run-glibc
 ROOTFS_FINAL_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/final_auto_run
+ROOTFS_CYCLICTEST_SCRIPT := $(ROOTFS_BASE_DIR)/root/cyclictest.sh
 ROOTFS_LTP_AUTO_RUN := $(ROOTFS_BASE_DIR)/root/ltp-auto-run
 ROOTFS_LTP_RUN_FILES := $(addprefix $(ROOTFS_BASE_DIR)/root/, \
 	ltp-run-musl ltp-run-glibc \
@@ -142,13 +145,15 @@ ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_REPO)/Makefile \
 	$(ROOTFS_REPO)/scripts/common-musl-env.sh \
 	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
 	$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC) $(ROOTFS_PIVOT_CAGENT_RETRY_SRC) \
-	$(ROOTFS_FINAL_AUTO_RUN) $(ROOTFS_BOOTSTRAP_LTP_FILES)
+	$(ROOTFS_FINAL_AUTO_RUN) $(ROOTFS_BOOTSTRAP_LTP_FILES) \
+	$(ROOTFS_CYCLICTEST_SCRIPT)
 else
 ROOTFS_VARIANT_DEPS := Makefile $(ROOTFS_SCRIPT_FILES) \
 	$(ROOTFS_BASE_DIR)/sbin/init $(ROOTFS_PIVOT_EVAL_HELPER) \
 	$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC) $(ROOTFS_PIVOT_CAGENT_RETRY_SRC) \
 	$(ROOTFS_CARGO_CACHE_HELPER) $(wildcard $(ROOTFS_CAGENT_WRAPPER)) \
-	$(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN)
+	$(wildcard $(ROOTFS_BUILDSTORM_WRAPPER)) $(ROOTFS_FINAL_AUTO_RUN) \
+	$(ROOTFS_CYCLICTEST_SCRIPT)
 endif
 ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 LA_ROOTFS_ARCH_FILES := bin/busybox
@@ -289,11 +294,11 @@ $(KERNEL_CONFIG_STAMP_LA): force | $(STAMP_DIR)
 	fi
 
 $(KERNEL_BUILD_STAMP_RV): $(KERNEL_BUILD_DEPS) $(KERNEL_CONFIG_STAMP_RV) | $(STAMP_DIR)
-	$(MAKE) -C os kernel ARCH=riscv64 KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS) COSMOS_MEMINFO=$(COSMOS_MEMINFO) SYSCALLS_COUNT=$(SYSCALLS_COUNT) IO_PERF_COUNTERS=$(IO_PERF_COUNTERS)
+	$(MAKE) -C os kernel ARCH=riscv64 KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS) COSMOS_MEMINFO=$(COSMOS_MEMINFO) SYSCALLS_COUNT=$(SYSCALLS_COUNT) IO_PERF_COUNTERS=$(IO_PERF_COUNTERS) SCHED_EEVDF=$(SCHED_EEVDF)
 	touch $@
 
 $(KERNEL_BUILD_STAMP_LA): $(KERNEL_BUILD_DEPS) $(KERNEL_CONFIG_STAMP_LA) | $(STAMP_DIR)
-	$(MAKE) -C os kernel ARCH=loongarch64 KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS) COSMOS_MEMINFO=$(COSMOS_MEMINFO) SYSCALLS_COUNT=$(SYSCALLS_COUNT) IO_PERF_COUNTERS=$(IO_PERF_COUNTERS)
+	$(MAKE) -C os kernel ARCH=loongarch64 KERNEL_TRAP_DIAGNOSTICS=$(KERNEL_TRAP_DIAGNOSTICS) COSMOS_MEMINFO=$(COSMOS_MEMINFO) SYSCALLS_COUNT=$(SYSCALLS_COUNT) IO_PERF_COUNTERS=$(IO_PERF_COUNTERS) SCHED_EEVDF=$(SCHED_EEVDF)
 	touch $@
 
 kernel-rv: $(KERNEL_BUILD_STAMP_RV)
@@ -382,11 +387,13 @@ ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner"
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry"
 	@cp -f $(ROOTFS_BOOTSTRAP_LTP_FILES) "$(ROOTFS_RV_DIR)/root/"
+	@cp -f "$(ROOTFS_CYCLICTEST_SCRIPT)" "$(ROOTFS_RV_DIR)/root/cyclictest.sh"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final_auto_run"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final-auto-run"
 	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root" \
 		"$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry" \
 		$(addprefix $(ROOTFS_RV_DIR)/root/,ltp-auto-run $(notdir $(ROOTFS_LTP_RUN_FILES))) \
+		"$(ROOTFS_RV_DIR)/root/cyclictest.sh" \
 		"$(ROOTFS_RV_DIR)/root/final_auto_run" "$(ROOTFS_RV_DIR)/root/final-auto-run"
 	@touch "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"
 else
@@ -420,6 +427,10 @@ endif
 		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final_auto_run"; \
 		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_RV_DIR)/root/final-auto-run"; \
 		chmod 0755 "$(ROOTFS_RV_DIR)/root/final_auto_run" "$(ROOTFS_RV_DIR)/root/final-auto-run"; \
+	fi
+	@if [ -f "$(ROOTFS_CYCLICTEST_SCRIPT)" ]; then \
+		cp -f "$(ROOTFS_CYCLICTEST_SCRIPT)" "$(ROOTFS_RV_DIR)/root/cyclictest.sh"; \
+		chmod 0755 "$(ROOTFS_RV_DIR)/root/cyclictest.sh"; \
 	fi
 	@if [ -f "$(ROOTFS_BASE_DIR)/sbin/init" ]; then \
 		cp -f "$(ROOTFS_BASE_DIR)/sbin/init" "$(ROOTFS_RV_DIR)/sbin/init"; \
@@ -488,11 +499,13 @@ ifeq ($(PIVOT_EVAL_ROOT_ENABLED),1)
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner"
 	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry"
 	@cp -f $(ROOTFS_BOOTSTRAP_LTP_FILES) "$(ROOTFS_LA_DIR)/root/"
+	@cp -f "$(ROOTFS_CYCLICTEST_SCRIPT)" "$(ROOTFS_LA_DIR)/root/cyclictest.sh"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final_auto_run"
 	@cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final-auto-run"
 	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/init" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root" \
 		"$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry" \
 		$(addprefix $(ROOTFS_LA_DIR)/root/,ltp-auto-run $(notdir $(ROOTFS_LTP_RUN_FILES))) \
+		"$(ROOTFS_LA_DIR)/root/cyclictest.sh" \
 		"$(ROOTFS_LA_DIR)/root/final_auto_run" "$(ROOTFS_LA_DIR)/root/final-auto-run"
 	@touch "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"
 else
@@ -518,6 +531,10 @@ endif
 		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final_auto_run"; \
 		cp -f "$(ROOTFS_FINAL_AUTO_RUN)" "$(ROOTFS_LA_DIR)/root/final-auto-run"; \
 		chmod 0755 "$(ROOTFS_LA_DIR)/root/final_auto_run" "$(ROOTFS_LA_DIR)/root/final-auto-run"; \
+	fi
+	@if [ -f "$(ROOTFS_CYCLICTEST_SCRIPT)" ]; then \
+		cp -f "$(ROOTFS_CYCLICTEST_SCRIPT)" "$(ROOTFS_LA_DIR)/root/cyclictest.sh"; \
+		chmod 0755 "$(ROOTFS_LA_DIR)/root/cyclictest.sh"; \
 	fi
 	@if [ -f "$(ROOTFS_CAGENT_WRAPPER)" ]; then \
 		cp -f "$(ROOTFS_CAGENT_WRAPPER)" "$(ROOTFS_LA_DIR)/root/cagent-run-glibc"; \

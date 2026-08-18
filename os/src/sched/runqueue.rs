@@ -1,10 +1,12 @@
-//! Per-hart runqueue management for RT and CFS scheduling classes.
+//! Per-hart runqueue management for RT and the compiled-in fair scheduler.
 
 use super::{current_task, processor::processor_for_hart};
 use crate::config::MAX_HARTS;
 use crate::hal::hartid;
 use crate::mm::online_mask as online_hart_mask;
 use crate::sbi::send_ipi_mask;
+#[cfg(feature = "sched_eevdf")]
+use crate::sched::{eevdf_virtual_deadline, EEVDF_DEFAULT_SLICE_NS, EEVDF_WAKEUP_GRANULARITY_NS};
 use crate::sched::{request_current_task_resched, CFS_WAKEUP_GRANULARITY_NS};
 use crate::sync::SpinNoIrqLock;
 use crate::task::{
@@ -28,10 +30,15 @@ type CfsKey = (u64, usize);
 struct EnqueuedTaskInfo {
     policy: SchedPolicy,
     rt_priority: u8,
+    #[cfg(not(feature = "sched_eevdf"))]
     vruntime_ns: u64,
+    #[cfg(feature = "sched_eevdf")]
+    virtual_deadline_ns: u64,
+    #[cfg(feature = "sched_eevdf")]
+    eligible: bool,
 }
 
-fn running_cfs_vruntime_snapshot(hart: usize) -> Option<u64> {
+fn running_fair_entity_snapshot(hart: usize) -> Option<(u64, u64)> {
     let task = processor_for_hart(normalize_hart(hart)).lock().current()?;
     let mut task_inner = task.inner_exclusive_access();
     if !task.on_cpu.load(Ordering::Relaxed)
@@ -41,7 +48,7 @@ fn running_cfs_vruntime_snapshot(hart: usize) -> Option<u64> {
         return None;
     }
     task_inner.account_cfs_runtime(get_time_ns());
-    Some(task_inner.sched.vruntime_ns)
+    Some((task_inner.sched.vruntime_ns, task_inner.sched.weight.max(1)))
 }
 
 /// Local runnable queues owned by one hart.
@@ -52,6 +59,16 @@ struct RunQueue {
     cfs_tasks: BTreeMap<CfsKey, Arc<TaskControlBlock>>,
     cfs_nr_running: usize,
     cfs_load: u64,
+    /// Cached EEVDF numerator and denominator for the queued fair entities.
+    ///
+    /// The running entity is intentionally excluded because it is not in
+    /// `cfs_tasks`; callers add it as a temporary argument when calculating
+    /// eligibility. Keeping this summary under the runqueue lock avoids an
+    /// O(n) scan and per-task lock acquisition on every scheduler decision.
+    #[cfg(feature = "sched_eevdf")]
+    eevdf_weighted_vruntime_ns: u128,
+    #[cfg(feature = "sched_eevdf")]
+    eevdf_total_weight: u128,
     min_vruntime_ns: u64,
     /// Keep a reference to the last exiting task so its kernel stack
     /// is not freed while this hart is still running on it.
@@ -67,13 +84,17 @@ impl RunQueue {
             cfs_tasks: BTreeMap::new(),
             cfs_nr_running: 0,
             cfs_load: 0,
+            #[cfg(feature = "sched_eevdf")]
+            eevdf_weighted_vruntime_ns: 0,
+            #[cfg(feature = "sched_eevdf")]
+            eevdf_total_weight: 0,
             min_vruntime_ns: 0,
             stop_task: None,
         }
     }
 
     /// Raw pointer identities of every runnable task in this runqueue
-    /// (all RT levels + the CFS tree). `stop_task` is intentionally excluded:
+    /// (all RT levels + the fair tree). `stop_task` is intentionally excluded:
     /// it is a dying-task reference held for kernel-stack safety, not a
     /// runnable entry. Used by scheduler diagnostics.
     pub(super) fn runnable_ptrs(&self) -> Vec<usize> {
@@ -93,7 +114,7 @@ impl RunQueue {
         &mut self,
         task: Arc<TaskControlBlock>,
         task_inner: &mut TaskControlBlockInner,
-        current_vruntime_hint: Option<u64>,
+        current_entity_hint: Option<(u64, u64)>,
     ) -> EnqueuedTaskInfo {
         match task_inner.sched.policy {
             SchedPolicy::Fifo | SchedPolicy::Rr => {
@@ -110,33 +131,91 @@ impl RunQueue {
                 EnqueuedTaskInfo {
                     policy: task_inner.sched.policy,
                     rt_priority: prio,
+                    #[cfg(not(feature = "sched_eevdf"))]
                     vruntime_ns: 0,
+                    #[cfg(feature = "sched_eevdf")]
+                    virtual_deadline_ns: 0,
+                    #[cfg(feature = "sched_eevdf")]
+                    eligible: false,
                 }
             }
             SchedPolicy::Other => {
+                #[cfg(feature = "sched_eevdf")]
+                let queue_was_empty = self.cfs_nr_running == 0;
                 let (placed_vruntime, initialized) = self.place_cfs_entity(
                     task_inner.sched.vruntime_ns,
                     task_inner.sched.cfs_initialized,
-                    current_vruntime_hint,
+                    current_entity_hint.map(|(vruntime, _)| vruntime),
                 );
                 task_inner.sched.vruntime_ns = placed_vruntime;
                 task_inner.sched.cfs_initialized = initialized;
                 let vruntime = task_inner.sched.vruntime_ns;
                 let weight = task_inner.sched.weight;
+                #[cfg(feature = "sched_eevdf")]
+                let virtual_deadline =
+                    eevdf_virtual_deadline(vruntime, weight, EEVDF_DEFAULT_SLICE_NS);
+                #[cfg(not(feature = "sched_eevdf"))]
+                let virtual_deadline = 0;
+                #[cfg(feature = "sched_eevdf")]
+                let key = (virtual_deadline, Arc::as_ptr(&task) as usize);
+                #[cfg(not(feature = "sched_eevdf"))]
                 let key = (vruntime, Arc::as_ptr(&task) as usize);
+                #[cfg(feature = "sched_eevdf")]
+                let eligible = task_inner.sched.vruntime_ns
+                    <= self.eevdf_average_vruntime_with_entity(
+                        current_entity_hint,
+                        Some((vruntime, weight)),
+                    );
                 task_inner.sched.cfs_rq_key = Some(key);
+                task_inner.sched.eevdf_deadline_ns = virtual_deadline;
                 self.cfs_tasks.insert(key, task);
                 self.cfs_nr_running += 1;
                 self.cfs_load = self.cfs_load.saturating_add(weight);
-                self.refresh_min_vruntime(None);
+                #[cfg(feature = "sched_eevdf")]
+                {
+                    self.eevdf_add_entity(vruntime, weight);
+                    // A newly-created fair queue has no leftmost entry for
+                    // refresh_min_vruntime() to inspect. Publish its first
+                    // entity directly instead of scanning the queue.
+                    if queue_was_empty {
+                        self.min_vruntime_ns = self.min_vruntime_ns.max(vruntime);
+                    }
+                }
                 EnqueuedTaskInfo {
                     policy: SchedPolicy::Other,
                     rt_priority: 0,
+                    #[cfg(not(feature = "sched_eevdf"))]
                     vruntime_ns: vruntime,
+                    #[cfg(feature = "sched_eevdf")]
+                    virtual_deadline_ns: virtual_deadline,
+                    #[cfg(feature = "sched_eevdf")]
+                    eligible,
                 }
             }
             SchedPolicy::Idle => unreachable!("idle tasks are not enqueued"),
         }
+    }
+
+    /// Add one queued fair entity to the cached EEVDF lag summary.
+    #[cfg(feature = "sched_eevdf")]
+    #[inline]
+    fn eevdf_add_entity(&mut self, vruntime_ns: u64, weight: u64) {
+        let weight = weight.max(1) as u128;
+        self.eevdf_weighted_vruntime_ns = self
+            .eevdf_weighted_vruntime_ns
+            .saturating_add((vruntime_ns as u128).saturating_mul(weight));
+        self.eevdf_total_weight = self.eevdf_total_weight.saturating_add(weight);
+    }
+
+    /// Remove one queued fair entity from the cached EEVDF lag summary.
+    #[cfg(feature = "sched_eevdf")]
+    #[inline]
+    fn eevdf_remove_entity(&mut self, vruntime_ns: u64, weight: u64) {
+        let weight = weight.max(1) as u128;
+        self.eevdf_weighted_vruntime_ns = self
+            .eevdf_weighted_vruntime_ns
+            .saturating_sub((vruntime_ns as u128).saturating_mul(weight));
+        self.eevdf_total_weight = self.eevdf_total_weight.saturating_sub(weight);
     }
 
     fn place_cfs_entity(
@@ -158,6 +237,59 @@ impl RunQueue {
         (placed_vruntime, true)
     }
 
+    /// Return the weighted average virtual runtime used by EEVDF's lag test.
+    ///
+    /// The currently running fair task is not in `cfs_tasks`, so callers pass
+    /// its `(vruntime, weight)` separately when it should participate in the
+    /// eligibility calculation. The queued portion comes from the cached
+    /// summary above; this must stay O(1) because it is called from both the
+    /// timer-tick and dequeue paths.
+    #[cfg(feature = "sched_eevdf")]
+    fn eevdf_average_vruntime(&self, current: Option<(u64, u64)>) -> u64 {
+        self.eevdf_average_vruntime_with_entity(current, None)
+    }
+
+    /// Return the weighted average virtual runtime while also accounting for
+    /// entities that are not part of the cached queue summary yet.
+    #[cfg(feature = "sched_eevdf")]
+    fn eevdf_average_vruntime_with_entity(
+        &self,
+        current: Option<(u64, u64)>,
+        incoming: Option<(u64, u64)>,
+    ) -> u64 {
+        let mut weighted_vruntime = self.eevdf_weighted_vruntime_ns;
+        let mut total_weight = self.eevdf_total_weight;
+        if let Some((vruntime, weight)) = incoming {
+            let weight = weight.max(1) as u128;
+            weighted_vruntime =
+                weighted_vruntime.saturating_add((vruntime as u128).saturating_mul(weight));
+            total_weight = total_weight.saturating_add(weight);
+        }
+        if let Some((vruntime, weight)) = current {
+            let weight = weight.max(1) as u128;
+            weighted_vruntime =
+                weighted_vruntime.saturating_add((vruntime as u128).saturating_mul(weight));
+            total_weight = total_weight.saturating_add(weight);
+        }
+        if total_weight == 0 {
+            return self.min_vruntime_ns;
+        }
+        let average = weighted_vruntime / total_weight;
+        average.min(u64::MAX as u128) as u64
+    }
+
+    /// Return the earliest virtual deadline among currently eligible EEVDF
+    /// tasks. The tree is deadline ordered, so the first eligible entry is
+    /// the next candidate.
+    #[cfg(feature = "sched_eevdf")]
+    fn eevdf_earliest_eligible_deadline(&self, current: Option<(u64, u64)>) -> Option<u64> {
+        let average_vruntime = self.eevdf_average_vruntime(current);
+        self.cfs_tasks.iter().find_map(|(key, task)| {
+            let task_inner = task.inner_exclusive_access();
+            (task_inner.sched.vruntime_ns <= average_vruntime).then_some(key.0)
+        })
+    }
+
     fn dequeue_highest_rt(&mut self) -> Option<Arc<TaskControlBlock>> {
         let prio = self.highest_rt_prio?;
         let task = self.rt_queues[prio as usize].pop_front()?;
@@ -167,8 +299,24 @@ impl RunQueue {
     }
 
     fn dequeue_leftmost_cfs(&mut self) -> Option<Arc<TaskControlBlock>> {
-        let key = *self.cfs_tasks.keys().next()?;
-        self.remove_cfs_by_key(key)
+        #[cfg(feature = "sched_eevdf")]
+        {
+            let average_vruntime = self.eevdf_average_vruntime(None);
+            let key = self
+                .cfs_tasks
+                .iter()
+                .find(|(_, task)| {
+                    task.inner_exclusive_access().sched.vruntime_ns <= average_vruntime
+                })
+                .map(|(key, _)| *key)
+                .or_else(|| self.cfs_tasks.keys().next().copied())?;
+            return self.remove_cfs_by_key(key);
+        }
+        #[cfg(not(feature = "sched_eevdf"))]
+        {
+            let key = *self.cfs_tasks.keys().next()?;
+            self.remove_cfs_by_key(key)
+        }
     }
 
     fn remove_cfs_by_key(&mut self, key: CfsKey) -> Option<Arc<TaskControlBlock>> {
@@ -176,8 +324,13 @@ impl RunQueue {
         let accounted_vruntime = {
             let mut task_inner = task.inner_exclusive_access();
             task_inner.sched.cfs_rq_key = None;
-            self.cfs_load = self.cfs_load.saturating_sub(task_inner.sched.weight);
-            task_inner.sched.vruntime_ns
+            task_inner.sched.eevdf_deadline_ns = 0;
+            let weight = task_inner.sched.weight;
+            let vruntime = task_inner.sched.vruntime_ns;
+            #[cfg(feature = "sched_eevdf")]
+            self.eevdf_remove_entity(vruntime, weight);
+            self.cfs_load = self.cfs_load.saturating_sub(weight);
+            vruntime
         };
         self.cfs_nr_running = self.cfs_nr_running.saturating_sub(1);
         self.refresh_min_vruntime(Some(accounted_vruntime));
@@ -216,14 +369,35 @@ impl RunQueue {
                 self.cfs_tasks.insert(key, queued_task);
                 continue;
             }
+            #[cfg(feature = "sched_eevdf")]
+            let old_entity = {
+                let task_inner = queued_task.inner_exclusive_access();
+                (task_inner.sched.vruntime_ns, task_inner.sched.weight)
+            };
+            #[cfg(feature = "sched_eevdf")]
+            self.eevdf_remove_entity(old_entity.0, old_entity.1);
             let new_key = {
                 let mut task_inner = queued_task.inner_exclusive_access();
                 task_inner.sched.vruntime_ns = boosted_vruntime;
+                #[cfg(feature = "sched_eevdf")]
+                let virtual_deadline = eevdf_virtual_deadline(
+                    boosted_vruntime,
+                    task_inner.sched.weight,
+                    EEVDF_DEFAULT_SLICE_NS,
+                );
+                #[cfg(not(feature = "sched_eevdf"))]
+                let virtual_deadline = 0;
+                #[cfg(feature = "sched_eevdf")]
+                let new_key = (virtual_deadline, Arc::as_ptr(&queued_task) as usize);
+                #[cfg(not(feature = "sched_eevdf"))]
                 let new_key = (boosted_vruntime, Arc::as_ptr(&queued_task) as usize);
                 task_inner.sched.cfs_rq_key = Some(new_key);
+                task_inner.sched.eevdf_deadline_ns = virtual_deadline;
                 new_key
             };
             self.cfs_tasks.insert(new_key, queued_task);
+            #[cfg(feature = "sched_eevdf")]
+            self.eevdf_add_entity(boosted_vruntime, old_entity.1);
             boosted += 1;
         }
         if boosted != 0 {
@@ -287,6 +461,7 @@ impl RunQueue {
         (self.cfs_load, self.cfs_nr_running)
     }
 
+    #[cfg(not(feature = "sched_eevdf"))]
     fn leftmost_cfs_vruntime(&self) -> Option<u64> {
         self.cfs_tasks.keys().next().map(|key| key.0)
     }
@@ -302,6 +477,7 @@ impl RunQueue {
         if let Some(vruntime) = accounted_vruntime {
             self.min_vruntime_ns = self.min_vruntime_ns.max(vruntime);
         }
+        #[cfg(not(feature = "sched_eevdf"))]
         if let Some(leftmost) = self.leftmost_cfs_vruntime() {
             self.min_vruntime_ns = self.min_vruntime_ns.max(leftmost);
         }
@@ -391,6 +567,7 @@ fn preempt_reason_for_current(
     current_policy: SchedPolicy,
     current_rt_priority: u8,
     current_vruntime_ns: u64,
+    _current_weight: u64,
     incoming: EnqueuedTaskInfo,
 ) -> Option<ReschedReason> {
     match (current_policy, incoming.policy) {
@@ -398,11 +575,30 @@ fn preempt_reason_for_current(
             (incoming.rt_priority > current_rt_priority).then_some(ReschedReason::HigherRtPriority)
         }
         (SchedPolicy::Other, incoming) if incoming.is_rt() => Some(ReschedReason::HigherRtPriority),
-        (SchedPolicy::Other, SchedPolicy::Other) => (incoming
-            .vruntime_ns
-            .saturating_add(CFS_WAKEUP_GRANULARITY_NS)
-            < current_vruntime_ns)
-            .then_some(ReschedReason::CfsPreempt),
+        (SchedPolicy::Other, SchedPolicy::Other) => {
+            #[cfg(feature = "sched_eevdf")]
+            {
+                let current_deadline = eevdf_virtual_deadline(
+                    current_vruntime_ns,
+                    _current_weight,
+                    EEVDF_DEFAULT_SLICE_NS,
+                );
+                (incoming.eligible
+                    && incoming
+                        .virtual_deadline_ns
+                        .saturating_add(EEVDF_WAKEUP_GRANULARITY_NS)
+                        < current_deadline)
+                    .then_some(ReschedReason::CfsPreempt)
+            }
+            #[cfg(not(feature = "sched_eevdf"))]
+            {
+                (incoming
+                    .vruntime_ns
+                    .saturating_add(CFS_WAKEUP_GRANULARITY_NS)
+                    < current_vruntime_ns)
+                    .then_some(ReschedReason::CfsPreempt)
+            }
+        }
         _ => None,
     }
 }
@@ -419,6 +615,7 @@ fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
     }
     let current_policy = task_inner.sched.policy;
     let current_rt_priority = task_inner.sched.rt_priority;
+    let current_weight = task_inner.sched.weight;
     // Wakeup preemption should compare against the current task's vruntime as
     // of "now", not the last tick or context-switch accounting point.
     if matches!(current_policy, SchedPolicy::Other) {
@@ -429,6 +626,7 @@ fn maybe_preempt_current_on_this_hart(incoming: EnqueuedTaskInfo) {
         current_policy,
         current_rt_priority,
         current_vruntime_after,
+        current_weight,
         incoming,
     );
     drop(task_inner);
@@ -622,7 +820,8 @@ pub fn highest_runnable_prio(hart: usize) -> Option<u8> {
     RUN_QUEUES[normalize_hart(hart)].lock().highest_rt_prio()
 }
 
-/// Return whether CFS should preempt the current task on `hart`.
+/// Return whether the compiled-in fair scheduler should preempt the current
+/// task on `hart`.
 pub fn cfs_should_preempt(
     hart: usize,
     current_vruntime_ns: u64,
@@ -633,26 +832,43 @@ pub fn cfs_should_preempt(
     if rq.highest_rt_prio().is_some() {
         return true;
     }
-    let Some(leftmost_vruntime) = rq.leftmost_cfs_vruntime() else {
-        return false;
-    };
-    if current_vruntime_ns <= leftmost_vruntime.saturating_add(CFS_WAKEUP_GRANULARITY_NS) {
-        return false;
-    }
-    let runnable = rq.cfs_nr_running.saturating_add(1);
-    let period = if (runnable as u64) * crate::sched::CFS_MIN_GRANULARITY_NS
-        > crate::sched::CFS_TARGET_LATENCY_NS
+    #[cfg(feature = "sched_eevdf")]
     {
-        (runnable as u64) * crate::sched::CFS_MIN_GRANULARITY_NS
-    } else {
-        crate::sched::CFS_TARGET_LATENCY_NS
-    };
-    let total_load = rq.cfs_load.saturating_add(current_weight).max(1);
-    let ideal_runtime = (period as u128)
-        .saturating_mul(current_weight as u128)
-        .checked_div(total_load as u128)
-        .unwrap_or(0) as u64;
-    current_slice_exec_ns >= ideal_runtime.max(crate::sched::CFS_MIN_GRANULARITY_NS)
+        if rq.cfs_nr_running == 0 || current_slice_exec_ns < EEVDF_DEFAULT_SLICE_NS {
+            return false;
+        }
+        let Some(incoming_deadline) =
+            rq.eevdf_earliest_eligible_deadline(Some((current_vruntime_ns, current_weight)))
+        else {
+            return false;
+        };
+        let current_deadline =
+            eevdf_virtual_deadline(current_vruntime_ns, current_weight, EEVDF_DEFAULT_SLICE_NS);
+        return incoming_deadline.saturating_add(EEVDF_WAKEUP_GRANULARITY_NS) < current_deadline;
+    }
+    #[cfg(not(feature = "sched_eevdf"))]
+    {
+        let Some(leftmost_vruntime) = rq.leftmost_cfs_vruntime() else {
+            return false;
+        };
+        if current_vruntime_ns <= leftmost_vruntime.saturating_add(CFS_WAKEUP_GRANULARITY_NS) {
+            return false;
+        }
+        let runnable = rq.cfs_nr_running.saturating_add(1);
+        let period = if (runnable as u64) * crate::sched::CFS_MIN_GRANULARITY_NS
+            > crate::sched::CFS_TARGET_LATENCY_NS
+        {
+            (runnable as u64) * crate::sched::CFS_MIN_GRANULARITY_NS
+        } else {
+            crate::sched::CFS_TARGET_LATENCY_NS
+        };
+        let total_load = rq.cfs_load.saturating_add(current_weight).max(1);
+        let ideal_runtime = (period as u128)
+            .saturating_mul(current_weight as u128)
+            .checked_div(total_load as u128)
+            .unwrap_or(0) as u64;
+        current_slice_exec_ns >= ideal_runtime.max(crate::sched::CFS_MIN_GRANULARITY_NS)
+    }
 }
 
 /// Add a task to the scheduler on the current hart.
@@ -673,7 +889,7 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         (task_inner.sched.cpu_affinity_mask, task_inner.sched.policy)
     };
     let target_hart = select_target_hart(hart, affinity_mask, policy);
-    let current_vruntime_hint = running_cfs_vruntime_snapshot(target_hart);
+    let current_entity_hint = running_fair_entity_snapshot(target_hart);
     let incoming = {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
@@ -687,14 +903,19 @@ pub fn enqueue_task_on(task: Arc<TaskControlBlock>, hart: usize) {
         task_inner.wait_reason = None;
         task_inner.sched.last_cpu = target_hart;
         task_inner.sched.on_rq = true;
-        let incoming = rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint);
+        let incoming = rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_entity_hint);
         incoming
     };
+    // Preserve the CFS min-vruntime refresh. EEVDF maintains its first-entry
+    // floor and cached lag summary during enqueue, so it needs no extra queue
+    // scan or lock acquisition here.
+    #[cfg(not(feature = "sched_eevdf"))]
+    RUN_QUEUES[target_hart].lock().refresh_min_vruntime(None);
     notify_enqueued_task(target_hart, incoming);
 }
 
 fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool {
-    let current_vruntime_hint = running_cfs_vruntime_snapshot(target_hart);
+    let current_entity_hint = running_fair_entity_snapshot(target_hart);
     let (incoming, repair_info) = {
         let mut rq = RUN_QUEUES[target_hart].lock();
         let mut task_inner = task.inner_exclusive_access();
@@ -732,9 +953,11 @@ fn enqueue_wakeup_task(task: Arc<TaskControlBlock>, target_hart: usize) -> bool 
         }
         task_inner.sched.last_cpu = target_hart;
         task_inner.sched.on_rq = true;
-        let incoming = rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_vruntime_hint);
+        let incoming = rq.enqueue_locked(Arc::clone(&task), &mut task_inner, current_entity_hint);
         (incoming, repair_info)
     };
+    #[cfg(not(feature = "sched_eevdf"))]
+    RUN_QUEUES[target_hart].lock().refresh_min_vruntime(None);
     if let Some((last_cpu, policy, pending, mask, resched)) = repair_info {
         let count = LOST_RUNNABLE_REPAIR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if should_log_sched_sample(count) {
@@ -1087,6 +1310,7 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
     let mut task_inner = task.inner_exclusive_access();
     task_inner.sched.on_rq = false;
     task_inner.sched.cfs_rq_key = None;
+    task_inner.sched.eevdf_deadline_ns = 0;
 }
 
 /// Set a task to stop-wait status on the current hart, keeping its kernel

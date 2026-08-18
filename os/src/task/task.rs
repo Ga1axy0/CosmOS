@@ -63,9 +63,9 @@ pub struct TaskSchedState {
     pub time_slice_ticks: u32,
     /// Remaining time slice budget, in timer ticks.
     pub remaining_slice_ticks: u32,
-    /// Linux nice value used by CFS.
+    /// Linux nice value used by the compiled-in regular-task scheduler.
     pub nice: i32,
-    /// CFS load weight derived from nice.
+    /// Fair-class load weight derived from nice.
     pub weight: u64,
     /// Raw Linux `sched_attr.sched_flags`.
     pub sched_flags: u64,
@@ -79,17 +79,22 @@ pub struct TaskSchedState {
     pub sched_util_min: u32,
     /// Linux util clamp maximum hint.
     pub sched_util_max: u32,
-    /// Virtual runtime used as the CFS ordering key, in nanoseconds.
+    /// Fair virtual runtime, in nanoseconds. CFS orders directly by this
+    /// value; EEVDF uses it for lag/eligibility and derives a deadline.
     pub vruntime_ns: u64,
     /// Last timestamp at which execution accounting was started, in nanoseconds.
     pub exec_start_ns: u64,
-    /// Total runtime accounted by CFS, in nanoseconds.
+    /// Total runtime accounted by the regular fair class, in nanoseconds.
     pub sum_exec_runtime_ns: u64,
-    /// Runtime accounting baseline for the current CFS CPU slice, in nanoseconds.
+    /// Runtime accounting baseline for the current fair CPU slice, in nanoseconds.
     pub cfs_slice_start_ns: u64,
-    /// Current key while this task is linked into a CFS runqueue.
+    /// Current key while this task is linked into the fair runqueue. It is a
+    /// vruntime key for CFS and a virtual-deadline key for EEVDF.
     pub cfs_rq_key: Option<(u64, usize)>,
-    /// Whether the task has been placed on a CFS runqueue before.
+    /// EEVDF virtual deadline for the current fair request, in nanoseconds.
+    /// This is zero for a task that is not queued or when CFS is selected.
+    pub eevdf_deadline_ns: u64,
+    /// Whether the task has been placed on a fair runqueue before.
     pub cfs_initialized: bool,
     /// Deferred reschedule request handled at safe scheduling points.
     pub resched_reason: Option<ReschedReason>,
@@ -123,6 +128,7 @@ impl TaskSchedState {
             sum_exec_runtime_ns: 0,
             cfs_slice_start_ns: 0,
             cfs_rq_key: None,
+            eevdf_deadline_ns: 0,
             cfs_initialized: false,
             resched_reason: None,
             rt_enqueue_head: false,
@@ -518,7 +524,8 @@ impl TaskControlBlockInner {
         self.sched.reset_time_slice();
     }
 
-    /// Account CFS runtime up to `now_ns` for a currently running regular task.
+    /// Account regular fair-class runtime up to `now_ns` for a currently
+    /// running SCHED_OTHER task.
     pub fn account_cfs_runtime(&mut self, now_ns: u64) {
         if !matches!(self.sched.policy, SchedPolicy::Other) {
             return;

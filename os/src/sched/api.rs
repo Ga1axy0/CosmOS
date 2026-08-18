@@ -6,7 +6,7 @@ use super::{
     take_current_task, TaskContext,
 };
 use crate::hal::hartid;
-use crate::sched::CFS_YIELD_PENALTY_NS;
+use crate::sched::FAIR_YIELD_PENALTY_NS;
 use crate::task::{ReschedReason, SchedPolicy, TaskStatus, WaitReason};
 use crate::timer::{get_time, get_time_ns};
 use alloc::vec::Vec;
@@ -61,7 +61,7 @@ fn suspend_current_and_run_next_inner(
                 task_inner.sched.vruntime_ns = task_inner
                     .sched
                     .vruntime_ns
-                    .saturating_add(CFS_YIELD_PENALTY_NS);
+                    .saturating_add(FAIR_YIELD_PENALTY_NS);
             }
         }
         task.set_resched_reason_locked(&mut task_inner, None);
@@ -76,7 +76,7 @@ pub fn suspend_current_and_run_next() {
     suspend_current_and_run_next_inner(false, false, Some(false));
 }
 
-/// Make current CFS task yield by charging a small vruntime penalty.
+/// Make current regular task yield by charging a small virtual-runtime penalty.
 pub fn yield_current_and_run_next() {
     suspend_current_and_run_next_inner(true, false, Some(false));
 }

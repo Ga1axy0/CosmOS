@@ -300,6 +300,10 @@ fn first_hart_main(hart_id: usize, fdt_ptr: usize) -> ! {
     platform::start_secondary_harts(hart_id);
     init_local_hart(hart_id);
     print_boot_stage("scheduler", "bootstrap hart entering run queue");
+    println!(
+        "[kernel] regular-task scheduler: {}",
+        sched::FAIR_SCHEDULER_NAME
+    );
     task::add_initproc();
     drivers::block::start_workers();
     fs::start_page_cache_workers();

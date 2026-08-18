@@ -19,10 +19,11 @@ pub use api::{
 pub use autogroup::{autogroup_enabled, set_autogroup_enabled};
 pub use context::TaskContext;
 pub use policy::{
-    clamp_nice, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy, CFS_MIN_GRANULARITY_NS,
-    CFS_TARGET_LATENCY_NS, CFS_WAKEUP_GRANULARITY_NS, CFS_YIELD_PENALTY_NS,
-    DEFAULT_TIME_SLICE_TICKS, MAX_NICE, MIN_NICE, NICE_0_LOAD, SCHED_RT_PRIO_MAX,
-    SCHED_RT_PRIO_MIN,
+    clamp_nice, eevdf_virtual_deadline, nice_to_weight, ReschedReason, SchedAttr, SchedPolicy,
+    CFS_MIN_GRANULARITY_NS, CFS_TARGET_LATENCY_NS, CFS_WAKEUP_GRANULARITY_NS,
+    CFS_YIELD_PENALTY_NS, DEFAULT_TIME_SLICE_TICKS, EEVDF_DEFAULT_SLICE_NS,
+    EEVDF_WAKEUP_GRANULARITY_NS, FAIR_SCHEDULER_NAME, FAIR_YIELD_PENALTY_NS, MAX_NICE, MIN_NICE,
+    NICE_0_LOAD, SCHED_RT_PRIO_MAX, SCHED_RT_PRIO_MIN,
 };
 pub(crate) use processor::{
     activate_current_address_space, current_kstack_top, defer_task_release_after_switch,

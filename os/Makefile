@@ -19,6 +19,9 @@ endif
 ifeq ($(IO_PERF_COUNTERS),1)
 EXTRA_FEATURES += --features io_perf_counters
 endif
+ifeq ($(SCHED_EEVDF),1)
+EXTRA_FEATURES += --features sched_eevdf
+endif
 ARCH_REQUEST := $(strip $(or $(target),$(ARCH),riscv64))
 ARCH_NORMALIZED := $(shell printf '%s' "$(ARCH_REQUEST)" | tr '[:upper:]' '[:lower:]')
 
