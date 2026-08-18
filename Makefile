@@ -426,7 +426,13 @@ endif
 		chmod 0755 "$(ROOTFS_RV_DIR)/sbin/init"; \
 	fi
 	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
-	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root"
+	# Full bootstrap mode still needs the pivot runtime helpers when the
+	# mounted test disk is a self-contained final evaluation image.
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner"
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry"
+	@chmod 0755 "$(ROOTFS_RV_DIR)/sbin/pivot-eval-root" \
+		"$(ROOTFS_RV_DIR)/sbin/pivot-cagent-runner" \
+		"$(ROOTFS_RV_DIR)/sbin/pivot-cagent-retry"
 	@mkdir -p "$(ROOTFS_RV_DIR)/etc"
 	@if [ "$(PIVOT_EVAL_ROOT_ENABLED)" = 1 ]; then \
 		touch "$(ROOTFS_RV_DIR)/etc/cosmos-pivot-eval-root"; \
@@ -526,7 +532,12 @@ endif
 		chmod 0755 "$(ROOTFS_LA_DIR)/sbin/init"; \
 	fi
 	@cp -f "$(ROOTFS_PIVOT_EVAL_HELPER)" "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
-	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root"
+	# Keep the full LoongArch bootstrap compatible with final-image pivoting.
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RUNNER_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner"
+	@cp -f "$(ROOTFS_PIVOT_CAGENT_RETRY_SRC)" "$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry"
+	@chmod 0755 "$(ROOTFS_LA_DIR)/sbin/pivot-eval-root" \
+		"$(ROOTFS_LA_DIR)/sbin/pivot-cagent-runner" \
+		"$(ROOTFS_LA_DIR)/sbin/pivot-cagent-retry"
 	@mkdir -p "$(ROOTFS_LA_DIR)/etc"
 	@if [ "$(PIVOT_EVAL_ROOT_ENABLED)" = 1 ]; then \
 		touch "$(ROOTFS_LA_DIR)/etc/cosmos-pivot-eval-root"; \
