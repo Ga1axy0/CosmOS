@@ -159,6 +159,10 @@ LA_ROOTFS_ARCH_FILES := bin/busybox usr/bin/bash lib/libc.so
 endif
 DISK_RV_IMG := disk.img
 DISK_LA_IMG := disk-la.img
+SDCARD_RV_IMG ?= sdcard-rv.img
+DISK_RV_SDCARD_IMG ?= disk-rv-with-sdcard.img
+SDCARD_LA_IMG ?= sdcard-la.img
+DISK_LA_STRICT_SDCARD_IMG ?= disk-la-strict-with-sdcard.img
 QEMU_LA_BLK_ARGS = -drive file=$(RUN_TEST_FS_LA),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0
 FAST_RUN_QEMU_LA_BLK_ARGS = -drive file=$(FAST_RUN_TEST_FS_LA),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0
 QEMU_LA_EXTRA_BLK_PRESENT = -drive file=$(DISK_LA_IMG),if=none,format=raw,id=x1 -device virtio-blk-pci,drive=x1
@@ -231,7 +235,7 @@ else
 $(error unsupported RUN_ARCH=$(RUN_ARCH), expected rv or la)
 endif
 
-.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rootfs-la-strict rv la disk-rv disk-la linux snapshot-fast-run snapshot-linux clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
+.PHONY: all submodules cargo-config docker build_docker fmt user-apps rootfs sync-rootfs-variants rootfs-rv rootfs-la rootfs-la-strict rv la disk-rv disk-la pack-rv-sdcard pack-la-strict-sdcard linux snapshot-fast-run snapshot-linux clean-eval-sdcard clean run run-trace run-comp-rv run-comp-la fast-run fast-run-la clean-all debug gdbserver gdbclient check-kernel check-user-apps check-rootfs check-rootfs-rv check-rootfs-la check-rootfs-rv-ready check-rootfs-la-ready check-rootfs-la-arch prepare-run-test-fs prepare-run-test-fs-la force
 
 all:
 	$(MAKE) submodules
@@ -569,6 +573,18 @@ endif
 rv disk-rv: $(DISK_RV_IMG)
 
 la disk-la: $(DISK_LA_IMG)
+
+# Expand the evaluation sdcard filesystem under /mnt of rootfs-rv, then pack
+# the combined filesystem. The source rootfs and sdcard image remain intact.
+pack-rv-sdcard: $(ROOTFS_RV_READY_STAMP) scripts/pack-rv-sdcard-rootfs.sh $(SDCARD_RV_IMG)
+	PACK_USER_APPS=0 LOOP_FAT32_ENABLE=0 EXTRA_MIB=$(PACK_EXTRA_MIB) MIN_SIZE_MIB=$(PACK_MIN_SIZE_MIB) \
+		./scripts/pack-rv-sdcard-rootfs.sh $(ROOTFS_RV_DIR) $(SDCARD_RV_IMG) $(DISK_RV_SDCARD_IMG) $(USER_BIN_DIR_RV)
+
+# Same combined-image flow for the existing strict LoongArch rootfs.
+pack-la-strict-sdcard: scripts/pack-la-strict-sdcard-rootfs.sh scripts/pack-rv-sdcard-rootfs.sh $(SDCARD_LA_IMG)
+	@test -d "$(ROOTFS_REPO)/rootfs-la-strict" || { echo "missing strict rootfs; run 'make rootfs-la-strict' first" >&2; exit 1; }
+	PACK_USER_APPS=0 LOOP_FAT32_ENABLE=0 EXTRA_MIB=$(PACK_EXTRA_MIB) MIN_SIZE_MIB=$(PACK_MIN_SIZE_MIB) \
+		./scripts/pack-la-strict-sdcard-rootfs.sh $(ROOTFS_REPO)/rootfs-la-strict $(SDCARD_LA_IMG) $(DISK_LA_STRICT_SDCARD_IMG) $(USER_BIN_DIR_LA)
 
 check-kernel: $(RUN_KERNEL)
 	@test -x "$(RUN_KERNEL)" || { \
