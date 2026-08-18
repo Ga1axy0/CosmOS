@@ -25,8 +25,10 @@ pub const fn boot_fdt_ptr(raw: usize) -> usize {
 }
 
 fn is_qemu_virt() -> bool {
-    crate::bootinfo::try_get().is_some_and(|info| {
-        info.pci_host().is_some() && info.pch_pic().is_some() && info.eiointc().is_some()
+    crate::boot::context::try_get().is_some_and(|info| {
+        info.devices().pci_host().is_some()
+            && info.devices().pch_pic().is_some()
+            && info.devices().eiointc().is_some()
     })
 }
 
@@ -49,7 +51,7 @@ pub fn probe_platform_devices() {
                 warn!("[kernel] LS2K1000 GMAC IRQ {} could not be routed", irq);
             }
         }
-        if crate::bootinfo::get().ahci().is_some() {
+        if crate::boot::context::get().devices().ahci().is_some() {
             crate::drivers::block::probe_ahci();
             return;
         }
@@ -77,7 +79,7 @@ impl Timer for LoongArchPlatform {
     }
 
     fn clock_freq() -> usize {
-        crate::bootinfo::timer_frequency()
+        crate::boot::context::timer_frequency()
     }
 }
 
@@ -170,8 +172,8 @@ pub fn use_early_console() -> bool {
 
 /// Write one string through the earliest available console path.
 pub fn early_console_write(s: &str) {
-    let uart = crate::bootinfo::try_get()
-        .and_then(|info| info.uart())
+    let uart = crate::boot::context::try_get()
+        .and_then(|info| info.devices().uart())
         .map(|resource| crate::platform::mmio_phys_to_virt(resource.start))
         .unwrap_or(VIRT_UART);
     for b in s.bytes() {
@@ -238,7 +240,7 @@ pub fn start_secondary_harts(bootstrap_hart_id: usize) {
     } else {
         _start as usize
     };
-    let boot_info = crate::bootinfo::get();
+    let boot_info = crate::boot::context::get();
     let hart_count = if boot_info.fdt_blob().is_some() {
         boot_info.hart_count()
     } else {
@@ -304,7 +306,7 @@ pub fn mmio_phys_to_virt(paddr: usize) -> usize {
 
 /// Whether the RTC is supported on this platform.
 pub fn rtc_is_supported() -> bool {
-    crate::bootinfo::get().rtc().is_some()
+    crate::boot::context::get().devices().rtc().is_some()
 }
 
 /// Whether the kernel heap may grow inside its dedicated virtual window.

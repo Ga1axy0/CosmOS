@@ -22,7 +22,7 @@ impl Timer for SbiPlatform {
     }
 
     fn clock_freq() -> usize {
-        crate::bootinfo::timer_frequency()
+        crate::boot::context::timer_frequency()
     }
 }
 

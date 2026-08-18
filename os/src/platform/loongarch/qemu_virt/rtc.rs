@@ -151,7 +151,8 @@ fn secs_to_calendar(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 
 lazy_static! {
     static ref RTC: Arc<SpinNoIrqLock<Rtc>> = {
-        let resource = crate::bootinfo::get()
+        let resource = crate::boot::context::get()
+            .devices()
             .rtc()
             .expect("FDT has no RTC resource");
         Arc::new(SpinNoIrqLock::new(Rtc::new(

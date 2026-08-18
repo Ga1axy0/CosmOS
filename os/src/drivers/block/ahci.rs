@@ -307,7 +307,7 @@ impl BlockDevice for AhciBlock {
 
 /// Probe the FDT-selected AHCI controller and register it as the primary disk.
 pub fn probe_ahci() {
-    let Some(resource) = crate::bootinfo::get().ahci() else {
+    let Some(resource) = crate::boot::context::get().devices().ahci() else {
         return;
     };
     let base = crate::platform::mmio_phys_to_virt(resource.start);
@@ -315,7 +315,7 @@ pub fn probe_ahci() {
         "[ahci] probing controller at pa={:#x} size={:#x}",
         resource.start, resource.size
     );
-    // SAFETY: bootinfo accepted an enabled AHCI-compatible FDT node, the MMIO
+    // SAFETY: early OF discovery accepted an enabled AHCI-compatible FDT node, the MMIO
     // direct map covers its `reg`, and this one-time probe owns the controller.
     let Some(device) = (unsafe { AhciBlock::try_new(base) }) else {
         panic!(

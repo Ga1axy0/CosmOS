@@ -12,7 +12,7 @@ use fs::errno::FS_ERRNO;
 use fs::Inode;
 use lazy_static::lazy_static;
 
-use crate::bootinfo;
+use crate::boot::context;
 use crate::config::PAGE_SIZE;
 use crate::hal::hartid;
 use crate::mm::{
@@ -2598,7 +2598,7 @@ fn dynamic_watermarks() -> (usize, usize) {
 /// 初始化时使用的保守水位估算。
 fn default_watermarks() -> (usize, usize) {
     let mut total_pages = 0usize;
-    bootinfo::for_each_usable_memory_region(|region| {
+    context::get().memblock().for_each_free_range(|region| {
         let start = region.start.div_ceil(PAGE_SIZE);
         let end = region.end / PAGE_SIZE;
         total_pages = total_pages.saturating_add(end.saturating_sub(start));

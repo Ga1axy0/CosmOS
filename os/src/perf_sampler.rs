@@ -214,7 +214,7 @@ pub fn render() -> String {
         let _ = writeln!(
             &mut out,
             "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-            s.tick / crate::bootinfo::timer_frequency(),
+            s.tick / crate::boot::context::timer_frequency(),
             s.heap_total_bytes,
             s.heap_used_bytes,
             s.heap_slack_bytes,

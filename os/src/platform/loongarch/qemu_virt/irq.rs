@@ -64,7 +64,8 @@ const EXTIOI_ROUTE_IP3: u32 = 0x0808_0808;
 
 #[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn pch_pic_base() -> usize {
-    let resource = crate::bootinfo::get()
+    let resource = crate::boot::context::get()
+        .devices()
         .pch_pic()
         .expect("FDT has no Loongson PCH PIC");
     crate::platform::mmio_phys_to_virt(resource.start)
@@ -72,7 +73,8 @@ fn pch_pic_base() -> usize {
 
 #[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn extioi_base() -> usize {
-    crate::bootinfo::get()
+    crate::boot::context::get()
+        .devices()
         .eiointc()
         .expect("FDT has no Loongson EIOINTC")
         .start
@@ -80,7 +82,8 @@ fn extioi_base() -> usize {
 
 #[cfg(not(feature = "platform-ls2k1000-nebula"))]
 fn uart_irq() -> u32 {
-    crate::bootinfo::get()
+    crate::boot::context::get()
+        .devices()
         .uart()
         .and_then(|resource| resource.irq)
         .expect("FDT console UART has no interrupt")
@@ -219,9 +222,10 @@ pub(crate) fn enable_device_irq(irq: u32) -> bool {
 /// Initialize platform external interrupt routing on the bootstrap hart.
 #[cfg(not(feature = "platform-ls2k1000-nebula"))]
 pub fn init_external_irq() {
-    if crate::bootinfo::get().pch_pic().is_none()
-        || crate::bootinfo::get().eiointc().is_none()
-        || crate::bootinfo::get()
+    if crate::boot::context::get().devices().pch_pic().is_none()
+        || crate::boot::context::get().devices().eiointc().is_none()
+        || crate::boot::context::get()
+            .devices()
             .uart()
             .and_then(|uart| uart.irq)
             .is_none()

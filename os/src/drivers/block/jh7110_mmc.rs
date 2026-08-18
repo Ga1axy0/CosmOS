@@ -8,7 +8,7 @@ use core::{any::Any, hint::spin_loop, ptr};
 
 use fs::{BlockDevice, BLOCK_SZ};
 
-use crate::{bootinfo::MmcResource, sync::SpinNoIrqLock};
+use crate::{of::block::MmcResource, sync::SpinNoIrqLock};
 
 use super::{block_device_name, BLOCK_DEVICES};
 
@@ -612,7 +612,7 @@ fn busy_wait_ms(milliseconds: usize) {
 /// Probe enabled JH7110 SD controllers until one returns a usable card.
 pub fn probe_jh7110_mmc() {
     assert_eq!(BLOCK_SZ, SD_BLOCK_SIZE);
-    for resource in crate::bootinfo::get().mmc_devices() {
+    for resource in crate::boot::context::get().devices().mmc_devices() {
         let device = resource.device();
         if resource.no_sd() {
             println!(

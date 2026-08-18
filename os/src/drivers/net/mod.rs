@@ -189,14 +189,14 @@ pub fn register_device(dev: VirtIONetDevice) {
 /// can register each successful device without changing FDT discovery again.
 #[cfg(all(target_arch = "loongarch64", feature = "platform-ls2k1000-nebula"))]
 pub fn probe_loongson_gmac() -> Option<u32> {
-    let info = crate::bootinfo::get();
-    if info.gmac_devices().next().is_none() {
+    let info = crate::boot::context::get();
+    if info.devices().gmac_devices().next().is_none() {
         println!("[net] LS2K1000 FDT has no supported GMAC resource");
         return None;
     }
 
     for require_pinctrl in [true, false] {
-        for resource in info.gmac_devices() {
+        for resource in info.devices().gmac_devices() {
             if resource.pinctrl_default().is_some() != require_pinctrl {
                 continue;
             }
@@ -225,11 +225,12 @@ pub fn probe_loongson_gmac() -> Option<u32> {
 /// Probe the JH7110 EQoS port used by the successful U-Boot TFTP path.
 #[cfg(all(target_arch = "riscv64", feature = "platform-visionfive2"))]
 pub fn probe_jh7110_eqos() -> Option<u32> {
-    let info = crate::bootinfo::get();
+    let info = crate::boot::context::get();
     let preferred = info
+        .devices()
         .gmac_devices()
         .find(|resource| resource.device().start == 0x1604_0000)
-        .or_else(|| info.gmac_devices().next());
+        .or_else(|| info.devices().gmac_devices().next());
     let Some(resource) = preferred else {
         println!("[jh7110-eqos] live FDT has no supported EQoS resource");
         return None;
@@ -247,7 +248,8 @@ pub fn probe_jh7110_eqos() -> Option<u32> {
 
 /// Probe all VirtIO MMIO slots and register the first network device.
 pub fn probe_net_devices() {
-    for (slot, resource) in crate::bootinfo::get()
+    for (slot, resource) in crate::boot::context::get()
+        .devices()
         .virtio_mmio_devices()
         .iter()
         .enumerate()

@@ -1,7 +1,8 @@
 //! Physical page frame allocator
 
 use super::{virt_to_phys, PhysPageNum};
-use crate::bootinfo::{self, PhysMemoryRegion};
+use crate::boot::context;
+use crate::boot::memblock::PhysMemoryRegion;
 use crate::config::PAGE_SIZE;
 use crate::fs::PAGE_CACHE_MANAGER;
 #[cfg(feature = "cosmos-meminfo")]
@@ -265,7 +266,7 @@ impl BuddyFrameAllocator {
 
     pub fn init_from_bootinfo(&mut self, kernel_start: PhysPageNum, kernel_end: PhysPageNum) {
         self.reset();
-        bootinfo::for_each_usable_memory_region(|region| {
+        context::get().memblock().for_each_free_range(|region| {
             self.add_usable_region(region, kernel_start.0, kernel_end.0);
         });
         self.free_bitmap.reset(self.start, self.end);

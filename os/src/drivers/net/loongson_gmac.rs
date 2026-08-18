@@ -7,7 +7,7 @@
 use core::{mem::size_of, ptr::addr_of_mut};
 
 use crate::{
-    bootinfo::{GmacResource, PhyInterfaceMode},
+    of::net::{GmacResource, PhyInterfaceMode},
     platform,
     sync::SpinNoIrqLock,
 };
