@@ -17,6 +17,7 @@
 | [09-elf-process-stack-syscall-abi.md](09-elf-process-stack-syscall-abi.md) | ELF、进程、用户栈、系统调用 ABI |
 | [10-qemu-gdb-debugging.md](10-qemu-gdb-debugging.md) | 构建、QEMU、GDB、日志、反汇编 |
 | [11-cosmos-codebase-map.md](11-cosmos-codebase-map.md) | CosmOS 模块地图、启动流程、改题入口 |
+| [12-binary-static-analysis.md](12-binary-static-analysis.md) | ELF、objdump、readelf、addr2line、符号和地址定位 |
 
 ## 使用方法
 

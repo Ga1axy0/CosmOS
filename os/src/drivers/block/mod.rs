@@ -393,7 +393,7 @@ fn block_io_worker_main() -> ! {
                 .map(|dev| dev.pending_request_count())
                 .sum::<usize>();
             let used = devices.iter().filter(|dev| dev.has_used_completions()).count();
-            println!(
+            debug!(
                 "[diag][blk-worker] loop={} event={} completed={} pending={} used={}",
                 diag,
                 had_completion_event,

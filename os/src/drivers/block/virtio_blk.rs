@@ -526,7 +526,7 @@ impl VirtIOBlock {
         self.pending.lock().insert(token, Arc::clone(&request));
         let diag = DIAG_BLOCK_SUBMITS.fetch_add(1, Ordering::Relaxed);
         if diag < 64 {
-            println!(
+            debug!(
                 "[diag][blk] submit self={:#x} op=read block={} len={} token={} pending={}",
                 self as *const Self as usize,
                 block_id,
@@ -564,7 +564,7 @@ impl VirtIOBlock {
         self.pending.lock().insert(token, Arc::clone(&request));
         let diag = DIAG_BLOCK_SUBMITS.fetch_add(1, Ordering::Relaxed);
         if diag < 64 {
-            println!(
+            debug!(
                 "[diag][blk] submit self={:#x} op=write block={} len={} token={} pending={}",
                 self as *const Self as usize,
                 block_id,
@@ -600,7 +600,7 @@ impl VirtIOBlock {
                 let diag = DIAG_BLOCK_WAITS.fetch_add(1, Ordering::Relaxed);
                 if diag < 64 {
                     let data = request.inner.lock();
-                    println!(
+                    debug!(
                         "[diag][blk] wait self={:#x} op={} block={} token={} pending={} waiters={}",
                         self as *const Self as usize,
                         data.kind.name(),
@@ -746,7 +746,7 @@ impl VirtIOBlock {
             let block_id = data.block_id;
             let diag = DIAG_BLOCK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
             if diag < 64 {
-                println!(
+                debug!(
                     "[diag][blk] complete self={:#x} op={} block={} token={} pending_before={}",
                     self as *const Self as usize,
                     kind.name(),
@@ -835,7 +835,7 @@ impl VirtIOBlock {
         let has_used = inner.peek_used().is_some();
         let diag = DIAG_BLOCK_IRQS.fetch_add(1, Ordering::Relaxed);
         if diag < 64 {
-            println!(
+            debug!(
                 "[diag][blk] irq self={:#x} isr={} used={} pending={}",
                 self as *const Self as usize,
                 isr_set,

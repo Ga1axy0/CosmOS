@@ -174,7 +174,7 @@ pub(crate) fn run_tasks() {
                     .upgrade()
                     .map(|process| process.getpid())
                     .unwrap_or(usize::MAX);
-                println!(
+                debug!(
                     "[diag][sched] pick event={} hart={} task={:#x} pid={}",
                     event,
                     hartid(),
@@ -254,7 +254,7 @@ pub(crate) fn run_tasks() {
         } else {
             let event = DIAG_IDLE_EVENTS.fetch_add(1, Ordering::Relaxed);
             if event < 16 {
-                println!("[diag][sched] idle event={} hart={}", event, hartid());
+                debug!("[diag][sched] idle event={} hart={}", event, hartid());
             }
             // idle: enable interrupts and wait for next interrupt (timer/UART/etc.)
             if INITPROC.inner_exclusive_access().is_zombie() {
