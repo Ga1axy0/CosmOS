@@ -26,6 +26,7 @@ use crate::{
     },
 };
 
+use alloc::vec;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
@@ -2463,5 +2464,55 @@ pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32) -> isize {
             write_pod_to_user(node_ptr, &0u32)?;
         }
         Ok(0)
+    })
+}
+
+const SECCOMP_STRICT_FAIL: usize = 0x100;
+const SECCOMP_WHITELIST: usize = 0x101;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SeccompWhitelist {
+    len: u16,
+    syscalls: *const u32
+}
+
+impl Pod for SeccompWhitelist {}
+
+pub fn sys_seccomp(operation: usize, flags: usize, args: *const SeccompWhitelist) -> isize {
+    syscall_body!({
+        let process = current_process();
+        let mut inner = process.inner_exclusive_access();
+        if inner.seccomp_enable {
+            return Err(ERRNO::EINVAL);
+        }
+        match operation {
+            SECCOMP_STRICT_FAIL => {
+                if flags != 0 || args != core::ptr::null() {
+                    return Err(ERRNO::EINVAL)
+                }
+                inner.seccomp_flags = vec![63, 64, 93];
+                inner.seccomp_enable=true;
+                Ok(0)
+            }
+            SECCOMP_WHITELIST => {
+                if flags != 0 { 
+                    return Err(ERRNO::EINVAL);
+                }
+                let whitelist = read_pod_from_user(args)?;
+                let ptr = whitelist.syscalls;
+                let mut res = vec![];
+                for i in 0..whitelist.len as usize {
+                    let x = read_pod_from_user((ptr as usize+ (i * size_of::<u32>())) as *const u32)?;
+                    res.push(x as usize);
+                }
+                res.push(93);
+
+                inner.seccomp_flags = res;
+                inner.seccomp_enable=true;
+                Ok(0)
+            }
+            _ => Err(ERRNO::EINVAL)
+        }
     })
 }

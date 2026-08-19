@@ -385,6 +385,9 @@ pub struct ProcessControlBlockInner {
     pub robust_list: RobustList,
     /// Active SysV shared-memory attachments in this process.
     pub shm_attachments: Vec<ShmAttachment>,
+
+    pub seccomp_enable: bool,
+    pub seccomp_flags: Vec<usize>,
 }
 
 /// One SysV shared-memory attachment in a process address space.
@@ -1120,6 +1123,8 @@ impl ProcessControlBlock {
                 itimer_prof: ItimerState::default(),
                 robust_list: RobustList { head: 0, len: 0 },
                 shm_attachments: Vec::new(),
+                seccomp_enable: false,
+                seccomp_flags: vec![],
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(true),
@@ -1556,6 +1561,10 @@ impl ProcessControlBlock {
             .as_ref()
             .map_or_else(|| self.getpid(), |parent| parent.getpid());
         let parent_shm_attachments = parent.shm_attachments.clone();
+        
+        let parent_seccomp_enable = parent.seccomp_enable;
+        let parent_seccomp_flags = parent.seccomp_flags.clone();
+        
         let parent_fd_count = parent.fd_table.len();
         // alloc a pid
         let pid = pid_alloc();
@@ -1638,6 +1647,9 @@ impl ProcessControlBlock {
                 itimer_prof: ItimerState::default(),
                 robust_list: RobustList { head: 0, len: 0 },
                 shm_attachments: parent_shm_attachments.clone(),
+
+                seccomp_enable: parent_seccomp_enable,
+                seccomp_flags: parent_seccomp_flags.clone(),
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(!vfork_clone),
@@ -1925,6 +1937,8 @@ impl ProcessControlBlock {
                 itimer_prof: ItimerState::default(),
                 robust_list: RobustList { head: 0, len: 0 },
                 shm_attachments: Vec::new(),
+                seccomp_enable: false,
+                seccomp_flags: vec![],
             }),
             wait_exit_queue: Arc::new(WaitQueue::new()),
             vfork_released: AtomicBool::new(true),

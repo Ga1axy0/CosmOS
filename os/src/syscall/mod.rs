@@ -364,6 +364,8 @@ pub const SYSCALL_SCHED_SETATTR: usize = 274;
 pub const SYSCALL_SCHED_GETATTR: usize = 275;
 /// renameat2 syscall
 pub const SYSCALL_RENAMEAT2: usize = 276;
+/// seccomp syscall
+pub const SYSCALL_SECCOMP: usize = 277;
 /// getrandom syscall
 pub const SYSCALL_GETRANDOM: usize = 278;
 /// memfd_create syscall
@@ -464,18 +466,20 @@ mod resource;
 mod sched;
 mod signal;
 mod sync;
+#[cfg(feature = "syscalls_count")]
+pub(crate) mod syscalls_count;
 mod thread;
 mod times;
 mod utils;
-#[cfg(feature = "syscalls_count")]
-pub(crate) mod syscalls_count;
 
 /// Standard error numbers and conversion traits
 pub mod errno;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::syscall::errno::ERRNO::ENOSYS;
 use crate::syscall::random::*;
+use crate::task::current_process;
 use fs::*;
 pub(crate) use fs::{
     bpf_prog_is_socket_filter, bpf_run_socket_filter_prog, write_process_accounting_on_exit,
@@ -576,6 +580,16 @@ fn errno_name(errno: isize) -> &'static str {
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     #[cfg(feature = "syscalls_count")]
     let syscall_start = syscalls_count::begin(syscall_id);
+
+    {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        if inner.seccomp_enable == true {
+            if !inner.seccomp_flags.iter().any(|i| *i == syscall_id) {
+                return syscall_body!({Err(ERRNO::ENOSYS)});
+            }
+        }
+    }
 
     let result = match syscall_id {
         SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1] as i32),
@@ -1088,6 +1102,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as u32),
         SYSCALL_TKILL => sys_tkill(args[0], args[1] as u32),
         SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as u32),
+        SYSCALL_SECCOMP => sys_seccomp(args[0], args[1], args[2] as *const SeccompWhitelist),
         _ => sys_nisyscall(syscall_id, args),
     };
     if (-4095..0).contains(&result) {
